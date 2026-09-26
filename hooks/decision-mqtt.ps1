@@ -68,6 +68,71 @@ function Get-CopilotMqttNodeId {
     "agent_bridge_$($clean.ToLowerInvariant())"
 }
 
+function Get-CopilotMqttMachineNode {
+    <#
+        The MQTT node id that carries everything the bridge publishes once per machine.
+
+        One Home Assistant is normally shared between machines, so these were the
+        entities that collided: a fixed `agent_bridge` node meant the laptop's update
+        entity, launch button and session counter overwrote the desktop's instead of
+        appearing next to them.
+    #>
+    param([string]$Slug)
+    if (-not $Slug) { $Slug = Get-BridgeMachineSlug }
+    "agent_bridge_$Slug"
+}
+
+function Get-CopilotMqttMachineDevice {
+    <#
+        The Home Assistant device every per-machine entity hangs off.
+
+        One device per machine rather than one for the whole bridge, so Home Assistant
+        groups each machine's controls together and the device page reads as "what is
+        this computer doing" instead of merging every computer into one list.
+    #>
+    param([string]$Slug, [string]$MachineName)
+    if (-not $Slug) { $Slug = Get-BridgeMachineSlug }
+    if (-not $MachineName) { $MachineName = [Environment]::MachineName }
+    @{
+        identifiers  = @("agent_bridge_$Slug")
+        name         = "AI Agent Bridge ($MachineName)"
+        manufacturer = 'AI CLI bridge'
+    }
+}
+
+function Get-CopilotMqttMachineTopicRoot {
+    <#
+        The topic prefix for one machine's own controls.
+
+        Namespacing the topics matters as much as namespacing the ids. Home Assistant
+        subscribes each MQTT entity to the command topic in its discovery payload, so
+        two machines sharing `copilot/cli/newsession/prompt/set` would have had every
+        keystroke typed on one machine's prompt box land in the other's as well.
+    #>
+    param([string]$Slug)
+    if (-not $Slug) { $Slug = Get-BridgeMachineSlug }
+    "$($script:CopilotMqttConfig.TopicRoot)/machine/$Slug"
+}
+
+function Get-BridgeMachineEntityId {
+    <#
+        The entity id of one of this machine's per-machine entities, e.g.
+        button.agent_bridge_desktop_new_session.
+
+        Every reader goes through here rather than writing the literal, because the
+        daemon polls these by id on each reconcile and the generated dashboard
+        references them in templates - so the id has to be derived one way or the two
+        drift apart silently.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Domain,
+        [Parameter(Mandatory)][string]$Key,
+        [string]$Slug
+    )
+    if (-not $Slug) { $Slug = Get-BridgeMachineSlug }
+    "$Domain.agent_bridge_${Slug}_$Key"
+}
+
 function Get-CopilotMqttTopics {
     param(
         [Parameter(Mandatory)]
@@ -395,27 +460,26 @@ function Publish-CopilotMqttUpdate {
         [string]$ReleaseUrl = '',
         [string]$ReleaseNotes = '',
         [switch]$InProgress,
+        [string]$Slug,
         [Parameter(Mandatory)][hashtable]$Headers
     )
 
-    $device = @{
-        identifiers  = @('agent_bridge')
-        name         = 'AI Agent Bridge'
-        manufacturer = 'AI CLI bridge'
-    }
-    $stateTopic = "$($script:CopilotMqttConfig.TopicRoot)/update/state"
+    if (-not $Slug) { $Slug = Get-BridgeMachineSlug }
+    $node = Get-CopilotMqttMachineNode -Slug $Slug
+    $device = Get-CopilotMqttMachineDevice -Slug $Slug
+    $stateTopic = "$(Get-CopilotMqttMachineTopicRoot -Slug $Slug)/update/state"
 
     $config = @{
         name        = 'Update'
-        unique_id   = 'agent_bridge_update'
-        object_id   = 'agent_bridge_update'
+        unique_id   = "agent_bridge_${Slug}_update"
+        object_id   = "agent_bridge_${Slug}_update"
         state_topic = $stateTopic
         device_class = 'firmware'
         icon        = 'mdi:package-up'
         device      = $device
     }
     Publish-CopilotMqttMessage `
-        -Topic "$($script:CopilotMqttConfig.DiscoveryPrefix)/update/agent_bridge/update/config" `
+        -Topic "$($script:CopilotMqttConfig.DiscoveryPrefix)/update/$node/update/config" `
         -Payload ($config | ConvertTo-Json -Depth 8 -Compress) -Headers $Headers -Retain
 
     # Release notes render in the entity's own dialog. They are capped because the
@@ -440,14 +504,14 @@ function Publish-CopilotMqttUpdate {
 
     $button = @{
         name          = 'Install Bridge Update'
-        unique_id     = 'agent_bridge_install_update'
-        object_id     = 'agent_bridge_install_update'
-        command_topic = "$($script:CopilotMqttConfig.TopicRoot)/update/install"
+        unique_id     = "agent_bridge_${Slug}_install_update"
+        object_id     = "agent_bridge_${Slug}_install_update"
+        command_topic = "$(Get-CopilotMqttMachineTopicRoot -Slug $Slug)/update/install"
         icon          = 'mdi:download'
         device        = $device
     }
     Publish-CopilotMqttMessage `
-        -Topic "$($script:CopilotMqttConfig.DiscoveryPrefix)/button/agent_bridge/install_update/config" `
+        -Topic "$($script:CopilotMqttConfig.DiscoveryPrefix)/button/$node/install_update/config" `
         -Payload ($button | ConvertTo-Json -Depth 8 -Compress) -Headers $Headers -Retain
 }
 
@@ -486,17 +550,17 @@ function Publish-CopilotMqttNewSession {
 
         [string]$LastResult = '',
 
+        [string]$Slug,
+
         [Parameter(Mandatory)]
         [hashtable]$Headers
     )
 
-    $device = @{
-        identifiers  = @('agent_bridge')
-        name         = 'AI Agent Bridge'
-        manufacturer = 'AI CLI bridge'
-    }
+    if (-not $Slug) { $Slug = Get-BridgeMachineSlug }
+    $node = Get-CopilotMqttMachineNode -Slug $Slug
+    $device = Get-CopilotMqttMachineDevice -Slug $Slug
     $prefix = $script:CopilotMqttConfig.DiscoveryPrefix
-    $root = $script:CopilotMqttConfig.TopicRoot
+    $root = Get-CopilotMqttMachineTopicRoot -Slug $Slug
 
     # An MQTT select must offer at least one option, so a bridge with nothing
     # configured still publishes a single explanatory entry rather than an invalid
@@ -506,27 +570,27 @@ function Publish-CopilotMqttNewSession {
 
     $promptConfig = @{
         name          = 'New session prompt'
-        unique_id     = 'agent_bridge_new_prompt'
-        object_id     = 'agent_bridge_new_prompt'
+        unique_id     = "agent_bridge_${Slug}_new_prompt"
+        object_id     = "agent_bridge_${Slug}_new_prompt"
         command_topic = "$root/newsession/prompt/set"
         max           = $script:CopilotMqttConfig.ReplyMaxChars
         mode          = 'text'
         icon          = 'mdi:message-plus-outline'
         device        = $device
     }
-    Publish-CopilotMqttMessage -Topic "$prefix/text/agent_bridge/new_prompt/config" `
+    Publish-CopilotMqttMessage -Topic "$prefix/text/$node/new_prompt/config" `
         -Payload ($promptConfig | ConvertTo-Json -Depth 8 -Compress) -Headers $Headers -Retain
 
     $workspaceConfig = @{
         name          = 'New session workspace'
-        unique_id     = 'agent_bridge_new_workspace'
-        object_id     = 'agent_bridge_new_workspace'
+        unique_id     = "agent_bridge_${Slug}_new_workspace"
+        object_id     = "agent_bridge_${Slug}_new_workspace"
         command_topic = "$root/newsession/workspace/set"
         options       = $options
         icon          = 'mdi:folder-open-outline'
         device        = $device
     }
-    Publish-CopilotMqttMessage -Topic "$prefix/select/agent_bridge/new_workspace/config" `
+    Publish-CopilotMqttMessage -Topic "$prefix/select/$node/new_workspace/config" `
         -Payload ($workspaceConfig | ConvertTo-Json -Depth 8 -Compress) -Headers $Headers -Retain
 
     # The Agency profile decides which MCP servers and plugins a session gets, and it
@@ -541,14 +605,14 @@ function Publish-CopilotMqttNewSession {
 
     $profileConfig = @{
         name          = 'New session profile'
-        unique_id     = 'agent_bridge_new_profile'
-        object_id     = 'agent_bridge_new_profile'
+        unique_id     = "agent_bridge_${Slug}_new_profile"
+        object_id     = "agent_bridge_${Slug}_new_profile"
         command_topic = "$root/newsession/profile/set"
         options       = $profileOptions
         icon          = 'mdi:account-cog-outline'
         device        = $device
     }
-    Publish-CopilotMqttMessage -Topic "$prefix/select/agent_bridge/new_profile/config" `
+    Publish-CopilotMqttMessage -Topic "$prefix/select/$node/new_profile/config" `
         -Payload ($profileConfig | ConvertTo-Json -Depth 8 -Compress) -Headers $Headers -Retain
 
     # Resume selector. "New session" is always the first option and the default, so
@@ -561,41 +625,41 @@ function Publish-CopilotMqttNewSession {
 
     $resumeConfig = @{
         name          = 'New session resume'
-        unique_id     = 'agent_bridge_new_resume'
-        object_id     = 'agent_bridge_new_resume'
+        unique_id     = "agent_bridge_${Slug}_new_resume"
+        object_id     = "agent_bridge_${Slug}_new_resume"
         command_topic = "$root/newsession/resume/set"
         options       = $resumeOptions
         icon          = 'mdi:history'
         device        = $device
     }
-    Publish-CopilotMqttMessage -Topic "$prefix/select/agent_bridge/new_resume/config" `
+    Publish-CopilotMqttMessage -Topic "$prefix/select/$node/new_resume/config" `
         -Payload ($resumeConfig | ConvertTo-Json -Depth 8 -Compress) -Headers $Headers -Retain
 
     $buttonConfig = @{
         name          = 'Start new session'
-        unique_id     = 'agent_bridge_new_session'
-        object_id     = 'agent_bridge_new_session'
+        unique_id     = "agent_bridge_${Slug}_new_session"
+        object_id     = "agent_bridge_${Slug}_new_session"
         command_topic = "$root/newsession/start"
         icon          = 'mdi:rocket-launch-outline'
         device        = $device
     }
-    Publish-CopilotMqttMessage -Topic "$prefix/button/agent_bridge/new_session/config" `
+    Publish-CopilotMqttMessage -Topic "$prefix/button/$node/new_session/config" `
         -Payload ($buttonConfig | ConvertTo-Json -Depth 8 -Compress) -Headers $Headers -Retain
 
     $resultTopic = "$root/newsession/result"
     $resultConfig = @{
         name        = 'New session result'
-        unique_id   = 'agent_bridge_new_session_result'
-        object_id   = 'agent_bridge_new_session_result'
+        unique_id   = "agent_bridge_${Slug}_new_session_result"
+        object_id   = "agent_bridge_${Slug}_new_session_result"
         state_topic = $resultTopic
         icon        = 'mdi:information-outline'
         device      = $device
     }
-    Publish-CopilotMqttMessage -Topic "$prefix/sensor/agent_bridge/new_session_result/config" `
+    Publish-CopilotMqttMessage -Topic "$prefix/sensor/$node/new_session_result/config" `
         -Payload ($resultConfig | ConvertTo-Json -Depth 8 -Compress) -Headers $Headers -Retain
 
     if ($PSBoundParameters.ContainsKey('LastResult')) {
-        Set-CopilotMqttNewSessionResult -Text $LastResult -Headers $Headers
+        Set-CopilotMqttNewSessionResult -Text $LastResult -Slug $Slug -Headers $Headers
     }
 }
 
@@ -606,6 +670,7 @@ function Set-CopilotMqttNewSessionResult {
     #>
     param(
         [string]$Text = '',
+        [string]$Slug,
         [Parameter(Mandatory)][hashtable]$Headers
     )
 
@@ -613,7 +678,7 @@ function Set-CopilotMqttNewSessionResult {
     $limit = $script:CopilotMqttConfig.StateMaxChars
     if ($value.Length -gt $limit) { $value = $value.Substring(0, $limit - 3) + '...' }
 
-    Publish-CopilotMqttMessage -Topic "$($script:CopilotMqttConfig.TopicRoot)/newsession/result" `
+    Publish-CopilotMqttMessage -Topic "$(Get-CopilotMqttMachineTopicRoot -Slug $Slug)/newsession/result" `
         -Payload $value -Headers $Headers -Retain
 }
 
@@ -700,40 +765,54 @@ function Get-CopilotLegacyMqttNodeId {
 
 function Publish-CopilotMqttGlobalStatus {
     <#
-        Publishes a single global sensor summarising all live sessions, so the
-        dashboard can show an accurate live-session count without a fragile template.
+        Publishes this machine's session summary, and doubles as its presence marker.
 
-        The old dashboard counter (input_number.copilot_cli_active_sessions) only
-        counted sessions in the 'working' state, so a set of sessions all idle and
-        waiting for input read as 0 - which looked broken. This sensor counts every
-        live session the daemon is tracking, whatever their turn state, and lists them
-        in an attribute.
+        The count exists because the old dashboard counter only counted sessions in
+        the 'working' state, so a set of sessions all idle and waiting for input read
+        as 0 - which looked broken. This counts every live session the daemon is
+        tracking, whatever their turn state.
+
+        It carries two further jobs now that one Home Assistant serves several
+        machines. The `sessions` attribute is how every other machine learns what this
+        one is running, so the dashboard can show all of them at once without any
+        machine talking to any other. And the entity's mere existence is how an
+        uninstall tells whether it is removing the last machine - it is retained, so it
+        survives a machine simply being switched off, which is exactly the case where
+        the shared dashboard must be left alone.
     #>
     param(
         [Parameter(Mandatory)]
         [AllowEmptyCollection()]
         [object[]]$Sessions,
 
+        # What this machine can offer on its launch card, so other machines can render
+        # it correctly without knowing anything about how it is configured.
+        [hashtable]$Capabilities = @{},
+
+        [string]$Slug,
+
+        [string]$MachineName,
+
         [Parameter(Mandatory)]
         [hashtable]$Headers
     )
 
-    $node = 'agent_bridge_global'
-    $stateTopic = "$($script:CopilotMqttConfig.TopicRoot)/global/state"
-    $attrTopic = "$($script:CopilotMqttConfig.TopicRoot)/global/attr"
+    if (-not $Slug) { $Slug = Get-BridgeMachineSlug }
+    if (-not $MachineName) { $MachineName = [Environment]::MachineName }
+
+    $node = Get-CopilotMqttMachineNode -Slug $Slug
+    $machineRoot = Get-CopilotMqttMachineTopicRoot -Slug $Slug
+    $stateTopic = "$machineRoot/global/state"
+    $attrTopic = "$machineRoot/global/attr"
 
     $config = @{
         name = 'Sessions'
-        unique_id = 'agent_bridge_sessions'
-        object_id = 'agent_bridge_sessions'
+        unique_id = "agent_bridge_${Slug}_sessions"
+        object_id = "agent_bridge_${Slug}_sessions"
         state_topic = $stateTopic
         json_attributes_topic = $attrTopic
         icon = 'mdi:robot-happy'
-        device = @{
-            identifiers = @('agent_bridge')
-            name = 'AI Agent Bridge'
-            manufacturer = 'AI CLI bridge'
-        }
+        device = Get-CopilotMqttMachineDevice -Slug $Slug -MachineName $MachineName
     }
     Publish-CopilotMqttMessage `
         -Topic "$($script:CopilotMqttConfig.DiscoveryPrefix)/sensor/$node/sessions/config" `
@@ -743,12 +822,167 @@ function Publish-CopilotMqttGlobalStatus {
         -Headers $Headers -Retain
     Publish-CopilotMqttMessage -Topic $attrTopic -Payload (@{
         sessions = @($Sessions)
+        machine = $MachineName
+        machine_slug = $Slug
+        capabilities = $Capabilities
         updated = [DateTimeOffset]::Now.ToString('o')
     } | ConvertTo-Json -Depth 6 -Compress) -Headers $Headers -Retain
 }
 
 function Get-CopilotMqttGlobalEntityId {
-    'sensor.agent_bridge_sessions'
+    param([string]$Slug)
+    Get-BridgeMachineEntityId -Domain 'sensor' -Key 'sessions' -Slug $Slug
+}
+
+function Get-BridgePeerMachine {
+    <#
+        Every machine publishing bridge entities to this Home Assistant, found by its
+        session sensor.
+
+        Discovery is one-directional and needs no coordination: each machine publishes
+        a retained sensor describing itself, and any other machine reads them all out
+        of /api/states. Nothing subscribes, nothing registers, and a machine that is
+        switched off still shows up - which is what makes this safe to use for
+        "am I the last one" during an uninstall.
+
+        -States is for tests; without it the state list is fetched. A caller that has
+        already read /api/states for another reason should pass it rather than paying
+        for a second full read.
+    #>
+    param(
+        [hashtable]$Headers,
+        [switch]$ExcludeSelf,
+        [AllowNull()][object[]]$States
+    )
+
+    if (-not $PSBoundParameters.ContainsKey('States')) {
+        $States = Invoke-DecisionHttpRequest -Parameters @{
+            Method = 'Get'
+            Uri = "$($script:DecisionBridgeConfig.HomeAssistantBaseUrl)/api/states"
+            Headers = $Headers
+            TimeoutSec = 15
+        }
+    }
+
+    $self = Get-BridgeMachineSlug
+    $found = [System.Collections.Generic.List[object]]::new()
+    foreach ($state in @($States)) {
+        if ($null -eq $state) { continue }
+        $entityId = [string]$state.entity_id
+        # A session node is alphanumeric only, so it can never end in _sessions; the
+        # suffix is therefore unambiguous evidence of a machine sensor.
+        if ($entityId -notmatch '^sensor\.agent_bridge_([a-z0-9_]+)_sessions$') { continue }
+        $slug = $Matches[1]
+        if ($ExcludeSelf -and $slug -eq $self) { continue }
+
+        $attributes = $state.attributes
+        $machine = ''
+        $sessions = @()
+        $capabilities = @{}
+        if ($null -ne $attributes) {
+            if ($attributes.PSObject.Properties.Name -contains 'machine') { $machine = [string]$attributes.machine }
+            if ($attributes.PSObject.Properties.Name -contains 'sessions') { $sessions = @($attributes.sessions) }
+            if ($attributes.PSObject.Properties.Name -contains 'capabilities' -and $null -ne $attributes.capabilities) {
+                $capabilities = $attributes.capabilities
+            }
+        }
+        # An older machine's sensor predates the machine attribute, so fall back to the
+        # slug rather than rendering a card with no name on it.
+        if ([string]::IsNullOrWhiteSpace($machine)) { $machine = $slug }
+
+        $found.Add([pscustomobject]@{
+            Slug = $slug
+            Machine = $machine
+            Sessions = @($sessions)
+            Capabilities = $capabilities
+            IsSelf = ($slug -eq $self)
+            EntityId = $entityId
+        })
+    }
+    # Returned unwrapped so the normal @(...) idiom at every call site works: an empty
+    # result yields nothing and collects as zero, rather than as one empty array.
+    $found.ToArray()
+}
+
+function Get-CopilotMqttMachineTopic {
+    <#
+        Every retained topic that belongs to one machine's own entities.
+
+        Kept in one place because it is walked in two directions: published on every
+        reconcile, and cleared on uninstall. A topic missing from here would leave an
+        entity behind in Home Assistant with nothing left to remove it.
+    #>
+    param([string]$Slug)
+    if (-not $Slug) { $Slug = Get-BridgeMachineSlug }
+
+    $prefix = $script:CopilotMqttConfig.DiscoveryPrefix
+    $node = Get-CopilotMqttMachineNode -Slug $Slug
+    $root = Get-CopilotMqttMachineTopicRoot -Slug $Slug
+
+    @(
+        "$prefix/update/$node/update/config"
+        "$prefix/button/$node/install_update/config"
+        "$prefix/text/$node/new_prompt/config"
+        "$prefix/select/$node/new_workspace/config"
+        "$prefix/select/$node/new_profile/config"
+        "$prefix/select/$node/new_resume/config"
+        "$prefix/button/$node/new_session/config"
+        "$prefix/sensor/$node/new_session_result/config"
+        "$prefix/sensor/$node/sessions/config"
+        "$root/update/state"
+        "$root/newsession/result"
+        "$root/global/state"
+        "$root/global/attr"
+    )
+}
+
+function Get-CopilotMqttLegacyMachineTopic {
+    <#
+        The retained topics from before entities were scoped to a machine.
+
+        These used a single fixed `agent_bridge` node, which is precisely why a second
+        machine overwrote the first. An upgraded install has to withdraw them, or Home
+        Assistant keeps showing the unscoped update entity and launch button - and the
+        launch button in particular would still be watched by nothing, so pressing it
+        would appear to do nothing at all.
+    #>
+    $prefix = $script:CopilotMqttConfig.DiscoveryPrefix
+    $root = $script:CopilotMqttConfig.TopicRoot
+
+    @(
+        "$prefix/update/agent_bridge/update/config"
+        "$prefix/button/agent_bridge/install_update/config"
+        "$prefix/text/agent_bridge/new_prompt/config"
+        "$prefix/select/agent_bridge/new_workspace/config"
+        "$prefix/select/agent_bridge/new_profile/config"
+        "$prefix/select/agent_bridge/new_resume/config"
+        "$prefix/button/agent_bridge/new_session/config"
+        "$prefix/sensor/agent_bridge/new_session_result/config"
+        "$prefix/sensor/agent_bridge_global/sessions/config"
+        "$root/update/state"
+        "$root/newsession/result"
+        "$root/global/state"
+        "$root/global/attr"
+    )
+}
+
+function Remove-CopilotMqttMachineEntities {
+    <#
+        Withdraws one machine's per-machine entities by clearing their retained topics.
+        Used by uninstall, so removing a laptop leaves the desktop's controls intact.
+    #>
+    param(
+        [string]$Slug,
+        [switch]$Legacy,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $topics = if ($Legacy) { Get-CopilotMqttLegacyMachineTopic } else { Get-CopilotMqttMachineTopic -Slug $Slug }
+    foreach ($topic in $topics) {
+        try { Publish-CopilotMqttMessage -Topic $topic -Payload '' -Headers $Headers -Retain }
+        catch { }
+    }
+    @($topics).Count
 }
 
 function Set-CopilotMqttStatus {

@@ -41,6 +41,10 @@ function Invoke-CopilotHaWebSocket {
 }
 
 Write-Host '--- the dashboard is titled and routed correctly ---'
+# Per-machine entity ids, derived rather than hard-coded so the suite passes on any
+# machine including a CI runner. Without a -Machines list the dashboard renders the
+# local machine alone, which is the single-machine case these tests cover.
+$slug = Get-BridgeMachineSlug
 $sessions = @(
     [pscustomobject]@{ Node = 'copilot_abc123def456'; Name = 'Copilot: my task'; Machine = 'BOX'; Kind = 'copilot' }
 )
@@ -61,9 +65,13 @@ $agentCard = @($cfg.views[0].cards | Where-Object {
 Test-That 'the agent sessions card exists' { $null -ne $agentCard }
 $control = @($agentCard.cards | Where-Object { $_.type -eq 'markdown' })[0]
 Test-That 'the control markdown card exists' { $null -ne $control }
-Test-That 'it shows the live session count' { $control.content.Contains("states('sensor.agent_bridge_sessions')") }
+Test-That 'it shows the live session count' {
+    # Summed across machines with int(0) on each term, so one machine's sensor being
+    # briefly unavailable reads as zero rather than breaking the whole template.
+    $control.content.Contains("states('sensor.agent_bridge_${slug}_sessions')|int(0)")
+}
 Test-That 'it shows the installed bridge version from the update entity' {
-    $control.content.Contains("state_attr('update.agent_bridge_update', 'installed_version')") -and
+    $control.content.Contains("state_attr('update.agent_bridge_${slug}_update', 'installed_version')") -and
     $control.content.Contains('**Bridge**')
 }
 
@@ -89,7 +97,7 @@ $allRows = @($cfg.views[0].cards | ForEach-Object {
     elseif ($_.type -eq 'entities') { $_.entities }
 })
 Test-That 'no card repeats the live-session sensor as a row' {
-    @($allRows | Where-Object { $_.entity -eq 'sensor.agent_bridge_sessions' }).Count -eq 0
+    @($allRows | Where-Object { $_.entity -eq "sensor.agent_bridge_${slug}_sessions" }).Count -eq 0
 }
 Test-That 'there is no longer a standalone toggle card beside the summary' {
     @($cfg.views[0].cards | Where-Object {
@@ -283,18 +291,18 @@ $newRows = @($newCard.entities | ForEach-Object {
 
 Test-That 'the card is still generated' { $null -ne $newCard }
 Test-That 'it keeps the selectors and Launch' {
-    ($newRows -contains 'select.agent_bridge_new_resume') -and
-    ($newRows -contains 'select.agent_bridge_new_workspace') -and
-    ($newRows -contains 'select.agent_bridge_new_profile') -and
-    ($newRows -contains 'button.agent_bridge_new_session')
+    ($newRows -contains "select.agent_bridge_${slug}_new_resume") -and
+    ($newRows -contains "select.agent_bridge_${slug}_new_workspace") -and
+    ($newRows -contains "select.agent_bridge_${slug}_new_profile") -and
+    ($newRows -contains "button.agent_bridge_${slug}_new_session")
 }
 Test-That 'the last-launch result is gone' {
-    $newRows -notcontains 'sensor.agent_bridge_new_session_result'
+    $newRows -notcontains "sensor.agent_bridge_${slug}_new_session_result"
 }
 Test-That 'the opening prompt is gone' {
-    $newRows -notcontains 'text.agent_bridge_new_prompt'
+    $newRows -notcontains "text.agent_bridge_${slug}_new_prompt"
 }
-Test-That 'Launch is the last thing on the card' { $newRows[-1] -eq 'button.agent_bridge_new_session' }
+Test-That 'Launch is the last thing on the card' { $newRows[-1] -eq "button.agent_bridge_${slug}_new_session" }
 
 Write-Host '--- the dashboard is provisioned before it is written to ---'
 # Invoke-CopilotHaWebSocket hands back each command's `result` already unwrapped, so

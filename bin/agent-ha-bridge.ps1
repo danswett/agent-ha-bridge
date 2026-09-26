@@ -22,7 +22,9 @@
       restart     Restart the bridge daemon.
       logs        Tail the daemon log.
       update      Check for a newer release and offer to install it.
-      uninstall   Remove the bridge.
+      uninstall   Remove the bridge. Entities for this machine go with it; the
+                  dashboard and Detailed activity toggle are shared, so they only
+                  go when this is the last machine.
       version     Print the installed version.
       help        This text.
 
@@ -115,7 +117,7 @@ function Show-Help {
     Write-Host '  restart      Restart the bridge daemon'
     Write-Host '  logs         Tail the daemon log (-Lines N, -Follow)'
     Write-Host '  update       Check for a newer release and offer to install it'
-    Write-Host '  uninstall    Remove the bridge'
+    Write-Host '  uninstall    Remove the bridge (-KeepConfig, -ClearShared, -KeepShared)'
     Write-Host '  version      Print the installed version'
     Write-Host '  help         This text'
     Write-Host ''

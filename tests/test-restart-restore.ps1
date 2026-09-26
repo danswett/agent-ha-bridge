@@ -132,6 +132,8 @@ Write-Host '--- the MCP discovery scan is cached within its TTL ---'
 $script:McpScanCalls = 0
 function Invoke-DecisionHttpRequest { param($Parameters) $script:McpScanCalls++; @() }
 $script:DaemonMcpCache = $null
+$script:DaemonStatesCache = $null
+$script:DaemonStatesCacheAt = [DateTimeOffset]::MinValue
 $script:DaemonMcpCacheAt = [DateTimeOffset]::MinValue
 $mcpHeaders = @{ Authorization = 'Bearer test' }
 $null = Get-LiveMcpSessions -Headers $mcpHeaders
@@ -139,8 +141,15 @@ $null = Get-LiveMcpSessions -Headers $mcpHeaders
 $null = Get-LiveMcpSessions -Headers $mcpHeaders
 Test-That 'the /api/states scan runs once within the TTL' { $script:McpScanCalls -eq 1 }
 $script:DaemonMcpCacheAt = [DateTimeOffset]::Now.AddSeconds(-9999)
+# The TTL lives on the shared /api/states snapshot now, which the peer-machine scan
+# reads too, so cross-machine discovery costs no extra HTTP traffic. Expiring the MCP
+# cache alone would not force a re-read, and must not: a private gate here could expire
+# while the snapshot behind it was still warm, so the "fresh" scan would re-read nothing.
+$script:DaemonStatesCacheAt = [DateTimeOffset]::Now.AddSeconds(-9999)
 $null = Get-LiveMcpSessions -Headers $mcpHeaders
 Test-That 'an expired cache triggers a fresh scan' { $script:McpScanCalls -eq 2 }
+$null = Get-DaemonPeerMachines -Headers $mcpHeaders
+Test-That 'a peer scan reuses that snapshot rather than reading it again' { $script:McpScanCalls -eq 2 }
 
 Write-Host '--- state persistence survives console detachment ---'
 # Regression. Reply injection does FreeConsole -> AttachConsole -> FreeConsole, and

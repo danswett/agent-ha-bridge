@@ -162,6 +162,14 @@ elseif ($ClearEntities) {
         }
         Write-Host '    session entities cleared'
 
+        # The update entity, the launch controls and the session counter belong to this
+        # machine alone, so they go with it and every other machine's stay put.
+        try {
+            $count = Remove-CopilotMqttMachineEntities -Headers $headers
+            Write-Host "    cleared $count topic(s) for $([Environment]::MachineName)"
+        }
+        catch { Write-Warning "Could not clear this machine's entities: $($_.Exception.Message)" }
+
         # The dashboard and the toggle belong to the Home Assistant instance, not to
         # this machine, so whether they may go depends on who else is still using it.
         $otherMachines = $null

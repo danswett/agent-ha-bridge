@@ -40,6 +40,25 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'bridge-update.ps1')
 . (Join-Path $PSScriptRoot 'session-launch.ps1')
 
+# This machine's own per-machine entities, resolved once. One Home Assistant is
+# normally shared between machines, so every one of these is scoped to the machine
+# that publishes it - reading the unscoped id would mean acting on whichever machine
+# happened to write it last, which is exactly how a single press of Launch used to
+# start a session everywhere at once.
+$script:DaemonMachineSlug = Get-BridgeMachineSlug
+$script:DaemonMachineName = [Environment]::MachineName
+$script:DaemonEntity = @{
+    Sessions      = Get-BridgeMachineEntityId -Domain 'sensor' -Key 'sessions'          -Slug $script:DaemonMachineSlug
+    Update        = Get-BridgeMachineEntityId -Domain 'update' -Key 'update'            -Slug $script:DaemonMachineSlug
+    InstallUpdate = Get-BridgeMachineEntityId -Domain 'button' -Key 'install_update'    -Slug $script:DaemonMachineSlug
+    NewPrompt     = Get-BridgeMachineEntityId -Domain 'text'   -Key 'new_prompt'        -Slug $script:DaemonMachineSlug
+    NewWorkspace  = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_workspace'     -Slug $script:DaemonMachineSlug
+    NewProfile    = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_profile'       -Slug $script:DaemonMachineSlug
+    NewResume     = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_resume'        -Slug $script:DaemonMachineSlug
+    NewSession    = Get-BridgeMachineEntityId -Domain 'button' -Key 'new_session'       -Slug $script:DaemonMachineSlug
+    NewResult     = Get-BridgeMachineEntityId -Domain 'sensor' -Key 'new_session_result' -Slug $script:DaemonMachineSlug
+}
+
 $script:DaemonConfig = @{
     MutexName = 'Local\AgentBridgeDaemon'
     VerboseToggle = 'input_boolean.agent_bridge_detailed_activity'
@@ -52,6 +71,8 @@ $script:DaemonConfig = @{
     # Written once the pre-rename entities have been swept, so the sweep does not
     # repeat on every daemon start.
     LegacyCleanupMarker = (Join-Path $env:TEMP 'agent-bridge-legacy-cleanup.json')
+    # The same, for the entities that predate being scoped to a machine.
+    UnscopedCleanupMarker = (Join-Path $env:TEMP 'agent-bridge-unscoped-cleanup.json')
     # Cap how much transcript is read in one pass, so a session that produced a huge
     # burst cannot stall the loop.
     MaxTailBytes = 512000
@@ -103,6 +124,11 @@ $script:DaemonGlobalLastPublish = [DateTimeOffset]::MinValue
 # StrictMode.
 $script:DaemonMcpCache = $null
 $script:DaemonMcpCacheAt = [DateTimeOffset]::MinValue
+# One /api/states read serves both the MCP scan and the peer-machine scan, so adding
+# cross-machine discovery costs no extra HTTP traffic.
+$script:DaemonStatesCache = $null
+$script:DaemonStatesCacheAt = [DateTimeOffset]::MinValue
+$script:DaemonPeerCache = $null
 $script:DaemonWatchFailures = 0
 
 # Update-check state. Initialised here rather than left undefined because the daemon
@@ -299,6 +325,62 @@ function Get-LiveCodexSessions {
     $live
 }
 
+function Get-DaemonHomeAssistantStates {
+    <#
+        Every Home Assistant state, cached for a short while.
+
+        Two scans need the full state list - MCP clients and peer machines - and both
+        change slowly, so they share one read rather than each paying for an O(all
+        entities) fetch on every reconcile. Failure throws; each caller decides whether
+        to fall back to its own last known good set.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Headers)
+
+    if ($null -ne $script:DaemonStatesCache -and
+        ([DateTimeOffset]::Now - $script:DaemonStatesCacheAt).TotalSeconds -lt $script:DaemonConfig.McpScanCacheSeconds) {
+        return ,$script:DaemonStatesCache
+    }
+
+    $states = Invoke-DecisionHttpRequest -Parameters @{
+        Method = 'Get'
+        Uri = "$($script:DecisionBridgeConfig.HomeAssistantBaseUrl)/api/states"
+        Headers = $Headers
+        TimeoutSec = 15
+    }
+    $script:DaemonStatesCache = @($states)
+    $script:DaemonStatesCacheAt = [DateTimeOffset]::Now
+    # Comma-wrapped: an empty array returned bare unrolls to nothing, and the caller's
+    # @($result) then yields a one-element array holding $null, which every consumer
+    # here would dereference.
+    ,$script:DaemonStatesCache
+}
+
+function Get-DaemonPeerMachines {
+    <#
+        The other machines running the bridge against this Home Assistant, with
+        whatever each is currently running.
+
+        This is what makes one dashboard able to show every machine. Discovery is
+        one-directional and needs no agreement between machines: each publishes a
+        retained sensor describing itself, and everyone else simply reads it.
+
+        A failed scan falls back to the last known set rather than to none, so a
+        transient Home Assistant error does not make every other machine's sessions
+        blink out of the dashboard and back in.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Headers)
+
+    try { $states = Get-DaemonHomeAssistantStates -Headers $Headers }
+    catch {
+        if ($null -ne $script:DaemonPeerCache) { return $script:DaemonPeerCache }
+        return @()
+    }
+
+    $peers = @(Get-BridgePeerMachine -States $states -ExcludeSelf)
+    $script:DaemonPeerCache = $peers
+    $peers
+}
+
 function Get-LiveMcpSessions {
     <#
         Live MCP clients, discovered from their Home Assistant entities.
@@ -319,19 +401,15 @@ function Get-LiveMcpSessions {
     # affects the global count and dashboard card - the MCP server publishes and
     # withdraws its own decision entities - so a short TTL avoids a full O(all HA
     # entities) /api/states read on every reconcile.
-    if ($null -ne $script:DaemonMcpCache -and
-        ([DateTimeOffset]::Now - $script:DaemonMcpCacheAt).TotalSeconds -lt $script:DaemonConfig.McpScanCacheSeconds) {
-        return $script:DaemonMcpCache
-    }
-
+    #
+    # That TTL now lives on the shared state snapshot, which the peer-machine scan
+    # reads too, so both get one HTTP round trip between them. Re-parsing the snapshot
+    # each call is cheap and keeps the two from drifting: a private freshness gate here
+    # as well could expire while the snapshot behind it was still warm, so the "fresh"
+    # scan would have re-read nothing.
     $live = @{}
     try {
-        $states = Invoke-DecisionHttpRequest -Parameters @{
-            Method = 'Get'
-            Uri = "$($script:DecisionBridgeConfig.HomeAssistantBaseUrl)/api/states"
-            Headers = $Headers
-            TimeoutSec = 15
-        }
+        $states = Get-DaemonHomeAssistantStates -Headers $Headers
     }
     catch {
         # Show the last known set on a transient scan failure rather than flapping the
@@ -341,6 +419,7 @@ function Get-LiveMcpSessions {
     }
 
     foreach ($state in @($states)) {
+        if ($null -eq $state) { continue }
         $entityId = [string]$state.entity_id
         if ($entityId -notmatch '^select\.(mcp_[a-z0-9]+)_decision$') { continue }
         $node = $Matches[1]
@@ -1630,7 +1709,7 @@ function Sync-DaemonUpdateStatus {
     # start time rather than simply ignoring the first value seen means a press made
     # moments after a restart still counts, instead of being silently swallowed.
     try {
-        $button = Get-HomeAssistantState -EntityId 'button.agent_bridge_install_update' -Headers $Headers
+        $button = Get-HomeAssistantState -EntityId $script:DaemonEntity.InstallUpdate -Headers $Headers
         $press = [string]$button.state
         if ($press -in @('unknown', 'unavailable', '')) { return }
         if ($press -eq $script:DaemonUpdateLastPress) { return }
@@ -1741,11 +1820,11 @@ function Set-DaemonNewSessionDefaults {
         $default = Get-BridgeDefaultWorkspaceLabel
         if (-not [string]::IsNullOrWhiteSpace($default)) {
             try {
-                $current = [string](Get-HomeAssistantState -EntityId 'select.agent_bridge_new_workspace' -Headers $Headers).state
+                $current = [string](Get-HomeAssistantState -EntityId $script:DaemonEntity.NewWorkspace -Headers $Headers).state
                 $valid = @($Workspaces | ForEach-Object { [string]$_.Label })
                 if ($current -in $stale -or $valid -notcontains $current) {
                     Invoke-HomeAssistantService -Domain 'select' -Service 'select_option' -Headers $Headers `
-                        -Data @{ entity_id = 'select.agent_bridge_new_workspace'; option = $default }
+                        -Data @{ entity_id = $script:DaemonEntity.NewWorkspace; option = $default }
                 }
             }
             catch { }
@@ -1756,10 +1835,10 @@ function Set-DaemonNewSessionDefaults {
         $default = Get-BridgeDefaultAgencyProfile
         if (-not [string]::IsNullOrWhiteSpace($default)) {
             try {
-                $current = [string](Get-HomeAssistantState -EntityId 'select.agent_bridge_new_profile' -Headers $Headers).state
+                $current = [string](Get-HomeAssistantState -EntityId $script:DaemonEntity.NewProfile -Headers $Headers).state
                 if ($current -in $stale -or $Profiles -notcontains $current) {
                     Invoke-HomeAssistantService -Domain 'select' -Service 'select_option' -Headers $Headers `
-                        -Data @{ entity_id = 'select.agent_bridge_new_profile'; option = $default }
+                        -Data @{ entity_id = $script:DaemonEntity.NewProfile; option = $default }
                 }
             }
             catch { }
@@ -1769,10 +1848,10 @@ function Set-DaemonNewSessionDefaults {
     # The prompt is optional, so it should look empty and inviting rather than
     # reading "unknown" as though something were wrong.
     try {
-        $current = [string](Get-HomeAssistantState -EntityId 'text.agent_bridge_new_prompt' -Headers $Headers).state
+        $current = [string](Get-HomeAssistantState -EntityId $script:DaemonEntity.NewPrompt -Headers $Headers).state
         if ($current -in @('unknown', 'unavailable')) {
             Invoke-HomeAssistantService -Domain 'text' -Service 'set_value' -Headers $Headers `
-                -Data @{ entity_id = 'text.agent_bridge_new_prompt'; value = $script:DaemonConfig.ReplyBlankValue }
+                -Data @{ entity_id = $script:DaemonEntity.NewPrompt; value = $script:DaemonConfig.ReplyBlankValue }
         }
     }
     catch { }
@@ -1781,11 +1860,11 @@ function Set-DaemonNewSessionDefaults {
     # session drops off the list, so a stale pick can never launch something
     # unexpected on the next press.
     try {
-        $current = [string](Get-HomeAssistantState -EntityId 'select.agent_bridge_new_resume' -Headers $Headers).state
+        $current = [string](Get-HomeAssistantState -EntityId $script:DaemonEntity.NewResume -Headers $Headers).state
         $valid = @($script:CopilotMqttNewSessionOption) + @($Resumable | ForEach-Object { [string]$_.Label })
         if ($current -in $stale -or $valid -notcontains $current) {
             Invoke-HomeAssistantService -Domain 'select' -Service 'select_option' -Headers $Headers `
-                -Data @{ entity_id = 'select.agent_bridge_new_resume'; option = $script:CopilotMqttNewSessionOption }
+                -Data @{ entity_id = $script:DaemonEntity.NewResume; option = $script:CopilotMqttNewSessionOption }
         }
     }
     catch { }
@@ -1843,7 +1922,7 @@ function Sync-DaemonNewSession {
     Set-DaemonNewSessionDefaults -Headers $Headers -Workspaces $workspaces -Profiles $profiles -Resumable $resumable
 
     try {
-        $button = Get-HomeAssistantState -EntityId 'button.agent_bridge_new_session' -Headers $Headers
+        $button = Get-HomeAssistantState -EntityId $script:DaemonEntity.NewSession -Headers $Headers
         $press = [string]$button.state
     }
     catch {
@@ -1868,7 +1947,7 @@ function Sync-DaemonNewSession {
 
     $label = ''
     try {
-        $selected = Get-HomeAssistantState -EntityId 'select.agent_bridge_new_workspace' -Headers $Headers
+        $selected = Get-HomeAssistantState -EntityId $script:DaemonEntity.NewWorkspace -Headers $Headers
         $label = [string]$selected.state
     }
     catch { }
@@ -1888,7 +1967,7 @@ function Sync-DaemonNewSession {
 
     $prompt = ''
     try {
-        $promptState = Get-HomeAssistantState -EntityId 'text.agent_bridge_new_prompt' -Headers $Headers
+        $promptState = Get-HomeAssistantState -EntityId $script:DaemonEntity.NewPrompt -Headers $Headers
         $prompt = [string]$promptState.state
     }
     catch { }
@@ -1902,7 +1981,7 @@ function Sync-DaemonNewSession {
     if ($launcher -eq 'agency' -and $profiles.Count -gt 0) {
         $profileLabel = ''
         try {
-            $profileState = Get-HomeAssistantState -EntityId 'select.agent_bridge_new_profile' -Headers $Headers
+            $profileState = Get-HomeAssistantState -EntityId $script:DaemonEntity.NewProfile -Headers $Headers
             $profileLabel = [string]$profileState.state
         }
         catch { }
@@ -1926,7 +2005,7 @@ function Sync-DaemonNewSession {
     $resumeSession = $null
     $resumeLabel = ''
     try {
-        $resumeState = Get-HomeAssistantState -EntityId 'select.agent_bridge_new_resume' -Headers $Headers
+        $resumeState = Get-HomeAssistantState -EntityId $script:DaemonEntity.NewResume -Headers $Headers
         $resumeLabel = [string]$resumeState.state
         if (-not [string]::IsNullOrWhiteSpace($resumeLabel) -and
             $resumeLabel -notin @('unknown', 'unavailable', $script:CopilotMqttNewSessionOption)) {
@@ -2010,7 +2089,7 @@ function Sync-DaemonNewSession {
     if ($prompt) {
         try {
             Invoke-HomeAssistantService -Domain 'text' -Service 'set_value' -Headers $Headers -Data @{
-                entity_id = 'text.agent_bridge_new_prompt'
+                entity_id = $script:DaemonEntity.NewPrompt
                 value     = $script:DaemonConfig.ReplyBlankValue
             }
         }
@@ -2057,6 +2136,34 @@ function Invoke-DaemonLegacyCleanup {
         $script:DaemonConfig.LegacyCleanupMarker,
         (@{ at = [DateTimeOffset]::Now.ToString('o'); cleared = $cleared } | ConvertTo-Json -Compress))
     Write-DaemonLog -Message "legacy entity cleanup: cleared $cleared retained topic(s), re-publishing $readopted live session(s)"
+
+    $cleared
+}
+
+function Invoke-DaemonUnscopedEntityCleanup {
+    <#
+        Withdraws the bridge-level entities from before they were scoped to a machine,
+        once.
+
+        An upgraded install has retained discovery configs under a single fixed
+        `agent_bridge` node - the update entity, the install button, the launch
+        controls and the session counter. The machine-scoped ones are published
+        alongside them, so without this sweep Home Assistant shows two of everything,
+        and the old launch button is the worse half: no daemon watches it any more, so
+        pressing it silently does nothing.
+
+        Returns the number of topics cleared, or -1 when the sweep has already run.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Headers)
+
+    if (Test-Path -LiteralPath $script:DaemonConfig.UnscopedCleanupMarker) { return -1 }
+
+    $cleared = Remove-CopilotMqttMachineEntities -Legacy -Headers $Headers
+
+    [System.IO.File]::WriteAllText(
+        $script:DaemonConfig.UnscopedCleanupMarker,
+        (@{ at = [DateTimeOffset]::Now.ToString('o'); cleared = $cleared } | ConvertTo-Json -Compress))
+    Write-DaemonLog -Message "unscoped entity cleanup: cleared $cleared retained topic(s)"
 
     $cleared
 }
@@ -2408,12 +2515,29 @@ function Sync-DaemonSessions {
     # Assistant restart dropping retained state. Republishing three retained messages
     # every reconcile - each stamped with a fresh 'updated' time that defeats payload
     # equality - was needless idle traffic and MQTT churn.
-    $globalSignature = ($descriptors | ForEach-Object { "$($_.Node)=$($_.Name)=$($_.Machine)" }) -join '|'
+    #
+    # It is also this machine's presence marker and the only thing other machines read
+    # to learn what it is running, so the capability flags travel with it: a peer has
+    # no other way to know whether to draw a profile or resume row on this machine's
+    # launch card.
+    $newSessionEnabled = [bool](Get-BridgeSetting 'newSession.enabled' $true)
+    $includeProfile = $newSessionEnabled -and (Get-BridgeLauncherKind) -eq 'agency'
+    $includeResume = $newSessionEnabled -and $null -ne (Get-BridgeAgencyPath)
+    $capabilities = @{
+        newSession = $newSessionEnabled
+        profile    = [bool]$includeProfile
+        resume     = [bool]$includeResume
+    }
+
+    $globalSignature = (($descriptors | ForEach-Object { "$($_.Node)=$($_.Name)=$($_.Machine)" }) -join '|') +
+        "#$($capabilities.newSession)$($capabilities.profile)$($capabilities.resume)"
     $globalStale = ([DateTimeOffset]::Now - $script:DaemonGlobalLastPublish).TotalSeconds -ge $script:DaemonConfig.GlobalReassertSeconds
     if ($globalSignature -ne $script:DaemonGlobalSignature -or $globalStale) {
         try {
-            Publish-CopilotMqttGlobalStatus -Headers $Headers -Sessions @(
-                $descriptors | ForEach-Object { @{ name = $_.Name; machine = $_.Machine; node = $_.Node } }
+            Publish-CopilotMqttGlobalStatus -Headers $Headers -Capabilities $capabilities -Sessions @(
+                $descriptors | ForEach-Object {
+                    @{ name = $_.Name; machine = $_.Machine; node = $_.Node; kind = [string]$_.Kind }
+                }
             )
             $script:DaemonGlobalSignature = $globalSignature
             $script:DaemonGlobalLastPublish = [DateTimeOffset]::Now
@@ -2423,18 +2547,73 @@ function Sync-DaemonSessions {
         }
     }
 
+    # Everything every machine is running, so the single shared dashboard shows the
+    # whole picture rather than only whichever machine rebuilt it last.
+    #
+    # Deduplicated by node because an MCP client is discovered directly by every
+    # daemon *and* reported in each of their session lists, so it would otherwise
+    # appear once per machine. The local descriptor wins: it is first-hand.
+    $peers = @(Get-DaemonPeerMachines -Headers $Headers)
+    $seenNodes = [System.Collections.Generic.HashSet[string]]::new(
+        [string[]]@($descriptors | ForEach-Object { [string]$_.Node }),
+        [StringComparer]::OrdinalIgnoreCase)
+    $allDescriptors = @($descriptors)
+    foreach ($peer in $peers) {
+        foreach ($remote in @($peer.Sessions)) {
+            $node = [string]$remote.node
+            if ([string]::IsNullOrWhiteSpace($node)) { continue }
+            if (-not $seenNodes.Add($node)) { continue }
+            $allDescriptors += [pscustomobject]@{
+                Node = $node
+                Name = [string]$remote.name
+                Machine = $(if ([string]$remote.machine) { [string]$remote.machine } else { $peer.Machine })
+                Kind = [string]$remote.kind
+            }
+        }
+    }
+
+    $machineCards = @(
+        [pscustomobject]@{
+            Slug = $script:DaemonMachineSlug
+            Machine = $script:DaemonMachineName
+            IncludeProfile = [bool]$includeProfile
+            IncludeResume = [bool]$includeResume
+        }
+    )
+    foreach ($peer in $peers) {
+        $peerCaps = $peer.Capabilities
+        $peerProfile = $false
+        $peerResume = $false
+        if ($null -ne $peerCaps) {
+            try { $peerProfile = [bool]$peerCaps.profile } catch { }
+            try { $peerResume = [bool]$peerCaps.resume } catch { }
+        }
+        $machineCards += [pscustomobject]@{
+            Slug = $peer.Slug
+            Machine = $peer.Machine
+            IncludeProfile = $peerProfile
+            IncludeResume = $peerResume
+        }
+    }
+    # Stable order, so two machines rebuilding independently generate byte-identical
+    # dashboards and neither keeps overwriting the other's ordering.
+    $machineCards = @($machineCards | Sort-Object -Property Slug)
+
     # The card header carries the session name, so a rename has to rebuild the
     # dashboard too - a signature of node ids alone would leave a renamed session
-    # showing its old generic title until the set of sessions happened to change.
-    $signature = ($descriptors | ForEach-Object { "$($_.Node)=$($_.Name)" }) -join '|'
+    # showing its old generic title until the set of sessions happened to change. The
+    # machine list joins it for the same reason: a machine appearing or disappearing
+    # changes the controls even when no session did.
+    $signature = (@($allDescriptors | Sort-Object -Property Node | ForEach-Object { "$($_.Node)=$($_.Name)" }) -join '|') +
+        '#' + (@($machineCards | ForEach-Object { "$($_.Slug):$($_.IncludeProfile)$($_.IncludeResume)" }) -join ',')
     if ($signature -ne $script:DaemonDashboardSignature) {
         try {
             [void](Set-CopilotMqttGlobalEntityId)
-            Save-CopilotSessionDashboard -Sessions $descriptors `
-                -IncludeProfile:((Get-BridgeSetting 'newSession.enabled' $true) -and (Get-BridgeLauncherKind) -eq 'agency') `
-                -IncludeResume:((Get-BridgeSetting 'newSession.enabled' $true) -and $null -ne (Get-BridgeAgencyPath))
+            Save-CopilotSessionDashboard -Sessions @($allDescriptors | Sort-Object -Property Node) `
+                -Machines $machineCards
             $script:DaemonDashboardSignature = $signature
-            Write-DaemonLog -Message "dashboard rebuilt for $($descriptors.Count) session(s)"
+            Write-DaemonLog -Message ("dashboard rebuilt for $($allDescriptors.Count) session(s) across " +
+                "$($machineCards.Count) machine(s)")
         }
         catch {
             Write-DaemonLog -Message "dashboard rebuild failed: $($_.Exception.Message)"
@@ -2778,6 +2957,15 @@ function Start-BridgeDaemon {
     }
     catch {
         Write-DaemonLog -Message "legacy entity cleanup failed: $($_.Exception.Message)"
+    }
+
+    # And the entities from before they were scoped to a machine, which would
+    # otherwise sit next to the new ones as a second, dead set of controls.
+    try {
+        [void](Invoke-DaemonUnscopedEntityCleanup -Headers $headers)
+    }
+    catch {
+        Write-DaemonLog -Message "unscoped entity cleanup failed: $($_.Exception.Message)"
     }
 
     Clear-CopilotMqttOrphans -Headers $headers -Live $live

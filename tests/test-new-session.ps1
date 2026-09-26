@@ -351,6 +351,15 @@ Test-That 'output without a sessions array yields an empty list' { @(Get-BridgeR
 Write-Host ''
 Write-Host '--- the published entities ---'
 
+# Everything the bridge publishes once per machine is scoped to that machine, because
+# one Home Assistant is normally shared and a fixed id meant the second machine
+# overwrote the first. Derived here rather than hard-coded so the suite passes on any
+# machine, including a CI runner with a generated name.
+$slug = Get-BridgeMachineSlug
+$node = "agent_bridge_$slug"
+function Uid { param([string]$Key) '"unique_id":"agent_bridge_' + $slug + '_' + $Key + '"' }
+function Dev { '"identifiers":\["agent_bridge_' + $slug + '"\]' }
+
 $script:MqttMsgs = @()
 function Publish-CopilotMqttMessage {
     param([string]$Topic, [AllowEmptyString()][string]$Payload, [hashtable]$Headers, [switch]$Retain)
@@ -367,17 +376,17 @@ Publish-CopilotMqttNewSession -Workspaces @(
 
 function Get-Config { param([string]$Match) ($script:MqttMsgs | Where-Object { $_.Topic -match $Match } | Select-Object -First 1).Payload }
 
-Test-That 'a prompt text entity is published'  { (Get-Config 'text/agent_bridge/new_prompt/config') -match '"unique_id":"agent_bridge_new_prompt"' }
-Test-That 'a workspace select is published'    { (Get-Config 'select/agent_bridge/new_workspace/config') -match '"unique_id":"agent_bridge_new_workspace"' }
-Test-That 'a profile select is published'      { (Get-Config 'select/agent_bridge/new_profile/config') -match '"unique_id":"agent_bridge_new_profile"' }
+Test-That 'a prompt text entity is published'  { (Get-Config "text/${node}/new_prompt/config") -match (Uid 'new_prompt') }
+Test-That 'a workspace select is published'    { (Get-Config "select/${node}/new_workspace/config") -match (Uid 'new_workspace') }
+Test-That 'a profile select is published'      { (Get-Config "select/${node}/new_profile/config") -match (Uid 'new_profile') }
 Test-That 'the profile select offers the profiles' { (Get-Config 'new_profile/config') -match 'work' -and (Get-Config 'new_profile/config') -match 'home' }
-Test-That 'a launch button is published'       { (Get-Config 'button/agent_bridge/new_session/config') -match '"unique_id":"agent_bridge_new_session"' }
-Test-That 'a resume select is published'       { (Get-Config 'select/agent_bridge/new_resume/config') -match '"unique_id":"agent_bridge_new_resume"' }
+Test-That 'a launch button is published'       { (Get-Config "button/${node}/new_session/config") -match (Uid 'new_session') }
+Test-That 'a resume select is published'       { (Get-Config "select/${node}/new_resume/config") -match (Uid 'new_resume') }
 Test-That 'resume defaults to starting fresh'  { (Get-Config 'new_resume/config') -match '"options":\["New session"' }
 Test-That 'the resume list offers the session' { (Get-Config 'new_resume/config') -match 'Fix the thing - alpha' }
-Test-That 'a result sensor is published'       { (Get-Config 'sensor/agent_bridge/new_session_result/config') -match '"unique_id":"agent_bridge_new_session_result"' }
+Test-That 'a result sensor is published'       { (Get-Config "sensor/${node}/new_session_result/config") -match (Uid 'new_session_result') }
 Test-That 'the select offers both workspaces'  { (Get-Config 'new_workspace/config') -match 'alpha' -and (Get-Config 'new_workspace/config') -match 'Beta project' }
-Test-That 'they all land on the bridge device' { (Get-Config 'new_prompt/config') -match '"identifiers":\["agent_bridge"\]' }
+Test-That 'they all land on the bridge device' { (Get-Config 'new_prompt/config') -match (Dev) }
 Test-That 'the prompt box is optimistic (no state topic)' { (Get-Config 'new_prompt/config') -notmatch '"state_topic"' }
 Test-That 'the result sensor does have a state topic' { (Get-Config 'new_session_result/config') -match '"state_topic"' }
 
@@ -450,11 +459,11 @@ function Reset-NewSessionTest {
     $script:DaemonNewSessionLastPress = ''
     $script:DaemonStartedAt = [DateTimeOffset]::Parse('2026-01-01T00:00:00Z')
     $script:HaStates = @{
-        'button.agent_bridge_new_session'   = $Press
-        'select.agent_bridge_new_workspace' = $Workspace
-        'select.agent_bridge_new_profile'   = $ProfileState
-        'select.agent_bridge_new_resume'    = $ResumeState
-        'text.agent_bridge_new_prompt'      = $Prompt
+        "button.agent_bridge_${slug}_new_session"   = $Press
+        "select.agent_bridge_${slug}_new_workspace" = $Workspace
+        "select.agent_bridge_${slug}_new_profile"   = $ProfileState
+        "select.agent_bridge_${slug}_new_resume"    = $ResumeState
+        "text.agent_bridge_${slug}_new_prompt"      = $Prompt
     }
 }
 

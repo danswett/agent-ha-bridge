@@ -276,15 +276,19 @@ function Resolve-CopilotMqttEntityIds {
 
 function Set-CopilotMqttGlobalEntityId {
     <#
-        Forces the global session-count sensor onto its deterministic id. Home
+        Forces this machine's session-count sensor onto its deterministic id. Home
         Assistant derives the id from device name plus entity name and ignores
-        object_id, so the sensor first appears as sensor.ai_agent_bridge_sessions;
-        rename it once so the dashboard and any templates can rely on
-        sensor.agent_bridge_sessions.
+        object_id, so the sensor first appears as sensor.ai_agent_bridge_desktop_sessions;
+        rename it once so the dashboard, the peer lookup and any templates can rely on
+        sensor.agent_bridge_<machine>_sessions.
     #>
-    $target = 'sensor.agent_bridge_sessions'
+    param([string]$Slug)
+    if (-not $Slug) { $Slug = Get-BridgeMachineSlug }
+
+    $uniqueId = "agent_bridge_${Slug}_sessions"
+    $target = Get-CopilotMqttGlobalEntityId -Slug $Slug
     $reg = (Invoke-CopilotHaWebSocket -Commands @(@{ type = 'config/entity_registry/list' }))[0]
-    $entry = @($reg) | Where-Object { $_.unique_id -eq 'agent_bridge_sessions' } | Select-Object -First 1
+    $entry = @($reg) | Where-Object { $_.unique_id -eq $uniqueId } | Select-Object -First 1
     if ($null -eq $entry) { return $false }
     if ([string]$entry.entity_id -eq $target) { return $true }
 
@@ -500,13 +504,20 @@ function Set-CopilotMqttUpdateEntityIds {
         Forces the update entity and its install button onto deterministic ids.
 
         Home Assistant builds an MQTT entity id from the device name plus the entity
-        name, so these first appear as update.agent_bridge_bridge_update and
-        button.agent_bridge_install_bridge_update. The daemon reads the button
+        name, so these first appear as update.agent_bridge_desktop_bridge_update and
+        button.agent_bridge_desktop_install_bridge_update. The daemon reads the button
         by id on every reconcile, so it has to be predictable.
+
+        Scoped to the machine, because each machine runs its own copy at its own
+        version - a shared update entity showed whichever machine published last and
+        its install button ran on all of them at once.
     #>
+    param([string]$Slug)
+    if (-not $Slug) { $Slug = Get-BridgeMachineSlug }
+
     $wanted = @{
-        'agent_bridge_update'         = 'update.agent_bridge_update'
-        'agent_bridge_install_update' = 'button.agent_bridge_install_update'
+        "agent_bridge_${Slug}_update"         = Get-BridgeMachineEntityId -Domain 'update' -Key 'update' -Slug $Slug
+        "agent_bridge_${Slug}_install_update" = Get-BridgeMachineEntityId -Domain 'button' -Key 'install_update' -Slug $Slug
     }
 
     $registry = (Invoke-CopilotHaWebSocket -Commands @(@{ type = 'config/entity_registry/list' }))[0]
@@ -536,17 +547,29 @@ function Set-CopilotMqttNewSessionEntityIds {
 
         Same reason as the update entities: Home Assistant builds an MQTT entity id
         from device name plus entity name and ignores object_id, so these would
-        otherwise appear as text.agent_bridge_new_session_prompt and friends.
+        otherwise appear as text.agent_bridge_desktop_new_session_prompt and friends.
         The daemon reads all four by id on every reconcile, and the generated
         dashboard references them literally, so they have to be predictable.
+
+        Scoped to the machine, because these are the controls that launch a session on
+        it. While they were shared, every daemon watched the same button with its own
+        idea of when it was last pressed, so one press started a session on every
+        machine at once.
     #>
-    $wanted = @{
-        'agent_bridge_new_prompt'         = 'text.agent_bridge_new_prompt'
-        'agent_bridge_new_workspace'      = 'select.agent_bridge_new_workspace'
-        'agent_bridge_new_profile'        = 'select.agent_bridge_new_profile'
-        'agent_bridge_new_resume'         = 'select.agent_bridge_new_resume'
-        'agent_bridge_new_session'        = 'button.agent_bridge_new_session'
-        'agent_bridge_new_session_result' = 'sensor.agent_bridge_new_session_result'
+    param([string]$Slug)
+    if (-not $Slug) { $Slug = Get-BridgeMachineSlug }
+
+    $wanted = @{}
+    foreach ($pair in @(
+        @('text',   'new_prompt'),
+        @('select', 'new_workspace'),
+        @('select', 'new_profile'),
+        @('select', 'new_resume'),
+        @('button', 'new_session'),
+        @('sensor', 'new_session_result')
+    )) {
+        $wanted["agent_bridge_${Slug}_$($pair[1])"] =
+            Get-BridgeMachineEntityId -Domain $pair[0] -Key $pair[1] -Slug $Slug
     }
 
     $registry = (Invoke-CopilotHaWebSocket -Commands @(@{ type = 'config/entity_registry/list' }))[0]
@@ -637,9 +660,15 @@ function Save-CopilotSessionDashboard {
 
         The dashboard is fully generated from the live session list, so it is rebuilt
         whenever a session appears or exits rather than hand-edited. It has a control
-        section (the session summary with its detailed-activity toggle, the update
-        row, and the new-session card) and one card per live session showing status,
+        section (the session summary with its detailed-activity toggle, an update row
+        and a launch card per machine) and one card per live session showing status,
         activity, the decision selector and the reply box.
+
+        There is one dashboard however many machines are running, and it shows all of
+        them. Each machine publishes what it is running to a sensor of its own, so any
+        machine can render the whole picture without talking to the others - and every
+        machine generates identical content, which is what makes it safe for all of
+        them to rebuild it.
 
         Live count and pending-decision count are rendered as Jinja templates over the
         exact entity ids, so they stay current between rebuilds as turn state and
@@ -652,6 +681,12 @@ function Save-CopilotSessionDashboard {
 
         [string]$VerboseToggle = 'input_boolean.agent_bridge_detailed_activity',
 
+        # Every machine to render controls for: Slug, Machine, and whether its launch
+        # card carries the profile and resume rows. Empty means the local machine only,
+        # taking those two from the switches below.
+        [AllowEmptyCollection()]
+        [object[]]$Machines = @(),
+
         # Whether to show the Agency profile row on the new-session card.
         [switch]$IncludeProfile,
 
@@ -662,18 +697,45 @@ function Save-CopilotSessionDashboard {
     $decisionEntities = @($Sessions | ForEach-Object { "select.$($_.Node)_decision" })
     $decisionList = ($decisionEntities | ForEach-Object { "'$_'" }) -join ','
 
-    $liveTemplate = "{{ states('sensor.agent_bridge_sessions') }}"
+    # No machine list means the caller is the only machine, so build the one entry the
+    # rest of this function works from. Every control below is derived from this list,
+    # so a one-machine dashboard and a five-machine one take exactly the same path.
+    $machineList = @($Machines)
+    if ($machineList.Count -eq 0) {
+        $machineList = @([pscustomobject]@{
+            Slug = Get-BridgeMachineSlug
+            Machine = [Environment]::MachineName
+            IncludeProfile = [bool]$IncludeProfile
+            IncludeResume = [bool]$IncludeResume
+        })
+    }
+    $multiMachine = $machineList.Count -gt 1
+
+    $countEntities = @($machineList | ForEach-Object {
+        Get-BridgeMachineEntityId -Domain 'sensor' -Key 'sessions' -Slug $_.Slug
+    })
+    # int(0) on every term, so one machine whose sensor is briefly unavailable reads as
+    # zero rather than turning the whole sum into an error string.
+    $liveTemplate = '{{ ' + (($countEntities | ForEach-Object { "states('$_')|int(0)" }) -join ' + ') + ' }}'
+
     $pendingTemplate = "{% set dc = [$decisionList] %}{{ dc | map('states') | reject('in',['Idle','unavailable','unknown','']) | list | count }}"
-    # The installed version comes from the update entity, which the daemon always
-    # publishes, so the card shows what is running without another moving part.
-    $installedTemplate = "{{ state_attr('update.agent_bridge_update', 'installed_version') or '?' }}"
+
+    # The installed version comes from each machine's update entity, which its daemon
+    # always publishes, so the card shows what is running without another moving part.
+    # With several machines the versions can differ, and which one is stale is exactly
+    # what you want to see, so they are listed rather than reduced to one number.
+    $versionParts = @($machineList | ForEach-Object {
+        $updateEntity = Get-BridgeMachineEntityId -Domain 'update' -Key 'update' -Slug $_.Slug
+        $label = if ($multiMachine) { $_.Machine } else { 'Bridge' }
+        "**$label** {{ state_attr('$updateEntity', 'installed_version') or '?' }}"
+    })
 
     $controlMarkdown = @{
         type = 'markdown'
         content = @(
             '## Agent sessions'
             ''
-            "**Live sessions:** $liveTemplate &bull; **Pending decisions:** $pendingTemplate &bull; **Bridge** $installedTemplate"
+            "**Live sessions:** $liveTemplate &bull; **Pending decisions:** $pendingTemplate &bull; $($versionParts -join ' &bull; ')"
             ''
             'Turn on *Detailed activity* to stream each session''s reasoning and every tool call.'
         ) -join "`n"
@@ -699,52 +761,68 @@ function Save-CopilotSessionDashboard {
     # The update row and its install button only appear when an update exists. A
     # conditional card is used rather than hiding rows inside the entities card,
     # because an entities row has no condition of its own.
-    $updateCard = @{
-        type = 'conditional'
-        conditions = @(@{ entity = 'update.agent_bridge_update'; state = 'on' })
-        card = @{
-            type = 'entities'
-            title = 'Bridge update available'
-            entities = @(
-                @{ entity = 'update.agent_bridge_update'; name = 'Version' }
-                @{ entity = 'button.agent_bridge_install_update'; name = 'Install now' }
-            )
-        }
-    }
-
-    $newSessionRows = @()
-    # Resume first: it decides whether the rows under it even apply. Defaults to
-    # "New session", so the common case reads top-to-bottom as a fresh launch.
-    if ($IncludeResume) {
-        $newSessionRows += @{ entity = 'select.agent_bridge_new_resume'; name = 'Resume' }
-    }
-    $newSessionRows += @{ entity = 'select.agent_bridge_new_workspace'; name = 'Workspace' }
-    # The profile row is only meaningful when Agency is the launcher, so it is left
-    # out entirely rather than shown as a control that does nothing.
-    if ($IncludeProfile) {
-        $newSessionRows += @{ entity = 'select.agent_bridge_new_profile'; name = 'Profile' }
-    }
-    # Launch sits directly under the selectors, because they all carry a default and a
-    # launch therefore needs no input at all - open the card, press Launch.
     #
-    # The result of the last launch and the optional opening prompt are deliberately
-    # not shown. The launch itself is visible within seconds as a new session card, so
-    # restating it only adds a row that is stale most of the time, and the prompt was
-    # an input nobody reached for on a card whose whole point is one press.
-    $newSessionRows += @{ entity = 'button.agent_bridge_new_session'; name = 'Launch' }
+    # One per machine: each runs its own copy at its own version, so a single shared
+    # row showed whichever machine published last and its install button ran on every
+    # machine at once.
+    $updateCards = @($machineList | ForEach-Object {
+        $updateEntity = Get-BridgeMachineEntityId -Domain 'update' -Key 'update' -Slug $_.Slug
+        $installEntity = Get-BridgeMachineEntityId -Domain 'button' -Key 'install_update' -Slug $_.Slug
+        $title = if ($multiMachine) { "Bridge update available on $($_.Machine)" } else { 'Bridge update available' }
+        @{
+            type = 'conditional'
+            conditions = @(@{ entity = $updateEntity; state = 'on' })
+            card = @{
+                type = 'entities'
+                title = $title
+                entities = @(
+                    @{ entity = $updateEntity; name = 'Version' }
+                    @{ entity = $installEntity; name = 'Install now' }
+                )
+            }
+        }
+    })
 
     # Starting a new session. Placed with the controls rather than among the session
     # cards because it belongs to the bridge, not to any one session, and it stays
     # visible when nothing is running at all - which is exactly when it is needed.
-    $newSessionCard = @{
-        type = 'entities'
-        title = 'Start a new session'
-        show_header_toggle = $false
-        entities = $newSessionRows
-    }
+    #
+    # One card per machine, because a launch happens somewhere. While these controls
+    # were shared, every daemon watched the same button with its own idea of when it
+    # was last pressed, so one press started a session on every machine at once.
+    $newSessionCards = @($machineList | ForEach-Object {
+        $slug = $_.Slug
+        $rows = @()
+        # Resume first: it decides whether the rows under it even apply. Defaults to
+        # "New session", so the common case reads top-to-bottom as a fresh launch.
+        if ($_.IncludeResume) {
+            $rows += @{ entity = (Get-BridgeMachineEntityId -Domain 'select' -Key 'new_resume' -Slug $slug); name = 'Resume' }
+        }
+        $rows += @{ entity = (Get-BridgeMachineEntityId -Domain 'select' -Key 'new_workspace' -Slug $slug); name = 'Workspace' }
+        # The profile row is only meaningful when Agency is the launcher, so it is left
+        # out entirely rather than shown as a control that does nothing.
+        if ($_.IncludeProfile) {
+            $rows += @{ entity = (Get-BridgeMachineEntityId -Domain 'select' -Key 'new_profile' -Slug $slug); name = 'Profile' }
+        }
+        # Launch sits directly under the selectors, because they all carry a default and
+        # a launch therefore needs no input at all - open the card, press Launch.
+        #
+        # The result of the last launch and the optional opening prompt are deliberately
+        # not shown. The launch itself is visible within seconds as a new session card,
+        # so restating it only adds a row that is stale most of the time, and the prompt
+        # was an input nobody reached for on a card whose whole point is one press.
+        $rows += @{ entity = (Get-BridgeMachineEntityId -Domain 'button' -Key 'new_session' -Slug $slug); name = 'Launch' }
+
+        @{
+            type = 'entities'
+            title = if ($multiMachine) { "Start a new session on $($_.Machine)" } else { 'Start a new session' }
+            show_header_toggle = $false
+            entities = $rows
+        }
+    })
 
     # The control panel is a plain card pair at the top of the masonry flow.
-    $controlCards = @($agentSessionsCard, $updateCard, $newSessionCard)
+    $controlCards = @($agentSessionsCard) + $updateCards + $newSessionCards
 
     $sessionSections = foreach ($session in $Sessions) {
         $node = $session.Node

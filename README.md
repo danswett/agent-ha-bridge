@@ -438,6 +438,40 @@ the **Resume** list and can be reopened — a mistaken press costs a window, not
 
 ---
 
+## Several machines, one Home Assistant
+
+Install the bridge on as many machines as you like. They all talk to the same Home
+Assistant and none of them needs to know about the others.
+
+Each machine publishes its own device — **AI Agent Bridge (DESKTOP)**, **AI Agent Bridge
+(LAPTOP)** — carrying its own update entity, its own launch controls and its own session
+counter. Entity ids are suffixed with the machine, so
+`button.agent_bridge_desktop_new_session` and `button.agent_bridge_laptop_new_session`
+are different buttons. Pressing one launches a session on that machine and nowhere else.
+
+There is still **one dashboard**, and it shows everything:
+
+- one **Start a new session on _machine_** card per machine,
+- a **Bridge update available on _machine_** row per machine, since each runs its own
+  copy and they can be at different versions,
+- **Live sessions** summed across every machine,
+- one card per session wherever it is running, labelled with its machine — and because
+  the entities are real, you can answer a prompt on the laptop from the same screen.
+
+No machine talks to another. Each publishes a retained sensor describing what it is
+running, and every daemon reads all of them, so the picture is complete whichever
+machine happens to rebuild the dashboard.
+
+Two things stay shared, because they belong to the instance rather than to a machine:
+the **Detailed activity** toggle and the dashboard itself. An uninstall therefore leaves
+them alone unless it is removing the last machine — see [Uninstall](#uninstall).
+
+Upgrading an older install migrates itself. The bridge-level entities it published
+before were unscoped, so the first run of the new daemon withdraws them and republishes
+them under this machine's name. Nothing needs doing by hand.
+
+---
+
 ## Updating
 
 The daemon asks GitHub for the newest release a few times a day (every 6 hours by

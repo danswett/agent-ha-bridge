@@ -1156,6 +1156,32 @@ function Get-CopilotSessionDisplay {
 }
 
 
+function Get-BridgeMachineSlug {
+    <#
+        A stable, entity-id-safe name for this machine.
+
+        Several machines routinely share one Home Assistant, and everything the bridge
+        publishes once per machine - the update entity, the new-session controls, the
+        session counter - needs an id that is unique to the machine publishing it.
+        Before this they used fixed ids, so the second machine silently overwrote the
+        first rather than appearing alongside it.
+
+        Home Assistant object ids allow only lowercase letters, digits and
+        underscores, so anything else collapses to a single underscore. The result is
+        also parsed back out of entity ids to discover which machines are present, so
+        it must never contain a character that would confuse that split.
+    #>
+    param([string]$MachineName = [Environment]::MachineName)
+
+    $clean = ([string]$MachineName).ToLowerInvariant() -replace '[^a-z0-9]+', '_'
+    $clean = $clean.Trim('_')
+    # NetBIOS names cap at 15 characters, so this only bites on a long DNS-style name;
+    # the trailing trim keeps a truncation from ending on the separator.
+    if ($clean.Length -gt 24) { $clean = $clean.Substring(0, 24).Trim('_') }
+    if ([string]::IsNullOrWhiteSpace($clean)) { return 'machine' }
+    $clean
+}
+
 function Get-CopilotSafeSessionKey {
     <#
         A filesystem-safe key for a session id.
