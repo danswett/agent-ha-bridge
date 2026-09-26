@@ -65,6 +65,32 @@ Test-That 'a repository is always resolved' {
     (Get-BridgeUpdateRepository) -match '^[\w.-]+/[\w.-]+$'
 } (Get-BridgeUpdateRepository)
 
+# This value decides what Invoke-BridgeSelfUpdate downloads and executes, so a stale
+# one is not a cosmetic problem. A pre-rename config names danswett/copilot-ha-bridge,
+# which resolves only while GitHub's rename redirect stands; the day someone else
+# registers that name, every install still carrying it fetches and runs a stranger's
+# archive.
+Test-That 'the pre-rename repository is corrected, not trusted' {
+    $script:DecisionBridgeConfig.UpdateRepositoryOverride = $null
+    function Get-BridgeSetting { param($Path, $Default) 'danswett/copilot-ha-bridge' }
+    try { (Get-BridgeUpdateRepository) -eq 'danswett/agent-ha-bridge' }
+    finally { Remove-Item Function:\Get-BridgeSetting -ErrorAction SilentlyContinue }
+}
+Test-That 'a fork is left exactly as configured' {
+    function Get-BridgeSetting { param($Path, $Default) 'someone-else/their-fork' }
+    try { (Get-BridgeUpdateRepository) -eq 'someone-else/their-fork' }
+    finally { Remove-Item Function:\Get-BridgeSetting -ErrorAction SilentlyContinue }
+}
+Test-That 'an unset repository falls back to this project' {
+    function Get-BridgeSetting { param($Path, $Default) '' }
+    try { (Get-BridgeUpdateRepository) -eq 'danswett/agent-ha-bridge' }
+    finally { Remove-Item Function:\Get-BridgeSetting -ErrorAction SilentlyContinue }
+}
+Test-That 'config.example.json names the current repository' {
+    $example = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\config.example.json') -Raw | ConvertFrom-Json
+    $example.updates.repository -eq 'danswett/agent-ha-bridge'
+}
+
 Write-Host '--- installed version ---'
 Test-That 'an installed version is always reported' {
     (Get-BridgeInstalledVersion) -match '^\d+\.\d+'

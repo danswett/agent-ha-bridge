@@ -1321,6 +1321,18 @@ if ($config.PSObject.Properties['dashboard'] -and
     Write-Host '    dashboard slug: copilot-decisions -> agent-decisions'
 }
 
+# Same for the update repository, and this one matters more than tidiness. A
+# pre-rename config still names danswett/copilot-ha-bridge, which resolves only
+# because GitHub redirects a renamed repository - and that redirect lasts exactly as
+# long as nobody else registers the old name. The moment someone does, every install
+# still carrying it checks a stranger's releases, and the self-updater downloads and
+# runs their archive. Only the old default is rewritten; a fork is left alone.
+if ($config.PSObject.Properties['updates'] -and $config.updates -and
+    [string]$config.updates.repository -eq 'danswett/copilot-ha-bridge') {
+    $config.updates.repository = 'danswett/agent-ha-bridge'
+    Write-Host '    update repository: danswett/copilot-ha-bridge -> danswett/agent-ha-bridge'
+}
+
 # ------------------------------------------------------------------- clients
 # Which clients to configure comes first: the answer decides what else gets offered,
 # and it is the question people most want to be asked. -Clients wins, then a

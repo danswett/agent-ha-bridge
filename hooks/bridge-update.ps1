@@ -55,6 +55,13 @@ function Get-BridgeInstalledVersion {
 function Get-BridgeUpdateRepository {
     $repository = Get-BridgeSetting 'updates.repository' ''
     if ([string]::IsNullOrWhiteSpace($repository)) { $repository = 'danswett/agent-ha-bridge' }
+    # A config written before the rename still names danswett/copilot-ha-bridge, which
+    # only resolves because GitHub redirects a renamed repository - and that redirect
+    # lasts exactly as long as nobody else registers the old name. Since this decides
+    # what Invoke-BridgeSelfUpdate downloads and runs, it is corrected here too, not
+    # only by install.ps1: a daemon can read a stale config for months before anyone
+    # re-runs the installer.
+    if ($repository -eq 'danswett/copilot-ha-bridge') { $repository = 'danswett/agent-ha-bridge' }
     $repository
 }
 

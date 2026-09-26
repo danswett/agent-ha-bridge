@@ -361,8 +361,60 @@ finally {
     Remove-Item -LiteralPath $sandboxArpKey -Recurse -Force -ErrorAction SilentlyContinue
 }
 
-Write-Host '--- the prompts people actually see, driven through stdin ---'
-# Read-Host reads redirected stdin, so the interactive path can be exercised for real
+Write-Host '--- upgrading a pre-rename config in place ---'
+# Two values in a pre-rename config point at the old name. The dashboard slug is
+# cosmetic; the update repository decides what the self-updater downloads and runs,
+# and it resolves today only because GitHub redirects a renamed repository.
+$legacy = New-ScratchDir
+try {
+    $legacyBridge = Join-Path $legacy '.agent-ha-bridge'
+    New-Item -ItemType Directory -Path $legacyBridge -Force | Out-Null
+    @{
+        homeAssistant = @{ baseUrl = 'http://ha.invalid:8123'; token = 'kept'; tokenEnvVar = 'AGENT_HA_TOKEN' }
+        dashboard     = @{ urlPath = 'copilot-decisions' }
+        clients       = @('copilot')
+        updates       = @{ repository = 'danswett/copilot-ha-bridge'; installedVersion = '1.2.0'; checkForUpdates = $true }
+    } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $legacyBridge 'config.json') -Encoding UTF8
+
+    $null = & pwsh -NoProfile -File (Join-Path $repoRoot 'install.ps1') `
+        -TargetHome $legacy -SkipTask -SkipPath -SkipDependencies -SkipVerify -NonInteractive 2>&1
+    $after = Get-Content -LiteralPath (Join-Path $legacyBridge 'config.json') -Raw | ConvertFrom-Json
+
+    Test-That 'the update repository is corrected' {
+        $after.updates.repository -eq 'danswett/agent-ha-bridge'
+    }
+    Test-That 'the dashboard slug is corrected' { $after.dashboard.urlPath -eq 'agent-decisions' }
+    Test-That 'the token survives the upgrade' { $after.homeAssistant.token -eq 'kept' }
+    Test-That 'the remembered client selection survives' { (@($after.clients) -join ',') -eq 'copilot' }
+    Test-That 'the recorded version is brought up to date' {
+        $after.updates.installedVersion -eq (Get-Content -LiteralPath (Join-Path $repoRoot 'VERSION') -Raw).Trim()
+    }
+}
+finally {
+    Remove-Item -LiteralPath $legacy -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $sandboxArpKey -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Test-That 'a fork is not rewritten' {
+    $fork = New-ScratchDir
+    try {
+        $forkBridge = Join-Path $fork '.agent-ha-bridge'
+        New-Item -ItemType Directory -Path $forkBridge -Force | Out-Null
+        @{
+            homeAssistant = @{ baseUrl = 'http://ha.invalid:8123'; token = 't'; tokenEnvVar = 'AGENT_HA_TOKEN' }
+            updates       = @{ repository = 'someone/their-fork'; installedVersion = '1.0.0'; checkForUpdates = $true }
+        } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $forkBridge 'config.json') -Encoding UTF8
+        $null = & pwsh -NoProfile -File (Join-Path $repoRoot 'install.ps1') `
+            -TargetHome $fork -SkipTask -SkipPath -SkipDependencies -SkipVerify -NonInteractive 2>&1
+        (Get-Content -LiteralPath (Join-Path $forkBridge 'config.json') -Raw | ConvertFrom-Json).updates.repository -eq 'someone/their-fork'
+    }
+    finally {
+        Remove-Item -LiteralPath $fork -Recurse -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath $sandboxArpKey -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+Write-Host '--- the prompts people actually see, driven through stdin ---'# Read-Host reads redirected stdin, so the interactive path can be exercised for real
 # rather than only through its injectable seams. -HomeAssistantUrl keeps both of these
 # off the network.
 function Invoke-SandboxInstall {
