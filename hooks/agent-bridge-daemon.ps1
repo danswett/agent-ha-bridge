@@ -57,6 +57,7 @@ $script:DaemonEntity = @{
     NewResume     = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_resume'        -Slug $script:DaemonMachineSlug
     NewSession    = Get-BridgeMachineEntityId -Domain 'button' -Key 'new_session'       -Slug $script:DaemonMachineSlug
     NewResult     = Get-BridgeMachineEntityId -Domain 'sensor' -Key 'new_session_result' -Slug $script:DaemonMachineSlug
+    Online        = Get-BridgeMachineEntityId -Domain 'binary_sensor' -Key 'online'      -Slug $script:DaemonMachineSlug
 }
 
 $script:DaemonConfig = @{
@@ -83,6 +84,11 @@ $script:DaemonConfig = @{
     # unchanged, so a Home Assistant restart that drops retained values re-establishes
     # the count within a bounded window. Between re-asserts an unchanged set is silent.
     GlobalReassertSeconds = 300
+    # The liveness heartbeat and how long Home Assistant waits before calling a
+    # machine offline. Three missed beats, so a single slow reconcile does not make a
+    # running machine flicker out of the launch picker.
+    OnlineHeartbeatSeconds = 60
+    OnlineExpireSeconds = 180
     # MCP-client presence changes slowly and only affects rendering (the MCP server
     # owns its own decision entities), so its full /api/states discovery scan is cached
     # for this long rather than repeated on every reconcile.
@@ -118,6 +124,7 @@ $script:DaemonStateLastWritten = $null
 # interval elapses, instead of on every reconcile. Initialised for StrictMode.
 $script:DaemonGlobalSignature = $null
 $script:DaemonGlobalLastPublish = [DateTimeOffset]::MinValue
+$script:DaemonOnlineLastPublish = [DateTimeOffset]::MinValue
 
 # Short-lived cache of the MCP-client discovery scan (a full /api/states read) and
 # a consecutive-failure counter for the WebSocket watch backoff. Initialised for
@@ -2558,6 +2565,21 @@ function Sync-DaemonSessions {
         }
     }
 
+    # Liveness, on its own short cadence. Everything above is retained so that a
+    # machine which is switched off is still *known*; this is the one signal that says
+    # it is actually running, so it has to keep arriving. The sensor itself is declared
+    # at startup, well before this, because an unretained beat that outruns its own
+    # discovery config is simply dropped.
+    if (([DateTimeOffset]::Now - $script:DaemonOnlineLastPublish).TotalSeconds -ge $script:DaemonConfig.OnlineHeartbeatSeconds) {
+        try {
+            Publish-CopilotMqttMachineHeartbeat -Slug $script:DaemonMachineSlug -Headers $Headers
+            $script:DaemonOnlineLastPublish = [DateTimeOffset]::Now
+        }
+        catch {
+            Write-DaemonLog -Message "online heartbeat failed: $($_.Exception.Message)"
+        }
+    }
+
     # Everything every machine is running, so the single shared dashboard shows the
     # whole picture rather than only whichever machine rebuilt it last.
     #
@@ -2570,6 +2592,11 @@ function Sync-DaemonSessions {
         [StringComparer]::OrdinalIgnoreCase)
     $allDescriptors = @($descriptors)
     foreach ($peer in $peers) {
+        # A machine that is not running has no live sessions. Its entities are retained,
+        # so the ones it had when it stopped are still there and would otherwise render
+        # as live cards showing whatever they last said - a session frozen mid-answer,
+        # with a reply box that goes nowhere.
+        if (-not $peer.Online) { continue }
         foreach ($remote in @($peer.Sessions)) {
             $node = [string]$remote.node
             if ([string]::IsNullOrWhiteSpace($node)) { continue }
@@ -2589,6 +2616,10 @@ function Sync-DaemonSessions {
             Machine = $script:DaemonMachineName
             IncludeProfile = [bool]$includeProfile
             IncludeResume = [bool]$includeResume
+            # This daemon is the one running the code, so it is online by definition -
+            # and saying so here means the launch picker is never empty while its own
+            # heartbeat sensor is still being created.
+            Online = $true
         }
     )
     foreach ($peer in $peers) {
@@ -2604,27 +2635,34 @@ function Sync-DaemonSessions {
             Machine = $peer.Machine
             IncludeProfile = $peerProfile
             IncludeResume = $peerResume
+            Online = [bool]$peer.Online
         }
     }
     # Stable order, so two machines rebuilding independently generate byte-identical
     # dashboards and neither keeps overwriting the other's ordering.
     $machineCards = @($machineCards | Sort-Object -Property Slug)
 
+    # Only machines that are actually running can start a session, so the picker lists
+    # those. Every registered machine still appears in the machines card, online or
+    # not, because a machine you expected to see and cannot is information too.
+    $onlineNames = @($machineCards | Where-Object { $_.Online } | ForEach-Object { [string]$_.Machine })
+
     # The card header carries the session name, so a rename has to rebuild the
     # dashboard too - a signature of node ids alone would leave a renamed session
     # showing its old generic title until the set of sessions happened to change. The
-    # machine list joins it for the same reason: a machine appearing or disappearing
-    # changes the controls even when no session did.
+    # machine list joins it for the same reason: a machine appearing, disappearing or
+    # going offline changes the controls even when no session did.
     $signature = (@($allDescriptors | Sort-Object -Property Node | ForEach-Object { "$($_.Node)=$($_.Name)" }) -join '|') +
-        '#' + (@($machineCards | ForEach-Object { "$($_.Slug):$($_.IncludeProfile)$($_.IncludeResume)" }) -join ',')
+        '#' + (@($machineCards | ForEach-Object { "$($_.Slug):$($_.IncludeProfile)$($_.IncludeResume):$($_.Online)" }) -join ',')
     if ($signature -ne $script:DaemonDashboardSignature) {
         try {
             [void](Set-CopilotMqttGlobalEntityId)
+            $selector = Initialize-BridgeMachineSelector -Machines $onlineNames
             Save-CopilotSessionDashboard -Sessions @($allDescriptors | Sort-Object -Property Node) `
-                -Machines $machineCards
+                -Machines $machineCards -MachineSelector $selector
             $script:DaemonDashboardSignature = $signature
             Write-DaemonLog -Message ("dashboard rebuilt for $($allDescriptors.Count) session(s) across " +
-                "$($machineCards.Count) machine(s)")
+                "$($machineCards.Count) machine(s), $($onlineNames.Count) online")
         }
         catch {
             Write-DaemonLog -Message "dashboard rebuild failed: $($_.Exception.Message)"
@@ -2977,6 +3015,19 @@ function Start-BridgeDaemon {
     }
     catch {
         Write-DaemonLog -Message "unscoped entity cleanup failed: $($_.Exception.Message)"
+    }
+
+    # Declare the liveness sensor now, not on the first heartbeat. The beat is
+    # deliberately unretained, so one that reaches Home Assistant before this config
+    # has been processed is dropped - and the machine then reads offline for a whole
+    # heartbeat interval starting from the moment its daemon came up.
+    try {
+        Publish-CopilotMqttMachineOnlineConfig -Headers $headers `
+            -ExpireAfter $script:DaemonConfig.OnlineExpireSeconds
+        [void](Set-CopilotMqttOnlineEntityId)
+    }
+    catch {
+        Write-DaemonLog -Message "online sensor setup failed: $($_.Exception.Message)"
     }
 
     Clear-CopilotMqttOrphans -Headers $headers -Live $live

@@ -451,19 +451,32 @@ are different buttons. Pressing one launches a session on that machine and nowhe
 
 There is still **one dashboard**, and it shows everything:
 
-- one **Start a new session on _machine_** card per machine,
-- a **Bridge update available on _machine_** row per machine, since each runs its own
-  copy and they can be at different versions,
-- **Live sessions** summed across every machine,
+- a **Machines** card listing every machine that has ever registered, with whether it is
+  online right now, how many sessions it is running and what version it is on,
+- one **Start a new session** card with a **Machine** dropdown at the top — pick where,
+  then the workspace, profile and resume rows for *that* machine appear beneath it,
+- **Live sessions** summed across the machines that are actually running,
 - one card per session wherever it is running, labelled with its machine — and because
   the entities are real, you can answer a prompt on the laptop from the same screen.
+
+The dropdown is a display filter and nothing more. No daemon reads it, and **Launch**
+presses the selected machine's own button — a single shared button is exactly what made
+one press start a session everywhere at once. With only one machine online there is
+nothing to pick, so the dropdown does not appear at all.
+
+Liveness is a heartbeat: each machine reports in every 60 seconds and Home Assistant
+marks it offline after three missed beats. An offline machine stays listed in
+**Machines**, because knowing a machine exists but is currently off is exactly what you
+want when a session you expected is not there — but it gets no launch card, no install
+button, and its sessions are hidden, since none of them can be running.
 
 No machine talks to another. Each publishes a retained sensor describing what it is
 running, and every daemon reads all of them, so the picture is complete whichever
 machine happens to rebuild the dashboard.
 
 Two things stay shared, because they belong to the instance rather than to a machine:
-the **Detailed activity** toggle and the dashboard itself. An uninstall therefore leaves
+the **Detailed activity** toggle and the dashboard itself. (The machine dropdown is
+shared too, but it is created and retired automatically.) An uninstall therefore leaves
 them alone unless it is removing the last machine — see [Uninstall](#uninstall).
 
 Upgrading an older install migrates itself. The bridge-level entities it published

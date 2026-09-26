@@ -839,6 +839,67 @@ function Publish-CopilotMqttGlobalStatus {
     } | ConvertTo-Json -Depth 6 -Compress) -Headers $Headers -Retain
 }
 
+function Publish-CopilotMqttMachineOnlineConfig {
+    <#
+        Declares this machine's liveness sensor.
+
+        Split from the heartbeat because the heartbeat is deliberately not retained, so
+        it is dropped outright if it reaches Home Assistant before the discovery config
+        has been processed. Publishing both in one breath lost the first beat every
+        time, and the machine read as offline for a full heartbeat interval after its
+        daemon started - which is exactly when someone is most likely to be looking.
+
+        Retained, so the entity survives a Home Assistant restart even though its state
+        does not.
+    #>
+    param(
+        [string]$Slug,
+        [string]$MachineName,
+        [int]$ExpireAfter = 180,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    if (-not $Slug) { $Slug = Get-BridgeMachineSlug }
+    if (-not $MachineName) { $MachineName = [Environment]::MachineName }
+
+    $node = Get-CopilotMqttMachineNode -Slug $Slug
+    $config = @{
+        name = 'Online'
+        unique_id = "agent_bridge_${Slug}_online"
+        object_id = "agent_bridge_${Slug}_online"
+        state_topic = "$(Get-CopilotMqttMachineTopicRoot -Slug $Slug)/online/state"
+        device_class = 'connectivity'
+        payload_on = 'online'
+        payload_off = 'offline'
+        expire_after = $ExpireAfter
+        device = Get-CopilotMqttMachineDevice -Slug $Slug -MachineName $MachineName
+    }
+    Publish-CopilotMqttMessage `
+        -Topic "$($script:CopilotMqttConfig.DiscoveryPrefix)/binary_sensor/$node/online/config" `
+        -Payload ($config | ConvertTo-Json -Depth 6 -Compress) -Headers $Headers -Retain
+}
+
+function Publish-CopilotMqttMachineHeartbeat {
+    <#
+        Says this machine is still running.
+
+        Everything else the bridge publishes is retained, which is what lets a machine
+        that is switched off still be *known* - the right behaviour for the machine
+        list and for deciding whether an uninstall is removing the last one. It does
+        mean presence cannot be inferred from any of it, so liveness gets its own
+        signal, and it is the one thing deliberately not retained: `expire_after` turns
+        it unavailable when the beats stop, and a Home Assistant restart cannot
+        resurrect a stale "online" for a machine that has since been switched off.
+    #>
+    param(
+        [string]$Slug,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    Publish-CopilotMqttMessage -Topic "$(Get-CopilotMqttMachineTopicRoot -Slug $Slug)/online/state" `
+        -Payload 'online' -Headers $Headers
+}
+
 function Get-CopilotMqttGlobalEntityId {
     param([string]$Slug)
     Get-BridgeMachineEntityId -Domain 'sensor' -Key 'sessions' -Slug $Slug
@@ -875,6 +936,16 @@ function Get-BridgePeerMachine {
     }
 
     $self = Get-BridgeMachineSlug
+    # Liveness rides on a separate, unretained sensor with an expiry, so it is the one
+    # thing here that distinguishes a machine that is running from one that merely
+    # registered at some point in the past.
+    $online = @{}
+    foreach ($state in @($States)) {
+        if ($null -eq $state) { continue }
+        if ([string]$state.entity_id -notmatch '^binary_sensor\.agent_bridge_([a-z0-9_]+)_online$') { continue }
+        $online[$Matches[1]] = ([string]$state.state -eq 'on')
+    }
+
     $found = [System.Collections.Generic.List[object]]::new()
     foreach ($state in @($States)) {
         if ($null -eq $state) { continue }
@@ -905,6 +976,7 @@ function Get-BridgePeerMachine {
             Machine = $machine
             Sessions = @($sessions)
             Capabilities = $capabilities
+            Online = [bool]$online[$slug]
             IsSelf = ($slug -eq $self)
             EntityId = $entityId
         })
@@ -939,8 +1011,10 @@ function Get-CopilotMqttMachineTopic {
         "$prefix/button/$node/new_session/config"
         "$prefix/sensor/$node/new_session_result/config"
         "$prefix/sensor/$node/sessions/config"
+        "$prefix/binary_sensor/$node/online/config"
         "$root/update/state"
         "$root/newsession/result"
+        "$root/online/state"
         "$root/global/state"
         "$root/global/attr"
     )

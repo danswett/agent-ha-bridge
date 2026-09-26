@@ -92,7 +92,7 @@ Write-Host '--- publishing this machine, and reading other machines back ---'
 $script:Published = @()
 function Publish-CopilotMqttMessage {
     param([string]$Topic, [AllowEmptyString()][string]$Payload, [hashtable]$Headers, [switch]$Retain)
-    $script:Published += [pscustomobject]@{ Topic = $Topic; Payload = $Payload }
+    $script:Published += [pscustomobject]@{ Topic = $Topic; Payload = $Payload; Retained = [bool]$Retain }
 }
 
 $script:Published = @()
@@ -182,34 +182,67 @@ $twoMachineSessions = @(
     [pscustomobject]@{ Node = 'agent_bridge_d1'; Name = 'Copilot: desk work'; Machine = 'DESKTOP'; Kind = 'copilot' }
     [pscustomobject]@{ Node = 'agent_bridge_l1'; Name = 'Claude: lap work'; Machine = 'LAPTOP'; Kind = 'claude' }
 )
-Save-CopilotSessionDashboard -Sessions $twoMachineSessions -Machines $machines
+Save-CopilotSessionDashboard -Sessions $twoMachineSessions -Machines $machines `
+    -MachineSelector 'input_select.agent_bridge_target_machine'
 $cfg = $script:SavedConfig
 $cards = @($cfg.views[0].cards)
 
-function Get-CardTitles { @($cards | Where-Object { $_.ContainsKey('title') } | ForEach-Object { [string]$_['title'] }) }
-function Get-AllRowEntities {
-    # Rows live at three depths: directly on an entities card, inside a conditional's
-    # card, and inside the summary's vertical-stack.
+function Get-CardTitles {
+    # Titles can sit one level down now, inside the launch stack.
     @($cards | ForEach-Object {
-        if ($_['type'] -eq 'entities') { $_['entities'] }
-        elseif ($_['type'] -eq 'conditional') { $_['card']['entities'] }
-        elseif ($_['type'] -eq 'vertical-stack') {
-            $_['cards'] | Where-Object { $_['type'] -eq 'entities' } | ForEach-Object { $_['entities'] }
+        if ($_.ContainsKey('title')) { [string]$_['title'] }
+        if ($_['type'] -eq 'vertical-stack') {
+            $_['cards'] | Where-Object { $_.ContainsKey('title') } | ForEach-Object { [string]$_['title'] }
         }
-    } | Where-Object { $null -ne $_ -and $_.ContainsKey('entity') } | ForEach-Object { [string]$_['entity'] })
+    })
 }
+function Get-RowEntity {
+    # Rows nest arbitrarily: entities cards, conditionals wrapping them, and stacks
+    # wrapping those. Walk it rather than hard-coding the depth.
+    param([object]$Card)
+    if ($null -eq $Card) { return }
+    if ($Card['type'] -eq 'entities') {
+        foreach ($row in @($Card['entities'])) {
+            if ($null -ne $row -and $row.ContainsKey('entity')) { [string]$row['entity'] }
+        }
+        return
+    }
+    if ($Card['type'] -eq 'conditional') { Get-RowEntity -Card $Card['card']; return }
+    if ($Card['type'] -eq 'vertical-stack') {
+        foreach ($child in @($Card['cards'])) { Get-RowEntity -Card $child }
+    }
+}
+function Get-AllRowEntities { @($cards | ForEach-Object { Get-RowEntity -Card $_ }) }
 $rows = Get-AllRowEntities
 
-Test-That 'there is a launch card for each machine' {
-    $titles = Get-CardTitles
-    ($titles -contains 'Start a new session on DESKTOP') -and ($titles -contains 'Start a new session on LAPTOP')
+Test-That 'there is one launch card, not one per machine' {
+    @(Get-CardTitles | Where-Object { $_ -eq 'Start a new session' }).Count -eq 1
 }
-Test-That 'each launch card presses only its own machine' {
+Test-That 'it offers a machine picker' {
+    $rows -contains 'input_select.agent_bridge_target_machine'
+}
+Test-That 'the picker is the first row on the card' {
+    # Choosing where to run comes before choosing what to run there.
+    $stack = @($cards | Where-Object {
+        $_['type'] -eq 'vertical-stack' -and
+        @($_['cards'] | Where-Object { $_.ContainsKey('title') -and $_['title'] -eq 'Start a new session' }).Count -gt 0
+    })[0]
+    [string]$stack['cards'][0]['entities'][0]['entity'] -eq 'input_select.agent_bridge_target_machine'
+}
+Test-That 'each machine rows are revealed by the picker, not all at once' {
+    $conds = @($cards | Where-Object { $_['type'] -eq 'vertical-stack' } | ForEach-Object { $_['cards'] } |
+        Where-Object { $_['type'] -eq 'conditional' } | ForEach-Object { $_['conditions'][0] })
+    @($conds | Where-Object { [string]$_['entity'] -eq 'input_select.agent_bridge_target_machine' }).Count -eq 2 -and
+    @($conds | ForEach-Object { [string]$_['state'] }) -contains 'DESKTOP' -and
+    @($conds | ForEach-Object { [string]$_['state'] }) -contains 'LAPTOP'
+}
+Test-That 'Launch still presses the machine own button' {
+    # The picker is a display filter. A single shared button is exactly what made one
+    # press start a session on every machine at once.
     ($rows -contains 'button.agent_bridge_desktop_new_session') -and
     ($rows -contains 'button.agent_bridge_laptop_new_session')
 }
 Test-That 'no unscoped launch button survives' {
-    # The one every daemon used to watch, which made a single press launch everywhere.
     $rows -notcontains 'button.agent_bridge_new_session'
 }
 Test-That 'a machine without Agency gets no profile row' {
@@ -227,14 +260,37 @@ Test-That 'the update rows are conditional on that machine having an update' {
     ($conds -contains 'update.agent_bridge_laptop_update')
 }
 
+Write-Host '--- the machines card reports who is around ---'
+
+$machinesCard = @($cards | Where-Object { $_['type'] -eq 'markdown' -and $_['content'] -match '### Machines' })[0]
+Test-That 'there is a machines card' { $null -ne $machinesCard }
+Test-That 'every registered machine is listed, online or not' {
+    $machinesCard.content -match '\*\*DESKTOP\*\*' -and $machinesCard.content -match '\*\*LAPTOP\*\*'
+}
+Test-That 'status comes from the liveness sensor' {
+    $machinesCard.content -match "is_state\('binary_sensor\.agent_bridge_desktop_online','on'\)" -and
+    $machinesCard.content -match "is_state\('binary_sensor\.agent_bridge_laptop_online','on'\)"
+}
+Test-That 'a machine that is not reporting reads as offline' {
+    # The sensor is unretained and expires, so anything other than on - including
+    # unavailable after the heartbeat stops - has to fall to the offline branch.
+    $machinesCard.content -match 'offline'
+}
+Test-That 'each line carries that machine version and session count' {
+    $machinesCard.content -match "state_attr\('update\.agent_bridge_desktop_update','installed_version'\)" -and
+    $machinesCard.content -match "states\('sensor\.agent_bridge_laptop_sessions'\)"
+}
+Test-That 'the summary no longer repeats the versions' {
+    $summaryCard = @($cards | Where-Object { $_['type'] -eq 'vertical-stack' } |
+        ForEach-Object { $_['cards'] } | Where-Object { $_['type'] -eq 'markdown' })[0]
+    $summaryCard.content -notmatch 'installed_version'
+}
+
 $summary = @($cards | Where-Object { $_['type'] -eq 'vertical-stack' } |
     ForEach-Object { $_['cards'] } | Where-Object { $_['type'] -eq 'markdown' })[0]
 
 Test-That 'the live count adds the machines together' {
     $summary.content -match "states\('sensor\.agent_bridge_desktop_sessions'\)\|int\(0\) \+ states\('sensor\.agent_bridge_laptop_sessions'\)\|int\(0\)"
-}
-Test-That 'each machine version is listed by name' {
-    $summary.content -match '\*\*DESKTOP\*\*' -and $summary.content -match '\*\*LAPTOP\*\*'
 }
 Test-That 'the shared Detailed activity toggle stays shared' {
     # It is a display preference, not a property of a machine, so it is deliberately
@@ -250,6 +306,61 @@ Test-That 'each session card names the machine it is on' {
     $content -match 'DESKTOP' -and $content -match 'LAPTOP'
 }
 
+Write-Host '--- an offline machine is listed, but cannot be launched on ---'
+
+$script:SavedConfig = $null
+function Invoke-CopilotHaWebSocket {
+    param([Parameter(Mandatory)][object[]]$Commands)
+    if ($Commands[0].ContainsKey('config')) { $script:SavedConfig = $Commands[0].config }
+    @()
+}
+Save-CopilotSessionDashboard -Sessions $twoMachineSessions -Machines @(
+    [pscustomobject]@{ Slug = 'desktop'; Machine = 'DESKTOP'; IncludeProfile = $true; IncludeResume = $true; Online = $true }
+    [pscustomobject]@{ Slug = 'laptop'; Machine = 'LAPTOP'; IncludeProfile = $false; IncludeResume = $false; Online = $false }
+)
+$offCards = @($script:SavedConfig.views[0].cards)
+$offRows = @($offCards | ForEach-Object { Get-RowEntity -Card $_ })
+
+Test-That 'the offline machine still appears in the machines card' {
+    $card = @($offCards | Where-Object { $_['type'] -eq 'markdown' -and $_['content'] -match '### Machines' })[0]
+    $card.content -match '\*\*LAPTOP\*\*'
+}
+Test-That 'it gets no launch card' {
+    # It had one, and with only one machine online there is no picker to tell the two
+    # apart - so the dashboard showed two identical "Start a new session" cards, one of
+    # which pressed a button nothing was listening to.
+    $offRows -notcontains 'button.agent_bridge_laptop_new_session'
+}
+Test-That 'there is exactly one launch card left' {
+    @($offCards | Where-Object { $_.ContainsKey('title') -and $_['title'] -eq 'Start a new session' }).Count -eq 1
+}
+Test-That 'and it belongs to the machine that is running' {
+    $offRows -contains 'button.agent_bridge_desktop_new_session'
+}
+Test-That 'it gets no install-update row either' {
+    # Pressing it would do nothing: the machine that would act on it is not running.
+    $offRows -notcontains 'button.agent_bridge_laptop_install_update'
+}
+Test-That 'its retained session counter is left out of the live total' {
+    # The counter is retained, so it still reads whatever it said when the machine
+    # stopped; summing it would report sessions that are not running.
+    $summaryCard = @($offCards | Where-Object { $_['type'] -eq 'vertical-stack' } |
+        ForEach-Object { $_['cards'] } | Where-Object { $_['type'] -eq 'markdown' })[0]
+    $summaryCard.content -match 'agent_bridge_desktop_sessions' -and
+    $summaryCard.content -notmatch 'agent_bridge_laptop_sessions'
+}
+
+Test-That 'a caller that does not track liveness is treated as all-online' {
+    # Keeps older callers and the single-machine path behaving exactly as before.
+    $script:SavedConfig = $null
+    Save-CopilotSessionDashboard -Sessions $twoMachineSessions -Machines @(
+        [pscustomobject]@{ Slug = 'desktop'; Machine = 'DESKTOP'; IncludeProfile = $true; IncludeResume = $true }
+        [pscustomobject]@{ Slug = 'laptop'; Machine = 'LAPTOP'; IncludeProfile = $false; IncludeResume = $false }
+    )
+    $rows2 = @($script:SavedConfig.views[0].cards | ForEach-Object { Get-RowEntity -Card $_ })
+    $rows2 -contains 'button.agent_bridge_laptop_new_session'
+}
+
 Write-Host '--- a single machine still reads as it did ---'
 
 $script:SavedConfig = $null
@@ -263,10 +374,131 @@ Test-That 'the launch card is not suffixed with the machine name' {
     # there is something to tell apart.
     @($soloCards | Where-Object { $_.ContainsKey('title') -and $_['title'] -eq 'Start a new session' }).Count -eq 1
 }
+Test-That 'a single machine gets no picker' {
+    ($script:SavedConfig | ConvertTo-Json -Depth 30) -notmatch 'agent_bridge_target_machine'
+}
+Test-That 'and no machines card' {
+    @($soloCards | Where-Object { $_['type'] -eq 'markdown' -and $_['content'] -match '### Machines' }).Count -eq 0
+}
 Test-That 'the version is still labelled Bridge rather than the hostname' {
     $md = @($soloCards | Where-Object { $_['type'] -eq 'vertical-stack' } |
         ForEach-Object { $_['cards'] } | Where-Object { $_['type'] -eq 'markdown' })[0]
     $md.content -match '\*\*Bridge\*\*'
+}
+
+Write-Host '--- the picker only offers machines that can actually launch ---'
+
+$script:SelectorCalls = @()
+function New-WebSocketResult {
+    # The real helper hands back one result per command, so the stub has to as well:
+    # a bare @() would collapse and the caller's [0] would index past the end.
+    param([object]$Value)
+    $result = New-Object object[] 1
+    $result[0] = $Value
+    ,$result
+}
+function Invoke-CopilotHaWebSocket {
+    param([Parameter(Mandatory)][object[]]$Commands)
+    $script:SelectorCalls += $Commands[0]
+    if ([string]$Commands[0].type -eq 'input_select/list') { return New-WebSocketResult @($script:ExistingSelects) }
+    if ([string]$Commands[0].type -eq 'input_select/create') {
+        return New-WebSocketResult ([pscustomobject]@{ id = 'agent_bridge_target_machine' })
+    }
+    New-WebSocketResult @()
+}
+
+$script:ExistingSelects = @()
+$script:SelectorCalls = @()
+$id = Initialize-BridgeMachineSelector -Machines @('DESKTOP', 'LAPTOP')
+Test-That 'a picker is created when there is a choice to make' {
+    $id -eq 'input_select.agent_bridge_target_machine' -and
+    @($script:SelectorCalls | Where-Object { $_.type -eq 'input_select/create' }).Count -eq 1
+}
+Test-That 'it is created with the machines as options' {
+    $create = @($script:SelectorCalls | Where-Object { $_.type -eq 'input_select/create' })[0]
+    (@($create.options) -join ',') -eq 'DESKTOP,LAPTOP'
+}
+
+$script:ExistingSelects = @([pscustomobject]@{ id = 'agent_bridge_target_machine'; options = @('DESKTOP', 'LAPTOP') })
+$script:SelectorCalls = @()
+[void](Initialize-BridgeMachineSelector -Machines @('DESKTOP', 'LAPTOP'))
+Test-That 'an unchanged option list is left alone' {
+    # Every daemon runs this, so a needless write would be a write per machine per
+    # rebuild, all of them setting the same value.
+    @($script:SelectorCalls | Where-Object { $_.type -eq 'input_select/update' }).Count -eq 0
+}
+
+$script:SelectorCalls = @()
+[void](Initialize-BridgeMachineSelector -Machines @('DESKTOP'))
+Test-That 'a machine going offline drops it from the picker' {
+    # One machine left means nothing to pick, so the picker is retired rather than
+    # left as a control with a single option.
+    @($script:SelectorCalls | Where-Object { $_.type -eq 'input_select/delete' }).Count -eq 1
+}
+
+$script:ExistingSelects = @()
+$script:SelectorCalls = @()
+$soloId = Initialize-BridgeMachineSelector -Machines @('DESKTOP')
+Test-That 'a lone machine never creates one in the first place' {
+    $soloId -eq '' -and @($script:SelectorCalls | Where-Object { $_.type -eq 'input_select/create' }).Count -eq 0
+}
+
+$script:ExistingSelects = @()
+$script:SelectorCalls = @()
+[void](Initialize-BridgeMachineSelector -Machines @('DESKTOP', '', '  ', 'DESKTOP', 'LAPTOP'))
+Test-That 'blanks and duplicates never reach the option list' {
+    $create = @($script:SelectorCalls | Where-Object { $_.type -eq 'input_select/create' })[0]
+    (@($create.options) -join ',') -eq 'DESKTOP,LAPTOP'
+}
+
+Write-Host '--- liveness is the one thing not retained ---'
+
+$script:Published = @()
+Publish-CopilotMqttMachineOnlineConfig -Slug 'laptop' -MachineName 'LAPTOP' -ExpireAfter 180 -Headers @{}
+$onlineConfig = @($script:Published | Where-Object { $_.Topic -match '/binary_sensor/agent_bridge_laptop/online/config$' })[0]
+
+Test-That 'the sensor is published for the machine' { $null -ne $onlineConfig }
+Test-That 'it expires, so a machine that stops reporting goes offline on its own' {
+    $onlineConfig.Payload -match '"expire_after":180'
+}
+Test-That 'it is a connectivity sensor' { $onlineConfig.Payload -match '"device_class":"connectivity"' }
+Test-That 'the discovery config is retained, so the entity survives a restart' {
+    $onlineConfig.Retained
+}
+Test-That 'declaring the sensor does not also beat' {
+    # An unretained beat that outruns its own discovery config is dropped, so the two
+    # are split and the config goes out at startup, long before the first beat.
+    @($script:Published | Where-Object { $_.Topic -match '/online/state$' }).Count -eq 0
+}
+
+$script:Published = @()
+Publish-CopilotMqttMachineHeartbeat -Slug 'laptop' -Headers @{}
+Test-That 'the beat is not retained' {
+    # Retaining it would resurrect a stale "online" for a machine that has since been
+    # switched off, every time Home Assistant restarts.
+    $state = @($script:Published | Where-Object { $_.Topic -match '/online/state$' })[0]
+    $state.Payload -eq 'online' -and -not $state.Retained
+}
+Test-That 'uninstalling a machine withdraws its liveness sensor too' {
+    @(Get-CopilotMqttMachineTopic -Slug 'laptop') -contains 'homeassistant/binary_sensor/agent_bridge_laptop/online/config'
+}
+
+$peerStates = @(
+    (New-MachineState -Slug 'desktop' -Machine 'DESKTOP'),
+    (New-MachineState -Slug 'laptop' -Machine 'LAPTOP'),
+    [pscustomobject]@{ entity_id = 'binary_sensor.agent_bridge_desktop_online'; state = 'on'; attributes = [pscustomobject]@{} },
+    [pscustomobject]@{ entity_id = 'binary_sensor.agent_bridge_laptop_online'; state = 'unavailable'; attributes = [pscustomobject]@{} }
+)
+$statusPeers = @(Get-BridgePeerMachine -States $peerStates)
+Test-That 'a reporting machine reads as online' {
+    @($statusPeers | Where-Object { $_.Slug -eq 'desktop' })[0].Online
+}
+Test-That 'an expired sensor reads as offline, not online' {
+    -not @($statusPeers | Where-Object { $_.Slug -eq 'laptop' })[0].Online
+}
+Test-That 'a machine with no liveness sensor at all reads as offline' {
+    $bare = @((New-MachineState -Slug 'ghost' -Machine 'GHOST'))
+    -not @(Get-BridgePeerMachine -States $bare)[0].Online
 }
 
 Write-Host '--- withdrawing one machine leaves the others alone ---'

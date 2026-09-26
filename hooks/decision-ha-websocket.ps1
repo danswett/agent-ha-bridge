@@ -285,19 +285,9 @@ function Set-CopilotMqttGlobalEntityId {
     param([string]$Slug)
     if (-not $Slug) { $Slug = Get-BridgeMachineSlug }
 
-    $uniqueId = "agent_bridge_${Slug}_sessions"
-    $target = Get-CopilotMqttGlobalEntityId -Slug $Slug
-    $reg = (Invoke-CopilotHaWebSocket -Commands @(@{ type = 'config/entity_registry/list' }))[0]
-    $entry = @($reg) | Where-Object { $_.unique_id -eq $uniqueId } | Select-Object -First 1
-    if ($null -eq $entry) { return $false }
-    if ([string]$entry.entity_id -eq $target) { return $true }
-
-    [void](Invoke-CopilotHaWebSocket -Commands @(@{
-        type = 'config/entity_registry/update'
-        entity_id = [string]$entry.entity_id
-        new_entity_id = $target
-    }))
-    $true
+    Set-CopilotMqttMachineEntityId -Wanted @{
+        "agent_bridge_${Slug}_sessions" = Get-CopilotMqttGlobalEntityId -Slug $Slug
+    }
 }
 
 function Initialize-CopilotVerboseToggle {
@@ -499,6 +489,52 @@ function Remove-CopilotVerboseToggle {
     return $true
 }
 
+function Set-CopilotMqttMachineEntityId {
+    <#
+        Forces a set of this machine's MQTT entities onto deterministic entity ids.
+
+        Home Assistant builds an MQTT entity id from the device name plus the entity
+        name and ignores object_id, so everything here first appears as
+        update.ai_agent_bridge_desktop_update and friends. The daemon reads several of
+        them by id on every reconcile and the generated dashboard references them in
+        templates, so they have to be predictable.
+
+        Takes a unique_id -> entity_id map rather than owning a list, because four
+        different groups need exactly this and each maintaining its own copy of the
+        registry walk was three copies too many.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Wanted)
+
+    $registry = (Invoke-CopilotHaWebSocket -Commands @(@{ type = 'config/entity_registry/list' }))[0]
+    $byUniqueId = @{}
+    foreach ($entry in @($registry)) {
+        if ($entry.unique_id) { $byUniqueId[[string]$entry.unique_id] = $entry }
+    }
+
+    $changed = $false
+    foreach ($uniqueId in $Wanted.Keys) {
+        $entry = $byUniqueId[$uniqueId]
+        if ($null -eq $entry) { continue }
+        if ([string]$entry.entity_id -eq $Wanted[$uniqueId]) { continue }
+        [void](Invoke-CopilotHaWebSocket -Commands @(@{
+            type          = 'config/entity_registry/update'
+            entity_id     = [string]$entry.entity_id
+            new_entity_id = $Wanted[$uniqueId]
+        }))
+        $changed = $true
+    }
+    $changed
+}
+
+function Set-CopilotMqttOnlineEntityId {
+    <# The liveness sensor, which the machine list and the launch picker both key on. #>
+    param([string]$Slug)
+    if (-not $Slug) { $Slug = Get-BridgeMachineSlug }
+    Set-CopilotMqttMachineEntityId -Wanted @{
+        "agent_bridge_${Slug}_online" = Get-BridgeMachineEntityId -Domain 'binary_sensor' -Key 'online' -Slug $Slug
+    }
+}
+
 function Set-CopilotMqttUpdateEntityIds {
     <#
         Forces the update entity and its install button onto deterministic ids.
@@ -519,26 +555,7 @@ function Set-CopilotMqttUpdateEntityIds {
         "agent_bridge_${Slug}_update"         = Get-BridgeMachineEntityId -Domain 'update' -Key 'update' -Slug $Slug
         "agent_bridge_${Slug}_install_update" = Get-BridgeMachineEntityId -Domain 'button' -Key 'install_update' -Slug $Slug
     }
-
-    $registry = (Invoke-CopilotHaWebSocket -Commands @(@{ type = 'config/entity_registry/list' }))[0]
-    $byUniqueId = @{}
-    foreach ($entry in @($registry)) {
-        if ($entry.unique_id) { $byUniqueId[[string]$entry.unique_id] = $entry }
-    }
-
-    $changed = $false
-    foreach ($uniqueId in $wanted.Keys) {
-        $entry = $byUniqueId[$uniqueId]
-        if ($null -eq $entry) { continue }
-        if ([string]$entry.entity_id -eq $wanted[$uniqueId]) { continue }
-        [void](Invoke-CopilotHaWebSocket -Commands @(@{
-            type          = 'config/entity_registry/update'
-            entity_id     = [string]$entry.entity_id
-            new_entity_id = $wanted[$uniqueId]
-        }))
-        $changed = $true
-    }
-    $changed
+    Set-CopilotMqttMachineEntityId -Wanted $wanted
 }
 
 function Set-CopilotMqttNewSessionEntityIds {
@@ -571,26 +588,102 @@ function Set-CopilotMqttNewSessionEntityIds {
         $wanted["agent_bridge_${Slug}_$($pair[1])"] =
             Get-BridgeMachineEntityId -Domain $pair[0] -Key $pair[1] -Slug $Slug
     }
+    Set-CopilotMqttMachineEntityId -Wanted $wanted
+}
 
-    $registry = (Invoke-CopilotHaWebSocket -Commands @(@{ type = 'config/entity_registry/list' }))[0]
-    $byUniqueId = @{}
-    foreach ($entry in @($registry)) {
-        if ($entry.unique_id) { $byUniqueId[[string]$entry.unique_id] = $entry }
-    }
+$script:BridgeMachineSelectorId = 'agent_bridge_target_machine'
 
-    $changed = $false
-    foreach ($uniqueId in $wanted.Keys) {
-        $entry = $byUniqueId[$uniqueId]
-        if ($null -eq $entry) { continue }
-        if ([string]$entry.entity_id -eq $wanted[$uniqueId]) { continue }
-        [void](Invoke-CopilotHaWebSocket -Commands @(@{
-            type          = 'config/entity_registry/update'
-            entity_id     = [string]$entry.entity_id
-            new_entity_id = $wanted[$uniqueId]
-        }))
-        $changed = $true
+function Initialize-BridgeMachineSelector {
+    <#
+        Keeps the "which machine" picker in step with the machines that are online.
+
+        The launch controls stay per-machine - that is what stops one press launching
+        everywhere - so this helper never launches anything and no daemon reads it.
+        It exists purely so the dashboard can show one launch card instead of one per
+        machine: each machine's rows sit behind a conditional card keyed on this
+        selection.
+
+        Every daemon computes the same option list from the same sensors, so they all
+        converge on the same value and the update is skipped when nothing changed.
+
+        Returns the helper's entity id, or '' when there is nothing to pick between.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [AllowEmptyString()]
+        [string[]]$Machines,
+
+        [string]$HelperId = $script:BridgeMachineSelectorId
+    )
+
+    $options = @($Machines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | Select-Object -Unique)
+    $entityId = "input_select.$HelperId"
+
+    try {
+        $existing = @((Invoke-CopilotHaWebSocket -Commands @(@{ type = 'input_select/list' }))[0]) |
+            Where-Object { [string]$_.id -eq $HelperId } | Select-Object -First 1
+
+        # One machine needs no picker. Don't create one, and retire one left over from
+        # when there were more, so the dashboard does not keep a dead control.
+        if ($options.Count -lt 2) {
+            if ($existing) {
+                [void](Invoke-CopilotHaWebSocket -Commands @(@{
+                    type = 'input_select/delete'; input_select_id = $HelperId
+                }))
+            }
+            return ''
+        }
+
+        if (-not $existing) {
+            $created = (Invoke-CopilotHaWebSocket -Commands @(@{
+                type = 'input_select/create'
+                name = 'Agent bridge target machine'
+                icon = 'mdi:desktop-tower-monitor'
+                options = $options
+            }))[0]
+            # A slug mismatch means Home Assistant de-duplicated the id against a
+            # helper that was already there, so keep that one and drop the stray.
+            if ([string]$created.id -ne $HelperId) {
+                try {
+                    [void](Invoke-CopilotHaWebSocket -Commands @(@{
+                        type = 'input_select/delete'; input_select_id = [string]$created.id
+                    }))
+                }
+                catch { }
+            }
+            return $entityId
+        }
+
+        $current = @($existing.options)
+        if (($current -join '|') -ne ($options -join '|')) {
+            [void](Invoke-CopilotHaWebSocket -Commands @(@{
+                type = 'input_select/update'
+                input_select_id = $HelperId
+                name = 'Agent bridge target machine'
+                icon = 'mdi:desktop-tower-monitor'
+                options = $options
+            }))
+        }
+        return $entityId
     }
-    $changed
+    catch {
+        Write-DecisionBridgeLog "machine selector update failed: $($_.Exception.Message)"
+        return ''
+    }
+}
+
+function Remove-BridgeMachineSelector {
+    <# Drops the picker. Used by uninstall when the last machine goes. #>
+    param([string]$HelperId = $script:BridgeMachineSelectorId)
+
+    $existing = @((Invoke-CopilotHaWebSocket -Commands @(@{ type = 'input_select/list' }))[0]) |
+        Where-Object { [string]$_.id -eq $HelperId } | Select-Object -First 1
+    if (-not $existing) { return $false }
+    [void](Invoke-CopilotHaWebSocket -Commands @(@{
+        type = 'input_select/delete'; input_select_id = $HelperId
+    }))
+    return $true
 }
 
 $script:BridgeDashboardReady = $false
@@ -687,6 +780,11 @@ function Save-CopilotSessionDashboard {
         [AllowEmptyCollection()]
         [object[]]$Machines = @(),
 
+        # The input_select that chooses which machine the launch card is showing. Empty
+        # means there is nothing to pick between, so the card is rendered directly.
+        [AllowEmptyString()]
+        [string]$MachineSelector = '',
+
         # Whether to show the Agency profile row on the new-session card.
         [switch]$IncludeProfile,
 
@@ -711,7 +809,16 @@ function Save-CopilotSessionDashboard {
     }
     $multiMachine = $machineList.Count -gt 1
 
-    $countEntities = @($machineList | ForEach-Object {
+    # Only a machine that is actually running can launch anything, answer anything, or
+    # install an update, so the controls are built from the online subset while the
+    # machine list itself stays complete. A caller that does not track liveness - an
+    # older one, or a test - is treated as all-online, which is the previous behaviour.
+    $onlineList = @($machineList | Where-Object {
+        $_.PSObject.Properties.Name -notcontains 'Online' -or $_.Online
+    })
+    if ($onlineList.Count -eq 0) { $onlineList = @($machineList) }
+
+    $countEntities = @($onlineList | ForEach-Object {
         Get-BridgeMachineEntityId -Domain 'sensor' -Key 'sessions' -Slug $_.Slug
     })
     # int(0) on every term, so one machine whose sensor is briefly unavailable reads as
@@ -722,20 +829,24 @@ function Save-CopilotSessionDashboard {
 
     # The installed version comes from each machine's update entity, which its daemon
     # always publishes, so the card shows what is running without another moving part.
-    # With several machines the versions can differ, and which one is stale is exactly
-    # what you want to see, so they are listed rather than reduced to one number.
-    $versionParts = @($machineList | ForEach-Object {
-        $updateEntity = Get-BridgeMachineEntityId -Domain 'update' -Key 'update' -Slug $_.Slug
-        $label = if ($multiMachine) { $_.Machine } else { 'Bridge' }
-        "**$label** {{ state_attr('$updateEntity', 'installed_version') or '?' }}"
-    })
+    # With one machine that is the whole story; with several, each machine's version
+    # and liveness belong together on its own line, so the summary keeps just the
+    # counts and the machines get a card of their own below.
+    $versionParts = @()
+    if (-not $multiMachine) {
+        $soloUpdate = Get-BridgeMachineEntityId -Domain 'update' -Key 'update' -Slug $onlineList[0].Slug
+        $versionParts = @("**Bridge** {{ state_attr('$soloUpdate', 'installed_version') or '?' }}")
+    }
+
+    $summaryLine = "**Live sessions:** $liveTemplate &bull; **Pending decisions:** $pendingTemplate"
+    if ($versionParts.Count) { $summaryLine += " &bull; $($versionParts -join ' &bull; ')" }
 
     $controlMarkdown = @{
         type = 'markdown'
         content = @(
             '## Agent sessions'
             ''
-            "**Live sessions:** $liveTemplate &bull; **Pending decisions:** $pendingTemplate &bull; $($versionParts -join ' &bull; ')"
+            $summaryLine
             ''
             'Turn on *Detailed activity* to stream each session''s reasoning and every tool call.'
         ) -join "`n"
@@ -758,6 +869,29 @@ function Save-CopilotSessionDashboard {
         )
     }
 
+    # Every machine that has ever registered, live or not, with its status and version.
+    # A machine's entities are retained, so one that is switched off stays listed - and
+    # knowing a machine exists but is currently off is exactly what you want when a
+    # session you expected to see is not there.
+    $machinesCard = $null
+    if ($multiMachine) {
+        $machineLines = @($machineList | ForEach-Object {
+            $onlineEntity = Get-BridgeMachineEntityId -Domain 'binary_sensor' -Key 'online' -Slug $_.Slug
+            $updateEntity = Get-BridgeMachineEntityId -Domain 'update' -Key 'update' -Slug $_.Slug
+            $countEntity = Get-BridgeMachineEntityId -Domain 'sensor' -Key 'sessions' -Slug $_.Slug
+            # The liveness sensor is not retained and expires, so "not on" covers both
+            # a machine that reported offline and one that simply stopped reporting.
+            "{% if is_state('$onlineEntity','on') %}🟢 **$($_.Machine)** &bull; " +
+            "{{ states('$countEntity')|int(0) }} session(s) &bull; " +
+            "{{ state_attr('$updateEntity','installed_version') or '?' }}" +
+            "{% else %}⚪ **$($_.Machine)** &bull; offline{% endif %}"
+        })
+        $machinesCard = @{
+            type = 'markdown'
+            content = (@('### Machines'; '') + $machineLines) -join "`n`n"
+        }
+    }
+
     # The update row and its install button only appear when an update exists. A
     # conditional card is used rather than hiding rows inside the entities card,
     # because an entities row has no condition of its own.
@@ -765,7 +899,7 @@ function Save-CopilotSessionDashboard {
     # One per machine: each runs its own copy at its own version, so a single shared
     # row showed whichever machine published last and its install button ran on every
     # machine at once.
-    $updateCards = @($machineList | ForEach-Object {
+    $updateCards = @($onlineList | ForEach-Object {
         $updateEntity = Get-BridgeMachineEntityId -Domain 'update' -Key 'update' -Slug $_.Slug
         $installEntity = Get-BridgeMachineEntityId -Domain 'button' -Key 'install_update' -Slug $_.Slug
         $title = if ($multiMachine) { "Bridge update available on $($_.Machine)" } else { 'Bridge update available' }
@@ -787,10 +921,13 @@ function Save-CopilotSessionDashboard {
     # cards because it belongs to the bridge, not to any one session, and it stays
     # visible when nothing is running at all - which is exactly when it is needed.
     #
-    # One card per machine, because a launch happens somewhere. While these controls
-    # were shared, every daemon watched the same button with its own idea of when it
-    # was last pressed, so one press started a session on every machine at once.
-    $newSessionCards = @($machineList | ForEach-Object {
+    # With several machines this reads as one card with a machine picker at the top,
+    # but the rows underneath are still each machine's own entities, revealed by a
+    # conditional card keyed on the picker. The picker is a display filter and nothing
+    # more: no daemon reads it, and Launch presses the selected machine's own button.
+    # A single shared button is precisely what made one press start a session
+    # everywhere at once.
+    $newSessionCards = @($onlineList | ForEach-Object {
         $slug = $_.Slug
         $rows = @()
         # Resume first: it decides whether the rows under it even apply. Defaults to
@@ -813,16 +950,44 @@ function Save-CopilotSessionDashboard {
         # was an input nobody reached for on a card whose whole point is one press.
         $rows += @{ entity = (Get-BridgeMachineEntityId -Domain 'button' -Key 'new_session' -Slug $slug); name = 'Launch' }
 
-        @{
+        $card = @{
             type = 'entities'
-            title = if ($multiMachine) { "Start a new session on $($_.Machine)" } else { 'Start a new session' }
+            title = 'Start a new session'
             show_header_toggle = $false
             entities = $rows
         }
+        if (-not $MachineSelector) { return $card }
+
+        # Titles live on the outer card only; a conditional card with a titled child
+        # would repeat the heading for whichever machine is selected.
+        $card.Remove('title')
+        @{
+            type = 'conditional'
+            conditions = @(@{ entity = $MachineSelector; state = $_.Machine })
+            card = $card
+        }
     })
 
+    if ($MachineSelector) {
+        # The picker and the rows it reveals are one card, so choosing a machine and
+        # launching on it read as a single action rather than two unrelated controls.
+        $newSessionCards = @(@{
+            type = 'vertical-stack'
+            cards = @(
+                @{
+                    type = 'entities'
+                    title = 'Start a new session'
+                    show_header_toggle = $false
+                    entities = @(@{ entity = $MachineSelector; name = 'Machine' })
+                }
+            ) + $newSessionCards
+        })
+    }
+
     # The control panel is a plain card pair at the top of the masonry flow.
-    $controlCards = @($agentSessionsCard) + $updateCards + $newSessionCards
+    $controlCards = @($agentSessionsCard)
+    if ($machinesCard) { $controlCards += $machinesCard }
+    $controlCards += $updateCards + $newSessionCards
 
     $sessionSections = foreach ($session in $Sessions) {
         $node = $session.Node

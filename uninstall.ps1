@@ -205,6 +205,13 @@ elseif ($ClearEntities) {
             }
             catch { Write-Warning "Could not remove the verbose toggle: $($_.Exception.Message)" }
 
+            try {
+                if (Get-Command Remove-BridgeMachineSelector -ErrorAction SilentlyContinue) {
+                    if (Remove-BridgeMachineSelector) { Write-Host '    removed the machine picker' }
+                }
+            }
+            catch { Write-Warning "Could not remove the machine picker: $($_.Exception.Message)" }
+
             $urlPath = $script:DecisionBridgeConfig.DashboardUrlPath
             try {
                 if ($urlPath) {
