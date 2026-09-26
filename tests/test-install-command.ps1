@@ -275,7 +275,10 @@ if ($env:BRIDGE_INSTALL_NORUN) { return }
     }
     Test-That 'the configured URL reaches it too' { $statusOut -match 'url=http://ha\.test:8123' }
     Test-That 'status reads the config beside the command, not the one in $HOME' {
-        $statusOut -match [regex]::Escape($statusHome)
+        # The leaf, not the whole path: a GitHub runner hands out $env:TEMP in 8.3
+        # short form while the child resolves it long, so the strings differ even
+        # though they are the same directory. The GUID is unique either way.
+        $statusOut -match [regex]::Escape((Split-Path $statusHome -Leaf))
     }
     Test-That 'status lists the configured clients' { $statusOut -match 'clients\s*:\s*copilot' }
 }
