@@ -189,6 +189,56 @@ if (Test-Path -LiteralPath $mcpDir) {
     Write-Host '    (run mcp/install-mcp.ps1 -Uninstall to also remove it from Claude Desktop)'
 }
 
+# The bridge root goes at the end of this script, but the PATH entry pointing into it
+# is stored elsewhere and would survive as a dead entry.
+$binDir = Join-Path $bridgeHome 'bin'
+
+function Remove-BridgePathRegistration {
+    <#
+        Drops the bridge's bin directory from the user PATH, reusing the installer's
+        own helpers so adding and removing always agree on what counts as the same
+        entry.
+
+        The dot-source happens inside this function on purpose: install.ps1 assigns
+        $TargetHome, $bridgeHome, $configPath and friends at its script level, and
+        dot-sourcing it at the caller's scope would rebind them mid-uninstall.
+    #>
+    param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)][string]$InstallerPath)
+    $env:BRIDGE_INSTALL_NORUN = '1'
+    try {
+        . $InstallerPath
+        if (Register-BridgePathEntry -Directory $Directory -Remove) {
+            Send-BridgeEnvironmentChange
+            return $true
+        }
+        return $false
+    }
+    finally { Remove-Item Env:\BRIDGE_INSTALL_NORUN -ErrorAction SilentlyContinue }
+}
+
+if ($TargetHome) {
+    # A sandbox install never put itself on PATH, so there is nothing to undo and the
+    # real install's entry must not be touched.
+    Write-Step 'Leaving PATH alone (-TargetHome)'
+}
+else {
+    Write-Step 'Removing agent-ha-bridge from your PATH'
+    $installerCopy = Join-Path $bridgeHome 'installer\install.ps1'
+    if (-not (Test-Path -LiteralPath $installerCopy)) { $installerCopy = Join-Path $PSScriptRoot 'install.ps1' }
+    try {
+        if (Test-Path -LiteralPath $installerCopy) {
+            if (Remove-BridgePathRegistration -Directory $binDir -InstallerPath $installerCopy) {
+                Write-Host "    removed $binDir"
+            }
+            else { Write-Host "    $binDir was not on the user PATH" }
+        }
+        else {
+            Write-Host "    no installer copy found; remove $binDir from PATH by hand if it is there" -ForegroundColor Yellow
+        }
+    }
+    catch { Write-Warning "Could not update PATH: $($_.Exception.Message)" }
+}
+
 if (-not $KeepConfig -and (Test-Path -LiteralPath $configPath)) {
     Write-Step 'Removing the bridge config (it holds your token)'
     Remove-Item -LiteralPath $configPath -Force

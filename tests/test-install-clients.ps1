@@ -80,6 +80,47 @@ Test-That 'a request beats a prompt' {
     (Resolve-BridgeClients -Requested @('copilot') -Prompt { @('claude') }) -join ',' -eq 'copilot'
 }
 
+Write-Host '--- a first install must always reach the picker ---'
+# The regression this pins down: config.example.json shipped "clients": ["copilot"],
+# and the installer seeds a fresh config from it. The persisted branch therefore fired
+# on the very first install, the picker never appeared, and every new machine silently
+# configured Copilot alone. Two things have to hold for that to stay fixed: nothing
+# may be persisted on a fresh install, and the example must not pretend otherwise.
+Test-That 'an empty persisted selection falls through to the picker' {
+    $script:PickerAsked = $false
+    $chosen = Resolve-BridgeClients -Persisted @() -Prompt { $script:PickerAsked = $true; @('claude') }
+    $script:PickerAsked -and ($chosen -join ',' -eq 'claude')
+}
+Test-That 'a null persisted selection falls through to the picker' {
+    (Resolve-BridgeClients -Persisted $null -Prompt { @('codex') }) -join ',' -eq 'codex'
+}
+$exampleRaw = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\config.example.json') -Raw -Encoding UTF8
+$example = $exampleRaw | ConvertFrom-Json
+Test-That 'config.example.json is still valid JSON' { $null -ne $example }
+Test-That 'config.example.json does not preselect any clients' {
+    -not $example.PSObject.Properties['clients']
+}
+Test-That 'the example still carries the settings the installer expects' {
+    $example.PSObject.Properties['homeAssistant'] -and
+    $example.PSObject.Properties['notifications'] -and
+    $example.PSObject.Properties['dashboard'] -and
+    $example.PSObject.Properties['updates']
+}
+Test-That 'the installer only treats a pre-existing config as a previous answer' {
+    # The guard in install.ps1 is `if ($configExisted -and ...)`; without the first
+    # half, seeding from the example resurrects the bug whatever the example says.
+    $installerText = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\install.ps1') -Raw
+    $installerText -match '\$configExisted\s+-and\s+\$config\.PSObject\.Properties\[.clients.\]'
+}
+
+Write-Host '--- the picker offers every client, and preselects what is detected ---'
+Test-That 'every known client has a label to show' {
+    @($script:KnownClients | Where-Object { -not $script:ClientLabels[$_] }).Count -eq 0
+}
+Test-That 'the labels cover nothing that is not a known client' {
+    @($script:ClientLabels.Keys | Where-Object { $script:KnownClients -notcontains $_ }).Count -eq 0
+}
+
 Write-Host '--- Test-BridgeClientInstalled returns a bool for each client ---'
 foreach ($c in @('copilot', 'claude', 'codex', 'mcp')) {
     Test-That "$c detection does not throw" { (Test-BridgeClientInstalled $c) -is [bool] }

@@ -31,6 +31,9 @@ cd codex
 .\install-codex.ps1
 ```
 
+Or, on a machine that already has the bridge, `agent-ha-bridge configure -Clients codex`
+does both in one step — and offers to install the Codex CLI itself if it is missing.
+
 Codex loads third-party hooks from plugins, so the adapter is packaged as one and
 registered through a local marketplace — the supported route for a plugin that does
 not come from a catalogue. The installer writes the plugin, registers the marketplace,

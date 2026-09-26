@@ -88,12 +88,13 @@ only a Home Assistant token.
 
 ## Requirements
 
-* Windows 10/11 and **PowerShell 7+**
+* Windows 10/11 and **PowerShell 7+** — the installer offers to install it if you
+  don't have it, including when you paste the one-liner into Windows PowerShell
 * At least one supported client. The installer asks which of
   **[GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/use-copilot-agents/use-copilot-cli)**,
   **Claude Code**, **Codex CLI** and the **MCP server** to configure (detecting what
-  you have). MCP additionally needs **Node.js**, and works with any MCP client
-  ([`mcp/`](mcp/))
+  you have), and offers to install any you picked but don't have yet. MCP additionally
+  needs **Node.js**, and works with any MCP client ([`mcp/`](mcp/))
 * Home Assistant with the **MQTT integration** configured (any broker)
 * A Home Assistant **long-lived access token**
 * These HACS frontend cards:
@@ -119,16 +120,18 @@ cd agent-ha-bridge
 .\install.ps1
 ```
 
-With no arguments the installer finds Home Assistant for you: it probes
-`homeassistant.local:8123` (the hostname Home Assistant publishes over mDNS, which
-Windows resolves natively) and confirms the product from its unauthenticated
-`manifest.json`. You confirm or correct the URL, then it walks you through creating a
-long-lived token and pastes straight into the config.
+Nothing is a hard prerequisite except Windows itself. If **PowerShell 7** is missing
+the installer offers to install it with winget and hands the install over to it —
+`bootstrap.ps1` is deliberately Windows PowerShell 5.1 compatible so the offer works
+where `pwsh` doesn't exist yet. Decline anything and you get the exact command to run
+later instead of a dead end; `-SkipDependencies` turns the offers off entirely.
 
 It then asks **which clients to configure** — Copilot CLI, Claude Code, Codex CLI, and
-the MCP server — pre-selecting the ones it detects. The shared daemon, dashboard and
-Home Assistant plumbing are installed either way; the choice only decides which
-adapters get set up. Pick them non-interactively with `-Clients`:
+the MCP server — pre-selecting the ones it detects, and offering to install any you
+chose that aren't there yet (`npm install -g` for the CLIs, winget for Node). The
+shared daemon, dashboard and Home Assistant plumbing are installed either way; the
+choice only decides which adapters get set up. Pick them non-interactively with
+`-Clients`:
 
 ```powershell
 .\install.ps1 -Clients copilot,claude,mcp
@@ -140,8 +143,25 @@ Choosing **mcp** installs the Node server, writes a paste-ready client config to
 it's present; other MCP clients (Cursor, ChatGPT) use the snippet — see
 [`mcp/README.md`](mcp/README.md).
 
-It also registers in **Apps & features**, so it uninstalls like any other program. No
-installer executable, no admin rights, and no SmartScreen warning.
+Then it finds Home Assistant: it probes `homeassistant.local:8123` (the hostname Home
+Assistant publishes over mDNS, which Windows resolves natively) and confirms the
+product from its unauthenticated `manifest.json`. **If that works it just uses it** —
+it doesn't ask you to confirm a question it already answered. You're only prompted for
+a URL when nothing responded. It then walks you through creating a long-lived token,
+and immediately shows you what you connected to:
+
+```
+==> Connecting to Home Assistant
+    connected to http://homeassistant.local:8123 - 303 Home 2026.9.3
+    mqtt.publish available
+```
+
+A token that doesn't work is reported there and then, with another go at pasting it,
+rather than failing at the end of the install.
+
+It also puts an **`agent-ha-bridge` command on your PATH** and registers in **Apps &
+features**, so it uninstalls like any other program. No installer executable, no admin
+rights, and no SmartScreen warning.
 
 If you already know the details, skip the prompts entirely:
 
@@ -160,14 +180,12 @@ Optional out-of-band push when a session needs you:
 
 The installer is idempotent — re-run it to upgrade in place. Re-running with only
 some arguments keeps the rest of your settings, and the previous config is backed up
-to `agent-ha-bridge.config.json.bak` first.
+to `config.json.bak` first.
 
 It is **not interactive** when you pass `-NonInteractive`, which is what you want in a
-script; otherwise it prompts for anything missing. Before finishing it verifies the URL
-and token against `/api/` and checks that `mqtt.publish` exists, so a misconfigured
-install fails immediately instead of silently doing nothing later. Use `-SkipVerify`
-for an offline install, or when the token comes from an environment variable that isn't
-set yet.
+script; otherwise it prompts for anything missing. Use `-SkipVerify` for an offline
+install, or when the token comes from an environment variable that isn't set yet, and
+`-SkipPath` to leave PATH alone.
 
 To try a build without touching a working install, point it at a sandbox:
 
@@ -175,6 +193,31 @@ To try a build without touching a working install, point it at a sandbox:
 .\install.ps1 -HomeAssistantUrl http://ha.example:8123 -Token test `
               -TargetHome $env:TEMP\bridge-sandbox -SkipTask -SkipVerify
 ```
+
+`-TargetHome` also keeps the sandbox off your PATH, so its copy of the command can
+never act on the real install.
+
+### The `agent-ha-bridge` command
+
+Installing puts `agent-ha-bridge` on your PATH, and copies the installer to
+`~/.agent-ha-bridge/installer`. That is how you change anything later — **you do not
+need the repository**, which matters because the one-liner doesn't leave one behind:
+
+```powershell
+agent-ha-bridge                 # same as `status`
+agent-ha-bridge configure       # re-run the installer, keeping your settings as defaults
+agent-ha-bridge status          # install, daemon and Home Assistant connection
+agent-ha-bridge restart         # restart the bridge daemon
+agent-ha-bridge logs -Follow    # tail the daemon log
+agent-ha-bridge update          # check for a newer release and offer to install it
+agent-ha-bridge uninstall       # remove the bridge
+agent-ha-bridge help
+```
+
+Anything after the command goes straight to the underlying script, as a normal named
+parameter — so `agent-ha-bridge configure -Clients copilot,claude` and
+`agent-ha-bridge configure -NotifyService notify.mobile_app_pixel` both work.
+`--configure` and `/configure` are accepted too.
 
 ### Configuration
 
@@ -398,6 +441,8 @@ From a terminal:
 .\update.ps1            # install it, after confirming
 ```
 
+Or, from anywhere, `agent-ha-bridge update`.
+
 Either way your configuration is preserved: the installer reads the existing config,
 backs it up, and keeps your URL, token and settings.
 
@@ -413,12 +458,13 @@ action, because this software types into terminals and registers scheduled tasks
 From **Settings → Apps → Installed apps**, or:
 
 ```powershell
-.\uninstall.ps1 -ClearEntities
+agent-ha-bridge uninstall
 ```
 
-`-ClearEntities` clears the retained MQTT discovery topics, the Detailed activity helper and
-the dashboard view, so Home Assistant is left clean; without it they linger.
-`-KeepConfig` preserves your settings.
+…which is `uninstall.ps1 -ClearEntities`. `-ClearEntities` clears the retained MQTT
+discovery topics, the Detailed activity helper and the dashboard view, so Home
+Assistant is left clean; without it they linger. `-KeepConfig` preserves your settings.
+The `agent-ha-bridge` PATH entry is removed too.
 
 ---
 
@@ -436,13 +482,24 @@ the dashboard view, so Home Assistant is left clean; without it they linger.
 .\tests\test-restart-restore.ps1  # a daemon restart restores cards instead of blanking them
 .\tests\test-new-session.ps1      # launching a session: argument quoting, the workspace allowlist, press handling
 .\tests\test-stop-session.ps1     # ending a session: graceful /exit, terminate fallback, press handling
-.\tests\test-install-clients.ps1  # installer client selection (‑Clients, persisted, defaults)
+.\tests\test-install-clients.ps1  # installer client selection (‑Clients, persisted, defaults, first-install picker)
+.\tests\test-install-deps.ps1     # dependency offers (PowerShell 7, Node, the agent CLIs) and PATH handling
+.\tests\test-install-connection.ps1 # Home Assistant discovery without a pointless prompt, and the connection check
+.\tests\test-install-command.ps1  # the agent-ha-bridge command, its payload, and a sandboxed end-to-end install
 .\tests\test-layout-migration.ps1 # upgrading a pre-rename ~/.copilot install in place
 .\tests\test-verbose-toggle.ps1   # Detailed activity helper is provisioned without ever resetting it
 ```
 
 These are plain PowerShell, need no Home Assistant, and run in a couple of seconds.
 The Claude adapter and the MCP server have their own suites — see their READMEs.
+
+Nothing in the suite may disturb a real install on the machine running it. The
+installer tests run against `-TargetHome` with `-SkipTask`, `-SkipPath` and
+`-SkipDependencies`, configure only Copilot (the Codex adapter registers a plugin with
+the real `codex` binary, and the MCP one can write to Claude Desktop — neither honours
+`-TargetHome`), inject their own package-manager runners, drive PATH through injected
+getters and setters, and assert afterwards that the user PATH and the real config are
+byte-for-byte unchanged.
 
 ---
 

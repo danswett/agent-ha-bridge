@@ -23,6 +23,9 @@ cd claude
 .\install-claude.ps1
 ```
 
+Or, on a machine that already has the bridge, `agent-ha-bridge configure -Clients claude`
+does both in one step — and offers to install Claude Code itself if it is missing.
+
 The adapter reuses the main bridge's Home Assistant layer, its daemon and its
 dashboard, so that must be installed first. `install-claude.ps1` copies the adapter to
 `~/.claude/ha-bridge` and merges three hooks into `~/.claude/settings.json`:

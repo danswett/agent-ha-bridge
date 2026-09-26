@@ -71,9 +71,13 @@ Test-That 'an installed version is always reported' {
 } (Get-BridgeInstalledVersion)
 
 Write-Host '--- the cache ---'
-$cachePath = $script:BridgeUpdateConfig.CacheFile
-$backup = "$cachePath.testbak"
-if (Test-Path -LiteralPath $cachePath) { Move-Item $cachePath $backup -Force }
+# Redirect the cache to a scratch file rather than writing bogus releases to the one
+# the daemon reads. Moving the real file aside and back still leaves a window where a
+# running daemon picks up "v9.9.9" and announces a phantom update in Home Assistant -
+# which it did, on the machine this was developed on.
+$realCachePath = $script:BridgeUpdateConfig.CacheFile
+$cachePath = Join-Path $env:TEMP ("bridge-update-test-" + [guid]::NewGuid().ToString('N') + '.json')
+$script:BridgeUpdateConfig.CacheFile = $cachePath
 try {
     # A cache that is fresh must be used rather than re-fetching. A bogus tag proves
     # the value came from the cache and not the network.
@@ -126,7 +130,13 @@ try {
 }
 finally {
     Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
-    if (Test-Path -LiteralPath $backup) { Move-Item $backup $cachePath -Force }
+    $script:BridgeUpdateConfig.CacheFile = $realCachePath
+}
+
+Test-That "the daemon's own update cache was never touched" {
+    $script:BridgeUpdateConfig.CacheFile -eq $realCachePath -and
+    ((-not (Test-Path -LiteralPath $realCachePath)) -or
+     ((Get-Content -LiteralPath $realCachePath -Raw) -notmatch '9\.9\.9'))
 }
 
 Write-Host '--- the generated updater is integrity-checked and safely quoted ---'

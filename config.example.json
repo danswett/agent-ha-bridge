@@ -32,7 +32,6 @@
     "copilotPath": "",
     "agencyPath": ""
   },
-  "clients": ["copilot"],
   "updates": {
     "repository": "danswett/agent-ha-bridge",
     "installedVersion": "",

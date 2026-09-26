@@ -9,6 +9,11 @@
     hooks; the shared daemon, dashboard and Home Assistant plumbing are installed
     regardless.
 
+    Anything missing is offered rather than demanded: PowerShell 7, Node.js and the
+    agent CLIs themselves can all be installed from here. It also puts an
+    `agent-ha-bridge` command on your PATH, which is how you reconfigure later without
+    needing the repository.
+
     Everything is idempotent: re-running it upgrades an existing install in place.
 
 .PARAMETER HomeAssistantUrl
@@ -37,6 +42,13 @@
     Skip the Home Assistant connectivity check. Use for an offline install, or when
     the token comes from an environment variable that is not set yet.
 
+.PARAMETER SkipDependencies
+    Never offer to install anything (PowerShell 7, Node.js, the agent CLIs). Missing
+    prerequisites are reported with the command that would install them.
+
+.PARAMETER SkipPath
+    Do not put the `agent-ha-bridge` command on your PATH.
+
 .PARAMETER NonInteractive
     Never prompt. Without this, the installer discovers Home Assistant on the network
     and asks for anything it still needs.
@@ -46,6 +58,10 @@
 
 .EXAMPLE
     .\install.ps1 -HomeAssistantUrl http://ha.lan:8123 -Token 'eyJ...' -NotifyService notify.mobile_app_pixel
+
+.EXAMPLE
+    # Once installed, reconfigure from anywhere - no clone needed.
+    agent-ha-bridge configure
 #>
 
 [CmdletBinding()]
@@ -57,6 +73,8 @@ param(
     [string]$TargetHome,
     [string[]]$Clients,
     [switch]$SkipVerify,
+    [switch]$SkipDependencies,
+    [switch]$SkipPath,
     [switch]$NonInteractive,
     [switch]$SkipTask
 )
@@ -77,6 +95,10 @@ $version = if (Test-Path -LiteralPath $versionFile) { (Get-Content -LiteralPath 
 $copilotHome = Join-Path $installHome '.copilot'
 $bridgeHome = Join-Path $installHome '.agent-ha-bridge'
 $hooksDir = Join-Path $bridgeHome 'hooks'
+# A copy of the installer, so `agent-ha-bridge configure` works on a machine that
+# never had the repository - which is every machine installed from the one-liner.
+$installerDir = Join-Path $bridgeHome 'installer'
+$binDir = Join-Path $bridgeHome 'bin'
 $configPath = Join-Path $bridgeHome 'config.json'
 $hookConfigPath = Join-Path $copilotHome 'hooks\decision-notifier.json'
 $taskName = 'AgentBridgeDaemon'
@@ -94,6 +116,482 @@ $legacyArpKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Copil
                 $(if ($TargetHome) { '_Sandbox' } else { '' })
 
 function Write-Step { param([string]$Message) Write-Host "==> $Message" -ForegroundColor Cyan }
+
+# ------------------------------------------------------------------ prompting
+# Everything that reads from the user goes through these, so the phrasing is uniform
+# and a non-interactive run has exactly one place that can ever block.
+
+function Read-BridgeYesNo {
+    <# A yes/no prompt that accepts Enter as the default. #>
+    param(
+        [Parameter(Mandatory)][string]$Prompt,
+        [bool]$Default = $true
+    )
+    $suffix = if ($Default) { '[Y/n]' } else { '[y/N]' }
+    while ($true) {
+        $answer = Read-Host "$Prompt $suffix"
+        if ([string]::IsNullOrWhiteSpace($answer)) { return $Default }
+        switch -Regex ($answer.Trim()) {
+            '^(y|yes)$' { return $true }
+            '^(n|no)$'  { return $false }
+            default     { Write-Host '    Please answer y or n.' -ForegroundColor DarkGray }
+        }
+    }
+}
+
+# --------------------------------------------------------------- dependencies
+# The installer used to stop dead on a missing prerequisite, which is a poor first
+# impression on a fresh machine. Everything it knows how to install lives in this
+# catalogue, so a missing dependency becomes an offer instead of an error and the
+# exact command is a single testable lookup.
+$script:BridgeDependencies = [ordered]@{
+    pwsh = [ordered]@{
+        Label   = 'PowerShell 7'
+        Manager = 'winget'
+        Package = 'Microsoft.PowerShell'
+        Why     = 'every bridge script and hook runs under pwsh'
+    }
+    node = [ordered]@{
+        Label   = 'Node.js (LTS)'
+        Manager = 'winget'
+        Package = 'OpenJS.NodeJS.LTS'
+        Why     = 'npm installs the agent CLIs, and the MCP server is a Node process'
+    }
+    copilot = [ordered]@{
+        Label   = 'GitHub Copilot CLI'
+        Manager = 'npm'
+        Package = '@github/copilot'
+        Why     = ''
+    }
+    claude = [ordered]@{
+        Label   = 'Claude Code'
+        Manager = 'npm'
+        Package = '@anthropic-ai/claude-code'
+        Why     = ''
+    }
+    codex = [ordered]@{
+        Label   = 'OpenAI Codex CLI'
+        Manager = 'npm'
+        Package = '@openai/codex'
+        Why     = ''
+    }
+}
+
+function Get-BridgeDependencyCommand {
+    <# The exact command line that installs a dependency. #>
+    param([Parameter(Mandatory)][string]$Name)
+
+    $dep = $script:BridgeDependencies[$Name]
+    if (-not $dep) { throw "Unknown dependency '$Name'. Known: $(($script:BridgeDependencies.Keys) -join ', ')." }
+    switch ($dep.Manager) {
+        'winget' {
+            return ("winget install --id $($dep.Package) --source winget --exact " +
+                    '--accept-package-agreements --accept-source-agreements')
+        }
+        'npm' { return "npm install -g $($dep.Package)" }
+        default { throw "Unknown package manager '$($dep.Manager)' for '$Name'." }
+    }
+}
+
+function Get-BridgePwshPath {
+    <#
+        pwsh.exe, wherever it is. Get-Command alone is not enough straight after a
+        winget install: this process's PATH predates it, so the well-known install
+        locations are checked as well.
+    #>
+    $command = Get-Command pwsh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($command) { return $command.Source }
+    $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ }
+    foreach ($root in $roots) {
+        $candidate = Join-Path $root 'PowerShell\7\pwsh.exe'
+        if (Test-Path -LiteralPath $candidate) { return $candidate }
+    }
+    $null
+}
+
+function Update-BridgeSessionPath {
+    <#
+        winget and npm update the stored PATH, not this process's copy of it, so a
+        dependency installed a moment ago is invisible until the next terminal. Merge
+        the stored value in so the rest of the install can use what it just installed,
+        without discarding anything this shell had of its own.
+    #>
+    try {
+        $seen = @{}
+        $merged = @()
+        foreach ($source in @(
+            $env:PATH,
+            [Environment]::GetEnvironmentVariable('Path', 'Machine'),
+            [Environment]::GetEnvironmentVariable('Path', 'User')
+        )) {
+            foreach ($entry in (([string]$source) -split ';')) {
+                if ([string]::IsNullOrWhiteSpace($entry)) { continue }
+                $key = ConvertTo-BridgePathKey $entry
+                if ($seen.ContainsKey($key)) { continue }
+                $seen[$key] = $true
+                $merged += $entry
+            }
+        }
+        if ($merged) { $env:PATH = $merged -join ';' }
+    }
+    catch { }
+}
+
+function ConvertTo-BridgeArgumentList {
+    <#
+        Rebuilds a command-line argument list from bound parameters, so the installer
+        can relaunch itself under PowerShell 7 with the options it was given.
+
+        Secrets are never forwarded - a command line is readable by every process on
+        the machine - so the caller refuses the relaunch when a token was passed
+        rather than this quietly leaking one.
+    #>
+    param([Parameter(Mandatory)][hashtable]$BoundParameters, [string[]]$Exclude = @())
+
+    $list = @()
+    foreach ($name in $BoundParameters.Keys) {
+        if ($Exclude -contains $name) { continue }
+        $value = $BoundParameters[$name]
+        if ($value -is [System.Management.Automation.SwitchParameter]) {
+            if ($value.IsPresent) { $list += "-$name" }
+            continue
+        }
+        if ($null -eq $value) { continue }
+        $joined = (@($value) | ForEach-Object { [string]$_ }) -join ','
+        if ([string]::IsNullOrWhiteSpace($joined)) { continue }
+        $list += "-$name"
+        $list += $joined
+    }
+    $list
+}
+
+function Test-BridgeDependencyInstalled {
+    <# Whether a catalogue entry is already satisfied. #>
+    param([Parameter(Mandatory)][string]$Name)
+    switch ($Name) {
+        'pwsh' { return [bool](Get-BridgePwshPath) }
+        'node' { return [bool](Get-Command npm -ErrorAction SilentlyContinue) }
+        default { return [bool](Test-BridgeClientInstalled $Name) }
+    }
+}
+
+function Invoke-BridgeInstallCommand {
+    <#
+        Runs an install command line, echoing its output rather than returning it, so
+        the caller gets a clean boolean and the user still sees the progress.
+    #>
+    param([Parameter(Mandatory)][string]$Command)
+
+    $parts = @($Command -split '\s+' | Where-Object { $_ })
+    $exe = $parts[0]
+    $rest = @()
+    if ($parts.Count -gt 1) { $rest = $parts[1..($parts.Count - 1)] }
+
+    $global:LASTEXITCODE = 0
+    & $exe @rest 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+    return ($LASTEXITCODE -eq 0)
+}
+
+function Request-BridgeDependency {
+    <#
+        Offers to install a missing dependency, and reports what happened as one of
+        Present, Installed, Declined, Failed, Unavailable or Skipped.
+
+        -Probe, -Ask, -Runner and -ManagerProbe are injectable, so the whole decision
+        can be tested without a package manager ever running.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [scriptblock]$Probe,
+        [scriptblock]$Ask,
+        [scriptblock]$Runner,
+        [scriptblock]$ManagerProbe,
+        [switch]$NonInteractive
+    )
+
+    $dep = $script:BridgeDependencies[$Name]
+    if (-not $dep) { throw "Unknown dependency '$Name'. Known: $(($script:BridgeDependencies.Keys) -join ', ')." }
+    if (-not $Probe)        { $Probe        = { param($n) Test-BridgeDependencyInstalled $n } }
+    if (-not $Ask)          { $Ask          = { param($p) Read-BridgeYesNo -Prompt $p } }
+    if (-not $Runner)       { $Runner       = { param($c) Invoke-BridgeInstallCommand -Command $c } }
+    if (-not $ManagerProbe) { $ManagerProbe = { param($m) [bool](Get-Command $m -ErrorAction SilentlyContinue) } }
+
+    if (& $Probe $Name) { return 'Present' }
+
+    $command = Get-BridgeDependencyCommand -Name $Name
+
+    if ($NonInteractive) {
+        Write-Warning "$($dep.Label) is not installed. Install it with: $command"
+        return 'Skipped'
+    }
+    if (-not (& $ManagerProbe $dep.Manager)) {
+        Write-Warning ("$($dep.Label) is missing and $($dep.Manager) is not available to install it. " +
+                       "Install it yourself with: $command")
+        return 'Unavailable'
+    }
+
+    Write-Host ''
+    Write-Host "$($dep.Label) is not installed." -ForegroundColor Yellow
+    if ($dep.Why) { Write-Host "    $($dep.Why)" -ForegroundColor DarkGray }
+    Write-Host "    $command" -ForegroundColor DarkGray
+    if (-not (& $Ask "    Install $($dep.Label) now?")) {
+        Write-Host "    skipped - install it later with: $command" -ForegroundColor DarkGray
+        return 'Declined'
+    }
+
+    Write-Step "Installing $($dep.Label)"
+    $ok = $false
+    try { $ok = [bool](& $Runner $command) }
+    catch { Write-Warning $_.Exception.Message; $ok = $false }
+
+    if (-not $ok) {
+        Write-Warning "$($dep.Label) did not install cleanly. Install it with: $command"
+        return 'Failed'
+    }
+
+    Update-BridgeSessionPath
+    if (& $Probe $Name) { Write-Host "    $($dep.Label) installed" -ForegroundColor Green }
+    else {
+        Write-Host ("    $($dep.Label) installed, but it is not on this shell's PATH yet - " +
+                    'open a new terminal to use it.') -ForegroundColor Yellow
+    }
+    return 'Installed'
+}
+
+# ------------------------------------------------------------------ user PATH
+# So that `agent-ha-bridge` works from any terminal, which is also how you
+# reconfigure an install whose clone is long gone.
+
+function ConvertTo-BridgePathKey {
+    <# Comparison form for a PATH entry: unquoted, trailing separator and case dropped. #>
+    param([AllowEmptyString()][AllowNull()][string]$Path)
+    ([string]$Path).Trim().Trim('"').TrimEnd('\', '/').ToLowerInvariant()
+}
+
+function Add-BridgePathEntry {
+    <#
+        $Current with $Directory appended, or $null when it is already present.
+
+        The existing value is preserved character for character - empty segments and
+        all - because the uninstaller has to be able to put it back exactly as it was.
+        A new entry goes in before any trailing separator, so a PATH written as
+        "a;b;" stays that shape rather than growing a ";;".
+
+        Pure, so the quoting, separator and duplicate handling are testable without
+        touching the real PATH.
+    #>
+    param(
+        [AllowEmptyString()][AllowNull()][string]$Current,
+        [Parameter(Mandatory)][string]$Directory
+    )
+    $target = ConvertTo-BridgePathKey $Directory
+    $segments = @(([string]$Current) -split ';')
+    foreach ($entry in $segments) {
+        if ([string]::IsNullOrWhiteSpace($entry)) { continue }
+        if ((ConvertTo-BridgePathKey $entry) -eq $target) { return $null }
+    }
+    if ([string]::IsNullOrWhiteSpace($Current)) { return $Directory }
+
+    $insertAt = $segments.Count
+    while ($insertAt -gt 0 -and [string]::IsNullOrWhiteSpace($segments[$insertAt - 1])) { $insertAt-- }
+
+    $updated = @()
+    if ($insertAt -gt 0) { $updated += $segments[0..($insertAt - 1)] }
+    $updated += $Directory
+    if ($insertAt -lt $segments.Count) { $updated += $segments[$insertAt..($segments.Count - 1)] }
+    $updated -join ';'
+}
+
+function Remove-BridgePathEntry {
+    <#
+        $Current without $Directory, or $null when it was not there to begin with.
+        Everything else is kept verbatim, so add-then-remove is an exact round trip.
+    #>
+    param(
+        [AllowEmptyString()][AllowNull()][string]$Current,
+        [Parameter(Mandatory)][string]$Directory
+    )
+    $target = ConvertTo-BridgePathKey $Directory
+    $segments = @(([string]$Current) -split ';')
+    $kept = @($segments | Where-Object {
+        [string]::IsNullOrWhiteSpace($_) -or (ConvertTo-BridgePathKey $_) -ne $target
+    })
+    if ($kept.Count -eq $segments.Count) { return $null }
+    $kept -join ';'
+}
+
+function Get-BridgeUserPath {
+    <#
+        The user PATH exactly as stored, unexpanded.
+
+        [Environment]::GetEnvironmentVariable would hand back an expanded copy, and
+        writing that back turns a REG_EXPAND_SZ PATH into a literal one - baking
+        today's %USERPROFILE% into every entry that used it. Reading through the
+        registry keeps the raw value intact.
+    #>
+    try {
+        $key = Get-Item -LiteralPath 'HKCU:\Environment' -ErrorAction Stop
+        return [string]$key.GetValue('Path', '', 'DoNotExpandEnvironmentNames')
+    }
+    catch { return '' }
+}
+
+function Set-BridgeUserPath {
+    <# Writes the user PATH back, preserving whether it expands environment variables. #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Value)
+
+    $kind = 'ExpandString'
+    try {
+        $key = Get-Item -LiteralPath 'HKCU:\Environment' -ErrorAction Stop
+        if ($key.GetValueNames() -contains 'Path') { $kind = [string]$key.GetValueKind('Path') }
+    }
+    catch { }
+    $type = if ($kind -eq 'String') { 'String' } else { 'ExpandString' }
+    Set-ItemProperty -LiteralPath 'HKCU:\Environment' -Name 'Path' -Value $Value -Type $type
+}
+
+function Send-BridgeEnvironmentChange {
+    <#
+        Tells Explorer the environment changed, so a terminal opened afterwards sees
+        the new PATH instead of needing a sign-out. Best-effort: a failure here only
+        costs the user a new shell.
+    #>
+    try {
+        if (-not ('BridgeNativeEnv' -as [type])) {
+            Add-Type -Namespace '' -Name 'BridgeNativeEnv' -MemberDefinition @'
+[DllImport("user32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+public static extern System.IntPtr SendMessageTimeout(System.IntPtr hWnd, uint Msg,
+    System.IntPtr wParam, string lParam, uint fuFlags, uint uTimeout, out System.UIntPtr lpdwResult);
+'@ -ErrorAction Stop
+        }
+        $result = [UIntPtr]::Zero
+        # HWND_BROADCAST, WM_SETTINGCHANGE, SMTO_ABORTIFHUNG, 5s.
+        [void][BridgeNativeEnv]::SendMessageTimeout([IntPtr]0xffff, 0x1A, [IntPtr]::Zero,
+            'Environment', 0x2, 5000, [ref]$result)
+    }
+    catch { }
+}
+
+function Register-BridgePathEntry {
+    <#
+        Adds (or with -Remove, drops) a directory on the user PATH and reports whether
+        anything changed. -Getter and -Setter are injectable so a test can exercise the
+        whole path without touching the real environment.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Directory,
+        [scriptblock]$Getter,
+        [scriptblock]$Setter,
+        [switch]$Remove
+    )
+    if (-not $Getter) { $Getter = { Get-BridgeUserPath } }
+    if (-not $Setter) { $Setter = { param($v) Set-BridgeUserPath -Value $v } }
+
+    $current = [string](& $Getter)
+    $updated = if ($Remove) { Remove-BridgePathEntry -Current $current -Directory $Directory }
+               else { Add-BridgePathEntry -Current $current -Directory $Directory }
+    if ($null -eq $updated) { return $false }
+
+    & $Setter $updated
+    return $true
+}
+
+# ------------------------------------------------------- Home Assistant check
+
+function Get-BridgeHttpErrorDetail {
+    <# Turns a failed Invoke-RestMethod into something worth showing a user. #>
+    param([Parameter(Mandatory)]$ErrorRecord)
+
+    $status = $null
+    try { $status = [int]$ErrorRecord.Exception.Response.StatusCode } catch { }
+    switch ($status) {
+        401 { return 'the token was rejected (401 Unauthorized) - it may be mistyped, or created on a different Home Assistant' }
+        403 { return 'access was refused (403 Forbidden)' }
+        404 { return 'no Home Assistant API at that URL (404) - check the port and any path prefix' }
+        default {
+            if ($status) { return "HTTP $status - $($ErrorRecord.Exception.Message)" }
+            return $ErrorRecord.Exception.Message
+        }
+    }
+}
+
+function Test-BridgeHomeAssistantConnection {
+    <#
+        Confirms that a URL and token really do talk to Home Assistant, and reports
+        enough to show the user what they just connected to.
+
+        Always returns an object rather than throwing, so the caller can offer another
+        go at the token instead of ending the install on a typo.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$BaseUrl,
+        [AllowEmptyString()][AllowNull()][string]$Token,
+        [int]$TimeoutSec = 15
+    )
+
+    $base = ([string]$BaseUrl).TrimEnd('/')
+    $result = [pscustomobject]@{
+        Ok           = $false
+        BaseUrl      = $base
+        Message      = ''
+        Version      = ''
+        LocationName = ''
+        MqttPublish  = $false
+        Error        = ''
+    }
+    if ([string]::IsNullOrWhiteSpace($base)) { $result.Error = 'no Home Assistant URL'; return $result }
+    if ([string]::IsNullOrWhiteSpace($Token)) { $result.Error = 'no Home Assistant token'; return $result }
+
+    $headers = @{ Authorization = "Bearer $Token"; 'Content-Type' = 'application/json' }
+    try {
+        $api = Invoke-RestMethod -Uri "$base/api/" -Headers $headers -TimeoutSec $TimeoutSec
+        $result.Message = [string]$api.message
+        $result.Ok = $true
+    }
+    catch {
+        $result.Error = Get-BridgeHttpErrorDetail -ErrorRecord $_
+        return $result
+    }
+
+    # Cosmetic, but it is what turns "it worked" into "it worked, and this is the
+    # Home Assistant you are now attached to".
+    try {
+        $haConfig = Invoke-RestMethod -Uri "$base/api/config" -Headers $headers -TimeoutSec $TimeoutSec
+        $result.Version = [string]$haConfig.version
+        $result.LocationName = [string]$haConfig.location_name
+    }
+    catch { }
+
+    # The MQTT integration is the one prerequisite the bridge cannot provision itself:
+    # every per-session entity is published through the mqtt.publish service.
+    try {
+        $services = Invoke-RestMethod -Uri "$base/api/services" -Headers $headers -TimeoutSec ($TimeoutSec + 5)
+        $mqtt = @($services) | Where-Object { $_.domain -eq 'mqtt' }
+        $result.MqttPublish = [bool]($mqtt -and ($mqtt.services.PSObject.Properties.Name -contains 'publish'))
+    }
+    catch { }
+
+    $result
+}
+
+function Write-BridgeConnectionResult {
+    <# The one place that decides how a connection attempt is reported. #>
+    param([Parameter(Mandatory)]$Result)
+
+    if (-not $Result.Ok) {
+        Write-Host "    could not connect to $($Result.BaseUrl): $($Result.Error)" -ForegroundColor Red
+        return
+    }
+    $who = @($Result.LocationName, $Result.Version) | Where-Object { $_ }
+    $suffix = if ($who) { " - $($who -join ' ')" } else { '' }
+    Write-Host "    connected to $($Result.BaseUrl)$suffix" -ForegroundColor Green
+    if ($Result.MqttPublish) { Write-Host '    mqtt.publish available' -ForegroundColor Green }
+    else {
+        Write-Warning ('Home Assistant has no mqtt.publish service. Add the MQTT integration ' +
+                       '(Settings > Devices & Services > Add Integration > MQTT) or the bridge ' +
+                       'cannot create its entities.')
+    }
+}
 
 $script:KnownClients = @('copilot', 'claude', 'codex', 'mcp')
 $script:ClientLabels = [ordered]@{
@@ -246,6 +744,48 @@ function Find-HomeAssistant {
         if (Test-IsHomeAssistant -BaseUrl $candidate) { return $candidate }
     }
     return $null
+}
+
+function Resolve-BridgeHomeAssistantUrl {
+    <#
+        Settles on a Home Assistant URL, and prompts only when it has to.
+
+        The old flow discovered Home Assistant, printed what it found, and then asked
+        for the URL anyway - an empty Enter being the right answer to a question that
+        should never have been asked. Now a URL that answers as Home Assistant is
+        simply used: the one already in the config first (a re-run should not re-probe
+        a working install), then whatever discovery turns up. The prompt is the
+        fallback for when neither works, and -HomeAssistantUrl still overrides
+        everything.
+
+        -Probe, -Discover and -Prompt are injectable so the decision is testable
+        without a Home Assistant on the network.
+    #>
+    param(
+        [AllowEmptyString()][AllowNull()][string]$Configured,
+        [scriptblock]$Probe,
+        [scriptblock]$Discover,
+        [scriptblock]$Prompt
+    )
+    if (-not $Probe)    { $Probe    = { param($u) Test-IsHomeAssistant -BaseUrl $u } }
+    if (-not $Discover) { $Discover = { Find-HomeAssistant } }
+
+    $configured = ([string]$Configured).Trim().TrimEnd('/')
+    if ($configured -and (& $Probe $configured)) {
+        return [pscustomobject]@{ Url = $configured; Source = 'config'; Prompted = $false }
+    }
+
+    $found = & $Discover
+    if ($found) {
+        return [pscustomobject]@{ Url = ([string]$found).TrimEnd('/'); Source = 'discovered'; Prompted = $false }
+    }
+
+    if (-not $Prompt) {
+        return [pscustomobject]@{ Url = $configured; Source = 'unverified'; Prompted = $false }
+    }
+    $answer = ([string](& $Prompt $configured)).Trim().TrimEnd('/')
+    if (-not $answer) { $answer = $configured }
+    [pscustomobject]@{ Url = $answer; Source = 'typed'; Prompted = $true }
 }
 
 function Protect-BridgeSecretFile {
@@ -420,6 +960,69 @@ function Invoke-BridgeLayoutMigration {
     $migrated
 }
 
+# ------------------------------------------------------- installer payload
+# So that an install can be reconfigured, updated or removed from a machine that
+# never had the repository - which is every machine installed from the one-liner.
+
+# What `agent-ha-bridge configure` needs to re-run a full install. node_modules is
+# excluded: the MCP installer runs npm itself, and copying it would dwarf everything
+# else here.
+$script:BridgePayloadFiles = @('install.ps1', 'uninstall.ps1', 'update.ps1', 'config.example.json', 'VERSION')
+$script:BridgePayloadDirs = @('hooks', 'bin', 'claude', 'codex', 'mcp')
+
+function Copy-BridgeInstallerPayload {
+    <#
+        Copies the installer next to the install it produced, and returns the number of
+        items copied. The destination is cleared first so a file deleted upstream cannot
+        linger and be re-run by a later `configure`.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [Parameter(Mandatory)][string]$Destination
+    )
+
+    if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Recurse -Force }
+    New-Item -ItemType Directory -Path $Destination -Force | Out-Null
+
+    $copied = 0
+    foreach ($name in $script:BridgePayloadFiles) {
+        $from = Join-Path $RepoRoot $name
+        if (Test-Path -LiteralPath $from) { Copy-Item -LiteralPath $from -Destination $Destination -Force; $copied++ }
+    }
+    foreach ($name in $script:BridgePayloadDirs) {
+        $from = Join-Path $RepoRoot $name
+        if (-not (Test-Path -LiteralPath $from)) { continue }
+        $to = Join-Path $Destination $name
+        Copy-Item -LiteralPath $from -Destination $to -Recurse -Force `
+            -Exclude @('node_modules') -ErrorAction SilentlyContinue
+        $stale = Join-Path $to 'node_modules'
+        if (Test-Path -LiteralPath $stale) { Remove-Item -LiteralPath $stale -Recurse -Force -ErrorAction SilentlyContinue }
+        $copied++
+    }
+    $copied
+}
+
+function Install-BridgeCommand {
+    <#
+        Puts the `agent-ha-bridge` command in $BinDir and reports its path.
+
+        The .cmd shim is what actually goes on PATH: a PowerShell function or a profile
+        edit would only work in pwsh, and only in shells started afterwards.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$RepoRoot,
+        [Parameter(Mandatory)][string]$BinDir
+    )
+
+    if (-not (Test-Path -LiteralPath $BinDir)) { New-Item -ItemType Directory -Path $BinDir -Force | Out-Null }
+    foreach ($name in @('agent-ha-bridge.ps1', 'agent-ha-bridge.cmd')) {
+        $from = Join-Path (Join-Path $RepoRoot 'bin') $name
+        if (-not (Test-Path -LiteralPath $from)) { throw "The bridge command source $from is missing." }
+        Copy-Item -LiteralPath $from -Destination $BinDir -Force
+    }
+    Join-Path $BinDir 'agent-ha-bridge.cmd'
+}
+
 # Tests dot-source this script with BRIDGE_INSTALL_NORUN set to load its helper
 # functions without running the install; a real run never sets it.
 if ($env:BRIDGE_INSTALL_NORUN) { return }
@@ -427,8 +1030,35 @@ if ($env:BRIDGE_INSTALL_NORUN) { return }
 if (-not $IsWindows -and $PSVersionTable.PSVersion.Major -ge 6) {
     throw 'This bridge is Windows-only: reply injection uses AttachConsole/WriteConsoleInput.'
 }
+
+# Windows PowerShell can parse this script but not run it: the hooks, the daemon and
+# the reply injection are all pwsh. A missing prerequisite used to end the install
+# here, which is exactly the wrong moment to hand someone a winget command - so get
+# PowerShell 7 installed and hand the install over to it instead.
 if ($PSVersionTable.PSVersion.Major -lt 7) {
-    throw "PowerShell 7+ is required (found $($PSVersionTable.PSVersion))."
+    Write-Host ''
+    Write-Host "This installer runs on PowerShell 7; you are on Windows PowerShell $($PSVersionTable.PSVersion)." -ForegroundColor Yellow
+
+    $pwshPath = Get-BridgePwshPath
+    if (-not $pwshPath) {
+        $outcome = Request-BridgeDependency -Name 'pwsh' -NonInteractive:$NonInteractive
+        if ($outcome -eq 'Installed') { $pwshPath = Get-BridgePwshPath }
+    }
+    if (-not $pwshPath) {
+        throw ("PowerShell 7 is required. Install it with:`n    " +
+               (Get-BridgeDependencyCommand -Name 'pwsh'))
+    }
+    if ($PSBoundParameters.ContainsKey('Token') -and $Token) {
+        throw ("PowerShell 7 is ready at $pwshPath, but -Token is not forwarded to it: a " +
+               "command line is readable by every process on the machine. Re-run there " +
+               "yourself:`n    & '$pwshPath' -NoProfile -File '$PSCommandPath' -Token '<token>'")
+    }
+
+    Write-Step "Restarting under PowerShell 7 ($pwshPath)"
+    $forwarded = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath) +
+                 @(ConvertTo-BridgeArgumentList -BoundParameters $PSBoundParameters -Exclude @('Token'))
+    & $pwshPath @forwarded
+    exit $LASTEXITCODE
 }
 if (-not (Test-Path -LiteralPath $bridgeHome)) {
     New-Item -ItemType Directory -Path $bridgeHome -Force | Out-Null
@@ -451,8 +1081,11 @@ Get-ChildItem (Join-Path $repoRoot 'hooks') -File | ForEach-Object {
 if (Test-Path -LiteralPath $versionFile) { Copy-Item $versionFile $hooksDir -Force }
 
 # --------------------------------------------------------------------- config
-Write-Step "Writing bridge config to $configPath"
-$config = if (Test-Path -LiteralPath $configPath) {
+Write-Step 'Reading the bridge config'
+# Whether this is a first install decides whether a remembered client selection
+# exists at all. config.example.json is a template, not a previous answer.
+$configExisted = Test-Path -LiteralPath $configPath
+$config = if ($configExisted) {
     # Never lose a working config to a mistyped re-run.
     Copy-Item $configPath "$configPath.bak" -Force
     [void](Protect-BridgeSecretFile -Path "$configPath.bak")
@@ -486,55 +1119,117 @@ if ($config.PSObject.Properties['dashboard'] -and
     Write-Host '    dashboard slug: copilot-decisions -> agent-decisions'
 }
 
-# --------------------------------------------------------------- interactive
-# Fill in whatever is still missing by discovering Home Assistant and asking, so the
-# common case is running install.ps1 with no arguments at all.
-if (-not $NonInteractive) {
-    $needsUrl = -not ($PSBoundParameters.ContainsKey('HomeAssistantUrl') -and $HomeAssistantUrl)
-    $knownToken = $config.homeAssistant.token
-    if (-not $knownToken -and $config.homeAssistant.tokenEnvVar) {
-        $knownToken = [Environment]::GetEnvironmentVariable($config.homeAssistant.tokenEnvVar)
-    }
-
-    if ($needsUrl) {
-        Write-Step 'Looking for Home Assistant'
-        $found = Find-HomeAssistant
-        if ($found) {
-            Write-Host "    found $found" -ForegroundColor Green
-            $config.homeAssistant.baseUrl = $found
-        }
-        else {
-            Write-Host '    not found automatically' -ForegroundColor Yellow
-        }
-        $prompt = "    Home Assistant URL [$($config.homeAssistant.baseUrl)]"
-        $answer = Read-Host $prompt
-        if ($answer) { $config.homeAssistant.baseUrl = $answer.Trim().TrimEnd('/') }
-    }
-
-    if (-not $knownToken) {
-        $profileUrl = "$($config.homeAssistant.baseUrl.TrimEnd('/'))/profile/security"
-        Write-Step 'Home Assistant needs a long-lived access token'
-        Write-Host "    1. Open $profileUrl"
-        Write-Host '    2. Scroll to "Long-lived access tokens" and choose "Create token"'
-        Write-Host '    3. Name it anything (e.g. "Copilot CLI bridge") and copy the value'
-        $entered = Read-Host '    Paste the token here'
-        if ($entered) { $config.homeAssistant.token = $entered.Trim() }
-    }
-}
-
 # ------------------------------------------------------------------- clients
-# Decide which clients to configure. -Clients wins, then a persisted selection (so a
-# re-run or self-update reconfigures the same set), then an interactive pick, then
-# 'copilot' as the unattended default. The shared daemon, dashboard and Home Assistant
-# plumbing are installed either way.
+# Which clients to configure comes first: the answer decides what else gets offered,
+# and it is the question people most want to be asked. -Clients wins, then a
+# selection remembered from a previous install (so a re-run or a self-update
+# reconfigures the same set), then an interactive pick, then 'copilot' as the
+# unattended default. The shared daemon, dashboard and Home Assistant plumbing are
+# installed either way.
 $detectedClients = @($script:KnownClients | Where-Object { Test-BridgeClientInstalled $_ })
 $requestedClients = if ($PSBoundParameters.ContainsKey('Clients')) { $Clients } else { $null }
-$persistedClients = if ($config.PSObject.Properties['clients']) { @($config.clients) } else { @() }
+# Only a config that already existed can hold a previous answer. Reading this from
+# the shipped example is what used to make the picker never appear.
+$persistedClients = @()
+if ($configExisted -and $config.PSObject.Properties['clients']) { $persistedClients = @($config.clients) }
 $selectedClients = Resolve-BridgeClients -Requested $requestedClients -Persisted $persistedClients `
     -NonInteractive:$NonInteractive -Prompt { Read-BridgeClientSelection -Detected $detectedClients }
 if ($config.PSObject.Properties['clients']) { $config.clients = @($selectedClients) }
 else { $config | Add-Member -NotePropertyName 'clients' -NotePropertyValue @($selectedClients) -Force }
 Write-Step "Configuring: $(($selectedClients | ForEach-Object { $script:ClientLabels[$_] }) -join ', ')"
+
+# Configuring a client the machine does not have writes hooks that do nothing, which
+# is a confusing thing to discover later. Offer to install each one instead - and
+# Node first when it is needed, since every agent CLI ships through npm.
+if (-not $SkipDependencies) {
+    $wanted = @($selectedClients | Where-Object { -not (Test-BridgeDependencyInstalled $_) })
+    if ($wanted) {
+        Write-Step 'Checking the clients you chose are installed'
+        # Node covers all of them: the CLIs install through npm, and 'mcp' is this
+        # repo's own Node server rather than a package, so it needs the runtime too.
+        [void](Request-BridgeDependency -Name 'node' -NonInteractive:$NonInteractive)
+        foreach ($client in @($wanted | Where-Object { $_ -ne 'mcp' })) {
+            [void](Request-BridgeDependency -Name $client -NonInteractive:$NonInteractive)
+        }
+    }
+}
+
+# ----------------------------------------------------------- Home Assistant
+# Settle the URL without asking a question that already has an answer, then make sure
+# the token actually works before the install carries on.
+$effectiveToken = $config.homeAssistant.token
+if (-not $effectiveToken -and $config.homeAssistant.tokenEnvVar) {
+    $effectiveToken = [Environment]::GetEnvironmentVariable($config.homeAssistant.tokenEnvVar)
+}
+
+if (-not ($PSBoundParameters.ContainsKey('HomeAssistantUrl') -and $HomeAssistantUrl)) {
+    Write-Step 'Looking for Home Assistant'
+    $urlPrompt = $null
+    if (-not $NonInteractive) {
+        $urlPrompt = {
+            param($current)
+            Write-Host '    not found automatically' -ForegroundColor Yellow
+            Read-Host "    Home Assistant URL [$current]"
+        }
+    }
+    $resolvedUrl = Resolve-BridgeHomeAssistantUrl -Configured $config.homeAssistant.baseUrl -Prompt $urlPrompt
+    if ($resolvedUrl.Url) { $config.homeAssistant.baseUrl = $resolvedUrl.Url }
+    switch ($resolvedUrl.Source) {
+        'config'     { Write-Host "    using $($resolvedUrl.Url) from the existing config" -ForegroundColor Green }
+        'discovered' { Write-Host "    found $($resolvedUrl.Url)" -ForegroundColor Green }
+        'typed'      { Write-Host "    using $($resolvedUrl.Url)" }
+        default      { Write-Host "    keeping $($resolvedUrl.Url), unverified" -ForegroundColor Yellow }
+    }
+}
+
+# A long-lived token is sent on every request, so over plain HTTP it crosses the
+# network in the clear. Local Home Assistant installs are usually http, so this warns
+# rather than blocks.
+$base = ([string]$config.homeAssistant.baseUrl).TrimEnd('/')
+if ($base -match '^http://' -and $base -notmatch '^http://(localhost|127\.0\.0\.1|\[::1\])') {
+    Write-Warning ("$base is plain HTTP, so the access token is sent unencrypted over your " +
+                   'network. Prefer https:// if your Home Assistant has a certificate.')
+}
+
+if ($SkipVerify) {
+    Write-Step 'Skipping the Home Assistant check (-SkipVerify)'
+    if (-not $effectiveToken -and -not $NonInteractive) {
+        Write-Host '    no token yet; set one later with: agent-ha-bridge configure' -ForegroundColor DarkGray
+    }
+}
+else {
+    Write-Step 'Connecting to Home Assistant'
+    # Up to three goes, because the overwhelmingly likely failure is a half-copied
+    # token - and being told that at the end of the install, rather than here, is what
+    # made the old flow frustrating.
+    $connection = Test-BridgeHomeAssistantConnection -BaseUrl $base -Token $effectiveToken
+    $remaining = 3
+    while (-not $connection.Ok -and -not $NonInteractive -and $remaining -gt 0) {
+        $remaining--
+        if ($effectiveToken) { Write-BridgeConnectionResult -Result $connection }
+        Write-Host ''
+        Write-Host 'Home Assistant needs a long-lived access token.' -ForegroundColor Yellow
+        Write-Host "    1. Open $base/profile/security"
+        Write-Host '    2. Scroll to "Long-lived access tokens" and choose "Create token"'
+        Write-Host '    3. Name it anything (e.g. "agent bridge") and copy the value'
+        $entered = Read-Host '    Paste the token here'
+        if ([string]::IsNullOrWhiteSpace($entered)) {
+            Write-Host '    nothing pasted; giving up on the token for now.' -ForegroundColor DarkGray
+            break
+        }
+        $effectiveToken = $entered.Trim()
+        $config.homeAssistant.token = $effectiveToken
+        Write-Step 'Connecting to Home Assistant'
+        $connection = Test-BridgeHomeAssistantConnection -BaseUrl $base -Token $effectiveToken
+    }
+
+    Write-BridgeConnectionResult -Result $connection
+    if (-not $connection.Ok) {
+        throw ("Could not reach Home Assistant at $base : $($connection.Error)`n" +
+               '    Fix it and re-run, or pass -SkipVerify to finish the install and use ' +
+               '`agent-ha-bridge configure` later.')
+    }
+}
 
 # Record what was installed, so the update check can compare against the newest
 # release without guessing.
@@ -545,6 +1240,7 @@ if (-not $config.PSObject.Properties.Name.Contains('updates')) {
 }
 $config.updates.installedVersion = $version
 
+Write-Step "Writing bridge config to $configPath"
 $config | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $configPath -Encoding UTF8
 # The token lives here; keep it readable only by the current user and out of any
 # shared listing.
@@ -553,64 +1249,6 @@ Write-Host "    baseUrl      : $($config.homeAssistant.baseUrl)"
 Write-Host "    token        : $(if ($config.homeAssistant.token) { 'set in config' } else { "from `$env:$($config.homeAssistant.tokenEnvVar)" })"
 Write-Host "    notifications: $(if ($config.notifications.enabled) { $config.notifications.service } else { 'disabled' })"
 
-# ------------------------------------------------------------------- preflight
-# Without this the installer happily reports success and the bridge only fails much
-# later, from a hook or the daemon, where the cause is far less obvious.
-if ($SkipVerify) {
-    Write-Step 'Skipping the Home Assistant check (-SkipVerify)'
-}
-else {
-    Write-Step 'Verifying Home Assistant'
-    $effectiveToken = $config.homeAssistant.token
-    if (-not $effectiveToken -and $config.homeAssistant.tokenEnvVar) {
-        $effectiveToken = [Environment]::GetEnvironmentVariable($config.homeAssistant.tokenEnvVar)
-    }
-
-    if (-not $effectiveToken) {
-        throw ("No Home Assistant token. Re-run without -NonInteractive to be prompted, " +
-               "or pass -Token '<long-lived token>', or set " +
-               "`$env:$($config.homeAssistant.tokenEnvVar), or pass -SkipVerify " +
-               'to finish the install and configure it later.')
-    }
-
-    $base = $config.homeAssistant.baseUrl.TrimEnd('/')
-    $authHeaders = @{ Authorization = "Bearer $effectiveToken"; 'Content-Type' = 'application/json' }
-
-    # A long-lived token is sent on every request, so over plain HTTP it crosses the
-    # network in the clear. Local Home Assistant installs are usually http, so this
-    # warns rather than blocks.
-    if ($base -match '^http://' -and $base -notmatch '^http://(localhost|127\.0\.0\.1|\[::1\])') {
-        Write-Warning ("$base is plain HTTP, so the access token is sent unencrypted " +
-                       'over your network. Prefer https:// if your Home Assistant has a certificate.')
-    }
-
-    try {
-        $api = Invoke-RestMethod -Uri "$base/api/" -Headers $authHeaders -TimeoutSec 15
-        Write-Host "    $base -> $($api.message)"
-    }
-    catch {
-        throw ("Could not reach Home Assistant at $base : $($_.Exception.Message)`n" +
-               '    Check -HomeAssistantUrl and that the token is valid, or pass -SkipVerify.')
-    }
-
-    # The MQTT integration is the one prerequisite the bridge cannot provision itself:
-    # every per-session entity is published through the mqtt.publish service.
-    try {
-        $services = Invoke-RestMethod -Uri "$base/api/services" -Headers $authHeaders -TimeoutSec 20
-        $mqtt = @($services) | Where-Object { $_.domain -eq 'mqtt' }
-        if ($mqtt -and $mqtt.services.PSObject.Properties.Name -contains 'publish') {
-            Write-Host '    mqtt.publish available'
-        }
-        else {
-            Write-Warning ('Home Assistant has no mqtt.publish service. Add the MQTT ' +
-                           'integration (Settings > Devices & Services > Add Integration > MQTT) ' +
-                           'or the bridge cannot create its entities.')
-        }
-    }
-    catch {
-        Write-Warning "Could not list Home Assistant services: $($_.Exception.Message)"
-    }
-}
 
 # Builds up to 1.4.2 shipped a decision-notifier skill. It never had frontmatter, so
 # Copilot never registered it, and any instruction telling the model to load it cost a
@@ -724,6 +1362,41 @@ foreach ($client in @('claude', 'codex', 'mcp')) {
     }
 }
 
+# ----------------------------------------------------- the bridge command
+# `agent-ha-bridge` on PATH is the answer to "how do I change this later". The
+# installer payload goes next to it so the command has a real installer to run, even
+# though the one-liner leaves nothing else behind.
+Write-Step "Installing the agent-ha-bridge command"
+$payloadCount = Copy-BridgeInstallerPayload -RepoRoot $repoRoot -Destination $installerDir
+Write-Host "    installer payload -> $installerDir ($payloadCount item(s))"
+$commandPath = Install-BridgeCommand -RepoRoot $repoRoot -BinDir $binDir
+Write-Host "    $commandPath"
+
+if ($SkipPath) {
+    Write-Step 'Leaving PATH alone (-SkipPath)'
+    Write-Host "    run it as $commandPath" -ForegroundColor DarkGray
+}
+elseif ($TargetHome) {
+    # A sandbox install shares the user's PATH with the real one, so putting its bin
+    # directory there would shadow the real command with a throwaway copy.
+    Write-Step 'Leaving PATH alone (-TargetHome)'
+    Write-Host "    run it as $commandPath" -ForegroundColor DarkGray
+}
+else {
+    Write-Step 'Putting agent-ha-bridge on your PATH'
+    if (Register-BridgePathEntry -Directory $binDir) {
+        Send-BridgeEnvironmentChange
+        Write-Host "    added $binDir to the user PATH" -ForegroundColor Green
+        Write-Host '    open a new terminal to use it there' -ForegroundColor DarkGray
+    }
+    else {
+        Write-Host "    $binDir was already on the user PATH"
+    }
+    # Make it usable in this shell straight away, without waiting for a new terminal.
+    $sessionPath = Add-BridgePathEntry -Current $env:PATH -Directory $binDir
+    if ($sessionPath) { $env:PATH = $sessionPath }
+}
+
 # ------------------------------------------------------- add/remove programs
 # No installer executable is needed for this: a per-user uninstall key is the same
 # list Settings reads, and it avoids the SmartScreen warning an unsigned exe would
@@ -777,8 +1450,14 @@ if ($selectedClients -contains 'mcp') {
 }
 Write-Host "  $stepNo. Open the Agent Sessions dashboard in Home Assistant."
 Write-Host "     Logs: `$env:TEMP\agent-bridge-daemon.log and agent-decision-bridge.log"
+Write-Host ''
+Write-Host 'From now on, manage this install with the agent-ha-bridge command:' -ForegroundColor Yellow
+Write-Host '  agent-ha-bridge status       what is installed, running and connected'
+Write-Host '  agent-ha-bridge configure    change any of these answers'
+Write-Host '  agent-ha-bridge update       move to a newer release'
+Write-Host '  agent-ha-bridge help         everything else'
 if ($selectedClients -notcontains 'mcp') {
     Write-Host ''
-    Write-Host 'Want an MCP client too (Claude Desktop, Cursor, ChatGPT)? Re-run with -Clients mcp,' -ForegroundColor DarkGray
-    Write-Host 'or add it in the picker. See mcp/README.md.' -ForegroundColor DarkGray
+    Write-Host 'Want an MCP client too (Claude Desktop, Cursor, ChatGPT)? Run' -ForegroundColor DarkGray
+    Write-Host '`agent-ha-bridge configure -Clients mcp`, or add it in the picker. See mcp/README.md.' -ForegroundColor DarkGray
 }
