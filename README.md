@@ -100,7 +100,9 @@ only a Home Assistant token.
 * These HACS frontend cards:
   [`card-mod`](https://github.com/thomasloven/lovelace-card-mod),
   [`button-card`](https://github.com/custom-cards/button-card),
-  [`layout-card`](https://github.com/thomasloven/lovelace-layout-card)
+  [`layout-card`](https://github.com/thomasloven/lovelace-layout-card).
+  The installer checks for these and tells you which are missing — and registers any
+  that you have downloaded but not added as a Lovelace resource
 
 ---
 
@@ -159,6 +161,14 @@ and immediately shows you what you connected to:
 A token that doesn't work is reported there and then, with another go at pasting it,
 rather than failing at the end of the install.
 
+Last it checks the three custom Lovelace cards the dashboard is drawn with. Without
+them the dashboard renders as a column of *Custom element doesn't exist* boxes — an
+install that reports success and visibly does not work. A card needs two separate
+things: the JavaScript downloaded to the Home Assistant host, which only HACS can do,
+and a Lovelace resource pointing at it, which is one WebSocket command — so the second
+half is repaired automatically, and the first is reported with the HACS repository to
+install.
+
 It also puts an **`agent-ha-bridge` command on your PATH** and registers in **Apps &
 features**, so it uninstalls like any other program. No installer executable, no admin
 rights, and no SmartScreen warning.
@@ -180,7 +190,10 @@ Optional out-of-band push when a session needs you:
 
 The installer is idempotent — re-run it to upgrade in place. Re-running with only
 some arguments keeps the rest of your settings, and the previous config is backed up
-to `config.json.bak` first.
+to `config.json.bak` first. A config written by an older version has any keys it is
+missing filled in from the defaults, and one that cannot be parsed at all is reported
+and replaced rather than ending the install on a JSON error — the backup is taken
+before it is read, so nothing is lost either way.
 
 It is **not interactive** when you pass `-NonInteractive`, which is what you want in a
 script; otherwise it prompts for anything missing. Use `-SkipVerify` for an offline
@@ -206,7 +219,7 @@ need the repository**, which matters because the one-liner doesn't leave one beh
 ```powershell
 agent-ha-bridge                 # same as `status`
 agent-ha-bridge configure       # re-run the installer, keeping your settings as defaults
-agent-ha-bridge status          # install, daemon and Home Assistant connection
+agent-ha-bridge status          # install, daemon, Home Assistant connection and dashboard cards
 agent-ha-bridge restart         # restart the bridge daemon
 agent-ha-bridge logs -Follow    # tail the daemon log
 agent-ha-bridge update          # check for a newer release and offer to install it
@@ -486,6 +499,7 @@ The `agent-ha-bridge` PATH entry is removed too.
 .\tests\test-install-deps.ps1     # dependency offers (PowerShell 7, Node, the agent CLIs) and PATH handling
 .\tests\test-install-connection.ps1 # Home Assistant discovery without a pointless prompt, and the connection check
 .\tests\test-install-command.ps1  # the agent-ha-bridge command, its payload, and a sandboxed end-to-end install
+.\tests\test-install-cards.ps1    # the dashboard's frontend cards: detection, and repairing an unregistered one
 .\tests\test-layout-migration.ps1 # upgrading a pre-rename ~/.copilot install in place
 .\tests\test-verbose-toggle.ps1   # Detailed activity helper is provisioned without ever resetting it
 ```

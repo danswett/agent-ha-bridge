@@ -139,7 +139,7 @@ $files = @(
     'decision-inject.ps1', 'agent-bridge-daemon.ps1', 'agent-bridge-supervisor.ps1',
     'agent-bridge-launch.vbs', 'route-ask-user-v3.ps1', 'notify-agent-response.ps1',
     'notify-home-assistant.ps1', 'bridge-adapter.ps1', 'bridge-update.ps1',
-    'session-launch.ps1', 'VERSION'
+    'bridge-frontend-cards.ps1', 'session-launch.ps1', 'VERSION'
 )
 foreach ($name in $files) {
     $path = Join-Path $hooksDir $name

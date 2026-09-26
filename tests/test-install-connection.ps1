@@ -220,6 +220,93 @@ Test-That 'it is flagged as unverified rather than claimed to work' {
     ($resolved.Source -eq 'unverified') -and (-not $resolved.Prompted)
 }
 
+Write-Host '--- discovery covers the cases mDNS cannot ---'
+$candidates = @(Get-BridgeHomeAssistantCandidate -Resolver { @('192.168.1.10', '192.168.1.11') })
+Test-That 'the mDNS hostname is probed first' { $candidates[0] -eq 'http://homeassistant.local:8123' }
+Test-That 'the bare hostname is probed, for a network without mDNS' {
+    $candidates -contains 'http://homeassistant:8123'
+}
+Test-That 'every resolved address is probed' {
+    ($candidates -contains 'http://192.168.1.10:8123') -and ($candidates -contains 'http://192.168.1.11:8123')
+}
+Test-That 'localhost is probed, for Home Assistant in Docker or WSL on this machine' {
+    $candidates -contains 'http://localhost:8123'
+}
+Test-That 'https is probed too' { $candidates -contains 'https://homeassistant.local:8123' }
+Test-That 'the expensive TLS candidate is left until last' {
+    $candidates[-1] -eq 'https://homeassistant.local:8123'
+}
+Test-That 'no candidate is probed twice' {
+    @($candidates | Group-Object | Where-Object { $_.Count -gt 1 }).Count -eq 0
+}
+Test-That 'a DNS failure still leaves a usable list' {
+    $noDns = @(Get-BridgeHomeAssistantCandidate -Resolver { throw 'no such host' })
+    ($noDns -contains 'http://homeassistant.local:8123') -and ($noDns -contains 'http://localhost:8123')
+}
+Test-That 'a resolver returning nothing is handled' {
+    @(Get-BridgeHomeAssistantCandidate -Resolver { @() }).Count -ge 4
+}
+
+Write-Host '--- an old or damaged config does not end the install ---'
+$example = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\config.example.json') -Raw -Encoding UTF8 | ConvertFrom-Json
+
+Test-That 'a config missing a whole section gets it back' {
+    $old = '{"homeAssistant":{"baseUrl":"http://ha:8123","token":"t"}}' | ConvertFrom-Json
+    $added = @(Merge-BridgeConfigDefaults -Config $old -Defaults $example)
+    ($added -contains 'notifications') -and ($null -ne $old.notifications) -and
+    ($old.notifications.enabled -eq $false)
+}
+Test-That 'a section missing one key gets just that key' {
+    $old = '{"notifications":{"enabled":true,"service":"notify.me"}}' | ConvertFrom-Json
+    $added = @(Merge-BridgeConfigDefaults -Config $old -Defaults $example)
+    ($added -contains 'notifications.tickerCategory') -and ($old.notifications.service -eq 'notify.me')
+}
+Test-That 'nothing already set is overwritten' {
+    $old = '{"homeAssistant":{"baseUrl":"http://mine:8123","token":"secret","tokenEnvVar":"X"}}' | ConvertFrom-Json
+    [void](Merge-BridgeConfigDefaults -Config $old -Defaults $example)
+    ($old.homeAssistant.baseUrl -eq 'http://mine:8123') -and ($old.homeAssistant.token -eq 'secret') -and
+    ($old.homeAssistant.tokenEnvVar -eq 'X')
+}
+Test-That 'an explicitly null section is replaced rather than left to crash' {
+    $old = '{"homeAssistant":null}' | ConvertFrom-Json
+    [void](Merge-BridgeConfigDefaults -Config $old -Defaults $example)
+    ($null -ne $old.homeAssistant) -and ($old.homeAssistant.PSObject.Properties['baseUrl'])
+}
+Test-That 'an already-complete config needs nothing added' {
+    $current = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\config.example.json') -Raw | ConvertFrom-Json
+    @(Merge-BridgeConfigDefaults -Config $current -Defaults $example).Count -eq 0
+}
+Test-That 'the example is not the place a client selection comes back from' {
+    $old = '{"homeAssistant":{"baseUrl":"http://ha:8123"}}' | ConvertFrom-Json
+    [void](Merge-BridgeConfigDefaults -Config $old -Defaults $example)
+    -not $old.PSObject.Properties['clients']
+}
+Test-That 'an array value is replaced wholesale, not merged into' {
+    $old = '{"newSession":{"profiles":["only-mine"]}}' | ConvertFrom-Json
+    [void](Merge-BridgeConfigDefaults -Config $old -Defaults $example)
+    (@($old.newSession.profiles) -join ',') -eq 'only-mine'
+}
+
+$scratch = Join-Path $env:TEMP ("bridge-config-" + [guid]::NewGuid().ToString('N') + '.json')
+try {
+    Set-Content -LiteralPath $scratch -Value '{"homeAssistant":{"baseUrl":"http://ha:8123"}' -Encoding UTF8
+    $read = Read-BridgeConfigFile -Path $scratch
+    Test-That 'malformed JSON is reported rather than thrown' {
+        ($null -eq $read.Config) -and $read.Error
+    }
+    Set-Content -LiteralPath $scratch -Value '' -Encoding UTF8
+    Test-That 'an empty config is reported too' {
+        $empty = Read-BridgeConfigFile -Path $scratch
+        ($null -eq $empty.Config) -and ($empty.Error -match 'empty')
+    }
+    Set-Content -LiteralPath $scratch -Value '{"homeAssistant":{"baseUrl":"http://ha:8123"}}' -Encoding UTF8
+    Test-That 'a good config is returned with no error' {
+        $good = Read-BridgeConfigFile -Path $scratch
+        ($good.Config.homeAssistant.baseUrl -eq 'http://ha:8123') -and (-not $good.Error)
+    }
+}
+finally { Remove-Item -LiteralPath $scratch -Force -ErrorAction SilentlyContinue }
+
 Write-Host ''
 if ($script:Failures) {
     Write-Host "$($script:Failures) check(s) failed" -ForegroundColor Red

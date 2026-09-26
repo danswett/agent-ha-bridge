@@ -142,9 +142,50 @@ try {
     Test-That 'a missing file is handled without throwing' {
         (Protect-BridgeSecretFile -Path (Join-Path $env:TEMP ([guid]::NewGuid().ToString('N')))) -eq $false
     }
+
+    # Every re-install hardens the same file again. Set-Acl asks for
+    # ACCESS_SYSTEM_SECURITY when the descriptor it writes is protected, which a normal
+    # user does not have - so the second pass used to fail with a SeSecurityPrivilege
+    # warning, and a genuinely weakened ACL could never be repaired.
+    Test-That 'hardening an already-hardened file succeeds' { Protect-BridgeSecretFile -Path $secretFile }
+    Test-That 'and again, because re-installing is the normal case' {
+        (Protect-BridgeSecretFile -Path $secretFile) -and (Protect-BridgeSecretFile -Path $secretFile)
+    }
+    Test-That 'it recognises a file that is already in the right state' {
+        Test-BridgeSecretFileProtected -Path $secretFile
+    }
+
+    Test-That 'a weakened ACL is detected' {
+        $file = Get-Item -LiteralPath $secretFile
+        $sections = [System.Security.AccessControl.AccessControlSections]::Access
+        $sd = [System.IO.FileSystemAclExtensions]::GetAccessControl($file, $sections)
+        $sd.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
+            'Everyone', 'Read', 'Allow')))
+        [System.IO.FileSystemAclExtensions]::SetAccessControl($file, $sd)
+        -not (Test-BridgeSecretFileProtected -Path $secretFile)
+    }
+    Test-That 'and repaired' {
+        (Protect-BridgeSecretFile -Path $secretFile) -and (@((Get-Acl -LiteralPath $secretFile).Access).Count -eq 1)
+    }
+    Test-That 'a file with inheritance still on is not called protected' {
+        $loose = Join-Path $env:TEMP ("bridge-acl-loose-" + [guid]::NewGuid().ToString('N') + '.json')
+        Set-Content -LiteralPath $loose -Value '{}' -Encoding UTF8
+        try { -not (Test-BridgeSecretFileProtected -Path $loose) }
+        finally { Remove-Item -LiteralPath $loose -Force -ErrorAction SilentlyContinue }
+    }
 }
 finally {
     Remove-Item -LiteralPath $secretFile -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host '--- a scripted run is never offered things only a human can use ---'
+Test-That 'console interactivity is reported as a bool' {
+    (Test-BridgeConsoleInteractive) -is [bool]
+}
+Test-That 'this suite runs with input redirected, so it reports non-interactive' {
+    # pwsh -File with a redirected stdin is exactly how the installer is driven in
+    # tests; the browser offer must not fire there.
+    ([Console]::IsInputRedirected) -eq (-not (Test-BridgeConsoleInteractive))
 }
 
 Write-Host ''

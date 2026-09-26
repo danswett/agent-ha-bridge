@@ -202,8 +202,39 @@ Add-Content -LiteralPath '$record' -Value ("uninstall keepConfig=[`$KeepConfig] 
 }
 finally { Remove-Item -LiteralPath $fakeHome -Recurse -Force -ErrorAction SilentlyContinue }
 
-Write-Host '--- status hands the configured token to the connection check ---'
-# The bug this pins down: `status` dot-sources install.ps1 to borrow its connection
+Write-Host '--- the frontend card check reaches the console ---'
+# `& $pwsh ...` makes a native child's stdout this function's output, so a caller
+# writing [void](...) throws away everything it printed - which is the entire point of
+# running it. The installer did exactly that: "Checking the dashboard frontend cards"
+# appeared with nothing under it.
+$cardHooks = New-ScratchDir
+try {
+    Set-Content -LiteralPath (Join-Path $cardHooks 'bridge-frontend-cards.ps1') -Encoding UTF8 -Value @'
+param([switch]$Register, [switch]$Json, [switch]$Quiet)
+Write-Host "CARD-CHECK-RAN register=$Register config=$env:AGENT_HA_BRIDGE_CONFIG"
+'@
+    $marker = Join-Path $cardHooks 'pretend-config.json'
+    $captured = (Invoke-BridgeFrontendCardCheck -HooksDir $cardHooks -ConfigPath $marker -Register 6>&1) |
+        Out-String
+
+    Test-That 'the check actually runs' { $captured -match 'CARD-CHECK-RAN' }
+    Test-That '-Register is passed through' { $captured -match 'register=True' }
+    Test-That 'it is pointed at the config this install wrote' {
+        $captured -match [regex]::Escape($marker)
+    }
+    Test-That 'the return value is a bool, not the child output' {
+        (Invoke-BridgeFrontendCardCheck -HooksDir $cardHooks -ConfigPath $marker) -is [bool]
+    }
+    Test-That 'a missing checker is not an error' {
+        (Invoke-BridgeFrontendCardCheck -HooksDir (New-ScratchDir) -ConfigPath $marker) -eq $false
+    }
+    Test-That 'AGENT_HA_BRIDGE_CONFIG is not left set afterwards' {
+        [string]::IsNullOrEmpty($env:AGENT_HA_BRIDGE_CONFIG)
+    }
+}
+finally { Remove-Item -LiteralPath $cardHooks -Recurse -Force -ErrorAction SilentlyContinue }
+
+Write-Host '--- status hands the configured token to the connection check ---'# The bug this pins down: `status` dot-sources install.ps1 to borrow its connection
 # check, and dot-sourcing a script rebinds every parameter that script *declares* to
 # that parameter's default. install.ps1 declares -Token, so a perfectly good token
 # read from the config was blanked on the way in and status reported "no token".

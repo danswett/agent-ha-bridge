@@ -139,6 +139,18 @@ function Read-BridgeYesNo {
     }
 }
 
+function Test-BridgeConsoleInteractive {
+    <#
+        Whether there is a person at the keyboard.
+
+        Read-Host reads piped input perfectly happily, which is what makes the
+        installer's prompts testable - but it also means a scripted run must not be
+        offered things only a human can act on, like a browser window.
+    #>
+    try { return -not [Console]::IsInputRedirected }
+    catch { return $false }
+}
+
 # --------------------------------------------------------------- dependencies
 # The installer used to stop dead on a missing prerequisite, which is a poor first
 # impression on a fresh machine. Everything it knows how to install lives in this
@@ -496,6 +508,72 @@ function Register-BridgePathEntry {
     return $true
 }
 
+function Merge-BridgeConfigDefaults {
+    <#
+        Fills in whatever a config is missing from the shipped example, and returns the
+        names of the keys it added.
+
+        A config written by an older version does not have every key a newer installer
+        expects, and the installer reaches straight into them: `$config.notifications
+        .enabled` against a config with no notifications section is a crash several
+        steps into an upgrade, with the config already backed up and half the install
+        done. Only absent - or explicitly null - keys are filled; anything already set
+        is left exactly as it is.
+
+        One level of nesting is enough: every section in config.example.json is flat.
+    #>
+    param(
+        [Parameter(Mandatory)]$Config,
+        [Parameter(Mandatory)]$Defaults
+    )
+
+    $added = @()
+    foreach ($property in $Defaults.PSObject.Properties) {
+        $name = $property.Name
+        $existing = $null
+        if ($Config.PSObject.Properties[$name]) { $existing = $Config.$name }
+
+        if (-not $Config.PSObject.Properties[$name] -or $null -eq $existing) {
+            $Config | Add-Member -NotePropertyName $name -NotePropertyValue $property.Value -Force
+            $added += $name
+            continue
+        }
+        if ($existing -is [psobject] -and $property.Value -is [psobject] -and
+            $existing -isnot [array] -and $property.Value -isnot [array]) {
+            foreach ($child in $property.Value.PSObject.Properties) {
+                if (-not $existing.PSObject.Properties[$child.Name]) {
+                    $existing | Add-Member -NotePropertyName $child.Name -NotePropertyValue $child.Value -Force
+                    $added += "$name.$($child.Name)"
+                }
+            }
+        }
+    }
+    $added
+}
+
+function Read-BridgeConfigFile {
+    <#
+        Reads a config, or reports that it could not be read.
+
+        A hand-edited config with a stray comma used to end the install on a raw JSON
+        parser error, which says nothing about what to do next. The file is always
+        backed up first, so falling back to the defaults loses nothing that cannot be
+        recovered from the .bak.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    try {
+        $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+        if ([string]::IsNullOrWhiteSpace($raw)) {
+            return [pscustomobject]@{ Config = $null; Error = 'the file is empty' }
+        }
+        return [pscustomobject]@{ Config = ($raw | ConvertFrom-Json); Error = '' }
+    }
+    catch {
+        return [pscustomobject]@{ Config = $null; Error = $_.Exception.Message }
+    }
+}
+
 # ------------------------------------------------------- Home Assistant check
 
 function Get-BridgeHttpErrorDetail {
@@ -718,28 +796,53 @@ function Test-IsHomeAssistant {
     catch { return $false }
 }
 
-function Find-HomeAssistant {
+function Get-BridgeHomeAssistantCandidate {
     <#
-        Locates Home Assistant on the local network.
+        The URLs worth probing for a Home Assistant, in the order worth trying them.
 
-        Home Assistant publishes itself as homeassistant.local over mDNS, which Windows
-        resolves natively, so the default hostname plus its resolved address covers
-        almost every install. Anything more exotic is a typed URL. No subnet scanning:
-        it is slow and looks like hostile traffic.
+        Split out from Find-HomeAssistant because that stops at the first hit, which
+        makes the list itself untestable on a network that has a Home Assistant on it.
+
+        -Resolver is injectable so the DNS lookup can be driven from a test.
     #>
+    param([scriptblock]$Resolver)
+
+    if (-not $Resolver) {
+        $Resolver = {
+            $resolved = Resolve-DnsName -Name 'homeassistant.local' -Type A -ErrorAction Stop
+            @($resolved | Where-Object IPAddress | Select-Object -Expand IPAddress)
+        }
+    }
+
     $candidates = [System.Collections.Generic.List[string]]::new()
+    # Home Assistant publishes itself as homeassistant.local over mDNS, which Windows
+    # resolves natively; the bare hostname covers a network that does its own DNS.
     foreach ($hostName in @('homeassistant.local', 'homeassistant')) {
         $candidates.Add("http://${hostName}:8123")
     }
     try {
-        $resolved = Resolve-DnsName -Name 'homeassistant.local' -Type A -ErrorAction Stop
-        foreach ($address in @($resolved | Where-Object IPAddress | Select-Object -Expand IPAddress)) {
-            $candidates.Add("http://${address}:8123")
+        foreach ($address in @(& $Resolver)) {
+            if ($address) { $candidates.Add("http://${address}:8123") }
         }
     }
     catch { }
+    # Home Assistant on this machine - a Docker or WSL install - is common enough to be
+    # worth one probe, and it is the one case mDNS cannot help with.
+    $candidates.Add('http://localhost:8123')
+    # Last, because it is the least likely and a TLS handshake costs the most to fail.
+    $candidates.Add('https://homeassistant.local:8123')
 
-    foreach ($candidate in ($candidates | Select-Object -Unique)) {
+    @($candidates | Select-Object -Unique)
+}
+
+function Find-HomeAssistant {
+    <#
+        Locates Home Assistant on the local network, or returns $null.
+
+        No subnet scanning: it is slow and looks like hostile traffic. Anything more
+        exotic than the candidates above is a typed URL.
+    #>
+    foreach ($candidate in (Get-BridgeHomeAssistantCandidate)) {
         Write-Host "    probing $candidate" -ForegroundColor DarkGray
         if (Test-IsHomeAssistant -BaseUrl $candidate) { return $candidate }
     }
@@ -788,33 +891,66 @@ function Resolve-BridgeHomeAssistantUrl {
     [pscustomobject]@{ Url = $answer; Source = 'typed'; Prompted = $true }
 }
 
+function Test-BridgeSecretFileProtected {
+    <#
+        True when a file is already locked to the current user alone: inheritance off,
+        and exactly one allow rule granting this user full control.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    try {
+        if (-not (Test-Path -LiteralPath $Path)) { return $false }
+        $acl = Get-Acl -LiteralPath $Path
+        if (-not $acl.AreAccessRulesProtected) { return $false }
+        $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
+        $rules = @($acl.Access)
+        if ($rules.Count -ne 1) { return $false }
+        $rule = $rules[0]
+        if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { return $false }
+        if ($rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]) -ne $me) { return $false }
+        $full = [System.Security.AccessControl.FileSystemRights]::FullControl
+        return (($rule.FileSystemRights -band $full) -eq $full)
+    }
+    catch { return $false }
+}
+
 function Protect-BridgeSecretFile {
     <#
         Restricts a file that holds the Home Assistant token to the current user, so
         another local account cannot read the token off disk. Best-effort by design: a
         machine with unusual ACL policy must not fail the whole install over this.
 
-        Returns $true when the file ended up with inheritance disabled and no identity
+        Returns $true when the file ends up with inheritance disabled and no identity
         other than the current user granted access, so the behaviour is testable.
+
+        The write goes through the .NET API rather than Set-Acl. Set-Acl asks for
+        ACCESS_SYSTEM_SECURITY when the descriptor it is writing is protected, which a
+        normal user does not have (SeSecurityPrivilege) - so every re-install of an
+        already-hardened file failed with a warning, and a genuinely wrong ACL could
+        never be repaired at all. Scoping the write to the Access section does not
+        touch the SACL and needs no privilege.
     #>
     param([Parameter(Mandatory)][string]$Path)
 
     try {
         if (-not (Test-Path -LiteralPath $Path)) { return $false }
+        # Nothing to do is the common case on a re-install, and rewriting an identical
+        # descriptor is exactly what used to fail.
+        if (Test-BridgeSecretFileProtected -Path $Path) { return $true }
+
         $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-        $acl = Get-Acl -LiteralPath $Path
+        $file = Get-Item -LiteralPath $Path -Force
+        $access = [System.Security.AccessControl.AccessControlSections]::Access
+        $acl = [System.IO.FileSystemAclExtensions]::GetAccessControl($file, $access)
         # Disable inheritance and drop inherited rules, then strip every explicit rule
         # so only the single current-user grant below remains.
         $acl.SetAccessRuleProtection($true, $false)
         @($acl.Access) | ForEach-Object { [void]$acl.RemoveAccessRule($_) }
         $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
             $me, 'FullControl', 'Allow')))
-        Set-Acl -LiteralPath $Path -AclObject $acl
+        [System.IO.FileSystemAclExtensions]::SetAccessControl($file, $acl)
 
-        $check = (Get-Acl -LiteralPath $Path).Access
-        return -not ($check | Where-Object {
-            $_.IsInherited -or $_.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]) -ne $me
-        })
+        return (Test-BridgeSecretFileProtected -Path $Path)
     }
     catch {
         Write-Host "    note: could not restrict permissions on $(Split-Path $Path -Leaf) ($($_.Exception.Message))" -ForegroundColor Yellow
@@ -960,6 +1096,56 @@ function Invoke-BridgeLayoutMigration {
     $migrated
 }
 
+function Invoke-BridgeFrontendCardCheck {
+    <#
+        Runs the dashboard's frontend card check, and lets it register any card that is
+        downloaded but not registered.
+
+        In a child pwsh on purpose: the check needs the runtime layer - the config
+        reader, the MQTT helpers and the WebSocket client - which between them set
+        script-scoped state and define several dozen functions, none of which belong in
+        the installer's scope. AGENT_HA_BRIDGE_CONFIG points it at the config this
+        install just wrote, so a -TargetHome sandbox checks its own settings rather
+        than the real install's.
+
+        Never throws: a dashboard prerequisite is worth reporting, not worth failing
+        an otherwise good install over.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$HooksDir,
+        [Parameter(Mandatory)][string]$ConfigPath,
+        [switch]$Register
+    )
+
+    $checker = Join-Path $HooksDir 'bridge-frontend-cards.ps1'
+    if (-not (Test-Path -LiteralPath $checker)) { return $false }
+
+    $pwsh = Join-Path $PSHOME 'pwsh.exe'
+    if (-not (Test-Path -LiteralPath $pwsh)) { $pwsh = 'pwsh' }
+
+    $previous = $env:AGENT_HA_BRIDGE_CONFIG
+    $env:AGENT_HA_BRIDGE_CONFIG = $ConfigPath
+    try {
+        $arguments = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $checker)
+        if ($Register) { $arguments += '-Register' }
+        # Echoed rather than returned: a native child's stdout becomes this function's
+        # output, so the caller's [void] would throw away everything it printed along
+        # with the return value - which is the whole point of running it. Write-Host
+        # rather than Out-Host, because Out-Host bypasses the streams and so cannot be
+        # asserted on.
+        & $pwsh @arguments 2>&1 | ForEach-Object { Write-Host $_ }
+        return ($LASTEXITCODE -eq 0)
+    }
+    catch {
+        Write-Host "    could not check the dashboard cards: $($_.Exception.Message)" -ForegroundColor Yellow
+        return $false
+    }
+    finally {
+        if ($null -eq $previous) { Remove-Item Env:\AGENT_HA_BRIDGE_CONFIG -ErrorAction SilentlyContinue }
+        else { $env:AGENT_HA_BRIDGE_CONFIG = $previous }
+    }
+}
+
 # ------------------------------------------------------- installer payload
 # So that an install can be reconfigured, updated or removed from a machine that
 # never had the repository - which is every machine installed from the one-liner.
@@ -1085,16 +1271,32 @@ Write-Step 'Reading the bridge config'
 # Whether this is a first install decides whether a remembered client selection
 # exists at all. config.example.json is a template, not a previous answer.
 $configExisted = Test-Path -LiteralPath $configPath
-$config = if ($configExisted) {
-    # Never lose a working config to a mistyped re-run.
+$exampleRaw = Get-Content -LiteralPath (Join-Path $repoRoot 'config.example.json') -Raw -Encoding UTF8
+$defaults = $exampleRaw | ConvertFrom-Json
+$config = $null
+if ($configExisted) {
+    # Never lose a working config to a mistyped re-run - and back it up before reading
+    # it, so even an unreadable one is recoverable.
     Copy-Item $configPath "$configPath.bak" -Force
     [void](Protect-BridgeSecretFile -Path "$configPath.bak")
     Write-Host "    backed up existing config to $(Split-Path $configPath -Leaf).bak"
-    Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
+
+    $read = Read-BridgeConfigFile -Path $configPath
+    if ($read.Config) { $config = $read.Config }
+    else {
+        Write-Warning ("$configPath could not be read ($($read.Error)). Starting from the " +
+                       "defaults; your previous file is at $(Split-Path $configPath -Leaf).bak.")
+        # A config that cannot be read holds no remembered answers either.
+        $configExisted = $false
+    }
 }
-else {
-    Get-Content -LiteralPath (Join-Path $repoRoot 'config.example.json') -Raw -Encoding UTF8 | ConvertFrom-Json
-}
+# Parsed separately rather than reusing $defaults: a fresh install would otherwise
+# merge an object into itself, and every later edit would mutate the defaults too.
+if (-not $config) { $config = $exampleRaw | ConvertFrom-Json }
+
+# A config from an older version is missing keys this installer reaches straight into.
+$filled = @(Merge-BridgeConfigDefaults -Config $config -Defaults $defaults)
+if ($filled) { Write-Host "    added missing setting(s): $($filled -join ', ')" }
 
 if ($PSBoundParameters.ContainsKey('HomeAssistantUrl') -and $HomeAssistantUrl) {
     $config.homeAssistant.baseUrl = $HomeAssistantUrl.TrimEnd('/')
@@ -1191,6 +1393,7 @@ if ($base -match '^http://' -and $base -notmatch '^http://(localhost|127\.0\.0\.
                    'network. Prefer https:// if your Home Assistant has a certificate.')
 }
 
+$homeAssistantReady = $false
 if ($SkipVerify) {
     Write-Step 'Skipping the Home Assistant check (-SkipVerify)'
     if (-not $effectiveToken -and -not $NonInteractive) {
@@ -1204,14 +1407,25 @@ else {
     # made the old flow frustrating.
     $connection = Test-BridgeHomeAssistantConnection -BaseUrl $base -Token $effectiveToken
     $remaining = 3
+    $offeredBrowser = $false
     while (-not $connection.Ok -and -not $NonInteractive -and $remaining -gt 0) {
         $remaining--
         if ($effectiveToken) { Write-BridgeConnectionResult -Result $connection }
+        $profileUrl = "$base/profile/security"
         Write-Host ''
         Write-Host 'Home Assistant needs a long-lived access token.' -ForegroundColor Yellow
-        Write-Host "    1. Open $base/profile/security"
+        Write-Host "    1. Open $profileUrl"
         Write-Host '    2. Scroll to "Long-lived access tokens" and choose "Create token"'
         Write-Host '    3. Name it anything (e.g. "agent bridge") and copy the value'
+        # Offered once, and never to a scripted run: nobody is there to see the window,
+        # and the prompt would eat a line of piped input meant for the token.
+        if (-not $offeredBrowser -and (Test-BridgeConsoleInteractive)) {
+            $offeredBrowser = $true
+            if (Read-BridgeYesNo -Prompt '    Open that page in your browser now?') {
+                try { Start-Process $profileUrl | Out-Null }
+                catch { Write-Host "    could not open a browser; visit $profileUrl yourself" -ForegroundColor Yellow }
+            }
+        }
         $entered = Read-Host '    Paste the token here'
         if ([string]::IsNullOrWhiteSpace($entered)) {
             Write-Host '    nothing pasted; giving up on the token for now.' -ForegroundColor DarkGray
@@ -1229,6 +1443,7 @@ else {
                '    Fix it and re-run, or pass -SkipVerify to finish the install and use ' +
                '`agent-ha-bridge configure` later.')
     }
+    $homeAssistantReady = $true
 }
 
 # Record what was installed, so the update check can compare against the newest
@@ -1248,6 +1463,15 @@ $config | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $configPath -Encodi
 Write-Host "    baseUrl      : $($config.homeAssistant.baseUrl)"
 Write-Host "    token        : $(if ($config.homeAssistant.token) { 'set in config' } else { "from `$env:$($config.homeAssistant.tokenEnvVar)" })"
 Write-Host "    notifications: $(if ($config.notifications.enabled) { $config.notifications.service } else { 'disabled' })"
+
+# The dashboard is drawn with three custom Lovelace cards. Without them it renders as
+# a column of "Custom element doesn't exist" boxes - an install that reports success
+# and then visibly does not work. The file itself can only come from HACS, but a card
+# that is downloaded and merely unregistered is repaired here.
+if ($homeAssistantReady) {
+    Write-Step 'Checking the dashboard frontend cards'
+    [void](Invoke-BridgeFrontendCardCheck -HooksDir $hooksDir -ConfigPath $configPath -Register)
+}
 
 
 # Builds up to 1.4.2 shipped a decision-notifier skill. It never had frontmatter, so
@@ -1313,32 +1537,45 @@ elseif (Test-Path -LiteralPath $hookConfigPath) {
 }
 
 # ------------------------------------------------------------- scheduled task
+$taskRegistered = $false
 if (-not $SkipTask) {
     Write-Step "Registering the '$taskName' scheduled task"
     # wscript + the VBS launcher, not pwsh directly: WScript.Shell.Run(..., 0, False)
     # starts the supervisor with no window at all, while still giving the daemon a real
     # console. conhost --headless would give a pseudoconsole and break reply injection.
-    $launcher = Join-Path $hooksDir 'agent-bridge-launch.vbs'
-    $action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$launcher`""
-    $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
-    $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
-        -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
-        -ExecutionTimeLimit ([TimeSpan]::Zero) -Hidden
-    $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
-        -LogonType Interactive -RunLevel Limited
+    try {
+        $launcher = Join-Path $hooksDir 'agent-bridge-launch.vbs'
+        $action = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$launcher`""
+        $trigger = New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME
+        $settings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+            -StartWhenAvailable -RestartCount 3 -RestartInterval (New-TimeSpan -Minutes 1) `
+            -ExecutionTimeLimit ([TimeSpan]::Zero) -Hidden
+        $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
+            -LogonType Interactive -RunLevel Limited
 
-    if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
-        Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-        Set-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
-            -Settings $settings -Principal $principal | Out-Null
+        if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+            Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+            Set-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+                -Settings $settings -Principal $principal | Out-Null
+        }
+        else {
+            Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
+                -Settings $settings -Principal $principal `
+                -Description 'Supervises the AI coding agent Home Assistant bridge daemon.' | Out-Null
+        }
+        Start-ScheduledTask -TaskName $taskName
+        Write-Host '    registered and started'
+        $taskRegistered = $true
     }
-    else {
-        Register-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
-            -Settings $settings -Principal $principal `
-            -Description 'Supervises the AI coding agent Home Assistant bridge daemon.' | Out-Null
+    catch {
+        # Group policy can forbid task creation outright. Everything else this installer
+        # does is still worth finishing - the PATH command, the hooks, the config - and
+        # `agent-ha-bridge status` reports the missing task, so fail loudly here rather
+        # than abandoning the install half-done.
+        Write-Warning ("Could not register the '$taskName' scheduled task: $($_.Exception.Message)`n" +
+                       '    The bridge cannot run until it exists. Task Scheduler is often ' +
+                       'restricted by policy; once that is sorted, run: agent-ha-bridge configure')
     }
-    Start-ScheduledTask -TaskName $taskName
-    Write-Host "    registered and started"
 }
 
 # --------------------------------------------------------- configure adapters
@@ -1429,6 +1666,11 @@ Set-ItemProperty -Path $arpKey -Name NoRepair -Value 1 -Type DWord
 Write-Host "    'AI coding agent Home Assistant bridge' is now uninstallable from Settings"
 
 Write-Step 'Done'
+if (-not $SkipTask -and -not $taskRegistered) {
+    Write-Host ''
+    Write-Host 'The bridge daemon is NOT running: its scheduled task could not be registered.' -ForegroundColor Red
+    Write-Host 'Nothing below will work until that is fixed - see the warning above.' -ForegroundColor Red
+}
 Write-Host 'Next steps:' -ForegroundColor Yellow
 $stepNo = 1
 if ($selectedClients -contains 'copilot') {

@@ -194,12 +194,32 @@ function Show-Status {
         $token = [Environment]::GetEnvironmentVariable([string]$config.homeAssistant.tokenEnvVar)
     }
 
+    $slug = 'agent-decisions'
+    if ($config.PSObject.Properties['dashboard'] -and $config.dashboard.urlPath) {
+        $slug = [string]$config.dashboard.urlPath
+    }
+    Write-Host "    dashboard  : $base/$slug"
+
     Write-Host '    home assistant:'
     try {
         Show-HomeAssistantStatus -BaseUrl $base -Token $token -InstallerPath (Get-BridgeScript 'install.ps1')
     }
     catch {
         Write-Host "    could not check the connection: $($_.Exception.Message)" -ForegroundColor Yellow
+    }
+
+    # Read-only here: status reports, configure repairs.
+    $cardCheck = Join-Path $bridgeHome 'hooks\bridge-frontend-cards.ps1'
+    if (Test-Path -LiteralPath $cardCheck) {
+        Write-Host '    dashboard cards:'
+        $previous = $env:AGENT_HA_BRIDGE_CONFIG
+        $env:AGENT_HA_BRIDGE_CONFIG = $configPath
+        try { & (Join-Path $PSHOME 'pwsh.exe') -NoProfile -ExecutionPolicy Bypass -File $cardCheck }
+        catch { Write-Host "    could not check the dashboard cards: $($_.Exception.Message)" -ForegroundColor Yellow }
+        finally {
+            if ($null -eq $previous) { Remove-Item Env:\AGENT_HA_BRIDGE_CONFIG -ErrorAction SilentlyContinue }
+            else { $env:AGENT_HA_BRIDGE_CONFIG = $previous }
+        }
     }
 }
 

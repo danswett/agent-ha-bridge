@@ -64,6 +64,7 @@ jobs:
             'tests/test-install-deps.ps1'
             'tests/test-install-connection.ps1'
             'tests/test-install-command.ps1'
+            'tests/test-install-cards.ps1'
             'tests/test-layout-migration.ps1'
             'tests/test-reliability.ps1'
             'tests/test-restart-restore.ps1'
@@ -117,3 +118,4 @@ jobs:
           node test/test-ha.js
           node test/test-http.js
           node test/test-http-e2e.js
+
