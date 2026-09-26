@@ -334,8 +334,9 @@ That means the MQTT integration is the one prerequisite it cannot provision itse
 installer checks for it and warns if `mqtt.publish` is missing. Nothing goes in
 `configuration.yaml`.
 
-`uninstall.ps1 -ClearEntities` reverses all of it, including the helper and the
-dashboard view.
+`uninstall.ps1 -ClearEntities` reverses all of it. The helper and the dashboard are
+shared with any other machine on the same Home Assistant, so they only go when the last
+machine is removed.
 
 ---
 
@@ -475,9 +476,14 @@ agent-ha-bridge uninstall
 ```
 
 …which is `uninstall.ps1 -ClearEntities`. `-ClearEntities` clears the retained MQTT
-discovery topics, the Detailed activity helper and the dashboard view, so Home
-Assistant is left clean; without it they linger. `-KeepConfig` preserves your settings.
-The `agent-ha-bridge` PATH entry is removed too.
+discovery topics for **this machine**, so Home Assistant is left clean; without it they
+linger. `-KeepConfig` preserves your settings. The `agent-ha-bridge` PATH entry is
+removed too.
+
+The dashboard and the Detailed activity toggle are shared by every machine that talks
+to the same Home Assistant, so they are only removed when this is the last one. If the
+bridge cannot tell, it asks; a scripted uninstall keeps them. `-ClearShared` and
+`-KeepShared` decide it outright.
 
 ---
 

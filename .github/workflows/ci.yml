@@ -65,6 +65,7 @@ jobs:
             'tests/test-install-connection.ps1'
             'tests/test-install-command.ps1'
             'tests/test-install-cards.ps1'
+            'tests/test-multi-machine.ps1'
             'tests/test-layout-migration.ps1'
             'tests/test-reliability.ps1'
             'tests/test-restart-restore.ps1'

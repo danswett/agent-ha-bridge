@@ -9,12 +9,26 @@
     Home Assistant entities are published through retained MQTT discovery messages, so
     -ClearEntities clears them; without it they linger until manually removed.
 
+    One Home Assistant can serve several machines, and some of what the bridge creates
+    there is shared by all of them - the dashboard and the Detailed activity toggle.
+    Removing this machine never removes those unless it is the last one, because doing
+    so would take the dashboard away from machines that are still running.
+
 .PARAMETER KeepConfig
     Leave the bridge config in place, so a later re-install keeps your settings.
 
 .PARAMETER ClearEntities
-    Clear the retained MQTT discovery topics so Home Assistant drops the bridge's
+    Clear the retained MQTT discovery topics so Home Assistant drops this machine's
     entities. Requires the config to still be present.
+
+.PARAMETER ClearShared
+    Also remove the state shared with every other machine: the dashboard and the
+    Detailed activity toggle. Only do this when no other machine uses this Home
+    Assistant, or you will remove their dashboard too.
+
+.PARAMETER KeepShared
+    Never remove the shared dashboard or toggle, even when this looks like the last
+    machine. Useful when another machine is simply switched off rather than gone.
 
 .PARAMETER TargetHome
     Uninstall from this directory's .agent-ha-bridge instead of $HOME's. Intended for
@@ -25,6 +39,8 @@
 param(
     [switch]$KeepConfig,
     [switch]$ClearEntities,
+    [switch]$ClearShared,
+    [switch]$KeepShared,
     [string]$TargetHome
 )
 
@@ -50,6 +66,79 @@ $legacyArpKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Copil
 
 function Write-Step { param([string]$Message) Write-Host "==> $Message" -ForegroundColor Cyan }
 
+function Test-BridgeUninstallInteractive {
+    <# False when stdin is redirected, so a scripted uninstall never blocks on a prompt. #>
+    try { return -not [Console]::IsInputRedirected } catch { return $false }
+}
+
+function Read-BridgeUninstallYesNo {
+    <# A y/N prompt that defaults to no, because the risky answer here is yes. #>
+    param([Parameter(Mandatory)][string]$Question)
+    $answer = Read-Host "$Question [y/N]"
+    return ([string]$answer).Trim().ToLowerInvariant() -in @('y', 'yes')
+}
+
+function Get-BridgeSharedStateDecision {
+    <#
+        Decides whether this uninstall may remove the state that every machine shares -
+        the generated dashboard and the Detailed activity toggle.
+
+        One Home Assistant commonly serves several machines. Before this, uninstalling
+        anywhere deleted the dashboard and the toggle outright, so tidying up a laptop
+        took the dashboard away from the desktop that was still running. The remaining
+        daemons do recreate both, but only on their next reconcile, so there was a
+        window where Home Assistant showed nothing.
+
+        The rule, in order:
+
+          * an explicit switch always wins, in either direction;
+          * a known list of other machines means leave the shared state alone;
+          * a known *empty* list means this is the last machine, so clean up fully;
+          * an unknown list falls back to asking, and to keeping when nobody can answer.
+
+        $OtherMachines is deliberately nullable, and $null means "could not tell" rather
+        than "none" - a failed lookup must never be read as permission to delete.
+    #>
+    param(
+        [switch]$ClearShared,
+        [switch]$KeepShared,
+        [bool]$Interactive,
+        [AllowNull()][string[]]$OtherMachines,
+        [scriptblock]$Prompt
+    )
+
+    if ($KeepShared -and $ClearShared) {
+        return [pscustomobject]@{ Clear = $false; Reason = '-KeepShared and -ClearShared were both given, so the safe one wins' }
+    }
+    if ($KeepShared) { return [pscustomobject]@{ Clear = $false; Reason = '-KeepShared' } }
+    if ($ClearShared) { return [pscustomobject]@{ Clear = $true; Reason = '-ClearShared' } }
+
+    if ($null -ne $OtherMachines) {
+        $others = @($OtherMachines | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        if ($others.Count -gt 0) {
+            return [pscustomobject]@{
+                Clear = $false
+                Reason = "still in use by $($others -join ', ')"
+            }
+        }
+        return [pscustomobject]@{ Clear = $true; Reason = 'this is the only machine using this Home Assistant' }
+    }
+
+    if ($Interactive -and $Prompt) {
+        if (& $Prompt) { return [pscustomobject]@{ Clear = $true; Reason = 'confirmed at the prompt' } }
+        return [pscustomobject]@{ Clear = $false; Reason = 'declined at the prompt' }
+    }
+
+    return [pscustomobject]@{
+        Clear = $false
+        Reason = 'could not tell whether another machine shares this Home Assistant'
+    }
+}
+
+# Tests dot-source this script with BRIDGE_UNINSTALL_NORUN set to load the helpers
+# above without removing anything.
+if ($env:BRIDGE_UNINSTALL_NORUN) { return }
+
 # Entities first: this needs the hooks and config that the rest of the script removes.
 if ($ClearEntities -and $TargetHome) {
     # Entities, the verbose toggle and the dashboard live in the shared Home Assistant
@@ -73,29 +162,58 @@ elseif ($ClearEntities) {
         }
         Write-Host '    session entities cleared'
 
-        # The daemon creates these two; without removing them Home Assistant keeps a
-        # dead dashboard and an orphaned toggle after everything else is gone.
+        # The dashboard and the toggle belong to the Home Assistant instance, not to
+        # this machine, so whether they may go depends on who else is still using it.
+        $otherMachines = $null
         try {
-            if (Remove-CopilotVerboseToggle) { Write-Host '    removed the Detailed activity toggle' }
-        }
-        catch { Write-Warning "Could not remove the verbose toggle: $($_.Exception.Message)" }
-
-        try {
-            $urlPath = $script:DecisionBridgeConfig.DashboardUrlPath
-            if ($urlPath) {
-                [void](Invoke-CopilotHaWebSocket -Commands @(@{
-                    type = 'lovelace/config/delete'; url_path = $urlPath
-                }))
-                Write-Host "    removed the '$urlPath' dashboard view"
+            if (Get-Command Get-BridgePeerMachine -ErrorAction SilentlyContinue) {
+                $otherMachines = @(Get-BridgePeerMachine -Headers $headers -ExcludeSelf |
+                    ForEach-Object { [string]$_.Machine })
             }
         }
         catch {
-            # Already absent is the desired end state, not a failure.
-            if ($_.Exception.Message -match 'config_not_found') {
-                Write-Host "    dashboard '$urlPath' already absent"
+            # Leave it unknown: a failed lookup must not read as "nobody else is here".
+            $otherMachines = $null
+        }
+
+        $decision = Get-BridgeSharedStateDecision `
+            -ClearShared:$ClearShared -KeepShared:$KeepShared `
+            -Interactive (Test-BridgeUninstallInteractive) `
+            -OtherMachines $otherMachines `
+            -Prompt {
+                Write-Host ''
+                Write-Host '    The dashboard and the Detailed activity toggle are shared by every' -ForegroundColor Yellow
+                Write-Host '    machine that talks to this Home Assistant.' -ForegroundColor Yellow
+                Read-BridgeUninstallYesNo '    Remove them too (only if this is your last machine)?'
             }
-            else {
-                Write-Warning "Could not remove the dashboard: $($_.Exception.Message)"
+
+        if (-not $decision.Clear) {
+            Write-Host "    keeping the shared dashboard and toggle - $($decision.Reason)"
+        }
+        else {
+            Write-Host "    removing the shared dashboard and toggle - $($decision.Reason)"
+            try {
+                if (Remove-CopilotVerboseToggle) { Write-Host '    removed the Detailed activity toggle' }
+            }
+            catch { Write-Warning "Could not remove the verbose toggle: $($_.Exception.Message)" }
+
+            $urlPath = $script:DecisionBridgeConfig.DashboardUrlPath
+            try {
+                if ($urlPath) {
+                    [void](Invoke-CopilotHaWebSocket -Commands @(@{
+                        type = 'lovelace/config/delete'; url_path = $urlPath
+                    }))
+                    Write-Host "    removed the '$urlPath' dashboard view"
+                }
+            }
+            catch {
+                # Already absent is the desired end state, not a failure.
+                if ($_.Exception.Message -match 'config_not_found') {
+                    Write-Host "    dashboard '$urlPath' already absent"
+                }
+                else {
+                    Write-Warning "Could not remove the dashboard: $($_.Exception.Message)"
+                }
             }
         }
     }
