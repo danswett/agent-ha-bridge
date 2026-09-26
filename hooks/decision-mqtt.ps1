@@ -392,6 +392,34 @@ function Publish-CopilotMqttSession {
     $topics
 }
 
+function Get-CopilotMqttSessionDiscoveryTopic {
+    <#
+        Every retained discovery topic belonging to one session node.
+
+        Shared by the two things that withdraw a session - the clean exit path, which
+        knows the session id, and the startup orphan sweep, which only ever has a node
+        id recovered from an entity id. They had a list each, and they drifted: the
+        stop button was added to one and not the other, so every swept session left a
+        dead Stop button behind in Home Assistant.
+    #>
+    param([Parameter(Mandatory)][string]$Node)
+
+    $prefix = $script:CopilotMqttConfig.DiscoveryPrefix
+    $topics = [System.Collections.Generic.List[string]]::new()
+    foreach ($entry in @(
+        @('select', 'decision'), @('text', 'reply'),
+        @('sensor', 'status'), @('sensor', 'activity'),
+        @('button', 'submit'), @('button', 'stop')
+    )) {
+        $topics.Add("$prefix/$($entry[0])/$Node/$($entry[1])/config")
+    }
+    # The per-field dropdown slots are part of the session too.
+    for ($i = 1; $i -le $script:CopilotMqttMaxFields; $i++) {
+        $topics.Add("$prefix/select/$Node/f$i/config")
+    }
+    $topics.ToArray()
+}
+
 function Remove-CopilotMqttSession {
     <#
         Clears the retained discovery configs so Home Assistant drops the entities
@@ -407,30 +435,12 @@ function Remove-CopilotMqttSession {
     )
 
     $topics = Get-CopilotMqttTopics -SessionId $SessionId
-    $node = $topics.Node
-    $prefix = $script:CopilotMqttConfig.DiscoveryPrefix
 
     Publish-CopilotMqttMessage -Topic $topics.Availability -Payload 'offline' -Headers $Headers -Retain
 
-    foreach ($entry in @(
-        @{ Component = 'select'; Object = 'decision' }
-        @{ Component = 'text'; Object = 'reply' }
-        @{ Component = 'sensor'; Object = 'status' }
-        @{ Component = 'sensor'; Object = 'activity' }
-    )) {
-        $topic = "$prefix/$($entry.Component)/$node/$($entry.Object)/config"
+    foreach ($topic in (Get-CopilotMqttSessionDiscoveryTopic -Node $topics.Node)) {
         Publish-CopilotMqttMessage -Topic $topic -Payload '' -Headers $Headers -Retain
     }
-
-    # The per-field dropdown slots are part of the session too.
-    for ($i = 1; $i -le $script:CopilotMqttMaxFields; $i++) {
-        Publish-CopilotMqttMessage -Topic "$prefix/select/$node/f$i/config" `
-            -Payload '' -Headers $Headers -Retain
-    }
-    Publish-CopilotMqttMessage -Topic "$prefix/button/$node/submit/config" `
-        -Payload '' -Headers $Headers -Retain
-    Publish-CopilotMqttMessage -Topic "$prefix/button/$node/stop/config" `
-        -Payload '' -Headers $Headers -Retain
 
     foreach ($topic in @(
         $topics.DecisionState, $topics.DecisionAttributes, $topics.ReplyState,

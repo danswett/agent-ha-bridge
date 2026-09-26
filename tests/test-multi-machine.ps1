@@ -298,8 +298,93 @@ Test-That 'the pre-scoping entities are withdrawn on upgrade' {
     ($legacy -contains 'homeassistant/sensor/agent_bridge_global/sessions/config')
 }
 
-Write-Host '--- deciding whether shared Home Assistant state may be removed ---'
+Write-Host '--- the orphan sweep never touches a running machine ---'
 
+# The sweep runs at daemon start and clears entities for sessions that are no longer
+# live. "Not live here" is not "orphaned" once a Home Assistant is shared, so this is
+# the check that a laptop starting up cannot delete the desktop's session cards.
+$env:AGENT_BRIDGE_DAEMON_NORUN = '1'
+. (Join-Path $PSScriptRoot '..\hooks\agent-bridge-daemon.ps1')
+Remove-Item Env:\AGENT_BRIDGE_DAEMON_NORUN -ErrorAction SilentlyContinue
+
+$script:Swept = @()
+function Publish-CopilotMqttMessage {
+    param([string]$Topic, [AllowEmptyString()][string]$Payload, [hashtable]$Headers, [switch]$Retain)
+    if ($Payload -eq '') { $script:Swept += $Topic }
+}
+function Write-DaemonLog { param([string]$Message) $script:SweepLog += $Message }
+$selfSlug = Get-BridgeMachineSlug
+
+# One session live here, one live on a peer, one genuinely abandoned.
+$sweepStates = @(
+    [pscustomobject]@{ entity_id = "sensor.agent_bridge_${selfSlug}_sessions"; state = '1'
+        attributes = [pscustomobject]@{ machine = 'HERE'; machine_slug = $selfSlug
+            sessions = @([pscustomobject]@{ node = 'agent_bridge_1111111111111111' }); capabilities = [pscustomobject]@{} } }
+    [pscustomobject]@{ entity_id = 'sensor.agent_bridge_peerbox_sessions'; state = '1'
+        attributes = [pscustomobject]@{ machine = 'PEERBOX'; machine_slug = 'peerbox'
+            sessions = @([pscustomobject]@{ node = 'agent_bridge_2222222222222222' }); capabilities = [pscustomobject]@{} } }
+    [pscustomobject]@{ entity_id = 'select.agent_bridge_1111111111111111_decision'; state = 'Idle'; attributes = [pscustomobject]@{} }
+    [pscustomobject]@{ entity_id = 'select.agent_bridge_2222222222222222_decision'; state = 'Idle'; attributes = [pscustomobject]@{} }
+    [pscustomobject]@{ entity_id = 'select.agent_bridge_3333333333333333_decision'; state = 'Idle'; attributes = [pscustomobject]@{} }
+)
+$script:DaemonStatesCache = $sweepStates
+$script:DaemonStatesCacheAt = [DateTimeOffset]::Now
+$script:SweepLog = @()
+Clear-CopilotMqttOrphans -Headers @{} -Live @{ '11111111-1111-1111-1111-111111111111' = $true }
+
+Test-That 'the abandoned session is cleared' {
+    @($script:Swept | Where-Object { $_ -match 'agent_bridge_3333333333333333' }).Count -ge 1
+}
+Test-That 'the sweep clears exactly what a clean exit would' {
+    # These were two hand-maintained lists and they drifted: the stop button was added
+    # to the exit path only, so every swept session left a dead Stop button behind.
+    $sweptForOrphan = @($script:Swept | Where-Object { $_ -match 'agent_bridge_3333333333333333' } | Sort-Object)
+    $expected = @(Get-CopilotMqttSessionDiscoveryTopic -Node 'agent_bridge_3333333333333333' | Sort-Object)
+    ($sweptForOrphan -join '|') -eq ($expected -join '|')
+}
+Test-That 'the stop button is one of them' {
+    @($script:Swept | Where-Object { $_ -match 'agent_bridge_3333333333333333/stop/config$' }).Count -eq 1
+}
+Test-That 'a peer machine live session is left alone' {
+    @($script:Swept | Where-Object { $_ -match 'agent_bridge_2222222222222222' }).Count -eq 0
+}
+Test-That 'this machine own live session is left alone' {
+    @($script:Swept | Where-Object { $_ -match 'agent_bridge_1111111111111111' }).Count -eq 0
+}
+Test-That 'no machine-level sensor is mistaken for an orphaned session' {
+    @($script:Swept | Where-Object { $_ -match 'peerbox|sessions/config' }).Count -eq 0
+}
+
+# A machine whose name happens to look like a session node.
+$script:Swept = @()
+$hexStates = @(
+    [pscustomobject]@{ entity_id = 'sensor.agent_bridge_abcdef012345_sessions'; state = '0'
+        attributes = [pscustomobject]@{ machine = 'abcdef012345'; machine_slug = 'abcdef012345'
+            sessions = @(); capabilities = [pscustomobject]@{} } }
+    [pscustomobject]@{ entity_id = 'button.agent_bridge_abcdef012345_new_session'; state = 'unknown'; attributes = [pscustomobject]@{} }
+)
+$script:DaemonStatesCache = $hexStates
+$script:DaemonStatesCacheAt = [DateTimeOffset]::Now
+Clear-CopilotMqttOrphans -Headers @{} -Live @{}
+Test-That 'a hostname shaped like a node id is still recognised as a machine' {
+    @($script:Swept).Count -eq 0
+}
+
+# The fail-safe: no machine sensors visible means the picture is incomplete.
+$script:Swept = @()
+$script:SweepLog = @()
+$script:DaemonStatesCache = @(
+    [pscustomobject]@{ entity_id = 'select.agent_bridge_4444444444444444_decision'; state = 'Idle'; attributes = [pscustomobject]@{} }
+)
+$script:DaemonStatesCacheAt = [DateTimeOffset]::Now
+Clear-CopilotMqttOrphans -Headers @{} -Live @{}
+Test-That 'an incomplete picture skips the sweep rather than guessing' {
+    # Deleting a running machine's entities is far worse than leaving a dead session
+    # a little longer; the sweep runs again on the next start.
+    @($script:Swept).Count -eq 0 -and @($script:SweepLog | Where-Object { $_ -match 'skipped' }).Count -eq 1
+}
+
+Write-Host '--- deciding whether shared Home Assistant state may be removed ---'
 Test-That 'another machine present keeps the dashboard' {
     $d = Get-BridgeSharedStateDecision -Interactive $false -OtherMachines @('LAPTOP')
     (-not $d.Clear) -and $d.Reason -match 'LAPTOP'

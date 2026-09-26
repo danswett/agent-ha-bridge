@@ -1431,9 +1431,16 @@ function Clear-CopilotMqttOrphans {
         dashboard never accumulates dead sessions across daemon restarts.
 
         Orphans are matched by node id: every published entity id is
-        `<component>.copilot_<node>_<object>`, and the live node ids are computed from
-        the live sessions. Anything published under a node id that is not live is
-        cleared.
+        `<component>.agent_bridge_<node>_<object>`, and the live node ids are computed
+        from the live sessions.
+
+        "Not live here" is not the same as orphaned, though, and that is the whole
+        difficulty. One Home Assistant is normally shared, so most published sessions
+        belong to some other machine and are perfectly alive. Nodes claimed by a peer
+        are therefore excluded, and when the peer list could not be read the sweep is
+        skipped entirely rather than run on a partial picture - deleting a running
+        machine's session entities is far worse than leaving a dead one a while longer,
+        and the sweep runs again on the next start.
     #>
     param(
         [Parameter(Mandatory)][hashtable]$Headers,
@@ -1446,18 +1453,33 @@ function Clear-CopilotMqttOrphans {
     }
 
     try {
-        $states = Invoke-RestMethod `
-            -Uri "$($script:DecisionBridgeConfig.HomeAssistantBaseUrl)/api/states" `
-            -Headers $Headers -TimeoutSec 20
+        $states = Get-DaemonHomeAssistantStates -Headers $Headers
     }
     catch {
         Write-DaemonLog -Message "orphan sweep skipped: $($_.Exception.Message)"
         return
     }
 
+    # Every machine, including this one, so a machine-level node is never mistaken for
+    # a session and peers' sessions are left alone.
+    $peers = @(Get-BridgePeerMachine -States $states)
+    if ($peers.Count -eq 0) {
+        Write-DaemonLog -Message 'orphan sweep skipped: no machine sensors visible yet'
+        return
+    }
+    foreach ($peer in $peers) {
+        $liveNodes[(Get-CopilotMqttMachineNode -Slug $peer.Slug)] = $true
+        if ($peer.IsSelf) { continue }
+        foreach ($remote in @($peer.Sessions)) {
+            $node = [string]$remote.node
+            if ($node) { $liveNodes[$node] = $true }
+        }
+    }
+
     $orphanNodes = @{}
-    foreach ($state in $states) {
-        if ([string]$state.entity_id -notmatch '^(?:select|sensor|text)\.(copilot_[0-9a-f]{16,})_') {
+    foreach ($state in @($states)) {
+        if ($null -eq $state) { continue }
+        if ([string]$state.entity_id -notmatch '^(?:select|sensor|text|button)\.(agent_bridge_[0-9a-z]{12,})_') {
             continue
         }
         $node = $Matches[1]
@@ -1465,18 +1487,7 @@ function Clear-CopilotMqttOrphans {
     }
 
     foreach ($node in $orphanNodes.Keys) {
-        foreach ($entry in @(
-            @{ Component = 'select'; Object = 'decision' }
-            @{ Component = 'text'; Object = 'reply' }
-            @{ Component = 'sensor'; Object = 'status' }
-            @{ Component = 'sensor'; Object = 'activity' }
-            @{ Component = 'select'; Object = 'f1' }
-            @{ Component = 'select'; Object = 'f2' }
-            @{ Component = 'select'; Object = 'f3' }
-            @{ Component = 'select'; Object = 'f4' }
-            @{ Component = 'button'; Object = 'submit' }
-        )) {
-            $topic = "$($script:CopilotMqttConfig.DiscoveryPrefix)/$($entry.Component)/$node/$($entry.Object)/config"
+        foreach ($topic in (Get-CopilotMqttSessionDiscoveryTopic -Node $node)) {
             try {
                 Publish-CopilotMqttMessage -Topic $topic -Payload '' -Headers $Headers -Retain
             }
@@ -1536,7 +1547,7 @@ function Invoke-DaemonUpdateOutcome {
             $message = "The Home Assistant bridge updated to **$version**."
             if ($url) { $message += " [Release notes]($url)" }
             Invoke-HomeAssistantService -Domain 'persistent_notification' -Service 'create' `
-                -Data @{ title = 'Bridge updated'; message = $message; notification_id = 'agent_bridge_update' } `
+                -Data @{ title = "Bridge updated on $($script:DaemonMachineName)"; message = $message; notification_id = "agent_bridge_update_$($script:DaemonMachineSlug)" } `
                 -Headers $Headers
             Write-DaemonLog -Message "self-update announced: updated to $version"
         }
@@ -1548,7 +1559,7 @@ function Invoke-DaemonUpdateOutcome {
             $latest = if ($version) { $version } else { $installed }
             Publish-CopilotMqttUpdate -InstalledVersion $installed -LatestVersion $latest -Headers $Headers
             Invoke-HomeAssistantService -Domain 'persistent_notification' -Service 'create' `
-                -Data @{ title = 'Bridge update failed'; message = "The bridge update did not complete: $err"; notification_id = 'agent_bridge_update' } `
+                -Data @{ title = "Bridge update failed on $($script:DaemonMachineName)"; message = "The bridge update did not complete: $err"; notification_id = "agent_bridge_update_$($script:DaemonMachineSlug)" } `
                 -Headers $Headers
             Write-DaemonLog -Message "self-update announced: FAILED ($err)"
         }

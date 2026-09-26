@@ -100,9 +100,15 @@ Test-That 'it publishes up to date with the spinner off' {
     $script:Published[-1].Latest -eq '1.2.0' -and -not $script:Published[-1].InProgress
 }
 Test-That 'it fires one notification naming the version' {
-    $script:Notified.Count -eq 1 -and $script:Notified[0].Title -eq 'Bridge updated' -and $script:Notified[0].Message -match '1\.2\.0'
+    $script:Notified.Count -eq 1 -and
+    $script:Notified[0].Title -match '^Bridge updated on ' -and
+    $script:Notified[0].Message -match '1\.2\.0'
 }
-Test-That 'the notification is a stable single id' { $script:Notified[0].Id -eq 'agent_bridge_update' }
+Test-That 'the notification is a stable single id, scoped to this machine' {
+    # Shared, two machines updating would overwrite each other's notification and the
+    # titles would read identically, so there was no way to tell which had updated.
+    $script:Notified[0].Id -eq "agent_bridge_update_$(Get-BridgeMachineSlug)"
+}
 Test-That 'the marker is consumed' { -not (Test-Path -LiteralPath $outcomeFile) }
 
 Write-Host '--- a failure marker clears the spinner and reports the error ---'
@@ -112,7 +118,9 @@ Invoke-DaemonUpdateOutcome -Headers $headers
 Test-That 'it clears the spinner' { $script:Published.Count -ge 1 -and -not $script:Published[-1].InProgress }
 Test-That 'it leaves the update available for retry' { $script:Published[-1].Installed -eq '1.1.0' }
 Test-That 'it notifies with the error text' {
-    $script:Notified.Count -eq 1 -and $script:Notified[0].Title -eq 'Bridge update failed' -and $script:Notified[0].Message -match 'disk full'
+    $script:Notified.Count -eq 1 -and
+    $script:Notified[0].Title -match '^Bridge update failed on ' -and
+    $script:Notified[0].Message -match 'disk full'
 }
 Test-That 'the marker is consumed' { -not (Test-Path -LiteralPath $outcomeFile) }
 
