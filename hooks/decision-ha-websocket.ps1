@@ -835,17 +835,21 @@ function Initialize-BridgeDashboard {
 
 function Test-BridgeActivityCardServed {
     <#
-        True when the served reply-card file includes agent-bridge-activity-card, read
-        from the `?v=` cache-buster on its resource URL. The element first shipped in
-        card version 1.10.0.
+        True when the served reply-card file includes agent-bridge-activity-card (or,
+        with -MinimumVersion, whatever element shipped in that version), read from
+        the `?v=` cache-buster on its resource URL. The activity card first shipped in
+        card version 1.10.0; agent-bridge-session-card in 1.12.0.
     #>
-    param([AllowEmptyString()][AllowNull()][string]$ReplyCardUrl)
+    param(
+        [AllowEmptyString()][AllowNull()][string]$ReplyCardUrl,
+        [string]$MinimumVersion = '1.10.0'
+    )
 
     if ([string]::IsNullOrWhiteSpace($ReplyCardUrl)) { return $false }
     if ($ReplyCardUrl -notmatch '[?&]v=([0-9]+(\.[0-9]+){1,3})') { return $false }
     $served = $null
     if (-not [version]::TryParse($Matches[1], [ref]$served)) { return $false }
-    $served -ge [version]'1.10.0'
+    $served -ge [version]$MinimumVersion
 }
 
 $script:BridgeReplyCardUrlCache = ''
@@ -1113,13 +1117,14 @@ function Save-CopilotSessionDashboard {
         if ($_.IncludeProfile) {
             $rows += @{ entity = (Get-BridgeMachineEntityId -Domain 'select' -Key 'new_profile' -Slug $slug); name = 'Profile' }
         }
-        # Launch sits directly under the selectors, because they all carry a default and
-        # a launch therefore needs no input at all - open the card, press Launch.
-        #
-        # The result of the last launch and the optional opening prompt are deliberately
-        # not shown. The launch itself is visible within seconds as a new session card,
-        # so restating it only adds a row that is stale most of the time, and the prompt
-        # was an input nobody reached for on a card whose whole point is one press.
+        # The optional first message. It had been dropped as an input nobody reached
+        # for, but Codex creates no session until it gets one - without it a Codex
+        # launch runs in a window the dashboard can never see - and for any agent it
+        # starts the work straight away.
+        $rows += @{ entity = (Get-BridgeMachineEntityId -Domain 'text' -Key 'new_prompt' -Slug $slug); name = 'First message' }
+        # Launch sits directly under the inputs, because they all carry a default and
+        # a launch therefore needs no input at all - open the card, press Launch. What
+        # the press led to shows in the note right under this card.
         $rows += @{ entity = (Get-BridgeMachineEntityId -Domain 'button' -Key 'new_session' -Slug $slug); name = 'Launch' }
 
         $card = @{
@@ -1147,7 +1152,10 @@ function Save-CopilotSessionDashboard {
             card = @{ type = 'markdown'; content = "{{ states('$resultEntity') }}" }
         }
 
-        if (-not $MachineSelector) { return @($card, $note) }
+        # One stack, so the note always sits right under the Launch button. As two
+        # top-level cards the masonry layout was free to put the note in another
+        # column entirely, and a press looked like it had done nothing.
+        if (-not $MachineSelector) { return @{ type = 'vertical-stack'; cards = @($card, $note) } }
 
         # Titles live on the outer card only; a conditional card with a titled child
         # would repeat the heading for whichever machine is selected.
@@ -1174,6 +1182,37 @@ function Save-CopilotSessionDashboard {
                 }
             ) + $newSessionCards
         })
+    }
+
+    # From card 1.12.0 the bridge draws the launch card itself: one compact row of
+    # agent, workspace and Launch, with resume, profile and a first message behind an
+    # expander, the note right under the button, and a machine picker when there is
+    # more than one. The entities card above gave every selector a full-height row,
+    # so launching took a screenful. It is still built above for older cards.
+    if (Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.12.0') {
+        $launchMachines = @($onlineList | ForEach-Object {
+            $slug = $_.Slug
+            $entry = [ordered]@{
+                machine   = [string]$_.Machine
+                workspace = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_workspace' -Slug $slug
+                prompt    = Get-BridgeMachineEntityId -Domain 'text' -Key 'new_prompt' -Slug $slug
+                launch    = Get-BridgeMachineEntityId -Domain 'button' -Key 'new_session' -Slug $slug
+                result    = Get-BridgeMachineEntityId -Domain 'sensor' -Key 'new_session_result' -Slug $slug
+            }
+            if ($_.IncludeResume) { $entry.resume = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_resume' -Slug $slug }
+            if ($_.PSObject.Properties['IncludeAgent'] -and $_.IncludeAgent) {
+                $entry.agent = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_agent' -Slug $slug
+            }
+            if ($_.IncludeProfile) { $entry.profile = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_profile' -Slug $slug }
+            $entry
+        })
+        $launchCard = [ordered]@{
+            type     = 'custom:agent-bridge-launch-card'
+            title    = 'Start a new session'
+            machines = $launchMachines
+        }
+        if ($MachineSelector) { $launchCard.selector = $MachineSelector }
+        $newSessionCards = @($launchCard)
     }
 
     # The control panel is a plain card pair at the top of the masonry flow.
@@ -1670,14 +1709,30 @@ ha-card {
             }
         }
 
-        # Each session is a vertical stack of its own cards. In a masonry view these
-        # stacks are packed into columns by height rather than aligned into rows, which
-        # is what stops one tall session from leaving dead space under every shorter
-        # card beside it.
-        @{
-            type = 'vertical-stack'
-            card_mod = @{ style = $sessionCardStyle }
-            cards = @($header) + @($fieldCards) + @($answerCard, $replyCard, $sendStatusCard, $cancelCard, $stopCard)
+        # Each session is one stack of its own cards. In a masonry view these stacks
+        # are packed into columns by height rather than aligned into rows, which is
+        # what stops one tall session from leaving dead space under every shorter card
+        # beside it.
+        #
+        # The bridge's own session card draws the frame and glow when the served card
+        # file has it. The card-mod-styled vertical-stack it replaces lost them on a
+        # hard refresh whenever the stack was built before card-mod loaded; it remains
+        # only for a Home Assistant still serving an older card.
+        $sessionCards = @($header) + @($fieldCards) + @($answerCard, $replyCard, $sendStatusCard, $cancelCard, $stopCard)
+        if (Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.12.0') {
+            @{
+                type     = 'custom:agent-bridge-session-card'
+                status   = $statusEntity
+                decision = $decisionEntity
+                cards    = $sessionCards
+            }
+        }
+        else {
+            @{
+                type = 'vertical-stack'
+                card_mod = @{ style = $sessionCardStyle }
+                cards = $sessionCards
+            }
         }
     }
 

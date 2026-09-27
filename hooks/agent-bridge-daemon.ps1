@@ -121,6 +121,9 @@ $script:DaemonConfig = @{
     # How soon to retry after a fetch that failed or came back empty, rather than
     # waiting out the full interval with a list known to be wrong.
     ResumeRetrySeconds = 20
+    # How long a launch-card note (a failed launch, an agent set up) stays before it
+    # is cleared. Nothing else removes one, so without this it stayed indefinitely.
+    NoteExpirySeconds = 600
 }
 
 # Session-set signature of the last dashboard rebuild, so the dashboard is only
@@ -2563,6 +2566,44 @@ function Sync-DaemonNewSession {
         }
     }
 
+    # A press while a Codex launched without a first message is still waiting for one
+    # sends the First message box into that window: Codex creates its session - and
+    # so becomes visible here - only on its first message.
+    # Only while Codex is still the chosen agent and there is a message to send: any
+    # other press is a new launch, and the waiting window is left to itself.
+    $first = ''
+    $firstAgent = ''
+    if ($null -ne $pending -and $pending.PSObject.Properties['AwaitingFirstMessage'] -and $pending.AwaitingFirstMessage) {
+        try { $first = [string](Get-HomeAssistantState -EntityId $script:DaemonEntity.NewPrompt -Headers $Headers).state } catch { }
+        try { $firstAgent = [string](Get-HomeAssistantState -EntityId $script:DaemonEntity.NewAgent -Headers $Headers).state } catch { }
+        if ($first -in @('unknown', 'unavailable')) { $first = '' }
+        $first = $first.Trim()
+        if (-not $first -or ($firstAgent -and (Resolve-BridgeLauncher -Label $firstAgent) -ne 'codex')) {
+            Write-DaemonLog -Message "stopped waiting on the Codex in $($pending.Label) for a first message: a new launch was asked for"
+            $script:DaemonPendingLaunch = $null
+            $pending = $null
+        }
+    }
+    if ($null -ne $pending -and $pending.PSObject.Properties['AwaitingFirstMessage'] -and $pending.AwaitingFirstMessage) {
+        $delivery = Send-CopilotSessionPrompt -SessionId 'codex-launch' -ProcessId $pending.ProcessId -Text $first
+        Write-DaemonLog -Message "first message sent to the Codex launched in $($pending.Label) (pid $($pending.ProcessId)): $($delivery.Detail)"
+        if (-not $delivery.Delivered) {
+            Set-CopilotMqttNewSessionResult -Headers $Headers -Text "Couldn't send that to Codex ($($delivery.Detail)) - type it in its window."
+            return
+        }
+        $pending.AwaitingFirstMessage = $false
+        $pending.Since = [DateTimeOffset]::Now
+        $pending.LastCheck = [DateTimeOffset]::MinValue
+        Set-CopilotMqttNewSessionResult -Headers $Headers -Text "Sending your first message to Codex in $($pending.Label)..."
+        try {
+            Invoke-HomeAssistantService -Domain 'text' -Service 'set_value' -Headers $Headers -Data @{
+                entity_id = $script:DaemonEntity.NewPrompt; value = $script:DaemonConfig.ReplyBlankValue
+            }
+        }
+        catch { }
+        return
+    }
+
     if ($workspaces.Count -eq 0) {
         Write-DaemonLog -Message 'new session requested but no workspaces are configured'
         Set-CopilotMqttNewSessionResult -Headers $Headers `
@@ -2738,6 +2779,10 @@ function Sync-DaemonNewSession {
         TrustAskedAt   = $null
         TrustConfirmed = $false
         TrustAnswers   = 0
+        # Codex registers only on its first message, so one opened without a prompt
+        # waits for it rather than timing out (Update-DaemonPendingLaunch).
+        AwaitingFirstMessage = ($chosenLauncher -eq 'codex' -and -not $prompt)
+        FirstMessageAsked    = $false
     }
 
     # A launch changes what is resumable - the session just started is now live, and
@@ -3092,6 +3137,31 @@ function Add-DaemonConfiguredClient {
     $script:BridgeUserConfig = $config
 }
 
+function Clear-DaemonStaleNote {
+    <#
+        Clears the launch card's note once it is NoteExpirySeconds old. A note says
+        what the last press or setup came to; once that is old news it only sits
+        there - "setting it up failed" long after it had been fixed. Its age comes
+        from Home Assistant's last_changed, so a note left from before a restart is
+        caught too. Never while a launch is still being followed up: that note is
+        live ("press Launch again to trust this folder").
+    #>
+    param([Parameter(Mandatory)][hashtable]$Headers)
+
+    if ($null -ne $script:DaemonPendingLaunch) { return }
+    try {
+        $state = Get-HomeAssistantState -EntityId $script:DaemonEntity.NewResult -Headers $Headers
+        $text = [string]$state.state
+        if ([string]::IsNullOrWhiteSpace($text) -or $text -in @('unknown', 'unavailable')) { return }
+        $changed = [DateTimeOffset]::MinValue
+        if (-not [DateTimeOffset]::TryParse([string]$state.last_changed, [ref]$changed)) { return }
+        if (([DateTimeOffset]::Now - $changed).TotalSeconds -lt $script:DaemonConfig.NoteExpirySeconds) { return }
+        Set-CopilotMqttNewSessionResult -Headers $Headers -Text ''
+        Write-DaemonLog -Message "cleared the launch note: $text"
+    }
+    catch { }
+}
+
 function Sync-DaemonClients {
     <#
         Sets up the bridge for a coding agent installed after the bridge was.
@@ -3226,6 +3296,23 @@ function Update-DaemonPendingLaunch {
             }
             return
         }
+    }
+
+    # A Codex opened without a first message has no session until it gets one. Once
+    # its window has had a moment to come up, the note says so and offers to send one
+    # from the card; it waits for as long as the window stays open (up to an hour),
+    # since there is no session to time out yet.
+    if ($p.PSObject.Properties['AwaitingFirstMessage'] -and $p.AwaitingFirstMessage) {
+        if (-not $p.FirstMessageAsked -and ($now - $p.Since).TotalSeconds -ge 4) {
+            $p.FirstMessageAsked = $true
+            Write-DaemonLog -Message "Codex in $($p.Label) is open and waiting for its first message"
+            Set-CopilotMqttNewSessionResult -Headers $Headers `
+                -Text "Codex is open in $($p.Label). It appears here after its first message: type one under First message and press Launch, or type it in its window."
+        }
+        if (($now - $p.Since).TotalMinutes -gt 60) {
+            & $finish '' "Codex in $($p.Label) never got a first message; stopped waiting"
+        }
+        return
     }
 
     if (($now - $p.Since).TotalSeconds -gt 90) {
@@ -4339,7 +4426,10 @@ function Start-BridgeDaemon {
                 # End session, likewise: left out, a press sat unnoticed for up to 15 s.
                 "button.${node}_stop"
             }
-        ) + @($script:DaemonConfig.VerboseToggle)
+        ) + @($script:DaemonConfig.VerboseToggle) +
+            # Launch too: left out, a press sat unnoticed for up to 15 s with nothing
+            # on the card to say it had been seen.
+            @($script:DaemonEntity.NewSession)
 
         $hit = $null
         try {
@@ -4402,6 +4492,18 @@ function Start-BridgeDaemon {
             }
         }
 
+        # Launch, likewise at once: its "Starting..." note is the feedback that the
+        # press landed, and waiting for the next reconcile left it up to 15 s late.
+        if ($null -ne $hit -and $hit.EntityId -eq $script:DaemonEntity.NewSession) {
+            try {
+                $liveNow = if ($script:DaemonLive -is [hashtable]) { $script:DaemonLive } else { @{} }
+                Sync-DaemonNewSession -Headers $headers -Live $liveNow
+            }
+            catch {
+                Write-DaemonLog -Message "launch failed: $($_.Exception.Message)"
+            }
+        }
+
         # A push hit only shortcuts latency; the sweep in the reconcile does the
         # authoritative delivery, so both paths funnel through the same guarded code.
         if (([DateTimeOffset]::Now - $lastReconcile).TotalSeconds -ge $ReconcileSeconds -or
@@ -4425,6 +4527,7 @@ function Start-BridgeDaemon {
                 Sync-DaemonUpdateStatus -Headers $headers
                 Sync-DaemonNewSession -Headers $headers -Live $live
                 Sync-DaemonClients -Headers $headers
+                Clear-DaemonStaleNote -Headers $headers
                 Invoke-DaemonFastActivity -Headers $headers -State $state
                 Write-DaemonState -State $state
             }

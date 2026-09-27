@@ -16,7 +16,7 @@
  * daemon downloads them and attaches them to the prompt.
  */
 
-const CARD_VERSION = '1.11.3';
+const CARD_VERSION = '1.12.0';
 
 // The working line, in the style of Claude Code's own spinner: its glyph cycle, and a
 // word picked once per turn. Claude Code does not record which word it chose, so the
@@ -617,8 +617,372 @@ class AgentBridgeActivityCard extends HTMLElement {
   }
 }
 
+/*
+ * One session's cards on a single surface: the border, background and state glow
+ * (working, waiting on you) drawn here, the section cards inside it.
+ *
+ * This used to be a vertical-stack styled by card-mod. card-mod is a dashboard
+ * resource, and on a hard refresh the stack could be built before it loaded - and
+ * card-mod never went back to it, so every session lost its outline, background
+ * and glow until the next navigation. A custom card type has no such race: Home
+ * Assistant waits for it to be defined before creating it. The children are made
+ * transparent through ha-card's own CSS variables, so they sit on this surface
+ * whether or not card-mod has arrived either.
+ */
+class AgentBridgeSessionCard extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: 'open' });
+    this._children = [];
+  }
+
+  setConfig(config) {
+    if (!config || !Array.isArray(config.cards)) {
+      throw new Error('agent-bridge-session-card: "cards" is required');
+    }
+    this._config = Object.assign({ status: '', decision: '' }, config);
+    this._build();
+  }
+
+  set hass(hass) {
+    this._hass = hass;
+    for (const child of this._children) { if (child) { child.hass = hass; } }
+    this._renderState();
+  }
+
+  getCardSize() {
+    return Math.max(4, (this._config && this._config.cards.length) || 4);
+  }
+
+  _build() {
+    const generation = (this._generation = (this._generation || 0) + 1);
+    this.shadowRoot.innerHTML = `
+      <style>
+        :host { display: block; }
+        .frame {
+          border-radius: var(--ha-card-border-radius, 12px);
+          background: var(--ha-card-background, var(--card-background-color, #fff));
+          overflow: hidden;
+          padding: 4px 12px 10px 12px;
+          box-sizing: border-box;
+          border: 1px solid var(--divider-color);
+          transition: border-color 0.4s ease;
+          /* Children draw no surface of their own. */
+          --ha-card-background: transparent;
+          --ha-card-box-shadow: none;
+          --ha-card-border-width: 0;
+          --ha-card-border-color: transparent;
+        }
+        .frame.working { border-color: var(--primary-color); animation: cpwork 1.6s ease-in-out infinite; }
+        .frame.waiting { border-color: var(--warning-color); animation: cpwait 1.6s ease-in-out infinite; }
+        @keyframes cpwork {
+          0%   { box-shadow: 0 0 6px 0px var(--primary-color); }
+          50%  { box-shadow: 0 0 16px 2px var(--primary-color); }
+          100% { box-shadow: 0 0 6px 0px var(--primary-color); }
+        }
+        @keyframes cpwait {
+          0%   { box-shadow: 0 0 6px 0px var(--warning-color); }
+          50%  { box-shadow: 0 0 18px 3px var(--warning-color); }
+          100% { box-shadow: 0 0 6px 0px var(--warning-color); }
+        }
+      </style>
+      <div class="frame"></div>`;
+    this._frame = this.shadowRoot.querySelector('.frame');
+    this._state = '';
+    this._children = [];
+    this._renderState();
+
+    const configs = this._config.cards;
+    const make = (helpers, index) => {
+      const el = helpers.createCardElement(configs[index]);
+      if (this._hass) { el.hass = this._hass; }
+      // A child whose custom type was not defined yet is built as a placeholder that
+      // asks to be rebuilt once it is - the same request a stack card honours.
+      el.addEventListener('ll-rebuild', (ev) => {
+        ev.stopPropagation();
+        if (generation !== this._generation) { return; }
+        const fresh = make(helpers, index);
+        el.replaceWith(fresh);
+        this._children[index] = fresh;
+      }, { once: true });
+      return el;
+    };
+    window.loadCardHelpers().then((helpers) => {
+      if (generation !== this._generation) { return; }
+      configs.forEach((_, index) => {
+        const el = make(helpers, index);
+        this._children[index] = el;
+        this._frame.appendChild(el);
+      });
+    });
+  }
+
+  _renderState() {
+    if (!this._frame || !this._hass || !this._config) { return; }
+    const states = this._hass.states;
+    const decision = this._config.decision ? states[this._config.decision] : undefined;
+    const status = this._config.status ? states[this._config.status] : undefined;
+    const waiting = !!(decision && decision.attributes && decision.attributes.question);
+    const state = waiting ? 'waiting' : (status && status.state === 'working' ? 'working' : '');
+    if (state === this._state) { return; }
+    this._state = state;
+    this._frame.classList.toggle('waiting', state === 'waiting');
+    this._frame.classList.toggle('working', state === 'working');
+  }
+}
+
+/*
+ * Starting a session. The entities card this replaces gave every selector a
+ * full-height row, so the card took a screenful to say "press Launch". Here the
+ * header carries the title, what a press will start (agent - workspace) and the
+ * Launch button itself; the choices fold out beneath it in a compact grid, and the
+ * note about the last press sits right under the button.
+ *
+ * A press shows "Launching..." at once, before the daemon has said anything, and
+ * that stays until the daemon's own note replaces it - so a press never looks as if
+ * it did nothing.
+ */
+const LAUNCH_FRESH = 'New session';
+const LAUNCH_BLANK = ' ';
+
+class AgentBridgeLaunchCard extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: 'open' });
+    this._pressedAt = 0;
+    try { this._open = localStorage.getItem('agent-bridge-launch-open') === '1'; } catch (e) { this._open = false; }
+  }
+
+  setConfig(config) {
+    if (!config || !Array.isArray(config.machines) || config.machines.length === 0) {
+      throw new Error('agent-bridge-launch-card: "machines" is required');
+    }
+    this._config = Object.assign({ title: 'Start a new session', selector: '' }, config);
+    this._built = false;
+    if (this._hass) { this._build(); this._render(); }
+  }
+
+  set hass(hass) {
+    this._hass = hass;
+    if (!this._built) { this._build(); }
+    this._render();
+  }
+
+  getCardSize() { return this._open ? 5 : 2; }
+
+  _build() {
+    this._built = true;
+    this.shadowRoot.innerHTML = `
+      <style>
+        ha-card { padding: 12px 16px; }
+        .head { display: flex; align-items: center; gap: 10px; }
+        .toggle { flex: 1; min-width: 0; cursor: pointer; user-select: none; }
+        .title { font-size: 1.1em; font-weight: 500; display: flex; align-items: center; gap: 6px; }
+        .chev { transition: transform 0.2s ease; color: var(--secondary-text-color); font-size: 0.8em; }
+        .open .chev { transform: rotate(90deg); }
+        .summary { color: var(--secondary-text-color); font-size: 0.9em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        button.launch {
+          border: none; border-radius: 8px; padding: 0 16px; height: 36px; flex: none;
+          font: inherit; font-weight: 600; cursor: pointer;
+          background: var(--primary-color); color: var(--text-primary-color, #fff);
+        }
+        button.launch:disabled { opacity: 0.5; cursor: default; }
+        .fields {
+          display: grid; grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
+          gap: 8px 10px; margin-top: 12px;
+        }
+        label { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+        label span { font-size: 11px; color: var(--secondary-text-color); }
+        label.wide { grid-column: 1 / -1; }
+        select, input {
+          height: 34px; min-width: 0; box-sizing: border-box; padding: 0 8px;
+          font: inherit; color: var(--primary-text-color);
+          background: var(--secondary-background-color, rgba(127,127,127,0.1));
+          border: 1px solid var(--divider-color); border-radius: 8px;
+        }
+        select:focus, input:focus { outline: none; border-color: var(--primary-color); }
+        .dim { opacity: 0.45; }
+        .note { margin-top: 10px; font-size: 0.92em; color: var(--secondary-text-color); display: flex; gap: 6px; align-items: baseline; }
+        .note .spin { color: var(--agent-bridge-spinner-color, #d97757); }
+        [hidden] { display: none !important; }
+      </style>
+      <ha-card>
+        <div class="head">
+          <div class="toggle" role="button" tabindex="0" aria-expanded="false">
+            <div class="title"><span class="chev">▶</span><span class="name"></span></div>
+            <div class="summary"></div>
+          </div>
+          <button class="launch">Launch</button>
+        </div>
+        <div class="fields" hidden>
+          <label class="f-machine wide"><span>Machine</span><select data-key="machine"></select></label>
+          <label class="f-resume wide"><span>Resume</span><select data-key="resume"></select></label>
+          <label class="f-agent"><span>Agent</span><select data-key="agent"></select></label>
+          <label class="f-workspace"><span>Workspace</span><select data-key="workspace"></select></label>
+          <label class="f-profile"><span>Profile</span><select data-key="profile"></select></label>
+          <label class="f-prompt wide"><span>First message (optional)</span><input data-key="prompt" type="text" placeholder="Start with a task, or leave empty"></label>
+        </div>
+        <div class="note" hidden><span class="spin"></span><span class="text"></span></div>
+      </ha-card>`;
+    const $ = (s) => this.shadowRoot.querySelector(s);
+    this._els = {
+      card: $('ha-card'), toggle: $('.toggle'), name: $('.name'), summary: $('.summary'),
+      launch: $('button.launch'), fields: $('.fields'), note: $('.note'), spin: $('.note .spin'), text: $('.note .text'),
+      prompt: $('input[data-key="prompt"]'),
+    };
+    this._els.name.textContent = this._config.title;
+
+    const flip = () => {
+      this._open = !this._open;
+      try { localStorage.setItem('agent-bridge-launch-open', this._open ? '1' : '0'); } catch (e) { /* per-viewer nicety only */ }
+      this._render();
+    };
+    this._els.toggle.addEventListener('click', flip);
+    this._els.toggle.addEventListener('keydown', (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); flip(); } });
+
+    this.shadowRoot.querySelectorAll('select').forEach((select) => {
+      select.addEventListener('change', () => this._choose(select.dataset.key, select.value));
+    });
+    this._els.prompt.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); this._launch(); } });
+    this._els.launch.addEventListener('click', () => this._launch());
+  }
+
+  _machine() {
+    const machines = this._config.machines;
+    const chosen = this._config.selector ? this._state(this._config.selector) : '';
+    return machines.find((m) => m.machine === chosen) || machines[0];
+  }
+
+  _state(entityId) {
+    const s = entityId && this._hass ? this._hass.states[entityId] : undefined;
+    return s ? String(s.state) : '';
+  }
+
+  _options(entityId) {
+    const s = entityId && this._hass ? this._hass.states[entityId] : undefined;
+    return s && s.attributes && Array.isArray(s.attributes.options) ? s.attributes.options.map(String) : [];
+  }
+
+  _entityFor(key) {
+    return key === 'machine' ? this._config.selector : this._machine()[key];
+  }
+
+  _choose(key, value) {
+    const entityId = this._entityFor(key);
+    if (!entityId) { return; }
+    const domain = entityId.split('.')[0];
+    this._hass.callService(domain, 'select_option', { entity_id: entityId, option: value });
+  }
+
+  async _launch() {
+    const m = this._machine();
+    if (!m.launch || this._els.launch.disabled) { return; }
+    this._pressedAt = Date.now();
+    this._pressedNote = this._state(m.result);
+    this._render();
+    try {
+      // The prompt is written before the press: the daemon reads it when it sees
+      // the press, and a value still sitting in this box would otherwise be missed.
+      const typed = this._els.prompt.value.trim();
+      if (m.prompt && typed !== this._state(m.prompt).trim()) {
+        await this._hass.callService('text', 'set_value', { entity_id: m.prompt, value: typed || LAUNCH_BLANK });
+      }
+      await this._hass.callService('button', 'press', { entity_id: m.launch });
+      this._els.prompt.value = '';
+    } catch (err) {
+      this._pressedAt = 0;
+      this._localNote = `Launch failed: ${err.message || err}`;
+      this._render();
+    }
+  }
+
+  _fill(select, entityId, labelEl) {
+    const options = this._options(entityId);
+    labelEl.hidden = !entityId || options.length === 0;
+    if (labelEl.hidden) { return; }
+    const key = options.join('\u0001');
+    if (select.dataset.options !== key) {
+      select.dataset.options = key;
+      select.textContent = '';
+      for (const option of options) {
+        const el = document.createElement('option');
+        el.value = option;
+        el.textContent = option;
+        select.appendChild(el);
+      }
+    }
+    // Never yank a list out from under someone choosing from it.
+    const current = this._state(entityId);
+    if (this.shadowRoot.activeElement !== select && options.includes(current) && select.value !== current) {
+      select.value = current;
+    }
+  }
+
+  _render() {
+    if (!this._els || !this._hass || !this._config) { return; }
+    const m = this._machine();
+    const machines = this._config.machines;
+    const q = (s) => this.shadowRoot.querySelector(s);
+
+    this._els.toggle.parentElement.classList.toggle('open', this._open);
+    this._els.toggle.setAttribute('aria-expanded', this._open ? 'true' : 'false');
+    this._els.fields.hidden = !this._open;
+
+    this._fill(q('select[data-key="machine"]'), machines.length > 1 ? this._config.selector : '', q('.f-machine'));
+    this._fill(q('select[data-key="resume"]'), m.resume, q('.f-resume'));
+    this._fill(q('select[data-key="agent"]'), m.agent, q('.f-agent'));
+    this._fill(q('select[data-key="workspace"]'), m.workspace, q('.f-workspace'));
+    this._fill(q('select[data-key="profile"]'), m.profile, q('.f-profile'));
+
+    // A resume brings its own agent and folder, so those choices step back.
+    const resume = m.resume ? this._state(m.resume) : '';
+    const resuming = !!resume && resume !== LAUNCH_FRESH && !['unknown', 'unavailable'].includes(resume);
+    const agent = m.agent ? this._state(m.agent) : '';
+    q('.f-agent').classList.toggle('dim', resuming);
+    q('.f-workspace').classList.toggle('dim', resuming);
+    // The profile applies only under Agency.
+    if (m.agent && agent && agent !== 'Agency') { q('.f-profile').hidden = true; }
+
+    const promptState = this._state(m.prompt);
+    if (this.shadowRoot.activeElement !== this._els.prompt && !this._els.prompt.value && promptState.trim() &&
+        !['unknown', 'unavailable'].includes(promptState)) {
+      this._els.prompt.value = promptState.trim();
+    }
+
+    const workspace = this._state(m.workspace);
+    const bits = resuming ? [`Resume: ${resume}`] : [agent, workspace].filter((b) => b && !['unknown', 'unavailable'].includes(b));
+    if (machines.length > 1) { bits.unshift(m.machine); }
+    this._els.summary.textContent = bits.join(' · ');
+    this._els.launch.textContent = resuming ? 'Resume' : 'Launch';
+
+    // The note: the daemon's word on the last press, or "Launching..." from the
+    // moment of the press until the daemon's note changes (20 s at most).
+    let note = this._state(m.result);
+    if (['unknown', 'unavailable'].includes(note)) { note = ''; }
+    const waiting = this._pressedAt && note === this._pressedNote && Date.now() - this._pressedAt < 20000;
+    if (this._pressedAt && !waiting) { this._pressedAt = 0; }
+    if (waiting) { note = 'Launching...'; }
+    if (this._localNote) { note = this._localNote; this._localNote = ''; }
+    const busy = waiting || /\.\.\.$/.test(note.trim());
+    this._els.note.hidden = !note.trim();
+    this._els.text.textContent = note.trim();
+    this._els.spin.textContent = busy ? '⏳' : '';
+    this._els.launch.disabled = waiting;
+    if (waiting && !this._pressTimer) {
+      // Re-check once the optimistic note would expire, even if no state changes.
+      this._pressTimer = setTimeout(() => { this._pressTimer = null; this._render(); }, 20500);
+    }
+  }
+}
+
 if (!customElements.get('agent-bridge-reply-card')) {
   customElements.define('agent-bridge-reply-card', AgentBridgeReplyCard);
+}
+if (!customElements.get('agent-bridge-launch-card')) {
+  customElements.define('agent-bridge-launch-card', AgentBridgeLaunchCard);
+}
+if (!customElements.get('agent-bridge-session-card')) {
+  customElements.define('agent-bridge-session-card', AgentBridgeSessionCard);
 }
 if (!customElements.get('agent-bridge-activity-card')) {
   customElements.define('agent-bridge-activity-card', AgentBridgeActivityCard);

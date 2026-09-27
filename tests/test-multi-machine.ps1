@@ -211,6 +211,21 @@ function Get-RowEntity {
     if ($Card['type'] -eq 'vertical-stack') {
         foreach ($child in @($Card['cards'])) { Get-RowEntity -Card $child }
     }
+    # The bridge's own launch card lists each machine's controls instead of rows.
+    if ($Card['type'] -eq 'custom:agent-bridge-launch-card') {
+        if ($Card['selector']) { [string]$Card['selector'] }
+        foreach ($m in @($Card['machines'])) { foreach ($key in @($m.Keys)) { if ($key -ne 'machine') { [string]$m[$key] } } }
+    }
+}
+function Get-LaunchCardCount {
+    # A launch card is titled wherever it sits: top level, or in a stack with its note.
+    param([object[]]$Cards)
+    @($Cards | ForEach-Object {
+        if ($_.ContainsKey('title') -and $_['title'] -eq 'Start a new session') { $_ }
+        elseif ($_['type'] -eq 'vertical-stack') {
+            @($_['cards']) | Where-Object { $_.ContainsKey('title') -and $_['title'] -eq 'Start a new session' }
+        }
+    }).Count
 }
 function Get-AllRowEntities { @($cards | ForEach-Object { Get-RowEntity -Card $_ }) }
 $rows = Get-AllRowEntities
@@ -334,7 +349,7 @@ Test-That 'it gets no launch card' {
     $offRows -notcontains 'button.agent_bridge_laptop_new_session'
 }
 Test-That 'there is exactly one launch card left' {
-    @($offCards | Where-Object { $_.ContainsKey('title') -and $_['title'] -eq 'Start a new session' }).Count -eq 1
+    (Get-LaunchCardCount -Cards $offCards) -eq 1
 }
 Test-That 'and it belongs to the machine that is running' {
     $offRows -contains 'button.agent_bridge_desktop_new_session'
@@ -374,7 +389,7 @@ $soloCards = @($script:SavedConfig.views[0].cards)
 Test-That 'the launch card is not suffixed with the machine name' {
     # Naming the machine on a one-machine dashboard is noise, so it only appears once
     # there is something to tell apart.
-    @($soloCards | Where-Object { $_.ContainsKey('title') -and $_['title'] -eq 'Start a new session' }).Count -eq 1
+    (Get-LaunchCardCount -Cards $soloCards) -eq 1
 }
 Test-That 'a single machine gets no picker' {
     ($script:SavedConfig | ConvertTo-Json -Depth 30) -notmatch 'agent_bridge_target_machine'

@@ -1139,6 +1139,58 @@ Reset-NewSessionTest -Press '2026-06-01T12:09:00+00:00'
 Sync-DaemonNewSession -Headers $headers -Live $noLive
 Test-That 'the whole feature can be turned off' { $script:Launches.Count -eq 0 -and $script:Results.Count -eq 0 }
 
+Write-Host ''
+Write-Host '--- Codex without a first message ---'
+# Codex creates its session only on its first message, so one opened without a
+# prompt is launched, then waits for a message the card can send it.
+$script:FakeSettings = @{ 'newSession.workspaces' = @($alpha) }
+$script:CodexPresent = $true
+$script:FakeRegistered = $false
+$script:Sent = @()
+function Send-CopilotSessionPrompt {
+    param([string]$SessionId, [string]$Text, [int]$ProcessId)
+    $script:Sent += [pscustomobject]@{ Text = $Text; ProcessId = $ProcessId }
+    [pscustomobject]@{ Delivered = $true; Detail = 'ok:5' }
+}
+Reset-NewSessionTest -Press '2026-06-01T12:40:00+00:00' -AgentState 'Codex' -Prompt ''
+$script:DaemonPendingLaunch = $null
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+Test-That 'a Codex launch needs no first message' { $script:Launches.Count -eq 1 -and $script:Launches[0].Launcher -eq 'codex' }
+Test-That 'and waits for one rather than timing out' { $script:DaemonPendingLaunch.AwaitingFirstMessage }
+$script:DaemonPendingLaunch.Since = [DateTimeOffset]::Now.AddMinutes(-5)
+$script:DaemonPendingLaunch.LastCheck = [DateTimeOffset]::MinValue
+Update-DaemonPendingLaunch -Headers $headers
+Test-That 'past the usual 90 s it is still waited on' { $null -ne $script:DaemonPendingLaunch }
+Test-That 'and the note offers to send the first message from the card' { ($script:Results -join ' ') -match 'appears here after its first message' }
+
+# A second press with a first message typed sends it into that window.
+$script:HaStates["button.agent_bridge_${slug}_new_session"] = '2026-06-01T12:41:00+00:00'
+$script:HaStates["text.agent_bridge_${slug}_new_prompt"] = 'fix the build'
+$script:Launches = @()
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+Test-That 'a second press sends the first message to the waiting Codex' {
+    $script:Sent.Count -eq 1 -and $script:Sent[0].Text -eq 'fix the build' -and $script:Sent[0].ProcessId -eq $PID
+}
+Test-That 'instead of launching another session' { $script:Launches.Count -eq 0 }
+Test-That 'and the launch is then followed until Codex registers' {
+    $null -ne $script:DaemonPendingLaunch -and -not $script:DaemonPendingLaunch.AwaitingFirstMessage
+}
+
+# With the agent switched, a press is a new launch and the Codex window is left be.
+Reset-NewSessionTest -Press '2026-06-01T12:42:00+00:00' -AgentState 'Codex' -Prompt ''
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+$script:Sent = @()
+$script:HaStates["button.agent_bridge_${slug}_new_session"] = '2026-06-01T12:43:00+00:00'
+$script:HaStates["select.agent_bridge_${slug}_new_agent"] = 'Copilot'
+$script:HaStates["text.agent_bridge_${slug}_new_prompt"] = 'something else'
+$script:Launches = @()
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+Test-That 'a press for another agent launches it instead' {
+    $script:Sent.Count -eq 0 -and $script:Launches.Count -eq 1 -and $script:Launches[0].Launcher -eq 'copilot'
+}
+$script:DaemonPendingLaunch = $null
+$script:CodexPresent = $false
+
 Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $testLogFile -Force -ErrorAction SilentlyContinue
 

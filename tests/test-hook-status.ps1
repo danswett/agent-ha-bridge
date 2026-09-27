@@ -255,6 +255,33 @@ Test-That 'Copilot installed later is set up by the main installer' {
 Test-That 'with Copilot added to the configured clients, not replacing them' { $script:Started[0] -match '-Clients claude,codex,copilot$' }
 
 Write-Host ''
+Write-Host '--- launch-card notes expire ---'
+# Nothing else clears a note: "setting it up failed" stayed long after it was fixed.
+$script:NoteState = $null
+function Get-HomeAssistantState { param([string]$EntityId, [hashtable]$Headers) $script:NoteState }
+$script:Notes = @()
+$script:DaemonPendingLaunch = $null
+
+$script:NoteState = [pscustomobject]@{ state = 'Copilot was found but setting it up failed'; last_changed = [DateTimeOffset]::Now.AddMinutes(-11).ToString('o') }
+Clear-DaemonStaleNote -Headers $headers
+Test-That 'a note older than ten minutes is cleared' { $script:Notes.Count -eq 1 -and $script:Notes[0] -eq '' }
+
+$script:Notes = @()
+$script:NoteState = [pscustomobject]@{ state = 'Launch failed: nope'; last_changed = [DateTimeOffset]::Now.AddMinutes(-2).ToString('o') }
+Clear-DaemonStaleNote -Headers $headers
+Test-That 'a recent note stays' { $script:Notes.Count -eq 0 }
+
+$script:NoteState = [pscustomobject]@{ state = 'Press Launch again to trust this folder'; last_changed = [DateTimeOffset]::Now.AddMinutes(-30).ToString('o') }
+$script:DaemonPendingLaunch = [pscustomobject]@{ SessionId = 'x' }
+Clear-DaemonStaleNote -Headers $headers
+Test-That 'a note for a launch still in progress stays, however old' { $script:Notes.Count -eq 0 }
+$script:DaemonPendingLaunch = $null
+
+$script:NoteState = [pscustomobject]@{ state = ''; last_changed = [DateTimeOffset]::Now.AddHours(-3).ToString('o') }
+Clear-DaemonStaleNote -Headers $headers
+Test-That 'an empty note is not cleared again' { $script:Notes.Count -eq 0 }
+
+Write-Host ''
 Write-Host '--- noticing PATH changes without a restart ---'
 
 $savedPath = $env:Path

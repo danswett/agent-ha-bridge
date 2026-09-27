@@ -1324,7 +1324,9 @@ function Start-BridgeCopilotSession {
         $result.SessionId = [guid]::NewGuid().ToString()
     }
 
-    $arguments = Get-BridgeNewSessionArguments `
+    # Wrapped: an empty list (Codex with no prompt and no options) came back as $null
+    # and failed the launch before anything started.
+    $arguments = @(Get-BridgeNewSessionArguments `
         -SessionId $result.SessionId `
         -Prompt $Prompt `
         -Model ([string](Get-BridgeSetting 'newSession.model' '')) `
@@ -1332,16 +1334,22 @@ function Start-BridgeCopilotSession {
         -ExtraArguments @(Get-BridgeSetting 'newSession.extraArgs' @()) `
         -Launcher $launcher `
         -AgencyProfile $AgencyProfile `
-        -Resume:$Resume
+        -Resume:$Resume)
 
     try {
         # Start-Process (ShellExecute) rather than a redirected .NET process start:
         # it gives the child its own console instead of letting it inherit the
-        # daemon's hidden one, which is what makes the window visible.
-        $process = Start-Process -FilePath $executable `
-            -ArgumentList (ConvertTo-BridgeArgumentString -Arguments $arguments) `
-            -WorkingDirectory $WorkingDirectory `
-            -WindowStyle Normal -PassThru -ErrorAction Stop
+        # daemon's hidden one, which is what makes the window visible. It refuses an
+        # empty -ArgumentList, so none is passed when there are no arguments.
+        $startArgs = @{
+            FilePath         = $executable
+            WorkingDirectory = $WorkingDirectory
+            WindowStyle      = 'Normal'
+            PassThru         = $true
+            ErrorAction      = 'Stop'
+        }
+        if ($arguments.Count -gt 0) { $startArgs.ArgumentList = ConvertTo-BridgeArgumentString -Arguments $arguments }
+        $process = Start-Process @startArgs
 
         $result.ProcessId = $process.Id
         $result.Launched = $true

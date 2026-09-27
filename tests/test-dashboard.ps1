@@ -277,14 +277,14 @@ Test-That 'the choice slots still carry their real options' {
 
 Write-Host ''
 Write-Host '--- the new-session card is only what a launch needs ---'
-# The card exists to be one press: every selector carries a default. A "Last launch"
-# row restated something already visible within seconds as a new session card, and was
-# stale the rest of the time; the optional opening prompt was an input nobody reached
-# for on a card whose whole point is not needing any.
+# The card exists to be one press: every selector carries a default. The first
+# message is back, optional: Codex creates no session until it has one. The launch
+# note sits in the same stack, right under Launch, so a press never looks ignored.
 Save-CopilotSessionDashboard -Sessions $sessions -IncludeProfile -IncludeResume
-$newCard = @($script:SavedConfig.views[0].cards | Where-Object {
-    $_.ContainsKey('title') -and $_['title'] -eq 'Start a new session'
+$launchStack = @($script:SavedConfig.views[0].cards | Where-Object {
+    $_['type'] -eq 'vertical-stack' -and @($_['cards'] | Where-Object { $_.ContainsKey('title') -and $_['title'] -eq 'Start a new session' }).Count -gt 0
 })[0]
+$newCard = @($launchStack['cards'] | Where-Object { $_.ContainsKey('title') -and $_['title'] -eq 'Start a new session' })[0]
 $newRows = @($newCard.entities | ForEach-Object {
     if ($_.ContainsKey('entity')) { [string]$_['entity'] } else { '' }
 })
@@ -296,15 +296,15 @@ Test-That 'it keeps the selectors and Launch' {
     ($newRows -contains "select.agent_bridge_${slug}_new_profile") -and
     ($newRows -contains "button.agent_bridge_${slug}_new_session")
 }
-Test-That 'the last-launch result is gone' {
+Test-That 'the last-launch result is not a row' {
     $newRows -notcontains "sensor.agent_bridge_${slug}_new_session_result"
 }
-Test-That 'the opening prompt is gone' {
-    $newRows -notcontains "text.agent_bridge_${slug}_new_prompt"
+Test-That 'an optional first message is offered' {
+    $newRows -contains "text.agent_bridge_${slug}_new_prompt"
 }
 Test-That 'Launch is the last thing on the card' { $newRows[-1] -eq "button.agent_bridge_${slug}_new_session" }
-Test-That 'a launch note shows under the card only when there is something to say' {
-    $note = @($script:SavedConfig.views[0].cards | Where-Object {
+Test-That 'the launch note sits right under the card, only when there is something to say' {
+    $note = @($launchStack['cards'] | Where-Object {
         $_['type'] -eq 'conditional' -and $_['card']['type'] -eq 'markdown' -and
         [string]$_['card']['content'] -match 'new_session_result'
     })[0]
@@ -312,14 +312,27 @@ Test-That 'a launch note shows under the card only when there is something to sa
     @($note['conditions'] | ForEach-Object { [string]$_['state_not'] }) -contains '' -and
     @($note['conditions'] | ForEach-Object { [string]$_['state_not'] }) -contains 'unknown'
 }
+
+# From card 1.12.0 the bridge draws a compact launch card of its own.
+Save-CopilotSessionDashboard -Sessions $sessions -IncludeProfile -IncludeResume -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.12.0'
+$compact = @($script:SavedConfig.views[0].cards | Where-Object { $_['type'] -eq 'custom:agent-bridge-launch-card' })
+Test-That 'a served 1.12.0 card gets the compact launch card' { $compact.Count -eq 1 }
+Test-That 'which carries every control of the machine' {
+    $m = @($compact[0]['machines'])[0]
+    $m['launch'] -eq "button.agent_bridge_${slug}_new_session" -and $m['prompt'] -eq "text.agent_bridge_${slug}_new_prompt" -and
+        $m['result'] -eq "sensor.agent_bridge_${slug}_new_session_result" -and $m['workspace'] -eq "select.agent_bridge_${slug}_new_workspace"
+}
+Test-That 'and no separate launch cards are left beside it' {
+    @($script:SavedConfig.views[0].cards | Where-Object { $_['type'] -eq 'vertical-stack' -and ($_ | ConvertTo-Json -Depth 20) -match 'new_session_result' }).Count -eq 0
+}
+Save-CopilotSessionDashboard -Sessions $sessions -IncludeProfile -IncludeResume
 Test-That 'there is no agent row when there is nothing to choose between' {
     $newRows -notcontains "select.agent_bridge_${slug}_new_agent"
 }
 
 Save-CopilotSessionDashboard -Sessions $sessions -IncludeAgent
-$newCard = @($script:SavedConfig.views[0].cards | Where-Object {
-    $_.ContainsKey('title') -and $_['title'] -eq 'Start a new session'
-})[0]
+$newCard = @($script:SavedConfig.views[0].cards | Where-Object { $_['type'] -eq 'vertical-stack' } | ForEach-Object { $_['cards'] } |
+    Where-Object { $_.ContainsKey('title') -and $_['title'] -eq 'Start a new session' })[0]
 $agentRows = @($newCard.entities | ForEach-Object { if ($_.ContainsKey('entity')) { [string]$_['entity'] } else { '' } })
 Test-That 'with several agents installed the agent row is shown' {
     $agentRows -contains "select.agent_bridge_${slug}_new_agent"
@@ -353,6 +366,22 @@ Test-That 'the version gate reads the cache-buster' {
     -not (Test-BridgeActivityCardServed -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.9.9') -and
     -not (Test-BridgeActivityCardServed -ReplyCardUrl '/local/agent-bridge-reply-card.js')
 }
+
+Write-Host ''
+Write-Host '--- the session frame does not depend on card-mod loading first ---'
+# A card-mod-styled vertical-stack lost its outline, background and glow on a hard
+# refresh whenever it was built before card-mod loaded. From 1.12.0 the bridge's own
+# card draws them.
+Save-CopilotSessionDashboard -Sessions $sessions -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.12.0'
+$framed = $script:SavedConfig | ConvertTo-Json -Depth 40 | ConvertFrom-Json -Depth 40
+$sessionCard = @($framed.views[0].cards | Where-Object { $_.type -eq 'custom:agent-bridge-session-card' }) | Select-Object -First 1
+Test-That 'a served 1.12.0 card frames each session with the session card' { $null -ne $sessionCard }
+Test-That 'which watches the session status and decision for its glow' {
+    $sessionCard.status -eq "sensor.$($sessions[0].Node)_status" -and $sessionCard.decision -eq "select.$($sessions[0].Node)_decision"
+}
+Test-That 'and holds the session sections' { @($sessionCard.cards | Where-Object { $_.type -eq 'custom:agent-bridge-activity-card' }).Count -eq 1 }
+Save-CopilotSessionDashboard -Sessions $sessions -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.11.3'
+Test-That 'an older served card keeps the styled stack' { (Get-SavedJson) -notmatch 'agent-bridge-session-card' }
 
 Write-Host '--- the dashboard is provisioned before it is written to ---'
 # Invoke-CopilotHaWebSocket hands back each command's `result` already unwrapped, so
