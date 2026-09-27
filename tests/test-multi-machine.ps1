@@ -616,6 +616,40 @@ Test-That 'an incomplete picture skips the sweep rather than guessing' {
     @($script:Swept).Count -eq 0 -and @($script:SweepLog | Where-Object { $_ -match 'skipped' }).Count -eq 1
 }
 
+Write-Host '--- holding the window open when Windows owns the console ---'
+
+$script:Prompted = 0
+function Read-Host { param([string]$Prompt) $script:Prompted++; '' }
+
+Test-That 'a terminal run is not interrupted by a prompt' {
+    # It already has a window that stays put, so pausing there is pure noise.
+    $script:PauseOnExit = $false
+    $script:Prompted = 0
+    [void](Wait-BridgeUninstallExit -Interactive $true)
+    $script:Prompted -eq 0
+}
+
+Test-That 'the Apps and features run waits before the window closes' {
+    # Windows gives that one its own console and closes it the instant the script
+    # ends, so every warning - and any outright failure - flashed past unread.
+    $script:PauseOnExit = $true
+    $script:Prompted = 0
+    $paused = Wait-BridgeUninstallExit -Interactive $true
+    $paused -and $script:Prompted -eq 1
+}
+
+Test-That 'an unattended run never blocks on it' {
+    # winget and friends use QuietUninstallString, which omits -Pause - but if one
+    # ever reached here, prompting would hang the caller forever rather than inform
+    # anyone, so a redirected stdin skips the wait outright.
+    $script:PauseOnExit = $true
+    $script:Prompted = 0
+    $paused = Wait-BridgeUninstallExit -Interactive $false
+    (-not $paused) -and $script:Prompted -eq 0
+}
+
+$script:PauseOnExit = $false
+
 Write-Host '--- deciding whether shared Home Assistant state may be removed ---'
 Test-That 'another machine present keeps the dashboard' {
     $d = Get-BridgeSharedStateDecision -Interactive $false -OtherMachines @('LAPTOP')

@@ -30,6 +30,11 @@
     Never remove the shared dashboard or toggle, even when this looks like the last
     machine. Useful when another machine is simply switched off rather than gone.
 
+.PARAMETER Pause
+    Wait for a keypress before closing. Set on the Apps & features entry, because
+    Windows launches that in a console of its own that vanishes the moment the script
+    ends - taking every warning, and any failure, with it.
+
 .PARAMETER TargetHome
     Uninstall from this directory's .agent-ha-bridge instead of $HOME's. Intended for
     testing; it also skips the machine-wide steps (scheduled task, process termination).
@@ -41,10 +46,47 @@ param(
     [switch]$ClearEntities,
     [switch]$ClearShared,
     [switch]$KeepShared,
+    [switch]$Pause,
     [string]$TargetHome
 )
 
 $ErrorActionPreference = 'Stop'
+
+# Held at script scope because the trap below cannot see the parameter directly.
+$script:PauseOnExit = [bool]$Pause
+
+function Wait-BridgeUninstallExit {
+    <#
+        Holds the window open so whatever just happened can actually be read.
+
+        Skipped when stdin is redirected: a scripted or piped run has nobody to press
+        a key, and blocking there would hang an unattended uninstall rather than
+        informing anyone.
+    #>
+    param(
+        [string]$Message = 'Press Enter to close this window',
+        [AllowNull()][object]$Interactive
+    )
+    if (-not $script:PauseOnExit) { return $false }
+    if ($null -eq $Interactive) { $Interactive = Test-BridgeUninstallInteractive }
+    if (-not $Interactive) { return $false }
+    Write-Host ''
+    [void](Read-Host $Message)
+    return $true
+}
+
+# A failure is exactly when the window must not vanish, so the pause is wired to the
+# error path as well as the normal one. `break` re-throws, so a run without -Pause
+# behaves precisely as it did before.
+trap {
+    if ($script:PauseOnExit) {
+        Write-Host ''
+        Write-Host "Uninstall failed: $($_.Exception.Message)" -ForegroundColor Red
+        [void](Wait-BridgeUninstallExit)
+        exit 1
+    }
+    break
+}
 
 $installHome = if ($TargetHome) { $TargetHome } else { $HOME }
 $copilotHome = Join-Path $installHome '.copilot'
@@ -403,3 +445,4 @@ if (Test-Path -LiteralPath $bridgeHome) {
 
 Write-Step 'Done'
 Write-Host 'Restart any running agent CLI sessions to drop the hooks.' -ForegroundColor Yellow
+[void](Wait-BridgeUninstallExit)

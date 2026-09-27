@@ -522,6 +522,10 @@ From **Settings → Apps → Installed apps**, or:
 agent-ha-bridge uninstall
 ```
 
+Both do the same thing. The Settings entry gets its own console window, which Windows
+closes the instant the script ends, so that one waits for a keypress before closing —
+otherwise every warning, and any outright failure, flashes past unread. (The silent
+entry that package managers use does not wait, since nothing is there to press a key.)
 …which is `uninstall.ps1 -ClearEntities`. `-ClearEntities` clears the retained MQTT
 discovery topics for **this machine**, so Home Assistant is left clean; without it they
 linger. `-KeepConfig` preserves your settings. The `agent-ha-bridge` PATH entry is

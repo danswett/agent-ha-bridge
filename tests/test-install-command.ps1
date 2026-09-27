@@ -337,6 +337,20 @@ try {
     Test-That 'it registered under the sandbox uninstall key, not the real one' {
         Test-Path -LiteralPath $sandboxArpKey
     }
+    Test-That 'the Apps & features entry pauses so its window can be read' {
+        # Windows gives that command its own console and closes it the instant the
+        # script ends, so without this every warning and any failure flashes past.
+        [string](Get-ItemProperty -LiteralPath $sandboxArpKey).UninstallString -match '\s-Pause\b'
+    }
+    Test-That 'the quiet entry does not, so an unattended uninstall cannot hang' {
+        # winget uses this one and has nobody to press a key.
+        [string](Get-ItemProperty -LiteralPath $sandboxArpKey).QuietUninstallString -notmatch '\s-Pause\b'
+    }
+    Test-That 'both still uninstall the sandbox rather than the real install' {
+        $arp = Get-ItemProperty -LiteralPath $sandboxArpKey
+        ([string]$arp.UninstallString -match '-TargetHome') -and
+        ([string]$arp.QuietUninstallString -match '-TargetHome')
+    }
 
     Write-Host '--- the installed command reports on the install it came from ---'
     $status = & pwsh -NoProfile -File (Join-Path $sandboxHome 'bin\agent-ha-bridge.ps1') version 2>&1

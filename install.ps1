@@ -1669,7 +1669,13 @@ $arpValues = @{
     Publisher       = 'agent-ha-bridge'
     InstallLocation = $bridgeHome
     URLInfoAbout    = 'https://github.com/danswett/agent-ha-bridge'
-    UninstallString = "pwsh.exe $uninstallArgs"
+    # Windows gives this its own console and closes it the instant the script ends, so
+    # without the pause every warning - and any outright failure - flashes past
+    # unread. That matters here more than for most uninstallers, because a good deal
+    # of the work happens in Home Assistant and can fail on its own.
+    UninstallString = "pwsh.exe $uninstallArgs -Pause"
+    # Deliberately without it: this one exists for unattended callers such as winget,
+    # and a prompt would hang them forever.
     QuietUninstallString = "pwsh.exe $uninstallArgs"
 }
 foreach ($name in $arpValues.Keys) { Set-ItemProperty -Path $arpKey -Name $name -Value $arpValues[$name] }
