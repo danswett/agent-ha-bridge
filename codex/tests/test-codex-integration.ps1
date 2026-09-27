@@ -81,6 +81,13 @@ try {
     $r = Invoke-Hook 'stop.json'
     Test-That 'the Stop hook exits 0' { $r.ExitCode -eq 0 }
     Test-That 'the session goes idle' { (Get-StatusState) -eq 'idle' } (Get-StatusState)
+    # The reply goes to the card whole, as `response`: published as the status line
+    # alone it was cut at 255 characters with no way to read the rest.
+    $stopActivity = try { Get-HomeAssistantState -EntityId "sensor.${node}_activity" -Headers $headers } catch { $null }
+    Test-That 'the whole reply is on the card as its response' {
+        [string]$stopActivity.attributes.response -eq "``````text`nhello-from-codex`n``````"
+    } ([string]$stopActivity.attributes.response)
+    Test-That 'and the status line is its first line' { [string]$stopActivity.state -eq '```text' } ([string]$stopActivity.state)
 
     Write-Host '--- SessionEnd returns promptly with no Home Assistant work ---'
     $r = Invoke-Hook 'sessionend.json'

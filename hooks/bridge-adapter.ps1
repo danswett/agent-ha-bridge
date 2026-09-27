@@ -121,7 +121,11 @@ function Publish-BridgeSessionStatus {
         # reasoning the card body is drawn from - and change only the status line.
         # Without it the activity is replaced by session and machine alone, which
         # empties the card for an adapter whose daemon streams the body.
-        [switch]$PreserveActivityDetail
+        [switch]$PreserveActivityDetail,
+
+        # Activity attributes to set on top - a Codex reply as `response`, which the
+        # card shows in full where the 255-character status line cannot.
+        [hashtable]$ActivityDetail
     )
 
     $attributes = @{
@@ -149,6 +153,9 @@ function Publish-BridgeSessionStatus {
             catch {
                 # Nothing published yet: there is nothing to preserve.
             }
+        }
+        if ($ActivityDetail) {
+            foreach ($key in $ActivityDetail.Keys) { $detail[$key] = $ActivityDetail[$key] }
         }
         $detail['session'] = $SessionName
         $detail['machine'] = $Machine
