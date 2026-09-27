@@ -139,9 +139,10 @@ function Get-ClaudeSessionRegistrations {
     <#
         Returns live registrations, and prunes dead ones as it goes.
 
-        A session counts as live when its recorded process is still a running claude
-        process; that check is what retires entities promptly on exit, since Claude
-        fires no reliable session-ended hook for every exit path.
+        A session counts as live exactly while its recorded process is still a running
+        claude process, however long it has been idle; that check is what retires
+        entities promptly on exit, since Claude fires no reliable session-ended hook for
+        every exit path.
 
         Two things keep this cheap, because the daemon calls it on every reconcile.
         The set of running claude pids is fetched once and then looked up by hash,
@@ -184,7 +185,11 @@ function Get-ClaudeSessionRegistrations {
             continue
         }
 
-        if ($IncludeStale -or ($alive -and $fresh)) {
+        # A running process is live however long it has been quiet. Requiring a fresh
+        # registration as well retired a session idle for four hours - one waiting out
+        # a usage limit, say - while it was still open and could still be replied to.
+        # Freshness only decides when a dead entry is finally deleted (above).
+        if ($IncludeStale -or $alive) {
             [pscustomobject]@{
                 SessionId        = [string]$entry.SessionId
                 ProcessId        = [int]($entry.ProcessId ?? 0)
@@ -193,7 +198,7 @@ function Get-ClaudeSessionRegistrations {
                 Updated          = [string]$entry.Updated
                 HookStatus       = if ($entry.PSObject.Properties['HookStatus']) { [string]$entry.HookStatus } else { '' }
                 HookStatusAt     = if ($entry.PSObject.Properties['HookStatusAt']) { [string]$entry.HookStatusAt } else { '' }
-                IsLive           = $alive -and $fresh
+                IsLive           = $alive
                 StatePath        = $file.FullName
             }
         }

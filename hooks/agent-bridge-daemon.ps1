@@ -3597,7 +3597,31 @@ function Invoke-DaemonReply {
         if ($null -ne $codexSession) { $explicitPid = [int]$codexSession.ProcessId }
     }
 
+    # For Claude the transcript shows whether the prompt was really submitted, so the
+    # send can be confirmed (Confirm-DaemonClaudeSubmit) rather than assumed.
+    $claudeTranscript = ''
+    $transcriptBefore = 0L
+    if ($null -ne $known -and [string]$known.Kind -eq 'claude' -and $known.PSObject.Properties['Transcript'] -and
+        [IO.File]::Exists([string]$known.Transcript)) {
+        $claudeTranscript = [string]$known.Transcript
+        $transcriptBefore = [IO.FileInfo]::new($claudeTranscript).Length
+    }
+
     $delivery = Send-CopilotSessionPrompt -SessionId $SessionId -Text $Text -ProcessId $explicitPid
+
+    if ($delivery.Delivered -and $claudeTranscript) {
+        $waitingOnPrompt = $known.PSObject.Properties['HookStatus'] -and [string]$known.HookStatus -eq 'waiting'
+        $confirm = Confirm-DaemonClaudeSubmit -ProcessId ([int]$delivery.ProcessId) -Transcript $claudeTranscript `
+            -Offset $transcriptBefore -AllowRetry:(-not $waitingOnPrompt)
+        if (-not $confirm.Submitted) {
+            $delivery.Delivered = $false
+            $delivery.Detail = "typed but not submitted ($($confirm.Detail))"
+        }
+        elseif ($confirm.Retries -gt 0) {
+            $delivery.Detail = "$($delivery.Detail); submitted after $($confirm.Retries) extra Enter(s)"
+        }
+    }
+
     if ($delivery.Delivered) {
         Write-DaemonLog -Message "reply delivered to $short (pid $($delivery.ProcessId)): $($delivery.Detail)"
     }
@@ -3660,6 +3684,85 @@ function Invoke-DaemonReply {
     }
 
     $delivery.Delivered
+}
+
+function Test-DaemonClaudePromptSubmitted {
+    <#
+        Whether Claude recorded a submitted prompt in the transcript bytes appended
+        since Offset: a user message (not a tool result), or, while a turn is running,
+        a queue entry for it. Claude writes either at the moment of submission.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Transcript,
+        [long]$Offset = 0
+    )
+
+    $append = Read-ClaudeTranscriptAppend -Path $Transcript -Offset $Offset
+    foreach ($line in @($append.Lines)) {
+        if ($line -match '"type":"queue-operation"' -and $line -match '"operation":"enqueue"') { return $true }
+        if ($line -notmatch '"type":"user"') { continue }
+        $entry = try { $line | ConvertFrom-Json } catch { $null }
+        if ($null -eq $entry -or ($entry.PSObject.Properties['isMeta'] -and $entry.isMeta)) { continue }
+        $blocks = Get-ClaudeContentBlocks -Message $entry.message
+        if (@($blocks | Where-Object { $_.type -eq 'tool_result' }).Count -eq 0) { return $true }
+    }
+    $false
+}
+
+function Confirm-DaemonClaudeSubmit {
+    <#
+        Confirms a reply typed into Claude was actually submitted, pressing Enter again
+        if it was not.
+
+        Claude Code treats a fast burst of more than a few dozen characters as a paste,
+        and an Enter that arrives while it is still settling that paste is absorbed
+        rather than submitting. The text then sat in the input box, the card said
+        "Reply sent", and it went in only with the next reply - run together with it.
+        Short replies were unaffected, which is why it looked intermittent.
+
+        The transcript settles it: a submitted prompt is written at once. If nothing
+        arrives, the text is still waiting, so Enter is pressed again, twice at most.
+        No retry is made while a permission prompt is pending (AllowRetry off), where
+        a stray Enter could accept it.
+    #>
+    param(
+        [Parameter(Mandatory)][int]$ProcessId,
+        [Parameter(Mandatory)][string]$Transcript,
+        [long]$Offset = 0,
+        [switch]$AllowRetry,
+        [int]$WaitMs = 1200,
+        [int]$MaxRetries = 2
+    )
+
+    $result = [pscustomobject]@{ Submitted = $false; Retries = 0; Detail = '' }
+    $attempt = 0
+    while ($true) {
+        $deadline = [DateTimeOffset]::Now.AddMilliseconds($WaitMs)
+        while ([DateTimeOffset]::Now -lt $deadline) {
+            if (Test-DaemonClaudePromptSubmitted -Transcript $Transcript -Offset $Offset) {
+                $result.Submitted = $true
+                $result.Retries = $attempt
+                return $result
+            }
+            Start-Sleep -Milliseconds 100
+        }
+
+        if (-not $AllowRetry) { $result.Detail = 'no submit seen; not retried while a prompt is pending'; break }
+        if ($attempt -ge $MaxRetries) { $result.Detail = "no submit seen after $attempt extra Enter(s)"; break }
+
+        $attempt++
+        try {
+            Initialize-CopilotConsoleInjector
+            $outcome = [CopilotCli.ConsoleInjector]::Send([uint32]$ProcessId, '', $true, 0)
+            if (-not ([string]$outcome).StartsWith('ok:')) { $result.Detail = "extra Enter failed: $outcome"; break }
+        }
+        catch {
+            $result.Detail = "extra Enter failed: $($_.Exception.Message)"
+            break
+        }
+    }
+    $result.Retries = $attempt
+    $result
 }
 
 function Resolve-SessionFromReplyEntity {

@@ -129,6 +129,38 @@ Invoke-DaemonFastActivity -Headers $headers -State $fastState
 Test-That 'before the first reconcile it does nothing' { $script:Updated.Count -eq 0 }
 
 Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
+
+Write-Host ''
+Write-Host '--- confirming a reply was submitted ---'
+
+# A long reply's Enter can be absorbed by Claude Code's paste handling, leaving the
+# text in the input box while the card said "Reply sent". The transcript is the proof.
+. (Join-Path $PSScriptRoot '..\claude\hooks\claude-transcript.ps1')
+$tx = Join-Path ([IO.Path]::GetTempPath()) "submit-$([guid]::NewGuid().ToString('N').Substring(0,8)).jsonl"
+Set-Content -LiteralPath $tx -Value '{"type":"assistant","message":{"content":[{"type":"text","text":"earlier"}]}}'
+$start = (Get-Item $tx).Length
+
+Test-That 'nothing new means not submitted' { -not (Test-DaemonClaudePromptSubmitted -Transcript $tx -Offset $start) }
+Add-Content -LiteralPath $tx -Value '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"x","content":"ok"}]}}'
+Test-That 'a tool result is not a submitted prompt' { -not (Test-DaemonClaudePromptSubmitted -Transcript $tx -Offset $start) }
+Add-Content -LiteralPath $tx -Value '{"type":"user","isMeta":true,"message":{"content":"housekeeping"}}'
+Test-That 'a meta entry is not one either' { -not (Test-DaemonClaudePromptSubmitted -Transcript $tx -Offset $start) }
+$beforePrompt = (Get-Item $tx).Length
+Add-Content -LiteralPath $tx -Value '{"type":"user","message":{"content":"the reply"}}'
+Test-That 'a user prompt is' { Test-DaemonClaudePromptSubmitted -Transcript $tx -Offset $start }
+Test-That 'but only if it is past the offset' { -not (Test-DaemonClaudePromptSubmitted -Transcript $tx -Offset (Get-Item $tx).Length) }
+$beforeQueue = (Get-Item $tx).Length
+Add-Content -LiteralPath $tx -Value '{"type":"queue-operation","operation":"enqueue","content":"queued reply"}'
+Test-That 'a reply queued while a turn runs is' { Test-DaemonClaudePromptSubmitted -Transcript $tx -Offset $beforeQueue }
+
+# With no submit in the transcript and retries not allowed, it reports rather than
+# pressing Enter into a pending permission prompt.
+$c = Confirm-DaemonClaudeSubmit -ProcessId 1 -Transcript $tx -Offset (Get-Item $tx).Length -WaitMs 200
+Test-That 'no retry is attempted while a prompt is pending' { -not $c.Submitted -and $c.Retries -eq 0 -and $c.Detail -match 'not retried' }
+$c = Confirm-DaemonClaudeSubmit -ProcessId 1 -Transcript $tx -Offset $beforePrompt -WaitMs 200 -AllowRetry
+Test-That 'an already submitted prompt needs no extra Enter' { $c.Submitted -and $c.Retries -eq 0 }
+Remove-Item -LiteralPath $tx -Force -ErrorAction SilentlyContinue
+
 Remove-Item -LiteralPath $script:DaemonConfig.LogFile -Force -ErrorAction SilentlyContinue
 
 Write-Host ''

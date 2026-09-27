@@ -201,18 +201,18 @@ function Get-CodexSessionRegistrations {
         }
 
         # Prune when the session is definitively over: it said goodbye, its process is
-        # gone, or it went quiet for long enough to be abandoned. The middle case
-        # matters because a session killed outright never fires SessionEnd, and
-        # without it the registration would linger for hours. It is only applied when
-        # a pid was actually recorded, so a session still resolving its owner is not
-        # discarded.
-        $finished = $ended -or ($knownPid -and -not $alive) -or -not $fresh
+        # gone, or - with no pid to check - it went quiet for long enough to be
+        # abandoned. The process check matters because a session killed outright never
+        # fires SessionEnd. Quietness is only a signal when there is no pid: a running
+        # process is live however long it has been idle, and treating a four-hour pause
+        # as abandonment retired sessions that were still open.
+        $finished = $ended -or ($knownPid -and -not $alive) -or (-not $knownPid -and -not $fresh)
         if (-not $IncludeEnded -and $finished) {
             Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
             continue
         }
 
-        if ($IncludeEnded -or ($alive -and $fresh)) {
+        if ($IncludeEnded -or $alive) {
             [pscustomobject]@{
                 SessionId        = [string]$entry.SessionId
                 ProcessId        = [int]($entry.ProcessId ?? 0)
@@ -221,7 +221,7 @@ function Get-CodexSessionRegistrations {
                 Model            = [string]$entry.Model
                 Status           = [string]$entry.Status
                 Activity         = [string]$entry.Activity
-                IsLive           = $alive -and $fresh -and -not $ended
+                IsLive           = $alive -and -not $ended
                 StatePath        = $file.FullName
             }
         }

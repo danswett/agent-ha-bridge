@@ -102,7 +102,9 @@ try {
         } | ConvertTo-Json | Set-Content (Join-Path $root "$id.json") -Encoding UTF8
     }
     $before = @(Get-ChildItem -LiteralPath $root -Filter '*.json' -File).Count
-    $live = @(Get-ClaudeSessionRegistrations)
+    # Only the entries seeded here: the registry is the real one, and a Claude session
+    # running on this machine - including the one running these tests - is live in it.
+    $live = @(Get-ClaudeSessionRegistrations | Where-Object { $seeded -contains $_.SessionId })
     $after = @(Get-ChildItem -LiteralPath $root -Filter '*.json' -File).Count
 
     Test-That 'dead registrations are not reported as live' { $live.Count -eq 0 } "$($live.Count)"
@@ -119,6 +121,33 @@ try {
     [void](Get-ClaudeSessionRegistrations)
     Test-That 'a fresh registration is not pruned' {
         Test-Path -LiteralPath (Join-Path $root "$fresh.json")
+    }
+
+    # A session whose process is still running is live however long it has been quiet.
+    # A registration last refreshed hours ago - a session waiting out a usage limit -
+    # used to be retired while it was still open. A copy of ping.exe named claude.exe
+    # stands in for the running session, since only the process name is checked.
+    $fakeDir = Join-Path ([IO.Path]::GetTempPath()) "fake-claude-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+    New-Item -ItemType Directory -Path $fakeDir -Force | Out-Null
+    $fakeExe = Join-Path $fakeDir 'claude.exe'
+    Copy-Item (Join-Path $env:WINDIR 'System32\PING.EXE') $fakeExe
+    $fake = Start-Process -FilePath $fakeExe -ArgumentList '-n 30 127.0.0.1' -WindowStyle Hidden -PassThru
+    try {
+        $idle = [guid]::NewGuid().ToString()
+        $seeded += $idle
+        [pscustomobject]@{
+            SessionId = $idle; ProcessId = $fake.Id; TranscriptPath = 'C:\nope.jsonl'
+            WorkingDirectory = 'C:\x'; Updated = [DateTimeOffset]::Now.AddDays(-3).ToString('o')
+        } | ConvertTo-Json | Set-Content (Join-Path $root "$idle.json") -Encoding UTF8
+
+        $found = @(Get-ClaudeSessionRegistrations | Where-Object { $_.SessionId -eq $idle })
+        Test-That 'an idle session whose process is running stays live' { $found.Count -eq 1 -and $found[0].IsLive }
+        Test-That 'and its registration is kept' { Test-Path -LiteralPath (Join-Path $root "$idle.json") }
+    }
+    finally {
+        Stop-Process -Id $fake.Id -Force -ErrorAction SilentlyContinue
+        Start-Sleep -Milliseconds 300
+        Remove-Item -LiteralPath $fakeDir -Recurse -Force -ErrorAction SilentlyContinue
     }
 }
 finally {
