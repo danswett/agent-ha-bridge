@@ -16,7 +16,7 @@
  * daemon downloads them and attaches them to the prompt.
  */
 
-const CARD_VERSION = '1.9.0';
+const CARD_VERSION = '1.9.1';
 
 class AgentBridgeReplyCard extends HTMLElement {
   constructor() {
@@ -60,6 +60,10 @@ class AgentBridgeReplyCard extends HTMLElement {
       .row { display: flex; align-items: flex-end; gap: 8px; }
       textarea {
         flex: 1 1 auto;
+        /* Block, not the default inline-block: an inline textarea sits on the text
+           baseline and reserves a few pixels of descender space below itself, which
+           is enough to stop the buttons lining up with its bottom edge. */
+        display: block;
         min-height: 44px;
         max-height: 40vh;
         resize: vertical;
@@ -75,9 +79,17 @@ class AgentBridgeReplyCard extends HTMLElement {
       }
       textarea:focus { outline: none; border-color: var(--primary-color, #03a9f4); }
       button {
+        /* Fixed height on both, so the pair match each other and the textarea's
+           bottom edge. Left to their content they differ, because an icon and a
+           word do not produce the same line box. */
+        height: 44px;
+        box-sizing: border-box;
+        display: inline-flex;
+        align-items: center;
+        justify-content: center;
         border: none;
         border-radius: 10px;
-        padding: 10px 12px;
+        padding: 0 16px;
         cursor: pointer;
         color: var(--text-primary-color, #fff);
         background: var(--primary-color, #03a9f4);
@@ -90,6 +102,8 @@ class AgentBridgeReplyCard extends HTMLElement {
         border: 1px solid var(--divider-color, #444);
         font-weight: 500;
       }
+      button.attach { width: 44px; padding: 0; flex: 0 0 auto; }
+      button.attach ha-icon { --mdc-icon-size: 20px; display: flex; }
       button:disabled { opacity: 0.45; cursor: default; }
       .chips { display: flex; flex-wrap: wrap; gap: 6px; margin-top: 8px; }
       .chip {
@@ -113,7 +127,7 @@ class AgentBridgeReplyCard extends HTMLElement {
     card.innerHTML = `
       <div class="row">
         <textarea part="input"></textarea>
-        <button class="ghost attach" title="Attach an image">&#128206;</button>
+        <button class="ghost attach" title="Attach an image"><ha-icon icon="mdi:paperclip"></ha-icon></button>
         <button class="send">Send</button>
       </div>
       <div class="chips"></div>
