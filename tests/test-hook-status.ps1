@@ -321,3 +321,5 @@ if ($script:Failures -gt 0) {
     exit 1
 }
 Write-Host 'all hook status checks passed' -ForegroundColor Green
+# Explicit: without it pwsh reports the last external command's exit code.
+exit 0

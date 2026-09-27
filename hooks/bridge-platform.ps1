@@ -99,6 +99,7 @@ function Get-BridgeCommandLine {
         return [string](Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue).CommandLine
     }
     try { [string](& /bin/ps -o 'args=' -p $ProcessId 2>$null | Select-Object -First 1) } catch { '' }
+    finally { $global:LASTEXITCODE = 0 }
 }
 
 function Get-BridgeProcessInfo {
@@ -118,6 +119,9 @@ function Get-BridgeProcessInfo {
     $info = $null
     try {
         $line = & /bin/ps -o 'pid=,ppid=,etime=,ucomm=' -p $ProcessId 2>$null | Select-Object -First 1
+        # ps exits 1 for a process that has gone, which is an answer, not a failure -
+        # and left in $LASTEXITCODE it became the exit code of whatever hook asked.
+        $global:LASTEXITCODE = 0
         if ($line) { $info = ConvertFrom-BridgePsLine -Line $line }
     }
     catch { }
@@ -137,6 +141,7 @@ function Get-BridgeProcessesNamed {
             Select-Object ProcessId, ParentProcessId, Name, CommandLine, CreationDate)
     }
     $all = try { @(& /bin/ps -A -o 'pid=,ppid=,etime=,ucomm=' 2>$null) } catch { @() }
+    $global:LASTEXITCODE = 0
     @($all | ForEach-Object { ConvertFrom-BridgePsLine -Line $_ } | Where-Object { $_ -and $_.Name -eq $Name } | ForEach-Object {
         $_.CommandLine = Get-BridgeCommandLine -ProcessId $_.ProcessId
         $_
