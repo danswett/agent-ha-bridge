@@ -105,6 +105,11 @@ $script:DaemonConfig = @{
     # comfortably while costing nothing when the value is already there.
     ReplyCommitAttempts = 6
     ReplyCommitWaitMs = 500
+    # How long a press of Send stays armed while the typed text has still not reached
+    # Home Assistant. Clicking Send does not commit the text field - confirmed from
+    # Home Assistant's own history, where three presses landed before the box was ever
+    # committed - so the press waits for the value instead of being spent on nothing.
+    SubmitArmSeconds = 90
     ResumeCacheSeconds = 180
     # How soon to retry after a fetch that failed or came back empty, rather than
     # waiting out the full interval with a list known to be wrong.
@@ -136,6 +141,9 @@ $script:DaemonMcpCacheAt = [DateTimeOffset]::MinValue
 $script:DaemonStatesCache = $null
 $script:DaemonStatesCacheAt = [DateTimeOffset]::MinValue
 $script:DaemonPeerCache = $null
+# Sessions whose cards have been removed from the dashboard but whose entities are
+# held back a pass, so the frontend has time to stop pointing at them.
+$script:DaemonPendingRetire = @()
 $script:DaemonWatchFailures = 0
 
 # Update-check state. Initialised here rather than left undefined because the daemon
@@ -962,38 +970,77 @@ function Invoke-PendingReplies {
             catch { }
         }
 
-        # Acknowledge the press immediately. A press that produces no visible change
+        # Acknowledge the press immediately - a press that produces no visible change
         # for even a second reads as a dead button, which is the other half of why it
-        # got pressed twice.
-        try {
-            Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Sending...' -Headers $Headers
-        }
-        catch { }
-
-        if ($entry.PSObject.Properties['LastSubmitAt']) { $entry.LastSubmitAt = $press }
-        else { $entry | Add-Member -NotePropertyName LastSubmitAt -NotePropertyValue $press -Force }
-
+        # got pressed twice. Which acknowledgement depends on whether the typed text
+        # has actually reached Home Assistant yet, so it happens in each branch below
+        # rather than unconditionally here: a blanket 'Sending...' on every pass would
+        # overwrite the armed message it is meant to sit alongside.
         if ([string]::IsNullOrWhiteSpace($value) -or $value -in @('unknown', 'unavailable')) {
-            # Say so rather than doing nothing. Silence here is indistinguishable from
-            # a broken button.
+            # The text is almost certainly on screen - it just is not in Home Assistant
+            # yet. A text entity only commits when it loses focus or you press Enter,
+            # and pressing Send does neither: Home Assistant's own history showed three
+            # presses landing before the box was committed even once. Burning the press
+            # here is what forced a second one, so it stays armed instead and fires the
+            # moment the value arrives.
+            $pendingAt = if ($entry.PSObject.Properties['PendingSubmitAt']) { [string]$entry.PendingSubmitAt } else { '' }
+            if ($pendingAt -ne $press) {
+                Set-DaemonSessionProperty -Entry $entry -Name 'PendingSubmitAt' -Value $press
+                Set-DaemonSessionProperty -Entry $entry -Name 'PendingSubmitSince' -Value ([DateTimeOffset]::Now.ToString('o'))
+                try {
+                    Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Waiting for your text' `
+                        -Extra @{ hint = 'Press Enter in the box, or tap outside it, and this sends on its own.' } `
+                        -Headers $Headers
+                }
+                catch { }
+                Write-DaemonLog -Message "send armed for $($sessionId.Substring(0,8)); the typed text has not reached Home Assistant yet"
+                continue
+            }
+
+            $since = [DateTimeOffset]::MinValue
+            if ($entry.PSObject.Properties['PendingSubmitSince']) {
+                try { $since = [DateTimeOffset]::Parse([string]$entry.PendingSubmitSince) } catch { }
+            }
+            if (([DateTimeOffset]::Now - $since).TotalSeconds -lt $script:DaemonConfig.SubmitArmSeconds) {
+                # Still armed; say nothing further and look again next pass.
+                continue
+            }
+
+            # Long enough that the box really was empty. Say so rather than doing
+            # nothing: silence here is indistinguishable from a broken button.
+            Set-DaemonSessionProperty -Entry $entry -Name 'LastSubmitAt' -Value $press
+            Set-DaemonSessionProperty -Entry $entry -Name 'PendingSubmitAt' -Value ''
             try {
                 Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Nothing to send' `
                     -Extra @{ hint = 'Type a reply first, then press Send.' } -Headers $Headers
             }
             catch { }
-            Write-DaemonLog -Message "send pressed for $($sessionId.Substring(0,8)) with an empty reply box"
+            Write-DaemonLog -Message "send for $($sessionId.Substring(0,8)) gave up waiting for the typed text"
             continue
         }
 
-        if ($entry.PSObject.Properties['LastReply']) {
-            $entry.LastReply = $value
+        Set-DaemonSessionProperty -Entry $entry -Name 'LastSubmitAt' -Value $press
+        Set-DaemonSessionProperty -Entry $entry -Name 'PendingSubmitAt' -Value ''
+        Set-DaemonSessionProperty -Entry $entry -Name 'LastReply' -Value $value
+
+        try {
+            Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Sending...' -Headers $Headers
         }
-        else {
-            $entry | Add-Member -NotePropertyName LastReply -NotePropertyValue $value -Force
-        }
+        catch { }
 
         [void](Invoke-DaemonReply -SessionId $sessionId -Text $value -Headers $Headers)
     }
+}
+
+function Set-DaemonSessionProperty {
+    <# Adds or updates a note property on a persisted session entry. #>
+    param(
+        [Parameter(Mandatory)][object]$Entry,
+        [Parameter(Mandatory)][string]$Name,
+        [AllowEmptyString()][AllowNull()][object]$Value
+    )
+    if ($Entry.PSObject.Properties[$Name]) { $Entry.$Name = $Value }
+    else { $Entry | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force }
 }
 
 function Repair-CopilotSessionEntities {
@@ -2705,10 +2752,22 @@ function Sync-DaemonSessions {
         }
     }
 
-    # Now that the dashboard no longer has a card pointing at them, remove the exited
-    # sessions' entities. Done last so there is never a window where a live card
-    # references a deleted entity.
-    foreach ($known in $goneSessions) {
+    # Retire the previous pass's exited sessions now, and queue this pass's for the
+    # next one.
+    #
+    # Rebuilding the dashboard first already removed their cards, but a browser holds
+    # the old Lovelace config until it is pushed the new one - so tearing the entities
+    # down in the same breath is exactly what made a just-ended session sit there as a
+    # card full of unknowns. Waiting a pass lets the frontend catch up first, and by
+    # then nothing is pointing at them.
+    #
+    # Only safe because the startup sweep clears orphans: a daemon that dies between
+    # the queue and the removal leaves entities behind, and that sweep is what comes
+    # back for them.
+    $retirePlan = Update-DaemonRetireQueue -Queued $script:DaemonPendingRetire -Gone $goneSessions `
+        -DashboardCurrent ($signature -eq $script:DaemonDashboardSignature)
+    $script:DaemonPendingRetire = @($retirePlan.Queue)
+    foreach ($known in @($retirePlan.Retire)) {
         try {
             Remove-CopilotMqttSession -SessionId $known -Headers $Headers
             Remove-CopilotDecisionMarker -SessionId $known
@@ -2717,6 +2776,37 @@ function Sync-DaemonSessions {
         catch {
             Write-DaemonLog -Message "retire failed for $known : $($_.Exception.Message)"
         }
+    }
+}
+
+function Update-DaemonRetireQueue {
+    <#
+        Decides which exited sessions may have their entities removed now.
+
+        Removal trails the dashboard rebuild by one pass. The rebuild takes their cards
+        away, but a browser keeps rendering the config it already has until Home
+        Assistant pushes the new one, so removing the entities immediately is what left
+        a just-ended session on screen as a card full of unknowns.
+
+        When the rebuild did not land, nothing is retired and everything is carried
+        forward: their cards may still be on screen, and pulling the entities out from
+        under a live card is the very thing this ordering exists to prevent.
+    #>
+    param(
+        [AllowEmptyCollection()][AllowNull()][string[]]$Queued,
+        [AllowEmptyCollection()][AllowNull()][string[]]$Gone,
+        [bool]$DashboardCurrent
+    )
+
+    if (-not $DashboardCurrent) {
+        return [pscustomobject]@{
+            Retire = @()
+            Queue = @(@($Queued) + @($Gone) | Where-Object { $_ } | Select-Object -Unique)
+        }
+    }
+    [pscustomobject]@{
+        Retire = @(@($Queued) | Where-Object { $_ })
+        Queue = @(@($Gone) | Where-Object { $_ } | Select-Object -Unique)
     }
 }
 

@@ -1396,7 +1396,7 @@ ha-card {
         # the activity is reporting on something the user just did, so it does not add
         # a permanently empty row to every card.
         $sendStates = @(
-            'Sending...', 'Sending answer...', 'Nothing to send'
+            'Sending...', 'Sending answer...', 'Nothing to send', 'Waiting for your text'
             'Reply sent', 'Reply NOT sent'
             'Answer sent', 'Answer NOT sent'
             'Not sent - answer every field'

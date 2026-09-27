@@ -377,7 +377,49 @@ $ctx = Reset-SendTest -Press '2026-06-01T12:05:00+00:00' -Reply ' '
 Invoke-PendingReplies -Headers $headers -State $ctx.State -Live $ctx.Live
 Test-That 'a press with an empty box sends nothing' { $script:Replies.Count -eq 0 }
 Test-That 'but still reports why, rather than looking dead' {
-    $script:Activity -contains 'Nothing to send'
+    # Not "Nothing to send" any more: the text is almost always on screen and simply
+    # has not reached Home Assistant, because pressing Send does not commit the field.
+    # Saying it is empty was both wrong and useless; this says what to do instead.
+    $script:Activity -contains 'Waiting for your text'
+}
+Test-That 'and the press is kept rather than spent' {
+    # Burning it here is what forced a second press: by the time the value arrived,
+    # the press that was meant to send it had already been consumed.
+    [string]$ctx.State['bbbbbbbb-1111-2222-3333-444444444444'].PendingSubmitAt -eq '2026-06-01T12:05:00+00:00'
+}
+
+Write-Host ''
+Write-Host '--- an armed press fires as soon as the text arrives ---'
+# The real sequence, from Home Assistant's own history: three presses landed at
+# 19:55:06, :14 and :15 while the box still held its blank sentinel, and the typed
+# value was not committed until 19:55:48. Every one of those presses was spent on
+# nothing, which is exactly what "I have to press Send more than once" is.
+$ctx = Reset-SendTest -Press '2026-06-01T14:00:00+00:00' -Reply ' '
+Invoke-PendingReplies -Headers $headers -State $ctx.State -Live $ctx.Live
+Test-That 'the first press sends nothing yet' { $script:Replies.Count -eq 0 }
+
+# The user taps outside the box; Home Assistant finally commits it.
+$script:HaStates["text.${replyNode}_reply"] = 'the reply that was on screen all along'
+Invoke-PendingReplies -Headers $headers -State $ctx.State -Live $ctx.Live
+Test-That 'the commit sends it without a second press' {
+    $script:Replies -contains 'the reply that was on screen all along'
+}
+Test-That 'and it is sent exactly once' { $script:Replies.Count -eq 1 }
+
+Invoke-PendingReplies -Headers $headers -State $ctx.State -Live $ctx.Live
+Test-That 'the armed press is spent once it has fired' { $script:Replies.Count -eq 1 }
+
+# A box that is genuinely empty must still give up rather than staying armed forever.
+$ctx = Reset-SendTest -Press '2026-06-01T14:30:00+00:00' -Reply ' '
+Invoke-PendingReplies -Headers $headers -State $ctx.State -Live $ctx.Live
+$ctx.State['bbbbbbbb-1111-2222-3333-444444444444'].PendingSubmitSince =
+    ([DateTimeOffset]::Now.AddSeconds(-($script:DaemonConfig.SubmitArmSeconds + 5))).ToString('o')
+Invoke-PendingReplies -Headers $headers -State $ctx.State -Live $ctx.Live
+Test-That 'an expired arm reports nothing to send' { $script:Activity -contains 'Nothing to send' }
+Test-That 'and stops re-reporting once it has given up' {
+    $before = $script:Activity.Count
+    Invoke-PendingReplies -Headers $headers -State $ctx.State -Live $ctx.Live
+    $script:Activity.Count -eq $before
 }
 
 $ctx = Reset-SendTest -Press 'unknown' -Reply 'text'
@@ -427,11 +469,55 @@ $script:BlankReads = 999
 $ctx = Reset-SendTest -Press '2026-06-01T13:05:00+00:00' -Reply ' '
 $script:ReadCount = 0
 Invoke-PendingReplies -Headers $headers -State $ctx.State -Live $ctx.Live
+$ctx.State['bbbbbbbb-1111-2222-3333-444444444444'].PendingSubmitSince =
+    ([DateTimeOffset]::Now.AddSeconds(-($script:DaemonConfig.SubmitArmSeconds + 5))).ToString('o')
+$script:ReadCount = 0
+Invoke-PendingReplies -Headers $headers -State $ctx.State -Live $ctx.Live
 Test-That 'a genuinely empty box still reports nothing to send' {
     $script:Activity -contains 'Nothing to send'
 }
 Test-That 'and it stops after the configured number of attempts' {
     $script:ReadCount -le ($script:DaemonConfig.ReplyCommitAttempts + 1)
+}
+
+Write-Host ''
+Write-Host '--- a just-ended session does not leave a card full of unknowns ---'
+# Rebuilding the dashboard removes the card, but a browser keeps rendering the config
+# it already has until Home Assistant pushes the new one. Removing the entities in the
+# same breath is what left the ended session on screen with every row unknown.
+$plan = Update-DaemonRetireQueue -Queued @() -Gone @('s1') -DashboardCurrent $true
+Test-That 'an exited session is not retired in the same pass as its card' {
+    @($plan.Retire).Count -eq 0 -and (@($plan.Queue) -join ',') -eq 's1'
+}
+
+$plan = Update-DaemonRetireQueue -Queued @('s1') -Gone @() -DashboardCurrent $true
+Test-That 'it is retired on the next pass, once the frontend has caught up' {
+    (@($plan.Retire) -join ',') -eq 's1' -and @($plan.Queue).Count -eq 0
+}
+
+$plan = Update-DaemonRetireQueue -Queued @('s1') -Gone @('s2') -DashboardCurrent $true
+Test-That 'each pass retires the previous one and queues its own' {
+    (@($plan.Retire) -join ',') -eq 's1' -and (@($plan.Queue) -join ',') -eq 's2'
+}
+
+$plan = Update-DaemonRetireQueue -Queued @('s1') -Gone @('s2') -DashboardCurrent $false
+Test-That 'a failed rebuild retires nothing at all' {
+    # Their cards may still be on screen, and pulling entities out from under a live
+    # card is the exact thing this ordering exists to prevent.
+    @($plan.Retire).Count -eq 0
+}
+Test-That 'and carries everything forward instead of dropping it' {
+    (@($plan.Queue | Sort-Object) -join ',') -eq 's1,s2'
+}
+
+$plan = Update-DaemonRetireQueue -Queued @('s1') -Gone @('s1') -DashboardCurrent $false
+Test-That 'a session held over twice is not queued twice' {
+    @($plan.Queue).Count -eq 1
+}
+
+$plan = Update-DaemonRetireQueue -Queued $null -Gone $null -DashboardCurrent $true
+Test-That 'empty queues are handled without erroring' {
+    @($plan.Retire).Count -eq 0 -and @($plan.Queue).Count -eq 0
 }
 
 Write-Host ''
