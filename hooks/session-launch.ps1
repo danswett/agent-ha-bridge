@@ -104,8 +104,10 @@ function Test-BridgeSystemDirectory {
     $root = [System.IO.Path]::GetPathRoot($full)
     if ([string]::IsNullOrWhiteSpace($full) -or $full -eq ([string]$root).TrimEnd('\', '/')) { return $true }
 
-    $excluded = @($env:WINDIR, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData, $env:TEMP) |
-        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    # Wrapped whole: with one folder left (macOS has only TEMP) the pipeline gives a
+    # string, and += on a string appends text rather than folders.
+    $excluded = @(@($env:WINDIR, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData, $env:TEMP) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
     if (-not $script:BridgeIsWindows) {
         $excluded += @('/System', '/Library', '/usr', '/bin', '/sbin', '/private', '/Applications', '/opt', '/var', '/etc')
     }
@@ -1161,9 +1163,11 @@ function Get-BridgeResumableSessions {
         if ([string]::IsNullOrWhiteSpace($summary)) { $summary = "Session $short" }
         if ($prefixed) { $summary = "$(Get-BridgeLauncherLabel -Launcher $entry.Launcher): $summary" }
 
+        # Either separator: a folder recorded on Windows is read on a Mac and the
+        # other way round, and GetFileName only knows the current system's.
         $folderLeaf = ''
         if (-not [string]::IsNullOrWhiteSpace($entry.Folder)) {
-            $folderLeaf = [System.IO.Path]::GetFileName($entry.Folder.TrimEnd('\', '/'))
+            $folderLeaf = @($entry.Folder.TrimEnd('\', '/') -split '[\\/]')[-1]
         }
 
         $label = if ($folderLeaf) { "$summary - $folderLeaf" } else { $summary }
