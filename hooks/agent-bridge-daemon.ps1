@@ -3063,6 +3063,10 @@ function Update-DaemonCodexActivity {
         [bool]$VerboseOn
     )
 
+    # The rollout reader ships with the Codex adapter. Without it there is nothing to
+    # read with - and calling it anyway threw, taking the whole pass down with it.
+    if (-not $script:CodexAdapterLoaded) { return }
+
     $append = Read-CodexTranscriptAppend -Path ([string]$Session.Transcript) `
         -Offset ([long]$Entry.Offset) -MaxTailBytes $script:DaemonConfig.MaxTailBytes
     $Entry.Offset = $append.Offset
