@@ -16,7 +16,7 @@
  * daemon downloads them and attaches them to the prompt.
  */
 
-const CARD_VERSION = '1.12.0';
+const CARD_VERSION = '1.12.2';
 
 // The working line, in the style of Claude Code's own spinner: its glyph cycle, and a
 // word picked once per turn. Claude Code does not record which word it chose, so the
@@ -409,15 +409,32 @@ class AgentBridgeActivityCard extends HTMLElement {
   }
 
   getCardSize() {
-    return 4;
+    return this._compact ? 1 : 4;
   }
+
+  // Set by a session card that folds; the header then keeps only its first lines.
+  set compact(value) {
+    this._compact = !!value;
+    const card = this.shadowRoot && this.shadowRoot.querySelector('ha-card');
+    if (card) { card.classList.toggle('compact', this._compact); }
+  }
+
+  get compact() { return !!this._compact; }
 
   _build() {
     this._built = true;
     const style = document.createElement('style');
     style.textContent = `
       ha-card { padding: 0 16px 8px; background: none; box-shadow: none; border: none; }
-      .title { font-size: 1.25em; font-weight: 500; margin: 12px 0 4px; }
+      .title {
+        font-size: 1.25em; font-weight: 500; margin: 12px 0 4px;
+        /* Inside a session card: room for its chevron, and the title folds it. */
+        padding-right: var(--agent-bridge-title-inset, 0);
+        cursor: var(--agent-bridge-title-cursor, default);
+      }
+      /* Folded: the header keeps its title, status line and spinner only. */
+      ha-card.compact .question, ha-card.compact .response,
+      ha-card.compact .reasoning, ha-card.compact .history { display: none !important; }
       .meta { color: var(--secondary-text-color); margin-bottom: 8px; }
       .meta b { color: var(--primary-text-color); }
       .waiting { font-weight: 600; margin: 8px 0 4px; }
@@ -447,6 +464,11 @@ class AgentBridgeActivityCard extends HTMLElement {
     `;
     this.shadowRoot.appendChild(style);
     this.shadowRoot.appendChild(card);
+    card.classList.toggle('compact', !!this._compact);
+    // A session card around this one folds on a click of the title.
+    card.querySelector('.title').addEventListener('click', () => {
+      this.dispatchEvent(new CustomEvent('agent-bridge-toggle', { bubbles: true, composed: true }));
+    });
 
     this._els = {
       title: card.querySelector('.title'),
@@ -629,11 +651,19 @@ class AgentBridgeActivityCard extends HTMLElement {
  * transparent through ha-card's own CSS variables, so they sit on this surface
  * whether or not card-mod has arrived either.
  */
+/*
+ * It also folds: collapsed, a session keeps only its header - title, status line,
+ * the working spinner - and hides the response, reasoning, history, reply box and
+ * buttons. The chevron or the title toggles it; each viewer's choice is remembered
+ * per session. A collapsed session that starts waiting on you opens by itself, so a
+ * question is never folded away unseen.
+ */
 class AgentBridgeSessionCard extends HTMLElement {
   constructor() {
     super();
     this.attachShadow({ mode: 'open' });
     this._children = [];
+    this._collapsed = false;
   }
 
   setConfig(config) {
@@ -641,7 +671,26 @@ class AgentBridgeSessionCard extends HTMLElement {
       throw new Error('agent-bridge-session-card: "cards" is required');
     }
     this._config = Object.assign({ status: '', decision: '' }, config);
+    this._storeKey = `agent-bridge-collapsed:${this._config.status || ''}`;
+    try { this._collapsed = localStorage.getItem(this._storeKey) === '1'; } catch (e) { this._collapsed = false; }
     this._build();
+  }
+
+  _setCollapsed(collapsed) {
+    this._collapsed = collapsed;
+    try {
+      if (collapsed) { localStorage.setItem(this._storeKey, '1'); } else { localStorage.removeItem(this._storeKey); }
+    } catch (e) { /* a per-viewer nicety; the card works without it */ }
+    this._applyCollapsed();
+  }
+
+  _applyCollapsed() {
+    if (!this._frame) { return; }
+    this._frame.classList.toggle('collapsed', this._collapsed);
+    this._toggle.setAttribute('aria-expanded', this._collapsed ? 'false' : 'true');
+    this._toggle.title = this._collapsed ? 'Expand' : 'Collapse';
+    const header = this._children[0];
+    if (header) { header.compact = this._collapsed; }
   }
 
   set hass(hass) {
@@ -651,6 +700,7 @@ class AgentBridgeSessionCard extends HTMLElement {
   }
 
   getCardSize() {
+    if (this._collapsed) { return 2; }
     return Math.max(4, (this._config && this._config.cards.length) || 4);
   }
 
@@ -660,6 +710,10 @@ class AgentBridgeSessionCard extends HTMLElement {
       <style>
         :host { display: block; }
         .frame {
+          position: relative;
+          /* Room for the chevron beside the header's title, and a title that toggles. */
+          --agent-bridge-title-inset: 30px;
+          --agent-bridge-title-cursor: pointer;
           border-radius: var(--ha-card-border-radius, 12px);
           background: var(--ha-card-background, var(--card-background-color, #fff));
           overflow: hidden;
@@ -685,17 +739,39 @@ class AgentBridgeSessionCard extends HTMLElement {
           50%  { box-shadow: 0 0 18px 3px var(--warning-color); }
           100% { box-shadow: 0 0 6px 0px var(--warning-color); }
         }
+        .fold {
+          position: absolute; top: 14px; right: 10px; z-index: 1;
+          width: 28px; height: 28px; padding: 0; border: none; border-radius: 50%;
+          background: none; cursor: pointer; color: var(--secondary-text-color);
+          display: flex; align-items: center; justify-content: center; --mdc-icon-size: 22px;
+          transition: transform 0.2s ease;
+        }
+        .fold:hover { background: var(--secondary-background-color, rgba(127,127,127,0.15)); }
+        .collapsed .fold { transform: rotate(-90deg); }
+        /* Collapsed, only the header stays. */
+        .collapsed .body > :not(:first-child) { display: none; }
+        .collapsed { padding-bottom: 4px; }
       </style>
-      <div class="frame"></div>`;
+      <div class="frame">
+        <button class="fold" aria-expanded="true" title="Collapse"><ha-icon icon="mdi:chevron-down"></ha-icon></button>
+        <div class="body"></div>
+      </div>`;
     this._frame = this.shadowRoot.querySelector('.frame');
-    this._state = '';
+    this._body = this.shadowRoot.querySelector('.body');
+    this._toggle = this.shadowRoot.querySelector('.fold');
+    this._toggle.addEventListener('click', () => this._setCollapsed(!this._collapsed));
+    // The header's title asks for the same, from inside its own shadow root.
+    this._frame.addEventListener('agent-bridge-toggle', (ev) => { ev.stopPropagation(); this._setCollapsed(!this._collapsed); });
+    this._state = null;
     this._children = [];
+    this._applyCollapsed();
     this._renderState();
 
     const configs = this._config.cards;
     const make = (helpers, index) => {
       const el = helpers.createCardElement(configs[index]);
       if (this._hass) { el.hass = this._hass; }
+      if (index === 0) { el.compact = this._collapsed; }
       // A child whose custom type was not defined yet is built as a placeholder that
       // asks to be rebuilt once it is - the same request a stack card honours.
       el.addEventListener('ll-rebuild', (ev) => {
@@ -712,7 +788,7 @@ class AgentBridgeSessionCard extends HTMLElement {
       configs.forEach((_, index) => {
         const el = make(helpers, index);
         this._children[index] = el;
-        this._frame.appendChild(el);
+        this._body.appendChild(el);
       });
     });
   }
@@ -725,6 +801,8 @@ class AgentBridgeSessionCard extends HTMLElement {
     const waiting = !!(decision && decision.attributes && decision.attributes.question);
     const state = waiting ? 'waiting' : (status && status.state === 'working' ? 'working' : '');
     if (state === this._state) { return; }
+    // A question arriving opens a folded session: it is waiting on you.
+    if (state === 'waiting' && this._collapsed) { this._setCollapsed(false); }
     this._state = state;
     this._frame.classList.toggle('waiting', state === 'waiting');
     this._frame.classList.toggle('working', state === 'working');
@@ -778,7 +856,8 @@ class AgentBridgeLaunchCard extends HTMLElement {
         .head { display: flex; align-items: center; gap: 10px; }
         .toggle { flex: 1; min-width: 0; cursor: pointer; user-select: none; }
         .title { font-size: 1.1em; font-weight: 500; display: flex; align-items: center; gap: 6px; }
-        .chev { transition: transform 0.2s ease; color: var(--secondary-text-color); font-size: 0.8em; }
+        /* An icon, not a glyph: phones drew the triangle as a colour emoji. */
+        .chev { transition: transform 0.2s ease; color: var(--secondary-text-color); --mdc-icon-size: 20px; display: inline-flex; margin-left: -4px; }
         .open .chev { transform: rotate(90deg); }
         .summary { color: var(--secondary-text-color); font-size: 0.9em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         button.launch {
@@ -809,7 +888,7 @@ class AgentBridgeLaunchCard extends HTMLElement {
       <ha-card>
         <div class="head">
           <div class="toggle" role="button" tabindex="0" aria-expanded="false">
-            <div class="title"><span class="chev">▶</span><span class="name"></span></div>
+            <div class="title"><ha-icon class="chev" icon="mdi:chevron-right"></ha-icon><span class="name"></span></div>
             <div class="summary"></div>
           </div>
           <button class="launch">Launch</button>

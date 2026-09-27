@@ -124,6 +124,9 @@ $script:DaemonConfig = @{
     # How long a launch-card note (a failed launch, an agent set up) stays before it
     # is cleared. Nothing else removes one, so without this it stayed indefinitely.
     NoteExpirySeconds = 600
+    # The first message a Codex launched without one is given, so that it creates
+    # its session and can be attached (see Sync-DaemonNewSession).
+    CodexStartPrompt = 'Reply with one short line saying you are ready, then wait for my next message.'
 }
 
 # Session-set signature of the last dashboard rebuild, so the dashboard is only
@@ -2691,6 +2694,15 @@ function Sync-DaemonNewSession {
     if ($prompt -in @('unknown', 'unavailable')) { $prompt = '' }
     $prompt = $prompt.Trim()
 
+    # Codex creates its session - its id, its session file, its first hook call -
+    # only on a first message, so one launched without a prompt ran in a window the
+    # bridge could never attach to. It is given a short opening message instead
+    # (`newSession.codexStartPrompt`; empty turns this off, and the launch then waits
+    # for a first message sent from the card).
+    if ($chosenLauncher -eq 'codex' -and -not $prompt) {
+        $prompt = ([string](Get-BridgeSetting 'newSession.codexStartPrompt' $script:DaemonConfig.CodexStartPrompt)).Trim()
+    }
+
     # The profile only applies under Agency. An untouched selector falls back to the
     # first configured profile, and an unrecognised one is refused outright rather
     # than passed to a command line.
@@ -3135,6 +3147,14 @@ function Add-DaemonConfiguredClient {
     else { $config | Add-Member -NotePropertyName 'clients' -NotePropertyValue @($clients) -Force }
     $config | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $path -Encoding UTF8
     $script:BridgeUserConfig = $config
+}
+
+function Test-DaemonLaunchProgressNote {
+    <# Whether a launch note is about a launch still being followed, not an outcome. #>
+    param([AllowEmptyString()][AllowNull()][string]$Text)
+    $t = ([string]$Text).Trim()
+    if (-not $t) { return $false }
+    $t.EndsWith('...') -or $t -like 'Codex is open in *' -or $t -like 'Claude is asking whether to trust *'
 }
 
 function Clear-DaemonStaleNote {
@@ -4282,6 +4302,19 @@ function Start-BridgeDaemon {
     $script:DaemonLive = $live
 
     Write-DaemonLog -Message "daemon starting (pid $PID), $($live.Count) live session(s)"
+
+    # A launch being followed does not survive a restart, so a note about one in
+    # progress ("Starting...", "Codex is open in...", "press Launch again to trust")
+    # would otherwise stay up with nothing left to clear it. Other notes - an agent
+    # just set up, which restarts the daemon on purpose - are left to expire.
+    try {
+        $note = [string](Get-HomeAssistantState -EntityId $script:DaemonEntity.NewResult -Headers $headers).state
+        if (Test-DaemonLaunchProgressNote -Text $note) {
+            Set-CopilotMqttNewSessionResult -Headers $headers -Text ''
+            Write-DaemonLog -Message "cleared a launch note left from before the restart: $note"
+        }
+    }
+    catch { }
 
     # Compile the console injector now rather than on the first reply. The compile
     # takes about 650 ms, which the first reply after every start used to wait for.

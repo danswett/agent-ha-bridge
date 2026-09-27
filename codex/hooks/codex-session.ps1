@@ -93,10 +93,16 @@ function Get-CodexOwningProcessId {
         Newer Codex runs hooks under a `codex.exe app-server` child of the terminal
         UI. That process has no console, so replies typed into it failed with
         attach-failed:6 (ERROR_INVALID_HANDLE); the walk carries on past it to the
-        interactive codex.exe that owns the window, and settles for the app-server
-        only when there is none above it.
+        interactive codex.exe that owns the window.
+
+        The app-server is also shared: a second Codex window reuses the one the first
+        started, so its hooks run under the first window's process tree - or under
+        no window at all once that one has closed. When the walk finds no window of
+        its own, this session keeps the window it already recorded if that is still
+        running; failing that, it takes the newest Codex window no other live
+        session has claimed. The app-server is the last resort.
     #>
-    param([int]$StartPid = $PID, [int]$MaxDepth = 12)
+    param([int]$StartPid = $PID, [int]$MaxDepth = 12, [string]$SessionId = '')
 
     $fallback = 0
     $current = $StartPid
@@ -105,13 +111,60 @@ function Get-CodexOwningProcessId {
         if (-not $process) { break }
         # Exact match: codex-windows-sandbox-setup and codex-command-runner also exist.
         if ($process.Name -match '^codex(\.exe)?$') {
-            if ([string]$process.CommandLine -notmatch '\sapp-server(\s|$)') { return [int]$process.ProcessId }
+            if (-not (Test-CodexAppServer -Process $process)) {
+                # Under the shared app-server, the window above it can belong to a
+                # different session: take it only if nobody else has.
+                if ($fallback -eq 0 -or -not (Test-CodexWindowClaimed -ProcessId ([int]$process.ProcessId) -SessionId $SessionId)) {
+                    return [int]$process.ProcessId
+                }
+                break
+            }
             if ($fallback -eq 0) { $fallback = [int]$process.ProcessId }
         }
         if (-not $process.ParentProcessId -or $process.ParentProcessId -eq $current) { break }
         $current = [int]$process.ParentProcessId
     }
+    if ($fallback -eq 0) { return 0 }
+
+    $windows = @(Get-CimInstance Win32_Process -Filter "Name='codex.exe'" -ErrorAction SilentlyContinue |
+        Where-Object { -not (Test-CodexAppServer -Process $_) })
+
+    # The window this session already recorded, while it runs.
+    if ($SessionId) {
+        $mine = Get-CodexRecordedProcessId -SessionId $SessionId
+        if ($mine -gt 0 -and @($windows | Where-Object { [int]$_.ProcessId -eq $mine }).Count -gt 0) { return $mine }
+    }
+
+    $free = @($windows | Where-Object { -not (Test-CodexWindowClaimed -ProcessId ([int]$_.ProcessId) -SessionId $SessionId) } |
+        Sort-Object CreationDate -Descending)
+    if ($free.Count -gt 0) { return [int]$free[0].ProcessId }
     $fallback
+}
+
+function Test-CodexAppServer {
+    param([Parameter(Mandatory)][object]$Process)
+    [string]$Process.CommandLine -match '\sapp-server(\s|$)'
+}
+
+function Get-CodexRecordedProcessId {
+    param([Parameter(Mandatory)][string]$SessionId)
+    $path = Join-Path (Get-CodexStateRoot) ((Get-CodexSafeSessionKey -SessionId $SessionId) + '.json')
+    try { [int]((Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json).ProcessId) } catch { 0 }
+}
+
+function Test-CodexWindowClaimed {
+    <# Whether another live session's registration already names this window. #>
+    param([Parameter(Mandatory)][int]$ProcessId, [string]$SessionId = '')
+    $root = Get-CodexStateRoot
+    if (-not (Test-Path -LiteralPath $root)) { return $false }
+    $ownKey = if ($SessionId) { (Get-CodexSafeSessionKey -SessionId $SessionId) + '.json' } else { '' }
+    foreach ($file in Get-ChildItem -LiteralPath $root -Filter '*.json' -File -ErrorAction SilentlyContinue) {
+        if ($file.Name -eq $ownKey -or $file.Name -like '*.approval.json') { continue }
+        try { $entry = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json } catch { continue }
+        if ($entry.PSObject.Properties['Ended'] -and $entry.Ended) { continue }
+        if ([int]($entry.ProcessId ?? 0) -eq $ProcessId) { return $true }
+    }
+    $false
 }
 
 function Write-CodexSessionRegistration {

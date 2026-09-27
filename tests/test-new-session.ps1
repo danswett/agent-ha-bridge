@@ -1152,10 +1152,25 @@ function Send-CopilotSessionPrompt {
     $script:Sent += [pscustomobject]@{ Text = $Text; ProcessId = $ProcessId }
     [pscustomobject]@{ Delivered = $true; Detail = 'ok:5' }
 }
+Reset-NewSessionTest -Press '2026-06-01T12:39:00+00:00' -AgentState 'Codex' -Prompt ''
+$script:DaemonPendingLaunch = $null
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+Test-That 'a Codex launch needs no first message from you' { $script:Launches.Count -eq 1 -and $script:Launches[0].Launcher -eq 'codex' }
+Test-That 'it is given a short opening message, so it creates its session and attaches' {
+    $script:Launches[0].Prompt -eq $script:DaemonConfig.CodexStartPrompt -and -not $script:DaemonPendingLaunch.AwaitingFirstMessage
+}
+Reset-NewSessionTest -Press '2026-06-01T12:39:30+00:00' -AgentState 'Claude' -Prompt ''
+$script:ClaudePresent = $true
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+Test-That 'other agents start with no message at all' { $script:Launches.Count -eq 1 -and $script:Launches[0].Prompt -eq '' }
+$script:ClaudePresent = $false
+
+# With the opening message turned off, the launch waits for one from the card.
+$script:FakeSettings = @{ 'newSession.workspaces' = @($alpha); 'newSession.codexStartPrompt' = '' }
 Reset-NewSessionTest -Press '2026-06-01T12:40:00+00:00' -AgentState 'Codex' -Prompt ''
 $script:DaemonPendingLaunch = $null
 Sync-DaemonNewSession -Headers $headers -Live $noLive
-Test-That 'a Codex launch needs no first message' { $script:Launches.Count -eq 1 -and $script:Launches[0].Launcher -eq 'codex' }
+Test-That 'a Codex launch without the opening message still starts' { $script:Launches.Count -eq 1 -and $script:Launches[0].Launcher -eq 'codex' }
 Test-That 'and waits for one rather than timing out' { $script:DaemonPendingLaunch.AwaitingFirstMessage }
 $script:DaemonPendingLaunch.Since = [DateTimeOffset]::Now.AddMinutes(-5)
 $script:DaemonPendingLaunch.LastCheck = [DateTimeOffset]::MinValue

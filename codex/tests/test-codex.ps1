@@ -200,11 +200,47 @@ $script:FakeTree = @{
 }
 function Get-CimInstance {
     param([string]$ClassName, [string]$Filter, $ErrorAction)
-    if ($Filter -match 'ProcessId=(\d+)') { $script:FakeTree[[int]$Matches[1]] }
+    if ($Filter -match 'ProcessId=(\d+)') { return $script:FakeTree[[int]$Matches[1]] }
+    if ($Filter -match "Name='([^']+)'") { $name = $Matches[1]; $script:FakeTree.Values | Where-Object Name -eq $name }
 }
-Test-That 'a hook under the app-server resolves to the terminal codex.exe' { (Get-CodexOwningProcessId -StartPid 100) -eq 80 }
-Test-That 'an app-server with no terminal above it is still better than nothing' { (Get-CodexOwningProcessId -StartPid 50) -eq 60 }
-Remove-Item function:Get-CimInstance
+# Registrations go to a scratch folder, not the real one.
+$savedRoot = $script:CodexStateRoot
+$script:CodexStateRoot = Join-Path ([IO.Path]::GetTempPath()) "codex-owner-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+New-Item -ItemType Directory -Force -Path $script:CodexStateRoot | Out-Null
+try {
+    Test-That 'a hook under the app-server resolves to the terminal codex.exe' { (Get-CodexOwningProcessId -StartPid 100) -eq 80 }
+    Test-That 'an app-server with no terminal above it, and no window free, is still better than nothing' {
+        $script:FakeTree.Remove(80); $r = Get-CodexOwningProcessId -StartPid 50
+        $script:FakeTree[80] = [pscustomobject]@{ ProcessId = 80; ParentProcessId = 70; Name = 'codex.exe'; CommandLine = 'C:\npm\codex-win32-x64\vendor\codex.exe'; CreationDate = [datetime]'2026-09-27T11:51:00' }
+        $r -eq 60
+    }
+
+    # The app-server is shared: a second window's hooks run under the first window's
+    # tree, or under a window that has since closed. Captured live: the second
+    # session was registered against the orphaned app-server and could not be
+    # replied to.
+    $script:FakeTree[80].PSObject.Properties.Add([psnoteproperty]::new('CreationDate', [datetime]'2026-09-27T11:51:00'))
+    $script:FakeTree[20] = [pscustomobject]@{ ProcessId = 20; ParentProcessId = 70; Name = 'codex.exe'; CommandLine = 'C:\npm\codex-win32-x64\vendor\codex.exe'; CreationDate = [datetime]'2026-09-27T12:31:30' }
+    Write-CodexSessionRegistration -SessionId 'first-session' -ProcessId 80 -Status 'idle' | Out-Null
+    Test-That 'a second session under the shared app-server takes the window nobody has claimed' {
+        (Get-CodexOwningProcessId -StartPid 100 -SessionId 'second-session') -eq 20
+    }
+    Test-That 'while the first session keeps its own window' {
+        (Get-CodexOwningProcessId -StartPid 100 -SessionId 'first-session') -eq 80
+    }
+    Test-That 'with the first window closed, the orphaned app-server still leads to the free window' {
+        (Get-CodexOwningProcessId -StartPid 50 -SessionId 'second-session') -eq 20
+    }
+    Write-CodexSessionRegistration -SessionId 'second-session' -ProcessId 20 -Status 'idle' | Out-Null
+    Test-That 'a session keeps the window it recorded' {
+        (Get-CodexOwningProcessId -StartPid 50 -SessionId 'second-session') -eq 20
+    }
+}
+finally {
+    Remove-Item -LiteralPath $script:CodexStateRoot -Recurse -Force -ErrorAction SilentlyContinue
+    $script:CodexStateRoot = $savedRoot
+    Remove-Item function:Get-CimInstance
+}
 
 Write-Host ''
 if ($script:Failures) {

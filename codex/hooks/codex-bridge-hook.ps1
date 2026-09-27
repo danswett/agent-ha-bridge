@@ -102,13 +102,16 @@ try {
         default { Exit-Silently }
     }
 
+    # The window this session runs in, which replies are typed into.
+    $ownerPid = Get-CodexOwningProcessId -SessionId $sessionId
+
     # Local state first, so a Home Assistant outage cannot lose the session record.
     Write-CodexSessionRegistration -SessionId $sessionId `
         -TranscriptPath (Get-EventField 'transcript_path') `
         -WorkingDirectory $workingDirectory `
         -Model (Get-EventField 'model') `
         -Status $status -Activity $activity `
-        -ProcessId (Get-CodexOwningProcessId) `
+        -ProcessId $ownerPid `
         -Ended:($eventName -eq 'SessionEnd') | Out-Null
 
     Write-DecisionBridgeLog -Message (
@@ -132,7 +135,7 @@ try {
 
     Publish-BridgeSessionStatus -SessionId $sessionId -SessionName $display.Name `
         -Machine $display.Machine -Headers $headers -Status $status -Activity $activity `
-        -ExtraAttributes @{ model = (Get-EventField 'model'); process_id = (Get-CodexOwningProcessId) }
+        -ExtraAttributes @{ model = (Get-EventField 'model'); process_id = $ownerPid }
 
     if ($pendingApproval) {
         # Arm the selector so the command can be approved from the dashboard. The
