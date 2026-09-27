@@ -144,6 +144,11 @@ $script:DaemonReconcileNow = $false
 # and why the daemon should restart once the pass is done - to load a new adapter.
 $script:DaemonClientSetup = @{}
 $script:DaemonRestartRequested = ''
+# The agent last published as the dashboard's default, kept across restarts so a
+# selection still showing it can be told apart from one the user made.
+$script:DaemonDefaultAgentFile = Join-Path $env:TEMP 'agent-bridge-default-agent.txt'
+$script:DaemonDefaultAgent = $null
+try { $script:DaemonDefaultAgent = ([System.IO.File]::ReadAllText($script:DaemonDefaultAgentFile)).Trim() } catch { }
 
 # Sessions whose reply-payload sensor has been checked this run, so the probe costs
 # one Home Assistant read per session rather than one per reconcile.
@@ -2397,10 +2402,17 @@ function Set-DaemonNewSessionDefaults {
         $default = Get-BridgeLauncherLabel -Launcher (Get-BridgeLauncherKind)
         if ($Agents -notcontains $default) { $default = $Agents[0] }
         try {
+            # A selection still showing the previous default was never the user's
+            # choice, so it follows the default when that moves; one they picked stays.
             $current = [string](Get-HomeAssistantState -EntityId $script:DaemonEntity.NewAgent -Headers $Headers).state
-            if ($current -in $stale -or $Agents -notcontains $current) {
+            $untouched = $null -ne $script:DaemonDefaultAgent -and $current -eq $script:DaemonDefaultAgent
+            if ($current -in $stale -or $Agents -notcontains $current -or ($untouched -and $current -ne $default)) {
                 Invoke-HomeAssistantService -Domain 'select' -Service 'select_option' -Headers $Headers `
                     -Data @{ entity_id = $script:DaemonEntity.NewAgent; option = $default }
+            }
+            if ($script:DaemonDefaultAgent -ne $default) {
+                $script:DaemonDefaultAgent = $default
+                try { [System.IO.File]::WriteAllText($script:DaemonDefaultAgentFile, $default) } catch { }
             }
         }
         catch { }
@@ -3020,12 +3032,34 @@ function Add-DaemonCardText {
 
 function Get-DaemonClientAdapterInstalled {
     <# Whether a client's bridge adapter is in place, from the files its installer leaves. #>
-    param([Parameter(Mandatory)][ValidateSet('claude', 'codex')][string]$Client)
+    param([Parameter(Mandatory)][ValidateSet('claude', 'codex', 'copilot')][string]$Client)
 
     switch ($Client) {
-        'claude' { return Test-Path -LiteralPath (Join-Path $HOME '.claude\ha-bridge\claude-session.ps1') }
-        'codex'  { return Test-Path -LiteralPath (Join-Path $HOME '.agent-ha-bridge\codex-bridge\plugins\agent-ha-bridge\hooks\codex-session.ps1') }
+        'claude'  { return Test-Path -LiteralPath (Join-Path $HOME '.claude\ha-bridge\claude-session.ps1') }
+        'codex'   { return Test-Path -LiteralPath (Join-Path $HOME '.agent-ha-bridge\codex-bridge\plugins\agent-ha-bridge\hooks\codex-session.ps1') }
+        'copilot' { return Test-Path -LiteralPath (Join-Path $HOME '.copilot\hooks\decision-notifier.json') }
     }
+}
+
+function Get-DaemonClientInstaller {
+    <#
+        How to install a client's adapter: the installer shipped with the bridge, and
+        its arguments. Copilot's hooks are written by the main installer, which also
+        removes them whenever Copilot is not among the configured clients - so it is
+        run with Copilot added to the list, which makes the setup stick.
+    #>
+    param([Parameter(Mandatory)][string]$Client)
+
+    $payload = Join-Path $HOME '.agent-ha-bridge\installer'
+    if ($Client -eq 'copilot') {
+        $clients = @(@(Get-BridgeSetting 'clients' @()) | ForEach-Object { [string]$_ } | Where-Object { $_ })
+        if ($clients -notcontains 'copilot') { $clients += 'copilot' }
+        return [pscustomobject]@{
+            Path      = Join-Path $payload 'install.ps1'
+            Arguments = "-NonInteractive -Clients $($clients -join ',')"
+        }
+    }
+    [pscustomobject]@{ Path = Join-Path $payload "$Client\install-$Client.ps1"; Arguments = '' }
 }
 
 function Add-DaemonConfiguredClient {
@@ -3071,7 +3105,7 @@ function Sync-DaemonClients {
 
     if (-not [bool](Get-BridgeSetting 'autoConfigureClients' $true)) { return }
 
-    foreach ($client in @('claude', 'codex')) {
+    foreach ($client in @('claude', 'codex', 'copilot')) {
         $job = $script:DaemonClientSetup[$client]
 
         if ($null -ne $job) {
@@ -3083,6 +3117,7 @@ function Sync-DaemonClients {
                 Write-DaemonLog -Message "set up the $label adapter (log: $($job.Log)); restarting to load it"
                 $note = "$label found and set up for the dashboard."
                 if ($client -eq 'codex') { $note += ' Open Codex once and approve the agent-ha-bridge hooks so its sessions show here.' }
+                elseif ($client -eq 'copilot' -and -not (Get-BridgeLauncherUsage -Launcher 'copilot').SignedIn) { $note += ' Run copilot once and sign in (/login) before launching it from here.' }
                 else { $note += ' Restart any running sessions so they pick it up.' }
                 try { Set-CopilotMqttNewSessionResult -Headers $Headers -Text $note } catch { }
                 $script:DaemonRestartRequested = "load the $label adapter"
@@ -3102,13 +3137,13 @@ function Sync-DaemonClients {
             continue
         }
 
-        $installer = Join-Path $HOME ".agent-ha-bridge\installer\$client\install-$client.ps1"
-        if (-not (Test-Path -LiteralPath $installer)) { continue }
+        $installer = Get-DaemonClientInstaller -Client $client
+        if (-not (Test-Path -LiteralPath $installer.Path)) { continue }
 
         $log = Join-Path $env:TEMP "agent-bridge-setup-$client.log"
         try {
             $process = Start-Process -FilePath 'pwsh' `
-                -ArgumentList "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$installer`"" `
+                -ArgumentList "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$($installer.Path)`" $($installer.Arguments)".TrimEnd() `
                 -WindowStyle Hidden -PassThru -RedirectStandardOutput $log -RedirectStandardError "$log.err" -ErrorAction Stop
             $script:DaemonClientSetup[$client] = [pscustomobject]@{ Process = $process; Log = $log; Done = $false }
             Write-DaemonLog -Message "$(Get-BridgeLauncherLabel -Launcher $client) is installed but has no bridge adapter; setting it up (pid $($process.Id))"

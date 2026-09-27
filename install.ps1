@@ -1167,6 +1167,13 @@ function Copy-BridgeInstallerPayload {
         [Parameter(Mandatory)][string]$Destination
     )
 
+    # Run from the payload itself - `agent-ha-bridge configure`, or the daemon setting
+    # up an agent installed later - the source is the destination: clearing it first
+    # deleted the whole payload, the running installer included. It is already current.
+    $source = [IO.Path]::GetFullPath($RepoRoot).TrimEnd('\', '/')
+    $target = [IO.Path]::GetFullPath($Destination).TrimEnd('\', '/')
+    if ($source -ieq $target) { return @(Get-ChildItem -LiteralPath $Destination -Force).Count }
+
     if (Test-Path -LiteralPath $Destination) { Remove-Item -LiteralPath $Destination -Recurse -Force }
     New-Item -ItemType Directory -Path $Destination -Force | Out-Null
 

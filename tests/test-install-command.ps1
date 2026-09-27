@@ -84,6 +84,13 @@ try {
         [void](Copy-BridgeInstallerPayload -RepoRoot $repoRoot -Destination $payloadRoot)
         -not (Test-Path -LiteralPath $orphan)
     }
+    # `configure` runs the installer from the payload, so source and destination are
+    # the same folder - which used to be cleared, taking the whole payload with it.
+    $again = Copy-BridgeInstallerPayload -RepoRoot "$payloadRoot\" -Destination $payloadRoot
+    Test-That 'copying the payload onto itself leaves it intact' {
+        $again -gt 0 -and (Test-Path -LiteralPath (Join-Path $payloadRoot 'bin\agent-ha-bridge.ps1')) -and
+            (Test-Path -LiteralPath (Join-Path $payloadRoot 'install.ps1'))
+    }
 }
 finally { Remove-Item -LiteralPath $payloadRoot -Recurse -Force -ErrorAction SilentlyContinue }
 

@@ -197,7 +197,7 @@ try {
         $activity.state -match 'git push'
     } $(if ($activity) { $activity.state } else { 'missing' })
 
-    Write-Host '--- Stop marks the turn idle and uses last_assistant_message ---'
+    Write-Host '--- Stop marks the turn idle ---'
     $stopHook = Join-Path $PSScriptRoot '..\hooks\notify-claude-stop.ps1'
     # Reuse the notified session, which already has entities, so the idle transition
     # is observable.
@@ -211,8 +211,10 @@ try {
     $statusAfter = Get-EntityState -EntityId "sensor.${notifyNode}_status" -Expected 'idle'
     $activityAfter = Get-EntityState -EntityId "sensor.${notifyNode}_activity"
     Test-That 'the session goes idle' { $statusAfter.state -eq 'idle' } $(if ($statusAfter) { $statusAfter.state } else { 'missing' })
-    Test-That 'the response comes from last_assistant_message' {
-        $activityAfter.state -match 'hello from the scratch file'
+    # Stop publishes status only: rewriting the activity from the hook replaced the
+    # card's attributes and collapsed it. The daemon owns the activity.
+    Test-That 'the Stop hook leaves the activity to the daemon' {
+        $activityAfter.state -match 'git push'
     } $(if ($activityAfter) { $activityAfter.state } else { 'missing' })
 }
 finally {

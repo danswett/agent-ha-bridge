@@ -240,6 +240,20 @@ $script:Started = @()
 Sync-DaemonClients -Headers $headers
 Test-That 'autoConfigureClients: false turns it off' { $script:Started.Count -eq 0 }
 
+# Copilot's hooks come from the main installer, which drops them for any client not
+# listed - so it is run with Copilot added to the clients already configured.
+$script:DaemonClientSetup = @{}
+$script:FakeSettings = @{ clients = @('claude', 'codex') }
+$script:Installed.copilot = $true
+$script:Adapters.copilot = $false
+$script:Adapters.codex = $true
+$script:Started = @()
+Sync-DaemonClients -Headers $headers
+Test-That 'Copilot installed later is set up by the main installer' {
+    $script:Started.Count -eq 1 -and $script:Started[0] -match '\\install\.ps1"' -and $script:Started[0] -match '-NonInteractive'
+}
+Test-That 'with Copilot added to the configured clients, not replacing them' { $script:Started[0] -match '-Clients claude,codex,copilot$' }
+
 Write-Host ''
 Write-Host '--- noticing PATH changes without a restart ---'
 

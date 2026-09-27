@@ -345,6 +345,44 @@ function Get-BridgeCopilotPath { if ($script:CopilotPresent) { 'C:\copilot.exe' 
 function Get-BridgeClaudePath { if ($script:ClaudePresent) { 'C:\claude.exe' } else { $null } }
 function Get-BridgeCodexPath { if ($script:CodexPresent) { 'C:\codex.cmd' } else { $null } }
 
+Write-Host ''
+Write-Host '--- reading how agents are used ---'
+$usageRoot = Join-Path ([IO.Path]::GetTempPath()) "bridge-usage-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+$savedHomes = @{ COPILOT_HOME = $env:COPILOT_HOME; CODEX_HOME = $env:CODEX_HOME; CLAUDE_CONFIG_DIR = $env:CLAUDE_CONFIG_DIR }
+try {
+    $env:COPILOT_HOME = Join-Path $usageRoot 'copilot'
+    $env:CODEX_HOME = Join-Path $usageRoot 'codex'
+    $env:CLAUDE_CONFIG_DIR = Join-Path $usageRoot 'claude'
+    $session = New-Item -ItemType Directory -Force -Path (Join-Path $usageRoot 'codex\sessions\2026\09\27')
+    $rollout = Join-Path $session.FullName 'rollout-1.jsonl'
+    Set-Content -LiteralPath $rollout -Value '{}'
+    (Get-Item -LiteralPath $rollout).LastWriteTimeUtc = [DateTime]::UtcNow.AddMinutes(10)
+    New-Item -ItemType Directory -Force -Path (Join-Path $usageRoot 'claude') | Out-Null
+    Set-Content -LiteralPath (Join-Path $usageRoot 'claude\.credentials.json') -Value '{}'
+
+    $codex = Get-BridgeLauncherUsage -Launcher 'codex'
+    Test-That 'a Codex session filed by date is found' { $null -ne $codex.LastUsed -and $codex.LastUsed -gt [DateTime]::UtcNow.AddMinutes(5) }
+    $claude = Get-BridgeLauncherUsage -Launcher 'claude'
+    Test-That 'a signed-in Claude with no sessions has no history' { $claude.SignedIn -and $null -eq $claude.LastUsed }
+    $copilot = Get-BridgeLauncherUsage -Launcher 'agency'
+    Test-That 'a Copilot never run is neither used nor signed in' { -not $copilot.SignedIn -and $null -eq $copilot.LastUsed }
+}
+finally {
+    foreach ($name in $savedHomes.Keys) { Set-Item -Path "env:$name" -Value $savedHomes[$name] -ErrorAction SilentlyContinue; if (-not $savedHomes[$name]) { Remove-Item -Path "env:$name" -ErrorAction SilentlyContinue } }
+    Remove-Item -LiteralPath $usageRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# Now shadow the usage probes too, so 'auto' sees no history unless a test gives it
+# some. Agency shares Copilot's history, as the real probe does.
+$script:Usage = @{}
+function Get-BridgeLauncherUsage {
+    param([string]$Launcher)
+    $key = if ($Launcher -eq 'agency') { 'copilot' } else { $Launcher }
+    if ($script:Usage.ContainsKey($key)) { return $script:Usage[$key] }
+    [pscustomobject]@{ LastUsed = $null; SignedIn = $false }
+}
+function Set-TestUsage { param([hashtable]$Usage) $script:Usage = $Usage; $script:BridgeAutoLauncher = $null }
+
 $script:FakeSettings = @{ 'newSession.launcher' = 'auto' }
 $script:AgencyPresent = $true
 Test-That 'auto prefers Agency when it is installed' { (Get-BridgeLauncherKind) -eq 'agency' }
@@ -381,6 +419,38 @@ $script:ClaudePresent = $true
 $script:CodexPresent = $true
 $script:FakeSettings = @{ 'newSession.launcher' = 'codex' }
 Test-That 'an explicit claude-or-codex choice is honoured' { (Get-BridgeLauncherKind) -eq 'codex' }
+
+# 'auto' follows how the machine is used, not a fixed order: installing Copilot to
+# try it must not turn every launch on a Claude machine into a Copilot one.
+$script:AgencyPresent = $false
+$script:FakeSettings = @{ 'newSession.launcher' = 'auto' }
+$now = [DateTime]::UtcNow
+Set-TestUsage @{
+    claude  = [pscustomobject]@{ LastUsed = $now.AddMinutes(-5); SignedIn = $true }
+    copilot = [pscustomobject]@{ LastUsed = $null; SignedIn = $false }
+    codex   = [pscustomobject]@{ LastUsed = $now.AddDays(-3); SignedIn = $true }
+}
+Test-That 'auto picks the agent used most recently' { (Get-BridgeLauncherKind) -eq 'claude' }
+Set-TestUsage @{
+    claude = [pscustomobject]@{ LastUsed = $now.AddDays(-1); SignedIn = $true }
+    codex  = [pscustomobject]@{ LastUsed = $now.AddMinutes(-1); SignedIn = $true }
+}
+Test-That 'and moves when another agent is used more recently' { (Get-BridgeLauncherKind) -eq 'codex' }
+Set-TestUsage @{ codex = [pscustomobject]@{ LastUsed = $null; SignedIn = $true } }
+Test-That 'with no history anywhere it prefers an agent that is signed in' { (Get-BridgeLauncherKind) -eq 'codex' }
+Set-TestUsage @{}
+Test-That 'and with nothing to go on, preference order' { (Get-BridgeLauncherKind) -eq 'copilot' }
+$script:AgencyPresent = $true
+Set-TestUsage @{
+    copilot = [pscustomobject]@{ LastUsed = $now; SignedIn = $true }
+    claude  = [pscustomobject]@{ LastUsed = $now.AddHours(-1); SignedIn = $true }
+}
+Test-That 'Agency shares Copilot''s history and wins the tie' { (Get-BridgeLauncherKind) -eq 'agency' }
+$script:FakeSettings = @{ 'newSession.launcher' = 'claude' }
+Set-TestUsage @{ codex = [pscustomobject]@{ LastUsed = $now; SignedIn = $true } }
+Test-That 'an explicit launcher setting still beats usage' { (Get-BridgeLauncherKind) -eq 'claude' }
+$script:FakeSettings = @{ 'newSession.launcher' = 'codex' }
+Set-TestUsage @{}
 Test-That 'every installed agent is offered, in preference order' {
     (@(Get-BridgeAvailableLaunchers) -join ',') -eq 'agency,copilot,claude,codex'
 }

@@ -485,20 +485,133 @@ function Resolve-BridgeLauncher {
     $null
 }
 
+function Get-BridgeNewestWriteTime {
+    <#
+        The newest write time among the given files and folders, following a folder's
+        newest child down up to -Depth levels (Codex files sessions by year\month\day).
+        $null when none exists. Folder times move whenever an entry is added, so this
+        stays cheap however many sessions there are.
+    #>
+    param([string[]]$Path, [int]$Depth = 1)
+
+    $newest = $null
+    foreach ($item in $Path) {
+        if (-not $item) { continue }
+        try {
+            $info = Get-Item -LiteralPath $item -Force -ErrorAction Stop
+            $level = 0
+            while ($true) {
+                if ($null -eq $newest -or $info.LastWriteTimeUtc -gt $newest) { $newest = $info.LastWriteTimeUtc }
+                if (-not $info.PSIsContainer -or $level -ge $Depth) { break }
+                $child = Get-ChildItem -LiteralPath $info.FullName -Force -ErrorAction Stop |
+                    Sort-Object LastWriteTimeUtc -Descending | Select-Object -First 1
+                if ($null -eq $child) { break }
+                $info = $child
+                $level++
+            }
+        }
+        catch { }
+    }
+    $newest
+}
+
+function Get-BridgeLauncherUsage {
+    <#
+        What this machine says about how each agent is used: when a session of it
+        last ran (LastUsed, UTC, or $null) and whether it has been signed in
+        (SignedIn). 'auto' picks the default launcher from this.
+
+        Agency runs Copilot underneath and keeps its sessions in Copilot's store, so
+        the two share one history; Agency, first in preference order, wins the tie
+        on a machine that has it.
+    #>
+    param([Parameter(Mandatory)][string]$Launcher)
+
+    $copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { Join-Path $HOME '.copilot' }
+    $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+    $claudeHome = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $HOME '.claude' }
+
+    switch ($Launcher) {
+        { $_ -in 'agency', 'copilot' } {
+            $state = Join-Path $copilotHome 'session-state'
+            return [pscustomobject]@{
+                LastUsed = Get-BridgeNewestWriteTime -Path @($state) -Depth 2
+                SignedIn = (Test-Path -LiteralPath $state) -or
+                    (Test-Path -LiteralPath (Join-Path $copilotHome 'config.json')) -or
+                    [bool]$env:GH_TOKEN -or [bool]$env:GITHUB_TOKEN -or [bool]$env:COPILOT_GITHUB_TOKEN
+            }
+        }
+        'claude' {
+            return [pscustomobject]@{
+                LastUsed = Get-BridgeNewestWriteTime -Path @((Join-Path $claudeHome 'history.jsonl'), (Join-Path $claudeHome 'projects')) -Depth 2
+                SignedIn = (Test-Path -LiteralPath (Join-Path $claudeHome '.credentials.json')) -or [bool]$env:ANTHROPIC_API_KEY
+            }
+        }
+        'codex' {
+            return [pscustomobject]@{
+                LastUsed = Get-BridgeNewestWriteTime -Path @((Join-Path $codexHome 'history.jsonl'), (Join-Path $codexHome 'sessions')) -Depth 4
+                SignedIn = (Test-Path -LiteralPath (Join-Path $codexHome 'auth.json')) -or [bool]$env:OPENAI_API_KEY
+            }
+        }
+    }
+    [pscustomobject]@{ LastUsed = $null; SignedIn = $false }
+}
+
+$script:BridgeAutoLauncher = $null
+
+function Get-BridgeAutoLauncher {
+    <#
+        The launcher 'auto' means: of the installed agents, the one used most recently
+        on this machine; failing any history, one that is signed in; failing that, the
+        first in preference order.
+
+        A fixed order was wrong wherever more than one agent is installed: installing
+        Copilot to try it made every dashboard launch a Copilot one on a machine used
+        for Claude, and an agent never signed in cannot start a session at all.
+        Cached for five minutes, since it only moves when a session starts.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Available)
+
+    $key = $Available -join ','
+    $cache = $script:BridgeAutoLauncher
+    if ($null -ne $cache -and $cache.Key -eq $key -and ([DateTimeOffset]::Now - $cache.At).TotalMinutes -lt 5) {
+        return $cache.Launcher
+    }
+
+    $ranked = for ($i = 0; $i -lt $Available.Count; $i++) {
+        $usage = Get-BridgeLauncherUsage -Launcher $Available[$i]
+        [pscustomobject]@{
+            Launcher = $Available[$i]
+            Order    = $i
+            LastUsed = if ($null -ne $usage.LastUsed) { $usage.LastUsed.Ticks } else { [long]0 }
+            SignedIn = [int][bool]$usage.SignedIn
+        }
+    }
+    $best = @($ranked | Sort-Object -Property @(
+            @{ Expression = 'LastUsed'; Descending = $true },
+            @{ Expression = 'SignedIn'; Descending = $true },
+            @{ Expression = 'Order'; Descending = $false })) | Select-Object -First 1
+    $launcher = if ($null -ne $best) { [string]$best.Launcher } else { $null }
+
+    $script:BridgeAutoLauncher = [pscustomobject]@{ Key = $key; At = [DateTimeOffset]::Now; Launcher = $launcher }
+    $launcher
+}
+
 function Get-BridgeLauncherKind {
     <#
         The default launcher for new sessions: 'agency', 'copilot', 'claude' or 'codex'.
 
         `newSession.launcher` names it. 'auto' (the default), or a launcher that is not
-        installed, falls back to the first installed one in preference order rather
-        than failing. With nothing installed it still answers 'copilot', so the launch
-        reports which executable is missing instead of doing nothing.
+        installed, picks among the installed ones by how this machine uses them (see
+        Get-BridgeAutoLauncher) rather than failing. With nothing installed it still
+        answers 'copilot', so the launch reports which executable is missing instead
+        of doing nothing.
     #>
     $configured = ([string](Get-BridgeSetting 'newSession.launcher' 'auto')).Trim().ToLowerInvariant()
     $available = @(Get-BridgeAvailableLaunchers)
 
     if ($available -contains $configured) { return $configured }
-    if ($available.Count -gt 0) { return [string]$available[0] }
+    if ($available.Count -gt 0) { return [string](Get-BridgeAutoLauncher -Available $available) }
     'copilot'
 }
 
