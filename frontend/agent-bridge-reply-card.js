@@ -16,7 +16,7 @@
  * daemon downloads them and attaches them to the prompt.
  */
 
-const CARD_VERSION = '1.9.1';
+const CARD_VERSION = '1.9.2';
 
 class AgentBridgeReplyCard extends HTMLElement {
   constructor() {
@@ -57,13 +57,18 @@ class AgentBridgeReplyCard extends HTMLElement {
     const style = document.createElement('style');
     style.textContent = `
       ha-card { padding: 12px; }
-      .row { display: flex; align-items: flex-end; gap: 8px; }
+      /* stretch, not flex-end: the buttons are pinned to the bottom of their own
+         full-height column rather than aligned against the textarea's box directly.
+         Aligning them against the textarea meant trusting how its box resolves in
+         the flex line, which left them sitting a few pixels high. */
+      .row { display: flex; align-items: stretch; gap: 8px; }
+      .actions { display: flex; align-items: flex-end; gap: 8px; flex: 0 0 auto; }
       textarea {
         flex: 1 1 auto;
         /* Block, not the default inline-block: an inline textarea sits on the text
-           baseline and reserves a few pixels of descender space below itself, which
-           is enough to stop the buttons lining up with its bottom edge. */
+           baseline and reserves a few pixels of descender space below itself. */
         display: block;
+        vertical-align: bottom;
         min-height: 44px;
         max-height: 40vh;
         resize: vertical;
@@ -127,8 +132,10 @@ class AgentBridgeReplyCard extends HTMLElement {
     card.innerHTML = `
       <div class="row">
         <textarea part="input"></textarea>
-        <button class="ghost attach" title="Attach an image"><ha-icon icon="mdi:paperclip"></ha-icon></button>
-        <button class="send">Send</button>
+        <div class="actions">
+          <button class="ghost attach" title="Attach an image"><ha-icon icon="mdi:paperclip"></ha-icon></button>
+          <button class="send">Send</button>
+        </div>
       </div>
       <div class="chips"></div>
       <div class="status"></div>
