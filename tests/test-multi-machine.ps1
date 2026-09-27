@@ -309,10 +309,9 @@ $summary = @($cards | Where-Object { $_['type'] -eq 'vertical-stack' } |
 Test-That 'the live count adds the machines together' {
     $summary.content -match "states\('sensor\.agent_bridge_desktop_sessions'\)\|int\(0\) \+ states\('sensor\.agent_bridge_laptop_sessions'\)\|int\(0\)"
 }
-Test-That 'the shared Detailed activity toggle stays shared' {
-    # It is a display preference, not a property of a machine, so it is deliberately
-    # the one bridge-level control that is not scoped.
-    $rows -contains 'input_boolean.agent_bridge_detailed_activity'
+Test-That 'there is no Detailed activity toggle to share' {
+    # It is the detailedActivity setting now, on each machine.
+    $rows -notcontains 'input_boolean.agent_bridge_detailed_activity'
 }
 Test-That 'both machines sessions get a card' {
     $content = ($cfg | ConvertTo-Json -Depth 30)

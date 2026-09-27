@@ -75,21 +75,15 @@ Test-That 'it shows the installed bridge version from the update entity' {
     $control.content.Contains('**Bridge**')
 }
 
-Write-Host '--- the detailed-activity toggle lives in that card ---'
+Write-Host '--- detailed activity is a setting, not a card ---'
+# Folding session cards does what the toggle was for, and the toggle never changed how
+# often anything is published, so it no longer takes a card of its own.
 $toggleRows = @($agentCard.cards | Where-Object { $_.type -eq 'entities' } | ForEach-Object { $_.entities })
-Test-That 'the toggle is inside the agent sessions card' {
-    @($toggleRows | Where-Object { $_.entity -eq 'input_boolean.agent_bridge_detailed_activity' }).Count -eq 1
+Test-That 'no Detailed activity toggle is drawn' {
+    @($toggleRows | Where-Object { $_.entity -eq 'input_boolean.agent_bridge_detailed_activity' }).Count -eq 0 -and
+        (($script:SavedConfig | ConvertTo-Json -Depth 40) -notmatch 'agent_bridge_detailed_activity')
 }
-Test-That 'it is labelled Detailed activity, not Live Verbose' {
-    ($toggleRows | Where-Object { $_.entity -eq 'input_boolean.agent_bridge_detailed_activity' }).name -eq 'Detailed activity'
-}
-Test-That 'the markdown refers to the toggle by its new name' {
-    $control.content -match 'Detailed activity' -and $control.content -notmatch 'Live Verbose'
-}
-Test-That 'the toggle keeps its original entity id for compatibility' {
-    @($toggleRows | Where-Object { $_.entity -eq 'input_boolean.agent_bridge_detailed_activity' }).Count -eq 1
-}
-
+Test-That 'and the summary no longer points at one' { $control.content -notmatch 'Detailed activity' }
 Write-Host '--- the duplicate session counter is gone ---'
 # The count is printed in the markdown above, so a sensor row repeating it was noise.
 $allRows = @($cfg.views[0].cards | ForEach-Object {

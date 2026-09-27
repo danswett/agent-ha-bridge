@@ -786,16 +786,18 @@ function Write-DaemonState {
 }
 
 function Test-VerboseStreaming {
-    param([Parameter(Mandatory)][hashtable]$Headers)
+    <#
+        Whether cards carry the model's reasoning and each tool call, from the
+        `detailedActivity` setting (on by default).
 
-    try {
-        $state = Get-HomeAssistantState -EntityId $script:DaemonConfig.VerboseToggle -Headers $Headers
-        return ([string]$state.state -eq 'on')
-    }
-    catch {
-        # Default to quiet if the toggle cannot be read, rather than flooding.
-        return $false
-    }
+        This was a dashboard toggle, a whole card of its own. It never changed how
+        often anything is published - activity goes out on every transcript change
+        either way - only what an update carries, and folding session cards now does
+        the job it was for: keeping busy sessions from flooding the page.
+    #>
+    param([hashtable]$Headers)
+
+    [bool](Get-BridgeSetting 'detailedActivity' $true)
 }
 
 function Read-TranscriptAppend {
@@ -3890,49 +3892,6 @@ function Update-DaemonRetireQueue {
     }
 }
 
-function Update-SessionsForVerbose {
-    <#
-        Immediately republishes every session's activity to show or hide its reasoning
-        the instant the Detailed activity toggle changes, without waiting for the session to
-        produce fresh transcript activity. Reasoning is kept in state regardless of the
-        toggle, so turning verbose on re-reveals the last captured reasoning at once and
-        turning it off hides it at once.
-    #>
-    param(
-        [Parameter(Mandatory)][hashtable]$Headers,
-        [Parameter(Mandatory)][hashtable]$State,
-        [Parameter(Mandatory)][bool]$VerboseOn
-    )
-
-    foreach ($id in @($State.Keys)) {
-        $entry = $State[$id]
-        $summary = if ($entry.PSObject.Properties['LastSummary'] -and
-            -not [string]::IsNullOrWhiteSpace($entry.LastSummary)) {
-            [string]$entry.LastSummary
-        }
-        elseif ([string]$entry.Status -eq 'working') { 'Working' }
-        else { 'Idle' }
-
-        $detail = @{
-            session = $entry.Name
-            machine = $entry.Machine
-            verbose = $VerboseOn
-            updated = [DateTimeOffset]::Now.ToString('o')
-        }
-        if ($entry.PSObject.Properties['LastHistory'] -and $entry.LastHistory) {
-            $detail['history'] = @($entry.LastHistory)
-        }
-        Add-DaemonCardText -Entry $entry -Detail $detail -VerboseOn $VerboseOn
-
-        try {
-            Set-CopilotMqttActivity -SessionId $id -Summary $summary -Detail $detail -Headers $Headers
-        }
-        catch {
-            Write-DaemonLog -Message "verbose refresh failed for $id : $($_.Exception.Message)"
-        }
-    }
-}
-
 function Invoke-PendingCodexApprovals {
     <#
         Delivers a dashboard answer into a Codex approval prompt.
@@ -4320,13 +4279,14 @@ function Start-BridgeDaemon {
     # takes about 650 ms, which the first reply after every start used to wait for.
     try { Initialize-CopilotConsoleInjector } catch { }
 
-    # Provision the dashboard's Detailed activity helper before anything renders it.
-    if (Initialize-CopilotVerboseToggle) {
-        Write-DaemonLog -Message "verbose toggle ready ($($script:DaemonConfig.VerboseToggle))"
+    # Detailed activity is a setting now (Test-VerboseStreaming), so the Home Assistant
+    # helper the old dashboard toggle drove is removed. A machine still on an older
+    # bridge recreates it and draws its toggle until it updates, which is harmless.
+    $script:DaemonVerbose = Test-VerboseStreaming
+    try {
+        if (Remove-CopilotVerboseToggle) { Write-DaemonLog -Message 'removed the Detailed activity helper; it is the detailedActivity setting now' }
     }
-    else {
-        Write-DaemonLog -Message 'verbose toggle unavailable; streaming defaults to quiet'
-    }
+    catch { }
 
     # Sweep the entities published under the old `copilot_cli_*` / `copilot_<hex>`
     # ids. Retained discovery configs outlive a rename, so without this the renamed
@@ -4459,7 +4419,7 @@ function Start-BridgeDaemon {
                 # End session, likewise: left out, a press sat unnoticed for up to 15 s.
                 "button.${node}_stop"
             }
-        ) + @($script:DaemonConfig.VerboseToggle) +
+        ) +
             # Launch too: left out, a press sat unnoticed for up to 15 s with nothing
             # on the card to say it had been seen.
             @($script:DaemonEntity.NewSession)
@@ -4484,19 +4444,6 @@ function Start-BridgeDaemon {
             $backoff = [int][Math]::Min(2 * [Math]::Pow(2, $script:DaemonWatchFailures - 1), 60)
             Write-DaemonLog -Message "watch failed (attempt $($script:DaemonWatchFailures)): $($_.Exception.Message); retrying in ${backoff}s"
             Start-Sleep -Seconds $backoff
-        }
-
-        # A verbose toggle change refreshes every card's reasoning at once, without
-        # waiting for the periodic reconcile or fresh transcript activity.
-        if ($null -ne $hit -and $hit.EntityId -eq $script:DaemonConfig.VerboseToggle) {
-            $script:DaemonVerbose = ($hit.State -eq 'on')
-            try {
-                Update-SessionsForVerbose -Headers $headers -State $state `
-                    -VerboseOn ($hit.State -eq 'on')
-            }
-            catch {
-                Write-DaemonLog -Message "verbose refresh failed: $($_.Exception.Message)"
-            }
         }
 
         # A reply from the dashboard is delivered before anything else. The reconcile

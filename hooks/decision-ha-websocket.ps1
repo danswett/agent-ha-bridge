@@ -1018,26 +1018,16 @@ function Save-CopilotSessionDashboard {
             '## Agent sessions'
             ''
             $summaryLine
-            ''
-            'Turn on *Detailed activity* to stream each session''s reasoning and every tool call.'
         ) -join "`n"
     }
 
-    # The summary and its one toggle are stacked into a single card rather than left
-    # as two. They are the same thing - what is running, and how much of it to show -
-    # and the toggle had been sharing a card with a "Live sessions" row that repeated
-    # the count printed directly above it.
+    # The summary card. It carried the Detailed activity toggle too, until that became
+    # the `detailedActivity` setting: folding session cards does what the toggle was
+    # for, and it never changed how often anything is published. Still a stack, the
+    # shape the machine-summary rows are added to.
     $agentSessionsCard = @{
         type = 'vertical-stack'
-        cards = @(
-            $controlMarkdown
-            @{
-                type = 'entities'
-                entities = @(
-                    @{ entity = $VerboseToggle; name = 'Detailed activity' }
-                )
-            }
-        )
+        cards = @($controlMarkdown)
     }
 
     # Every machine that has ever registered, live or not, with its status and version.
