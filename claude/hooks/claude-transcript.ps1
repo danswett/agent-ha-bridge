@@ -59,6 +59,8 @@ function Get-ClaudeActivityFromTranscript {
     $reasoning = $null
     $response = $null
     $status = $null
+    $turnStarted = $false
+    $lastActivityAt = $null
     $history = New-Object System.Collections.Generic.List[string]
 
     foreach ($line in $Lines) {
@@ -73,11 +75,32 @@ function Get-ClaudeActivityFromTranscript {
 
         $type = [string]$entry.type
 
+        # The newest activity's time, so a caller can tell work that happened after a
+        # hook set the status from the tail of the turn that hook just ended.
+        if ($type -in @('user', 'assistant') -and $entry.PSObject.Properties['timestamp']) {
+            # ConvertFrom-Json turns an ISO timestamp into a DateTime already; anything
+            # else is parsed as a string, culture-independently.
+            $raw = $entry.timestamp
+            $at = [DateTimeOffset]::MinValue
+            $parsed = if ($raw -is [datetime]) { $at = [DateTimeOffset]$raw.ToUniversalTime(); $true }
+                else {
+                    [DateTimeOffset]::TryParse([string]$raw, [Globalization.CultureInfo]::InvariantCulture,
+                        [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$at)
+                }
+            if ($parsed -and ($null -eq $lastActivityAt -or $at -gt $lastActivityAt)) { $lastActivityAt = $at }
+        }
+
         if ($type -eq 'user') {
             $blocks = Get-ClaudeContentBlocks -Message $entry.message
             $isToolResult = @($blocks | Where-Object { $_.type -eq 'tool_result' }).Count -gt 0
             if (-not $isToolResult) {
+                # A new message starts a new turn. Whatever was reasoned or done before
+                # it belongs to the previous one, and carrying it over is what left the
+                # card showing last turn's reasoning under this turn's status.
                 $status = 'working'
+                $turnStarted = $true
+                $reasoning = $null
+                $history.Clear()
                 $summary = 'Reading your message'
                 $history.Add($summary)
             }
@@ -116,11 +139,16 @@ function Get-ClaudeActivityFromTranscript {
     }
 
     [pscustomobject]@{
-        Summary   = $summary
-        Reasoning = $reasoning
-        Response  = $response
-        Status    = $status
-        History   = @($history)
+        Summary     = $summary
+        Reasoning   = $reasoning
+        Response    = $response
+        Status      = $status
+        History     = @($history)
+        # True when this batch contains the start of a new turn, so the caller drops
+        # the reasoning and history it has been carrying from the last one.
+        TurnStarted = $turnStarted
+        # Time of the newest user or assistant entry in the batch, or $null.
+        LastActivityAt = $lastActivityAt
     }
 }
 

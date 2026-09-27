@@ -91,7 +91,13 @@ function Write-ClaudeSessionRegistration {
         [Parameter(Mandatory)][string]$SessionId,
         [string]$TranscriptPath,
         [string]$WorkingDirectory,
-        [int]$ProcessId = 0
+        [int]$ProcessId = 0,
+
+        # The status this hook set ('working', 'waiting' or 'idle'), recorded with
+        # its time. Hooks publish status straight to Home Assistant, so without this
+        # the daemon never learns of it: its own copy stays 'working', and it never
+        # sends 'working' again when the session resumes after a wait or a new prompt.
+        [string]$Status = ''
     )
 
     $path = Join-Path (Get-ClaudeStateRoot) ((Get-ClaudeSafeSessionKey -SessionId $SessionId) + '.json')
@@ -104,12 +110,26 @@ function Write-ClaudeSessionRegistration {
         $ProcessId = [int]$existing.ProcessId
     }
 
+    # Likewise a later event that sets no status keeps the last one recorded.
+    $hookStatus = ''
+    $hookStatusAt = ''
+    if ($Status) {
+        $hookStatus = $Status
+        $hookStatusAt = [DateTimeOffset]::Now.ToString('o')
+    }
+    elseif ($existing -and $existing.PSObject.Properties['HookStatus']) {
+        $hookStatus = [string]$existing.HookStatus
+        $hookStatusAt = [string]$existing.HookStatusAt
+    }
+
     [pscustomobject]@{
         SessionId        = $SessionId
         ProcessId        = $ProcessId
         TranscriptPath   = $TranscriptPath
         WorkingDirectory = $WorkingDirectory
         Updated          = [DateTimeOffset]::Now.ToString('o')
+        HookStatus       = $hookStatus
+        HookStatusAt     = $hookStatusAt
     } | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $path -Encoding UTF8
 
     $path
@@ -171,6 +191,8 @@ function Get-ClaudeSessionRegistrations {
                 TranscriptPath   = [string]$entry.TranscriptPath
                 WorkingDirectory = [string]$entry.WorkingDirectory
                 Updated          = [string]$entry.Updated
+                HookStatus       = if ($entry.PSObject.Properties['HookStatus']) { [string]$entry.HookStatus } else { '' }
+                HookStatusAt     = if ($entry.PSObject.Properties['HookStatusAt']) { [string]$entry.HookStatusAt } else { '' }
                 IsLive           = $alive -and $fresh
                 StatePath        = $file.FullName
             }

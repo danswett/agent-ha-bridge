@@ -44,19 +44,14 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
     throw "PowerShell 7+ is required (found $($PSVersionTable.PSVersion))."
 }
 
-# The hook command must survive being run from any working directory, and pwsh is
-# what the adapter is written for.
-#
-# The Store build resolves to a versioned folder under Program Files\WindowsApps that
-# disappears on its next update, silently breaking every hook (they exit 0 by design,
-# so nothing reports it). Its execution alias under LocalAppData is stable, so that is
-# written instead.
-$pwshPath = (Get-Command pwsh -ErrorAction SilentlyContinue)?.Source
-$storeAlias = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\pwsh.exe'
-if ($pwshPath -and $pwshPath -match '\\Program Files\\WindowsApps\\' -and (Test-Path -LiteralPath $storeAlias)) {
-    $pwshPath = $storeAlias
-}
-if (-not $pwshPath) { $pwshPath = 'pwsh' }
+# Hooks run through run-hook.cmd rather than naming pwsh directly. Claude Code runs
+# hook commands under Git Bash on Windows, and there is no pwsh path that works there
+# reliably: the Store build's versioned folder vanishes on its next update, its
+# execution alias cannot be executed by Bash at all ("Permission denied"), and a bare
+# `pwsh` only resolves to a runnable file when Claude happened to be started from that
+# same PowerShell. Every one of those fails silently, because the hooks exit 0 by
+# design. cmd resolves pwsh the way Windows does, whichever way it was installed.
+$hookLauncher = Join-Path $adapterDir 'run-hook.cmd'
 
 function Get-Settings {
     if (-not (Test-Path -LiteralPath $settingsPath)) { return @{} }
@@ -120,7 +115,7 @@ function Add-BridgeHook {
     $hooks = $Settings['hooks']
     if (-not $hooks.ContainsKey($EventName)) { $hooks[$EventName] = @() }
 
-    $command = '"{0}" -NoProfile -ExecutionPolicy Bypass -File "{1}"' -f $pwshPath, (Join-Path $adapterDir $ScriptName)
+    $command = '"{0}" "{1}"' -f $hookLauncher, (Join-Path $adapterDir $ScriptName)
     $entry = [ordered]@{
         matcher = $Matcher
         hooks   = @(
@@ -147,8 +142,11 @@ if ($Uninstall) {
         Remove-Item -LiteralPath $adapterDir -Recurse -Force
         Write-Host '    adapter removed'
     }
+    # The session registry lives in the real %TEMP%, which -TargetHome does not
+    # redirect, so a sandboxed uninstall must not touch it: it holds the live
+    # registrations of every Claude session actually running on this machine.
     $stateRoot = Join-Path $env:TEMP 'agent-bridge-claude'
-    if (Test-Path -LiteralPath $stateRoot) { Remove-Item -LiteralPath $stateRoot -Recurse -Force }
+    if (-not $TargetHome -and (Test-Path -LiteralPath $stateRoot)) { Remove-Item -LiteralPath $stateRoot -Recurse -Force }
     Write-Step 'Done'
     return
 }

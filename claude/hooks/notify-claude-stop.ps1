@@ -42,7 +42,7 @@ try {
     # Keeps the registration fresh, and recovers the owning pid if an earlier event
     # could not resolve it.
     Write-ClaudeSessionRegistration -SessionId $sessionId -TranscriptPath $transcriptPath `
-        -WorkingDirectory ([string]$event.cwd) -ProcessId (Get-ClaudeOwningProcessId) | Out-Null
+        -WorkingDirectory ([string]$event.cwd) -ProcessId (Get-ClaudeOwningProcessId) -Status 'idle' | Out-Null
 
     # The turn has already ended, so a miss here costs nothing - the daemon reconciles
     # it. Enter-BridgeAdapterSession returns headers when reachable, or $null when not.

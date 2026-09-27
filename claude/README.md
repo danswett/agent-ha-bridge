@@ -41,9 +41,12 @@ dashboard, so that must be installed first. `install-claude.ps1` copies the adap
 Before `SessionStart` was hooked, a session had no card until its first turn ended,
 and a session launched from the dashboard could never be confirmed as started.
 
-The hook command uses the Store PowerShell's execution alias
-(`%LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe`) rather than its versioned install
-folder, which disappears on the next Store update and would silently break every hook.
+Each hook runs through `run-hook.cmd`, not a direct path to pwsh. Claude Code runs
+hooks under Git Bash on Windows, which cannot execute the Store PowerShell's execution
+alias ("Permission denied"), while the versioned folder behind it disappears on every
+Store update. `cmd` resolves `pwsh` however it was installed, so hooks survive
+PowerShell updates. Since the hooks always exit 0, a broken hook shows up only as a
+`hook_non_blocking_error` entry in the session transcript.
 
 Existing settings and any hooks you added yourself are preserved; re-running is safe,
 and `-Uninstall` removes only this bridge's entries. Restart Claude sessions

@@ -48,7 +48,7 @@ try {
     $owningPid = Get-ClaudeOwningProcessId
     Write-ClaudeSessionRegistration -SessionId $sessionId `
         -TranscriptPath (Resolve-ClaudeTranscriptPath -SessionId $sessionId -KnownPath ([string]$event.transcript_path)) `
-        -WorkingDirectory ([string]$event.cwd) -ProcessId $owningPid | Out-Null
+        -WorkingDirectory ([string]$event.cwd) -ProcessId $owningPid -Status 'waiting' | Out-Null
 
     # A notification must never delay Claude; the daemon reconciles whatever a miss
     # leaves behind. A notification can be the first thing a session ever does, so the

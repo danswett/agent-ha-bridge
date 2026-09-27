@@ -33,8 +33,13 @@ try {
         $transcriptPath = Resolve-ClaudeTranscriptPath -SessionId $sessionId
     }
 
+    # A submitted prompt is the start of a turn, so it records 'working'; that is what
+    # lifts the card out of 'idle' or 'waiting' straight away. SessionStart records
+    # no status, leaving whatever the daemon infers.
+    $status = if ([string]$event.hook_event_name -eq 'UserPromptSubmit') { 'working' } else { '' }
+
     Write-ClaudeSessionRegistration -SessionId $sessionId -TranscriptPath $transcriptPath `
-        -WorkingDirectory ([string]$event.cwd) -ProcessId (Get-ClaudeOwningProcessId) | Out-Null
+        -WorkingDirectory ([string]$event.cwd) -ProcessId (Get-ClaudeOwningProcessId) -Status $status | Out-Null
 }
 catch {
     # Fail open: a bridge fault must never affect the session.

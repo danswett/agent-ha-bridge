@@ -508,6 +508,9 @@ function Get-LiveClaudeSessions {
             WorkingDirectory = $registration.WorkingDirectory
             LastWrite        = [IO.File]::GetLastWriteTimeUtc($transcript)
             Kind             = 'claude'
+            # The status the last hook set, and when (see Sync-DaemonHookStatus).
+            HookStatus       = [string]$registration.HookStatus
+            HookStatusAt     = [string]$registration.HookStatusAt
         }
     }
     $live
@@ -576,6 +579,55 @@ function Test-BridgeSessionWorking {
         return ([DateTime]::UtcNow - [IO.File]::GetLastWriteTimeUtc($Transcript)).TotalSeconds -lt 20
     }
     catch { return $false }
+}
+
+function Sync-DaemonHookStatus {
+    <#
+        Adopts the status a Claude hook last set, once per hook event.
+
+        Hooks publish 'idle' and 'waiting' to Home Assistant themselves; recording
+        them here is what lets the transcript loop see the session resume and send
+        'working' again. 'working' comes from UserPromptSubmit, which does not talk to
+        Home Assistant, so it is published from here.
+
+        Returns when that hook fired, or $null when no hook status is recorded, so the
+        caller can ignore transcript lines older than it.
+    #>
+    param(
+        [Parameter(Mandatory)]$Entry,
+        [Parameter(Mandatory)]$Session,
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    if (-not $Session.PSObject.Properties['HookStatus'] -or [string]::IsNullOrWhiteSpace([string]$Session.HookStatus)) { return $null }
+    $at = [DateTimeOffset]::MinValue
+    if (-not [DateTimeOffset]::TryParse([string]$Session.HookStatusAt, [ref]$at)) { return $null }
+
+    $seen = if ($Entry.PSObject.Properties['HookStatusAt']) { [string]$Entry.HookStatusAt } else { '' }
+    if ($seen -eq [string]$Session.HookStatusAt) { return $at }
+
+    $status = [string]$Session.HookStatus
+    if ($status -eq 'working' -and $status -ne [string]$Entry.Status) {
+        try {
+            Set-CopilotMqttStatus -SessionId $SessionId -Status 'working' -Headers $Headers -Attributes @{
+                session    = $Entry.Name
+                machine    = $Entry.Machine
+                process_id = $Session.ProcessId
+                updated    = [DateTimeOffset]::Now.ToString('o')
+            }
+        }
+        catch {
+            # Left unmarked, so the next reconcile tries again.
+            Write-DaemonLog -Message "status publish failed for $SessionId : $($_.Exception.Message)"
+            return $at
+        }
+    }
+
+    $Entry.Status = $status
+    if ($Entry.PSObject.Properties['HookStatusAt']) { $Entry.HookStatusAt = [string]$Session.HookStatusAt }
+    else { $Entry | Add-Member -NotePropertyName HookStatusAt -NotePropertyValue ([string]$Session.HookStatusAt) -Force }
+    $at
 }
 
 function Read-DaemonStateFile {
@@ -2769,13 +2821,30 @@ function Sync-DaemonSessions {
             }
         }
 
+        # Claude's hooks set the status directly (idle at Stop, waiting at a
+        # notification, working at a new prompt). Adopt it here before reading the
+        # transcript, or this loop keeps believing its own stale copy and never
+        # republishes 'working' when the session carries on.
+        $hookStatusAt = $null
+        if ($entryKind -eq 'claude') {
+            $hookStatusAt = Sync-DaemonHookStatus -Entry $entry -Session $session -SessionId $id -Headers $Headers
+        }
+
         $append = Read-BridgeTranscriptAppend -Path $session.Transcript -Offset ([long]$entry.Offset) -Kind $entryKind
         $entry.Offset = $append.Offset
         if ($append.Lines.Count -eq 0) { continue }
 
         $activity = Get-BridgeActivity -Lines $append.Lines -VerboseMode $verbose -Kind $entryKind
 
-        if (-not [string]::IsNullOrWhiteSpace($activity.Status) -and
+        # Work written before the hook that stopped the turn is that turn's tail, not
+        # a resumption; only activity newer than the hook may flip it back to working.
+        $staleTail = $false
+        if ($null -ne $hookStatusAt -and [string]$entry.Status -in @('idle', 'waiting') -and
+            $activity.PSObject.Properties['LastActivityAt']) {
+            $staleTail = ($null -eq $activity.LastActivityAt) -or ($activity.LastActivityAt -le $hookStatusAt)
+        }
+
+        if (-not $staleTail -and -not [string]::IsNullOrWhiteSpace($activity.Status) -and
             $activity.Status -ne [string]$entry.Status) {
             $entry.Status = $activity.Status
             try {
@@ -2800,7 +2869,11 @@ function Sync-DaemonSessions {
         # batches that carry no reasoning (a tool call, a plain message), and so the
         # verbose toggle can show it instantly. Capture is unconditional; only display
         # is gated on verbose (below).
-        $lastReasoning = if ($entry.PSObject.Properties['LastReasoning']) {
+        #
+        # A batch that starts a new turn drops what was carried from the last one;
+        # otherwise the card shows the previous turn's reasoning under the new status.
+        $turnStarted = [bool]($activity.PSObject.Properties['TurnStarted'] -and $activity.TurnStarted)
+        $lastReasoning = if (-not $turnStarted -and $entry.PSObject.Properties['LastReasoning']) {
             [string]$entry.LastReasoning
         }
         else { '' }
@@ -2847,8 +2920,16 @@ function Sync-DaemonSessions {
             machine = $entry.Machine
             verbose = $verbose
             updated = [DateTimeOffset]::Now.ToString('o')
-            history = @($activity.History | Select-Object -Last $script:DaemonConfig.ActivityHistory)
         }
+        # The history is a rolling trail across batches, not just this batch: the
+        # daemon reads the transcript every few seconds, so a single batch usually
+        # holds one or two steps and the trail would otherwise never show more.
+        $carried = @()
+        if (-not $turnStarted -and $entry.PSObject.Properties['LastHistory'] -and $entry.LastHistory) {
+            $carried = @($entry.LastHistory | ForEach-Object { [string]$_ })
+        }
+        $detail['history'] = @(@($carried) + @($activity.History | ForEach-Object { [string]$_ }) |
+            Select-Object -Last $script:DaemonConfig.ActivityHistory)
         # Persist the history alongside the summary and reasoning, so a daemon restart
         # can restore the whole card rather than blanking it.
         if ($entry.PSObject.Properties['LastHistory']) { $entry.LastHistory = $detail.history }
@@ -3072,16 +3153,19 @@ function Sync-DaemonSessions {
     # dashboard too - a signature of node ids alone would leave a renamed session
     # showing its old generic title until the set of sessions happened to change. The
     # machine list joins it for the same reason: a machine appearing, disappearing or
-    # going offline changes the controls even when no session did.
+    # going offline changes the controls even when no session did. The served card
+    # URL joins it because a card upgrade changes which cards the dashboard can use.
+    $replyCardUrl = Get-BridgeServedReplyCardUrl
     $signature = (@($allDescriptors | Sort-Object -Property Node | ForEach-Object { "$($_.Node)=$($_.Name)" }) -join '|') +
-        '#' + (@($machineCards | ForEach-Object { "$($_.Slug):$($_.IncludeProfile)$($_.IncludeResume)$($_.IncludeAgent):$($_.Online)" }) -join ',')
+        '#' + (@($machineCards | ForEach-Object { "$($_.Slug):$($_.IncludeProfile)$($_.IncludeResume)$($_.IncludeAgent):$($_.Online)" }) -join ',') +
+        '#' + $replyCardUrl
     if ($signature -ne $script:DaemonDashboardSignature) {
         try {
             [void](Set-CopilotMqttGlobalEntityId)
             $selector = Initialize-BridgeMachineSelector -Machines $onlineNames
             Save-CopilotSessionDashboard -Sessions @($allDescriptors | Sort-Object -Property Node) `
                 -Machines $machineCards -MachineSelector $selector `
-                -ReplyCardUrl (Get-BridgeServedReplyCardUrl)
+                -ReplyCardUrl $replyCardUrl
             $script:DaemonDashboardSignature = $signature
             Write-DaemonLog -Message ("dashboard rebuilt for $($allDescriptors.Count) session(s) across " +
                 "$($machineCards.Count) machine(s), $($onlineNames.Count) online")

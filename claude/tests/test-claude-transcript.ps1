@@ -127,6 +127,52 @@ Test-That 'exactly one user prompt is counted' {
 Test-That 'attachment and system entries add nothing' { $real.History.Count -eq 3 } "$($real.History.Count)"
 
 Write-Host ''
+Write-Host '--- a new message starts a new turn ---'
+
+function New-Line {
+    param([string]$Type, [object]$Content)
+    @{ type = $Type; message = @{ role = $Type; content = $Content } } | ConvertTo-Json -Depth 8 -Compress
+}
+$endOfTurn = @(
+    (New-Line 'assistant' @(@{ type = 'thinking'; thinking = 'old reasoning' }))
+    (New-Line 'assistant' @(@{ type = 'tool_use'; name = 'Edit'; input = @{} }))
+)
+$nextTurn = @(
+    (New-Line 'user' 'the next question')
+    (New-Line 'assistant' @(@{ type = 'tool_use'; name = 'Read'; input = @{} }))
+)
+
+$carryOn = Get-ClaudeActivityFromTranscript -Lines $endOfTurn
+Test-That 'a batch with no new message is not a new turn' { -not $carryOn.TurnStarted }
+
+$turn = Get-ClaudeActivityFromTranscript -Lines @($endOfTurn + $nextTurn)
+Test-That 'a batch with a new message marks a new turn' { $turn.TurnStarted }
+Test-That 'reasoning from before the message is dropped' { [string]::IsNullOrEmpty($turn.Reasoning) } $turn.Reasoning
+Test-That 'history starts from the message' {
+    ($turn.History -join ',') -eq 'Reading your message,Running: Read'
+} ($turn.History -join ',')
+
+Write-Host ''
+Write-Host '--- when the newest activity happened ---'
+
+$stamped = @(
+    (@{ type = 'assistant'; timestamp = '2026-09-27T07:00:00.000Z'; message = @{ content = @(@{ type = 'text'; text = 'a' }) } } | ConvertTo-Json -Depth 8 -Compress)
+    (@{ type = 'attachment'; timestamp = '2026-09-27T09:00:00.000Z' } | ConvertTo-Json -Compress)
+    (@{ type = 'assistant'; timestamp = '2026-09-27T07:05:00.000Z'; message = @{ content = @(@{ type = 'text'; text = 'b' }) } } | ConvertTo-Json -Depth 8 -Compress)
+)
+$timed = Get-ClaudeActivityFromTranscript -Lines $stamped
+Test-That 'the newest user or assistant entry is reported' {
+    $timed.LastActivityAt -eq [DateTimeOffset]'2026-09-27T07:05:00Z'
+} "$($timed.LastActivityAt)"
+Test-That 'housekeeping entries do not count as activity' { $timed.LastActivityAt -lt [DateTimeOffset]'2026-09-27T09:00:00Z' }
+Test-That 'a batch with no timestamps reports none' { $null -eq (Get-ClaudeActivityFromTranscript -Lines $endOfTurn).LastActivityAt }
+
+$toolResult = New-Line 'user' @(@{ type = 'tool_result'; tool_use_id = 'x'; content = 'ok' })
+Test-That 'a tool result is not a new turn' {
+    -not (Get-ClaudeActivityFromTranscript -Lines @($endOfTurn + $toolResult)).TurnStarted
+}
+
+Write-Host ''
 if ($script:Failures) {
     Write-Host "$($script:Failures) test(s) failed" -ForegroundColor Red
     exit 1

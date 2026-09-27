@@ -842,7 +842,10 @@ function Get-BridgeServedReplyCardUrl {
             if (-not $resource.PSObject.Properties['url']) { continue }
             $url = [string]$resource.url
             if ([string]::IsNullOrWhiteSpace($url)) { continue }
-            $leaf = ((($url -split '\?')[0]) -split '[/\\]')[-1]
+            # An inline card names itself in its fragment; its base64 body can
+            # contain slashes, so only the fragment is looked at.
+            $named = if ($url.StartsWith('data:') -and $url.Contains('#')) { $url.Substring($url.LastIndexOf('#') + 1) } else { $url }
+            $leaf = ((($named -split '\?')[0]) -split '[/\\]')[-1]
             if ($leaf -eq 'agent-bridge-reply-card.js') { $found = $url; break }
         }
     }

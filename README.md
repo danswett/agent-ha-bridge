@@ -104,9 +104,9 @@ only a Home Assistant token.
   [`layout-card`](https://github.com/thomasloven/lovelace-layout-card).
   The installer checks for these and tells you which are missing — and registers any
   that you have downloaded but not added as a Lovelace resource
-* Write access to Home Assistant's configuration folder, usually the Samba add-on's
-  `\\<host>\config` share. The installer copies its own reply card there; without it
-  the dashboard still works, with a plainer and more limited reply box
+* Nothing extra for the bridge's own dashboard card: the installer registers it as a
+  Lovelace resource over the API, so no file share, Samba add-on or credentials are
+  needed
 
 ---
 
@@ -618,14 +618,17 @@ Get-Content $env:TEMP\agent-bridge-daemon.log -Tail 20
 
 ## Notes and limitations
 
-* **The reply box needs the bridge's own card.** The installer copies
-  `agent-bridge-reply-card.js` into Home Assistant's `config\www` folder over the
-  configuration share and registers it. If it cannot reach that share, the dashboard
-  falls back to a plain `text` entity and Send button, and two older limits come back
-  with it: a reply is capped at **255 characters** (Home Assistant's limit for any
-  entity state), and Send has to be pressed after the box loses focus, because a text
-  entity only commits on blur or Enter. Set `homeAssistant.configPath` if the share is
-  somewhere the installer would not guess.
+* **The reply box needs the bridge's own card.** The installer registers
+  `agent-bridge-reply-card.js` inline, as a `data:` URL Lovelace resource, over the
+  websocket API. There is no API for writing a file into `www`, but a resource is only
+  a URL, and the frontend loads a module resource with a plain `<script src>`, so no
+  file share is involved. The card is about 27 KB, sent with Home Assistant's resource
+  list when the app or page loads. It shows as a very long URL under Settings >
+  Dashboards > Resources; that is expected. If it cannot be registered, the dashboard
+  falls back to a plain `text` entity and Send button, with a **255-character** cap
+  on replies, until the next install or update registers it. Installs from before
+  1.10.1 copied the card into `config\www`; that file is no longer used and can be
+  deleted.
 * **Images go via Home Assistant.** A pasted image is uploaded to Home Assistant, pulled
   down by the daemon, attached to the prompt as `@<path>`, and then deleted from Home
   Assistant. Local copies are kept for a day in case the CLI is slow to read them.

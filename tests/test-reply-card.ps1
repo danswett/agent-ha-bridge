@@ -205,158 +205,109 @@ Test-That 'the sensor unique id matches the entity id the daemon reads' {
 
 Write-Host '--- the card resource url ---'
 
-Test-That 'the card is served from the local www folder' {
-    (Get-BridgeReplyCardUrl -Version '') -eq '/local/agent-bridge-reply-card.js'
-}
-Test-That 'a version is appended so browsers reload it after an upgrade' {
-    (Get-BridgeReplyCardUrl -Version '1.9.0') -eq '/local/agent-bridge-reply-card.js?v=1.9.0'
-}
-Test-That 'the resource matcher recognises the card whatever the version' {
-    Test-BridgeCardResourceMatch -ResourceUrl '/local/agent-bridge-reply-card.js?v=9.9.9' `
-        -FileName 'agent-bridge-reply-card.js'
-}
+$script:CardSource = (Resolve-Path (Join-Path $PSScriptRoot '..\frontend\agent-bridge-reply-card.js')).Path
+$script:InlineUrl = Get-BridgeInlineReplyCardUrl -SourcePath $script:CardSource -Version '1.9.0'
 
-Write-Host '--- finding the config folder ---'
-
-Test-That 'an explicitly configured path is tried first' {
-    @(Get-BridgeConfigPathCandidate -Explicit 'D:\ha' -BaseUrl 'http://hass.local:8123')[0] -eq 'D:\ha'
+Test-That 'the card is registered inline, as a data url' {
+    $script:InlineUrl.StartsWith('data:text/javascript;base64,')
 }
-Test-That 'the usual samba share is derived from the server address' {
-    @(Get-BridgeConfigPathCandidate -Explicit '' -BaseUrl 'http://192.168.1.188:8123')[0] -eq '\\192.168.1.188\config'
+Test-That 'the inline url carries the real card' {
+    $body = $script:InlineUrl.Substring('data:text/javascript;base64,'.Length).Split('#')[0]
+    [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($body)) -eq (Get-Content -LiteralPath $script:CardSource -Raw)
 }
-Test-That 'a trailing slash on a configured path is not doubled up' {
-    @(Get-BridgeConfigPathCandidate -Explicit 'D:\ha\' -BaseUrl '')[0] -eq 'D:\ha'
+Test-That 'its fragment names the card and its version' { $script:InlineUrl.EndsWith('#agent-bridge-reply-card.js?v=1.9.0') }
+Test-That 'the resource matcher recognises the inline card' {
+    Test-BridgeCardResourceMatch -ResourceUrl $script:InlineUrl -FileName 'agent-bridge-reply-card.js'
 }
-Test-That 'no address and no configured path yields nothing to try' {
-    @(Get-BridgeConfigPathCandidate -Explicit '' -BaseUrl '').Count -eq 0
+Test-That 'and a file-served card from an earlier version' {
+    Test-BridgeCardResourceMatch -ResourceUrl '/local/agent-bridge-reply-card.js?v=9.9.9' -FileName 'agent-bridge-reply-card.js'
 }
-Test-That 'an unparseable address does not throw' {
-    @(Get-BridgeConfigPathCandidate -Explicit '' -BaseUrl 'not a url').Count -ge 0
+Test-That 'but not some other inline resource' {
+    -not (Test-BridgeCardResourceMatch -ResourceUrl 'data:text/javascript;base64,YWJj' -FileName 'agent-bridge-reply-card.js')
 }
 
 Write-Host '--- installing the card ---'
 
-$script:Sandbox = Join-Path ([System.IO.Path]::GetTempPath()) ("bridge-card-" + [guid]::NewGuid().ToString('N'))
-New-Item -ItemType Directory -Path $script:Sandbox -Force | Out-Null
-$script:CardSource = (Resolve-Path (Join-Path $PSScriptRoot '..\frontend\agent-bridge-reply-card.js')).Path
+Test-That 'the card source ships with the bridge' { Test-Path -LiteralPath $script:CardSource }
 
-try {
-    Test-That 'the card source ships with the bridge' {
-        Test-Path -LiteralPath $script:CardSource
-    }
+$script:Sent = @()
+$script:Invoker = { param($commands) $script:Sent += $commands; @(@()) }
 
-    $script:Sent = @()
-    $script:Invoker = { param($commands) $script:Sent += $commands; @(@()) }
-
-    $script:Result = Install-BridgeReplyCard -SourcePath $script:CardSource -ConfigPath $script:Sandbox `
-        -Version '1.9.0' -Invoker $script:Invoker -Resources { @() }
-
-    Test-That 'the card is copied into the config folder' { $script:Result.Deployed }
-    Test-That 'it lands in www, where Home Assistant serves /local from' {
-        Test-Path -LiteralPath (Join-Path $script:Sandbox 'www\agent-bridge-reply-card.js')
-    }
-    Test-That 'the copy is the real card, not an empty file' {
-        (Get-Item (Join-Path $script:Sandbox 'www\agent-bridge-reply-card.js')).Length -gt 1000
-    }
-    Test-That 'the resource is registered' { $script:Result.Registered }
-    Test-That 'registering creates a module resource' {
-        $script:Sent[0].type -eq 'lovelace/resources/create' -and $script:Sent[0].res_type -eq 'module'
-    }
-    Test-That 'the registered url is the versioned one' {
-        $script:Sent[0].url -eq '/local/agent-bridge-reply-card.js?v=1.9.0'
-    }
-
-    # Keyed on the card's own version, not the bridge's: otherwise every bridge
-    # release invalidates a URL that only a machine with share access could rewrite,
-    # and machines without it report a stale card forever.
-    Test-That 'the card version is read from the card itself' {
-        (Get-BridgeReplyCardFileVersion -SourcePath $script:CardSource) -match '^\d+\.\d+\.\d+$'
-    }
-    Test-That 'a missing card file yields no version rather than throwing' {
-        (Get-BridgeReplyCardFileVersion -SourcePath (Join-Path $script:Sandbox 'nope.js')) -eq ''
-    }
-    $script:Sent = @()
-    $script:Auto = Install-BridgeReplyCard -SourcePath $script:CardSource -ConfigPath $script:Sandbox `
-        -Invoker $script:Invoker -Resources { @() } -FileProbe { $false }
-    Test-That 'with no version passed it uses the card file version' {
-        $script:Auto.Url -eq "/local/agent-bridge-reply-card.js?v=$(Get-BridgeReplyCardFileVersion -SourcePath $script:CardSource)"
-    }
-
-    # An upgrade must not leave two resources pointing at the same card, one of them
-    # stuck on the old version string.
-    $script:Sent = @()
-    $script:Existing = @([pscustomobject]@{ id = 'res-1'; url = '/local/agent-bridge-reply-card.js?v=1.8.0' })
-    $script:Result2 = Install-BridgeReplyCard -SourcePath $script:CardSource -ConfigPath $script:Sandbox `
-        -Version '1.9.0' -Invoker $script:Invoker -Resources { $script:Existing } -FileProbe { $true }
-
-    Test-That 'an upgrade updates the existing resource instead of adding another' {
-        $script:Sent.Count -eq 1 -and $script:Sent[0].type -eq 'lovelace/resources/update'
-    }
-    Test-That 'the update targets the resource that was already there' {
-        $script:Sent[0].resource_id -eq 'res-1'
-    }
-    Test-That 'the update carries the new version' {
-        $script:Sent[0].url -eq '/local/agent-bridge-reply-card.js?v=1.9.0'
-    }
-
-    # Home Assistant is shared, so on the second machine the card is already there.
-    # Nothing should be written, and nothing should be reported as wrong.
-    $script:Sent = @()
-    $script:Current = @([pscustomobject]@{ id = 'res-1'; url = '/local/agent-bridge-reply-card.js?v=1.9.0' })
-    $script:Result3 = Install-BridgeReplyCard -SourcePath $script:CardSource -ConfigPath $script:Sandbox `
-        -Version '1.9.0' -Invoker $script:Invoker -Resources { $script:Current } -FileProbe { $true }
-
-    Test-That 're-running with nothing to change sends no resource command' {
-        $script:Sent.Count -eq 0
-    }
-    Test-That 'it reports the card as already current' { $script:Result3.Action -eq 'current' }
-    Test-That 'and reports success rather than a problem' { $script:Result3.Ok }
-
-    # The whole point: a machine with no access to the config share still installs
-    # cleanly, because the card it needs is already in Home Assistant.
-    $script:Sent = @()
-    $script:NoShareButPresent = Install-BridgeReplyCard -SourcePath $script:CardSource `
-        -ConfigPath (Join-Path $script:Sandbox 'absent') -Version '1.9.0' `
-        -Invoker $script:Invoker -Resources { $script:Current } -FileProbe { $true }
-    Test-That 'an unreachable share is not a problem when the card is already installed' {
-        $script:NoShareButPresent.Ok -and $script:NoShareButPresent.Action -eq 'current'
-    }
-
-    # Same machine, but Home Assistant has an older card than this build ships.
-    # It cannot be updated from here, and that is still not a failure.
-    $script:Older = @([pscustomobject]@{ id = 'res-1'; url = '/local/agent-bridge-reply-card.js?v=1.8.0' })
-    $script:KeptResult = Install-BridgeReplyCard -SourcePath $script:CardSource `
-        -ConfigPath (Join-Path $script:Sandbox 'absent') -Version '1.9.0' `
-        -Invoker $script:Invoker -Resources { $script:Older } -FileProbe { $true }
-    Test-That 'an older card that cannot be updated from here is kept, not failed' {
-        $script:KeptResult.Ok -and $script:KeptResult.Action -eq 'kept'
-    }
-
-    # A resource registered but not actually served renders an error box on the
-    # dashboard, so it must not count as installed.
-    $script:Dangling = Install-BridgeReplyCard -SourcePath $script:CardSource -ConfigPath $script:Sandbox `
-        -Version '1.9.0' -Invoker $script:Invoker -Resources { $script:Current } -FileProbe { $false }
-    Test-That 'a registration whose file is missing is repaired, not trusted' {
-        $script:Dangling.Deployed
-    }
-
-    # A bridge that cannot deliver the card is still a working bridge, so none of
-    # these may throw.
-    $script:Missing = Install-BridgeReplyCard -SourcePath (Join-Path $script:Sandbox 'nope.js') `
-        -ConfigPath $script:Sandbox -Version '1.9.0' -Invoker $script:Invoker -Resources { @() }
-    Test-That 'a missing card source is reported, not thrown' {
-        (-not $script:Missing.Deployed) -and $script:Missing.Detail -match 'not found'
-    }
-
-    $script:NoShare = Install-BridgeReplyCard -SourcePath $script:CardSource `
-        -ConfigPath (Join-Path $script:Sandbox 'absent') -Version '1.9.0' `
-        -Invoker $script:Invoker -Resources { @() }
-    Test-That 'an unreachable config folder is reported, not thrown' {
-        (-not $script:NoShare.Deployed) -and $script:NoShare.Detail -match 'no reachable'
-    }
+# The case that used to leave the card missing for good: a first install, with
+# nothing in Home Assistant yet and no file share to write to.
+$script:First = Install-BridgeReplyCard -SourcePath $script:CardSource -Version '1.9.0' `
+    -Invoker $script:Invoker -Resources { @() }
+Test-That 'a first install registers the card' { $script:First.Ok -and $script:First.Action -eq 'deployed' }
+Test-That 'as one module resource' {
+    $script:Sent.Count -eq 1 -and $script:Sent[0].type -eq 'lovelace/resources/create' -and $script:Sent[0].res_type -eq 'module'
 }
-finally {
-    Remove-Item -LiteralPath $script:Sandbox -Recurse -Force -ErrorAction SilentlyContinue
+Test-That 'pointing at the inline card' { $script:Sent[0].url -eq $script:InlineUrl }
+
+Test-That 'the card version is read from the card itself' {
+    (Get-BridgeReplyCardFileVersion -SourcePath $script:CardSource) -match '^\d+\.\d+\.\d+$'
+}
+Test-That 'a missing card file yields no version rather than throwing' {
+    (Get-BridgeReplyCardFileVersion -SourcePath (Join-Path $PSScriptRoot 'nope.js')) -eq ''
+}
+$script:Sent = @()
+$script:Auto = Install-BridgeReplyCard -SourcePath $script:CardSource -Invoker $script:Invoker -Resources { @() }
+Test-That 'with no version passed it uses the card file version' {
+    $script:Auto.Url.EndsWith("?v=$(Get-BridgeReplyCardFileVersion -SourcePath $script:CardSource)")
+}
+
+# Home Assistant is shared, so on the second machine the card is already there.
+$script:Sent = @()
+$script:Current = @([pscustomobject]@{ id = 'res-1'; url = $script:InlineUrl })
+$script:Again = Install-BridgeReplyCard -SourcePath $script:CardSource -Version '1.9.0' `
+    -Invoker $script:Invoker -Resources { $script:Current } -FileProbe { throw 'an inline card has no file to probe' }
+Test-That 're-running with nothing to change sends no resource command' { $script:Sent.Count -eq 0 }
+Test-That 'it reports the card as already current' { $script:Again.Ok -and $script:Again.Action -eq 'current' }
+
+# An upgrade must not leave two resources pointing at the same card.
+$script:Sent = @()
+$script:Older = @([pscustomobject]@{ id = 'res-1'; url = (Get-BridgeInlineReplyCardUrl -SourcePath $script:CardSource -Version '1.8.0') })
+$script:Upgrade = Install-BridgeReplyCard -SourcePath $script:CardSource -Version '1.9.0' `
+    -Invoker $script:Invoker -Resources { $script:Older }
+Test-That 'an upgrade updates the existing resource instead of adding another' {
+    $script:Upgrade.Action -eq 'updated' -and $script:Sent.Count -eq 1 -and
+    $script:Sent[0].type -eq 'lovelace/resources/update' -and $script:Sent[0].resource_id -eq 'res-1'
+}
+Test-That 'the update carries the new version' { $script:Sent[0].url -eq $script:InlineUrl }
+
+# Earlier versions served the card as a file from `www`. Even at the same version it
+# moves to the inline copy, so every install ends up on the one route.
+$script:Sent = @()
+$script:FileServed = @([pscustomobject]@{ id = 'res-7'; url = '/local/agent-bridge-reply-card.js?v=1.9.0' })
+$script:Migrated = Install-BridgeReplyCard -SourcePath $script:CardSource -Version '1.9.0' `
+    -Invoker $script:Invoker -Resources { $script:FileServed } -FileProbe { $true }
+Test-That 'a file-served card is re-pointed at the inline copy' {
+    $script:Migrated.Action -eq 'updated' -and $script:Sent[0].resource_id -eq 'res-7' -and $script:Sent[0].url -eq $script:InlineUrl
+}
+
+# A bridge that cannot deliver the card is still a working bridge, so none of these
+# may throw.
+$script:Kept = Install-BridgeReplyCard -SourcePath $script:CardSource -Version '1.9.0' `
+    -Invoker { param($c) throw 'websocket down' } -Resources { $script:FileServed } -FileProbe { $true }
+Test-That 'an older card that cannot be replaced is kept, not failed' {
+    $script:Kept.Ok -and $script:Kept.Action -eq 'kept'
+}
+
+$script:Missing = Install-BridgeReplyCard -SourcePath (Join-Path $PSScriptRoot 'nope.js') -Version '1.9.0' `
+    -Invoker $script:Invoker -Resources { @() }
+Test-That 'a missing card source is reported, not thrown' {
+    (-not $script:Missing.Ok) -and $script:Missing.Detail -match 'not readable'
+}
+
+$script:NoWebsocket = Install-BridgeReplyCard -SourcePath $script:CardSource -Version '1.9.0' `
+    -Invoker { param($c) throw 'websocket down' } -Resources { @() }
+Test-That 'a failed registration is reported, not thrown' {
+    (-not $script:NoWebsocket.Ok) -and $script:NoWebsocket.Detail -match 'could not register'
+}
+
+$script:Unreadable = Install-BridgeReplyCard -SourcePath $script:CardSource -Version '1.9.0' `
+    -Invoker $script:Invoker -Resources { throw 'no websocket' }
+Test-That 'an unreadable resource list is reported, not thrown' {
+    (-not $script:Unreadable.Ok) -and $script:Unreadable.Detail -match 'could not read'
 }
 
 Write-Host '--- the card itself ---'
@@ -488,6 +439,20 @@ Test-That 'a resource entry with no url does not throw' {
 # Falling back to the text box is the safe answer when Home Assistant cannot be asked.
 Test-That 'an unreadable resource list falls back rather than throwing' {
     (Get-BridgeServedReplyCardUrl -CacheSeconds 0 -Resources { throw 'no websocket' }) -eq ''
+}
+
+# An inline card's base64 body contains slashes, so it is recognised by its fragment.
+$inlineCard = 'data:text/javascript;base64,Ly8gYS9iL2M/ZD0x/abc+/=#agent-bridge-reply-card.js?v=1.10.0'
+Test-That 'an inline card resource is found' {
+    (Get-BridgeServedReplyCardUrl -CacheSeconds 0 -Resources { @([pscustomobject]@{ url = $inlineCard }) }) -eq $inlineCard
+}
+Test-That 'an inline card of 1.10.0 or later gets the activity header' {
+    Test-BridgeActivityCardServed -ReplyCardUrl $inlineCard
+}
+Test-That 'some other inline resource is not mistaken for the card' {
+    (Get-BridgeServedReplyCardUrl -CacheSeconds 0 -Resources {
+        @([pscustomobject]@{ url = 'data:text/javascript;base64,YWdlbnQtYnJpZGdlLXJlcGx5LWNhcmQuanM=' })
+    }) -eq ''
 }
 
 Write-Host ''
