@@ -692,9 +692,13 @@ Write-Host '--- resume command lines ---'
 $args1 = @(Get-BridgeNewSessionArguments -SessionId 'abc' -Launcher 'claude' -Resume -Prompt 'carry on')
 Test-That 'Claude resumes with --resume, not --session-id' { ($args1 -join ' ') -eq '--resume abc -- carry on' }
 $args2 = @(Get-BridgeNewSessionArguments -SessionId 'abc' -Launcher 'codex' -Resume -Prompt 'carry on')
-Test-That 'Codex resumes with its resume subcommand' { ($args2 -join ' ') -eq 'resume abc -- carry on' }
+Test-That 'Codex resumes with its resume subcommand' { ($args2 -join ' ') -match '(^| )resume abc -- carry on$' }
 $args3 = @(Get-BridgeNewSessionArguments -SessionId 'abc' -Launcher 'codex' -Resume)
-Test-That 'a Codex resume without a prompt just names the session' { ($args3 -join ' ') -eq 'resume abc' }
+Test-That 'a Codex resume without a prompt just names the session' { ($args3 -join ' ') -match '(^| )resume abc$' }
+# Its daemon has no console, so every hook it ran opened a window on Windows.
+Test-That 'Codex is started without its background daemon' { $args2[0] -eq '--no-daemon' -and $args3[0] -eq '--no-daemon' }
+Test-That 'with reasoning summaries on, for the card to stream' { ($args3 -join ' ') -match '-c model_reasoning_summary=detailed' }
+Test-That 'the global options come before the resume subcommand' { $args2.IndexOf('--no-daemon') -lt $args2.IndexOf('resume') }
 $args4 = @(Get-BridgeNewSessionArguments -SessionId 'abc' -Launcher 'copilot' -Resume)
 Test-That 'Copilot resumes through --session-id as before' { $args4[0] -eq '--session-id' -and $args4[1] -eq 'abc' }
 $args5 = @(Get-BridgeNewSessionArguments -SessionId 'abc' -Launcher 'claude')

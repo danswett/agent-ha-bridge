@@ -741,7 +741,17 @@ function Get-BridgeNewSessionArguments {
 
     if ($Launcher -in @('claude', 'codex')) {
         $arguments = @()
-        if ($Launcher -eq 'codex' -and $resuming) { $arguments += 'resume' }
+        if ($Launcher -eq 'codex') {
+            # Without its shared background daemon, Codex runs hooks from its own
+            # window's process. Under the daemon - which has no console - Windows opened
+            # a console window for every hook, several a turn, and a reply could not tell
+            # which window was the session's.
+            $arguments += '--no-daemon'
+            # Reasoning summaries, which the card streams; without this Codex writes its
+            # reasoning encrypted and there is nothing to show.
+            if ([bool](Get-BridgeSetting 'detailedActivity' $true)) { $arguments += @('-c', 'model_reasoning_summary=detailed') }
+            if ($resuming) { $arguments += 'resume' }
+        }
         if ($Launcher -eq 'claude' -and -not [string]::IsNullOrWhiteSpace($SessionId)) {
             $arguments += if ($resuming) { @('--resume', $SessionId) } else { @('--session-id', $SessionId) }
         }

@@ -3048,6 +3048,73 @@ function Update-DaemonSessionActivity {
     }
 }
 
+function Update-DaemonCodexActivity {
+    <#
+        Streams a Codex session's rollout to its card: the newest thing it said (its
+        progress notes, then the answer, and reasoning summaries when there are any,
+        in order, as a Claude card shows them) and its tool calls as the history.
+
+        Only the card body is written; the status line keeps what the hooks last set
+        (the registration's activity). What is shown is remembered on the entry, so a
+        batch with nothing new - or a hook republishing the status - never blanks it,
+        and a new turn starts it afresh.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Id,
+        [Parameter(Mandatory)]$Entry,
+        [Parameter(Mandatory)]$Session,
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [bool]$VerboseOn
+    )
+
+    $append = Read-CodexTranscriptAppend -Path ([string]$Session.Transcript) `
+        -Offset ([long]$Entry.Offset) -MaxTailBytes $script:DaemonConfig.MaxTailBytes
+    $Entry.Offset = $append.Offset
+    if ($append.Lines.Count -eq 0) { return }
+
+    $activity = Get-CodexActivityFromTranscript -Lines $append.Lines
+    if ($activity.TurnStarted) {
+        foreach ($name in @('LastMessage', 'LastReasoning')) { Set-DaemonSessionProperty -Entry $Entry -Name $name -Value '' }
+        Set-DaemonSessionProperty -Entry $Entry -Name 'LastMessageIsThinking' -Value $false
+        Set-DaemonSessionProperty -Entry $Entry -Name 'LastHistory' -Value @()
+    }
+    if (-not $activity.TurnStarted -and -not $activity.Latest -and @($activity.History).Count -eq 0) { return }
+
+    if ($activity.Latest) {
+        Set-DaemonSessionProperty -Entry $Entry -Name 'LastMessage' -Value ([string]$activity.Latest)
+        Set-DaemonSessionProperty -Entry $Entry -Name 'LastMessageIsThinking' -Value ([bool]$activity.LatestIsThinking)
+    }
+    if ($activity.Reasoning) { Set-DaemonSessionProperty -Entry $Entry -Name 'LastReasoning' -Value ([string]$activity.Reasoning) }
+    $history = @(@($(if ($Entry.PSObject.Properties['LastHistory']) { $Entry.LastHistory } else { @() })) + @($activity.History) |
+        Where-Object { $_ } | Select-Object -Last 8)
+    Set-DaemonSessionProperty -Entry $Entry -Name 'LastHistory' -Value $history
+
+    $detail = @{ session = $Entry.Name; machine = $Entry.Machine }
+    if ($history.Count) { $detail['history'] = $history }
+    $message = if ($Entry.PSObject.Properties['LastMessage']) { [string]$Entry.LastMessage } else { '' }
+    $thinking = $Entry.PSObject.Properties['LastMessageIsThinking'] -and [bool]$Entry.LastMessageIsThinking
+    # Reasoning is detailed activity: with it off, a card shows only what Codex said.
+    if ($message -and ($VerboseOn -or -not $thinking)) {
+        if ($message.Length -gt $script:DaemonConfig.ResponseMaxChars) {
+            $message = $message.Substring(0, $script:DaemonConfig.ResponseMaxChars).TrimEnd() + "`n`n_(truncated - see terminal)_"
+        }
+        $detail['response'] = $message
+        $detail['response_kind'] = if ($thinking) { 'reasoning' } else { 'text' }
+    }
+
+    # The status line as the hooks last set it, read fresh: the live snapshot is up to a
+    # reconcile old, and republishing it would put an earlier status back.
+    $summary = if ($Session.PSObject.Properties['Activity'] -and $Session.Activity) { [string]$Session.Activity } else { 'Working' }
+    try {
+        $registration = Join-Path (Get-CodexStateRoot) ((Get-CodexSafeSessionKey -SessionId $Id) + '.json')
+        $fresh = [string](Get-Content -LiteralPath $registration -Raw | ConvertFrom-Json).Activity
+        if ($fresh) { $summary = $fresh }
+    }
+    catch { }
+    try { Set-CopilotMqttActivity -SessionId $Id -Summary $summary -Detail $detail -Headers $Headers }
+    catch { Write-DaemonLog -Message "codex activity publish failed for $Id : $($_.Exception.Message)" }
+}
+
 function Add-DaemonCardText {
     <#
         Puts the card's main text (and, where it applies, the reasoning expander) into
@@ -3388,8 +3455,15 @@ function Invoke-DaemonFastActivity {
         if ($null -eq $entry -or $null -eq $session) { continue }
 
         $kind = if ($entry.PSObject.Properties.Name -contains 'Kind' -and $entry.Kind) { [string]$entry.Kind } else { 'copilot' }
-        # Codex reports its activity from its hooks, sooner than a transcript could.
-        if ($kind -eq 'codex') { continue }
+        # Codex: its status comes from its hooks, and what it says from its rollout.
+        if ($kind -eq 'codex') {
+            $length = 0L
+            try { $length = [IO.FileInfo]::new([string]$session.Transcript).Length } catch { continue }
+            if ($length -ne [long]$entry.Offset) {
+                Update-DaemonCodexActivity -Id $id -Entry $entry -Session $session -Headers $Headers -VerboseOn ([bool]$script:DaemonVerbose)
+            }
+            continue
+        }
 
         $changed = $false
 
@@ -3563,37 +3637,11 @@ function Sync-DaemonSessions {
         }
 
         $entryKind = if ($entry.PSObject.Properties.Name -contains 'Kind' -and $entry.Kind) { [string]$entry.Kind } else { 'copilot' }
-        # Codex publishes its own status, activity and response from its hooks, which
-        # report them sooner than a transcript tail could. The rollout is read for one
-        # thing only - reasoning - and only while verbose streaming is on.
+        # Codex publishes its status from its hooks; what it says - progress notes, the
+        # answer, reasoning, tool calls - is read from its rollout, here and in the fast
+        # lane (Update-DaemonCodexActivity).
         if ($entryKind -eq 'codex') {
-            if (-not $verbose) { continue }
-            $append = Read-CodexTranscriptAppend -Path ([string]$session.Transcript) `
-                -Offset ([long]$entry.Offset) -MaxTailBytes $script:DaemonConfig.MaxTailBytes
-            $entry.Offset = $append.Offset
-            if ($append.Lines.Count -eq 0) { continue }
-
-            $reasoning = Get-CodexReasoningFromTranscript -Lines $append.Lines
-            if (-not [string]::IsNullOrWhiteSpace($reasoning)) {
-                $capped = $reasoning
-                if ($capped.Length -gt $script:DaemonConfig.ReasoningMaxChars) {
-                    $capped = $capped.Substring(0, $script:DaemonConfig.ReasoningMaxChars).TrimEnd() + '…'
-                }
-                try {
-                    # The activity label itself still comes from the hooks; this only
-                    # adds the reasoning attribute the card's expander reads.
-                    Set-CopilotMqttActivity -SessionId $id `
-                        -Summary $(if ($session.PSObject.Properties.Name -contains 'Activity' -and $session.Activity) { [string]$session.Activity } else { 'Working' }) `
-                        -Detail @{
-                            session   = $entry.Name
-                            machine   = $entry.Machine
-                            reasoning = $capped
-                        } -Headers $Headers
-                }
-                catch {
-                    Write-DaemonLog -Message "codex reasoning publish failed for $id : $($_.Exception.Message)"
-                }
-            }
+            Update-DaemonCodexActivity -Id $id -Entry $entry -Session $session -Headers $Headers -VerboseOn $verbose
             continue
         }
 

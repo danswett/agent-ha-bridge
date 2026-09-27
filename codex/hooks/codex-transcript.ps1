@@ -99,6 +99,69 @@ function Get-CodexReasoningFromTranscript {
     $reasoning
 }
 
+function Get-CodexActivityFromTranscript {
+    <#
+        What a batch of rollout lines adds to the card, as
+        { TurnStarted, Latest, LatestIsThinking, Reasoning, History }.
+
+        Latest is the newest thing Codex said, in order: its progress notes while it
+        works (assistant messages with phase "commentary"), then the final answer, and
+        reasoning summaries when the model writes them - so the card reads like the
+        terminal, as a Claude card does. History is the tool calls. TurnStarted marks
+        a new turn in the batch, and everything returned is from after it.
+
+        The hooks alone gave the card nothing but a status line until the turn ended,
+        and the reply only then.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines)
+
+    $result = [pscustomobject]@{ TurnStarted = $false; Latest = ''; LatestIsThinking = $false; Reasoning = ''; History = @() }
+    foreach ($line in $Lines) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        # Cheap pre-filter: token counts and world state are most of a rollout.
+        if ($line -notmatch '"type":"(task_started|message|reasoning|custom_tool_call|function_call|local_shell_call|web_search_call)"') { continue }
+        $entry = try { $line | ConvertFrom-Json } catch { $null }
+        if ($null -eq $entry -or -not $entry.PSObject.Properties['payload'] -or $null -eq $entry.payload) { continue }
+        $payload = $entry.payload
+        $kind = if ($payload.PSObject.Properties['type']) { [string]$payload.type } else { '' }
+
+        if ([string]$entry.type -eq 'event_msg') {
+            if ($kind -eq 'task_started') {
+                $result.TurnStarted = $true
+                $result.Latest = ''; $result.LatestIsThinking = $false; $result.Reasoning = ''; $result.History = @()
+            }
+            continue
+        }
+        if ([string]$entry.type -ne 'response_item') { continue }
+
+        switch ($kind) {
+            'message' {
+                if (-not $payload.PSObject.Properties['role'] -or [string]$payload.role -ne 'assistant') { break }
+                $text = (@($payload.content) | Where-Object {
+                    $_ -and $_.PSObject.Properties['text'] -and (-not $_.PSObject.Properties['type'] -or [string]$_.type -eq 'output_text')
+                } | ForEach-Object { [string]$_.text }) -join "`n"
+                if (-not [string]::IsNullOrWhiteSpace($text)) { $result.Latest = $text.Trim(); $result.LatestIsThinking = $false }
+            }
+            'reasoning' {
+                # Encrypted unless model_reasoning_summary asks for a summary.
+                if (-not $payload.PSObject.Properties['summary']) { break }
+                $text = (@($payload.summary) | ForEach-Object {
+                    if ($_ -is [string]) { $_ } elseif ($_ -and $_.PSObject.Properties['text']) { [string]$_.text }
+                }) -join "`n"
+                if (-not [string]::IsNullOrWhiteSpace($text)) {
+                    $result.Reasoning = $text.Trim(); $result.Latest = $text.Trim(); $result.LatestIsThinking = $true
+                }
+            }
+            default {
+                $name = if ($payload.PSObject.Properties['name'] -and $payload.name) { [string]$payload.name }
+                    elseif ($kind -eq 'local_shell_call') { 'shell' } elseif ($kind -eq 'web_search_call') { 'web search' } else { $kind }
+                $result.History = @($result.History) + "Ran: $name"
+            }
+        }
+    }
+    $result
+}
+
 function Read-CodexTranscriptAppend {
     <#
         Reads the bytes appended since the last offset.
