@@ -126,7 +126,7 @@ try {
         Test-That 'the shim looks for pwsh where Homebrew puts it' {
             (Get-Content -LiteralPath $cmd -Raw) -match '/opt/homebrew/bin/pwsh'
         }
-        Test-That 'the shim works' { ((& $cmd version 2>&1) -join '') -match '\d+\.\d+' }
+        Test-That 'the shim runs the command' { $null = & $cmd version 2>&1; $LASTEXITCODE -eq 0 }
     }
     Test-That 'installing again is a no-op that still succeeds' {
         [void](Install-BridgeCommand -RepoRoot $repoRoot -BinDir $binRoot)

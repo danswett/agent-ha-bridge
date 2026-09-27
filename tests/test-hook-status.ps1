@@ -291,6 +291,14 @@ Test-That 'an empty note is not cleared again' { $script:Notes.Count -eq 0 }
 Write-Host ''
 Write-Host '--- noticing PATH changes without a restart ---'
 
+# Windows only: macOS has no stored machine or user PATH, and the LaunchAgent is given
+# the installer's PATH instead.
+if (-not $script:BridgeIsWindows) {
+    $savedPath = $env:PATH
+    Update-BridgeProcessPath -Force
+    Test-That 'on macOS PATH is left exactly as it was' { $env:PATH -eq $savedPath }
+}
+else {
 $savedPath = $env:Path
 try {
     $env:Path = 'C:\only\this'
@@ -303,6 +311,7 @@ try {
     Test-That 'running it again adds no duplicates' { $env:Path -eq $before }
 }
 finally { $env:Path = $savedPath }
+}
 
 Remove-Item -LiteralPath $script:DaemonConfig.LogFile -Force -ErrorAction SilentlyContinue
 

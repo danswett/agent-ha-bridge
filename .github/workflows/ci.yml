@@ -135,9 +135,8 @@ jobs:
           bash -n bootstrap.sh
           sh -n bin/agent-ha-bridge
 
-      - name: Test suites on macOS (report only, while the port settles)
+      - name: Test suites on macOS
         shell: pwsh
-        continue-on-error: true
         run: |
           $failed = @()
           foreach ($suite in @(Get-ChildItem tests/test-*.ps1, claude/tests/test-*.ps1, codex/tests/test-*.ps1 | Where-Object { $_.Name -notmatch 'integration|platform' })) {

@@ -179,12 +179,20 @@ $script:FakeSettings = @{}
 Test-That 'discovery alone is enough, with no config at all' { (Get-BridgeDefaultWorkspaceLabel) -eq 'gamma' }
 $script:FakeDiscovered = @()
 
-Test-That 'System32 is a system folder' { Test-BridgeSystemDirectory -Path (Join-Path $env:WINDIR 'System32') }
-Test-That 'the Windows folder itself is a system folder' { Test-BridgeSystemDirectory -Path $env:WINDIR }
-Test-That 'Program Files is a system folder' { Test-BridgeSystemDirectory -Path (Join-Path $env:ProgramFiles 'Something') }
-Test-That 'a drive root is a system folder' { Test-BridgeSystemDirectory -Path 'C:\' }
+if ($script:BridgeIsWindows) {
+    Test-That 'System32 is a system folder' { Test-BridgeSystemDirectory -Path (Join-Path $env:WINDIR 'System32') }
+    Test-That 'the Windows folder itself is a system folder' { Test-BridgeSystemDirectory -Path $env:WINDIR }
+    Test-That 'Program Files is a system folder' { Test-BridgeSystemDirectory -Path (Join-Path $env:ProgramFiles 'Something') }
+    Test-That 'a drive root is a system folder' { Test-BridgeSystemDirectory -Path 'C:\' }
+    Test-That 'a sibling that only shares a prefix is not' { -not (Test-BridgeSystemDirectory -Path "$($env:WINDIR)Projects") }
+}
+else {
+    Test-That '/System is a system folder' { Test-BridgeSystemDirectory -Path '/System/Library' }
+    Test-That '/usr is a system folder' { Test-BridgeSystemDirectory -Path '/usr/local/bin' }
+    Test-That 'the root is a system folder' { Test-BridgeSystemDirectory -Path '/' }
+    Test-That 'a sibling that only shares a prefix is not' { -not (Test-BridgeSystemDirectory -Path '/Users/someone/usrstuff') }
+}
 Test-That 'a project under the home folder is not' { -not (Test-BridgeSystemDirectory -Path (Join-Path $HOME 'repos\project')) }
-Test-That 'a sibling that only shares a prefix is not' { -not (Test-BridgeSystemDirectory -Path "$($env:WINDIR)Projects") }
 
 Write-Host ''
 Write-Host '--- defaults, so a launch needs no input ---'
@@ -274,11 +282,13 @@ $agNoProfile = @(Get-BridgeNewSessionArguments -SessionId $sid -Launcher 'agency
 Test-That 'no profile means no --profile-only' { $agNoProfile -notcontains '--profile-only' }
 Test-That 'and agency still gets the session id' { $agNoProfile -contains '--session-id' }
 
+if ($script:BridgeIsWindows) {
 $agLine = ConvertTo-BridgeArgumentString -Arguments (
     Get-BridgeNewSessionArguments -SessionId $sid -Launcher 'agency' -AgencyProfile 'work' -Prompt 'refactor the "login" flow')
 $agParsed = @(ConvertFrom-CommandLine -CommandLine $agLine)
 Test-That 'the whole agency line survives a round trip' {
     $agParsed[0] -eq 'copilot' -and $agParsed[-1] -ceq 'refactor the "login" flow'
+}
 }
 
 # --- Claude and Codex ------------------------------------------------------------
@@ -298,8 +308,10 @@ Test-That 'allowAllTools maps to skipping claude permissions' { $clAll -contains
 Test-That 'no claude prompt means no --' { $clAll -notcontains '--' }
 
 $flagPrompt = '--dangerously-skip-permissions'
-$clFlag = @(ConvertFrom-CommandLine -CommandLine (ConvertTo-BridgeArgumentString -Arguments (
-    Get-BridgeNewSessionArguments -SessionId $sid -Launcher 'claude' -Prompt $flagPrompt)))
+# As the launched process will see it: through the Windows command line, or on macOS
+# the list tmux is given as it is.
+$clArgs = @(Get-BridgeNewSessionArguments -SessionId $sid -Launcher 'claude' -Prompt $flagPrompt)
+$clFlag = if ($script:BridgeIsWindows) { @(ConvertFrom-CommandLine -CommandLine (ConvertTo-BridgeArgumentString -Arguments $clArgs)) } else { $clArgs }
 Test-That 'a prompt that looks like a flag stays behind --' {
     $clFlag.IndexOf($flagPrompt) -eq $clFlag.Count - 1 -and $clFlag[-2] -eq '--'
 }
