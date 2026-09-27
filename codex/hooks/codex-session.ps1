@@ -89,19 +89,29 @@ function Get-CodexOwningProcessId {
         Finds the codex process that owns this hook by walking the parent chain, the
         same approach the Claude adapter uses: a hook runs as a descendant of its
         session, so this identifies the right one even with several open.
+
+        Newer Codex runs hooks under a `codex.exe app-server` child of the terminal
+        UI. That process has no console, so replies typed into it failed with
+        attach-failed:6 (ERROR_INVALID_HANDLE); the walk carries on past it to the
+        interactive codex.exe that owns the window, and settles for the app-server
+        only when there is none above it.
     #>
     param([int]$StartPid = $PID, [int]$MaxDepth = 12)
 
+    $fallback = 0
     $current = $StartPid
     for ($depth = 0; $depth -lt $MaxDepth; $depth++) {
         $process = Get-CimInstance Win32_Process -Filter "ProcessId=$current" -ErrorAction SilentlyContinue
-        if (-not $process) { return 0 }
+        if (-not $process) { break }
         # Exact match: codex-windows-sandbox-setup and codex-command-runner also exist.
-        if ($process.Name -match '^codex(\.exe)?$') { return [int]$process.ProcessId }
-        if (-not $process.ParentProcessId -or $process.ParentProcessId -eq $current) { return 0 }
+        if ($process.Name -match '^codex(\.exe)?$') {
+            if ([string]$process.CommandLine -notmatch '\sapp-server(\s|$)') { return [int]$process.ProcessId }
+            if ($fallback -eq 0) { $fallback = [int]$process.ProcessId }
+        }
+        if (-not $process.ParentProcessId -or $process.ParentProcessId -eq $current) { break }
         $current = [int]$process.ParentProcessId
     }
-    return 0
+    $fallback
 }
 
 function Write-CodexSessionRegistration {

@@ -465,6 +465,114 @@ $script:ClaudePresent = $false
 # --- the resume list ---------------------------------------------------------------
 
 Write-Host ''
+Write-Host '--- reading each agent''s sessions ---'
+
+# Real parsers against fixture stores laid out as each CLI writes them.
+$storeRoot = Join-Path ([IO.Path]::GetTempPath()) "bridge-sessions-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+$savedHomes = @{ COPILOT_HOME = $env:COPILOT_HOME; CODEX_HOME = $env:CODEX_HOME; CLAUDE_CONFIG_DIR = $env:CLAUDE_CONFIG_DIR }
+function Write-Lines { param([string]$Path, [object[]]$Records) New-Item -ItemType Directory -Force -Path (Split-Path $Path) | Out-Null; Set-Content -LiteralPath $Path -Value @($Records | ForEach-Object { if ($_ -is [string]) { $_ } else { $_ | ConvertTo-Json -Compress -Depth 8 } }) -Encoding utf8 }
+try {
+    $env:CLAUDE_CONFIG_DIR = Join-Path $storeRoot 'claude'
+    $env:COPILOT_HOME = Join-Path $storeRoot 'copilot'
+    $env:CODEX_HOME = Join-Path $storeRoot 'codex'
+    $project = Join-Path $storeRoot 'claude\projects\C--repos-alpha'
+
+    Write-Lines (Join-Path $project '11111111-aaaa-0000-0000-000000000001.jsonl') @(
+        @{ type = 'user'; cwd = 'C:\repos\alpha'; message = @{ role = 'user'; content = '<command-name>/clear</command-name>' } }
+        @{ type = 'user'; cwd = 'C:\repos\alpha'; message = @{ role = 'user'; content = @(@{ type = 'text'; text = "Fix the flaky`nlogin test" }) } }
+        @{ type = 'ai-title'; aiTitle = 'Flaky login test' })
+    Write-Lines (Join-Path $project '11111111-aaaa-0000-0000-000000000002.jsonl') @(
+        @{ type = 'user'; cwd = 'C:\repos\alpha'; message = @{ role = 'user'; content = 'Plan the release' } }
+        @{ type = 'ai-title'; aiTitle = 'Release planning' }
+        @{ type = 'custom-title'; customTitle = 'v2 launch' })
+    Write-Lines (Join-Path $project '11111111-aaaa-0000-0000-000000000003.jsonl') @(
+        @{ type = 'user'; cwd = 'C:\repos\alpha'; message = @{ role = 'user'; content = 'Just a prompt' } })
+    # Opened and closed without a prompt: nothing to go back to.
+    Write-Lines (Join-Path $project '11111111-aaaa-0000-0000-000000000004.jsonl') @(
+        @{ type = 'mode'; mode = 'normal' }
+        @{ type = 'user'; cwd = 'C:\repos\alpha'; message = @{ role = 'user'; content = '<local-command-stdout>See ya!</local-command-stdout>' } })
+    # A subagent transcript in a folder below is not a session of its own.
+    Write-Lines (Join-Path $project '11111111-aaaa-0000-0000-000000000001\subagents\agent-1.jsonl') @(
+        @{ type = 'user'; cwd = 'C:\repos\alpha'; message = @{ role = 'user'; content = 'subagent task' } })
+
+    $claudeEntries = @(Get-BridgeClaudeSessionEntries -Limit 10)
+    $byId = @{}; foreach ($e in $claudeEntries) { $byId[$e.SessionId] = $e }
+    Test-That 'Claude sessions are read from the projects folder' { $claudeEntries.Count -eq 3 }
+    Test-That 'a generated title is used' { $byId['11111111-aaaa-0000-0000-000000000001'].Summary -eq 'Flaky login test' }
+    Test-That 'a title the user gave wins over the generated one' { $byId['11111111-aaaa-0000-0000-000000000002'].Summary -eq 'v2 launch' }
+    Test-That 'without a title the first real prompt is used' { $byId['11111111-aaaa-0000-0000-000000000003'].Summary -eq 'Just a prompt' }
+    Test-That 'a session with no prompt is left out' { -not $byId.ContainsKey('11111111-aaaa-0000-0000-000000000004') }
+    Test-That 'subagent transcripts are not listed' { @($claudeEntries | Where-Object { $_.SessionId -like 'agent-*' }).Count -eq 0 }
+    Test-That 'the folder comes from the transcript' { $byId['11111111-aaaa-0000-0000-000000000001'].Folder -eq 'C:\repos\alpha' }
+    Test-That 'and each entry names Claude as its launcher' { @($claudeEntries | Where-Object Launcher -ne 'claude').Count -eq 0 }
+
+    # A transcript far larger than the window read from each end still gives up its
+    # title and folder, and nothing from the middle is needed.
+    $big = Join-Path $project '11111111-aaaa-0000-0000-000000000005.jsonl'
+    Write-Lines $big @(
+        @{ type = 'user'; cwd = 'C:\repos\alpha'; message = @{ role = 'user'; content = 'Big one' } }
+        @(1..3000 | ForEach-Object { @{ type = 'assistant'; message = @{ content = ('x' * 200) } } })
+        @{ type = 'ai-title'; aiTitle = 'Big session' })
+    Test-That 'a large transcript is read from its ends' {
+        (@(Get-BridgeClaudeSessionEntries -Limit 10) | Where-Object SessionId -eq '11111111-aaaa-0000-0000-000000000005').Summary -eq 'Big session'
+    }
+
+    $state = Join-Path $storeRoot 'copilot\session-state'
+    New-Item -ItemType Directory -Force -Path (Join-Path $state '22222222-bbbb-0000-0000-000000000001') | Out-Null
+    Set-Content -LiteralPath (Join-Path $state '22222222-bbbb-0000-0000-000000000001\workspace.yaml') -Value @(
+        'id: 22222222-bbbb-0000-0000-000000000001', 'cwd: C:\repos\beta', 'summary: "Refactor the parser"')
+    Write-Lines (Join-Path $state '22222222-bbbb-0000-0000-000000000002\events.jsonl') @(
+        @{ type = 'session.start'; data = @{} }
+        @{ type = 'user.message'; data = @{ content = 'Write the changelog' } })
+    New-Item -ItemType Directory -Force -Path (Join-Path $state '22222222-bbbb-0000-0000-000000000003') | Out-Null
+    $copilotEntries = @(Get-BridgeCopilotSessionEntries -Limit 10)
+    Test-That 'Copilot sessions come with their workspace summary and folder' {
+        $e = $copilotEntries | Where-Object SessionId -eq '22222222-bbbb-0000-0000-000000000001'
+        $e.Summary -eq 'Refactor the parser' -and $e.Folder -eq 'C:\repos\beta' -and $e.Launcher -eq 'copilot'
+    }
+    Test-That 'or with their first prompt when there is no summary' {
+        ($copilotEntries | Where-Object SessionId -eq '22222222-bbbb-0000-0000-000000000002').Summary -eq 'Write the changelog'
+    }
+    Test-That 'an empty Copilot session is left out' { $copilotEntries.Count -eq 2 }
+
+    $rollouts = Join-Path $storeRoot 'codex\sessions\2026\09\27'
+    Write-Lines (Join-Path $rollouts 'rollout-2026-09-27T10-00-00-33333333-cccc-0000-0000-000000000001.jsonl') @(
+        @{ type = 'session_meta'; payload = @{ id = '33333333-cccc-0000-0000-000000000001'; cwd = 'C:\repos\gamma' } }
+        @{ type = 'event_msg'; payload = @{ type = 'user_message'; message = '<environment_context>...</environment_context>' } }
+        @{ type = 'event_msg'; payload = @{ type = 'user_message'; message = 'Port the tests' } })
+    Write-Lines (Join-Path $rollouts 'rollout-2026-09-27T11-00-00-33333333-cccc-0000-0000-000000000002.jsonl') @(
+        @{ type = 'session_meta'; payload = @{ id = '33333333-cccc-0000-0000-000000000002'; cwd = 'C:\repos\gamma' } }
+        @{ type = 'event_msg'; payload = @{ type = 'user_message'; message = 'Something' } })
+    Write-Lines (Join-Path $storeRoot 'codex\session_index.jsonl') @(
+        @{ id = '33333333-cccc-0000-0000-000000000002'; thread_name = 'Named thread' })
+    $codexEntries = @(Get-BridgeCodexSessionEntries -Limit 10)
+    Test-That 'Codex sessions are found in their dated folders, with id and folder' {
+        $e = $codexEntries | Where-Object SessionId -eq '33333333-cccc-0000-0000-000000000001'
+        $e.Summary -eq 'Port the tests' -and $e.Folder -eq 'C:\repos\gamma' -and $e.Launcher -eq 'codex'
+    }
+    Test-That 'a thread name the user gave is the title' {
+        ($codexEntries | Where-Object SessionId -eq '33333333-cccc-0000-0000-000000000002').Summary -eq 'Named thread'
+    }
+}
+finally {
+    foreach ($key in $savedHomes.Keys) {
+        if ($savedHomes[$key]) { Set-Item -Path "env:$key" -Value $savedHomes[$key] } else { Remove-Item -Path "env:$key" -ErrorAction SilentlyContinue }
+    }
+    Remove-Item -LiteralPath $storeRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+# From here the file readers are shadowed, so this machine's own sessions never
+# leak into the assertions below.
+$script:FileEntries = @{ claude = @(); copilot = @(); codex = @() }
+function Get-BridgeClaudeSessionEntries { param([int]$Limit) @($script:FileEntries.claude) }
+function Get-BridgeCopilotSessionEntries { param([int]$Limit) @($script:FileEntries.copilot) }
+function Get-BridgeCodexSessionEntries { param([int]$Limit) @($script:FileEntries.codex) }
+function New-FileEntry {
+    param([string]$Id, [string]$Launcher, [string]$Summary, [string]$Folder, [string]$Updated)
+    [pscustomobject]@{ SessionId = $Id; Launcher = $Launcher; Summary = $Summary; Folder = $Folder; Updated = [DateTimeOffset]::Parse($Updated) }
+}
+
+Write-Host ''
 Write-Host '--- the resumable session list ---'
 
 # Shadow the one slow, machine-dependent step so the parsing is testable offline.
@@ -522,6 +630,59 @@ $script:AgencyJson = ''
 Test-That 'no Agency output yields an empty list' { @(Get-BridgeResumableSessions).Count -eq 0 }
 $script:AgencyJson = '{"unexpected":true}'
 Test-That 'output without a sessions array yields an empty list' { @(Get-BridgeResumableSessions).Count -eq 0 }
+
+Write-Host ''
+Write-Host '--- resuming across agents ---'
+
+$savedPresence = @($script:AgencyPresent, $script:CopilotPresent, $script:ClaudePresent, $script:CodexPresent)
+$script:AgencyPresent = $false; $script:CopilotPresent = $true; $script:ClaudePresent = $true; $script:CodexPresent = $true
+$script:AgencyJson = ''
+$script:FileEntries = @{
+    claude  = @(New-FileEntry -Id 'c1' -Launcher 'claude' -Summary 'Claude work' -Folder 'C:\repos\alpha' -Updated '2026-09-27T10:00:00Z')
+    copilot = @(New-FileEntry -Id 'p1' -Launcher 'copilot' -Summary 'Copilot work' -Folder 'C:\repos\beta' -Updated '2026-09-27T12:00:00Z')
+    codex   = @(New-FileEntry -Id 'x1' -Launcher 'codex' -Summary 'Codex work' -Folder 'C:\repos\gamma' -Updated '2026-09-27T11:00:00Z')
+}
+$mixed = @(Get-BridgeResumableSessions)
+Test-That 'without Agency, every agent''s sessions are offered' { ($mixed.SessionId -join ',') -eq 'p1,x1,c1' }
+Test-That 'each keeps the agent that reopens it' { ($mixed.Launcher -join ',') -eq 'copilot,codex,claude' }
+Test-That 'labels name the agent once the list mixes them' { $mixed[2].Label -eq 'Claude: Claude work - alpha' }
+
+$script:CodexPresent = $false
+Test-That 'an agent that is not installed contributes nothing' { @(Get-BridgeResumableSessions).SessionId -notcontains 'x1' }
+
+$script:CopilotPresent = $false; $script:ClaudePresent = $true
+Test-That 'with one agent the labels stay plain' { (@(Get-BridgeResumableSessions)[0]).Label -eq 'Claude work - alpha' }
+
+# With Agency installed it speaks for Copilot; a session it also knows is listed once,
+# under the agent whose files hold it.
+$script:AgencyPresent = $true; $script:CopilotPresent = $true
+Set-AgencySessions -Sessions @(
+    @{ session_id = 'a1'; summary = 'Agency work'; folder = 'C:\repos\beta'; can_resume = $true; updated_at = '2026-09-27T13:00:00Z' }
+    @{ session_id = 'c1'; summary = 'Claude work'; folder = 'C:\repos\alpha'; can_resume = $true; updated_at = '2026-09-27T10:00:00Z' }
+)
+$withAgency = @(Get-BridgeResumableSessions)
+Test-That 'Agency replaces Copilot''s own store' { $withAgency.SessionId -notcontains 'p1' -and $withAgency.SessionId -contains 'a1' }
+Test-That 'a session two sources know appears once, as its own agent' {
+    @($withAgency | Where-Object SessionId -eq 'c1').Count -eq 1 -and ($withAgency | Where-Object SessionId -eq 'c1').Launcher -eq 'claude'
+}
+$script:AgencyJson = ''
+Test-That 'and Copilot''s store fills in when Agency has nothing' { @(Get-BridgeResumableSessions).SessionId -contains 'p1' }
+
+$script:AgencyPresent, $script:CopilotPresent, $script:ClaudePresent, $script:CodexPresent = $savedPresence
+$script:FileEntries = @{ claude = @(); copilot = @(); codex = @() }
+
+Write-Host ''
+Write-Host '--- resume command lines ---'
+$args1 = @(Get-BridgeNewSessionArguments -SessionId 'abc' -Launcher 'claude' -Resume -Prompt 'carry on')
+Test-That 'Claude resumes with --resume, not --session-id' { ($args1 -join ' ') -eq '--resume abc -- carry on' }
+$args2 = @(Get-BridgeNewSessionArguments -SessionId 'abc' -Launcher 'codex' -Resume -Prompt 'carry on')
+Test-That 'Codex resumes with its resume subcommand' { ($args2 -join ' ') -eq 'resume abc -- carry on' }
+$args3 = @(Get-BridgeNewSessionArguments -SessionId 'abc' -Launcher 'codex' -Resume)
+Test-That 'a Codex resume without a prompt just names the session' { ($args3 -join ' ') -eq 'resume abc' }
+$args4 = @(Get-BridgeNewSessionArguments -SessionId 'abc' -Launcher 'copilot' -Resume)
+Test-That 'Copilot resumes through --session-id as before' { $args4[0] -eq '--session-id' -and $args4[1] -eq 'abc' }
+$args5 = @(Get-BridgeNewSessionArguments -SessionId 'abc' -Launcher 'claude')
+Test-That 'a new Claude session still sets its id' { ($args5 -join ' ') -eq '--session-id abc' }
 
 # --- discovery payloads ----------------------------------------------------------
 
@@ -943,9 +1104,24 @@ Reset-NewSessionTest -Press '2026-06-01T12:33:00+00:00' -AgentState 'Claude' -Re
 Reset-ResumeCache
 $script:DaemonNewSessionSignature = ''
 Sync-DaemonNewSession -Headers $headers -Live $noLive
-Test-That 'a resume goes through Agency whichever agent is selected' {
+Test-That 'an Agency session resumes in Agency whichever agent is selected' {
     $script:Launches.Count -eq 1 -and $script:Launches[0].Resumed -and $script:Launches[0].Launcher -eq 'agency'
 }
+
+# And a Claude session resumes in Claude, with no Agency profile, even with Copilot
+# selected for new sessions.
+$script:AgencyJson = ''
+$script:FileEntries = @{ claude = @(New-FileEntry -Id '9e9e9e9e-0000-0000-0000-000000000001' -Launcher 'claude' -Summary 'Claude task' -Folder $beta -Updated '2026-09-27T10:00:00Z'); copilot = @(); codex = @() }
+Reset-NewSessionTest -Press '2026-06-01T12:33:30+00:00' -AgentState 'Copilot' -ResumeState 'Claude task - beta'
+Reset-ResumeCache
+$script:DaemonNewSessionSignature = ''
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+Test-That 'a Claude session resumes in Claude whichever agent is selected' {
+    $script:Launches.Count -eq 1 -and $script:Launches[0].Resumed -and $script:Launches[0].Launcher -eq 'claude' -and
+        $script:Launches[0].SessionId -eq '9e9e9e9e-0000-0000-0000-000000000001'
+}
+Test-That 'in its own folder, and without an Agency profile' { $script:Launches[0].Directory -eq $beta -and -not $script:Launches[0].AgencyProfile }
+$script:FileEntries = @{ claude = @(); copilot = @(); codex = @() }
 $script:AgencyJson = ''
 Reset-ResumeCache
 $script:ClaudePresent = $false

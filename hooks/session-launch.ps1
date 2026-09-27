@@ -679,6 +679,10 @@ function Get-BridgeNewSessionArguments {
         one it chose through its SessionStart hook. Both take the prompt as a
         positional argument, so it goes after `--`: a prompt typed as
         "--dangerously-skip-permissions" must stay a prompt, not become a flag.
+
+        -Resume reopens the session named by -SessionId. Copilot and Agency do that
+        with the same --session-id; Claude refuses an id already in use and needs
+        `--resume <id>`; Codex needs its `resume <id>` subcommand.
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$SessionId,
@@ -687,16 +691,19 @@ function Get-BridgeNewSessionArguments {
         [switch]$AllowAllTools,
         [string[]]$ExtraArguments = @(),
         [ValidateSet('copilot', 'agency', 'claude', 'codex')][string]$Launcher = 'copilot',
-        [string]$AgencyProfile = ''
+        [string]$AgencyProfile = '',
+        [switch]$Resume
     )
 
     $flatPrompt = ($Prompt -replace '\r?\n', ' ').Trim()
     $extras = @(@($ExtraArguments) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { [string]$_ })
+    $resuming = $Resume.IsPresent -and -not [string]::IsNullOrWhiteSpace($SessionId)
 
     if ($Launcher -in @('claude', 'codex')) {
         $arguments = @()
+        if ($Launcher -eq 'codex' -and $resuming) { $arguments += 'resume' }
         if ($Launcher -eq 'claude' -and -not [string]::IsNullOrWhiteSpace($SessionId)) {
-            $arguments += @('--session-id', $SessionId)
+            $arguments += if ($resuming) { @('--resume', $SessionId) } else { @('--session-id', $SessionId) }
         }
         if (-not [string]::IsNullOrWhiteSpace($Model)) { $arguments += @('--model', $Model) }
         # Opt-in only, as for Copilot. Codex keeps its sandbox; only approvals go.
@@ -704,6 +711,8 @@ function Get-BridgeNewSessionArguments {
             $arguments += if ($Launcher -eq 'claude') { '--dangerously-skip-permissions' } else { @('--ask-for-approval', 'never') }
         }
         $arguments += $extras
+        # `codex resume [OPTIONS] [SESSION_ID] [PROMPT]`: the id is the first positional.
+        if ($Launcher -eq 'codex' -and $resuming) { $arguments += $SessionId }
         if ($flatPrompt) { $arguments += @('--', $flatPrompt) }
         return @($arguments)
     }
@@ -769,20 +778,304 @@ function Get-BridgeAgencySessionJson {
     $raw.Substring($start)
 }
 
-function Get-BridgeResumableSessions {
+function Get-BridgeAgencySessionEntries {
     <#
-        Recent sessions that can be resumed, newest first.
+        Resumable sessions from Agency, as raw entries (Get-BridgeResumableSessions
+        labels them).
 
-        Agency is the only thing that knows this: it aggregates sessions from the CLI,
-        the desktop app and VS Code, and marks which are actually resumable. On a
-        working machine that call returns about half a megabyte describing 700+
-        sessions and takes over a second, so it is never run on a reconcile - the
-        daemon caches the result and only refreshes it on a timer.
+        Agency aggregates sessions from the CLI, the desktop app and VS Code, and marks
+        which are actually resumable. On a working machine that call returns about
+        half a megabyte describing 700+ sessions and takes over a second, so it is
+        never run on a reconcile - the daemon caches the list and refreshes it on a
+        timer.
 
         `can_resume` is the filter that matters: desktop-app and VS Code sessions all
-        report false, and resuming one in a terminal is not a thing. Sessions that are
-        currently live are excluded separately by the caller, because attaching a
-        second process to a running session would mean two CLIs writing one transcript.
+        report false, and resuming one in a terminal is not a thing.
+    #>
+    $json = Get-BridgeAgencySessionJson
+    if ([string]::IsNullOrWhiteSpace($json)) { return @() }
+
+    try { $parsed = $json | ConvertFrom-Json }
+    catch { return @() }
+
+    if ($null -eq $parsed -or -not $parsed.PSObject.Properties['sessions']) { return @() }
+
+    $entries = foreach ($session in @($parsed.sessions)) {
+        if (-not $session.can_resume) { continue }
+        $id = [string]$session.session_id
+        if ([string]::IsNullOrWhiteSpace($id)) { continue }
+
+        $updated = [DateTimeOffset]::MinValue
+        if ($session.PSObject.Properties['updated_at']) {
+            [void][DateTimeOffset]::TryParse([string]$session.updated_at, [ref]$updated)
+        }
+
+        [pscustomobject]@{
+            SessionId = $id
+            Launcher  = 'agency'
+            Summary   = if ($session.PSObject.Properties['summary']) { [string]$session.summary } else { '' }
+            Folder    = if ($session.PSObject.Properties['folder']) { [string]$session.folder } else { '' }
+            Updated   = $updated
+        }
+    }
+    @($entries)
+}
+
+function Read-BridgeFileEnds {
+    <#
+        The complete lines in the first and last -Bytes of a file, without reading the
+        middle. Transcripts run to tens of megabytes, and what a resume list needs -
+        where the session ran, its title, its first prompt - sits at either end.
+    #>
+    param([Parameter(Mandatory)][string]$Path, [int]$Bytes = 131072)
+
+    $stream = $null
+    try {
+        $stream = [System.IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite, Delete')
+        $length = $stream.Length
+        $read = {
+            param([long]$Offset, [int]$Count)
+            $buffer = New-Object byte[] $Count
+            [void]$stream.Seek($Offset, 'Begin')
+            $got = 0
+            while ($got -lt $Count) {
+                $n = $stream.Read($buffer, $got, $Count - $got)
+                if ($n -le 0) { break }
+                $got += $n
+            }
+            [System.Text.Encoding]::UTF8.GetString($buffer, 0, $got)
+        }
+
+        if ($length -le 2 * $Bytes) {
+            return @((& $read 0 ([int]$length)) -split "\r?\n" | Where-Object { $_ })
+        }
+        # A cut line at the seam is dropped: the head's last line and the tail's first.
+        $head = @((& $read 0 $Bytes) -split "\r?\n")
+        $tail = @((& $read ($length - $Bytes) $Bytes) -split "\r?\n")
+        @(@($head | Select-Object -SkipLast 1) + @($tail | Select-Object -Skip 1) | Where-Object { $_ })
+    }
+    catch { @() }
+    finally { if ($null -ne $stream) { $stream.Dispose() } }
+}
+
+function Get-BridgePromptSummary {
+    <#
+        A user prompt as a resume-list title, or '' for text that is not one: the
+        wrappers the CLIs record around slash commands, environment context and
+        caveats all start with a tag.
+    #>
+    param([AllowNull()][object]$Content)
+
+    $text = ''
+    if ($Content -is [string]) { $text = $Content }
+    else {
+        foreach ($part in @($Content)) {
+            if ($null -ne $part -and $part.PSObject.Properties['text'] -and
+                (-not $part.PSObject.Properties['type'] -or [string]$part.type -in @('text', 'input_text'))) {
+                $text = [string]$part.text
+                break
+            }
+        }
+    }
+    $text = ($text -replace '\s+', ' ').Trim()
+    if (-not $text -or $text.StartsWith('<')) { return '' }
+    $text
+}
+
+function Get-BridgeSessionFilesByAge {
+    <#
+        The newest files matching -Filter under the given folders, newest first,
+        at most -Count of them.
+    #>
+    param([string[]]$Folder, [string]$Filter, [int]$Count, [switch]$Recurse)
+
+    $files = foreach ($dir in @($Folder)) {
+        if (-not $dir -or -not [System.IO.Directory]::Exists($dir)) { continue }
+        Get-ChildItem -LiteralPath $dir -Filter $Filter -File -Recurse:$Recurse -Force -ErrorAction SilentlyContinue
+    }
+    @(@($files) | Sort-Object LastWriteTimeUtc -Descending | Select-Object -First $Count)
+}
+
+function Get-BridgeClaudeSessionEntries {
+    <#
+        Recent Claude Code sessions: ~/.claude/projects/<folder>/<session id>.jsonl.
+
+        The title is the one the user gave (/rename, a custom-title line), else the
+        one Claude generated (ai-title), else the first prompt. A session opened and
+        closed without a prompt has none of these and is left out: there is nothing
+        in it to go back to.
+    #>
+    param([int]$Limit)
+
+    $claudeHome = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $HOME '.claude' }
+    $projects = Join-Path $claudeHome 'projects'
+    if (-not [System.IO.Directory]::Exists($projects)) { return @() }
+
+    # Only each project folder's own files: subagent transcripts live in folders below.
+    $folders = @(Get-ChildItem -LiteralPath $projects -Directory -Force -ErrorAction SilentlyContinue | ForEach-Object { $_.FullName })
+    $files = Get-BridgeSessionFilesByAge -Folder $folders -Filter '*.jsonl' -Count ($Limit * 3)
+
+    $entries = foreach ($file in $files) {
+        $customTitle = ''; $aiTitle = ''; $prompt = ''; $folder = ''
+        foreach ($line in (Read-BridgeFileEnds -Path $file.FullName)) {
+            if ($line -notmatch '"type":"(custom-title|ai-title|user)"') { continue }
+            try { $record = $line | ConvertFrom-Json } catch { continue }
+            switch ([string]$record.type) {
+                'custom-title' { if ($record.PSObject.Properties['customTitle']) { $customTitle = [string]$record.customTitle } }
+                'ai-title' { if ($record.PSObject.Properties['aiTitle']) { $aiTitle = [string]$record.aiTitle } }
+                'user' {
+                    if (-not $folder -and $record.PSObject.Properties['cwd']) { $folder = [string]$record.cwd }
+                    if (-not $prompt -and $record.PSObject.Properties['message'] -and $null -ne $record.message -and
+                        $record.message.PSObject.Properties['content'] -and
+                        -not ($record.PSObject.Properties['isMeta'] -and $record.isMeta)) {
+                        $prompt = Get-BridgePromptSummary -Content $record.message.content
+                    }
+                }
+            }
+        }
+        $summary = if ($customTitle) { $customTitle } elseif ($aiTitle) { $aiTitle } else { $prompt }
+        if (-not $summary) { continue }
+
+        [pscustomobject]@{
+            SessionId = $file.BaseName
+            Launcher  = 'claude'
+            Summary   = $summary
+            Folder    = $folder
+            Updated   = [DateTimeOffset]$file.LastWriteTimeUtc
+        }
+    }
+    @($entries)
+}
+
+function Get-BridgeCopilotSessionEntries {
+    <#
+        Recent Copilot CLI sessions: ~/.copilot/session-state/<session id>/, whose
+        workspace.yaml records the folder and a summary, and whose events.jsonl
+        holds the prompts when there is no summary yet.
+    #>
+    param([int]$Limit)
+
+    $copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { Join-Path $HOME '.copilot' }
+    $state = Join-Path $copilotHome 'session-state'
+    if (-not [System.IO.Directory]::Exists($state)) { return @() }
+
+    $dirs = @(Get-ChildItem -LiteralPath $state -Directory -Force -ErrorAction SilentlyContinue |
+        Sort-Object LastWriteTimeUtc -Descending | Select-Object -First ($Limit * 3))
+
+    $entries = foreach ($dir in $dirs) {
+        $summary = ''; $folder = ''
+        $updated = [DateTimeOffset]$dir.LastWriteTimeUtc
+        $workspace = Join-Path $dir.FullName 'workspace.yaml'
+        if ([System.IO.File]::Exists($workspace)) {
+            foreach ($line in [System.IO.File]::ReadAllLines($workspace)) {
+                if ($line -match '^(\w+):\s*(.*)$') {
+                    $value = $Matches[2].Trim().Trim('"', "'")
+                    switch ($Matches[1]) {
+                        'cwd' { $folder = $value }
+                        'summary' { $summary = $value }
+                        'updated_at' { $parsed = [DateTimeOffset]::MinValue; if ([DateTimeOffset]::TryParse($value, [ref]$parsed)) { $updated = $parsed } }
+                    }
+                }
+            }
+        }
+        $events = Join-Path $dir.FullName 'events.jsonl'
+        if ([System.IO.File]::Exists($events)) {
+            $updated = [DateTimeOffset]([System.IO.File]::GetLastWriteTimeUtc($events))
+            if (-not $summary) {
+                foreach ($line in (Read-BridgeFileEnds -Path $events)) {
+                    if ($line -notmatch '"type":"user\.message"') { continue }
+                    try { $record = $line | ConvertFrom-Json } catch { continue }
+                    if ($record.PSObject.Properties['data'] -and $null -ne $record.data -and $record.data.PSObject.Properties['content']) {
+                        $summary = Get-BridgePromptSummary -Content $record.data.content
+                        if ($summary) { break }
+                    }
+                }
+            }
+        }
+        if (-not $summary) { continue }
+
+        [pscustomobject]@{
+            SessionId = $dir.Name
+            Launcher  = 'copilot'
+            Summary   = $summary
+            Folder    = $folder
+            Updated   = $updated
+        }
+    }
+    @($entries)
+}
+
+function Get-BridgeCodexSessionEntries {
+    <#
+        Recent Codex sessions: ~/.codex/sessions/<yyyy>/<mm>/<dd>/rollout-*.jsonl,
+        whose first line (session_meta) carries the id and folder. The title is the
+        thread name from session_index.jsonl when the user gave one, else the first
+        prompt.
+    #>
+    param([int]$Limit)
+
+    $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+    $sessions = Join-Path $codexHome 'sessions'
+    if (-not [System.IO.Directory]::Exists($sessions)) { return @() }
+
+    $names = @{}
+    $index = Join-Path $codexHome 'session_index.jsonl'
+    if ([System.IO.File]::Exists($index)) {
+        foreach ($line in (Read-BridgeFileEnds -Path $index)) {
+            try { $record = $line | ConvertFrom-Json } catch { continue }
+            if ($record.PSObject.Properties['id'] -and $record.PSObject.Properties['thread_name'] -and $record.thread_name) {
+                $names[[string]$record.id] = [string]$record.thread_name
+            }
+        }
+    }
+
+    $files = Get-BridgeSessionFilesByAge -Folder @($sessions) -Filter 'rollout-*.jsonl' -Count ($Limit * 3) -Recurse
+
+    $entries = foreach ($file in $files) {
+        $id = ''; $folder = ''; $prompt = ''
+        foreach ($line in (Read-BridgeFileEnds -Path $file.FullName)) {
+            if ($line -notmatch '"type":"(session_meta|user_message)"') { continue }
+            try { $record = $line | ConvertFrom-Json } catch { continue }
+            if (-not $record.PSObject.Properties['payload'] -or $null -eq $record.payload) { continue }
+            $payload = $record.payload
+            if ([string]$record.type -eq 'session_meta') {
+                if ($payload.PSObject.Properties['id']) { $id = [string]$payload.id }
+                if ($payload.PSObject.Properties['cwd']) { $folder = [string]$payload.cwd }
+            }
+            elseif (-not $prompt -and $payload.PSObject.Properties['type'] -and [string]$payload.type -eq 'user_message' -and
+                $payload.PSObject.Properties['message']) {
+                $prompt = Get-BridgePromptSummary -Content $payload.message
+            }
+        }
+        if (-not $id) { continue }
+        $summary = if ($names.ContainsKey($id)) { $names[$id] } else { $prompt }
+        if (-not $summary) { continue }
+
+        [pscustomobject]@{
+            SessionId = $id
+            Launcher  = 'codex'
+            Summary   = $summary
+            Folder    = $folder
+            Updated   = [DateTimeOffset]$file.LastWriteTimeUtc
+        }
+    }
+    @($entries)
+}
+
+function Get-BridgeResumableSessions {
+    <#
+        Recent sessions that can be resumed, newest first, from every installed agent:
+        each entry names the launcher that reopens it, so a Claude session resumes in
+        Claude whichever agent is the default for new ones.
+
+        Agency, when installed, is asked for Copilot sessions - it knows which of its
+        sessions can resume - and Copilot's own store fills in when it is not (or
+        comes back empty). Claude and Codex are read from their session files. A
+        session two sources know is listed once, under its own agent.
+
+        Sessions that are currently live are excluded separately by the caller,
+        because attaching a second process to a running session would mean two CLIs
+        writing one transcript.
     #>
     param(
         [int]$Limit = 0,
@@ -795,48 +1088,40 @@ function Get-BridgeResumableSessions {
     if ($Limit -le 0) { $Limit = [int](Get-BridgeSetting 'newSession.resumeCount' 12) }
     if ($Limit -le 0) { return @() }
 
-    $json = Get-BridgeAgencySessionJson
-    if ([string]::IsNullOrWhiteSpace($json)) { return @() }
-
-    try { $parsed = $json | ConvertFrom-Json }
-    catch { return @() }
-
-    if ($null -eq $parsed -or -not $parsed.PSObject.Properties['sessions']) { return @() }
+    $installed = @(Get-BridgeAvailableLaunchers)
+    $candidates = @()
+    if ($installed -contains 'claude') { $candidates += @(Get-BridgeClaudeSessionEntries -Limit $Limit) }
+    if ($installed -contains 'codex') { $candidates += @(Get-BridgeCodexSessionEntries -Limit $Limit) }
+    $agency = @()
+    if ($installed -contains 'agency') { $agency = @(Get-BridgeAgencySessionEntries); $candidates += $agency }
+    if ($installed -contains 'copilot' -and $agency.Count -eq 0) { $candidates += @(Get-BridgeCopilotSessionEntries -Limit $Limit) }
 
     $excluded = @{}
     foreach ($id in @($Exclude)) {
         if (-not [string]::IsNullOrWhiteSpace($id)) { $excluded[[string]$id] = $true }
     }
-
-    $candidates = foreach ($session in @($parsed.sessions)) {
-        if (-not $session.can_resume) { continue }
-        $id = [string]$session.session_id
-        if ([string]::IsNullOrWhiteSpace($id)) { continue }
-        if ($excluded.ContainsKey($id)) { continue }
-
-        $updated = [DateTimeOffset]::MinValue
-        if ($session.PSObject.Properties['updated_at']) {
-            [void][DateTimeOffset]::TryParse([string]$session.updated_at, [ref]$updated)
-        }
-
-        [pscustomobject]@{
-            SessionId = $id
-            Summary   = if ($session.PSObject.Properties['summary']) { [string]$session.summary } else { '' }
-            Folder    = if ($session.PSObject.Properties['folder']) { [string]$session.folder } else { '' }
-            Updated   = $updated
-        }
+    $unique = foreach ($entry in @($candidates)) {
+        if ($excluded.ContainsKey([string]$entry.SessionId)) { continue }
+        $excluded[[string]$entry.SessionId] = $true
+        $entry
     }
 
-    $recent = @($candidates) | Sort-Object Updated -Descending | Select-Object -First $Limit
+    $recent = @(@($unique) | Sort-Object Updated -Descending | Select-Object -First $Limit)
+
+    # The agent is named in each label once the list holds more than one kind, so a
+    # Claude and a Copilot session on the same task can be told apart.
+    $kinds = @($recent | ForEach-Object { if ($_.Launcher -eq 'agency') { 'copilot' } else { $_.Launcher } } | Select-Object -Unique)
+    $prefixed = $kinds.Count -gt 1
 
     # Build display labels. Home Assistant needs every option in a select to be
     # unique, and a duplicate would make two different sessions indistinguishable, so
     # a repeated label gets its session-id prefix appended.
     $seen = @{}
-    $results = foreach ($entry in @($recent)) {
+    $results = foreach ($entry in $recent) {
         $short = $entry.SessionId.Substring(0, [Math]::Min(8, $entry.SessionId.Length))
         $summary = ($entry.Summary -replace '\s+', ' ').Trim()
         if ([string]::IsNullOrWhiteSpace($summary)) { $summary = "Session $short" }
+        if ($prefixed) { $summary = "$(Get-BridgeLauncherLabel -Launcher $entry.Launcher): $summary" }
 
         $folderLeaf = ''
         if (-not [string]::IsNullOrWhiteSpace($entry.Folder)) {
@@ -855,6 +1140,7 @@ function Get-BridgeResumableSessions {
         [pscustomobject]@{
             Label     = $label
             SessionId = $entry.SessionId
+            Launcher  = $entry.Launcher
             Folder    = $entry.Folder
             Updated   = $entry.Updated
         }
@@ -1000,9 +1286,9 @@ function Start-BridgeCopilotSession {
         # 'agency', 'copilot', 'claude' or 'codex'; empty means the default.
         [string]$Launcher = '',
 
-        # Resuming an existing session rather than creating one. The command line is
-        # identical - the CLI resumes whenever --session-id names a session that
-        # already exists - so this only affects what gets reported.
+        # Resuming an existing session rather than creating one. Copilot and Agency
+        # resume whenever --session-id names a session that exists; Claude and Codex
+        # need their own resume syntax (Get-BridgeNewSessionArguments).
         [switch]$Resume
     )
 
@@ -1045,7 +1331,8 @@ function Start-BridgeCopilotSession {
         -AllowAllTools:([bool](Get-BridgeSetting 'newSession.allowAllTools' $false)) `
         -ExtraArguments @(Get-BridgeSetting 'newSession.extraArgs' @()) `
         -Launcher $launcher `
-        -AgencyProfile $AgencyProfile
+        -AgencyProfile $AgencyProfile `
+        -Resume:$Resume
 
     try {
         # Start-Process (ShellExecute) rather than a redirected .NET process start:

@@ -185,6 +185,28 @@ finally {
 }
 
 Write-Host ''
+Write-Host '--- the process a reply is typed into ---'
+
+# Codex 0.157 runs hooks under a console-less `codex.exe app-server` child of the
+# terminal UI; registering that pid made every dashboard reply fail with
+# attach-failed:6. The tree below is the one captured from a live session.
+$script:FakeTree = @{
+    100 = [pscustomobject]@{ ProcessId = 100; ParentProcessId = 90; Name = 'pwsh.exe'; CommandLine = 'pwsh -File codex-bridge-hook.ps1' }
+    90  = [pscustomobject]@{ ProcessId = 90; ParentProcessId = 80; Name = 'codex.exe'; CommandLine = '"\\?\C:\Users\u\.codex\packages\app-server-daemon\bin\codex.exe" app-server --listen stdio' }
+    80  = [pscustomobject]@{ ProcessId = 80; ParentProcessId = 70; Name = 'codex.exe'; CommandLine = 'C:\npm\codex-win32-x64\vendor\codex.exe' }
+    70  = [pscustomobject]@{ ProcessId = 70; ParentProcessId = 1; Name = 'node.exe'; CommandLine = 'node codex.js' }
+    60  = [pscustomobject]@{ ProcessId = 60; ParentProcessId = 1; Name = 'codex.exe'; CommandLine = 'codex.exe app-server' }
+    50  = [pscustomobject]@{ ProcessId = 50; ParentProcessId = 60; Name = 'pwsh.exe'; CommandLine = 'pwsh -File codex-bridge-hook.ps1' }
+}
+function Get-CimInstance {
+    param([string]$ClassName, [string]$Filter, $ErrorAction)
+    if ($Filter -match 'ProcessId=(\d+)') { $script:FakeTree[[int]$Matches[1]] }
+}
+Test-That 'a hook under the app-server resolves to the terminal codex.exe' { (Get-CodexOwningProcessId -StartPid 100) -eq 80 }
+Test-That 'an app-server with no terminal above it is still better than nothing' { (Get-CodexOwningProcessId -StartPid 50) -eq 60 }
+Remove-Item function:Get-CimInstance
+
+Write-Host ''
 if ($script:Failures) {
     Write-Host "$($script:Failures) test(s) failed" -ForegroundColor Red
     exit 1

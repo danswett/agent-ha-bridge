@@ -2322,10 +2322,11 @@ function Get-DaemonResumableSessions {
     <#
         The cached list of sessions offered in the resume dropdown.
 
-        Behind this is `agency hub list-local-sessions --json`, which on a working
-        machine describes hundreds of sessions in half a megabyte and takes over a
-        second. Running that every 15 seconds would be a waste, and the list barely
-        changes, so it is refreshed on a timer and served from memory in between.
+        Behind this are each agent's session files and, with Agency installed,
+        `agency hub list-local-sessions --json`, which on a working machine describes
+        hundreds of sessions in half a megabyte and takes over a second. Running that
+        every 15 seconds would be a waste, and the list barely changes, so it is
+        refreshed on a timer and served from memory in between.
 
         Live sessions are excluded every time, from the current live set rather than
         from the cache, so a session that has just started cannot be offered for
@@ -2588,6 +2589,38 @@ function Sync-DaemonNewSession {
         $chosenLauncher = $launcher
     }
 
+    # Resume, if one is selected. The chosen session brings its own agent and working
+    # directory: a Claude conversation reopens in Claude whatever the agent selector
+    # says, and resuming somewhere other than where it happened would point the agent
+    # at the wrong tree. The agent and workspace selectors are therefore ignored for
+    # a resume; the profile still applies to an Agency one.
+    $resumeSession = $null
+    $resumeLabel = ''
+    try {
+        $resumeState = Get-HomeAssistantState -EntityId $script:DaemonEntity.NewResume -Headers $Headers
+        $resumeLabel = [string]$resumeState.state
+        if (-not [string]::IsNullOrWhiteSpace($resumeLabel) -and
+            $resumeLabel -notin @('unknown', 'unavailable', $script:CopilotMqttNewSessionOption)) {
+            $resumeSession = @($resumable) | Where-Object { $_.Label -eq $resumeLabel } | Select-Object -First 1
+            if ($null -eq $resumeSession) {
+                Write-DaemonLog -Message "resume requested for unknown session '$resumeLabel'"
+                Set-CopilotMqttNewSessionResult -Text "That session is no longer resumable" -Headers $Headers
+                return
+            }
+        }
+    }
+    catch { }
+    if ($null -ne $resumeSession) {
+        # Entries from before a list carried its agent came from Agency.
+        $chosenLauncher = if ($resumeSession.PSObject.Properties['Launcher'] -and $resumeSession.Launcher) { [string]$resumeSession.Launcher } else { 'agency' }
+        if ($launchers -notcontains $chosenLauncher) {
+            $agentName = Get-BridgeLauncherLabel -Launcher $chosenLauncher
+            Write-DaemonLog -Message "resume requested for a $agentName session, but $agentName is not installed"
+            Set-CopilotMqttNewSessionResult -Text "$agentName is not installed here, so that session can't be resumed" -Headers $Headers
+            return
+        }
+    }
+
     $label = ''
     try {
         $selected = Get-HomeAssistantState -EntityId $script:DaemonEntity.NewWorkspace -Headers $Headers
@@ -2641,27 +2674,6 @@ function Sync-DaemonNewSession {
         }
     }
 
-    # Resume, if one is selected. The chosen session brings its own working
-    # directory: resuming a conversation somewhere other than where it happened
-    # would point the agent at the wrong tree. The workspace selector is therefore
-    # ignored for a resume, and only the profile still applies.
-    $resumeSession = $null
-    $resumeLabel = ''
-    try {
-        $resumeState = Get-HomeAssistantState -EntityId $script:DaemonEntity.NewResume -Headers $Headers
-        $resumeLabel = [string]$resumeState.state
-        if (-not [string]::IsNullOrWhiteSpace($resumeLabel) -and
-            $resumeLabel -notin @('unknown', 'unavailable', $script:CopilotMqttNewSessionOption)) {
-            $resumeSession = @($resumable) | Where-Object { $_.Label -eq $resumeLabel } | Select-Object -First 1
-            if ($null -eq $resumeSession) {
-                Write-DaemonLog -Message "resume requested for unknown session '$resumeLabel'"
-                Set-CopilotMqttNewSessionResult -Text "That session is no longer resumable" -Headers $Headers
-                return
-            }
-        }
-    }
-    catch { }
-
     if ($null -ne $resumeSession) {
         $resumeDirectory = [string]$resumeSession.Folder
         if ([string]::IsNullOrWhiteSpace($resumeDirectory) -or -not [System.IO.Directory]::Exists($resumeDirectory)) {
@@ -2670,9 +2682,6 @@ function Sync-DaemonNewSession {
             $resumeDirectory = $directory
         }
 
-        # The resume list comes from Agency and holds Copilot sessions, so a resume
-        # always goes through Agency whichever agent is selected for new sessions.
-        $chosenLauncher = 'agency'
         $short = $resumeSession.SessionId.Substring(0, [Math]::Min(8, $resumeSession.SessionId.Length))
         Write-DaemonLog -Message "resume requested for $short ($resumeDirectory)$(if ($agencyProfile) { " profile '$agencyProfile'" })"
         Set-CopilotMqttNewSessionResult -Text "Resuming $resumeLabel..." -Headers $Headers
@@ -3543,7 +3552,8 @@ function Sync-DaemonSessions {
     $newSessionEnabled = [bool](Get-BridgeSetting 'newSession.enabled' $true)
     $installedLaunchers = @(Get-BridgeAvailableLaunchers)
     $includeProfile = $newSessionEnabled -and $installedLaunchers -contains 'agency'
-    $includeResume = $newSessionEnabled -and $installedLaunchers -contains 'agency'
+    # Every agent's sessions can be resumed now, not only Agency's.
+    $includeResume = $newSessionEnabled -and $installedLaunchers.Count -gt 0
     $includeAgent = $newSessionEnabled -and $installedLaunchers.Count -gt 1
     $capabilities = @{
         newSession = $newSessionEnabled
