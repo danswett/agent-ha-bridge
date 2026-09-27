@@ -167,6 +167,35 @@ Test-That 'the newest user or assistant entry is reported' {
 Test-That 'housekeeping entries do not count as activity' { $timed.LastActivityAt -lt [DateTimeOffset]'2026-09-27T09:00:00Z' }
 Test-That 'a batch with no timestamps reports none' { $null -eq (Get-ClaudeActivityFromTranscript -Lines $endOfTurn).LastActivityAt }
 
+Write-Host ''
+Write-Host '--- the newest line, in terminal order ---'
+
+# Claude Code shows thinking summaries and replies in one stream. The card follows
+# the newest of either kind, or it reads as out of order against the terminal.
+$thenThought = Get-ClaudeActivityFromTranscript -Lines @(
+    (New-Line 'assistant' @(@{ type = 'text'; text = 'a reply' }))
+    (New-Line 'assistant' @(@{ type = 'thinking'; thinking = 'a later thought' }))
+)
+Test-That 'a thought after a reply is the newest line' {
+    $thenThought.Latest -eq 'a later thought' -and $thenThought.LatestIsThinking
+}
+Test-That 'while the reply is still kept as the response' { $thenThought.Response -eq 'a reply' }
+
+$thenReply = Get-ClaudeActivityFromTranscript -Lines @(
+    (New-Line 'assistant' @(@{ type = 'thinking'; thinking = 'a thought' }))
+    (New-Line 'assistant' @(@{ type = 'text'; text = 'the reply' }))
+)
+Test-That 'a reply after a thought is the newest line' { $thenReply.Latest -eq 'the reply' -and -not $thenReply.LatestIsThinking }
+
+$empty = Get-ClaudeActivityFromTranscript -Lines @((New-Line 'assistant' @(@{ type = 'thinking'; thinking = '' })))
+Test-That 'an empty thinking block is not a line' { $null -eq $empty.Latest }
+
+$newTurn = Get-ClaudeActivityFromTranscript -Lines @(
+    (New-Line 'assistant' @(@{ type = 'thinking'; thinking = 'last turn' }))
+    (New-Line 'user' 'next question')
+)
+Test-That 'a new message clears the newest line' { $null -eq $newTurn.Latest }
+
 $toolResult = New-Line 'user' @(@{ type = 'tool_result'; tool_use_id = 'x'; content = 'ok' })
 Test-That 'a tool result is not a new turn' {
     -not (Get-ClaudeActivityFromTranscript -Lines @($endOfTurn + $toolResult)).TurnStarted

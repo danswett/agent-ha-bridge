@@ -62,7 +62,7 @@ try {
 
     Publish-BridgeSessionStatus -SessionId $sessionId -SessionName $display.Name `
         -Machine $display.Machine -Headers $headers -Status 'waiting' -Activity $message `
-        -ExtraAttributes @{ message = $message }
+        -ExtraAttributes @{ message = $message } -PreserveActivityDetail
 
     $body = @(
         "Session: $($display.Name)"

@@ -71,9 +71,13 @@ try {
         $response = $activity.Response
     }
 
+    # Status only. The daemon streams the finished reply onto the card from the
+    # transcript within a tick; publishing it here as well replaced the card's
+    # attributes with a bare set - emptying its body until something republished it -
+    # and put the whole reply in the status line.
     if ($exists) {
         Publish-BridgeSessionStatus -SessionId $sessionId -SessionName $display.Name `
-            -Machine $display.Machine -Headers $headers -Status 'idle' -Activity ([string]$response)
+            -Machine $display.Machine -Headers $headers -Status 'idle'
     }
 
     Send-BridgeResponseNotification -SessionName $display.Name -Response ([string]$response) -Headers $headers

@@ -1287,7 +1287,7 @@ ha-select, mwc-select { width: 100%; }
 
 {{ q }}{% elif resp %}
 
-{{ resp }}{% endif %}
+{% if state_attr('$activityEntity','response_kind') == 'reasoning' %}🧠 {% endif %}{{ resp }}{% endif %}
 {% set r = state_attr('$activityEntity','reasoning') %}{% set hist = state_attr('$activityEntity','history') %}{% if r %}<details><summary><em>🧠 reasoning</em></summary>
 
 {{ r }}

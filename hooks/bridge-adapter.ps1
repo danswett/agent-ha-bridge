@@ -115,7 +115,13 @@ function Publish-BridgeSessionStatus {
         [Parameter(Mandatory)][hashtable]$Headers,
         [Parameter(Mandatory)][string]$Status,
         [string]$Activity,
-        [hashtable]$ExtraAttributes
+        [hashtable]$ExtraAttributes,
+
+        # Keep the activity attributes already published - the response, history and
+        # reasoning the card body is drawn from - and change only the status line.
+        # Without it the activity is replaced by session and machine alone, which
+        # empties the card for an adapter whose daemon streams the body.
+        [switch]$PreserveActivityDetail
     )
 
     $attributes = @{
@@ -129,8 +135,24 @@ function Publish-BridgeSessionStatus {
 
     Set-CopilotMqttStatus -SessionId $SessionId -Status $Status -Headers $Headers -Attributes $attributes
     if (-not [string]::IsNullOrWhiteSpace($Activity)) {
-        Set-CopilotMqttActivity -SessionId $SessionId -Summary $Activity `
-            -Detail @{ session = $SessionName; machine = $Machine } -Headers $Headers
+        $detail = @{}
+        if ($PreserveActivityDetail) {
+            try {
+                $node = Get-CopilotMqttNodeId -SessionId $SessionId
+                $current = Get-HomeAssistantState -EntityId "sensor.${node}_activity" -Headers $Headers
+                foreach ($property in $current.attributes.PSObject.Properties) {
+                    # Home Assistant adds these itself; echoing them back is noise.
+                    if ($property.Name -in @('friendly_name', 'icon', 'device_class', 'unit_of_measurement')) { continue }
+                    $detail[$property.Name] = $property.Value
+                }
+            }
+            catch {
+                # Nothing published yet: there is nothing to preserve.
+            }
+        }
+        $detail['session'] = $SessionName
+        $detail['machine'] = $Machine
+        Set-CopilotMqttActivity -SessionId $SessionId -Summary $Activity -Detail $detail -Headers $Headers
     }
 }
 

@@ -16,7 +16,17 @@
  * daemon downloads them and attaches them to the prompt.
  */
 
-const CARD_VERSION = '1.10.0';
+const CARD_VERSION = '1.11.0';
+
+// The working line, in the style of Claude Code's own spinner: its glyph cycle, and a
+// word picked once per turn. Claude Code does not record which word it chose, so the
+// card picks its own from the same kind of list.
+const SPINNER_GLYPHS = ['·', '✢', '✳', '✶', '✻', '✽', '✻', '✶', '✳', '✢'];
+const SPINNER_VERBS = [
+  'Thinking', 'Pondering', 'Slithering', 'Brewing', 'Conjuring', 'Noodling', 'Percolating',
+  'Mulling', 'Cogitating', 'Simmering', 'Ruminating', 'Tinkering', 'Churning', 'Musing',
+  'Crafting', 'Forging', 'Marinating', 'Synthesizing', 'Deliberating', 'Puttering',
+];
 
 class AgentBridgeReplyCard extends HTMLElement {
   constructor() {
@@ -400,6 +410,12 @@ class AgentBridgeActivityCard extends HTMLElement {
       summary { cursor: pointer; font-style: italic; color: var(--secondary-text-color); }
       ul { margin: 6px 0; padding-left: 20px; }
       .plain { white-space: pre-wrap; }
+      /* A thinking summary shown as the newest line, as the terminal shows it. */
+      .response.thinking { font-style: italic; color: var(--secondary-text-color); }
+      .response.thinking::before { content: '🧠'; float: left; margin: 0 6px 0 0; font-style: normal; }
+      .working { margin-top: 8px; color: var(--agent-bridge-spinner-color, #d97757); font-variant-numeric: tabular-nums; }
+      .working .glyph { display: inline-block; width: 1.1em; text-align: center; }
+      .working .elapsed { color: var(--secondary-text-color); }
       [hidden] { display: none !important; }
     `;
 
@@ -411,6 +427,7 @@ class AgentBridgeActivityCard extends HTMLElement {
       <div class="md response" hidden></div>
       <details class="reasoning" hidden><summary>🧠 reasoning</summary><div class="md r"></div></details>
       <details class="history" hidden><summary>recent activity</summary><ul></ul></details>
+      <div class="working" hidden><span class="glyph"></span><span class="verb"></span><span class="elapsed"></span></div>
     `;
     this.shadowRoot.appendChild(style);
     this.shadowRoot.appendChild(card);
@@ -425,6 +442,10 @@ class AgentBridgeActivityCard extends HTMLElement {
       r: card.querySelector('.r'),
       history: card.querySelector('.history'),
       list: card.querySelector('.history ul'),
+      working: card.querySelector('.working'),
+      glyph: card.querySelector('.working .glyph'),
+      verb: card.querySelector('.working .verb'),
+      elapsed: card.querySelector('.working .elapsed'),
     };
 
     // ha-markdown is loaded lazily by the frontend. If it was not there at build
@@ -441,6 +462,34 @@ class AgentBridgeActivityCard extends HTMLElement {
     if (this._last[key] === value) { return false; }
     this._last[key] = value;
     return true;
+  }
+
+  // Only two small spans change on each frame, so the animation never re-renders the
+  // card or moves anything around it.
+  _startSpinner() {
+    if (this._spinner) { return; }
+    let frame = 0;
+    const tick = () => {
+      this._els.glyph.textContent = SPINNER_GLYPHS[frame++ % SPINNER_GLYPHS.length];
+      const secs = Math.max(0, Math.floor((Date.now() - this._since) / 1000));
+      const text = secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`;
+      if (this._els.elapsed.textContent !== ` (${text})`) { this._els.elapsed.textContent = ` (${text})`; }
+    };
+    tick();
+    this._spinner = setInterval(tick, 120);
+  }
+
+  _stopSpinner() {
+    if (this._spinner) { clearInterval(this._spinner); this._spinner = null; }
+  }
+
+  connectedCallback() {
+    // Re-attached after navigating away and back: resume if the session is working.
+    if (this._els && !this._els.working.hidden) { this._startSpinner(); }
+  }
+
+  disconnectedCallback() {
+    this._stopSpinner();
   }
 
   _setMarkdown(container, text) {
@@ -494,9 +543,28 @@ class AgentBridgeActivityCard extends HTMLElement {
     }
 
     const response = question ? '' : String(attr(activity, 'response') || '');
-    if (this._changed('response', response)) {
+    const thinking = attr(activity, 'response_kind') === 'reasoning';
+    if (this._changed('response', `${thinking ? 'r' : 't'}\u0001${response}`)) {
       this._els.response.hidden = !response;
+      this._els.response.classList.toggle('thinking', thinking);
       if (response) { this._setMarkdown(this._els.response, response); }
+    }
+
+    // The working line runs whenever the session is working and not waiting on you.
+    // Its turn starts when the status last changed to working.
+    const working = !question && statusText === 'working';
+    const since = working && status ? String(status.last_changed || '') : '';
+    if (this._changed('working', since)) {
+      this._els.working.hidden = !working;
+      if (working) {
+        let hash = 0;
+        for (const ch of since) { hash = (hash * 31 + ch.charCodeAt(0)) >>> 0; }
+        this._els.verb.textContent = `${SPINNER_VERBS[hash % SPINNER_VERBS.length]}…`;
+        this._since = Date.parse(since) || Date.now();
+        this._startSpinner();
+      } else {
+        this._stopSpinner();
+      }
     }
 
     const reasoning = String(attr(activity, 'reasoning') || '');

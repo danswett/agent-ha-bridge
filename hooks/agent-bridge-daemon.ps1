@@ -637,6 +637,38 @@ function Sync-DaemonHookStatus {
     $at
 }
 
+function Get-DaemonStartupStatus {
+    <#
+        The status to restore a session with when the daemon starts.
+
+        This used Copilot's lock-file check for every session, which always answers
+        'idle' for Claude, so each restart - including every update - turned a busy
+        Claude card idle until its transcript or a hook next said otherwise. A long
+        tool call writes nothing to the transcript, so that could take minutes.
+
+        A Claude hook's recorded status is authoritative when there is one; anything
+        else goes through the kind-aware check.
+    #>
+    param(
+        [Parameter(Mandatory)]$Session,
+        [Parameter(Mandatory)]$Entry
+    )
+
+    $kind = if ($Entry.PSObject.Properties.Name -contains 'Kind' -and $Entry.Kind) { [string]$Entry.Kind } else { 'copilot' }
+
+    if ($kind -eq 'claude' -and $Session.PSObject.Properties['HookStatus'] -and
+        [string]$Session.HookStatus -in @('working', 'waiting', 'idle')) {
+        return [string]$Session.HookStatus
+    }
+
+    $sessionStatus = if ($Session.PSObject.Properties.Name -contains 'Status') { [string]$Session.Status } else { '' }
+    $transcript = if ($Session.PSObject.Properties.Name -contains 'Transcript') { [string]$Session.Transcript } else { '' }
+    if (Test-BridgeSessionWorking -SessionId ([string]$Session.SessionId) -Kind $kind -Transcript $transcript -Status $sessionStatus) {
+        return 'working'
+    }
+    'idle'
+}
+
 function Read-DaemonStateFile {
     <#
         Parses one state file into a hashtable. Returns @{} for an empty file (a
@@ -2759,29 +2791,79 @@ function Update-DaemonSessionActivity {
     # can restore the whole card rather than blanking it.
     if ($entry.PSObject.Properties['LastHistory']) { $entry.LastHistory = $detail.history }
     else { $entry | Add-Member -NotePropertyName LastHistory -NotePropertyValue $detail.history -Force }
-    # The card shows the response in full; the expander is reserved for reasoning
-    # and extra detail, so nothing is split off into a "show more" remainder.
-    if (-not [string]::IsNullOrWhiteSpace($lastResponse)) {
-        $capped = $lastResponse
-        if ($capped.Length -gt $script:DaemonConfig.ResponseMaxChars) {
-            $capped = $capped.Substring(0, $script:DaemonConfig.ResponseMaxChars).TrimEnd() +
-                "`n`n_(truncated - see terminal)_"
+    # The newest line of either kind, for Claude (see Add-DaemonCardText).
+    if ($entryKind -eq 'claude') {
+        $lastMessage = if (-not $turnStarted -and $entry.PSObject.Properties['LastMessage']) { [string]$entry.LastMessage } else { '' }
+        $lastIsThinking = if (-not $turnStarted -and $entry.PSObject.Properties['LastMessageIsThinking']) { [bool]$entry.LastMessageIsThinking } else { $false }
+        if ($activity.PSObject.Properties['Latest'] -and -not [string]::IsNullOrWhiteSpace([string]$activity.Latest)) {
+            $lastMessage = [string]$activity.Latest
+            $lastIsThinking = [bool]$activity.LatestIsThinking
         }
-        $detail['response'] = $capped
+        Set-DaemonSessionProperty -Entry $entry -Name 'LastMessage' -Value $lastMessage
+        Set-DaemonSessionProperty -Entry $entry -Name 'LastMessageIsThinking' -Value $lastIsThinking
     }
-    if ($verbose -and -not [string]::IsNullOrWhiteSpace($lastReasoning)) {
-        $capped = $lastReasoning
-        if ($capped.Length -gt $script:DaemonConfig.ReasoningMaxChars) {
-            $capped = $capped.Substring(0, $script:DaemonConfig.ReasoningMaxChars).TrimEnd() + '…'
-        }
-        $detail['reasoning'] = $capped
-    }
+
+    Add-DaemonCardText -Entry $entry -Detail $detail -VerboseOn $verbose
 
     try {
         Set-CopilotMqttActivity -SessionId $id -Summary $summary -Detail $detail -Headers $Headers
     }
     catch {
         Write-DaemonLog -Message "activity publish failed for $id : $($_.Exception.Message)"
+    }
+}
+
+function Add-DaemonCardText {
+    <#
+        Puts the card's main text (and, where it applies, the reasoning expander) into
+        an activity update, from a session's remembered state.
+
+        Claude Code shows its thinking summaries and its replies in one stream, in the
+        order they happen. Showing the last reply as the response and the last thought
+        in an expander below it put an older line above a newer one, so the card read as
+        out of order against the terminal. With Detailed activity on, a Claude card
+        instead shows the newest line of either kind, and `response_kind` says whether
+        it is reasoning. Other agents keep the separate expander.
+
+        Shared by the live update, the verbose toggle and the restart restore, so all
+        three lay the card out the same way.
+    #>
+    param(
+        [Parameter(Mandatory)]$Entry,
+        [Parameter(Mandatory)][hashtable]$Detail,
+        [bool]$VerboseOn
+    )
+
+    $kind = if ($Entry.PSObject.Properties.Name -contains 'Kind' -and $Entry.Kind) { [string]$Entry.Kind } else { 'copilot' }
+    $shown = if ($Entry.PSObject.Properties['LastResponse']) { [string]$Entry.LastResponse } else { '' }
+    $shownKind = 'text'
+
+    if ($kind -eq 'claude') {
+        $lastMessage = if ($Entry.PSObject.Properties['LastMessage']) { [string]$Entry.LastMessage } else { '' }
+        if ($VerboseOn -and -not [string]::IsNullOrWhiteSpace($lastMessage)) {
+            $shown = $lastMessage
+            if ($Entry.PSObject.Properties['LastMessageIsThinking'] -and [bool]$Entry.LastMessageIsThinking) { $shownKind = 'reasoning' }
+        }
+    }
+
+    # The card shows the text in full; nothing is split off into a "show more".
+    if (-not [string]::IsNullOrWhiteSpace($shown)) {
+        if ($shown.Length -gt $script:DaemonConfig.ResponseMaxChars) {
+            $shown = $shown.Substring(0, $script:DaemonConfig.ResponseMaxChars).TrimEnd() +
+                "`n`n_(truncated - see terminal)_"
+        }
+        $Detail['response'] = $shown
+        $Detail['response_kind'] = $shownKind
+    }
+
+    # Claude's reasoning is already inline, in order; repeating it below would put it
+    # out of order again.
+    $reasoning = if ($Entry.PSObject.Properties['LastReasoning']) { [string]$Entry.LastReasoning } else { '' }
+    if ($VerboseOn -and $kind -ne 'claude' -and -not [string]::IsNullOrWhiteSpace($reasoning)) {
+        if ($reasoning.Length -gt $script:DaemonConfig.ReasoningMaxChars) {
+            $reasoning = $reasoning.Substring(0, $script:DaemonConfig.ReasoningMaxChars).TrimEnd() + '…'
+        }
+        $Detail['reasoning'] = $reasoning
     }
 }
 
@@ -3358,23 +3440,10 @@ function Update-SessionsForVerbose {
             verbose = $VerboseOn
             updated = [DateTimeOffset]::Now.ToString('o')
         }
-        $lastResponse = if ($entry.PSObject.Properties['LastResponse']) { [string]$entry.LastResponse } else { '' }
-        if (-not [string]::IsNullOrWhiteSpace($lastResponse)) {
-            $capped = $lastResponse
-            if ($capped.Length -gt $script:DaemonConfig.ResponseMaxChars) {
-                $capped = $capped.Substring(0, $script:DaemonConfig.ResponseMaxChars).TrimEnd() +
-                    "`n`n_(truncated - see terminal)_"
-            }
-            $detail['response'] = $capped
+        if ($entry.PSObject.Properties['LastHistory'] -and $entry.LastHistory) {
+            $detail['history'] = @($entry.LastHistory)
         }
-        $lastReasoning = if ($entry.PSObject.Properties['LastReasoning']) { [string]$entry.LastReasoning } else { '' }
-        if ($VerboseOn -and -not [string]::IsNullOrWhiteSpace($lastReasoning)) {
-            $capped = $lastReasoning
-            if ($capped.Length -gt $script:DaemonConfig.ReasoningMaxChars) {
-                $capped = $capped.Substring(0, $script:DaemonConfig.ReasoningMaxChars).TrimEnd() + '…'
-            }
-            $detail['reasoning'] = $capped
-        }
+        Add-DaemonCardText -Entry $entry -Detail $detail -VerboseOn $VerboseOn
 
         try {
             Set-CopilotMqttActivity -SessionId $id -Summary $summary -Detail $detail -Headers $Headers
@@ -3508,9 +3577,21 @@ function Invoke-DaemonReply {
     # explicitly from the registration their hooks maintain. Without this the
     # injector falls back to the Copilot-only lock file, finds nothing, and the reply
     # box fails silently - which is worse than not offering one.
+    #
+    # The live set the last reconcile found already has it. Rescanning every
+    # registration and the whole process list here cost a noticeable slice of each
+    # send, so that is only the fallback.
     $explicitPid = 0
-    $claudeSession = (Get-LiveClaudeSessions)[$SessionId]
-    if ($null -ne $claudeSession) { $explicitPid = [int]$claudeSession.ProcessId }
+    $known = if ($script:DaemonLive) { $script:DaemonLive[$SessionId] } else { $null }
+    if ($null -ne $known -and $known.PSObject.Properties['Kind'] -and [string]$known.Kind -in @('claude', 'codex') -and
+        $known.PSObject.Properties['ProcessId'] -and [int]$known.ProcessId -gt 0 -and
+        $null -ne (Get-Process -Id ([int]$known.ProcessId) -ErrorAction SilentlyContinue)) {
+        $explicitPid = [int]$known.ProcessId
+    }
+    if ($explicitPid -le 0) {
+        $claudeSession = (Get-LiveClaudeSessions)[$SessionId]
+        if ($null -ne $claudeSession) { $explicitPid = [int]$claudeSession.ProcessId }
+    }
     if ($explicitPid -le 0) {
         $codexSession = (Get-LiveCodexSessions)[$SessionId]
         if ($null -ne $codexSession) { $explicitPid = [int]$codexSession.ProcessId }
@@ -3603,7 +3684,7 @@ function Resolve-DaemonPrimedCard {
     #>
     param(
         [Parameter(Mandatory)]$Entry,
-        [Parameter(Mandatory)][ValidateSet('working', 'idle')][string]$Status,
+        [Parameter(Mandatory)][ValidateSet('working', 'waiting', 'idle')][string]$Status,
         [bool]$VerboseOn
     )
 
@@ -3621,12 +3702,7 @@ function Resolve-DaemonPrimedCard {
     if ($Entry.PSObject.Properties['LastHistory'] -and $Entry.LastHistory) {
         $detail['history'] = @($Entry.LastHistory)
     }
-    if ($Entry.PSObject.Properties['LastResponse'] -and -not [string]::IsNullOrWhiteSpace([string]$Entry.LastResponse)) {
-        $detail['response'] = [string]$Entry.LastResponse
-    }
-    if ($VerboseOn -and $Entry.PSObject.Properties['LastReasoning'] -and -not [string]::IsNullOrWhiteSpace([string]$Entry.LastReasoning)) {
-        $detail['reasoning'] = [string]$Entry.LastReasoning
-    }
+    Add-DaemonCardText -Entry $Entry -Detail $detail -VerboseOn $VerboseOn
 
     [pscustomobject]@{ Summary = $summary; Detail = $detail }
 }
@@ -3644,6 +3720,10 @@ function Start-BridgeDaemon {
     $script:DaemonLive = $live
 
     Write-DaemonLog -Message "daemon starting (pid $PID), $($live.Count) live session(s)"
+
+    # Compile the console injector now rather than on the first reply. The compile
+    # takes about 650 ms, which the first reply after every start used to wait for.
+    try { Initialize-CopilotConsoleInjector } catch { }
 
     # Provision the dashboard's Detailed activity helper before anything renders it.
     if (Initialize-CopilotVerboseToggle) {
@@ -3703,7 +3783,7 @@ function Start-BridgeDaemon {
         $entry = $state[$sid]
         if ($null -eq $entry) { continue }
         $node = Get-CopilotMqttNodeId -SessionId $sid
-        $status = if (Test-CopilotSessionWorking -SessionId $sid) { 'working' } else { 'idle' }
+        $status = Get-DaemonStartupStatus -Session $session -Entry $entry
 
         # Provision entities added after this session was first published. A session
         # already recorded in state never goes through Sync-DaemonSessions' publish
@@ -3778,6 +3858,9 @@ function Start-BridgeDaemon {
                 "text.${node}_reply"
                 "select.${node}_decision"
                 "button.${node}_submit"
+                # The reply card publishes here rather than to the text box. Left out,
+                # a card reply waited for the 15-second reconcile to be noticed.
+                "sensor.${node}_reply_payload"
             }
         ) + @($script:DaemonConfig.VerboseToggle)
 
@@ -3812,6 +3895,19 @@ function Start-BridgeDaemon {
             }
             catch {
                 Write-DaemonLog -Message "verbose refresh failed: $($_.Exception.Message)"
+            }
+        }
+
+        # A reply from the dashboard is delivered before anything else. The reconcile
+        # below would get to it too, but only after a string of unrelated Home
+        # Assistant calls. The payload stamp and submit press are recorded before
+        # delivery, so the reconcile's own pass cannot send it a second time.
+        if ($null -ne $hit -and $hit.EntityId -match '_(reply|reply_payload|submit)$') {
+            try {
+                Invoke-PendingReplies -Headers $headers -State $state -Live $script:DaemonLive
+            }
+            catch {
+                Write-DaemonLog -Message "reply delivery failed: $($_.Exception.Message)"
             }
         }
 

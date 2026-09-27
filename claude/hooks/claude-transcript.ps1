@@ -61,6 +61,8 @@ function Get-ClaudeActivityFromTranscript {
     $status = $null
     $turnStarted = $false
     $lastActivityAt = $null
+    $latest = $null
+    $latestIsThinking = $false
     $history = New-Object System.Collections.Generic.List[string]
 
     foreach ($line in $Lines) {
@@ -100,6 +102,8 @@ function Get-ClaudeActivityFromTranscript {
                 $status = 'working'
                 $turnStarted = $true
                 $reasoning = $null
+                $latest = $null
+                $latestIsThinking = $false
                 $history.Clear()
                 $summary = 'Reading your message'
                 $history.Add($summary)
@@ -121,7 +125,11 @@ function Get-ClaudeActivityFromTranscript {
                 }
                 'thinking' {
                     $text = [string]$block.thinking
-                    if (-not [string]::IsNullOrWhiteSpace($text)) { $reasoning = $text.Trim() }
+                    if (-not [string]::IsNullOrWhiteSpace($text)) {
+                        $reasoning = $text.Trim()
+                        $latest = $reasoning
+                        $latestIsThinking = $true
+                    }
                 }
                 'text' {
                     $text = [string]$block.text
@@ -132,6 +140,8 @@ function Get-ClaudeActivityFromTranscript {
                             $history.Add($summary)
                         }
                         $response = $text.Trim()
+                        $latest = $response
+                        $latestIsThinking = $false
                     }
                 }
             }
@@ -149,6 +159,11 @@ function Get-ClaudeActivityFromTranscript {
         TurnStarted = $turnStarted
         # Time of the newest user or assistant entry in the batch, or $null.
         LastActivityAt = $lastActivityAt
+        # The newest message of either kind, and whether it was a thinking summary.
+        # Claude Code shows thinking summaries and replies in one stream, so this is
+        # what matches the terminal's order; Response alone runs behind it.
+        Latest = $latest
+        LatestIsThinking = $latestIsThinking
     }
 }
 
