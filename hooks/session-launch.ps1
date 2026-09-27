@@ -419,7 +419,7 @@ function Find-BridgeUnixCommand {
     #>
     param([Parameter(Mandatory)][string]$Name)
 
-    $dirs = @('/opt/homebrew/bin', '/usr/local/bin', (Join-Path $HOME '.local/bin'),
+    $dirs = @('/opt/homebrew/bin', '/usr/local/bin', '/opt/local/bin', (Join-Path $HOME '.local/bin'),
         (Join-Path $HOME '.claude/local'), (Join-Path $HOME '.npm-global/bin'), (Join-Path $HOME '.bun/bin'))
     foreach ($dir in $dirs) {
         $candidate = Join-Path $dir $Name

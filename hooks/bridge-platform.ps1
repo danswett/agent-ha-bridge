@@ -214,7 +214,9 @@ function Get-BridgeTmuxPath {
     #>
     $command = Get-Command tmux -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($command) { return $command.Source }
-    foreach ($candidate in @('/opt/homebrew/bin/tmux', '/usr/local/bin/tmux', '/usr/bin/tmux')) {
+    # Homebrew on Apple silicon, then on Intel, then MacPorts - which Intel Macs use now
+    # that Homebrew has dropped them.
+    foreach ($candidate in @('/opt/homebrew/bin/tmux', '/usr/local/bin/tmux', '/opt/local/bin/tmux', '/usr/bin/tmux')) {
         if ([IO.File]::Exists($candidate)) { return $candidate }
     }
     $null

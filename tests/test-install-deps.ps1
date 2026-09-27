@@ -52,7 +52,16 @@ else {
     Test-That 'on macOS Node installs from Homebrew' { (Get-BridgeDependencyCommand -Name 'node') -eq 'brew install node' }
     Test-That 'and so does PowerShell' { (Get-BridgeDependencyCommand -Name 'pwsh') -eq 'brew install powershell' }
 }
-Test-That 'tmux installs from Homebrew' { (Get-BridgeDependencyCommand -Name 'tmux') -eq 'brew install tmux' }
+Test-That 'tmux installs from Homebrew where it is available' {
+    $script:BridgeDependencies.tmux.Manager -ne 'brew' -or (Get-BridgeDependencyCommand -Name 'tmux') -eq 'brew install tmux'
+}
+# Intel Macs, which Homebrew no longer supports, use MacPorts.
+$savedManager = $script:BridgeDependencies.tmux.Manager
+$script:BridgeDependencies.tmux.Manager = 'port'
+Test-That 'through MacPorts it is a system install, so sudo, and never a prompt of its own' {
+    (Get-BridgeDependencyCommand -Name 'tmux') -eq 'sudo port -N install tmux'
+}
+$script:BridgeDependencies.tmux.Manager = $savedManager
 Test-That 'the Copilot CLI is the published npm package' {
     (Get-BridgeDependencyCommand -Name 'copilot') -eq 'npm install -g @github/copilot'
 }

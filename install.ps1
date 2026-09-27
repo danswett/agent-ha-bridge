@@ -200,12 +200,28 @@ $script:BridgeDependencies = [ordered]@{
         Why     = 'on macOS each session runs in tmux, which is how replies from the dashboard reach it'
     }
 }
-# macOS installs through Homebrew what Windows installs through winget.
+# macOS installs through Homebrew what Windows installs through winget - or, on an
+# Intel Mac, which Homebrew no longer supports, through MacPorts.
 if (-not $script:BridgeIsWindows) {
-    $script:BridgeDependencies.pwsh.Manager = 'brew'
-    $script:BridgeDependencies.pwsh.Package = 'powershell'
-    $script:BridgeDependencies.node.Manager = 'brew'
-    $script:BridgeDependencies.node.Package = 'node'
+    # MacPorts' folder, so the checks below - and anything it installs - are found.
+    if ([IO.Directory]::Exists('/opt/local/bin') -and (($env:PATH -split ':') -notcontains '/opt/local/bin')) {
+        $env:PATH = "$env:PATH`:/opt/local/bin"
+    }
+    $useMacPorts = -not (Get-Command brew -ErrorAction SilentlyContinue) -and
+        ((Get-Command port -ErrorAction SilentlyContinue) -or [IO.File]::Exists('/opt/local/bin/port'))
+    if ($useMacPorts) {
+        $script:BridgeDependencies.pwsh.Manager = 'port'
+        $script:BridgeDependencies.pwsh.Package = 'powershell'
+        $script:BridgeDependencies.node.Manager = 'port'
+        $script:BridgeDependencies.node.Package = 'nodejs22 npm10'
+        $script:BridgeDependencies.tmux.Manager = 'port'
+    }
+    else {
+        $script:BridgeDependencies.pwsh.Manager = 'brew'
+        $script:BridgeDependencies.pwsh.Package = 'powershell'
+        $script:BridgeDependencies.node.Manager = 'brew'
+        $script:BridgeDependencies.node.Package = 'node'
+    }
 }
 
 function Get-BridgeDependencyCommand {
@@ -221,6 +237,8 @@ function Get-BridgeDependencyCommand {
         }
         'npm' { return "npm install -g $($dep.Package)" }
         'brew' { return "brew install $($dep.Package)" }
+        # MacPorts installs system-wide, so it asks for the Mac's password.
+        'port' { return "sudo port -N install $($dep.Package)" }
         default { throw "Unknown package manager '$($dep.Manager)' for '$Name'." }
     }
 }
@@ -251,7 +269,7 @@ function Update-BridgeSessionPath {
     # macOS has no stored PATH to merge (and separates entries with ':'); Homebrew's
     # folder is added instead, so something brew just installed is found.
     if (-not $script:BridgeIsWindows) {
-        foreach ($dir in @('/opt/homebrew/bin', '/usr/local/bin')) {
+        foreach ($dir in @('/opt/homebrew/bin', '/usr/local/bin', '/opt/local/bin')) {
             if ([IO.Directory]::Exists($dir) -and (($env:PATH -split ':') -notcontains $dir)) { $env:PATH = "$env:PATH`:$dir" }
         }
         return
@@ -1728,7 +1746,7 @@ if (-not $SkipTask -and -not $script:BridgeIsWindows) {
     try {
         if ($TargetHome) { throw 'a -TargetHome sandbox does not register a LaunchAgent' }
         $pwshPath = (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source
-        $pathValue = @(@($env:PATH -split ':') + @('/opt/homebrew/bin', '/usr/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin') |
+        $pathValue = @(@($env:PATH -split ':') + @('/opt/homebrew/bin', '/usr/local/bin', '/opt/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin') |
             Where-Object { $_ } | Select-Object -Unique) -join ':'
         $plist = Get-BridgeLaunchAgentPlist -Label $launchAgentLabel -PwshPath $pwshPath `
             -DaemonPath (Join-Path $hooksDir 'agent-bridge-daemon.ps1') `

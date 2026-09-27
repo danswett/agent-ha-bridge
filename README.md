@@ -93,7 +93,7 @@ only a Home Assistant token.
 * Windows 10/11 and **PowerShell 7+** — the installer offers to install it if you
   don't have it, including when you paste the one-liner into Windows PowerShell
 * or macOS 13+ with **PowerShell 7+** and **tmux** — the macOS one-liner installs both
-  through Homebrew, and offers to install Homebrew too
+  (through Homebrew on Apple silicon, Microsoft's package and MacPorts on Intel)
 * At least one supported client. The installer asks which of
   **[GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/use-copilot-agents/use-copilot-cli)**,
   **Claude Code**, **Codex CLI** and the **MCP server** to configure (detecting what
@@ -137,10 +137,18 @@ The one-liner, in Terminal:
 curl -fsSL https://raw.githubusercontent.com/danswett/agent-ha-bridge/main/bootstrap.sh | bash
 ```
 
-It installs what is missing through [Homebrew](https://brew.sh) - offering to install
-Homebrew itself first, which asks for your Mac password - then PowerShell 7 and tmux,
-and hands over to the same installer, which asks the same questions. From a clone it
-is `pwsh ./install.ps1`.
+It installs what is missing, then hands over to the same installer, which asks the
+same questions. From a clone it is `pwsh ./install.ps1`.
+
+* **Apple silicon:** PowerShell 7 and tmux come from [Homebrew](https://brew.sh),
+  which it offers to install first.
+* **Intel:** Homebrew no longer supports Intel Macs, so PowerShell comes from
+  Microsoft's own package (falling back to 7.4, the long-term release, if the newest
+  needs a later macOS), and tmux from [MacPorts](https://www.macports.org) - offered
+  too, along with Apple's command line tools it needs. An Intel Mac that already has
+  a working Homebrew keeps using it.
+
+Installing any of these asks for your Mac password.
 
 What differs on a Mac:
 
