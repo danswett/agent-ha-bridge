@@ -1589,6 +1589,27 @@ if (-not $SkipTask) {
                 -Settings $settings -Principal $principal `
                 -Description 'Supervises the AI coding agent Home Assistant bridge daemon.' | Out-Null
         }
+        # Stopping the task does not stop the bridge: the task only runs wscript, which
+        # has long since exited, and the supervisor it started is detached. The old
+        # supervisor and daemon therefore kept running the previous version, and the new
+        # supervisor saw one already running and quit - so an install or update never
+        # took effect until the next logon. They are stopped here, sparing this
+        # installer's own ancestors: a dashboard update runs it from the daemon.
+        if (-not $TargetHome) {
+            $ancestors = @{}
+            $walk = $PID
+            for ($i = 0; $i -lt 16 -and $walk; $i++) {
+                $ancestors[[int]$walk] = $true
+                $walk = (Get-CimInstance Win32_Process -Filter "ProcessId=$walk" -ErrorAction SilentlyContinue).ParentProcessId
+            }
+            foreach ($proc in @(Get-CimInstance Win32_Process -Filter "Name='pwsh.exe'" -ErrorAction SilentlyContinue)) {
+                if ($ancestors.ContainsKey([int]$proc.ProcessId)) { continue }
+                if ([string]$proc.CommandLine -match 'agent-bridge-(supervisor|daemon)\.ps1') {
+                    Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+                    Write-Host "    stopped the running $($Matches[1]) (pid $($proc.ProcessId))"
+                }
+            }
+        }
         Start-ScheduledTask -TaskName $taskName
         Write-Host '    registered and started'
         $taskRegistered = $true

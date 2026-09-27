@@ -140,6 +140,11 @@ $script:DaemonRegistrationStamps = @{}
 $script:DaemonPendingLaunch = $null
 $script:DaemonReconcileNow = $false
 
+# Adapter installs started for agents installed after the bridge (Sync-DaemonClients),
+# and why the daemon should restart once the pass is done - to load a new adapter.
+$script:DaemonClientSetup = @{}
+$script:DaemonRestartRequested = ''
+
 # Sessions whose reply-payload sensor has been checked this run, so the probe costs
 # one Home Assistant read per session rather than one per reconcile.
 $script:DaemonPayloadSensorChecked = @{}
@@ -3013,6 +3018,108 @@ function Add-DaemonCardText {
     }
 }
 
+function Get-DaemonClientAdapterInstalled {
+    <# Whether a client's bridge adapter is in place, from the files its installer leaves. #>
+    param([Parameter(Mandatory)][ValidateSet('claude', 'codex')][string]$Client)
+
+    switch ($Client) {
+        'claude' { return Test-Path -LiteralPath (Join-Path $HOME '.claude\ha-bridge\claude-session.ps1') }
+        'codex'  { return Test-Path -LiteralPath (Join-Path $HOME '.agent-ha-bridge\codex-bridge\plugins\agent-ha-bridge\hooks\codex-session.ps1') }
+    }
+}
+
+function Add-DaemonConfiguredClient {
+    <#
+        Adds a client to `clients` in the bridge config, so later installs and updates
+        keep its adapter current. The file is re-read rather than rewritten from memory,
+        so nothing changed on disk since the daemon started is lost.
+    #>
+    param([Parameter(Mandatory)][string]$Client)
+
+    $path = Join-Path $HOME '.agent-ha-bridge\config.json'
+    if (-not (Test-Path -LiteralPath $path)) { return }
+    $config = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
+    $clients = @()
+    if ($config.PSObject.Properties['clients']) { $clients = @($config.clients | ForEach-Object { [string]$_ }) }
+    if ($clients -contains $Client) { return }
+    $clients += $Client
+    if ($config.PSObject.Properties['clients']) { $config.clients = @($clients) }
+    else { $config | Add-Member -NotePropertyName 'clients' -NotePropertyValue @($clients) -Force }
+    $config | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $path -Encoding UTF8
+    $script:BridgeUserConfig = $config
+}
+
+function Sync-DaemonClients {
+    <#
+        Sets up the bridge for a coding agent installed after the bridge was.
+
+        Launching an agent from the dashboard only needs the agent on PATH, but showing
+        its sessions, streaming them and answering them needs its adapter - hooks the
+        agent runs - which used to mean re-running the installer by hand. Now an agent
+        that is installed but has no adapter gets one: its installer, shipped with the
+        bridge, runs in the background; the agent joins `clients` so updates keep it
+        current; the launch note says what happened; and the daemon restarts to load
+        the adapter.
+
+        Codex additionally asks, inside Codex, for its hooks to be trusted once. That is
+        Codex's own safety check and is left to the user; the note says so.
+
+        Off with `autoConfigureClients: false`. Tried once per client per daemon run,
+        so a failing installer is not retried in a loop.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Headers)
+
+    if (-not [bool](Get-BridgeSetting 'autoConfigureClients' $true)) { return }
+
+    foreach ($client in @('claude', 'codex')) {
+        $job = $script:DaemonClientSetup[$client]
+
+        if ($null -ne $job) {
+            if ($job.Done -or -not $job.Process.HasExited) { continue }
+            $job.Done = $true
+            $label = Get-BridgeLauncherLabel -Launcher $client
+            if ($job.Process.ExitCode -eq 0 -and (Get-DaemonClientAdapterInstalled -Client $client)) {
+                try { Add-DaemonConfiguredClient -Client $client } catch { Write-DaemonLog -Message "could not record $client in the config: $($_.Exception.Message)" }
+                Write-DaemonLog -Message "set up the $label adapter (log: $($job.Log)); restarting to load it"
+                $note = "$label found and set up for the dashboard."
+                if ($client -eq 'codex') { $note += ' Open Codex once and approve the agent-ha-bridge hooks so its sessions show here.' }
+                else { $note += ' Restart any running sessions so they pick it up.' }
+                try { Set-CopilotMqttNewSessionResult -Headers $Headers -Text $note } catch { }
+                $script:DaemonRestartRequested = "load the $label adapter"
+            }
+            else {
+                Write-DaemonLog -Message "setting up the $label adapter failed (exit $($job.Process.ExitCode)); see $($job.Log)"
+                try { Set-CopilotMqttNewSessionResult -Headers $Headers -Text "$label was found but setting it up failed - run agent-ha-bridge configure." } catch { }
+            }
+            continue
+        }
+
+        if (-not (Get-BridgeLauncherPath -Launcher $client)) { continue }
+        if (Get-DaemonClientAdapterInstalled -Client $client) {
+            # Adapter present but not listed - installed by hand - so just record it.
+            $listed = @(Get-BridgeSetting 'clients' @()) -contains $client
+            if (-not $listed) { try { Add-DaemonConfiguredClient -Client $client } catch { } }
+            continue
+        }
+
+        $installer = Join-Path $HOME ".agent-ha-bridge\installer\$client\install-$client.ps1"
+        if (-not (Test-Path -LiteralPath $installer)) { continue }
+
+        $log = Join-Path $env:TEMP "agent-bridge-setup-$client.log"
+        try {
+            $process = Start-Process -FilePath 'pwsh' `
+                -ArgumentList "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$installer`"" `
+                -WindowStyle Hidden -PassThru -RedirectStandardOutput $log -RedirectStandardError "$log.err" -ErrorAction Stop
+            $script:DaemonClientSetup[$client] = [pscustomobject]@{ Process = $process; Log = $log; Done = $false }
+            Write-DaemonLog -Message "$(Get-BridgeLauncherLabel -Launcher $client) is installed but has no bridge adapter; setting it up (pid $($process.Id))"
+        }
+        catch {
+            $script:DaemonClientSetup[$client] = [pscustomobject]@{ Process = $null; Log = $log; Done = $true }
+            Write-DaemonLog -Message "could not start the $client adapter installer: $($_.Exception.Message)"
+        }
+    }
+}
+
 function Update-DaemonPendingLaunch {
     <#
         Follows a session launched from the dashboard until it registers, a pass at a
@@ -4272,6 +4379,7 @@ function Start-BridgeDaemon {
                 Invoke-DaemonFastActivity -Headers $headers -State $state
                 Sync-DaemonUpdateStatus -Headers $headers
                 Sync-DaemonNewSession -Headers $headers -Live $live
+                Sync-DaemonClients -Headers $headers
                 Invoke-DaemonFastActivity -Headers $headers -State $state
                 Write-DaemonState -State $state
             }
@@ -4279,6 +4387,14 @@ function Start-BridgeDaemon {
                 Write-DaemonLog -Message "reconcile failed: $($_.Exception.Message)"
             }
             $lastReconcile = [DateTimeOffset]::Now
+
+            # A newly installed adapter is only loaded at startup, so the daemon ends
+            # here and the supervisor starts it again a few seconds later. State was
+            # just written, so the new daemon carries straight on.
+            if ($script:DaemonRestartRequested) {
+                Write-DaemonLog -Message "restarting to $($script:DaemonRestartRequested)"
+                return
+            }
         }
     }
 }

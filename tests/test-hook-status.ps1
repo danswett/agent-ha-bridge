@@ -161,6 +161,101 @@ $c = Confirm-DaemonClaudeSubmit -ProcessId 1 -Transcript $tx -Offset $beforeProm
 Test-That 'an already submitted prompt needs no extra Enter' { $c.Submitted -and $c.Retries -eq 0 }
 Remove-Item -LiteralPath $tx -Force -ErrorAction SilentlyContinue
 
+Write-Host ''
+Write-Host '--- setting up an agent installed after the bridge ---'
+
+# Every side effect is stood in for: no installer runs and the real config is untouched.
+$script:Installed = @{ claude = $true; codex = $false }
+$script:Adapters = @{ claude = $true; codex = $false }
+$script:Started = @()
+$script:Recorded = @()
+$script:Notes = @()
+$script:FakeExit = 0
+function Get-BridgeLauncherPath { param([string]$Launcher) if ($script:Installed[$Launcher]) { "C:\bin\$Launcher.exe" } else { $null } }
+function Get-DaemonClientAdapterInstalled { param([string]$Client) [bool]$script:Adapters[$Client] }
+function Add-DaemonConfiguredClient { param([string]$Client) $script:Recorded += $Client }
+function Set-CopilotMqttNewSessionResult { param([string]$Text, [hashtable]$Headers) $script:Notes += $Text }
+function Start-Process {
+    param($FilePath, $ArgumentList, $WindowStyle, [switch]$PassThru, $RedirectStandardOutput, $RedirectStandardError, $ErrorAction)
+    $script:Started += [string]$ArgumentList
+    $script:FakeProcess = [pscustomobject]@{ Id = 777; HasExited = $false; ExitCode = 0 }
+    $script:FakeProcess
+}
+
+$script:DaemonClientSetup = @{}
+$script:DaemonRestartRequested = ''
+$script:FakeSettings = @{ clients = @('claude') }
+function Get-BridgeSetting { param([string]$Path, $Default) if ($script:FakeSettings.ContainsKey($Path)) { $script:FakeSettings[$Path] } else { $Default } }
+
+Sync-DaemonClients -Headers $headers
+Test-That 'an agent that is not installed is left alone' { $script:Started.Count -eq 0 }
+
+$script:Installed.codex = $true
+Sync-DaemonClients -Headers $headers
+Test-That 'a newly installed agent gets its adapter installer run' {
+    $script:Started.Count -eq 1 -and $script:Started[0] -match 'install-codex\.ps1'
+}
+Test-That 'in the background, without waiting' { -not $script:DaemonClientSetup.codex.Done }
+Test-That 'an agent whose adapter is already there is not reinstalled' { @($script:Started | Where-Object { $_ -match 'install-claude' }).Count -eq 0 }
+
+Sync-DaemonClients -Headers $headers
+Test-That 'it is not started twice while running' { $script:Started.Count -eq 1 }
+
+$script:FakeProcess.HasExited = $true
+$script:Adapters.codex = $true
+Sync-DaemonClients -Headers $headers
+Test-That 'on success the agent joins the configured clients' { $script:Recorded -contains 'codex' }
+Test-That 'the note says to approve the hooks in Codex' { ($script:Notes -join ' ') -match 'approve the agent-ha-bridge hooks' }
+Test-That 'and the daemon restarts to load the adapter' { $script:DaemonRestartRequested -match 'Codex' }
+
+$script:Started = @(); $script:DaemonRestartRequested = ''
+Sync-DaemonClients -Headers $headers
+Test-That 'a finished setup is not repeated' { $script:Started.Count -eq 0 }
+
+# A failing installer is reported once, not retried on every pass.
+$script:DaemonClientSetup = @{}
+$script:Adapters.codex = $false
+$script:Notes = @(); $script:Recorded = @()
+Sync-DaemonClients -Headers $headers
+$script:FakeProcess.HasExited = $true
+$script:FakeProcess.ExitCode = 1
+Sync-DaemonClients -Headers $headers
+Test-That 'a failed setup is reported' { ($script:Notes -join ' ') -match 'setting it up failed' -and $script:Recorded.Count -eq 0 }
+Test-That 'without a restart' { -not $script:DaemonRestartRequested }
+$script:Started = @()
+Sync-DaemonClients -Headers $headers
+Test-That 'and not retried in a loop' { $script:Started.Count -eq 0 }
+
+# An adapter installed by hand but missing from the list is recorded, not reinstalled.
+$script:DaemonClientSetup = @{}
+$script:Adapters.codex = $true
+$script:Recorded = @(); $script:Started = @()
+Sync-DaemonClients -Headers $headers
+Test-That 'a hand-installed adapter is recorded without running its installer' { ($script:Recorded -contains 'codex') -and $script:Started.Count -eq 0 }
+
+$script:DaemonClientSetup = @{}
+$script:Adapters.codex = $false
+$script:FakeSettings['autoConfigureClients'] = $false
+$script:Started = @()
+Sync-DaemonClients -Headers $headers
+Test-That 'autoConfigureClients: false turns it off' { $script:Started.Count -eq 0 }
+
+Write-Host ''
+Write-Host '--- noticing PATH changes without a restart ---'
+
+$savedPath = $env:Path
+try {
+    $env:Path = 'C:\only\this'
+    Update-BridgeProcessPath -Force
+    $parts = @($env:Path -split ';')
+    Test-That 'entries the machine and user PATH gained are added' { $parts.Count -gt 1 }
+    Test-That 'nothing already there is removed' { $parts[0] -eq 'C:\only\this' }
+    $before = $env:Path
+    Update-BridgeProcessPath -Force
+    Test-That 'running it again adds no duplicates' { $env:Path -eq $before }
+}
+finally { $env:Path = $savedPath }
+
 Remove-Item -LiteralPath $script:DaemonConfig.LogFile -Force -ErrorAction SilentlyContinue
 
 Write-Host ''

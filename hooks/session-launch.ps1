@@ -419,11 +419,48 @@ function Get-BridgeLauncherPath {
     $null
 }
 
+$script:BridgePathRefreshedAt = [DateTimeOffset]::MinValue
+
+function Update-BridgeProcessPath {
+    <#
+        Adds to this process's PATH any entries the machine and user PATH have gained
+        since it started.
+
+        The daemon runs for days, and a process's PATH is a copy taken when it started,
+        so an agent installed afterwards - `npm install -g @openai/codex` adding npm's
+        folder, say - stayed invisible until the daemon was restarted. Nothing is
+        removed, and it runs at most once a minute.
+    #>
+    param([switch]$Force)
+
+    if (-not $Force -and ([DateTimeOffset]::Now - $script:BridgePathRefreshedAt).TotalSeconds -lt 60) { return }
+    $script:BridgePathRefreshedAt = [DateTimeOffset]::Now
+
+    $current = @($env:Path -split ';' | Where-Object { $_ })
+    $known = @{}
+    foreach ($entry in $current) { $known[$entry.TrimEnd('\').ToLowerInvariant()] = $true }
+
+    $added = foreach ($scope in 'Machine', 'User') {
+        $raw = [Environment]::GetEnvironmentVariable('Path', $scope)
+        if ([string]::IsNullOrWhiteSpace($raw)) { continue }
+        foreach ($entry in ($raw -split ';')) {
+            if ([string]::IsNullOrWhiteSpace($entry)) { continue }
+            $expanded = [Environment]::ExpandEnvironmentVariables($entry)
+            $key = $expanded.TrimEnd('\').ToLowerInvariant()
+            if ($known.ContainsKey($key)) { continue }
+            $known[$key] = $true
+            $expanded
+        }
+    }
+    if (@($added).Count -gt 0) { $env:Path = (@($current) + @($added)) -join ';' }
+}
+
 function Get-BridgeAvailableLaunchers {
     <#
         The launchers installed on this machine, in preference order. This is what the
         dashboard's agent selector offers, so it cannot show a choice that would fail.
     #>
+    Update-BridgeProcessPath
     @(@($script:BridgeLaunchers.Keys) | Where-Object { Get-BridgeLauncherPath -Launcher $_ })
 }
 
