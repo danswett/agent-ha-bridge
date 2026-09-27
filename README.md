@@ -219,7 +219,7 @@ need the repository**, which matters because the one-liner doesn't leave one beh
 ```powershell
 agent-ha-bridge                 # same as `status`
 agent-ha-bridge configure       # re-run the installer, keeping your settings as defaults
-agent-ha-bridge status          # install, daemon, Home Assistant connection and dashboard cards
+agent-ha-bridge status          # install, daemon, Home Assistant connection, cards and machines
 agent-ha-bridge restart         # restart the bridge daemon
 agent-ha-bridge logs -Follow    # tail the daemon log
 agent-ha-bridge update          # check for a newer release and offer to install it

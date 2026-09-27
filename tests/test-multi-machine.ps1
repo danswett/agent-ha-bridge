@@ -409,6 +409,17 @@ function Invoke-CopilotHaWebSocket {
 
 $script:ExistingSelects = @()
 $script:SelectorCalls = @()
+# The repair path reads the helper's state and may re-point it, so both sides are
+# stubbed; without this the selector tests would reach for a real Home Assistant.
+$script:SelectorState = 'DESKTOP'
+$script:Selected = @()
+function Get-HomeAssistantHeaders { @{ Authorization = 'Bearer test' } }
+function Get-HomeAssistantState { param([string]$EntityId, [hashtable]$Headers) [pscustomobject]@{ state = $script:SelectorState } }
+function Invoke-HomeAssistantService {
+    param([string]$Domain, [string]$Service, [hashtable]$Headers, [hashtable]$Data)
+    $script:Selected += [string]$Data.option
+}
+
 $id = Initialize-BridgeMachineSelector -Machines @('DESKTOP', 'LAPTOP')
 Test-That 'a picker is created when there is a choice to make' {
     $id -eq 'input_select.agent_bridge_target_machine' -and
@@ -449,6 +460,44 @@ $script:SelectorCalls = @()
 Test-That 'blanks and duplicates never reach the option list' {
     $create = @($script:SelectorCalls | Where-Object { $_.type -eq 'input_select/create' })[0]
     (@($create.options) -join ',') -eq 'DESKTOP,LAPTOP'
+}
+
+Write-Host '--- the picker never points at a machine that is gone ---'
+
+$script:ExistingSelects = @([pscustomobject]@{ id = 'agent_bridge_target_machine'; options = @('DESKTOP', 'LAPTOP', 'SERVER') })
+$script:SelectorState = 'LAPTOP'
+$script:Selected = @()
+[void](Initialize-BridgeMachineSelector -Machines @('DESKTOP', 'SERVER'))
+Test-That 'losing the selected machine re-points the picker' {
+    # Home Assistant sets the state to 'unknown' rather than picking another option -
+    # confirmed against a live instance. The launch rows are conditional on the
+    # selection matching a machine name, so an unknown selection matches nothing and
+    # the card collapses to a dropdown with no Workspace, Profile or Launch under it.
+    (@($script:Selected) -join ',') -eq 'DESKTOP'
+}
+
+$script:SelectorState = 'unknown'
+$script:Selected = @()
+[void](Repair-BridgeMachineSelection -EntityId 'input_select.agent_bridge_target_machine' -Options @('DESKTOP', 'SERVER'))
+Test-That 'an unknown selection is repaired even when the options did not change' {
+    # It can also be left invalid by a Home Assistant restart or a hand edit, so the
+    # check runs on every rebuild rather than only after an options update.
+    (@($script:Selected) -join ',') -eq 'DESKTOP'
+}
+
+$script:SelectorState = 'SERVER'
+$script:Selected = @()
+[void](Repair-BridgeMachineSelection -EntityId 'input_select.agent_bridge_target_machine' -Options @('DESKTOP', 'SERVER'))
+Test-That 'a valid selection is left exactly where it is' {
+    # Re-pointing a good selection would yank the picker out from under whoever was
+    # about to press Launch, on every rebuild.
+    @($script:Selected).Count -eq 0
+}
+
+Test-That 'an empty option list repairs nothing rather than erroring' {
+    $script:Selected = @()
+    (-not (Repair-BridgeMachineSelection -EntityId 'input_select.x' -Options @())) -and
+    @($script:Selected).Count -eq 0
 }
 
 Write-Host '--- liveness is the one thing not retained ---'

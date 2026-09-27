@@ -2647,6 +2647,39 @@ function Sync-DaemonSessions {
     # not, because a machine you expected to see and cannot is information too.
     $onlineNames = @($machineCards | Where-Object { $_.Online } | ForEach-Object { [string]$_.Machine })
 
+    # The picker can end up pointing at a machine that has gone. Home Assistant sets
+    # the selection to 'unknown' when the option it was on is removed, and it does so
+    # asynchronously - so repairing it as part of the rebuild races that and loses.
+    # The launch rows are conditional on the selection matching a machine name, so an
+    # unknown selection renders a dropdown with nothing underneath it.
+    #
+    # Checked here on every reconcile instead, off the cached state list, so it costs
+    # nothing until something actually looks wrong.
+    if ($onlineNames.Count -gt 1) {
+        $selectorId = "input_select.$($script:BridgeMachineSelectorId)"
+        $selectorState = ''
+        # Deliberately not $state: this function takes a [hashtable]$State parameter,
+        # PowerShell variable names are case-insensitive, and assigning a state object
+        # to a typed parameter is a hard failure - it crash-looped the daemon.
+        foreach ($snapshotEntry in @($script:DaemonStatesCache)) {
+            if ($null -eq $snapshotEntry) { continue }
+            if ([string]$snapshotEntry.entity_id -eq $selectorId) {
+                $selectorState = [string]$snapshotEntry.state
+                break
+            }
+        }
+        if ($selectorState -and $onlineNames -notcontains $selectorState) {
+            try {
+                # Re-reads the live state before writing, so a stale snapshot costs a
+                # read rather than a needless change under whoever is looking at it.
+                if (Repair-BridgeMachineSelection -EntityId $selectorId -Options $onlineNames) {
+                    Write-DaemonLog -Message "machine picker was on '$selectorState', which is gone; moved it to $($onlineNames[0])"
+                }
+            }
+            catch { }
+        }
+    }
+
     # The card header carries the session name, so a rename has to rebuild the
     # dashboard too - a signature of node ids alone would leave a renamed session
     # showing its old generic title until the set of sessions happened to change. The

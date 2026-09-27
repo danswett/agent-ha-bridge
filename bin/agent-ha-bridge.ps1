@@ -223,6 +223,69 @@ function Show-Status {
             else { $env:AGENT_HA_BRIDGE_CONFIG = $previous }
         }
     }
+
+    Show-BridgeMachines -HooksDir (Join-Path $bridgeHome 'hooks') -ConfigPath $configPath
+}
+
+function Show-BridgeMachines {
+    <#
+        Every machine sharing this Home Assistant, and whether it is running.
+
+        There was no way to see this outside the dashboard, which is precisely the
+        wrong place to look when the question is "why is the dashboard showing
+        something odd" - or when a machine you expected to be there is missing.
+
+        Run in a child pwsh pointed at this install's config, so the runtime layer is
+        loaded against the right instance and nothing is left dot-sourced here.
+    #>
+    param([Parameter(Mandatory)][string]$HooksDir, [Parameter(Mandatory)][string]$ConfigPath)
+
+    if (-not (Test-Path -LiteralPath (Join-Path $HooksDir 'decision-mqtt.ps1'))) { return }
+
+    $script = @'
+param([string]$HooksDir)
+$ErrorActionPreference = 'Stop'
+. (Join-Path $HooksDir 'decision-bridge-common.ps1')
+. (Join-Path $HooksDir 'decision-mqtt.ps1')
+$headers = Get-HomeAssistantHeaders
+$states = Invoke-DecisionHttpRequest -Parameters @{
+    Method = 'Get'
+    Uri = "$($script:DecisionBridgeConfig.HomeAssistantBaseUrl)/api/states"
+    Headers = $headers
+    TimeoutSec = 15
+}
+$peers = @(Get-BridgePeerMachine -States $states)
+if ($peers.Count -eq 0) { Write-Host '    none registered yet'; return }
+foreach ($p in ($peers | Sort-Object Slug)) {
+    $mark = if ($p.Online) { 'online ' } else { 'offline' }
+    $self = if ($p.IsSelf) { ' (this machine)' } else { '' }
+    $count = @($p.Sessions).Count
+    Write-Host ("    {0}  {1,-18} {2} session(s){3}" -f $mark, $p.Machine, $count, $self)
+}
+# Only an older bridge still publishes these, and it also rebuilds the shared
+# dashboard from its own sessions alone - so it quietly overwrites everyone else's.
+$stale = @($states | Where-Object {
+    $_.entity_id -in @('sensor.agent_bridge_sessions', 'button.agent_bridge_new_session')
+})
+if ($stale.Count) {
+    Write-Host '    a machine is running a bridge older than 1.6.0 - upgrade it, or it will' -ForegroundColor Yellow
+    Write-Host '    keep replacing the shared dashboard with its own sessions only' -ForegroundColor Yellow
+}
+'@
+    $temp = Join-Path ([IO.Path]::GetTempPath()) "bridge-machines-$([guid]::NewGuid().ToString('N').Substring(0,8)).ps1"
+    $previous = $env:AGENT_HA_BRIDGE_CONFIG
+    try {
+        Set-Content -LiteralPath $temp -Value $script -Encoding UTF8
+        $env:AGENT_HA_BRIDGE_CONFIG = $ConfigPath
+        Write-Host '    machines:'
+        & (Join-Path $PSHOME 'pwsh.exe') -NoProfile -ExecutionPolicy Bypass -File $temp -HooksDir $HooksDir
+    }
+    catch { Write-Host "    could not list the machines: $($_.Exception.Message)" -ForegroundColor Yellow }
+    finally {
+        if ($null -eq $previous) { Remove-Item Env:\AGENT_HA_BRIDGE_CONFIG -ErrorAction SilentlyContinue }
+        else { $env:AGENT_HA_BRIDGE_CONFIG = $previous }
+        Remove-Item -LiteralPath $temp -Force -ErrorAction SilentlyContinue
+    }
 }
 
 function Invoke-Restart {

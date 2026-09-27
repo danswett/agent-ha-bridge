@@ -664,12 +664,53 @@ function Initialize-BridgeMachineSelector {
                 icon = 'mdi:desktop-tower-monitor'
                 options = $options
             }))
+            # Home Assistant recalculates the selection asynchronously after an options
+            # change, and repairing before that lands is simply overwritten by it. The
+            # daemon re-checks on every reconcile regardless, so this only shortens the
+            # window rather than being the thing relied on.
+            Start-Sleep -Milliseconds 1500
         }
+
+        [void](Repair-BridgeMachineSelection -EntityId $entityId -Options $options)
         return $entityId
     }
     catch {
         Write-DecisionBridgeLog "machine selector update failed: $($_.Exception.Message)"
         return ''
+    }
+}
+
+function Repair-BridgeMachineSelection {
+    <#
+        Puts the picker back on a machine that still exists.
+
+        Home Assistant does not re-point a selection when the option it was on is
+        removed - it sets the state to 'unknown', confirmed against a live instance.
+        The launch rows are conditional on the selection matching a machine name, so
+        an unknown selection matches nothing and the card collapses to a lone dropdown
+        with no workspace, profile or Launch beneath it.
+
+        Checked on every rebuild rather than only after an options change, because the
+        state can also be left invalid by a Home Assistant restart or by editing the
+        helper by hand.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$EntityId,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Options
+    )
+
+    if ($Options.Count -eq 0) { return $false }
+    try {
+        $state = [string](Get-HomeAssistantState -EntityId $EntityId -Headers (Get-HomeAssistantHeaders)).state
+        if ($Options -contains $state) { return $false }
+        Invoke-HomeAssistantService -Domain 'input_select' -Service 'select_option' `
+            -Headers (Get-HomeAssistantHeaders) `
+            -Data @{ entity_id = $EntityId; option = $Options[0] } | Out-Null
+        return $true
+    }
+    catch {
+        Write-DecisionBridgeLog "machine selection repair failed: $($_.Exception.Message)"
+        return $false
     }
 }
 
