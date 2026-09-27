@@ -240,8 +240,8 @@ function Resolve-CopilotMqttEntityIds {
         predicted. Predicting the id from the session name would break the moment a
         session is renamed, so the registry is the source of truth.
 
-        Returns a hashtable keyed Decision/Reply/Status/Activity. Missing entries mean
-        discovery has not registered yet.
+        Returns a hashtable keyed Decision/Reply/ReplyPayload/Status/Activity. Missing
+        entries mean discovery has not registered yet.
     #>
     param(
         [Parameter(Mandatory)]
@@ -252,6 +252,7 @@ function Resolve-CopilotMqttEntityIds {
     $wanted = @{
         "${node}_decision" = 'Decision'
         "${node}_reply" = 'Reply'
+        "${node}_reply_payload" = 'ReplyPayload'
         "${node}_status" = 'Status'
         "${node}_activity" = 'Activity'
     }
@@ -788,6 +789,58 @@ function Initialize-BridgeDashboard {
     }
 }
 
+$script:BridgeReplyCardUrlCache = ''
+$script:BridgeReplyCardUrlCachedAt = [datetime]::MinValue
+
+function Get-BridgeServedReplyCardUrl {
+    <#
+        The reply card's resource URL if Home Assistant will serve it, otherwise ''.
+
+        Read from the registered Lovelace resources rather than by fetching the file.
+        The resource list is what actually decides whether a browser loads the card:
+        a file sitting in www that was never registered is not usable, and rendering
+        the card in that case produces an error box where the reply box should be.
+
+        Matching is on the file name so a version query string or a different install
+        location still counts. Cached because this sits on the dashboard rebuild path
+        and installing the card is not something that happens mid-session.
+    #>
+    param(
+        [scriptblock]$Resources,
+        [int]$CacheSeconds = 300
+    )
+
+    if ($CacheSeconds -gt 0 -and
+        ((Get-Date) - $script:BridgeReplyCardUrlCachedAt).TotalSeconds -lt $CacheSeconds) {
+        return $script:BridgeReplyCardUrlCache
+    }
+
+    if (-not $Resources) {
+        $Resources = { @((Invoke-CopilotHaWebSocket -Commands @(@{ type = 'lovelace/resources' }))[0]) }
+    }
+
+    $found = ''
+    try {
+        foreach ($resource in @(& $Resources)) {
+            if ($null -eq $resource) { continue }
+            if (-not $resource.PSObject.Properties['url']) { continue }
+            $url = [string]$resource.url
+            if ([string]::IsNullOrWhiteSpace($url)) { continue }
+            $leaf = ((($url -split '\?')[0]) -split '[/\\]')[-1]
+            if ($leaf -eq 'agent-bridge-reply-card.js') { $found = $url; break }
+        }
+    }
+    catch {
+        # Unreadable resource list: fall back to the plain text box rather than risk
+        # an error box where the reply box should be.
+        $found = ''
+    }
+
+    $script:BridgeReplyCardUrlCache = $found
+    $script:BridgeReplyCardUrlCachedAt = Get-Date
+    $found
+}
+
 function Save-CopilotSessionDashboard {
     <#
         Regenerates the agent-decisions dashboard for the per-session MQTT model.
@@ -830,7 +883,14 @@ function Save-CopilotSessionDashboard {
         [switch]$IncludeProfile,
 
         # Whether to show the resume row on the new-session card.
-        [switch]$IncludeResume
+        [switch]$IncludeResume,
+
+        # Resource URL of the reply card, or empty when Home Assistant is not serving
+        # it. Empty falls back to the plain text box and Send button: a Lovelace view
+        # that references a custom card which does not exist renders an error box
+        # where the reply box should be, leaving no way to reply at all.
+        [AllowEmptyString()]
+        [string]$ReplyCardUrl = ''
     )
 
     $decisionEntities = @($Sessions | ForEach-Object { "select.$($_.Node)_decision" })
@@ -1320,7 +1380,28 @@ ha-card {
             'hui-generic-entity-row$' = 'state-badge { display: none !important; } .info { display: none !important; }'
         }
 
-        $replyCard = @{
+        # Two shapes of reply box, chosen by whether Home Assistant is serving the
+        # bridge's own card.
+        #
+        # The card is much the better of the two: it reads the textarea at the moment
+        # Send is pressed, so one press is always enough, it publishes over MQTT so a
+        # reply is not limited to the 255 characters an entity state allows, and it
+        # can carry pasted images. The text box below is kept as a fallback because a
+        # view referencing a custom card that is not installed renders an error box
+        # instead of a reply box, which would leave no way to reply at all.
+        $replyCard = if (-not [string]::IsNullOrWhiteSpace($ReplyCardUrl)) {
+            @{
+                type = 'custom:agent-bridge-reply-card'
+                card_mod = @{ style = $bareChild }
+                # Empty so the card draws no header of its own; the session card
+                # already has one.
+                name = ''
+                topic = (Get-CopilotMqttReplyPayloadTopic -Node $node)
+                placeholder = 'Reply or continue...'
+            }
+        }
+        else {
+        @{
             type = 'custom:layout-card'
             # The layout card draws its own surface. That went unnoticed while every
             # sibling had one too, but against a single shared background it is the
@@ -1386,6 +1467,7 @@ ha-card {
                     }
                 }
             )
+        }
         }
 
         # Send feedback belongs next to Send, not in the header. The header is the
@@ -1541,6 +1623,7 @@ function Set-CopilotMqttEntityIds {
     $targets = @{
         Decision = "select.${node}_decision"
         Reply = "text.${node}_reply"
+        ReplyPayload = "sensor.${node}_reply_payload"
         Status = "sensor.${node}_status"
         Activity = "sensor.${node}_activity"
     }

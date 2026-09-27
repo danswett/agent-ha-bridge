@@ -126,6 +126,10 @@ $script:DaemonConfig = @{
 # regenerated when a session appears or exits, not on every reconcile.
 $script:DaemonDashboardSignature = $null
 
+# Sessions whose reply-payload sensor has been checked this run, so the probe costs
+# one Home Assistant read per session rather than one per reconcile.
+$script:DaemonPayloadSensorChecked = @{}
+
 # Serialised state of the last successful state-file write, so an idle daemon skips
 # rewriting identical JSON every reconcile. Initialised for StrictMode.
 $script:DaemonStateLastWritten = $null
@@ -852,6 +856,187 @@ function Set-DaemonTransientActivity {
     Set-CopilotMqttActivity -SessionId $SessionId -Summary $Summary -Detail $attributes -Headers $Headers
 }
 
+function Get-BridgeAttachmentRoot {
+    <#
+        Where images from the reply card are written before being attached.
+
+        The path must not contain a space. The CLI attaches a file when the prompt
+        references it as `@<path>`, and there is no way to quote a path in that
+        syntax, so a space would split one attachment into two broken words.
+        LOCALAPPDATA normally qualifies, but it sits under the user profile, so a
+        user name containing a space would make every attachment unusable - hence
+        the fallback to the public profile, which never contains one.
+    #>
+    $root = ''
+    if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+        $root = Join-Path ([string]$env:LOCALAPPDATA) 'agent-ha-bridge\attachments'
+    }
+    if ([string]::IsNullOrWhiteSpace($root) -or $root -match '\s') {
+        $root = Join-Path ([string]$env:PUBLIC) 'agent-ha-bridge\attachments'
+    }
+    if (-not (Test-Path -LiteralPath $root)) {
+        New-Item -ItemType Directory -Path $root -Force | Out-Null
+    }
+    $root
+}
+
+function Get-BridgeReplyPayload {
+    <#
+        Reads one submission from the reply card's payload sensor.
+
+        Returns $null when there is nothing usable to send.
+
+        The stamp is the card's own timestamp, carried in the sensor state via
+        value_template. Comparing it against the last one handled is what makes a
+        duplicate delivery impossible - the same contract the Submit button's press
+        stamp already uses. The text itself is read from the attributes rather than
+        the state because Home Assistant caps a state at 255 characters and does not
+        cap attributes, which is the whole reason this entity exists.
+    #>
+    param([object]$State)
+
+    if ($null -eq $State) { return $null }
+
+    $stamp = ''
+    if ($State.PSObject.Properties['state']) { $stamp = [string]$State.state }
+    if ([string]::IsNullOrWhiteSpace($stamp) -or $stamp -in @('unknown', 'unavailable')) { return $null }
+
+    $attrs = $null
+    if ($State.PSObject.Properties['attributes']) { $attrs = $State.attributes }
+    if ($null -eq $attrs) { return $null }
+
+    $text = ''
+    if ($attrs.PSObject.Properties['text']) { $text = [string]$attrs.text }
+
+    $images = [System.Collections.Generic.List[object]]::new()
+    if ($attrs.PSObject.Properties['images'] -and $null -ne $attrs.images) {
+        foreach ($image in @($attrs.images)) {
+            if ($null -eq $image) { continue }
+            $id = ''
+            if ($image.PSObject.Properties['id']) { $id = [string]$image.id }
+            if ([string]::IsNullOrWhiteSpace($id)) { continue }
+            $name = ''
+            if ($image.PSObject.Properties['name']) { $name = [string]$image.name }
+            $images.Add([pscustomobject]@{ Id = $id; Name = $name })
+        }
+    }
+
+    # An empty submission is not an error, it is just nothing to do.
+    if ([string]::IsNullOrWhiteSpace($text) -and $images.Count -eq 0) { return $null }
+
+    [pscustomobject]@{
+        Stamp  = $stamp
+        Text   = $text
+        Images = $images.ToArray()
+    }
+}
+
+function New-BridgeAttachmentPrompt {
+    <#
+        Builds the text that is typed into the CLI for a reply carrying attachments.
+
+        Copilot CLI attaches a file when the prompt references it as `@<path>`, so
+        the attachments lead and the typed text follows. A path containing a space
+        cannot be expressed that way and is dropped rather than silently corrupting
+        the rest of the prompt; Get-BridgeAttachmentRoot exists to make that
+        impossible in the first place.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
+        [string[]]$Paths = @()
+    )
+
+    $parts = [System.Collections.Generic.List[string]]::new()
+    foreach ($path in @($Paths)) {
+        if ([string]::IsNullOrWhiteSpace($path)) { continue }
+        if ($path -match '\s') { continue }
+        $parts.Add("@$path")
+    }
+
+    $clean = ([string]$Text).Trim()
+    if (-not [string]::IsNullOrWhiteSpace($clean)) { $parts.Add($clean) }
+
+    $parts -join ' '
+}
+
+function Save-BridgeReplyAttachment {
+    <#
+        Downloads one image the reply card uploaded to Home Assistant.
+
+        Returns the local path, or '' if it could not be fetched. The extension is
+        taken from the original file name because the CLI decides how to treat an
+        attachment from its extension, and falls back to .png - the format anything
+        pasted from a clipboard arrives as.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$ImageId,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Name,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $extension = ''
+    try { $extension = [System.IO.Path]::GetExtension($Name) } catch { $extension = '' }
+    if ($extension -notin @('.png', '.jpg', '.jpeg', '.gif', '.webp', '.heic', '.heif', '.pdf')) {
+        $extension = '.png'
+    }
+
+    $safeId = $ImageId -replace '[^0-9a-zA-Z]', ''
+    if ([string]::IsNullOrWhiteSpace($safeId)) { return '' }
+
+    $path = Join-Path (Get-BridgeAttachmentRoot) "$safeId$extension"
+    $uri = "$($script:DecisionBridgeConfig.HomeAssistantBaseUrl)/api/image/serve/$ImageId/original"
+
+    try {
+        Invoke-WebRequest -Uri $uri -Headers $Headers -OutFile $path -UseBasicParsing -ErrorAction Stop | Out-Null
+    }
+    catch {
+        Write-DaemonLog -Message "could not fetch attachment $ImageId : $($_.Exception.Message)"
+        return ''
+    }
+
+    if (-not (Test-Path -LiteralPath $path)) { return '' }
+    $path
+}
+
+function Remove-BridgeHomeAssistantImage {
+    <#
+        Deletes an uploaded image from Home Assistant once it is safely on disk here.
+
+        Best effort: a failure leaves a file in Home Assistant's upload store, which
+        is untidy but harmless, and must never stop a reply being delivered.
+    #>
+    param([Parameter(Mandatory)][string]$ImageId)
+
+    try {
+        [void](Invoke-CopilotHaWebSocket -Commands @(@{ type = 'image/delete'; image_id = $ImageId }))
+    }
+    catch {
+        Write-DaemonLog -Message "could not remove uploaded image $ImageId from Home Assistant: $($_.Exception.Message)"
+    }
+}
+
+function Remove-BridgeStaleAttachment {
+    <#
+        Clears attachments left behind by previous replies.
+
+        They are only needed until the CLI has read them, which happens within
+        seconds of delivery, but deleting immediately would race that read. A day is
+        far longer than the CLI needs and keeps the folder from growing without end.
+    #>
+    param([int]$MaxAgeHours = 24)
+
+    try {
+        $cutoff = (Get-Date).AddHours(-$MaxAgeHours)
+        $root = Get-BridgeAttachmentRoot
+        foreach ($file in @(Get-ChildItem -LiteralPath $root -File -ErrorAction SilentlyContinue)) {
+            if ($file.LastWriteTime -lt $cutoff) {
+                Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
+            }
+        }
+    }
+    catch { }
+}
+
 function Invoke-PendingReplies {
     <#
         Delivers any reply box that currently holds text.
@@ -925,6 +1110,66 @@ function Invoke-PendingReplies {
         }
 
         $entry = $State[$sessionId]
+
+        # The reply card delivers here, and takes precedence over the text box below.
+        #
+        # It sends what is on screen at the instant Send is pressed rather than
+        # whatever Home Assistant last managed to commit, so it needs no arming and
+        # no waiting, and it can carry images and text of any length.
+        $payload = $null
+        try {
+            $payloadState = Get-HomeAssistantState -EntityId "sensor.${node}_reply_payload" -Headers $Headers
+            $payload = Get-BridgeReplyPayload -State $payloadState
+        }
+        catch {
+            # No payload sensor yet (a session published before this existed), or it
+            # is unreadable. The text box below still works.
+        }
+
+        if ($null -ne $payload) {
+            $lastPayload = if ($entry.PSObject.Properties['LastReplyPayloadAt']) { [string]$entry.LastReplyPayloadAt } else { '' }
+            if ($payload.Stamp -ne $lastPayload) {
+                # Record the stamp before delivering, not after. Delivery types the
+                # reply into the console one character at a time, which is long enough
+                # for the next reconcile to see the same payload still sitting there
+                # and send it a second time.
+                Set-DaemonSessionProperty -Entry $entry -Name 'LastReplyPayloadAt' -Value $payload.Stamp
+
+                try {
+                    Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Sending...' -Headers $Headers
+                }
+                catch { }
+
+                $paths = [System.Collections.Generic.List[string]]::new()
+                $fetched = [System.Collections.Generic.List[string]]::new()
+                foreach ($image in @($payload.Images)) {
+                    $saved = Save-BridgeReplyAttachment -ImageId $image.Id -Name $image.Name -Headers $Headers
+                    if (-not [string]::IsNullOrWhiteSpace($saved)) {
+                        $paths.Add($saved)
+                        $fetched.Add($image.Id)
+                    }
+                }
+
+                $prompt = New-BridgeAttachmentPrompt -Text $payload.Text -Paths $paths.ToArray()
+                if ([string]::IsNullOrWhiteSpace($prompt)) {
+                    Write-DaemonLog -Message "reply card payload for $($sessionId.Substring(0,8)) had nothing deliverable"
+                    continue
+                }
+
+                $attachmentNote = if ($paths.Count -gt 0) { " with $($paths.Count) attachment(s)" } else { '' }
+                Write-DaemonLog -Message "reply card payload for $($sessionId.Substring(0,8))$attachmentNote"
+
+                Set-DaemonSessionProperty -Entry $entry -Name 'LastReply' -Value $payload.Text
+                [void](Invoke-DaemonReply -SessionId $sessionId -Text $prompt -Headers $Headers `
+                    -DisplayText $payload.Text -ClearReplyBox:$false)
+
+                # Only once it is delivered, so a failed send leaves the image in place
+                # to be retried by hand.
+                foreach ($id in $fetched) { Remove-BridgeHomeAssistantImage -ImageId $id }
+                Remove-BridgeStaleAttachment
+                continue
+            }
+        }
 
         # Read the press first. The old order read the reply box first and bailed on a
         # blank one, which lost the race Home Assistant creates: a text entity commits
@@ -1075,6 +1320,39 @@ function Repair-CopilotSessionEntities {
     foreach ($sessionId in @($State.Keys)) {
         if (-not $Live.ContainsKey($sessionId)) { continue }
         $node = Get-CopilotMqttNodeId -SessionId $sessionId
+
+        # Sessions that were already running when the reply card arrived have no
+        # payload sensor, yet the dashboard shows them the card regardless. Anything
+        # typed into it would publish to a topic nothing subscribes to and be lost
+        # without a word, so provision the sensor onto them here.
+        #
+        # Checked once per session per daemon run rather than every reconcile: the
+        # answer cannot change underneath us, and this is a Home Assistant read per
+        # live session.
+        if (-not $script:DaemonPayloadSensorChecked.ContainsKey($sessionId)) {
+            $script:DaemonPayloadSensorChecked[$sessionId] = $true
+            try {
+                $payloadProbe = $null
+                try { $payloadProbe = Get-HomeAssistantState -EntityId "sensor.${node}_reply_payload" -Headers $Headers }
+                catch { $payloadProbe = $null }
+                if ($null -eq $payloadProbe) {
+                    $payloadEntry = $State[$sessionId]
+                    Publish-CopilotMqttReplyPayloadSensor -SessionId $sessionId `
+                        -SessionName ([string]$payloadEntry.Name) -Machine ([string]$payloadEntry.Machine) `
+                        -Headers $Headers
+                    # Home Assistant derives the entity id from the device and entity
+                    # names and ignores object_id, so without this the sensor lands as
+                    # sensor.copilot_<session title>_reply_payload and the daemon's
+                    # read of sensor.<node>_reply_payload finds nothing.
+                    Start-Sleep -Milliseconds 1500
+                    [void](Set-CopilotMqttEntityIds -SessionId $sessionId)
+                    Write-DaemonLog -Message "provisioned reply payload sensor for $($sessionId.Substring(0,8))"
+                }
+            }
+            catch {
+                Write-DaemonLog -Message "could not provision the reply payload sensor for $sessionId : $($_.Exception.Message)"
+            }
+        }
 
         $needsRepair = $false
         try {
@@ -2748,7 +3026,8 @@ function Sync-DaemonSessions {
             [void](Set-CopilotMqttGlobalEntityId)
             $selector = Initialize-BridgeMachineSelector -Machines $onlineNames
             Save-CopilotSessionDashboard -Sessions @($allDescriptors | Sort-Object -Property Node) `
-                -Machines $machineCards -MachineSelector $selector
+                -Machines $machineCards -MachineSelector $selector `
+                -ReplyCardUrl (Get-BridgeServedReplyCardUrl)
             $script:DaemonDashboardSignature = $signature
             Write-DaemonLog -Message ("dashboard rebuilt for $($allDescriptors.Count) session(s) across " +
                 "$($machineCards.Count) machine(s), $($onlineNames.Count) online")
@@ -2979,7 +3258,14 @@ function Invoke-DaemonReply {
     param(
         [Parameter(Mandatory)][string]$SessionId,
         [Parameter(Mandatory)][string]$Text,
-        [Parameter(Mandatory)][hashtable]$Headers
+        [Parameter(Mandatory)][hashtable]$Headers,
+        # What to show on the card. A reply carrying attachments is injected as
+        # "@C:\...\shot.png your question", which is not what the user typed and
+        # should not be echoed back at them.
+        [AllowEmptyString()][string]$DisplayText = '',
+        # The reply card does not use the text box, so clearing it would wipe
+        # anything left sitting there rather than confirming the send.
+        [bool]$ClearReplyBox = $true
     )
 
     $short = $SessionId.Substring(0, [Math]::Min(8, $SessionId.Length))
@@ -3009,7 +3295,7 @@ function Invoke-DaemonReply {
     # session or vanished. A failure especially must be visible: the whole point of
     # the reply box is that nobody is watching the terminal.
     try {
-        $preview = ($Text -replace '\s+', ' ').Trim()
+        $preview = ($(if ([string]::IsNullOrWhiteSpace($DisplayText)) { $Text } else { $DisplayText }) -replace '\s+', ' ').Trim()
         if ($preview.Length -gt 60) { $preview = $preview.Substring(0, 57) + '...' }
         if ($delivery.Delivered) {
             Set-DaemonTransientActivity -SessionId $SessionId -Summary 'Reply sent' `
@@ -3033,6 +3319,8 @@ function Invoke-DaemonReply {
     # is cleared with the text.set_value service, not by publishing to a state topic
     # that nothing is subscribed to.
     try {
+        if (-not $ClearReplyBox) { return $delivery.Delivered }
+
         $node = Get-CopilotMqttNodeId -SessionId $SessionId
         $current = $null
         try {

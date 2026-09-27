@@ -151,6 +151,11 @@ function Get-CopilotMqttTopics {
         DecisionAttributes = "$root/decision/attr"
         ReplyCommand = "$root/reply/set"
         ReplyState = "$root/reply/state"
+        # The reply card publishes here. It is a state topic rather than a command
+        # topic because the payload has to reach the daemon through a sensor's
+        # attributes, which is the only part of an entity Home Assistant does not
+        # cap at 255 characters.
+        ReplyPayload = Get-CopilotMqttReplyPayloadTopic -Node $node
         StatusState = "$root/status/state"
         StatusAttributes = "$root/status/attr"
         ActivityState = "$root/activity/state"
@@ -190,6 +195,7 @@ function Get-CopilotMqttEntityIds {
     @{
         Decision = "select.${node}_decision"
         Reply = "text.${node}_reply"
+        ReplyPayload = "sensor.${node}_reply_payload"
         Status = "sensor.${node}_status"
         Activity = "sensor.${node}_activity"
     }
@@ -300,6 +306,16 @@ function Publish-CopilotMqttSession {
         availability = $availability
     }
 
+    # Where the custom reply card delivers what you typed.
+    #
+    # The card publishes one JSON message carrying the text, any uploaded image
+    # ids, and a timestamp. The state is only that timestamp - short enough for the
+    # 255-character state limit, and the same "press stamp" contract the Submit
+    # button already uses, so a replayed message cannot resend an old reply. The
+    # text itself rides in the attributes, which have no such limit.
+    $replyPayload = New-CopilotMqttReplyPayloadConfig -Node $node -Device $device `
+        -Availability $availability -Topic $topics.ReplyPayload
+
     # Sensors are published by the daemon, so these keep a state topic.
     $status = @{
         name = 'Status'
@@ -326,6 +342,7 @@ function Publish-CopilotMqttSession {
     $map = @(
         @{ Component = 'select'; Object = 'decision'; Config = $decision }
         @{ Component = 'text'; Object = 'reply'; Config = $reply }
+        @{ Component = 'sensor'; Object = 'replypayload'; Config = $replyPayload }
         @{ Component = 'sensor'; Object = 'status'; Config = $status }
         @{ Component = 'sensor'; Object = 'activity'; Config = $activity }
     )
@@ -392,6 +409,19 @@ function Publish-CopilotMqttSession {
     $topics
 }
 
+function Get-CopilotMqttReplyPayloadTopic {
+    <#
+        Where the reply card publishes for one session.
+
+        Derived from the node alone so the dashboard can build it without a session
+        id, and defined once so the card's topic and the sensor's state topic can
+        never drift apart - a mismatch there would leave a reply box that silently
+        goes nowhere.
+    #>
+    param([Parameter(Mandatory)][string]$Node)
+    "$($script:CopilotMqttConfig.TopicRoot)/$Node/replypayload/set"
+}
+
 function Get-CopilotMqttSessionDiscoveryTopic {
     <#
         Every retained discovery topic belonging to one session node.
@@ -408,6 +438,7 @@ function Get-CopilotMqttSessionDiscoveryTopic {
     $topics = [System.Collections.Generic.List[string]]::new()
     foreach ($entry in @(
         @('select', 'decision'), @('text', 'reply'),
+        @('sensor', 'replypayload'),
         @('sensor', 'status'), @('sensor', 'activity'),
         @('button', 'submit'), @('button', 'stop')
     )) {
@@ -440,6 +471,7 @@ function Get-CopilotMqttSessionStateTopic {
         "$root/decision/state"
         "$root/decision/attr"
         "$root/reply/state"
+        "$root/replypayload/set"
         "$root/status/state"
         "$root/status/attr"
         "$root/activity/state"
@@ -1241,6 +1273,61 @@ function Publish-CopilotMqttDecisionFields {
             # Non-fatal; the dashboard condition treats a missing value as unanswered.
         }
     }
+}
+
+function New-CopilotMqttReplyPayloadConfig {
+    <#
+        The discovery payload for a session's reply-payload sensor.
+
+        Shared by the full session publish and the single-entity provisioning below,
+        so the two can never drift - the drifted-list mistake that once left every
+        swept session with a dead Stop button.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Node,
+        [Parameter(Mandatory)][object]$Device,
+        [Parameter(Mandatory)][object[]]$Availability,
+        [Parameter(Mandatory)][string]$Topic
+    )
+
+    @{
+        name = 'Reply payload'
+        unique_id = "${Node}_reply_payload"
+        state_topic = $Topic
+        value_template = '{{ value_json.at }}'
+        json_attributes_topic = $Topic
+        icon = 'mdi:reply-all'
+        device = $Device
+        availability = $Availability
+    }
+}
+
+function Publish-CopilotMqttReplyPayloadSensor {
+    <#
+        Publishes just the reply-payload sensor for a session.
+
+        Needed for sessions that were already running when the reply card arrived.
+        Without it the dashboard would show them the card while nothing in Home
+        Assistant subscribed to the topic it publishes to, so every reply typed into
+        it would vanish silently - worse than not offering the card at all.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][string]$SessionName,
+        [Parameter(Mandatory)][string]$Machine,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $topics = Get-CopilotMqttTopics -SessionId $SessionId
+    $node = $topics.Node
+    $device = New-CopilotMqttDeviceBlock -Node $node -SessionName $SessionName -Machine $Machine
+    $availability = @(@{ topic = $topics.Availability; payload_available = 'online'; payload_not_available = 'offline' })
+
+    $config = New-CopilotMqttReplyPayloadConfig -Node $node -Device $device `
+        -Availability $availability -Topic $topics.ReplyPayload
+
+    Publish-CopilotMqttMessage -Topic "$($script:CopilotMqttConfig.DiscoveryPrefix)/sensor/$node/replypayload/config" `
+        -Payload ($config | ConvertTo-Json -Depth 8 -Compress) -Headers $Headers -Retain
 }
 
 function Publish-CopilotMqttSubmitButton {

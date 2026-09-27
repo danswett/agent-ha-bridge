@@ -1154,7 +1154,7 @@ function Invoke-BridgeFrontendCardCheck {
 # excluded: the MCP installer runs npm itself, and copying it would dwarf everything
 # else here.
 $script:BridgePayloadFiles = @('install.ps1', 'uninstall.ps1', 'update.ps1', 'config.example.json', 'VERSION')
-$script:BridgePayloadDirs = @('hooks', 'bin', 'claude', 'codex', 'mcp')
+$script:BridgePayloadDirs = @('hooks', 'bin', 'claude', 'codex', 'mcp', 'frontend')
 
 function Copy-BridgeInstallerPayload {
     <#
@@ -1265,6 +1265,20 @@ Get-ChildItem (Join-Path $repoRoot 'hooks') -File | ForEach-Object {
 }
 
 if (Test-Path -LiteralPath $versionFile) { Copy-Item $versionFile $hooksDir -Force }
+
+# The reply card lives next to the hooks so bridge-frontend-cards.ps1 can find it
+# from an install that never had the repository.
+$frontendSource = Join-Path $repoRoot 'frontend'
+if (Test-Path -LiteralPath $frontendSource) {
+    $frontendDir = Join-Path $bridgeHome 'frontend'
+    if (-not (Test-Path -LiteralPath $frontendDir)) {
+        New-Item -ItemType Directory -Path $frontendDir -Force | Out-Null
+    }
+    Get-ChildItem $frontendSource -File | ForEach-Object {
+        Copy-Item $_.FullName $frontendDir -Force
+        Write-Host "    $($_.Name)"
+    }
+}
 
 # --------------------------------------------------------------------- config
 Write-Step 'Reading the bridge config'

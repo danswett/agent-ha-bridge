@@ -28,6 +28,7 @@ prompt, so the terminal never stops working and nothing is ever answered twice.
 | **Detailed activity** | A dashboard toggle streams the model's reasoning and every tool call into an expander. |
 | **Real forms** | Multi-field questions become one dropdown per field plus a Send button. |
 | **Continuation** | Reply to a finished turn from your phone; it's typed into the session. |
+| **Paste an image** | Paste or attach a screenshot in the reply box and it's attached to the prompt. |
 | **Start a conversation** | A session appears as soon as it opens, so you can send it its first prompt from the dashboard. |
 | **Launch a session** | Pick a workspace, type an opening prompt, press a button — a new CLI session opens on your desktop. |
 | **End a session** | An **End session** row on every card, so sessions don't just accumulate. |
@@ -103,6 +104,9 @@ only a Home Assistant token.
   [`layout-card`](https://github.com/thomasloven/lovelace-layout-card).
   The installer checks for these and tells you which are missing — and registers any
   that you have downloaded but not added as a Lovelace resource
+* Write access to Home Assistant's configuration folder, usually the Samba add-on's
+  `\\<host>\config` share. The installer copies its own reply card there; without it
+  the dashboard still works, with a plainer and more limited reply box
 
 ---
 
@@ -611,11 +615,17 @@ Get-Content $env:TEMP\agent-bridge-daemon.log -Tail 20
 
 ## Notes and limitations
 
-* **Enter doesn't send a reply.** Home Assistant commits a text entity on the `change`
-  event, which fires identically for Enter and for clicking away — they can't be told
-  apart, so replies are sent with the Send button instead.
-* **Reply length is capped at 255 characters** by Home Assistant's `text` entity.
-  Use the terminal for longer answers.
+* **The reply box needs the bridge's own card.** The installer copies
+  `agent-bridge-reply-card.js` into Home Assistant's `config\www` folder over the
+  configuration share and registers it. If it cannot reach that share, the dashboard
+  falls back to a plain `text` entity and Send button, and two older limits come back
+  with it: a reply is capped at **255 characters** (Home Assistant's limit for any
+  entity state), and Send has to be pressed after the box loses focus, because a text
+  entity only commits on blur or Enter. Set `homeAssistant.configPath` if the share is
+  somewhere the installer would not guess.
+* **Images go via Home Assistant.** A pasted image is uploaded to Home Assistant, pulled
+  down by the daemon, attached to the prompt as `@<path>`, and then deleted from Home
+  Assistant. Local copies are kept for a day in case the CLI is slow to read them.
 * **Multi-field questions cap at 4 fields**; larger forms fall back to a text outline.
 * **Hooks never wait on a missing Home Assistant.** Each one probes first and skips its
   Home Assistant work if the host doesn't answer within about a second, so an outage
