@@ -121,7 +121,16 @@ function Wait-CopilotHaStateChange {
         [Parameter(Mandatory)]
         [int]$TimeoutSeconds,
 
-        [string[]]$IgnoreStates = @('unknown', 'unavailable', '')
+        [string[]]$IgnoreStates = @('unknown', 'unavailable', ''),
+
+        # Run every TickMilliseconds while waiting. The daemon streams transcript
+        # activity from here, so it reaches Home Assistant within a tick instead of
+        # after the whole wait. The pending receive is polled, never cancelled:
+        # cancelling a WebSocket receive aborts the socket.
+        [scriptblock]$OnTick,
+
+        [ValidateRange(20, 5000)]
+        [int]$TickMilliseconds = 100
     )
     # Same token resolution as the REST helpers: config file, then environment.
     $token = (Get-HomeAssistantHeaders).Authorization -replace '^Bearer ', ''
@@ -182,19 +191,44 @@ function Wait-CopilotHaStateChange {
         }
         [void](& $receive 30)
 
-        while ([DateTimeOffset]::Now -lt $deadline) {
-            $remaining = [int]([Math]::Max(1, ($deadline - [DateTimeOffset]::Now).TotalSeconds))
-            $slice = [Math]::Min(30, $remaining)
+        $frame = [byte[]]::new(65536)
+        $pending = $null
+        $text = [Text.StringBuilder]::new()
 
-            try {
-                $message = & $receive $slice
+        while ([DateTimeOffset]::Now -lt $deadline) {
+            # One receive stays outstanding across ticks; it is only replaced once it
+            # has completed.
+            if ($null -eq $pending) {
+                $pending = $socket.ReceiveAsync([ArraySegment[byte]]::new($frame), $cancel.Token)
             }
+
+            $remainingMs = [int][Math]::Max(1, ($deadline - [DateTimeOffset]::Now).TotalMilliseconds)
+            $waitMs = if ($OnTick) { [Math]::Min($TickMilliseconds, $remainingMs) } else { $remainingMs }
+
+            $arrived = $false
+            try { $arrived = $pending.Wait($waitMs) }
             catch {
-                # No trigger fired in this window. With a scoped trigger this is the
-                # normal idle path, not an error.
-                if ($socket.State -ne [Net.WebSockets.WebSocketState]::Open) { return $null }
+                # The receive faulted: the socket dropped. Let the caller reconnect.
+                return $null
+            }
+
+            if (-not $arrived) {
+                if ($OnTick) {
+                    # A fault in the tick must not end the wait or drop the socket.
+                    try { & $OnTick } catch { }
+                }
                 continue
             }
+
+            $result = $pending.Result
+            $pending = $null
+            if ($result.MessageType -eq [Net.WebSockets.WebSocketMessageType]::Close) { return $null }
+            [void]$text.Append([Text.Encoding]::UTF8.GetString($frame, 0, $result.Count))
+            if (-not $result.EndOfMessage) { continue }
+
+            $raw = $text.ToString()
+            [void]$text.Clear()
+            try { $message = $raw | ConvertFrom-Json } catch { continue }
 
             if ($message.type -ne 'event') { continue }
             $trigger = $message.event.variables.trigger

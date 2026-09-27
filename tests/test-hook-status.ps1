@@ -85,6 +85,50 @@ Test-That 'an older registration without hook fields is tolerated' {
     $null -eq (Sync-DaemonHookStatus -Entry $entry -Session ([pscustomobject]@{ ProcessId = 1 }) -SessionId 's' -Headers $headers)
 }
 
+Write-Host ''
+Write-Host '--- the fast lane ---'
+
+# Streaming used to happen only in the 15-second reconcile. The fast lane runs every
+# wait tick and must act on exactly the sessions whose transcript grew.
+$work = Join-Path ([IO.Path]::GetTempPath()) "fastlane-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+New-Item -ItemType Directory -Path $work -Force | Out-Null
+$grown = Join-Path $work 'grown.jsonl'
+$quiet = Join-Path $work 'quiet.jsonl'
+Set-Content -LiteralPath $grown -Value 'one line' -NoNewline
+Set-Content -LiteralPath $quiet -Value 'one line' -NoNewline
+
+$script:Updated = @()
+function Update-DaemonSessionActivity {
+    param([string]$Id, $Entry, $Session, [hashtable]$Headers, [bool]$VerboseOn)
+    $script:Updated += "$Id/$VerboseOn"
+}
+
+$fastState = @{
+    grown = [pscustomobject]@{ Kind = 'copilot'; Offset = 0 }
+    quiet = [pscustomobject]@{ Kind = 'copilot'; Offset = (Get-Item $quiet).Length }
+    codex = [pscustomobject]@{ Kind = 'codex'; Offset = 0 }
+    gone  = [pscustomobject]@{ Kind = 'copilot'; Offset = 0 }
+}
+$script:DaemonLive = @{
+    grown = [pscustomobject]@{ Transcript = $grown }
+    quiet = [pscustomobject]@{ Transcript = $quiet }
+    codex = [pscustomobject]@{ Transcript = $grown }
+}
+$script:DaemonVerbose = $true
+
+Invoke-DaemonFastActivity -Headers $headers -State $fastState
+Test-That 'a session whose transcript grew is streamed' { $script:Updated -contains 'grown/True' }
+Test-That 'with the current verbose setting' { $script:Updated -notcontains 'grown/False' }
+Test-That 'an unchanged transcript costs nothing' { $script:Updated -notmatch '^quiet/' }
+Test-That 'codex is left to its hooks' { $script:Updated -notmatch '^codex/' }
+Test-That 'a session the last reconcile did not see as live is skipped' { $script:Updated -notmatch '^gone/' }
+
+$script:Updated = @()
+$script:DaemonLive = @{}
+Invoke-DaemonFastActivity -Headers $headers -State $fastState
+Test-That 'before the first reconcile it does nothing' { $script:Updated.Count -eq 0 }
+
+Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $script:DaemonConfig.LogFile -Force -ErrorAction SilentlyContinue
 
 Write-Host ''

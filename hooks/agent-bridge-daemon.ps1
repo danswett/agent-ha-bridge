@@ -127,6 +127,13 @@ $script:DaemonConfig = @{
 # regenerated when a session appears or exits, not on every reconcile.
 $script:DaemonDashboardSignature = $null
 
+# The fast lane's view between reconciles (see Invoke-DaemonFastActivity): the live
+# sessions and verbose setting the last reconcile saw, and the last-seen write time of
+# each Claude registration.
+$script:DaemonLive = @{}
+$script:DaemonVerbose = $false
+$script:DaemonRegistrationStamps = @{}
+
 # Sessions whose reply-payload sensor has been checked this run, so the probe costs
 # one Home Assistant read per session rather than one per reconcile.
 $script:DaemonPayloadSensorChecked = @{}
@@ -2619,6 +2626,228 @@ function Invoke-DaemonUnscopedEntityCleanup {
     $cleared
 }
 
+function Update-DaemonSessionActivity {
+    <#
+        Streams one session's new transcript activity to Home Assistant.
+
+        Shared by the full reconcile and the fast lane (Invoke-DaemonFastActivity),
+        which calls it the moment a transcript grows, so both publish exactly the same
+        way. Everything it changes lives on the session's own state entry.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Id,
+        [Parameter(Mandatory)]$Entry,
+        [Parameter(Mandatory)]$Session,
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [bool]$VerboseOn = $false
+    )
+
+    # Names the body below has always used.
+    $id = $Id; $entry = $Entry; $session = $Session; $verbose = $VerboseOn
+    $entryKind = if ($entry.PSObject.Properties.Name -contains 'Kind' -and $entry.Kind) { [string]$entry.Kind } else { 'copilot' }
+
+    # Claude's hooks set the status directly (idle at Stop, waiting at a
+    # notification, working at a new prompt). Adopt it here before reading the
+    # transcript, or this loop keeps believing its own stale copy and never
+    # republishes 'working' when the session carries on.
+    $hookStatusAt = $null
+    if ($entryKind -eq 'claude') {
+        $hookStatusAt = Sync-DaemonHookStatus -Entry $entry -Session $session -SessionId $id -Headers $Headers
+    }
+
+    $append = Read-BridgeTranscriptAppend -Path $session.Transcript -Offset ([long]$entry.Offset) -Kind $entryKind
+    $entry.Offset = $append.Offset
+    if ($append.Lines.Count -eq 0) { return }
+
+    $activity = Get-BridgeActivity -Lines $append.Lines -VerboseMode $verbose -Kind $entryKind
+
+    # Work written before the hook that stopped the turn is that turn's tail, not
+    # a resumption; only activity newer than the hook may flip it back to working.
+    $staleTail = $false
+    if ($null -ne $hookStatusAt -and [string]$entry.Status -in @('idle', 'waiting') -and
+        $activity.PSObject.Properties['LastActivityAt']) {
+        $staleTail = ($null -eq $activity.LastActivityAt) -or ($activity.LastActivityAt -le $hookStatusAt)
+    }
+
+    if (-not $staleTail -and -not [string]::IsNullOrWhiteSpace($activity.Status) -and
+        $activity.Status -ne [string]$entry.Status) {
+        $entry.Status = $activity.Status
+        try {
+            Set-CopilotMqttStatus -SessionId $id -Status $activity.Status -Headers $Headers -Attributes @{
+                session = $entry.Name
+                machine = $entry.Machine
+                process_id = $session.ProcessId
+                updated = [DateTimeOffset]::Now.ToString('o')
+            }
+        }
+        catch {
+            Write-DaemonLog -Message "status publish failed for $id : $($_.Exception.Message)"
+        }
+    }
+
+    if ([string]::IsNullOrWhiteSpace($activity.Summary) -and
+        [string]::IsNullOrWhiteSpace($activity.Reasoning)) {
+        return
+    }
+
+    # Persist the latest reasoning in session state so it stays on the card across
+    # batches that carry no reasoning (a tool call, a plain message), and so the
+    # verbose toggle can show it instantly. Capture is unconditional; only display
+    # is gated on verbose (below).
+    #
+    # A batch that starts a new turn drops what was carried from the last one;
+    # otherwise the card shows the previous turn's reasoning under the new status.
+    $turnStarted = [bool]($activity.PSObject.Properties['TurnStarted'] -and $activity.TurnStarted)
+    $lastReasoning = if (-not $turnStarted -and $entry.PSObject.Properties['LastReasoning']) {
+        [string]$entry.LastReasoning
+    }
+    else { '' }
+    if (-not [string]::IsNullOrWhiteSpace($activity.Reasoning)) {
+        $lastReasoning = $activity.Reasoning
+    }
+    if ($entry.PSObject.Properties['LastReasoning']) {
+        $entry.LastReasoning = $lastReasoning
+    }
+    else {
+        $entry | Add-Member -NotePropertyName LastReasoning -NotePropertyValue $lastReasoning -Force
+    }
+
+    # Persist the full text of the last substantive response, likewise, so the
+    # card can render the whole answer across later tool-call batches that carry
+    # no new content.
+    $lastResponse = if ($entry.PSObject.Properties['LastResponse']) {
+        [string]$entry.LastResponse
+    }
+    else { '' }
+    if (-not [string]::IsNullOrWhiteSpace($activity.Response)) {
+        $lastResponse = $activity.Response
+    }
+    if ($entry.PSObject.Properties['LastResponse']) {
+        $entry.LastResponse = $lastResponse
+    }
+    else {
+        $entry | Add-Member -NotePropertyName LastResponse -NotePropertyValue $lastResponse -Force
+    }
+
+    $summary = $activity.Summary
+    if ([string]::IsNullOrWhiteSpace($summary)) { $summary = 'Thinking' }
+    # Remember the summary so a verbose-toggle refresh can republish the card
+    # without needing fresh transcript activity.
+    if ($entry.PSObject.Properties['LastSummary']) {
+        $entry.LastSummary = $summary
+    }
+    else {
+        $entry | Add-Member -NotePropertyName LastSummary -NotePropertyValue $summary -Force
+    }
+
+    $detail = @{
+        session = $entry.Name
+        machine = $entry.Machine
+        verbose = $verbose
+        updated = [DateTimeOffset]::Now.ToString('o')
+    }
+    # The history is a rolling trail across batches, not just this batch: the
+    # daemon reads the transcript every few seconds, so a single batch usually
+    # holds one or two steps and the trail would otherwise never show more.
+    $carried = @()
+    if (-not $turnStarted -and $entry.PSObject.Properties['LastHistory'] -and $entry.LastHistory) {
+        $carried = @($entry.LastHistory | ForEach-Object { [string]$_ })
+    }
+    $detail['history'] = @(@($carried) + @($activity.History | ForEach-Object { [string]$_ }) |
+        Select-Object -Last $script:DaemonConfig.ActivityHistory)
+    # Persist the history alongside the summary and reasoning, so a daemon restart
+    # can restore the whole card rather than blanking it.
+    if ($entry.PSObject.Properties['LastHistory']) { $entry.LastHistory = $detail.history }
+    else { $entry | Add-Member -NotePropertyName LastHistory -NotePropertyValue $detail.history -Force }
+    # The card shows the response in full; the expander is reserved for reasoning
+    # and extra detail, so nothing is split off into a "show more" remainder.
+    if (-not [string]::IsNullOrWhiteSpace($lastResponse)) {
+        $capped = $lastResponse
+        if ($capped.Length -gt $script:DaemonConfig.ResponseMaxChars) {
+            $capped = $capped.Substring(0, $script:DaemonConfig.ResponseMaxChars).TrimEnd() +
+                "`n`n_(truncated - see terminal)_"
+        }
+        $detail['response'] = $capped
+    }
+    if ($verbose -and -not [string]::IsNullOrWhiteSpace($lastReasoning)) {
+        $capped = $lastReasoning
+        if ($capped.Length -gt $script:DaemonConfig.ReasoningMaxChars) {
+            $capped = $capped.Substring(0, $script:DaemonConfig.ReasoningMaxChars).TrimEnd() + '…'
+        }
+        $detail['reasoning'] = $capped
+    }
+
+    try {
+        Set-CopilotMqttActivity -SessionId $id -Summary $summary -Detail $detail -Headers $Headers
+    }
+    catch {
+        Write-DaemonLog -Message "activity publish failed for $id : $($_.Exception.Message)"
+    }
+}
+
+function Invoke-DaemonFastActivity {
+    <#
+        The fast lane: publishes new transcript activity within one wait tick.
+
+        The full reconcile runs every 15 seconds and makes dozens of Home Assistant
+        calls, so streaming only from there left reasoning up to 15 seconds behind the
+        terminal. This runs between reconciles, from inside the Home Assistant wait
+        (every 100 ms), and costs a file-size check per live session when nothing has
+        changed. It works from the live set the last reconcile found; sessions that
+        appear or exit are still picked up there.
+
+        For Claude it also watches the hook registration, so a status a hook just set
+        (a new prompt's 'working', say) is adopted within a tick rather than a reconcile.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [Parameter(Mandatory)][hashtable]$State
+    )
+
+    $live = $script:DaemonLive
+    if ($null -eq $live -or $live.Count -eq 0) { return }
+
+    foreach ($id in @($State.Keys)) {
+        $entry = $State[$id]
+        $session = $live[$id]
+        if ($null -eq $entry -or $null -eq $session) { continue }
+
+        $kind = if ($entry.PSObject.Properties.Name -contains 'Kind' -and $entry.Kind) { [string]$entry.Kind } else { 'copilot' }
+        # Codex reports its activity from its hooks, sooner than a transcript could.
+        if ($kind -eq 'codex') { continue }
+
+        $changed = $false
+
+        if ($kind -eq 'claude' -and $script:ClaudeAdapterLoaded) {
+            $registration = Join-Path $env:TEMP "agent-bridge-claude\$(Get-ClaudeSafeSessionKey -SessionId $id).json"
+            $stamp = [IO.File]::GetLastWriteTimeUtc($registration).Ticks
+            if (-not $script:DaemonRegistrationStamps.ContainsKey($id) -or $script:DaemonRegistrationStamps[$id] -ne $stamp) {
+                $script:DaemonRegistrationStamps[$id] = $stamp
+                try {
+                    $fresh = Get-Content -LiteralPath $registration -Raw | ConvertFrom-Json
+                    foreach ($field in @('HookStatus', 'HookStatusAt')) {
+                        if ($fresh.PSObject.Properties[$field]) {
+                            $session | Add-Member -NotePropertyName $field -NotePropertyValue ([string]$fresh.$field) -Force
+                        }
+                    }
+                    $changed = $true
+                }
+                catch { }
+            }
+        }
+
+        $transcript = [string]$session.Transcript
+        if (-not $changed) {
+            if ([string]::IsNullOrWhiteSpace($transcript)) { continue }
+            $length = 0L
+            try { $length = [IO.FileInfo]::new($transcript).Length } catch { continue }
+            if ($length -eq [long]$entry.Offset) { continue }
+        }
+
+        Update-DaemonSessionActivity -Id $id -Entry $entry -Session $session -Headers $Headers -VerboseOn ([bool]$script:DaemonVerbose)
+    }
+}
+
 function Sync-DaemonSessions {
     <#
         Brings the published Home Assistant entities in line with the live sessions,
@@ -2631,6 +2860,9 @@ function Sync-DaemonSessions {
 
     $live = Get-LiveBridgeSessions
     $verbose = Test-VerboseStreaming -Headers $Headers
+    # The fast lane streams between reconciles from this snapshot.
+    $script:DaemonLive = $live
+    $script:DaemonVerbose = $verbose
 
     # Note sessions that have exited, and drop them from state now, but defer removing
     # their Home Assistant entities until after the dashboard has been rebuilt without
@@ -2821,143 +3053,7 @@ function Sync-DaemonSessions {
             }
         }
 
-        # Claude's hooks set the status directly (idle at Stop, waiting at a
-        # notification, working at a new prompt). Adopt it here before reading the
-        # transcript, or this loop keeps believing its own stale copy and never
-        # republishes 'working' when the session carries on.
-        $hookStatusAt = $null
-        if ($entryKind -eq 'claude') {
-            $hookStatusAt = Sync-DaemonHookStatus -Entry $entry -Session $session -SessionId $id -Headers $Headers
-        }
-
-        $append = Read-BridgeTranscriptAppend -Path $session.Transcript -Offset ([long]$entry.Offset) -Kind $entryKind
-        $entry.Offset = $append.Offset
-        if ($append.Lines.Count -eq 0) { continue }
-
-        $activity = Get-BridgeActivity -Lines $append.Lines -VerboseMode $verbose -Kind $entryKind
-
-        # Work written before the hook that stopped the turn is that turn's tail, not
-        # a resumption; only activity newer than the hook may flip it back to working.
-        $staleTail = $false
-        if ($null -ne $hookStatusAt -and [string]$entry.Status -in @('idle', 'waiting') -and
-            $activity.PSObject.Properties['LastActivityAt']) {
-            $staleTail = ($null -eq $activity.LastActivityAt) -or ($activity.LastActivityAt -le $hookStatusAt)
-        }
-
-        if (-not $staleTail -and -not [string]::IsNullOrWhiteSpace($activity.Status) -and
-            $activity.Status -ne [string]$entry.Status) {
-            $entry.Status = $activity.Status
-            try {
-                Set-CopilotMqttStatus -SessionId $id -Status $activity.Status -Headers $Headers -Attributes @{
-                    session = $entry.Name
-                    machine = $entry.Machine
-                    process_id = $session.ProcessId
-                    updated = [DateTimeOffset]::Now.ToString('o')
-                }
-            }
-            catch {
-                Write-DaemonLog -Message "status publish failed for $id : $($_.Exception.Message)"
-            }
-        }
-
-        if ([string]::IsNullOrWhiteSpace($activity.Summary) -and
-            [string]::IsNullOrWhiteSpace($activity.Reasoning)) {
-            continue
-        }
-
-        # Persist the latest reasoning in session state so it stays on the card across
-        # batches that carry no reasoning (a tool call, a plain message), and so the
-        # verbose toggle can show it instantly. Capture is unconditional; only display
-        # is gated on verbose (below).
-        #
-        # A batch that starts a new turn drops what was carried from the last one;
-        # otherwise the card shows the previous turn's reasoning under the new status.
-        $turnStarted = [bool]($activity.PSObject.Properties['TurnStarted'] -and $activity.TurnStarted)
-        $lastReasoning = if (-not $turnStarted -and $entry.PSObject.Properties['LastReasoning']) {
-            [string]$entry.LastReasoning
-        }
-        else { '' }
-        if (-not [string]::IsNullOrWhiteSpace($activity.Reasoning)) {
-            $lastReasoning = $activity.Reasoning
-        }
-        if ($entry.PSObject.Properties['LastReasoning']) {
-            $entry.LastReasoning = $lastReasoning
-        }
-        else {
-            $entry | Add-Member -NotePropertyName LastReasoning -NotePropertyValue $lastReasoning -Force
-        }
-
-        # Persist the full text of the last substantive response, likewise, so the
-        # card can render the whole answer across later tool-call batches that carry
-        # no new content.
-        $lastResponse = if ($entry.PSObject.Properties['LastResponse']) {
-            [string]$entry.LastResponse
-        }
-        else { '' }
-        if (-not [string]::IsNullOrWhiteSpace($activity.Response)) {
-            $lastResponse = $activity.Response
-        }
-        if ($entry.PSObject.Properties['LastResponse']) {
-            $entry.LastResponse = $lastResponse
-        }
-        else {
-            $entry | Add-Member -NotePropertyName LastResponse -NotePropertyValue $lastResponse -Force
-        }
-
-        $summary = $activity.Summary
-        if ([string]::IsNullOrWhiteSpace($summary)) { $summary = 'Thinking' }
-        # Remember the summary so a verbose-toggle refresh can republish the card
-        # without needing fresh transcript activity.
-        if ($entry.PSObject.Properties['LastSummary']) {
-            $entry.LastSummary = $summary
-        }
-        else {
-            $entry | Add-Member -NotePropertyName LastSummary -NotePropertyValue $summary -Force
-        }
-
-        $detail = @{
-            session = $entry.Name
-            machine = $entry.Machine
-            verbose = $verbose
-            updated = [DateTimeOffset]::Now.ToString('o')
-        }
-        # The history is a rolling trail across batches, not just this batch: the
-        # daemon reads the transcript every few seconds, so a single batch usually
-        # holds one or two steps and the trail would otherwise never show more.
-        $carried = @()
-        if (-not $turnStarted -and $entry.PSObject.Properties['LastHistory'] -and $entry.LastHistory) {
-            $carried = @($entry.LastHistory | ForEach-Object { [string]$_ })
-        }
-        $detail['history'] = @(@($carried) + @($activity.History | ForEach-Object { [string]$_ }) |
-            Select-Object -Last $script:DaemonConfig.ActivityHistory)
-        # Persist the history alongside the summary and reasoning, so a daemon restart
-        # can restore the whole card rather than blanking it.
-        if ($entry.PSObject.Properties['LastHistory']) { $entry.LastHistory = $detail.history }
-        else { $entry | Add-Member -NotePropertyName LastHistory -NotePropertyValue $detail.history -Force }
-        # The card shows the response in full; the expander is reserved for reasoning
-        # and extra detail, so nothing is split off into a "show more" remainder.
-        if (-not [string]::IsNullOrWhiteSpace($lastResponse)) {
-            $capped = $lastResponse
-            if ($capped.Length -gt $script:DaemonConfig.ResponseMaxChars) {
-                $capped = $capped.Substring(0, $script:DaemonConfig.ResponseMaxChars).TrimEnd() +
-                    "`n`n_(truncated - see terminal)_"
-            }
-            $detail['response'] = $capped
-        }
-        if ($verbose -and -not [string]::IsNullOrWhiteSpace($lastReasoning)) {
-            $capped = $lastReasoning
-            if ($capped.Length -gt $script:DaemonConfig.ReasoningMaxChars) {
-                $capped = $capped.Substring(0, $script:DaemonConfig.ReasoningMaxChars).TrimEnd() + '…'
-            }
-            $detail['reasoning'] = $capped
-        }
-
-        try {
-            Set-CopilotMqttActivity -SessionId $id -Summary $summary -Detail $detail -Headers $Headers
-        }
-        catch {
-            Write-DaemonLog -Message "activity publish failed for $id : $($_.Exception.Message)"
-        }
+        Update-DaemonSessionActivity -Id $id -Entry $entry -Session $session -Headers $Headers -VerboseOn $verbose
     }
 
     # Keep the global count sensor and the dashboard in step with the live set. The
@@ -3544,6 +3640,8 @@ function Start-BridgeDaemon {
     # state. Pruning first would discard the record while leaving the published
     # entities behind as orphans.
     $live = Get-LiveBridgeSessions
+    # Seed the fast lane, so streaming starts now rather than after the first reconcile.
+    $script:DaemonLive = $live
 
     Write-DaemonLog -Message "daemon starting (pid $PID), $($live.Count) live session(s)"
 
@@ -3685,8 +3783,13 @@ function Start-BridgeDaemon {
 
         $hit = $null
         try {
+            # The fast lane runs on every tick of the wait, on this thread, so it
+            # shares state with the reconcile without any locking. A plain script
+            # block, not a closure: GetNewClosure() would run it in a new module scope
+            # that cannot see this script's functions.
+            $fastLane = { Invoke-DaemonFastActivity -Headers $headers -State $state }
             $hit = Wait-CopilotHaStateChange -EntityIds $watchEntities `
-                -TimeoutSeconds $ReconcileSeconds
+                -TimeoutSeconds $ReconcileSeconds -OnTick $fastLane -TickMilliseconds 100
             $script:DaemonWatchFailures = 0
         }
         catch {
@@ -3702,6 +3805,7 @@ function Start-BridgeDaemon {
         # A verbose toggle change refreshes every card's reasoning at once, without
         # waiting for the periodic reconcile or fresh transcript activity.
         if ($null -ne $hit -and $hit.EntityId -eq $script:DaemonConfig.VerboseToggle) {
+            $script:DaemonVerbose = ($hit.State -eq 'on')
             try {
                 Update-SessionsForVerbose -Headers $headers -State $state `
                     -VerboseOn ($hit.State -eq 'on')
@@ -3716,15 +3820,23 @@ function Start-BridgeDaemon {
         if (([DateTimeOffset]::Now - $lastReconcile).TotalSeconds -ge $ReconcileSeconds -or
             $null -ne $hit) {
             try {
+                # The reconcile makes a string of Home Assistant calls, and a
+                # transcript write that lands during it would otherwise wait for all of
+                # them. The fast lane between steps costs a file-size check per session
+                # when nothing changed.
                 $live = Get-LiveBridgeSessions
                 Sync-DaemonSessions -Headers $headers -State $state
                 Repair-CopilotSessionEntities -Headers $headers -State $state -Live $live
+                Invoke-DaemonFastActivity -Headers $headers -State $state
                 Invoke-PendingDecisions -Headers $headers -State $state -Live $live
                 Invoke-PendingReplies -Headers $headers -State $state -Live $live
+                Invoke-DaemonFastActivity -Headers $headers -State $state
                 Invoke-PendingCodexApprovals -Headers $headers -State $state -Live $live
                 Invoke-PendingStops -Headers $headers -State $state -Live $live
+                Invoke-DaemonFastActivity -Headers $headers -State $state
                 Sync-DaemonUpdateStatus -Headers $headers
                 Sync-DaemonNewSession -Headers $headers -Live $live
+                Invoke-DaemonFastActivity -Headers $headers -State $state
                 Write-DaemonState -State $state
             }
             catch {
