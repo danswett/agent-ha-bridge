@@ -147,9 +147,10 @@ jobs:
             if ($code -ne 0) {
               $failed += $suite.Name
               Write-Host "::warning::$($suite.Name) exited with $code"
-              # Why: run it again inside a caller that reports the script's own exit
-              # code and whatever errors were recorded on the way out.
-              pwsh -NoProfile -Command "& '$($suite.FullName)' *> `$null; Write-Host ('script exit code: ' + `$LASTEXITCODE); `$Error | Select-Object -First 8 | ForEach-Object { Write-Host ('error: ' + `$_ + ' @ ' + `$_.InvocationInfo.PositionMessage) }"
+              # Why: run it again traced, and show where it stopped.
+              $trace = @(pwsh -NoProfile -Command "Set-PSDebug -Trace 1; & '$($suite.FullName)'" 2>&1 | ForEach-Object { [string]$_ })
+              Write-Host "--- last traced lines of $($suite.Name) ---"
+              $trace | Select-Object -Last 40 | ForEach-Object { Write-Host $_ }
             }
           }
           Write-Host "Failed on macOS: $($failed -join ', ')"
