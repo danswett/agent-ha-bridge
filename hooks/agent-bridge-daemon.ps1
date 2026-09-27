@@ -109,7 +109,13 @@ $script:DaemonConfig = @{
     # Home Assistant. Clicking Send does not commit the text field - confirmed from
     # Home Assistant's own history, where three presses landed before the box was ever
     # committed - so the press waits for the value instead of being spent on nothing.
-    SubmitArmSeconds = 90
+    #
+    # Ten minutes, not ninety seconds. Ninety was measured against real use and lost:
+    # a press armed at 20:26:16 expired at 20:27:49, and the reply went out on a second
+    # press at 20:34 - exactly the double press this is meant to remove. Pressing Send
+    # is deliberate, so honouring it later is right; what must not happen is a reply
+    # going out that Send was never pressed for at all.
+    SubmitArmSeconds = 600
     ResumeCacheSeconds = 180
     # How soon to retry after a fetch that failed or came back empty, rather than
     # waiting out the full interval with a list known to be wrong.
