@@ -221,6 +221,94 @@ function Get-BridgeConfigPathCandidate {
     $candidates.ToArray()
 }
 
+function Get-BridgeReplyCardState {
+    <#
+        What Home Assistant already has: the registered resource, and whether the
+        file behind it is actually being served.
+
+        Both matter, and for different reasons. A registration with no file renders
+        an error box on the dashboard; a file with no registration is never loaded.
+        Only when both hold is the card usable, which is what lets an install on a
+        second machine see that there is nothing to do.
+
+        -Resources and -FileProbe are injectable so this is testable offline.
+    #>
+    param(
+        [scriptblock]$Resources,
+        [scriptblock]$FileProbe
+    )
+
+    if (-not $Resources) {
+        $Resources = { @((Invoke-CopilotHaWebSocket -Commands @(@{ type = 'lovelace/resources' }))[0]) }
+    }
+    if (-not $FileProbe) {
+        $FileProbe = {
+            param($relativeUrl)
+            $base = ([string]$script:DecisionBridgeConfig.HomeAssistantBaseUrl).TrimEnd('/')
+            try {
+                $response = Invoke-WebRequest -Uri "$base$relativeUrl" -TimeoutSec 8 `
+                    -SkipHttpErrorCheck -ErrorAction Stop
+                return ([int]$response.StatusCode -eq 200)
+            }
+            catch { return $false }
+        }
+    }
+
+    $state = [pscustomobject]@{
+        Registered = $false
+        Served     = $false
+        Url        = ''
+        Version    = ''
+        ResourceId = ''
+        Readable   = $true
+    }
+
+    try {
+        foreach ($resource in @(& $Resources)) {
+            if ($null -eq $resource) { continue }
+            if (-not $resource.PSObject.Properties['url']) { continue }
+            $url = [string]$resource.url
+            if (-not (Test-BridgeCardResourceMatch -ResourceUrl $url -FileName 'agent-bridge-reply-card.js')) { continue }
+            $state.Registered = $true
+            $state.Url = $url
+            if ($resource.PSObject.Properties['id']) { $state.ResourceId = [string]$resource.id }
+            if ($url -match '[?&]v=([^&]+)') { $state.Version = $Matches[1] }
+            break
+        }
+    }
+    catch {
+        # Unreadable: say so rather than reporting the card as missing, which would
+        # send an install off to rewrite a file that is probably already correct.
+        $state.Readable = $false
+        return $state
+    }
+
+    if ($state.Registered) {
+        try { $state.Served = [bool](& $FileProbe ($state.Url)) } catch { $state.Served = $false }
+    }
+
+    $state
+}
+
+function Get-BridgeReplyCardFileVersion {
+    <#
+        The card's own version, read from its CARD_VERSION constant.
+
+        The resource URL is cache-busted by this rather than by the bridge version,
+        so a release that does not touch the card does not invalidate a URL that only
+        a machine with config-share access could rewrite. Without that, every bridge
+        release would leave share-less machines reporting a stale card forever.
+    #>
+    param([Parameter(Mandatory)][string]$SourcePath)
+
+    try {
+        $text = Get-Content -LiteralPath $SourcePath -Raw -ErrorAction Stop
+        if ($text -match "CARD_VERSION\s*=\s*'([^']+)'") { return $Matches[1] }
+    }
+    catch { }
+    ''
+}
+
 function Get-BridgeReplyCardUrl {
     <# The Lovelace resource URL for the reply card, cache-busted by version. #>
     param([AllowEmptyString()][AllowNull()][string]$Version)
@@ -231,25 +319,52 @@ function Get-BridgeReplyCardUrl {
 
 function Install-BridgeReplyCard {
     <#
-        Copies the reply card into Home Assistant's `www` folder and registers it.
+        Makes sure Home Assistant is serving the reply card, copying it into the
+        `www` folder over the configuration share only when that is actually needed.
 
-        Returns a record rather than throwing: a bridge that cannot deliver the card
+        Home Assistant is shared between machines, so on the second and later
+        machines the card is already installed and there is nothing to do. Checking
+        that first is what stops a perfectly healthy install reporting a problem and
+        asking for a share it does not need.
+
+        Returns a record rather than throwing. A bridge that cannot deliver the card
         is still a working bridge - the dashboard falls back to the plain text box -
-        so this must never be able to fail an install.
+        so this must never fail an install.
+
+        Action is one of:
+          current   - already installed and up to date; nothing was written
+          deployed  - copied and registered
+          updated   - copied over an older copy and the resource re-pointed
+          kept      - an older copy is in place and the share is unreachable, so the
+                      card that is there carries on being used
+          missing   - not installed and cannot be delivered
     #>
     param(
         [string]$SourcePath,
         [AllowEmptyString()][AllowNull()][string]$ConfigPath,
         [AllowEmptyString()][AllowNull()][string]$Version,
         [scriptblock]$Invoker,
-        [scriptblock]$Resources
+        [scriptblock]$Resources,
+        [scriptblock]$FileProbe
     )
 
     if ([string]::IsNullOrWhiteSpace($SourcePath)) {
         $SourcePath = Join-Path (Split-Path -Parent $PSScriptRoot) 'frontend\agent-bridge-reply-card.js'
     }
 
+    # The card carries its own version, which is what the resource URL is keyed on.
+    if ([string]::IsNullOrWhiteSpace($Version) -and (Test-Path -LiteralPath $SourcePath)) {
+        $Version = Get-BridgeReplyCardFileVersion -SourcePath $SourcePath
+    }
+
+    if (-not $Invoker) { $Invoker = { param($commands) Invoke-CopilotHaWebSocket -Commands $commands } }
+    if (-not $Resources) {
+        $Resources = { @((& $Invoker @(@{ type = 'lovelace/resources' }))[0]) }
+    }
+
     $result = [pscustomobject]@{
+        Ok         = $false
+        Action     = 'missing'
         Deployed   = $false
         Registered = $false
         Path       = ''
@@ -257,8 +372,29 @@ function Install-BridgeReplyCard {
         Detail     = ''
     }
 
+    # What Home Assistant already has decides whether the configuration share is
+    # touched at all. Home Assistant is shared between machines, so on the second and
+    # later machines the card is already there and correct, and an install that went
+    # looking for a file share it does not need would report a problem that is not one.
+    $state = Get-BridgeReplyCardState -Resources $Resources -FileProbe $FileProbe
+    if (-not $state.Readable) {
+        $result.Detail = 'could not read the Lovelace resource list'
+        return $result
+    }
+
+    $present = ($state.Registered -and $state.Served)
+    if ($present -and ([string]::IsNullOrWhiteSpace($Version) -or $state.Version -eq $Version)) {
+        # Already installed and the right version: touch nothing.
+        $result.Registered = $true
+        $result.Url = $state.Url
+        $result.Ok = $true
+        $result.Action = 'current'
+        return $result
+    }
+
     if (-not (Test-Path -LiteralPath $SourcePath)) {
         $result.Detail = "card source not found at $SourcePath"
+        if ($present) { $result.Ok = $true; $result.Action = 'kept' }
         return $result
     }
 
@@ -271,7 +407,15 @@ function Install-BridgeReplyCard {
     }
 
     if ([string]::IsNullOrWhiteSpace($target)) {
-        $result.Detail = 'no reachable Home Assistant config folder'
+        if ($present) {
+            $result.Ok = $true
+            $result.Action = 'kept'
+            $result.Detail = "the card already in Home Assistant (v$($state.Version)) is being used; " +
+                             'this machine cannot reach the config share to update it'
+        }
+        else {
+            $result.Detail = 'no reachable Home Assistant config folder'
+        }
         return $result
     }
 
@@ -287,50 +431,34 @@ function Install-BridgeReplyCard {
     }
     catch {
         $result.Detail = "could not copy the card: $($_.Exception.Message)"
+        if ($present) { $result.Ok = $true; $result.Action = 'kept' }
         return $result
     }
 
     # Registering is separate from copying: an upgrade re-copies the file but must
     # update the existing resource rather than adding a second one pointing at the
     # same card with a stale version string.
-    if (-not $Invoker) { $Invoker = { param($commands) Invoke-CopilotHaWebSocket -Commands $commands } }
-    if (-not $Resources) {
-        $Resources = { @((& $Invoker @(@{ type = 'lovelace/resources' }))[0]) }
-    }
-
-    $existing = $null
     try {
-        foreach ($resource in @(& $Resources)) {
-            if ($null -eq $resource) { continue }
-            if (-not $resource.PSObject.Properties['url']) { continue }
-            if (Test-BridgeCardResourceMatch -ResourceUrl ([string]$resource.url) -FileName 'agent-bridge-reply-card.js') {
-                $existing = $resource
-                break
-            }
-        }
-    }
-    catch {
-        $result.Detail = "could not read Lovelace resources: $($_.Exception.Message)"
-        return $result
-    }
-
-    try {
-        if ($null -ne $existing -and $existing.PSObject.Properties['id']) {
-            if ([string]$existing.url -ne $result.Url) {
+        if ($state.Registered -and -not [string]::IsNullOrWhiteSpace($state.ResourceId)) {
+            if ($state.Url -ne $result.Url) {
                 [void](& $Invoker @(@{
                     type        = 'lovelace/resources/update'
-                    resource_id = [string]$existing.id
+                    resource_id = $state.ResourceId
                     url         = $result.Url
                 }))
             }
+            $result.Action = 'updated'
         }
         else {
             [void](& $Invoker @(@{ type = 'lovelace/resources/create'; res_type = 'module'; url = $result.Url }))
+            $result.Action = 'deployed'
         }
         $result.Registered = $true
+        $result.Ok = $true
     }
     catch {
         $result.Detail = "could not register the resource: $($_.Exception.Message)"
+        if ($present) { $result.Ok = $true; $result.Action = 'kept' }
     }
 
     $result
@@ -363,22 +491,27 @@ if ($Register) {
     # The bridge's own reply card. Unlike the three above it is not a HACS download,
     # so the installer delivers it: there is no Home Assistant API for writing a file
     # into the `www` folder, which leaves the configuration share as the only route.
-    $cardVersion = ''
-    foreach ($candidate in @(
-        (Join-Path $PSScriptRoot 'VERSION'),
-        (Join-Path (Split-Path -Parent $PSScriptRoot) 'VERSION')
-    )) {
-        if (Test-Path -LiteralPath $candidate) {
-            $cardVersion = (Get-Content -LiteralPath $candidate -Raw).Trim()
-            break
+    #
+    # No version is passed: the card is keyed on its own CARD_VERSION, so a bridge
+    # release that does not change the card leaves every machine's view of it alone.
+    $configShare = Get-BridgeSetting 'homeAssistant.configPath' ''
+    $replyCard = Install-BridgeReplyCard -ConfigPath $configShare
+
+    if ($replyCard.Action -eq 'current') {
+        if (-not $Quiet) {
+            Write-Host '    reply card is already installed in Home Assistant' -ForegroundColor Green
         }
     }
-
-    $configShare = Get-BridgeSetting 'homeAssistant.configPath' ''
-    $replyCard = Install-BridgeReplyCard -ConfigPath $configShare -Version $cardVersion
-
-    if ($replyCard.Deployed -and $replyCard.Registered) {
+    elseif ($replyCard.Action -eq 'deployed') {
         Write-Host "    reply card installed -> $($replyCard.Path)" -ForegroundColor Green
+    }
+    elseif ($replyCard.Action -eq 'updated') {
+        Write-Host "    reply card updated -> $($replyCard.Path)" -ForegroundColor Green
+    }
+    elseif ($replyCard.Action -eq 'kept') {
+        # Not a problem: the card is installed and working, this machine simply
+        # cannot reach the share to write a newer copy. Another machine will.
+        Write-Host "    reply card: $($replyCard.Detail)" -ForegroundColor DarkGray
     }
     else {
         Write-Host "    reply card not installed ($($replyCard.Detail))" -ForegroundColor Yellow
