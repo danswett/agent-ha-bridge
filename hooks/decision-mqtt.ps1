@@ -420,6 +420,34 @@ function Get-CopilotMqttSessionDiscoveryTopic {
     $topics.ToArray()
 }
 
+function Get-CopilotMqttSessionStateTopic {
+    <#
+        Every retained *state* topic belonging to one session node.
+
+        Separate from the discovery list because the two are cleared at different
+        points - discovery removes the entity, state removes what it last said - but
+        derived from the node alone so the startup sweep can clear them too. The sweep
+        only ever recovers a node id from an entity id; it has no session id to hand.
+
+        Without this the sweep withdrew a dead session's entities and left its retained
+        state behind in the broker permanently, a handful of messages per session that
+        nothing would ever clean up.
+    #>
+    param([Parameter(Mandatory)][string]$Node)
+
+    $root = "$($script:CopilotMqttConfig.TopicRoot)/$Node"
+    @(
+        "$root/decision/state"
+        "$root/decision/attr"
+        "$root/reply/state"
+        "$root/status/state"
+        "$root/status/attr"
+        "$root/activity/state"
+        "$root/activity/attr"
+        "$root/available"
+    )
+}
+
 function Remove-CopilotMqttSession {
     <#
         Clears the retained discovery configs so Home Assistant drops the entities
@@ -442,11 +470,7 @@ function Remove-CopilotMqttSession {
         Publish-CopilotMqttMessage -Topic $topic -Payload '' -Headers $Headers -Retain
     }
 
-    foreach ($topic in @(
-        $topics.DecisionState, $topics.DecisionAttributes, $topics.ReplyState,
-        $topics.StatusState, $topics.StatusAttributes,
-        $topics.ActivityState, $topics.ActivityAttributes, $topics.Availability
-    )) {
+    foreach ($topic in (Get-CopilotMqttSessionStateTopic -Node $topics.Node)) {
         Publish-CopilotMqttMessage -Topic $topic -Payload '' -Headers $Headers -Retain
     }
 }

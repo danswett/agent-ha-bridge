@@ -474,6 +474,22 @@ No machine talks to another. Each publishes a retained sensor describing what it
 running, and every daemon reads all of them, so the picture is complete whichever
 machine happens to rebuild the dashboard.
 
+You can see the same list from any machine's terminal:
+
+```powershell
+agent-ha-bridge status
+```
+
+```
+machines:
+online   DESKTOP            2 session(s) (this machine)
+offline  LAPTOP             0 session(s)
+```
+
+It also warns if it finds a machine still running a bridge older than 1.6.0, because
+that one rebuilds the shared dashboard from its own sessions alone and will keep
+replacing everyone else's until it is upgraded.
+
 Two things stay shared, because they belong to the instance rather than to a machine:
 the **Detailed activity** toggle and the dashboard itself. (The machine dropdown is
 shared too, but it is created and retired automatically.) An uninstall therefore leaves

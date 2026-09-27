@@ -1494,7 +1494,10 @@ function Clear-CopilotMqttOrphans {
     }
 
     foreach ($node in $orphanNodes.Keys) {
-        foreach ($topic in (Get-CopilotMqttSessionDiscoveryTopic -Node $node)) {
+        foreach ($topic in @(
+            (Get-CopilotMqttSessionDiscoveryTopic -Node $node) +
+            (Get-CopilotMqttSessionStateTopic -Node $node)
+        )) {
             try {
                 Publish-CopilotMqttMessage -Topic $topic -Payload '' -Headers $Headers -Retain
             }

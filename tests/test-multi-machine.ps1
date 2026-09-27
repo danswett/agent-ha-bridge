@@ -620,11 +620,18 @@ Test-That 'the sweep clears exactly what a clean exit would' {
     # These were two hand-maintained lists and they drifted: the stop button was added
     # to the exit path only, so every swept session left a dead Stop button behind.
     $sweptForOrphan = @($script:Swept | Where-Object { $_ -match 'agent_bridge_3333333333333333' } | Sort-Object)
-    $expected = @(Get-CopilotMqttSessionDiscoveryTopic -Node 'agent_bridge_3333333333333333' | Sort-Object)
+    $expected = @(@(Get-CopilotMqttSessionDiscoveryTopic -Node 'agent_bridge_3333333333333333') +
+                  @(Get-CopilotMqttSessionStateTopic -Node 'agent_bridge_3333333333333333') | Sort-Object)
     ($sweptForOrphan -join '|') -eq ($expected -join '|')
 }
 Test-That 'the stop button is one of them' {
     @($script:Swept | Where-Object { $_ -match 'agent_bridge_3333333333333333/stop/config$' }).Count -eq 1
+}
+Test-That 'the retained state goes too, not just the entities' {
+    # Withdrawing the discovery config removes the entity but leaves what it last said
+    # sitting in the broker forever - a handful of messages per dead session that
+    # nothing would ever come back for.
+    @($script:Swept | Where-Object { $_ -match 'agent_bridge_3333333333333333/(status/state|activity/attr|available)$' }).Count -eq 3
 }
 Test-That 'a peer machine live session is left alone' {
     @($script:Swept | Where-Object { $_ -match 'agent_bridge_2222222222222222' }).Count -eq 0
