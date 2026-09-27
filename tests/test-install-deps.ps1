@@ -36,16 +36,23 @@ function Test-That {
 }
 
 Write-Host '--- the dependency catalogue ---'
-Test-That 'PowerShell 7 installs from winget' {
-    (Get-BridgeDependencyCommand -Name 'pwsh') -match '^winget install --id Microsoft\.PowerShell\b'
+if ($script:BridgeIsWindows) {
+    Test-That 'PowerShell 7 installs from winget' {
+        (Get-BridgeDependencyCommand -Name 'pwsh') -match '^winget install --id Microsoft\.PowerShell\b'
+    }
+    Test-That 'Node installs the LTS package' {
+        (Get-BridgeDependencyCommand -Name 'node') -match '--id OpenJS\.NodeJS\.LTS\b'
+    }
+    Test-That 'winget commands accept the agreements, so they never sit at a prompt' {
+        (Get-BridgeDependencyCommand -Name 'pwsh') -match '--accept-package-agreements' -and
+        (Get-BridgeDependencyCommand -Name 'pwsh') -match '--accept-source-agreements'
+    }
 }
-Test-That 'Node installs the LTS package' {
-    (Get-BridgeDependencyCommand -Name 'node') -match '--id OpenJS\.NodeJS\.LTS\b'
+else {
+    Test-That 'on macOS Node installs from Homebrew' { (Get-BridgeDependencyCommand -Name 'node') -eq 'brew install node' }
+    Test-That 'and so does PowerShell' { (Get-BridgeDependencyCommand -Name 'pwsh') -eq 'brew install powershell' }
 }
-Test-That 'winget commands accept the agreements, so they never sit at a prompt' {
-    (Get-BridgeDependencyCommand -Name 'pwsh') -match '--accept-package-agreements' -and
-    (Get-BridgeDependencyCommand -Name 'pwsh') -match '--accept-source-agreements'
-}
+Test-That 'tmux installs from Homebrew' { (Get-BridgeDependencyCommand -Name 'tmux') -eq 'brew install tmux' }
 Test-That 'the Copilot CLI is the published npm package' {
     (Get-BridgeDependencyCommand -Name 'copilot') -eq 'npm install -g @github/copilot'
 }
@@ -275,12 +282,14 @@ Write-Host '--- the entry points still parse on Windows PowerShell ---'
 # PowerShell 7 is absent. PowerShell parses an entire file before executing any of it,
 # so one PS7-only construct anywhere in these two files turns the offer into a parse
 # error - the exact failure it exists to prevent.
-$winPs = Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe'
-if (-not (Test-Path -LiteralPath $winPs)) {
+$winPs = if ($env:SystemRoot) { Join-Path $env:SystemRoot 'System32\WindowsPowerShell\v1.0\powershell.exe' } else { '' }
+if (-not $winPs -or -not (Test-Path -LiteralPath $winPs)) {
     Write-Host '  SKIP  Windows PowerShell is not present on this machine' -ForegroundColor Yellow
 }
 else {
-    foreach ($name in @('install.ps1', 'bootstrap.ps1')) {
+    # install.ps1 loads the platform layer before it can offer PowerShell 7, so that
+    # file has to parse there too.
+    foreach ($name in @('install.ps1', 'bootstrap.ps1', 'hooks\bridge-platform.ps1')) {
         $target = (Resolve-Path (Join-Path $PSScriptRoot "..\$name")).Path
         Test-That "$name parses under Windows PowerShell 5.1" {
             $script = @"

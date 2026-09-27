@@ -80,6 +80,9 @@ function ConvertFrom-CommandLine {
     finally { [void][BridgeTest.Cmd]::LocalFree($ptr) }
 }
 
+# Windows command lines only: on macOS tmux is handed the arguments as a list and
+# nothing is ever quoted into one string.
+if ($script:BridgeIsWindows) {
 Write-Host '--- argument quoting round-trips through CommandLineToArgvW ---'
 
 $cases = @(
@@ -111,6 +114,7 @@ Test-That 'a quote in the prompt cannot inject an extra argument' {
     $evil = 'hi" --allow-all-tools "'
     $parsed = @(ConvertFrom-CommandLine -CommandLine (ConvertTo-BridgeArgumentString -Arguments @('-i', $evil)))
     $parsed.Count -eq 2 -and $parsed[1] -ceq $evil -and $parsed -notcontains '--allow-all-tools'
+}
 }
 
 # --- the approved workspace list -------------------------------------------------

@@ -183,7 +183,10 @@ function Show-Status {
     Write-Host "    clients    : $(if ($clients) { $clients -join ', ' } else { 'none recorded' })"
 
     $task = if ($script:BridgeIsWindows) { Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue } else { $null }
-    if (-not $script:BridgeIsWindows) {
+    if (-not $script:BridgeIsWindows -and -not (Get-Command Get-BridgeProcessesNamed -ErrorAction SilentlyContinue)) {
+        Write-Host '    daemon     : unknown - the install''s hooks are missing; run agent-ha-bridge configure' -ForegroundColor Yellow
+    }
+    elseif (-not $script:BridgeIsWindows) {
         $loaded = [bool](& launchctl print "gui/$(& id -u)/$launchAgentLabel" 2>$null)
         $daemon = @(Get-BridgeProcessesNamed -Name 'pwsh' | Where-Object { $_.CommandLine -match 'agent-bridge-daemon\.ps1' })
         if ($daemon) { Write-Host "    daemon     : running (pid $($daemon[0].ProcessId))" -ForegroundColor Green }

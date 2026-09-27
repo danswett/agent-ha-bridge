@@ -127,6 +127,28 @@ foreach ($c in @('copilot', 'claude', 'codex', 'mcp')) {
 }
 
 Write-Host '--- Protect-BridgeSecretFile locks a token file to the current user ---'
+if (-not $script:BridgeIsWindows) {
+    # macOS: owner read/write only (600), in place of the Windows ACL.
+    $secretFile = Join-Path $env:TEMP ("bridge-acl-" + [guid]::NewGuid().ToString('N') + '.json')
+    Set-Content -LiteralPath $secretFile -Value '{"homeAssistant":{"token":"secret"}}' -Encoding UTF8
+    try {
+        Test-That 'hardening reports success' { Protect-BridgeSecretFile -Path $secretFile }
+        Test-That 'the file is readable by its owner alone' {
+            [IO.File]::GetUnixFileMode($secretFile) -eq ([IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite)
+        }
+        Test-That 'hardening it again succeeds' { Protect-BridgeSecretFile -Path $secretFile }
+        Test-That 'a loosened file is detected' {
+            [IO.File]::SetUnixFileMode($secretFile, [IO.UnixFileMode]'UserRead, UserWrite, GroupRead, OtherRead')
+            -not (Test-BridgeSecretFileProtected -Path $secretFile)
+        }
+        Test-That 'and repaired' { (Protect-BridgeSecretFile -Path $secretFile) -and (Test-BridgeSecretFileProtected -Path $secretFile) }
+        Test-That 'a missing file is handled without throwing' {
+            (Protect-BridgeSecretFile -Path (Join-Path $env:TEMP ([guid]::NewGuid().ToString('N')))) -eq $false
+        }
+    }
+    finally { Remove-Item -LiteralPath $secretFile -Force -ErrorAction SilentlyContinue }
+}
+else {
 $secretFile = Join-Path $env:TEMP ("bridge-acl-" + [guid]::NewGuid().ToString('N') + '.json')
 Set-Content -LiteralPath $secretFile -Value '{"homeAssistant":{"token":"secret"}}' -Encoding UTF8
 try {
@@ -176,6 +198,7 @@ try {
 }
 finally {
     Remove-Item -LiteralPath $secretFile -Force -ErrorAction SilentlyContinue
+}
 }
 
 Write-Host '--- a scripted run is never offered things only a human can use ---'

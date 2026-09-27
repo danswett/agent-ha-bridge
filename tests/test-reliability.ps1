@@ -129,9 +129,17 @@ try {
     # stands in for the running session, since only the process name is checked.
     $fakeDir = Join-Path ([IO.Path]::GetTempPath()) "fake-claude-$([guid]::NewGuid().ToString('N').Substring(0,8))"
     New-Item -ItemType Directory -Path $fakeDir -Force | Out-Null
-    $fakeExe = Join-Path $fakeDir 'claude.exe'
-    Copy-Item (Join-Path $env:WINDIR 'System32\PING.EXE') $fakeExe
-    $fake = Start-Process -FilePath $fakeExe -ArgumentList '-n 30 127.0.0.1' -WindowStyle Hidden -PassThru
+    # macOS: a copy of sleep, named claude, plays the same part.
+    if ($script:BridgeIsWindows) {
+        $fakeExe = Join-Path $fakeDir 'claude.exe'
+        Copy-Item (Join-Path $env:WINDIR 'System32\PING.EXE') $fakeExe
+        $fake = Start-Process -FilePath $fakeExe -ArgumentList '-n 30 127.0.0.1' -WindowStyle Hidden -PassThru
+    }
+    else {
+        $fakeExe = Join-Path $fakeDir 'claude'
+        Copy-Item '/bin/sleep' $fakeExe
+        $fake = Start-Process -FilePath $fakeExe -ArgumentList '30' -PassThru
+    }
     try {
         $idle = [guid]::NewGuid().ToString()
         $seeded += $idle

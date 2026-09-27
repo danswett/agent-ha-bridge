@@ -3122,7 +3122,8 @@ function Get-DaemonClientInstaller {
     #>
     param([Parameter(Mandatory)][string]$Client)
 
-    $payload = Join-Path $HOME '.agent-ha-bridge\installer'
+    # $script:DaemonInstallerPayload lets a test point this at a fake payload.
+    $payload = if ($script:DaemonInstallerPayload) { $script:DaemonInstallerPayload } else { Join-Path $HOME '.agent-ha-bridge\installer' }
     if ($Client -eq 'copilot') {
         $clients = @(@(Get-BridgeSetting 'clients' @()) | ForEach-Object { [string]$_ } | Where-Object { $_ })
         if ($clients -notcontains 'copilot') { $clients += 'copilot' }

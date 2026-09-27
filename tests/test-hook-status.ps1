@@ -165,6 +165,13 @@ Write-Host ''
 Write-Host '--- setting up an agent installed after the bridge ---'
 
 # Every side effect is stood in for: no installer runs and the real config is untouched.
+# The installers are found in a fake payload, not whatever this machine has installed.
+$script:DaemonInstallerPayload = Join-Path ([IO.Path]::GetTempPath()) "bridge-payload-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+foreach ($stub in @('install.ps1', 'claude/install-claude.ps1', 'codex/install-codex.ps1')) {
+    $stubPath = Join-Path $script:DaemonInstallerPayload $stub
+    New-Item -ItemType Directory -Path (Split-Path $stubPath -Parent) -Force | Out-Null
+    Set-Content -LiteralPath $stubPath -Value '# stub'
+}
 $script:Installed = @{ claude = $true; codex = $false }
 $script:Adapters = @{ claude = $true; codex = $false }
 $script:Started = @()
@@ -250,7 +257,7 @@ $script:Adapters.codex = $true
 $script:Started = @()
 Sync-DaemonClients -Headers $headers
 Test-That 'Copilot installed later is set up by the main installer' {
-    $script:Started.Count -eq 1 -and $script:Started[0] -match '\\install\.ps1"' -and $script:Started[0] -match '-NonInteractive'
+    $script:Started.Count -eq 1 -and $script:Started[0] -match '[\\/]install\.ps1"' -and $script:Started[0] -match '-NonInteractive'
 }
 Test-That 'with Copilot added to the configured clients, not replacing them' { $script:Started[0] -match '-Clients claude,codex,copilot$' }
 

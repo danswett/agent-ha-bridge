@@ -161,7 +161,8 @@ Write-Host '--- state persistence survives console detachment ---'
 # file that silently stopped advancing from the first injection onward.
 #
 # Run in a child process, because the console juggling would break the rest of this
-# suite's own output.
+# suite's own output. Windows only: macOS never attaches to a session's console.
+if ($script:BridgeIsWindows) {
 $detachDir = Join-Path ([System.IO.Path]::GetTempPath()) ("bridge-detach-test-" + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $detachDir -Force | Out-Null
 $detachScript = Join-Path $detachDir 'detach.ps1'
@@ -209,6 +210,7 @@ try {
 }
 finally {
     Remove-Item -LiteralPath $detachDir -Recurse -Force -ErrorAction SilentlyContinue
+}
 }
 
 Write-Host '--- the legacy cleanup runs once and re-publishes live sessions ---'
