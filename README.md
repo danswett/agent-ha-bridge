@@ -12,10 +12,11 @@ doing, what it just said, and what it's waiting on. When the agent asks a questi
 card grows the matching controls. Whatever you pick is typed into the real terminal
 prompt, so the terminal never stops working and nothing is ever answered twice.
 
-> **Windows only** for the terminal integration. Answers are delivered into the running
-> CLI with `AttachConsole` + `WriteConsoleInput`, which is Win32-specific. Everything
-> else is portable — and the [MCP server](mcp/) needs no console injection at all, so
-> it runs on any OS.
+> **Windows and macOS.** Answers are typed into the running CLI: on Windows through the
+> session's console (`AttachConsole` + `WriteConsoleInput`), on macOS through the tmux
+> pane the session runs in. Everything above that - the daemon, the dashboard, how
+> replies are confirmed and forms are answered - is the same code on both. The
+> [MCP server](mcp/) needs no console at all, so it runs on any OS.
 
 ---
 
@@ -91,6 +92,8 @@ only a Home Assistant token.
 
 * Windows 10/11 and **PowerShell 7+** — the installer offers to install it if you
   don't have it, including when you paste the one-liner into Windows PowerShell
+* or macOS 13+ with **PowerShell 7+** and **tmux** — the macOS one-liner installs both
+  through Homebrew, and offers to install Homebrew too
 * At least one supported client. The installer asks which of
   **[GitHub Copilot CLI](https://docs.github.com/copilot/how-tos/use-copilot-agents/use-copilot-cli)**,
   **Claude Code**, **Codex CLI** and the **MCP server** to configure (detecting what
@@ -125,6 +128,33 @@ git clone https://github.com/danswett/agent-ha-bridge.git
 cd agent-ha-bridge
 .\install.ps1
 ```
+
+### macOS
+
+The one-liner, in Terminal:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/danswett/agent-ha-bridge/main/bootstrap.sh | bash
+```
+
+It installs what is missing through [Homebrew](https://brew.sh) - offering to install
+Homebrew itself first, which asks for your Mac password - then PowerShell 7 and tmux,
+and hands over to the same installer, which asks the same questions. From a clone it
+is `pwsh ./install.ps1`.
+
+What differs on a Mac:
+
+* **Sessions run in tmux.** That is how the dashboard types into them. Sessions it
+  launches are started in tmux and shown in a Terminal window attached to it (iTerm
+  with `platform.terminal: iTerm`, or no window with `none`). For a session you start
+  yourself, start it inside tmux - `tmux new claude` - or its card still shows
+  everything but the reply box cannot reach it.
+* **The first launch asks for permission.** macOS asks once whether PowerShell may
+  control Terminal, which is how the window is opened. Allow it.
+* **The daemon is a LaunchAgent** (`com.agent-ha-bridge.daemon`) rather than a
+  scheduled task: it starts at login and launchd restarts it if it exits.
+* **`agent-ha-bridge` goes on your PATH through `~/.zprofile`**; open a new terminal
+  to use it.
 
 Nothing is a hard prerequisite except Windows itself. If **PowerShell 7** is missing
 the installer offers to install it with winget and hands the install over to it —
@@ -253,6 +283,7 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `newSession.launcher` | Default agent: `auto` (default: the installed agent used most recently on this machine, else one that is signed in), `agency`, `copilot`, `claude` or `codex`. With more than one installed, the card also gets an Agent dropdown |
 | `newSession.codexStartPrompt` | The first message a Codex launched without one is given, so it creates its session and attaches. Empty: the launch waits for a first message sent from the card |
 | `detailedActivity` | `true` (default): cards carry reasoning and each tool call. `false`: status and responses only |
+| `platform.terminal` | macOS: the window a launched session opens in - `Terminal` (default), `iTerm`, or `none` (the session still runs; `tmux attach` reaches it) |
 | `newSession.profiles` | Agency profiles offered on the dashboard (default `["work","home","local"]`) |
 | `newSession.defaultProfile` | Profile preselected on the card (default: the first in `profiles`) |
 | `newSession.defaultWorkspace` | Workspace label preselected on the card (default: the first in `workspaces`) |
@@ -538,7 +569,7 @@ action, because this software types into terminals and registers scheduled tasks
 
 ## Uninstall
 
-From **Settings → Apps → Installed apps**, or:
+From **Settings → Apps → Installed apps** on Windows, or on either system:
 
 ```powershell
 agent-ha-bridge uninstall
@@ -644,6 +675,10 @@ Get-Content $env:TEMP\agent-bridge-daemon.log -Tail 20
   HTTP it crosses your network in the clear. The installer warns about this.
 * The daemon idles at a few percent of one core and reconciles every ~15 s, with
   WebSocket pushes for anything latency-sensitive.
+* **On macOS, only sessions in tmux can be replied to.** Windows can type into any
+  console; macOS offers no way to type into a terminal another app owns, so the bridge
+  goes through tmux. A session outside tmux still gets its card - status, reasoning,
+  responses, questions - from its hooks and transcript.
 
 ---
 
