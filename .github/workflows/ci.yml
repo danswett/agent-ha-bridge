@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, macos]
   pull_request:
     branches: [main]
 
@@ -105,6 +105,50 @@ jobs:
             }
           }
           if ($failed.Count) { throw "Failed suites: $($failed -join ', ')" }
+
+  macos:
+    name: macOS (platform layer, tmux delivery, suites)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install tmux
+        run: brew list tmux >/dev/null 2>&1 || brew install tmux
+
+      - name: Parse-check every PowerShell file
+        shell: pwsh
+        run: |
+          $errors = 0
+          Get-ChildItem -Recurse -Include *.ps1 | Where-Object { $_.FullName -notmatch '/node_modules/' } | ForEach-Object {
+            $parseErrors = $null
+            [void][System.Management.Automation.Language.Parser]::ParseFile($_.FullName, [ref]$null, [ref]$parseErrors)
+            foreach ($e in @($parseErrors)) { $errors++; Write-Host "::error file=$($_.FullName),line=$($e.Extent.StartLineNumber)::$($e.Message)" }
+          }
+          if ($errors) { throw "$errors parse error(s) found" }
+
+      - name: Platform layer and tmux delivery
+        shell: pwsh
+        run: pwsh -NoProfile -File tests/test-platform.ps1
+
+      - name: Shell scripts
+        run: |
+          bash -n bootstrap.sh
+          sh -n bin/agent-ha-bridge
+
+      - name: Test suites on macOS (report only, while the port settles)
+        shell: pwsh
+        continue-on-error: true
+        run: |
+          $failed = @()
+          foreach ($suite in @(Get-ChildItem tests/test-*.ps1, claude/tests/test-*.ps1, codex/tests/test-*.ps1 | Where-Object { $_.Name -notmatch 'integration|platform' })) {
+            Write-Host "::group::$($suite.Name)"
+            pwsh -NoProfile -File $suite.FullName
+            $code = $LASTEXITCODE
+            Write-Host "::endgroup::"
+            if ($code -ne 0) { $failed += $suite.Name; Write-Host "::warning::$($suite.Name) exited with $code" }
+          }
+          Write-Host "Failed on macOS: $($failed -join ', ')"
+          if ($failed.Count) { exit 1 }
 
   node:
     name: MCP server (Node)
