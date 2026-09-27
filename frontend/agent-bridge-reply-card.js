@@ -16,7 +16,7 @@
  * daemon downloads them and attaches them to the prompt.
  */
 
-const CARD_VERSION = '1.11.0';
+const CARD_VERSION = '1.11.1';
 
 // The working line, in the style of Claude Code's own spinner: its glyph cycle, and a
 // word picked once per turn. Claude Code does not record which word it chose, so the
@@ -525,7 +525,16 @@ class AgentBridgeActivityCard extends HTMLElement {
     if (this._changed('title', title)) { this._els.title.textContent = title; }
 
     const shownStatus = question ? 'waiting for you' : statusText;
-    const activityText = activity ? activity.state : '';
+    let activityText = activity ? String(activity.state || '') : '';
+    // The summary is usually the first line of the newest message, which the body
+    // right below already starts with. Repeating it read as the card saying
+    // everything twice, so it is shown only when it adds something ("Running: Edit",
+    // a permission message). The state can be cut at Home Assistant's 255-character
+    // limit with a trailing "...", so that is ignored when comparing.
+    const bodyText = question ? '' : String(attr(activity, 'response') || '');
+    const squash = (s) => s.replace(/\s+/g, ' ').trim();
+    const summaryCore = squash(activityText.replace(/\.\.\.$/, ''));
+    if (summaryCore && squash(bodyText).startsWith(summaryCore)) { activityText = ''; }
     const meta = `${this._config.machine}\u0001${shownStatus}\u0001${activityText}`;
     if (this._changed('meta', meta)) {
       this._els.meta.textContent = '';
@@ -533,7 +542,8 @@ class AgentBridgeActivityCard extends HTMLElement {
       machine.textContent = this._config.machine;
       const bold = document.createElement('b');
       bold.textContent = shownStatus;
-      this._els.meta.append(machine, ' • status: ', bold, ` • ${activityText}`);
+      this._els.meta.append(machine, ' • status: ', bold);
+      if (activityText) { this._els.meta.append(` • ${activityText}`); }
     }
 
     // The question, when one is waiting, takes the place of the response.

@@ -145,6 +145,34 @@ function Get-ClaudeHookEvent {
     try { return $Raw | ConvertFrom-Json } catch { return $null }
 }
 
+function Test-ClaudeNotificationNeedsUser {
+    <#
+        Whether a Notification event means Claude is blocked on the user.
+
+        Claude sends notifications for several reasons, and only some of them mean
+        it cannot continue: a permission prompt, a question dialog. The idle reminder
+        - "Claude is waiting for your input", sent about a minute after a turn ends -
+        does not; the turn is already over. Treating it as blocked turned every
+        finished session's card to 'waiting' a minute later.
+
+        The type comes from `notification_type`, read out of Claude Code 2.1.283. A
+        build that does not send one is judged by the idle reminder's fixed wording,
+        and anything else is still treated as blocking, so a genuine prompt is never
+        missed.
+    #>
+    param([Parameter(Mandatory)]$Event)
+
+    $blocking = @('permission_prompt', 'worker_permission_prompt', 'elicitation_dialog',
+                  'elicitation_url_dialog', 'agent_needs_input')
+
+    $type = ''
+    if ($Event.PSObject.Properties['notification_type']) { $type = [string]$Event.notification_type }
+    if (-not [string]::IsNullOrWhiteSpace($type)) { return ($blocking -contains $type) }
+
+    $message = if ($Event.PSObject.Properties['message']) { [string]$Event.message } else { '' }
+    -not ($message -match '^\s*Claude is waiting for your input')
+}
+
 function Get-ClaudeOwningProcessId {
     <#
         Finds the claude process that owns this hook.

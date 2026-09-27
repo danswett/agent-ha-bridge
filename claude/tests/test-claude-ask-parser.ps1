@@ -90,6 +90,30 @@ Test-That 'no claude ancestor resolves to 0' { (Get-ClaudeOwningProcessId -Start
 Test-That 'an unknown pid resolves to 0' { (Get-ClaudeOwningProcessId -StartPid 999999) -eq 0 }
 
 Write-Host ''
+Write-Host '--- which notifications mean Claude is blocked ---'
+
+# The idle reminder a minute after a finished turn used to turn the card 'waiting'.
+function New-Notification { param([string]$Type, [string]$Message)
+    $n = [ordered]@{ session_id = 's'; hook_event_name = 'Notification'; message = $Message }
+    if ($Type) { $n.notification_type = $Type }
+    [pscustomobject]$n
+}
+Test-That 'a permission prompt is blocking' {
+    Test-ClaudeNotificationNeedsUser -Event (New-Notification 'permission_prompt' 'Claude needs your permission to use Bash')
+}
+Test-That 'a question dialog is blocking' { Test-ClaudeNotificationNeedsUser -Event (New-Notification 'elicitation_dialog' 'x') }
+Test-That 'the idle reminder is not' {
+    -not (Test-ClaudeNotificationNeedsUser -Event (New-Notification 'idle_prompt' 'Claude is waiting for your input'))
+}
+Test-That 'nor is a finished-auth notice' { -not (Test-ClaudeNotificationNeedsUser -Event (New-Notification 'auth_success' 'Signed in')) }
+Test-That 'with no type, the idle wording is recognised' {
+    -not (Test-ClaudeNotificationNeedsUser -Event (New-Notification '' 'Claude is waiting for your input'))
+}
+Test-That 'with no type, anything else is still treated as blocking' {
+    Test-ClaudeNotificationNeedsUser -Event (New-Notification '' 'Claude needs your permission to run: git push --force')
+}
+
+Write-Host ''
 if ($script:Failures) {
     Write-Host "$($script:Failures) test(s) failed" -ForegroundColor Red
     exit 1

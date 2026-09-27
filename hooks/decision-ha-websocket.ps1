@@ -1279,7 +1279,7 @@ ha-select, mwc-select { width: 100%; }
             card_mod = @{ style = $bareChild }
             content = @"
 ### {% if state_attr('$decisionEntity','question') %}🟡{% elif is_state('$statusEntity','working') %}🟢{% else %}⚪{% endif %} $($session.Name)
-*$($session.Machine)* &bull; status: **{% if state_attr('$decisionEntity','question') %}waiting for you{% else %}{{ states('$statusEntity') }}{% endif %}** &bull; {{ states('$activityEntity') }}
+*$($session.Machine)* &bull; status: **{% if state_attr('$decisionEntity','question') %}waiting for you{% else %}{{ states('$statusEntity') }}{% endif %}**{% set act = states('$activityEntity') %}{% set body = state_attr('$activityEntity','response') or '' %}{% if not (body and body.startswith(act.rstrip('.'))) %} &bull; {{ act }}{% endif %}
 {% set q = state_attr('$decisionEntity','question') %}{% set resp = state_attr('$activityEntity','response') %}{% if q %}
 
 ---

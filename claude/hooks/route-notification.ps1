@@ -41,6 +41,16 @@ try {
     $sessionId = [string]$event.session_id
     if ([string]::IsNullOrWhiteSpace($sessionId)) { Exit-Silently }
 
+    # Only a notification Claude is actually blocked on marks the session waiting.
+    # The idle reminder after a finished turn just keeps the registration fresh; the
+    # card stays idle, and no push goes out for it.
+    if (-not (Test-ClaudeNotificationNeedsUser -Event $event)) {
+        Write-ClaudeSessionRegistration -SessionId $sessionId `
+            -TranscriptPath (Resolve-ClaudeTranscriptPath -SessionId $sessionId -KnownPath ([string]$event.transcript_path)) `
+            -WorkingDirectory ([string]$event.cwd) -ProcessId (Get-ClaudeOwningProcessId) | Out-Null
+        Exit-Silently
+    }
+
     $message = [string]$event.message
     if ([string]::IsNullOrWhiteSpace($message)) { $message = 'Claude is waiting for you.' }
     if ($message.Length -gt 600) { $message = $message.Substring(0, 597) + '...' }
