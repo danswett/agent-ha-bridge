@@ -185,6 +185,32 @@ finally {
 }
 
 Write-Host ''
+Write-Host '--- what a turn adds to the card (Codex 0.157 rollout shapes) ---'
+$turn = @(
+    '{"type":"event_msg","payload":{"type":"task_started","turn_id":"t1"}}'
+    '{"type":"response_item","payload":{"type":"message","role":"user","content":[{"type":"input_text","text":"is my wifi ok?"}]}}'
+    '{"type":"response_item","payload":{"type":"reasoning","summary":[],"encrypted_content":"gAAAA"}}'
+    '{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"commentary","content":[{"type":"output_text","text":"I''ll check the network settings first."}]}}'
+    '{"type":"response_item","payload":{"type":"custom_tool_call","name":"exec","input":"ipconfig"}}'
+    '{"type":"event_msg","payload":{"type":"token_count"}}'
+    '{"type":"response_item","payload":{"type":"message","role":"assistant","phase":"final_answer","content":[{"type":"output_text","text":"**DNS is fine.**\nThe problem is the proxy."}]}}'
+)
+$a = Get-CodexActivityFromTranscript -Lines $turn
+Test-That 'a new turn is noticed' { $a.TurnStarted }
+Test-That 'the newest thing said is the final answer, whole' { $a.Latest -eq "**DNS is fine.**`nThe problem is the proxy." -and -not $a.LatestIsThinking }
+Test-That 'the user''s own message is not shown as the agent''s' { $a.Latest -notmatch 'wifi' }
+Test-That 'tool calls become the history' { (@($a.History) -join '|') -eq 'Ran: exec' }
+Test-That 'encrypted reasoning shows nothing' { -not $a.Reasoning }
+$mid = Get-CodexActivityFromTranscript -Lines $turn[0..4]
+Test-That 'mid-turn, the progress note is what the card shows' { $mid.Latest -eq "I'll check the network settings first." }
+$summary = Get-CodexActivityFromTranscript -Lines @('{"type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"Weighing DNS against the proxy"}]}}')
+Test-That 'a reasoning summary is shown as thinking' { $summary.Latest -eq 'Weighing DNS against the proxy' -and $summary.LatestIsThinking -and $summary.Reasoning }
+Test-That 'a batch with nothing to show adds nothing' {
+    $none = Get-CodexActivityFromTranscript -Lines @('{"type":"event_msg","payload":{"type":"token_count"}}', 'not json')
+    -not $none.TurnStarted -and -not $none.Latest -and @($none.History).Count -eq 0
+}
+
+Write-Host ''
 Write-Host '--- the process a reply is typed into ---'
 
 # Codex 0.157 runs hooks under a console-less `codex.exe app-server` child of the
