@@ -53,6 +53,7 @@ try {
     $status = ''
     $activity = ''
     $response = ''
+    $activityDetail = $null
     $pendingApproval = $false
     switch ($eventName) {
         'SessionStart' { $status = 'idle'; $activity = 'Session started' }
@@ -96,7 +97,18 @@ try {
         'Stop' {
             $status = 'idle'
             $response = Get-EventField 'last_assistant_message'
-            $activity = if ($response) { $response } else { 'Idle' }
+            # The status line is a state, cut at 255 characters, so it gets the first
+            # line; the reply itself goes to the card as `response`, shown in full.
+            # Published as the status line alone, a long reply was cut off with no way
+            # to read the rest.
+            $activity = 'Idle'
+            if ($response) {
+                $first = @($response -split '\r?\n' | Where-Object { $_.Trim() })[0]
+                $activity = if ($first.Length -gt 200) { $first.Substring(0, 197) + '...' } else { $first }
+                $shown = $response.Trim()
+                if ($shown.Length -gt 6000) { $shown = $shown.Substring(0, 6000).TrimEnd() + "`n`n_(truncated - see terminal)_" }
+                $activityDetail = @{ response = $shown; response_kind = 'text' }
+            }
         }
         'SessionEnd' { $status = 'ended' }
         default { Exit-Silently }
@@ -133,9 +145,13 @@ try {
     [void](Confirm-BridgeSessionEntities -SessionId $sessionId -SessionName $display.Name `
         -Machine $display.Machine -Headers $headers)
 
+    # A new prompt starts the card afresh; every other event keeps what it shows - the
+    # reasoning the daemon streams, the reply - and changes the status line.
     Publish-BridgeSessionStatus -SessionId $sessionId -SessionName $display.Name `
         -Machine $display.Machine -Headers $headers -Status $status -Activity $activity `
-        -ExtraAttributes @{ model = (Get-EventField 'model'); process_id = $ownerPid }
+        -ExtraAttributes @{ model = (Get-EventField 'model'); process_id = $ownerPid } `
+        -PreserveActivityDetail:($eventName -notin @('UserPromptSubmit', 'SessionStart')) `
+        -ActivityDetail $activityDetail
 
     if ($pendingApproval) {
         # Arm the selector so the command can be approved from the dashboard. The
