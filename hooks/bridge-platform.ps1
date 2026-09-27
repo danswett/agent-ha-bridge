@@ -98,7 +98,7 @@ function Get-BridgeCommandLine {
     if ($script:BridgeIsWindows) {
         return [string](Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue).CommandLine
     }
-    try { [string](& ps -o 'args=' -p $ProcessId 2>$null | Select-Object -First 1) } catch { '' }
+    try { [string](& /bin/ps -o 'args=' -p $ProcessId 2>$null | Select-Object -First 1) } catch { '' }
 }
 
 function Get-BridgeProcessInfo {
@@ -117,7 +117,7 @@ function Get-BridgeProcessInfo {
     }
     $info = $null
     try {
-        $line = & ps -o 'pid=,ppid=,etime=,ucomm=' -p $ProcessId 2>$null | Select-Object -First 1
+        $line = & /bin/ps -o 'pid=,ppid=,etime=,ucomm=' -p $ProcessId 2>$null | Select-Object -First 1
         if ($line) { $info = ConvertFrom-BridgePsLine -Line $line }
     }
     catch { }
@@ -136,7 +136,7 @@ function Get-BridgeProcessesNamed {
         return @(Get-CimInstance Win32_Process -Filter "Name='$Name.exe'" -ErrorAction SilentlyContinue |
             Select-Object ProcessId, ParentProcessId, Name, CommandLine, CreationDate)
     }
-    $all = try { @(& ps -A -o 'pid=,ppid=,etime=,ucomm=' 2>$null) } catch { @() }
+    $all = try { @(& /bin/ps -A -o 'pid=,ppid=,etime=,ucomm=' 2>$null) } catch { @() }
     @($all | ForEach-Object { ConvertFrom-BridgePsLine -Line $_ } | Where-Object { $_ -and $_.Name -eq $Name } | ForEach-Object {
         $_.CommandLine = Get-BridgeCommandLine -ProcessId $_.ProcessId
         $_
@@ -216,13 +216,18 @@ function Get-BridgeTmuxPath {
 }
 
 function Invoke-BridgeTmux {
-    <# Runs tmux with the given arguments; returns its output lines, or $null on failure. #>
+    <#
+        Runs tmux with the given arguments, as { Ok, Output }.
+
+        An object rather than the output itself: most tmux commands succeed silently,
+        and PowerShell hands an empty result back as $null - so returning the lines
+        made every successful send-keys look like a failure.
+    #>
     param([Parameter(Mandatory)][string[]]$Arguments)
     $tmux = Get-BridgeTmuxPath
-    if (-not $tmux) { return $null }
-    $output = & $tmux @Arguments 2>$null
-    if ($LASTEXITCODE -ne 0) { return $null }
-    @($output)
+    if (-not $tmux) { return [pscustomobject]@{ Ok = $false; Output = @() } }
+    $output = @(& $tmux @Arguments 2>$null)
+    [pscustomobject]@{ Ok = ($LASTEXITCODE -eq 0); Output = $output }
 }
 
 function Find-BridgeTmuxPane {
@@ -236,9 +241,9 @@ function Find-BridgeTmuxPane {
     param([Parameter(Mandatory)][int]$ProcessId)
 
     $panes = Invoke-BridgeTmux -Arguments @('list-panes', '-a', '-F', '#{pane_pid} #{pane_id}')
-    if (-not $panes) { return $null }
+    if (-not $panes.Ok) { return $null }
     $byPid = @{}
-    foreach ($line in $panes) {
+    foreach ($line in $panes.Output) {
         if ($line -match '^(\d+)\s+(%\d+)$') { $byPid[[int]$Matches[1]] = $Matches[2] }
     }
     $current = $ProcessId
@@ -265,15 +270,15 @@ function Send-BridgeTmuxKeys {
     if ($Literal) { $arguments += '-l' }
     $arguments += '--'
     $arguments += $Keys
-    $null -ne (Invoke-BridgeTmux -Arguments $arguments)
+    (Invoke-BridgeTmux -Arguments $arguments).Ok
 }
 
 function Read-BridgeTmuxPane {
     <# The visible text of a pane, or '' when it cannot be read. #>
     param([Parameter(Mandatory)][string]$Pane)
-    $lines = Invoke-BridgeTmux -Arguments @('capture-pane', '-p', '-t', $Pane)
-    if ($null -eq $lines) { return '' }
-    ($lines -join "`n")
+    $capture = Invoke-BridgeTmux -Arguments @('capture-pane', '-p', '-t', $Pane)
+    if (-not $capture.Ok) { return '' }
+    ($capture.Output -join "`n")
 }
 
 function Send-BridgeTmuxText {

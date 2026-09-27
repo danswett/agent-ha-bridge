@@ -127,7 +127,8 @@ if (-not $script:BridgeIsWindows -and (Get-BridgeTmuxPath)) {
     $tricky = 'a; rm -rf $(whoami) `id` "q" ''s'' && | > <'
     $r = Invoke-BridgeConsoleSend -ProcessId $processId -Text $tricky -Submit $true -DelayMs 100
     Start-Sleep -Milliseconds 500
-    $lines = if (Test-Path -LiteralPath $received) { @(Get-Content -LiteralPath $received) } else { @() }
+    # Wrapped whole: `$x = if ... { @(...) }` unrolls a one-line result to a string.
+    $lines = @(if (Test-Path -LiteralPath $received) { Get-Content -LiteralPath $received })
     Test-That 'it arrives as typed' { $lines.Count -ge 1 -and $lines[0] -eq 'hello from the dashboard' } ($lines -join ' | ')
     Test-That 'shell characters in a reply arrive as plain text' { $lines.Count -ge 2 -and $lines[1] -eq $tricky } ($lines -join ' | ')
     Test-That 'a reply to a process outside tmux says so' { (Invoke-BridgeConsoleSend -ProcessId $PID -Text 'x' -Submit $true) -eq 'not-in-tmux' }
