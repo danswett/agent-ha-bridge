@@ -16,7 +16,7 @@
  * daemon downloads them and attaches them to the prompt.
  */
 
-const CARD_VERSION = '1.11.2';
+const CARD_VERSION = '1.11.3';
 
 // The working line, in the style of Claude Code's own spinner: its glyph cycle, and a
 // word picked once per turn. Claude Code does not record which word it chose, so the
@@ -234,17 +234,10 @@ class AgentBridgeReplyCard extends HTMLElement {
   }
 
   async _upload(file) {
-    const token = this._accessToken();
-    if (!token) { throw new Error('no access token'); }
-
     const form = new FormData();
     form.append('file', file, file.name || 'pasted.png');
 
-    const resp = await fetch('/api/image/upload', {
-      method: 'POST',
-      body: form,
-      headers: { authorization: `Bearer ${token}` },
-    });
+    const resp = await this._authFetch('/api/image/upload', { method: 'POST', body: form });
     if (!resp.ok) {
       throw new Error(`${resp.status} ${resp.statusText}`);
     }
@@ -264,8 +257,33 @@ class AgentBridgeReplyCard extends HTMLElement {
     return auth.accessToken || null;
   }
 
+  // An authenticated request to Home Assistant. Access tokens live 30 minutes, and
+  // a browser tab left open keeps its websocket but never refreshes the token until
+  // something asks - so reading hass.auth's token directly sent an expired one and
+  // got a 401. hass.fetchWithAuth refreshes first; without it, refresh when expired,
+  // and once more on a 401.
+  async _authFetch(path, init = {}) {
+    const hass = this._hass;
+    if (hass && typeof hass.fetchWithAuth === 'function') {
+      const resp = await hass.fetchWithAuth(path, init);
+      if (resp.status !== 401) { return resp; }
+    }
+    const auth = hass && hass.auth;
+    if (!auth) { throw new Error('no access token'); }
+    const send = () => fetch(path, {
+      ...init,
+      headers: { ...(init.headers || {}), authorization: `Bearer ${this._accessToken()}` },
+    });
+    if (auth.expired && typeof auth.refreshAccessToken === 'function') { await auth.refreshAccessToken(); }
+    let resp = await send();
+    if (resp.status === 401 && typeof auth.refreshAccessToken === 'function') {
+      await auth.refreshAccessToken();
+      resp = await send();
+    }
+    return resp;
+  }
+
   _renderChips() {
-    const token = this._accessToken();
     this._els.chips.innerHTML = '';
     this._images.forEach((img, index) => {
       const chip = document.createElement('div');
@@ -273,14 +291,12 @@ class AgentBridgeReplyCard extends HTMLElement {
 
       const thumb = document.createElement('img');
       thumb.alt = img.name;
-      if (token) {
-        // The serve endpoint needs auth, so the thumbnail is fetched as a blob
-        // rather than pointed at directly with a plain src.
-        fetch(`/api/image/serve/${img.id}/256x256`, { headers: { authorization: `Bearer ${token}` } })
-          .then((r) => (r.ok ? r.blob() : null))
-          .then((b) => { if (b) { thumb.src = URL.createObjectURL(b); } })
-          .catch(() => {});
-      }
+      // The serve endpoint needs auth, so the thumbnail is fetched as a blob
+      // rather than pointed at directly with a plain src.
+      this._authFetch(`/api/image/serve/${img.id}/256x256`)
+        .then((r) => (r.ok ? r.blob() : null))
+        .then((b) => { if (b) { thumb.src = URL.createObjectURL(b); } })
+        .catch(() => {});
 
       const label = document.createElement('span');
       label.textContent = img.name.length > 18 ? `${img.name.slice(0, 15)}...` : img.name;
