@@ -144,7 +144,13 @@ jobs:
             pwsh -NoProfile -File $suite.FullName
             $code = $LASTEXITCODE
             Write-Host "::endgroup::"
-            if ($code -ne 0) { $failed += $suite.Name; Write-Host "::warning::$($suite.Name) exited with $code" }
+            if ($code -ne 0) {
+              $failed += $suite.Name
+              Write-Host "::warning::$($suite.Name) exited with $code"
+              # Why: run it again inside a caller that reports the script's own exit
+              # code and whatever errors were recorded on the way out.
+              pwsh -NoProfile -Command "& '$($suite.FullName)' *> `$null; Write-Host ('script exit code: ' + `$LASTEXITCODE); `$Error | Select-Object -First 8 | ForEach-Object { Write-Host ('error: ' + `$_ + ' @ ' + `$_.InvocationInfo.PositionMessage) }"
+            }
           }
           Write-Host "Failed on macOS: $($failed -join ', ')"
           if ($failed.Count) { exit 1 }
