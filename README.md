@@ -250,17 +250,20 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `notifications.enabled` / `.service` | Optional notify-style service |
 | `copilot.sessionStateRoot` | Override the Copilot CLI's session-state location if not `~/.copilot/session-state` |
 | `newSession.enabled` | Set to `false` to hide the "Start a new session" controls (default `true`) |
-| `newSession.launcher` | `auto` (default: Agency when installed), `agency`, or `copilot` |
+| `newSession.launcher` | Default agent: `auto` (default: the first installed of Agency, Copilot, Claude, Codex), `agency`, `copilot`, `claude` or `codex`. With more than one installed, the card also gets an Agent dropdown |
 | `newSession.profiles` | Agency profiles offered on the dashboard (default `["work","home","local"]`) |
 | `newSession.defaultProfile` | Profile preselected on the card (default: the first in `profiles`) |
 | `newSession.defaultWorkspace` | Workspace label preselected on the card (default: the first in `workspaces`) |
-| `newSession.workspaces` | Directories offered as launch targets — a path string, or `{ "label": …, "path": … }` |
+| `newSession.workspaces` | Directories offered as launch targets — a path string, or `{ "label": …, "path": … }`. Folders recent Claude/Codex sessions worked in are added after these, and the home folder is offered if the list would otherwise be empty |
+| `newSession.discoverWorkspaces` | Set to `false` to offer only the configured workspaces (default `true`). System folders such as `C:\Windows\System32` are never discovered |
+| `newSession.discoverCount` | How many discovered folders to offer (default `8`) |
 | `newSession.resumeCount` | How many recent sessions the Resume dropdown offers (default `12`) |
 | `newSession.model` | Model for launched sessions (default: whatever the CLI would pick) |
-| `newSession.allowAllTools` | Add `--allow-all-tools` to launched sessions (default `false`) |
+| `newSession.allowAllTools` | Launch without permission prompts (default `false`): `--allow-all-tools` for Copilot, `--dangerously-skip-permissions` for Claude, `--ask-for-approval never` for Codex |
 | `newSession.extraArgs` | Extra CLI arguments for launched sessions, e.g. `["--plan"]` |
 | `newSession.copilotPath` | Full path to `copilot.exe` if it is not on the daemon's PATH |
 | `newSession.agencyPath` | Full path to `agency.exe` if it is not on the daemon's PATH |
+| `newSession.claudePath` / `.codexPath` | Full path to `claude.exe` / the Codex CLI if not on the daemon's PATH |
 | `updates.repository` | Repository to check for releases (default `danswett/agent-ha-bridge`) |
 | `updates.checkForUpdates` | Set to `false` to disable the update check |
 | `updates.checkHours` | How often to check GitHub for a release (default `6`, i.e. 4×/day) |

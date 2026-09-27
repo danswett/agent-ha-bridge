@@ -54,6 +54,7 @@ $script:DaemonEntity = @{
     NewPrompt     = Get-BridgeMachineEntityId -Domain 'text'   -Key 'new_prompt'        -Slug $script:DaemonMachineSlug
     NewWorkspace  = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_workspace'     -Slug $script:DaemonMachineSlug
     NewProfile    = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_profile'       -Slug $script:DaemonMachineSlug
+    NewAgent      = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_agent'         -Slug $script:DaemonMachineSlug
     NewResume     = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_resume'        -Slug $script:DaemonMachineSlug
     NewSession    = Get-BridgeMachineEntityId -Domain 'button' -Key 'new_session'       -Slug $script:DaemonMachineSlug
     NewResult     = Get-BridgeMachineEntityId -Domain 'sensor' -Key 'new_session_result' -Slug $script:DaemonMachineSlug
@@ -2163,10 +2164,24 @@ function Set-DaemonNewSessionDefaults {
         [Parameter(Mandatory)][hashtable]$Headers,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Workspaces,
         [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Profiles,
-        [AllowEmptyCollection()][object[]]$Resumable = @()
+        [AllowEmptyCollection()][object[]]$Resumable = @(),
+        [AllowEmptyCollection()][string[]]$Agents = @()
     )
 
     $stale = @('unknown', 'unavailable', '')
+
+    if ($Agents.Count -gt 0) {
+        $default = Get-BridgeLauncherLabel -Launcher (Get-BridgeLauncherKind)
+        if ($Agents -notcontains $default) { $default = $Agents[0] }
+        try {
+            $current = [string](Get-HomeAssistantState -EntityId $script:DaemonEntity.NewAgent -Headers $Headers).state
+            if ($current -in $stale -or $Agents -notcontains $current) {
+                Invoke-HomeAssistantService -Domain 'select' -Service 'select_option' -Headers $Headers `
+                    -Data @{ entity_id = $script:DaemonEntity.NewAgent; option = $default }
+            }
+        }
+        catch { }
+    }
 
     if ($Workspaces.Count -gt 0) {
         $default = Get-BridgeDefaultWorkspaceLabel
@@ -2244,26 +2259,30 @@ function Sync-DaemonNewSession {
 
     $workspaces = @(Get-BridgeWorkspaceChoices)
     $launcher = Get-BridgeLauncherKind
+    $launchers = @(Get-BridgeAvailableLaunchers)
+    $agents = @($launchers | ForEach-Object { Get-BridgeLauncherLabel -Launcher $_ })
     # Assigned in two steps deliberately: `$x = if (...) { @(...) } else { @() }`
     # collapses an empty array to $null, and StrictMode then throws on .Count.
+    # Profiles are offered whenever Agency is installed, since it can be chosen as the
+    # agent at launch time even when it is not the default.
     $profiles = @()
-    if ($launcher -eq 'agency') { $profiles = @(Get-BridgeAgencyProfiles) }
+    if ($launchers -contains 'agency') { $profiles = @(Get-BridgeAgencyProfiles) }
 
     $resumable = @(Get-DaemonResumableSessions -LiveSessionIds @($Live.Keys))
 
     # Re-publish only when the configured list changes, so an unchanged bridge sends
     # nothing on a normal reconcile.
     $signature = (($workspaces | ForEach-Object { "$($_.Label)=$($_.Path)" }) -join '|') +
-        "#$launcher#" + ($profiles -join ',') +
+        "#$launcher#" + ($agents -join ',') + '#' + ($profiles -join ',') +
         '#' + (($resumable | ForEach-Object { [string]$_.SessionId }) -join ',')
     if (-not $script:DaemonNewSessionPublished -or $signature -ne $script:DaemonNewSessionSignature) {
         try {
             Publish-CopilotMqttNewSession -Workspaces $workspaces -Profiles $profiles `
-                -Resumable $resumable -Headers $Headers
+                -Resumable $resumable -Agents $agents -Headers $Headers
             [void](Set-CopilotMqttNewSessionEntityIds)
             $script:DaemonNewSessionPublished = $true
             $script:DaemonNewSessionSignature = $signature
-            Write-DaemonLog -Message "new-session controls published ($($workspaces.Count) workspace(s), launcher $launcher$(if ($profiles.Count) { ", profiles: $($profiles -join ', ')" }), $($resumable.Count) resumable)"
+            Write-DaemonLog -Message "new-session controls published ($($workspaces.Count) workspace(s), agents: $(if ($agents.Count) { $agents -join ', ' } else { 'none' }), default $launcher$(if ($profiles.Count) { ", profiles: $($profiles -join ', ')" }), $($resumable.Count) resumable)"
         }
         catch {
             Write-DaemonLog -Message "new-session publish failed: $($_.Exception.Message)"
@@ -2271,7 +2290,8 @@ function Sync-DaemonNewSession {
         }
     }
 
-    Set-DaemonNewSessionDefaults -Headers $Headers -Workspaces $workspaces -Profiles $profiles -Resumable $resumable
+    Set-DaemonNewSessionDefaults -Headers $Headers -Workspaces $workspaces -Profiles $profiles `
+        -Resumable $resumable -Agents $agents
 
     try {
         $button = Get-HomeAssistantState -EntityId $script:DaemonEntity.NewSession -Headers $Headers
@@ -2295,6 +2315,25 @@ function Sync-DaemonNewSession {
         Set-CopilotMqttNewSessionResult -Headers $Headers `
             -Text 'No workspaces configured - add newSession.workspaces to the bridge config'
         return
+    }
+
+    # The agent. An untouched selector means the default; anything else must name an
+    # installed agent, or the launch is refused rather than guessed at.
+    $agentLabel = ''
+    try { $agentLabel = [string](Get-HomeAssistantState -EntityId $script:DaemonEntity.NewAgent -Headers $Headers).state }
+    catch { }
+    if ($agentLabel -in @('unknown', 'unavailable', '') -or [string]::IsNullOrWhiteSpace($agentLabel)) {
+        $agentLabel = Get-BridgeLauncherLabel -Launcher $launcher
+    }
+    $chosenLauncher = Resolve-BridgeLauncher -Label $agentLabel
+    if ([string]::IsNullOrWhiteSpace($chosenLauncher)) {
+        if ($launchers.Count -gt 0) {
+            Write-DaemonLog -Message "new session requested with unknown agent '$agentLabel'"
+            Set-CopilotMqttNewSessionResult -Text "Unknown agent '$agentLabel'" -Headers $Headers
+            return
+        }
+        # Nothing is installed: let the launch attempt name what is missing.
+        $chosenLauncher = $launcher
     }
 
     $label = ''
@@ -2330,7 +2369,7 @@ function Sync-DaemonNewSession {
     # first configured profile, and an unrecognised one is refused outright rather
     # than passed to a command line.
     $agencyProfile = ''
-    if ($launcher -eq 'agency' -and $profiles.Count -gt 0) {
+    if ($chosenLauncher -eq 'agency' -and $profiles.Count -gt 0) {
         $profileLabel = ''
         try {
             $profileState = Get-HomeAssistantState -EntityId $script:DaemonEntity.NewProfile -Headers $Headers
@@ -2379,19 +2418,26 @@ function Sync-DaemonNewSession {
             $resumeDirectory = $directory
         }
 
+        # The resume list comes from Agency and holds Copilot sessions, so a resume
+        # always goes through Agency whichever agent is selected for new sessions.
+        $chosenLauncher = 'agency'
         $short = $resumeSession.SessionId.Substring(0, [Math]::Min(8, $resumeSession.SessionId.Length))
         Write-DaemonLog -Message "resume requested for $short ($resumeDirectory)$(if ($agencyProfile) { " profile '$agencyProfile'" })"
         Set-CopilotMqttNewSessionResult -Text "Resuming $resumeLabel..." -Headers $Headers
 
+        $launchedAt = [DateTimeOffset]::Now
         $launch = Start-BridgeCopilotSession -WorkingDirectory $resumeDirectory -Prompt $prompt `
-            -AgencyProfile $agencyProfile -SessionId ([string]$resumeSession.SessionId) -Resume
+            -AgencyProfile $agencyProfile -SessionId ([string]$resumeSession.SessionId) -Launcher $chosenLauncher -Resume
     }
     else {
-        Write-DaemonLog -Message "new session requested in '$label' ($directory)$(if ($agencyProfile) { " profile '$agencyProfile'" })$(if ($prompt) { " with prompt: $prompt" })"
+        $agentName = Get-BridgeLauncherLabel -Launcher $chosenLauncher
+        Write-DaemonLog -Message "new $agentName session requested in '$label' ($directory)$(if ($agencyProfile) { " profile '$agencyProfile'" })$(if ($prompt) { " with prompt: $prompt" })"
         Set-CopilotMqttNewSessionResult -Headers $Headers `
-            -Text "Starting a session in $label$(if ($agencyProfile) { " ($agencyProfile)" })..."
+            -Text "Starting $agentName in $label$(if ($agencyProfile) { " ($agencyProfile)" })..."
 
-        $launch = Start-BridgeCopilotSession -WorkingDirectory $directory -Prompt $prompt -AgencyProfile $agencyProfile
+        $launchedAt = [DateTimeOffset]::Now
+        $launch = Start-BridgeCopilotSession -WorkingDirectory $directory -Prompt $prompt `
+            -AgencyProfile $agencyProfile -Launcher $chosenLauncher
     }
 
     if (-not $launch.Launched) {
@@ -2400,11 +2446,12 @@ function Sync-DaemonNewSession {
         return
     }
 
-    Write-DaemonLog -Message "new session launched: $($launch.Detail) (session $($launch.SessionId))"
+    Write-DaemonLog -Message "new session launched: $($launch.Detail) (session $(if ($launch.SessionId) { $launch.SessionId } else { 'id chosen by the agent' }))"
 
     # Remember the process the bridge started, so End session can close the console
-    # window it opened rather than leaving an empty terminal behind.
-    if ($launch.ProcessId -gt 0) {
+    # window it opened rather than leaving an empty terminal behind. Codex picks its
+    # own id, so there is nothing to key it by.
+    if ($launch.ProcessId -gt 0 -and $launch.SessionId) {
         $script:DaemonLaunchedPids[[string]$launch.SessionId] = [int]$launch.ProcessId
     }
 
@@ -2419,8 +2466,8 @@ function Sync-DaemonNewSession {
     # lock file proves the CLI got far enough to be a session the daemon can adopt,
     # so the dashboard reports what actually happened rather than an optimistic
     # guess. The next reconcile publishes the session itself.
-    if (Wait-BridgeSessionRegistered -SessionId $launch.SessionId) {
-        $short = $launch.SessionId.Substring(0, [Math]::Min(8, $launch.SessionId.Length))
+    if (Wait-BridgeSessionRegistered -SessionId ([string]$launch.SessionId) -Launcher $chosenLauncher -Since $launchedAt) {
+        $short = if ($launch.SessionId) { $launch.SessionId.Substring(0, [Math]::Min(8, $launch.SessionId.Length)) } else { 'a session' }
         Set-CopilotMqttNewSessionResult -Headers $Headers `
             -Text "$verb $short in $where at $([DateTimeOffset]::Now.ToString('HH:mm'))"
     }
@@ -2873,16 +2920,19 @@ function Sync-DaemonSessions {
     # no other way to know whether to draw a profile or resume row on this machine's
     # launch card.
     $newSessionEnabled = [bool](Get-BridgeSetting 'newSession.enabled' $true)
-    $includeProfile = $newSessionEnabled -and (Get-BridgeLauncherKind) -eq 'agency'
-    $includeResume = $newSessionEnabled -and $null -ne (Get-BridgeAgencyPath)
+    $installedLaunchers = @(Get-BridgeAvailableLaunchers)
+    $includeProfile = $newSessionEnabled -and $installedLaunchers -contains 'agency'
+    $includeResume = $newSessionEnabled -and $installedLaunchers -contains 'agency'
+    $includeAgent = $newSessionEnabled -and $installedLaunchers.Count -gt 1
     $capabilities = @{
         newSession = $newSessionEnabled
         profile    = [bool]$includeProfile
         resume     = [bool]$includeResume
+        agent      = [bool]$includeAgent
     }
 
     $globalSignature = (($descriptors | ForEach-Object { "$($_.Node)=$($_.Name)=$($_.Machine)" }) -join '|') +
-        "#$($capabilities.newSession)$($capabilities.profile)$($capabilities.resume)"
+        "#$($capabilities.newSession)$($capabilities.profile)$($capabilities.resume)$($capabilities.agent)"
     $globalStale = ([DateTimeOffset]::Now - $script:DaemonGlobalLastPublish).TotalSeconds -ge $script:DaemonConfig.GlobalReassertSeconds
     if ($globalSignature -ne $script:DaemonGlobalSignature -or $globalStale) {
         try {
@@ -2950,6 +3000,7 @@ function Sync-DaemonSessions {
             Machine = $script:DaemonMachineName
             IncludeProfile = [bool]$includeProfile
             IncludeResume = [bool]$includeResume
+            IncludeAgent = [bool]$includeAgent
             # This daemon is the one running the code, so it is online by definition -
             # and saying so here means the launch picker is never empty while its own
             # heartbeat sensor is still being created.
@@ -2960,15 +3011,18 @@ function Sync-DaemonSessions {
         $peerCaps = $peer.Capabilities
         $peerProfile = $false
         $peerResume = $false
+        $peerAgent = $false
         if ($null -ne $peerCaps) {
             try { $peerProfile = [bool]$peerCaps.profile } catch { }
             try { $peerResume = [bool]$peerCaps.resume } catch { }
+            try { $peerAgent = [bool]$peerCaps.agent } catch { }
         }
         $machineCards += [pscustomobject]@{
             Slug = $peer.Slug
             Machine = $peer.Machine
             IncludeProfile = $peerProfile
             IncludeResume = $peerResume
+            IncludeAgent = $peerAgent
             Online = [bool]$peer.Online
         }
     }
@@ -3020,7 +3074,7 @@ function Sync-DaemonSessions {
     # machine list joins it for the same reason: a machine appearing, disappearing or
     # going offline changes the controls even when no session did.
     $signature = (@($allDescriptors | Sort-Object -Property Node | ForEach-Object { "$($_.Node)=$($_.Name)" }) -join '|') +
-        '#' + (@($machineCards | ForEach-Object { "$($_.Slug):$($_.IncludeProfile)$($_.IncludeResume):$($_.Online)" }) -join ',')
+        '#' + (@($machineCards | ForEach-Object { "$($_.Slug):$($_.IncludeProfile)$($_.IncludeResume)$($_.IncludeAgent):$($_.Online)" }) -join ',')
     if ($signature -ne $script:DaemonDashboardSignature) {
         try {
             [void](Set-CopilotMqttGlobalEntityId)

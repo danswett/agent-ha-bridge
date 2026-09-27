@@ -303,6 +303,47 @@ Test-That 'the opening prompt is gone' {
     $newRows -notcontains "text.agent_bridge_${slug}_new_prompt"
 }
 Test-That 'Launch is the last thing on the card' { $newRows[-1] -eq "button.agent_bridge_${slug}_new_session" }
+Test-That 'there is no agent row when there is nothing to choose between' {
+    $newRows -notcontains "select.agent_bridge_${slug}_new_agent"
+}
+
+Save-CopilotSessionDashboard -Sessions $sessions -IncludeAgent
+$newCard = @($script:SavedConfig.views[0].cards | Where-Object {
+    $_.ContainsKey('title') -and $_['title'] -eq 'Start a new session'
+})[0]
+$agentRows = @($newCard.entities | ForEach-Object { if ($_.ContainsKey('entity')) { [string]$_['entity'] } else { '' } })
+Test-That 'with several agents installed the agent row is shown' {
+    $agentRows -contains "select.agent_bridge_${slug}_new_agent"
+}
+Test-That 'the agent row sits under the workspace' {
+    $agentRows.IndexOf("select.agent_bridge_${slug}_new_agent") -eq $agentRows.IndexOf("select.agent_bridge_${slug}_new_workspace") + 1
+}
+
+Write-Host ''
+Write-Host '--- the session header updates in place when the card supports it ---'
+# The markdown header re-renders wholesale on every attribute change, collapsing the
+# reasoning expander while it streams. The activity card ships in the reply card's
+# file from 1.10.0, and naming it against an older served copy would render an error.
+function Get-SavedJson { $script:SavedConfig | ConvertTo-Json -Depth 40 -Compress }
+
+Save-CopilotSessionDashboard -Sessions $sessions -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.10.0'
+Test-That 'a served 1.10.0 card gets the in-place activity header' { (Get-SavedJson) -match 'custom:agent-bridge-activity-card' }
+Test-That 'the header is pointed at the session entities' {
+    (Get-SavedJson) -match [regex]::Escape("sensor.$($sessions[0].Node)_activity")
+}
+
+Save-CopilotSessionDashboard -Sessions $sessions -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.9.2'
+Test-That 'an older served card keeps the markdown header' { (Get-SavedJson) -notmatch 'custom:agent-bridge-activity-card' }
+
+Save-CopilotSessionDashboard -Sessions $sessions
+Test-That 'no served card keeps the markdown header' { (Get-SavedJson) -notmatch 'custom:agent-bridge-activity-card' }
+
+Test-That 'the version gate reads the cache-buster' {
+    (Test-BridgeActivityCardServed -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.10.1') -and
+    (Test-BridgeActivityCardServed -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=2.0') -and
+    -not (Test-BridgeActivityCardServed -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.9.9') -and
+    -not (Test-BridgeActivityCardServed -ReplyCardUrl '/local/agent-bridge-reply-card.js')
+}
 
 Write-Host '--- the dashboard is provisioned before it is written to ---'
 # Invoke-CopilotHaWebSocket hands back each command's `result` already unwrapped, so

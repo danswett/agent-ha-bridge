@@ -1,5 +1,5 @@
 <#
-    Launching a brand new Copilot CLI session on request.
+    Launching a brand new agent session (Copilot, Agency, Claude or Codex) on request.
 
     Everything else in the bridge attaches to sessions that already exist: the daemon
     discovers them from the `inuse.<pid>.lock` files the CLI leaves behind. This
@@ -83,18 +83,131 @@ function ConvertTo-BridgeArgumentString {
     $parts -join ' '
 }
 
+$script:BridgeDiscoveredWorkspaceCache = $null
+$script:BridgeDiscoveredWorkspaceCacheAt = [DateTimeOffset]::MinValue
+
+function Test-BridgeSystemDirectory {
+    <#
+        True for a directory no session should be launched into.
+
+        A console opened from the Start menu starts in System32, so that is a routine
+        working directory for a session nobody meant to point anywhere in particular.
+        Offering it back as a workspace would turn an accident into a default. The
+        Windows folder, Program Files, ProgramData, temp and bare drive roots are all
+        excluded for the same reason.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    try { $full = [System.IO.Path]::GetFullPath($Path).TrimEnd('\', '/') }
+    catch { return $true }
+
+    $root = [System.IO.Path]::GetPathRoot($full)
+    if ([string]::IsNullOrWhiteSpace($full) -or $full -eq ([string]$root).TrimEnd('\', '/')) { return $true }
+
+    $excluded = @($env:WINDIR, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData, $env:TEMP) |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    foreach ($candidate in $excluded) {
+        $prefix = [System.IO.Path]::GetFullPath($candidate).TrimEnd('\', '/')
+        if ($full -eq $prefix -or $full.StartsWith("$prefix\", [StringComparison]::OrdinalIgnoreCase)) { return $true }
+    }
+    $false
+}
+
+function Get-BridgeDiscoveredWorkspaces {
+    <#
+        Folders agent sessions on this machine have recently worked in, newest first.
+
+        A fresh install has no `newSession.workspaces`, and the folders a user actually
+        works in are already known: every Claude transcript records its cwd, and the
+        Claude and Codex hooks register theirs. Offering those means the launch card
+        works on a new machine without editing any config.
+
+        These come only from files the agents write locally, never from Home
+        Assistant, so they sit inside the same boundary as the configured list. System
+        folders are dropped (see Test-BridgeSystemDirectory). Disabled with
+        `newSession.discoverWorkspaces: false`; `newSession.discoverCount` caps it.
+
+        Cached for a minute, because the daemon asks several times per reconcile and
+        the answer changes about as often as a new project is opened.
+    #>
+    if (-not [bool](Get-BridgeSetting 'newSession.discoverWorkspaces' $true)) { return @() }
+    $limit = [int](Get-BridgeSetting 'newSession.discoverCount' 8)
+    if ($limit -le 0) { return @() }
+
+    if ($null -ne $script:BridgeDiscoveredWorkspaceCache -and
+        ([DateTimeOffset]::Now - $script:BridgeDiscoveredWorkspaceCacheAt).TotalSeconds -lt 60) {
+        return @($script:BridgeDiscoveredWorkspaceCache | Select-Object -First $limit)
+    }
+
+    $candidates = [System.Collections.Generic.List[object]]::new()
+
+    # Hook registrations: what is running, or ran recently.
+    foreach ($stateDir in @('agent-bridge-claude', 'agent-bridge-codex')) {
+        $dir = Join-Path $env:TEMP $stateDir
+        if (-not [System.IO.Directory]::Exists($dir)) { continue }
+        foreach ($file in Get-ChildItem -LiteralPath $dir -Filter '*.json' -File -ErrorAction SilentlyContinue) {
+            if ($file.Name -like '*.approval.json') { continue }
+            try { $entry = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json } catch { continue }
+            if ($entry -and $entry.PSObject.Properties['WorkingDirectory'] -and $entry.WorkingDirectory) {
+                $candidates.Add([pscustomobject]@{ Path = [string]$entry.WorkingDirectory; Updated = $file.LastWriteTime })
+            }
+        }
+    }
+
+    # Claude transcripts: the history, one folder per project. The cwd is on nearly
+    # every line, so only the head of the newest transcript in each is read.
+    $projects = Join-Path $HOME '.claude\projects'
+    if ([System.IO.Directory]::Exists($projects)) {
+        $dirs = Get-ChildItem -LiteralPath $projects -Directory -ErrorAction SilentlyContinue |
+            Sort-Object LastWriteTime -Descending | Select-Object -First ($limit * 3)
+        foreach ($dir in $dirs) {
+            $newest = Get-ChildItem -LiteralPath $dir.FullName -Filter '*.jsonl' -File -ErrorAction SilentlyContinue |
+                Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if ($null -eq $newest) { continue }
+            try {
+                foreach ($line in [System.Linq.Enumerable]::Take([System.IO.File]::ReadLines($newest.FullName), 40)) {
+                    if ($line -notmatch '"cwd"') { continue }
+                    $cwd = [string]($line | ConvertFrom-Json).cwd
+                    if ($cwd) {
+                        $candidates.Add([pscustomobject]@{ Path = $cwd; Updated = $newest.LastWriteTime })
+                        break
+                    }
+                }
+            }
+            catch { }
+        }
+    }
+
+    $seen = @{}
+    $found = foreach ($candidate in ($candidates | Sort-Object Updated -Descending)) {
+        try { $path = [System.IO.Path]::GetFullPath($candidate.Path).TrimEnd('\', '/') } catch { continue }
+        $key = $path.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        if (-not [System.IO.Directory]::Exists($path)) { continue }
+        if (Test-BridgeSystemDirectory -Path $path) { continue }
+        $path
+    }
+
+    $script:BridgeDiscoveredWorkspaceCache = @($found | Select-Object -First $limit)
+    $script:BridgeDiscoveredWorkspaceCacheAt = [DateTimeOffset]::Now
+    @($script:BridgeDiscoveredWorkspaceCache)
+}
+
 function Get-BridgeWorkspaceChoices {
     <#
-        The directories offered as launch targets, from `newSession.workspaces`.
+        The directories offered as launch targets: `newSession.workspaces` first, then
+        folders recent sessions worked in (Get-BridgeDiscoveredWorkspaces), and the home
+        folder if both are empty, so the launch card is never left with nothing.
 
-        Each entry is either a plain path string or an object with `label` and
-        `path`. A label keeps the dropdown readable on a phone, where a full path is
+        Each configured entry is either a plain path string or an object with `label`
+        and `path`. A label keeps the dropdown readable on a phone, where a full path is
         unusable, and is what the daemon matches against when the button is pressed.
 
         This list is also the security boundary. The daemon never launches a path
-        that came from Home Assistant; it launches a path that came from this file,
-        selected by label. A wrong or tampered entity state can therefore only ever
-        pick a directory the user already approved, or nothing at all.
+        that came from Home Assistant; it launches a path from this list, selected by
+        label. A wrong or tampered entity state can therefore only ever pick a
+        directory the user configured or already worked in, or nothing at all.
 
         Paths that do not exist are dropped rather than offered, so the dashboard
         cannot present a choice that is guaranteed to fail.
@@ -122,6 +235,19 @@ function Get-BridgeWorkspaceChoices {
         if ([string]::IsNullOrWhiteSpace($label)) { $label = $path }
 
         [pscustomobject]@{ Label = $label; Path = $path }
+    }
+    $choices = @($choices)
+
+    $known = @{}
+    foreach ($choice in $choices) { $known[$choice.Path.TrimEnd('\', '/').ToLowerInvariant()] = $true }
+    foreach ($path in @(Get-BridgeDiscoveredWorkspaces)) {
+        if ($known.ContainsKey($path.ToLowerInvariant())) { continue }
+        $known[$path.ToLowerInvariant()] = $true
+        $choices += [pscustomobject]@{ Label = [System.IO.Path]::GetFileName($path); Path = $path }
+    }
+
+    if ($choices.Count -eq 0 -and [System.IO.Directory]::Exists($HOME)) {
+        $choices = @([pscustomobject]@{ Label = 'Home'; Path = [System.IO.Path]::GetFullPath($HOME) })
     }
 
     # Home Assistant select options must be unique, so a duplicate label would make
@@ -228,22 +354,115 @@ function Get-BridgeAgencyPath {
     $null
 }
 
+function Get-BridgeClaudePath {
+    <#
+        Locates claude.exe. An explicit `newSession.claudePath` wins; otherwise PATH,
+        then the native installer's location, which a scheduled task's narrower PATH
+        may not include.
+    #>
+    $configured = [string](Get-BridgeSetting 'newSession.claudePath' '')
+    if (-not [string]::IsNullOrWhiteSpace($configured)) {
+        if ([System.IO.File]::Exists($configured)) { return $configured }
+        return $null
+    }
+
+    $command = Get-Command 'claude' -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($command -and $command.Source) { return [string]$command.Source }
+
+    $native = Join-Path $HOME '.local\bin\claude.exe'
+    if ([System.IO.File]::Exists($native)) { return $native }
+
+    $null
+}
+
+function Get-BridgeCodexPath {
+    <#
+        Locates the Codex CLI. An explicit `newSession.codexPath` wins; otherwise PATH,
+        then npm's global bin, where `npm i -g @openai/codex` puts its shim.
+    #>
+    $configured = [string](Get-BridgeSetting 'newSession.codexPath' '')
+    if (-not [string]::IsNullOrWhiteSpace($configured)) {
+        if ([System.IO.File]::Exists($configured)) { return $configured }
+        return $null
+    }
+
+    $command = Get-Command 'codex' -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if ($command -and $command.Source) { return [string]$command.Source }
+
+    $npm = Join-Path $env:APPDATA 'npm\codex.cmd'
+    if ([System.IO.File]::Exists($npm)) { return $npm }
+
+    $null
+}
+
+# Every agent the bridge can start, keyed by kind, valued by the label shown on the
+# dashboard. The order is the one 'auto' prefers: Agency first, because a machine
+# that has it expects sessions to carry an Agency profile.
+$script:BridgeLaunchers = [ordered]@{
+    agency  = 'Agency'
+    copilot = 'Copilot'
+    claude  = 'Claude'
+    codex   = 'Codex'
+}
+
+function Get-BridgeLauncherPath {
+    param([Parameter(Mandatory)][string]$Launcher)
+
+    switch ($Launcher) {
+        'agency'  { return Get-BridgeAgencyPath }
+        'copilot' { return Get-BridgeCopilotPath }
+        'claude'  { return Get-BridgeClaudePath }
+        'codex'   { return Get-BridgeCodexPath }
+    }
+    $null
+}
+
+function Get-BridgeAvailableLaunchers {
+    <#
+        The launchers installed on this machine, in preference order. This is what the
+        dashboard's agent selector offers, so it cannot show a choice that would fail.
+    #>
+    @(@($script:BridgeLaunchers.Keys) | Where-Object { Get-BridgeLauncherPath -Launcher $_ })
+}
+
+function Get-BridgeLauncherLabel {
+    param([Parameter(Mandatory)][string]$Launcher)
+    if ($script:BridgeLaunchers.Contains($Launcher)) { return [string]$script:BridgeLaunchers[$Launcher] }
+    $Launcher
+}
+
+function Resolve-BridgeLauncher {
+    <#
+        Maps an agent label from Home Assistant back to an installed launcher kind, or
+        $null. Validated for the same reason workspaces and profiles are: a value
+        arriving from outside never picks an executable unchecked.
+    #>
+    param([string]$Label)
+
+    if ([string]::IsNullOrWhiteSpace($Label)) { return $null }
+    foreach ($kind in @(Get-BridgeAvailableLaunchers)) {
+        if ($Label -eq $kind -or $Label -eq (Get-BridgeLauncherLabel -Launcher $kind)) { return $kind }
+    }
+    $null
+}
+
 function Get-BridgeLauncherKind {
     <#
-        Which launcher new sessions use: 'agency' or 'copilot'.
+        The default launcher for new sessions: 'agency', 'copilot', 'claude' or 'codex'.
 
-        The default is 'auto', which prefers Agency when it is installed, because a
-        machine that has Agency is a machine where sessions are expected to carry an
-        Agency profile. Setting it explicitly pins the choice either way, and a
-        request for Agency on a machine without it falls back rather than failing.
+        `newSession.launcher` names it. 'auto' (the default), or a launcher that is not
+        installed, falls back to the first installed one in preference order rather
+        than failing. With nothing installed it still answers 'copilot', so the launch
+        reports which executable is missing instead of doing nothing.
     #>
     $configured = ([string](Get-BridgeSetting 'newSession.launcher' 'auto')).Trim().ToLowerInvariant()
+    $available = @(Get-BridgeAvailableLaunchers)
 
-    switch ($configured) {
-        'copilot' { return 'copilot' }
-        'agency'  { if (Get-BridgeAgencyPath) { return 'agency' } else { return 'copilot' } }
-        default   { if (Get-BridgeAgencyPath) { return 'agency' } else { return 'copilot' } }
-    }
+    if ($available -contains $configured) { return $configured }
+    if ($available.Count -gt 0) { return [string]$available[0] }
+    'copilot'
 }
 
 function Get-BridgeAgencyProfiles {
@@ -305,16 +524,39 @@ function Get-BridgeNewSessionArguments {
         EXTRA_ARGS, behind Agency's own options. Agency takes `--session-id` itself
         and uses that UUID for both its session and the underlying Copilot one, so
         the daemon still knows the id up front either way.
+
+        Claude takes `--session-id` too. Codex cannot be told its id; it reports the
+        one it chose through its SessionStart hook. Both take the prompt as a
+        positional argument, so it goes after `--`: a prompt typed as
+        "--dangerously-skip-permissions" must stay a prompt, not become a flag.
     #>
     param(
-        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$SessionId,
         [string]$Prompt = '',
         [string]$Model = '',
         [switch]$AllowAllTools,
         [string[]]$ExtraArguments = @(),
-        [ValidateSet('copilot', 'agency')][string]$Launcher = 'copilot',
+        [ValidateSet('copilot', 'agency', 'claude', 'codex')][string]$Launcher = 'copilot',
         [string]$AgencyProfile = ''
     )
+
+    $flatPrompt = ($Prompt -replace '\r?\n', ' ').Trim()
+    $extras = @(@($ExtraArguments) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { [string]$_ })
+
+    if ($Launcher -in @('claude', 'codex')) {
+        $arguments = @()
+        if ($Launcher -eq 'claude' -and -not [string]::IsNullOrWhiteSpace($SessionId)) {
+            $arguments += @('--session-id', $SessionId)
+        }
+        if (-not [string]::IsNullOrWhiteSpace($Model)) { $arguments += @('--model', $Model) }
+        # Opt-in only, as for Copilot. Codex keeps its sandbox; only approvals go.
+        if ($AllowAllTools.IsPresent) {
+            $arguments += if ($Launcher -eq 'claude') { '--dangerously-skip-permissions' } else { @('--ask-for-approval', 'never') }
+        }
+        $arguments += $extras
+        if ($flatPrompt) { $arguments += @('--', $flatPrompt) }
+        return @($arguments)
+    }
 
     # Copilot-side arguments, identical in both modes.
     $copilotArguments = @('--banner')
@@ -473,8 +715,8 @@ function Get-BridgeResumableSessions {
 
 function Start-BridgeCopilotSession {
     <#
-        Starts a new Copilot CLI session in its own visible console window, through
-        Agency when it is available.
+        Starts a new agent session in its own visible console window, with the chosen
+        launcher, or the default one (Get-BridgeLauncherKind) when none is given.
 
         Returns a result object instead of throwing: a failed launch has to surface
         on the dashboard and leave the daemon running, exactly like a failed reply.
@@ -488,6 +730,9 @@ function Start-BridgeCopilotSession {
         [string]$Prompt = '',
         [string]$SessionId = '',
         [string]$AgencyProfile = '',
+
+        # 'agency', 'copilot', 'claude' or 'codex'; empty means the default.
+        [string]$Launcher = '',
 
         # Resuming an existing session rather than creating one. The command line is
         # identical - the CLI resumes whenever --session-id names a session that
@@ -508,25 +753,22 @@ function Start-BridgeCopilotSession {
         return $result
     }
 
-    $launcher = Get-BridgeLauncherKind
+    $launcher = if ([string]::IsNullOrWhiteSpace($Launcher)) { Get-BridgeLauncherKind } else { $Launcher.ToLowerInvariant() }
+    if (-not $script:BridgeLaunchers.Contains($launcher)) {
+        $result.Detail = "unknown launcher '$launcher'"
+        return $result
+    }
     $result.Launcher = $launcher
 
-    if ($launcher -eq 'agency') {
-        $executable = Get-BridgeAgencyPath
-        if ([string]::IsNullOrWhiteSpace($executable)) {
-            $result.Detail = 'agency.exe not found; set newSession.agencyPath or newSession.launcher to "copilot"'
-            return $result
-        }
-    }
-    else {
-        $executable = Get-BridgeCopilotPath
-        if ([string]::IsNullOrWhiteSpace($executable)) {
-            $result.Detail = 'copilot.exe not found; set newSession.copilotPath in the bridge config'
-            return $result
-        }
+    $executable = Get-BridgeLauncherPath -Launcher $launcher
+    if ([string]::IsNullOrWhiteSpace($executable)) {
+        $result.Detail = "$launcher not found; install it or set newSession.${launcher}Path in the bridge config"
+        return $result
     }
 
-    if ([string]::IsNullOrWhiteSpace($result.SessionId)) {
+    # Codex picks its own session id and reports it through its hook, so none is
+    # invented for it here.
+    if ([string]::IsNullOrWhiteSpace($result.SessionId) -and $launcher -ne 'codex') {
         $result.SessionId = [guid]::NewGuid().ToString()
     }
 
@@ -551,7 +793,7 @@ function Start-BridgeCopilotSession {
         $result.ProcessId = $process.Id
         $result.Launched = $true
         $verb = if ($Resume.IsPresent) { 'resumed' } else { 'started' }
-        $detail = "$verb pid $($process.Id) in $WorkingDirectory via $launcher"
+        $detail = "$verb pid $($process.Id) in $WorkingDirectory via $(Get-BridgeLauncherLabel -Launcher $launcher)"
         if ($launcher -eq 'agency' -and $AgencyProfile) { $detail += " (profile $AgencyProfile)" }
         $result.Detail = $detail
     }
@@ -655,12 +897,45 @@ function Wait-BridgeSessionRegistered {
         report instant success for a resume that in fact never started.
     #>
     param(
-        [Parameter(Mandatory)][string]$SessionId,
-        [int]$TimeoutSeconds = 25
+        [Parameter(Mandatory)][AllowEmptyString()][string]$SessionId,
+        [int]$TimeoutSeconds = 25,
+
+        # Claude and Codex have no lock file; their hooks write a registration under
+        # %TEMP% instead, recording the owning pid, and that is waited for.
+        [string]$Launcher = 'copilot',
+
+        # Codex chooses its own session id, so its registration is recognised as the
+        # first one written after the launch.
+        [DateTimeOffset]$Since = [DateTimeOffset]::Now.AddMinutes(-1)
     )
 
-    $directory = Join-Path $script:DecisionBridgeConfig.SessionStateRoot $SessionId
     $deadline = [DateTimeOffset]::Now.AddSeconds($TimeoutSeconds)
+
+    if ($Launcher -in @('claude', 'codex')) {
+        $stateDir = Join-Path $env:TEMP "agent-bridge-$Launcher"
+        while ([DateTimeOffset]::Now -lt $deadline) {
+            if ([System.IO.Directory]::Exists($stateDir)) {
+                $files = if ($Launcher -eq 'claude') {
+                    @(Join-Path $stateDir "$SessionId.json" | Where-Object { [System.IO.File]::Exists($_) } | Get-Item)
+                }
+                else {
+                    @(Get-ChildItem -LiteralPath $stateDir -Filter '*.json' -File -ErrorAction SilentlyContinue |
+                        Where-Object { $_.Name -notlike '*.approval.json' -and $_.LastWriteTime -ge $Since.LocalDateTime })
+                }
+                foreach ($file in $files) {
+                    try { $entry = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json } catch { continue }
+                    $processId = [int]($entry.ProcessId ?? 0)
+                    if ($processId -le 0) { continue }
+                    $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
+                    if ($process -and $process.ProcessName -match "^$Launcher") { return $true }
+                }
+            }
+            Start-Sleep -Milliseconds 500
+        }
+        return $false
+    }
+
+    $directory = Join-Path $script:DecisionBridgeConfig.SessionStateRoot $SessionId
 
     while ([DateTimeOffset]::Now -lt $deadline) {
         if ([System.IO.Directory]::Exists($directory)) {

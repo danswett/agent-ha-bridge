@@ -28,13 +28,22 @@ does both in one step — and offers to install Claude Code itself if it is miss
 
 The adapter reuses the main bridge's Home Assistant layer, its daemon and its
 dashboard, so that must be installed first. `install-claude.ps1` copies the adapter to
-`~/.claude/ha-bridge` and merges three hooks into `~/.claude/settings.json`:
+`~/.claude/ha-bridge` and merges these hooks into `~/.claude/settings.json`:
 
 | Hook | Matcher | Purpose |
 |---|---|---|
 | `PreToolUse` | `AskUserQuestion` | Mirror a multiple-choice question to the dashboard |
 | `Notification` | all | Surface "Claude is waiting", including permission prompts |
 | `Stop` | all | Mark the turn idle and push the response |
+| `SessionStart` | all | Register the session so its card appears the moment it opens |
+| `UserPromptSubmit` | all | Register a session that was already open when the adapter was installed |
+
+Before `SessionStart` was hooked, a session had no card until its first turn ended,
+and a session launched from the dashboard could never be confirmed as started.
+
+The hook command uses the Store PowerShell's execution alias
+(`%LOCALAPPDATA%\Microsoft\WindowsApps\pwsh.exe`) rather than its versioned install
+folder, which disappears on the next Store update and would silently break every hook.
 
 Existing settings and any hooks you added yourself are preserved; re-running is safe,
 and `-Uninstall` removes only this bridge's entries. Restart Claude sessions
@@ -105,6 +114,11 @@ came from a live session.
 - **Idle.** Claude writes no turn-end transcript entry, so the `Stop` hook is the
   authoritative idle signal; freshness is used only when adopting an already-running
   session.
+- **Reasoning is sporadic.** Claude Code saves most `thinking` blocks to the
+  transcript with empty text and only an occasional summary, so the reasoning
+  expander can lag minutes behind a burst of tool calls. The card shows the recent
+  activity trail alongside it for that reason. (Measured on one session: 14 of 56
+  thinking blocks carried text.)
 - **Cards are prefixed `Claude:`** so they are distinguishable from Copilot's on a
   shared dashboard.
 - All three hooks write nothing to stdout and always exit 0, so a bridge fault can

@@ -582,6 +582,7 @@ function Set-CopilotMqttNewSessionEntityIds {
         @('text',   'new_prompt'),
         @('select', 'new_workspace'),
         @('select', 'new_profile'),
+        @('select', 'new_agent'),
         @('select', 'new_resume'),
         @('button', 'new_session'),
         @('sensor', 'new_session_result')
@@ -789,6 +790,21 @@ function Initialize-BridgeDashboard {
     }
 }
 
+function Test-BridgeActivityCardServed {
+    <#
+        True when the served reply-card file includes agent-bridge-activity-card, read
+        from the `?v=` cache-buster on its resource URL. The element first shipped in
+        card version 1.10.0.
+    #>
+    param([AllowEmptyString()][AllowNull()][string]$ReplyCardUrl)
+
+    if ([string]::IsNullOrWhiteSpace($ReplyCardUrl)) { return $false }
+    if ($ReplyCardUrl -notmatch '[?&]v=([0-9]+(\.[0-9]+){1,3})') { return $false }
+    $served = $null
+    if (-not [version]::TryParse($Matches[1], [ref]$served)) { return $false }
+    $served -ge [version]'1.10.0'
+}
+
 $script:BridgeReplyCardUrlCache = ''
 $script:BridgeReplyCardUrlCachedAt = [datetime]::MinValue
 
@@ -885,6 +901,9 @@ function Save-CopilotSessionDashboard {
         # Whether to show the resume row on the new-session card.
         [switch]$IncludeResume,
 
+        # Whether to show the agent row - worth it only when there is a choice.
+        [switch]$IncludeAgent,
+
         # Resource URL of the reply card, or empty when Home Assistant is not serving
         # it. Empty falls back to the plain text box and Send button: a Lovelace view
         # that references a custom card which does not exist renders an error box
@@ -906,6 +925,7 @@ function Save-CopilotSessionDashboard {
             Machine = [Environment]::MachineName
             IncludeProfile = [bool]$IncludeProfile
             IncludeResume = [bool]$IncludeResume
+            IncludeAgent = [bool]$IncludeAgent
         })
     }
     $multiMachine = $machineList.Count -gt 1
@@ -1037,8 +1057,13 @@ function Save-CopilotSessionDashboard {
             $rows += @{ entity = (Get-BridgeMachineEntityId -Domain 'select' -Key 'new_resume' -Slug $slug); name = 'Resume' }
         }
         $rows += @{ entity = (Get-BridgeMachineEntityId -Domain 'select' -Key 'new_workspace' -Slug $slug); name = 'Workspace' }
-        # The profile row is only meaningful when Agency is the launcher, so it is left
-        # out entirely rather than shown as a control that does nothing.
+        # A peer running an older bridge reports no agent capability at all.
+        if ($_.PSObject.Properties['IncludeAgent'] -and $_.IncludeAgent) {
+            $rows += @{ entity = (Get-BridgeMachineEntityId -Domain 'select' -Key 'new_agent' -Slug $slug); name = 'Agent' }
+        }
+        # The profile row is only meaningful when Agency is installed, so it is left
+        # out entirely rather than shown as a control that does nothing. It applies
+        # only when Agency is the chosen agent.
         if ($_.IncludeProfile) {
             $rows += @{ entity = (Get-BridgeMachineEntityId -Domain 'select' -Key 'new_profile' -Slug $slug); name = 'Profile' }
         }
@@ -1208,8 +1233,10 @@ ha-select, mwc-select { width: 100%; }
         # The collapsed card always carries the whole thing: the full question when one
         # is waiting, otherwise the full text of the last response. The expander holds
         # only supporting detail - the model's reasoning when Detailed activity is on, and
-        # the recent activity trail otherwise - so opening it is never required to read
-        # what was actually asked or answered.
+        # the recent activity trail - so opening it is never required to read what was
+        # actually asked or answered. Both are shown together: Claude records a thinking
+        # summary only now and then, so reasoning can sit minutes behind a burst of tool
+        # calls, and hiding the trail behind it made a busy session look stalled.
         $header = @{
             type = 'markdown'
             card_mod = @{ style = $bareChild }
@@ -1227,12 +1254,29 @@ ha-select, mwc-select { width: 100%; }
 {% set r = state_attr('$activityEntity','reasoning') %}{% set hist = state_attr('$activityEntity','history') %}{% if r %}<details><summary><em>🧠 reasoning</em></summary>
 
 {{ r }}
-</details>{% elif hist %}<details><summary><em>recent activity</em></summary>
+</details>{% endif %}{% if hist %}<details><summary><em>recent activity</em></summary>
 
 {% for h in hist[-8:] %}- {{ h }}
 {% endfor %}
 </details>{% endif %}
 "@
+        }
+
+        # The markdown header re-renders its whole template on every attribute change,
+        # which snaps an open expander shut and jumps the page while reasoning streams.
+        # The activity card updates in place instead. It ships in the reply card's file,
+        # so it is used only when Home Assistant serves a copy new enough to have it -
+        # a view naming a custom element that does not exist renders an error box.
+        if (Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl) {
+            $header = @{
+                type     = 'custom:agent-bridge-activity-card'
+                card_mod = @{ style = $bareChild }
+                name     = [string]$session.Name
+                machine  = [string]$session.Machine
+                status   = $statusEntity
+                activity = $activityEntity
+                decision = $decisionEntity
+            }
         }
 
         # The Answer control is shown only while a question is actually waiting. The

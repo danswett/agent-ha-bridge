@@ -7,7 +7,9 @@
     ~/.claude/settings.json:
 
       * PreToolUse, matching AskUserQuestion, to mirror questions to Home Assistant
+      * Notification, to surface permission prompts and idle waits
       * Stop, to mark the turn idle and push the response preview
+      * SessionStart and UserPromptSubmit, to register the session immediately
 
     The main bridge must already be installed: the adapter reuses its Home Assistant
     layer, its daemon and its dashboard.
@@ -44,7 +46,16 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
 
 # The hook command must survive being run from any working directory, and pwsh is
 # what the adapter is written for.
+#
+# The Store build resolves to a versioned folder under Program Files\WindowsApps that
+# disappears on its next update, silently breaking every hook (they exit 0 by design,
+# so nothing reports it). Its execution alias under LocalAppData is stable, so that is
+# written instead.
 $pwshPath = (Get-Command pwsh -ErrorAction SilentlyContinue)?.Source
+$storeAlias = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\pwsh.exe'
+if ($pwshPath -and $pwshPath -match '\\Program Files\\WindowsApps\\' -and (Test-Path -LiteralPath $storeAlias)) {
+    $pwshPath = $storeAlias
+}
 if (-not $pwshPath) { $pwshPath = 'pwsh' }
 
 function Get-Settings {
@@ -167,8 +178,15 @@ $settings = Add-BridgeHook -Settings $settings -EventName 'Notification' -Matche
     -ScriptName 'route-notification.ps1' -TimeoutSeconds 30
 $settings = Add-BridgeHook -Settings $settings -EventName 'Stop' -Matcher '' `
     -ScriptName 'notify-claude-stop.ps1' -TimeoutSeconds 30
+# SessionStart makes a session visible the moment it opens rather than after its first
+# turn, and is what lets a dashboard launch confirm it started. UserPromptSubmit
+# covers a session that was already open when this ran.
+$settings = Add-BridgeHook -Settings $settings -EventName 'SessionStart' -Matcher '' `
+    -ScriptName 'register-claude-session.ps1' -TimeoutSeconds 15
+$settings = Add-BridgeHook -Settings $settings -EventName 'UserPromptSubmit' -Matcher '' `
+    -ScriptName 'register-claude-session.ps1' -TimeoutSeconds 15
 Save-Settings -Settings $settings
-Write-Host '    PreToolUse (AskUserQuestion), Notification and Stop registered'
+Write-Host '    PreToolUse (AskUserQuestion), Notification, Stop, SessionStart and UserPromptSubmit registered'
 
 Write-Step 'Done'
 Write-Host ''

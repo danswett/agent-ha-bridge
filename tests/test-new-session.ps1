@@ -129,6 +129,11 @@ function Get-BridgeSetting {
     $Default
 }
 
+# Discovery reads this machine's real Claude history, so it is shadowed with a fixed
+# list; the system-folder filter it relies on is tested on its own below.
+$script:FakeDiscovered = @()
+function Get-BridgeDiscoveredWorkspaces { @($script:FakeDiscovered) }
+
 Write-Host ''
 Write-Host '--- the workspace list ---'
 
@@ -150,7 +155,32 @@ Test-That 'two folders with the same name both survive' { $choices.Count -eq 2 }
 Test-That 'the duplicate label is disambiguated' { ($choices | Select-Object -Expand Label | Sort-Object -Unique).Count -eq 2 }
 
 $script:FakeSettings = @{ 'newSession.workspaces' = @() }
-Test-That 'no configuration yields no choices' { @(Get-BridgeWorkspaceChoices).Count -eq 0 }
+$choices = @(Get-BridgeWorkspaceChoices)
+Test-That 'no configuration and nothing discovered falls back to home' {
+    $choices.Count -eq 1 -and $choices[0].Label -eq 'Home' -and $choices[0].Path -eq [IO.Path]::GetFullPath($HOME)
+}
+
+Write-Host ''
+Write-Host '--- discovered workspaces ---'
+
+$gamma = Join-Path $root 'gamma'
+New-Item -ItemType Directory -Path $gamma -Force | Out-Null
+$script:FakeDiscovered = @($gamma, $alpha)
+$script:FakeSettings = @{ 'newSession.workspaces' = @($alpha) }
+$choices = @(Get-BridgeWorkspaceChoices)
+Test-That 'discovered folders follow the configured ones' { ($choices.Label -join ',') -eq 'alpha,gamma' }
+Test-That 'a discovered folder already configured is not offered twice' { @($choices | Where-Object Path -eq $alpha).Count -eq 1 }
+Test-That 'a discovered folder resolves like a configured one' { (Resolve-BridgeWorkspacePath -Label 'gamma') -eq $gamma }
+$script:FakeSettings = @{}
+Test-That 'discovery alone is enough, with no config at all' { (Get-BridgeDefaultWorkspaceLabel) -eq 'gamma' }
+$script:FakeDiscovered = @()
+
+Test-That 'System32 is a system folder' { Test-BridgeSystemDirectory -Path (Join-Path $env:WINDIR 'System32') }
+Test-That 'the Windows folder itself is a system folder' { Test-BridgeSystemDirectory -Path $env:WINDIR }
+Test-That 'Program Files is a system folder' { Test-BridgeSystemDirectory -Path (Join-Path $env:ProgramFiles 'Something') }
+Test-That 'a drive root is a system folder' { Test-BridgeSystemDirectory -Path 'C:\' }
+Test-That 'a project under the home folder is not' { -not (Test-BridgeSystemDirectory -Path (Join-Path $HOME 'repos\project')) }
+Test-That 'a sibling that only shares a prefix is not' { -not (Test-BridgeSystemDirectory -Path "$($env:WINDIR)Projects") }
 
 Write-Host ''
 Write-Host '--- defaults, so a launch needs no input ---'
@@ -166,7 +196,7 @@ Test-That 'a default naming a missing workspace falls back to the first' {
     (Get-BridgeDefaultWorkspaceLabel) -eq 'alpha'
 }
 $script:FakeSettings = @{ 'newSession.workspaces' = @() }
-Test-That 'no workspaces means no default' { (Get-BridgeDefaultWorkspaceLabel) -eq '' }
+Test-That 'no workspaces means home is the default' { (Get-BridgeDefaultWorkspaceLabel) -eq 'Home' }
 
 $script:FakeSettings = @{ 'newSession.profiles' = @('work', 'home') }
 Test-That 'the first profile is the default when none is configured' { (Get-BridgeDefaultAgencyProfile) -eq 'work' }
@@ -247,6 +277,36 @@ Test-That 'the whole agency line survives a round trip' {
     $agParsed[0] -eq 'copilot' -and $agParsed[-1] -ceq 'refactor the "login" flow'
 }
 
+# --- Claude and Codex ------------------------------------------------------------
+
+Write-Host ''
+Write-Host '--- launching Claude and Codex ---'
+
+$cl = @(Get-BridgeNewSessionArguments -SessionId $sid -Launcher 'claude' -Prompt 'do it')
+Test-That 'claude is given the session id up front' { $cl[$cl.IndexOf('--session-id') + 1] -eq $sid }
+Test-That 'the claude prompt is positional, after --' { $cl[-2] -eq '--' -and $cl[-1] -eq 'do it' }
+Test-That 'claude gets no copilot-only arguments' { $cl -notcontains '--banner' -and $cl -notcontains '-i' }
+Test-That 'claude permissions are not skipped by default' { $cl -notcontains '--dangerously-skip-permissions' }
+
+$clAll = @(Get-BridgeNewSessionArguments -SessionId $sid -Launcher 'claude' -Model 'opus' -AllowAllTools)
+Test-That 'claude takes the configured model' { $clAll[$clAll.IndexOf('--model') + 1] -eq 'opus' }
+Test-That 'allowAllTools maps to skipping claude permissions' { $clAll -contains '--dangerously-skip-permissions' }
+Test-That 'no claude prompt means no --' { $clAll -notcontains '--' }
+
+$flagPrompt = '--dangerously-skip-permissions'
+$clFlag = @(ConvertFrom-CommandLine -CommandLine (ConvertTo-BridgeArgumentString -Arguments (
+    Get-BridgeNewSessionArguments -SessionId $sid -Launcher 'claude' -Prompt $flagPrompt)))
+Test-That 'a prompt that looks like a flag stays behind --' {
+    $clFlag.IndexOf($flagPrompt) -eq $clFlag.Count - 1 -and $clFlag[-2] -eq '--'
+}
+
+$cx = @(Get-BridgeNewSessionArguments -SessionId '' -Launcher 'codex' -Prompt 'do it' -AllowAllTools)
+Test-That 'codex is not given a session id' { $cx -notcontains '--session-id' }
+Test-That 'allowAllTools maps to never asking codex for approval' {
+    $cx[$cx.IndexOf('--ask-for-approval') + 1] -eq 'never'
+}
+Test-That 'the codex prompt is positional, after --' { $cx[-2] -eq '--' -and $cx[-1] -eq 'do it' }
+
 Write-Host ''
 Write-Host '--- profile validation ---'
 
@@ -263,9 +323,15 @@ Test-That 'the default profile list is work, home, local' { (Get-BridgeAgencyPro
 Write-Host ''
 Write-Host '--- launcher selection ---'
 
-# Shadow the probes so launcher selection can be tested without either tool present.
+# Shadow the probes so launcher selection can be tested without any tool present.
 $script:AgencyPresent = $true
+$script:CopilotPresent = $true
+$script:ClaudePresent = $false
+$script:CodexPresent = $false
 function Get-BridgeAgencyPath { if ($script:AgencyPresent) { 'C:\agency.exe' } else { $null } }
+function Get-BridgeCopilotPath { if ($script:CopilotPresent) { 'C:\copilot.exe' } else { $null } }
+function Get-BridgeClaudePath { if ($script:ClaudePresent) { 'C:\claude.exe' } else { $null } }
+function Get-BridgeCodexPath { if ($script:CodexPresent) { 'C:\codex.cmd' } else { $null } }
 
 $script:FakeSettings = @{ 'newSession.launcher' = 'auto' }
 $script:AgencyPresent = $true
@@ -284,6 +350,35 @@ Test-That 'asking for Agency without it installed falls back rather than failing
 $script:FakeSettings = @{ 'newSession.launcher' = 'AGENCY' }
 $script:AgencyPresent = $true
 Test-That 'the launcher setting is case-insensitive' { (Get-BridgeLauncherKind) -eq 'agency' }
+
+# A machine with only Claude on it - the case that used to fail with copilot.exe
+# not found.
+$script:AgencyPresent = $false
+$script:CopilotPresent = $false
+$script:ClaudePresent = $true
+$script:FakeSettings = @{ 'newSession.launcher' = 'auto' }
+Test-That 'auto picks Claude when it is the only agent installed' { (Get-BridgeLauncherKind) -eq 'claude' }
+$script:FakeSettings = @{ 'newSession.launcher' = 'copilot' }
+Test-That 'a configured launcher that is missing falls back to one that is installed' { (Get-BridgeLauncherKind) -eq 'claude' }
+$script:ClaudePresent = $false
+Test-That 'with nothing installed it still names copilot, so the error says what is missing' { (Get-BridgeLauncherKind) -eq 'copilot' }
+
+$script:AgencyPresent = $true
+$script:CopilotPresent = $true
+$script:ClaudePresent = $true
+$script:CodexPresent = $true
+$script:FakeSettings = @{ 'newSession.launcher' = 'codex' }
+Test-That 'an explicit claude-or-codex choice is honoured' { (Get-BridgeLauncherKind) -eq 'codex' }
+Test-That 'every installed agent is offered, in preference order' {
+    (@(Get-BridgeAvailableLaunchers) -join ',') -eq 'agency,copilot,claude,codex'
+}
+Test-That 'an agent label resolves to its launcher' { (Resolve-BridgeLauncher -Label 'Claude') -eq 'claude' }
+Test-That 'the launcher kind itself also resolves' { (Resolve-BridgeLauncher -Label 'codex') -eq 'codex' }
+Test-That 'an unknown agent is refused' { $null -eq (Resolve-BridgeLauncher -Label 'Claude --yolo') }
+$script:CodexPresent = $false
+Test-That 'an agent that is not installed is refused' { $null -eq (Resolve-BridgeLauncher -Label 'Codex') }
+$script:CopilotPresent = $true
+$script:ClaudePresent = $false
 
 # --- the resume list ---------------------------------------------------------------
 
@@ -422,22 +517,22 @@ function Get-HomeAssistantState {
     if (-not $script:HaStates.ContainsKey($EntityId)) { throw "no such entity $EntityId" }
     [pscustomobject]@{ state = $script:HaStates[$EntityId] }
 }
-function Publish-CopilotMqttNewSession { param([object[]]$Workspaces, [string[]]$Profiles = @(), [object[]]$Resumable = @(), [string]$LastResult = '', [hashtable]$Headers) }
+function Publish-CopilotMqttNewSession { param([object[]]$Workspaces, [string[]]$Profiles = @(), [object[]]$Resumable = @(), [string[]]$Agents = @(), [string]$LastResult = '', [hashtable]$Headers) }
 function Set-CopilotMqttNewSessionEntityIds { $false }
 function Set-CopilotMqttNewSessionResult {
     param([string]$Text = '', [hashtable]$Headers)
     $script:Results += $Text
 }
 function Start-BridgeCopilotSession {
-    param([string]$WorkingDirectory, [string]$Prompt = '', [string]$SessionId = '', [string]$AgencyProfile = '', [switch]$Resume)
+    param([string]$WorkingDirectory, [string]$Prompt = '', [string]$SessionId = '', [string]$AgencyProfile = '', [string]$Launcher = '', [switch]$Resume)
     $script:Launches += [pscustomobject]@{
         Directory = $WorkingDirectory; Prompt = $Prompt; AgencyProfile = $AgencyProfile
-        SessionId = $SessionId; Resumed = $Resume.IsPresent
+        SessionId = $SessionId; Resumed = $Resume.IsPresent; Launcher = $Launcher
     }
     $id = if ($SessionId) { $SessionId } else { '11111111-2222-3333-4444-555555555555' }
     [pscustomobject]@{ Launched = $true; SessionId = $id; ProcessId = 4242; Launcher = 'agency'; Detail = 'started pid 4242' }
 }
-function Wait-BridgeSessionRegistered { param([string]$SessionId, [int]$TimeoutSeconds = 25) $true }
+function Wait-BridgeSessionRegistered { param([string]$SessionId, [int]$TimeoutSeconds = 25, [string]$Launcher = 'copilot', [DateTimeOffset]$Since) $true }
 function Invoke-HomeAssistantService {
     param([string]$Domain, [string]$Service, [hashtable]$Data, [hashtable]$Headers)
     $script:Cleared += "$Domain.$Service"
@@ -449,7 +544,8 @@ function Reset-NewSessionTest {
         [string]$Workspace = 'alpha',
         [string]$Prompt = 'do the thing',
         [string]$ProfileState = 'work',
-        [string]$ResumeState = 'New session'
+        [string]$ResumeState = 'New session',
+        [string]$AgentState = 'unknown'
     )
     $script:Launches = @()
     $script:Results = @()
@@ -463,6 +559,7 @@ function Reset-NewSessionTest {
         "select.agent_bridge_${slug}_new_workspace" = $Workspace
         "select.agent_bridge_${slug}_new_profile"   = $ProfileState
         "select.agent_bridge_${slug}_new_resume"    = $ResumeState
+        "select.agent_bridge_${slug}_new_agent"     = $AgentState
         "text.agent_bridge_${slug}_new_prompt"      = $Prompt
     }
 }
@@ -648,12 +745,49 @@ $script:FakeSettings = @{
     'newSession.profiles'   = @('work', 'home', 'local')
 }
 
-Reset-NewSessionTest -Press '2026-06-01T12:08:00+00:00'
+Write-Host ''
+Write-Host '--- choosing the agent ---'
+
+$script:ClaudePresent = $true
+
+Reset-NewSessionTest -Press '2026-06-01T12:30:00+00:00' -AgentState 'unknown'
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+Test-That 'an untouched agent selector launches the default agent' {
+    $script:Launches.Count -eq 1 -and $script:Launches[0].Launcher -eq 'agency'
+}
+
+Reset-NewSessionTest -Press '2026-06-01T12:31:00+00:00' -AgentState 'Claude' -ProfileState 'home'
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+Test-That 'choosing Claude launches Claude' { $script:Launches.Count -eq 1 -and $script:Launches[0].Launcher -eq 'claude' }
+Test-That 'an Agency profile is not passed to Claude' { $script:Launches[0].AgencyProfile -eq '' }
+Test-That 'the result names the agent' { ($script:Results -join ' ') -match 'Claude' }
+
+Reset-NewSessionTest -Press '2026-06-01T12:32:00+00:00' -AgentState 'Codex'
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+Test-That 'an agent that is not installed refuses to launch' { $script:Launches.Count -eq 0 }
+Test-That 'and says which agent' { ($script:Results -join ' ') -match "Unknown agent 'Codex'" }
+
+Set-AgencySessions -Sessions @(
+    @{ session_id = 'f0f0f0f0-1111-2222-3333-444444444444'; summary = 'Earlier work'; folder = $beta; can_resume = $true; updated_at = '2026-09-23T10:00:00Z' }
+)
+Reset-NewSessionTest -Press '2026-06-01T12:33:00+00:00' -AgentState 'Claude' -ResumeState 'Earlier work - beta'
+Reset-ResumeCache
+$script:DaemonNewSessionSignature = ''
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+Test-That 'a resume goes through Agency whichever agent is selected' {
+    $script:Launches.Count -eq 1 -and $script:Launches[0].Resumed -and $script:Launches[0].Launcher -eq 'agency'
+}
+$script:AgencyJson = ''
+Reset-ResumeCache
+$script:ClaudePresent = $false
+
+Reset-NewSessionTest -Press '2026-06-01T12:08:00+00:00' -Workspace 'unknown'
 $script:FakeSettings = @{ 'newSession.workspaces' = @() }
 $script:DaemonNewSessionSignature = ''
 Sync-DaemonNewSession -Headers $headers -Live $noLive
-Test-That 'no configured workspaces refuses to launch' { $script:Launches.Count -eq 0 }
-Test-That 'and explains what to configure' { ($script:Results -join ' ') -match 'No workspaces configured' }
+Test-That 'no configured workspaces launches in the home folder' {
+    $script:Launches.Count -eq 1 -and $script:Launches[0].Directory -eq [IO.Path]::GetFullPath($HOME)
+}
 
 $script:FakeSettings = @{ 'newSession.enabled' = $false; 'newSession.workspaces' = @($alpha) }
 Reset-NewSessionTest -Press '2026-06-01T12:09:00+00:00'

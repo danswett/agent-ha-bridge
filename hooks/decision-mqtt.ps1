@@ -614,6 +614,10 @@ function Publish-CopilotMqttNewSession {
         [AllowEmptyCollection()]
         [object[]]$Resumable = @(),
 
+        # Labels of the agents installed on this machine (Claude, Copilot, ...).
+        [AllowEmptyCollection()]
+        [string[]]$Agents = @(),
+
         [string]$LastResult = '',
 
         [string]$Slug,
@@ -680,6 +684,23 @@ function Publish-CopilotMqttNewSession {
     }
     Publish-CopilotMqttMessage -Topic "$prefix/select/$node/new_profile/config" `
         -Payload ($profileConfig | ConvertTo-Json -Depth 8 -Compress) -Headers $Headers -Retain
+
+    # Which agent to start. Only installed ones are offered, and the daemon resolves
+    # the chosen label back against that same list before launching anything.
+    $agentOptions = @(@($Agents) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($agentOptions.Count -eq 0) { $agentOptions = @('(no agents installed)') }
+
+    $agentConfig = @{
+        name          = 'New session agent'
+        unique_id     = "agent_bridge_${Slug}_new_agent"
+        object_id     = "agent_bridge_${Slug}_new_agent"
+        command_topic = "$root/newsession/agent/set"
+        options       = $agentOptions
+        icon          = 'mdi:robot-outline'
+        device        = $device
+    }
+    Publish-CopilotMqttMessage -Topic "$prefix/select/$node/new_agent/config" `
+        -Payload ($agentConfig | ConvertTo-Json -Depth 8 -Compress) -Headers $Headers -Retain
 
     # Resume selector. "New session" is always the first option and the default, so
     # the common case needs no interaction and nothing can be resumed by accident.
@@ -1063,6 +1084,7 @@ function Get-CopilotMqttMachineTopic {
         "$prefix/text/$node/new_prompt/config"
         "$prefix/select/$node/new_workspace/config"
         "$prefix/select/$node/new_profile/config"
+        "$prefix/select/$node/new_agent/config"
         "$prefix/select/$node/new_resume/config"
         "$prefix/button/$node/new_session/config"
         "$prefix/sensor/$node/new_session_result/config"

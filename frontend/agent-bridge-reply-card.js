@@ -16,7 +16,7 @@
  * daemon downloads them and attaches them to the prompt.
  */
 
-const CARD_VERSION = '1.9.2';
+const CARD_VERSION = '1.10.0';
 
 class AgentBridgeReplyCard extends HTMLElement {
   constructor() {
@@ -347,8 +347,183 @@ class AgentBridgeReplyCard extends HTMLElement {
   }
 }
 
+/*
+ * agent-bridge-activity-card
+ *
+ * The live header of a session card: status, the last response, and the reasoning
+ * and activity expanders.
+ *
+ * A markdown card re-renders its whole template whenever any referenced attribute
+ * changes. With reasoning streaming in, that meant the expander snapped shut and
+ * the page jumped on every update. This card builds its DOM once and afterwards
+ * only swaps the text of the parts that changed, so an open expander stays open and
+ * nothing else moves.
+ */
+class AgentBridgeActivityCard extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: 'open' });
+    this._built = false;
+    this._last = {};
+  }
+
+  setConfig(config) {
+    if (!config || !config.activity || !config.status) {
+      throw new Error('agent-bridge-activity-card: "activity" and "status" are required');
+    }
+    this._config = Object.assign({ name: '', machine: '', decision: '' }, config);
+    this._last = {};
+    if (this._hass) { this._render(); }
+  }
+
+  set hass(hass) {
+    this._hass = hass;
+    if (!this._built) { this._build(); }
+    this._render();
+  }
+
+  getCardSize() {
+    return 4;
+  }
+
+  _build() {
+    this._built = true;
+    const style = document.createElement('style');
+    style.textContent = `
+      ha-card { padding: 0 16px 8px; background: none; box-shadow: none; border: none; }
+      .title { font-size: 1.25em; font-weight: 500; margin: 12px 0 4px; }
+      .meta { color: var(--secondary-text-color); margin-bottom: 8px; }
+      .meta b { color: var(--primary-text-color); }
+      .waiting { font-weight: 600; margin: 8px 0 4px; }
+      hr { border: none; border-top: 1px solid var(--divider-color); margin: 8px 0; }
+      details { margin-top: 8px; }
+      summary { cursor: pointer; font-style: italic; color: var(--secondary-text-color); }
+      ul { margin: 6px 0; padding-left: 20px; }
+      .plain { white-space: pre-wrap; }
+      [hidden] { display: none !important; }
+    `;
+
+    const card = document.createElement('ha-card');
+    card.innerHTML = `
+      <div class="title"></div>
+      <div class="meta"></div>
+      <div class="question" hidden><hr><div class="waiting">Waiting on you:</div><div class="md q"></div></div>
+      <div class="md response" hidden></div>
+      <details class="reasoning" hidden><summary>🧠 reasoning</summary><div class="md r"></div></details>
+      <details class="history" hidden><summary>recent activity</summary><ul></ul></details>
+    `;
+    this.shadowRoot.appendChild(style);
+    this.shadowRoot.appendChild(card);
+
+    this._els = {
+      title: card.querySelector('.title'),
+      meta: card.querySelector('.meta'),
+      question: card.querySelector('.question'),
+      q: card.querySelector('.q'),
+      response: card.querySelector('.response'),
+      reasoning: card.querySelector('.reasoning'),
+      r: card.querySelector('.r'),
+      history: card.querySelector('.history'),
+      list: card.querySelector('.history ul'),
+    };
+
+    // ha-markdown is loaded lazily by the frontend. If it was not there at build
+    // time the text went in as plain text, so render it again once it arrives.
+    if (!customElements.get('ha-markdown')) {
+      customElements.whenDefined('ha-markdown').then(() => {
+        this._last = {};
+        this._render();
+      });
+    }
+  }
+
+  _changed(key, value) {
+    if (this._last[key] === value) { return false; }
+    this._last[key] = value;
+    return true;
+  }
+
+  _setMarkdown(container, text) {
+    if (customElements.get('ha-markdown')) {
+      let md = container.firstElementChild;
+      if (!md || md.tagName !== 'HA-MARKDOWN') {
+        container.textContent = '';
+        container.classList.remove('plain');
+        md = document.createElement('ha-markdown');
+        md.breaks = true;
+        container.appendChild(md);
+      }
+      md.content = text;
+    } else {
+      container.classList.add('plain');
+      container.textContent = text;
+    }
+  }
+
+  _render() {
+    if (!this._els || !this._hass || !this._config) { return; }
+    const states = this._hass.states;
+    const activity = states[this._config.activity];
+    const status = states[this._config.status];
+    const decision = this._config.decision ? states[this._config.decision] : undefined;
+    const attr = (entity, name) => (entity && entity.attributes ? entity.attributes[name] : undefined);
+
+    const question = attr(decision, 'question') || '';
+    const statusText = status ? status.state : 'unknown';
+    const dot = question ? '🟡' : (statusText === 'working' ? '🟢' : '⚪');
+
+    const title = `${dot} ${this._config.name}`;
+    if (this._changed('title', title)) { this._els.title.textContent = title; }
+
+    const shownStatus = question ? 'waiting for you' : statusText;
+    const activityText = activity ? activity.state : '';
+    const meta = `${this._config.machine}\u0001${shownStatus}\u0001${activityText}`;
+    if (this._changed('meta', meta)) {
+      this._els.meta.textContent = '';
+      const machine = document.createElement('i');
+      machine.textContent = this._config.machine;
+      const bold = document.createElement('b');
+      bold.textContent = shownStatus;
+      this._els.meta.append(machine, ' • status: ', bold, ` • ${activityText}`);
+    }
+
+    // The question, when one is waiting, takes the place of the response.
+    if (this._changed('question', question)) {
+      this._els.question.hidden = !question;
+      if (question) { this._setMarkdown(this._els.q, String(question)); }
+    }
+
+    const response = question ? '' : String(attr(activity, 'response') || '');
+    if (this._changed('response', response)) {
+      this._els.response.hidden = !response;
+      if (response) { this._setMarkdown(this._els.response, response); }
+    }
+
+    const reasoning = String(attr(activity, 'reasoning') || '');
+    if (this._changed('reasoning', reasoning)) {
+      this._els.reasoning.hidden = !reasoning;
+      if (reasoning) { this._setMarkdown(this._els.r, reasoning); }
+    }
+
+    const history = attr(activity, 'history');
+    const items = Array.isArray(history) ? history.slice(-8).map(String) : [];
+    if (this._changed('history', items.join('\u0001'))) {
+      this._els.history.hidden = items.length === 0;
+      this._els.list.textContent = '';
+      for (const item of items) {
+        const li = document.createElement('li');
+        li.textContent = item;
+        this._els.list.appendChild(li);
+      }
+    }
+  }
+}
+
 if (!customElements.get('agent-bridge-reply-card')) {
   customElements.define('agent-bridge-reply-card', AgentBridgeReplyCard);
+}
+if (!customElements.get('agent-bridge-activity-card')) {
+  customElements.define('agent-bridge-activity-card', AgentBridgeActivityCard);
 }
 
 window.customCards = window.customCards || [];
@@ -356,6 +531,11 @@ window.customCards.push({
   type: 'agent-bridge-reply-card',
   name: 'Agent Bridge Reply',
   description: 'Reply box for a bridged coding-agent session, with image attachments.',
+});
+window.customCards.push({
+  type: 'agent-bridge-activity-card',
+  name: 'Agent Bridge Activity',
+  description: 'Live status, response and reasoning for a bridged session, updated in place.',
 });
 
 console.info(`%c AGENT-BRIDGE-REPLY-CARD %c ${CARD_VERSION} `,
