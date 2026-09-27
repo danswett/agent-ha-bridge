@@ -2166,6 +2166,21 @@ function Invoke-PendingStops {
         $short = $sessionId.Substring(0, [Math]::Min(8, $sessionId.Length))
         Write-DaemonLog -Message "end requested for $short (pid $processId)"
 
+        # Say so on the card straight away: the status reads "ending" while the
+        # session closes, instead of carrying on as "working" or "idle" until it has
+        # gone.
+        # Separately guarded, so a failed status publish cannot also cost the card its
+        # "Ending session..." line.
+        try {
+            Set-CopilotMqttStatus -SessionId $sessionId -Status 'ending' -Headers $Headers -Attributes @{
+                session    = $entry.Name
+                machine    = $entry.Machine
+                process_id = $processId
+                updated    = [DateTimeOffset]::Now.ToString('o')
+            }
+            $entry.Status = 'ending'
+        }
+        catch { }
         try {
             Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Ending session...' `
                 -Headers $Headers
@@ -2175,6 +2190,9 @@ function Invoke-PendingStops {
         $stop = Stop-BridgeCopilotSession -SessionId $sessionId -ProcessId $processId
         if ($stop.Stopped) {
             Write-DaemonLog -Message "ended $short : $($stop.Detail)"
+            # Retire it now rather than on the next pass, so the card goes when the
+            # session does.
+            $script:DaemonReconcileNow = $true
 
             # Close the console the bridge opened for this session. The CLI exiting
             # does not always take its launcher with it - Agency wraps the CLI, so the
@@ -4166,6 +4184,8 @@ function Start-BridgeDaemon {
                 # The reply card publishes here rather than to the text box. Left out,
                 # a card reply waited for the 15-second reconcile to be noticed.
                 "sensor.${node}_reply_payload"
+                # End session, likewise: left out, a press sat unnoticed for up to 15 s.
+                "button.${node}_stop"
             }
         ) + @($script:DaemonConfig.VerboseToggle)
 
@@ -4214,6 +4234,19 @@ function Start-BridgeDaemon {
             }
             catch {
                 Write-DaemonLog -Message "reply delivery failed: $($_.Exception.Message)"
+            }
+        }
+
+        # End session is acted on before the reconcile below, not inside it: the
+        # reconcile then finds the session gone and drops its card in the same pass.
+        # Inside the reconcile the stop came after the check for exited sessions, so
+        # the card stayed up until the next pass.
+        if ($null -ne $hit -and $hit.EntityId -match '_stop$') {
+            try {
+                Invoke-PendingStops -Headers $headers -State $state -Live $script:DaemonLive
+            }
+            catch {
+                Write-DaemonLog -Message "end session failed: $($_.Exception.Message)"
             }
         }
 

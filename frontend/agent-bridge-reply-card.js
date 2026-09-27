@@ -16,7 +16,7 @@
  * daemon downloads them and attaches them to the prompt.
  */
 
-const CARD_VERSION = '1.11.1';
+const CARD_VERSION = '1.11.2';
 
 // The working line, in the style of Claude Code's own spinner: its glyph cycle, and a
 // word picked once per turn. Claude Code does not record which word it chose, so the
@@ -518,8 +518,12 @@ class AgentBridgeActivityCard extends HTMLElement {
     const attr = (entity, name) => (entity && entity.attributes ? entity.attributes[name] : undefined);
 
     const question = attr(decision, 'question') || '';
-    const statusText = status ? status.state : 'unknown';
-    const dot = question ? '🟡' : (statusText === 'working' ? '🟢' : '⚪');
+    // A session's entities are removed once it has exited, but a dashboard that has
+    // not reloaded yet still shows its card. That read "status: unknown" over an empty
+    // card; it is the end of the session, so it says so.
+    const rawStatus = status ? String(status.state) : 'unknown';
+    const statusText = ['unknown', 'unavailable'].includes(rawStatus) ? 'ended' : rawStatus;
+    const dot = question ? '🟡' : (statusText === 'working' ? '🟢' : (['ending', 'ended'].includes(statusText) ? '⏹️' : '⚪'));
 
     const title = `${dot} ${this._config.name}`;
     if (this._changed('title', title)) { this._els.title.textContent = title; }
