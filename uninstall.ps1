@@ -88,6 +88,11 @@ trap {
     break
 }
 
+# Windows/macOS differences; on macOS also makes Join-Path accept '\'. Beside this
+# script in both the repository and an install.
+$platform = Join-Path (Join-Path $PSScriptRoot 'hooks') 'bridge-platform.ps1'
+if (Test-Path -LiteralPath $platform) { . $platform } else { $script:BridgeIsWindows = [bool]$IsWindows }
+
 $installHome = if ($TargetHome) { $TargetHome } else { $HOME }
 $copilotHome = Join-Path $installHome '.copilot'
 $arpKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\AgentHaBridge' +
@@ -282,6 +287,22 @@ elseif ($ClearEntities) {
 if ($TargetHome) {
     Write-Step 'Skipping the scheduled task and process cleanup (-TargetHome)'
 }
+elseif (-not $script:BridgeIsWindows) {
+    $label = 'com.agent-ha-bridge.daemon'
+    Write-Step "Removing the '$label' LaunchAgent"
+    & launchctl bootout "gui/$(& id -u)/$label" 2>$null | Out-Null
+    $plist = Join-Path $installHome "Library/LaunchAgents/$label.plist"
+    if (Test-Path -LiteralPath $plist) { Remove-Item -LiteralPath $plist -Force; Write-Host "    removed $plist" }
+    else { Write-Host '    not registered' }
+
+    Write-Step 'Stopping any running daemon'
+    foreach ($proc in @(Get-BridgeProcessesNamed -Name 'pwsh')) {
+        if ($proc.ProcessId -ne $PID -and [string]$proc.CommandLine -match 'agent-bridge-(daemon|supervisor)\.ps1') {
+            Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
+            Write-Host "    stopped pid $($proc.ProcessId)"
+        }
+    }
+}
 else {
     Write-Step "Removing the '$taskName' scheduled task"
     foreach ($name in @($taskName, $legacyTaskName)) {
@@ -314,7 +335,7 @@ $files = @(
     'decision-inject.ps1', 'agent-bridge-daemon.ps1', 'agent-bridge-supervisor.ps1',
     'agent-bridge-launch.vbs', 'route-ask-user-v3.ps1', 'notify-agent-response.ps1',
     'notify-home-assistant.ps1', 'bridge-adapter.ps1', 'bridge-update.ps1',
-    'bridge-frontend-cards.ps1', 'session-launch.ps1', 'VERSION'
+    'bridge-frontend-cards.ps1', 'session-launch.ps1', 'bridge-platform.ps1', 'VERSION'
 )
 foreach ($name in $files) {
     $path = Join-Path $hooksDir $name
@@ -395,6 +416,20 @@ if ($TargetHome) {
     # A sandbox install never put itself on PATH, so there is nothing to undo and the
     # real install's entry must not be touched.
     Write-Step 'Leaving PATH alone (-TargetHome)'
+}
+elseif (-not $script:BridgeIsWindows) {
+    # The line the installer marked in the shell profiles.
+    Write-Step 'Removing agent-ha-bridge from your PATH'
+    foreach ($name in @('.zprofile', '.bash_profile')) {
+        $file = Join-Path $installHome $name
+        if (-not (Test-Path -LiteralPath $file)) { continue }
+        $lines = @(Get-Content -LiteralPath $file)
+        $kept = @($lines | Where-Object { $_ -notmatch '# agent-ha-bridge$' })
+        if ($kept.Count -ne $lines.Count) {
+            Set-Content -LiteralPath $file -Value $kept
+            Write-Host "    removed from ~/$name"
+        }
+    }
 }
 else {
     Write-Step 'Removing agent-ha-bridge from your PATH'

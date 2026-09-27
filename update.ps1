@@ -41,7 +41,7 @@ param(
 
 $ErrorActionPreference = 'Stop'
 
-$hooksDir = Join-Path $HOME '.agent-ha-bridge\hooks'
+$hooksDir = Join-Path $HOME '.agent-ha-bridge/hooks'
 if (-not (Test-Path -LiteralPath (Join-Path $hooksDir 'bridge-update.ps1'))) {
     # Fall back to the copy in this clone, so -Check works before a first install.
     $hooksDir = Join-Path $PSScriptRoot 'hooks'

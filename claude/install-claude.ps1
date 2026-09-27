@@ -31,6 +31,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Windows/macOS differences; on macOS also makes Join-Path accept '\'.
+. (Join-Path $PSScriptRoot '../hooks/bridge-platform.ps1')
 
 $installHome = if ($TargetHome) { $TargetHome } else { $HOME }
 $claudeHome = Join-Path $installHome '.claude'
@@ -116,6 +118,12 @@ function Add-BridgeHook {
     if (-not $hooks.ContainsKey($EventName)) { $hooks[$EventName] = @() }
 
     $command = '"{0}" "{1}"' -f $hookLauncher, (Join-Path $adapterDir $ScriptName)
+    # macOS runs hook commands through sh, so pwsh is named directly - by full path,
+    # since a hook's PATH need not include Homebrew.
+    if (-not $script:BridgeIsWindows) {
+        $pwsh = (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source
+        $command = "'{0}' -NoProfile -NonInteractive -File '{1}'" -f $pwsh, (Join-Path $adapterDir $ScriptName)
+    }
     $entry = [ordered]@{
         matcher = $Matcher
         hooks   = @(
@@ -165,6 +173,10 @@ Get-ChildItem (Join-Path $PSScriptRoot 'hooks') -File | ForEach-Object {
     Copy-Item $_.FullName $adapterDir -Force
     Write-Host "    $($_.Name)"
 }
+# The hooks run apart from the core, so they carry their own copy of the
+# Windows/macOS layer.
+Copy-Item (Join-Path (Split-Path $PSScriptRoot -Parent) 'hooks/bridge-platform.ps1') $adapterDir -Force
+Write-Host '    bridge-platform.ps1'
 
 Write-Step "Registering hooks in $settingsPath"
 $settings = Remove-BridgeHooks -Settings (Get-Settings)

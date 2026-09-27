@@ -20,7 +20,47 @@
 
 $script:CopilotInjectorTypeName = 'CopilotCli.ConsoleInjector'
 
+function Invoke-BridgeConsoleSend {
+    <#
+        Types $Text into the terminal of $ProcessId and, with -Submit, presses Enter
+        after $DelayMs as a separate keystroke. The text may carry arrow-key escape
+        sequences (a form's Down presses).
+
+        Windows attaches to the session's console (ConsoleInjector.Send); macOS types
+        into the tmux pane the session runs in. Returns "ok:..." or why it failed -
+        "not-in-tmux" for a macOS session started outside tmux.
+    #>
+    param(
+        [Parameter(Mandatory)][int]$ProcessId,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
+        [bool]$Submit = $true,
+        [int]$DelayMs = 300
+    )
+    if (-not $script:BridgeIsWindows) {
+        return Send-BridgeTmuxText -ProcessId $ProcessId -Text $Text -Submit:$Submit -SubmitDelayMs $DelayMs
+    }
+    Initialize-CopilotConsoleInjector
+    [string][CopilotCli.ConsoleInjector]::Send([uint32]$ProcessId, $Text, $Submit, $DelayMs)
+}
+
+function Invoke-BridgeConsoleChoice {
+    <# Answers an arrow-key choice prompt through its "Other" entry; see Send-CopilotSessionChoice. #>
+    param(
+        [Parameter(Mandatory)][int]$ProcessId,
+        [Parameter(Mandatory)][int]$DownCount,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
+        [int]$StepDelayMs = 120
+    )
+    if (-not $script:BridgeIsWindows) {
+        return Send-BridgeTmuxChoice -ProcessId $ProcessId -DownCount $DownCount -Text $Text -StepDelayMs $StepDelayMs
+    }
+    Initialize-CopilotConsoleInjector
+    [string][CopilotCli.ConsoleInjector]::SendChoice([uint32]$ProcessId, $DownCount, $Text, $StepDelayMs)
+}
+
 function Initialize-CopilotConsoleInjector {
+    # The Windows console API; macOS goes through tmux instead (Invoke-BridgeConsoleSend).
+    if (-not $script:BridgeIsWindows) { return }
     if (-not ([Management.Automation.PSTypeName]$script:CopilotInjectorTypeName).Type) {
         Add-Type -Language CSharp -TypeDefinition @'
 using System;
@@ -370,7 +410,7 @@ function Get-CopilotSessionProcessId {
         if ($null -eq $process) { continue }
         # Exact match only. The machine also runs `copilotapp` and `copilotapphost`,
         # which a prefix match would happily accept and then type into.
-        if ($process.ProcessName -ne 'copilot') { continue }
+        if (-not (Test-BridgeAgentProcess -Process $process -Agent 'copilot')) { continue }
         return $processId
     }
 
@@ -443,10 +483,8 @@ function Send-CopilotSessionPrompt {
     $clean = Get-CopilotInjectableText -Text $Text
 
     try {
-        Initialize-CopilotConsoleInjector
-        $outcome = [CopilotCli.ConsoleInjector]::Send(
-            [uint32]$processId, $clean, (-not $NoSubmit.IsPresent), $SubmitDelayMs
-        )
+        $outcome = Invoke-BridgeConsoleSend -ProcessId $processId -Text $clean `
+            -Submit (-not $NoSubmit.IsPresent) -DelayMs $SubmitDelayMs
         $result.Detail = $outcome
         $result.Delivered = $outcome.StartsWith('ok:')
     }
@@ -579,8 +617,6 @@ function Send-CopilotSessionForm {
     $result.ProcessId = $processId
 
     try {
-        Initialize-CopilotConsoleInjector
-
         # One attach-write-detach per FIELD, with that field's arrows and its
         # committing Enter in the same call.
         #
@@ -596,8 +632,7 @@ function Send-CopilotSessionForm {
         # reply, which is the delivery path with a long record of working.
         $outcome = 'ok:form'
         for ($i = 0; $i -lt $steps.Count; $i++) {
-            $r = [CopilotCli.ConsoleInjector]::Send(
-                [uint32]$processId, $steps[$i].Payload, $true, $StepDelayMs)
+            $r = Invoke-BridgeConsoleSend -ProcessId $processId -Text $steps[$i].Payload -Submit $true -DelayMs $StepDelayMs
             if (-not $r.StartsWith('ok')) { $outcome = "field${i}:$r"; break }
             Start-Sleep -Milliseconds ($StepDelayMs * 2)
         }
@@ -670,10 +705,7 @@ function Send-CopilotSessionChoice {
     $downs = [Math]::Max(1, $ChoiceCount + 2)
 
     try {
-        Initialize-CopilotConsoleInjector
-        $outcome = [CopilotCli.ConsoleInjector]::SendChoice(
-            [uint32]$processId, $downs, $clean, $StepDelayMs
-        )
+        $outcome = Invoke-BridgeConsoleChoice -ProcessId $processId -DownCount $downs -Text $clean -StepDelayMs $StepDelayMs
         $result.Detail = $outcome
         $result.Delivered = $outcome.StartsWith('ok:')
     }

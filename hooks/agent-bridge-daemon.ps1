@@ -265,7 +265,7 @@ function Get-LiveCopilotSessions {
 
     # One process snapshot; membership is then a hash lookup per lock.
     $livePids = @{}
-    foreach ($process in @(Get-Process -Name 'copilot' -ErrorAction SilentlyContinue)) {
+    foreach ($process in @(Get-BridgeAgentProcesses -Agent 'copilot')) {
         $livePids[$process.Id] = $true
     }
     if ($livePids.Count -eq 0) { return @{} }
@@ -988,7 +988,12 @@ function Get-BridgeAttachmentRoot {
         the fallback to the public profile, which never contains one.
     #>
     $root = ''
-    if (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
+    # macOS: beside the bridge's config, or /tmp for a home folder with a space.
+    if (-not $script:BridgeIsWindows) {
+        $root = Join-Path $HOME '.agent-ha-bridge/attachments'
+        if ($root -match '\s') { $root = Join-Path $env:TEMP 'agent-ha-bridge-attachments' }
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
         $root = Join-Path ([string]$env:LOCALAPPDATA) 'agent-ha-bridge\attachments'
     }
     if ([string]::IsNullOrWhiteSpace($root) -or $root -match '\s') {
@@ -1880,8 +1885,7 @@ function Complete-DaemonClaudeAnswer {
     if (& $answered) { return $Delivery }
 
     try {
-        Initialize-CopilotConsoleInjector
-        [void][CopilotCli.ConsoleInjector]::Send([uint32]$Delivery.ProcessId, '', $true, 0)
+        [void](Invoke-BridgeConsoleSend -ProcessId ([int]$Delivery.ProcessId) -Text '' -Submit $true -DelayMs 0)
     }
     catch { }
 
@@ -3243,9 +3247,17 @@ function Sync-DaemonClients {
 
         $log = Join-Path $env:TEMP "agent-bridge-setup-$client.log"
         try {
-            $process = Start-Process -FilePath 'pwsh' `
-                -ArgumentList "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$($installer.Path)`" $($installer.Arguments)".TrimEnd() `
-                -WindowStyle Hidden -PassThru -RedirectStandardOutput $log -RedirectStandardError "$log.err" -ErrorAction Stop
+            $setup = @{
+                FilePath               = 'pwsh'
+                ArgumentList           = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$($installer.Path)`" $($installer.Arguments)".TrimEnd()
+                PassThru               = $true
+                RedirectStandardOutput = $log
+                RedirectStandardError  = "$log.err"
+                ErrorAction            = 'Stop'
+            }
+            # Not supported, and refused, off Windows.
+            if ($script:BridgeIsWindows) { $setup.WindowStyle = 'Hidden' }
+            $process = Start-Process @setup
             $script:DaemonClientSetup[$client] = [pscustomobject]@{ Process = $process; Log = $log; Done = $false }
             Write-DaemonLog -Message "$(Get-BridgeLauncherLabel -Launcher $client) is installed but has no bridge adapter; setting it up (pid $($process.Id))"
         }
@@ -4190,8 +4202,7 @@ function Confirm-DaemonClaudeSubmit {
 
         $attempt++
         try {
-            Initialize-CopilotConsoleInjector
-            $outcome = [CopilotCli.ConsoleInjector]::Send([uint32]$ProcessId, '', $true, 0)
+            $outcome = Invoke-BridgeConsoleSend -ProcessId $ProcessId -Text '' -Submit $true -DelayMs 0
             if (-not ([string]$outcome).StartsWith('ok:')) { $result.Detail = "extra Enter failed: $outcome"; break }
         }
         catch {

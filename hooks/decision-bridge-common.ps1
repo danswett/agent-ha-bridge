@@ -18,6 +18,10 @@
     below. See config.example.json in the repository root.
 #>
 
+# Windows/macOS differences (the temporary folder, process lookups, tmux), first so
+# everything below can rely on them.
+. (Join-Path $PSScriptRoot 'bridge-platform.ps1')
+
 function Get-BridgeUserConfig {
     $candidates = @()
     if (-not [string]::IsNullOrWhiteSpace($env:AGENT_HA_BRIDGE_CONFIG)) {

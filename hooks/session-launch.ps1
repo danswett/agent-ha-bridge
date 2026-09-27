@@ -106,9 +106,13 @@ function Test-BridgeSystemDirectory {
 
     $excluded = @($env:WINDIR, $env:ProgramFiles, ${env:ProgramFiles(x86)}, $env:ProgramData, $env:TEMP) |
         Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    if (-not $script:BridgeIsWindows) {
+        $excluded += @('/System', '/Library', '/usr', '/bin', '/sbin', '/private', '/Applications', '/opt', '/var', '/etc')
+    }
+    $separator = [System.IO.Path]::DirectorySeparatorChar
     foreach ($candidate in $excluded) {
         $prefix = [System.IO.Path]::GetFullPath($candidate).TrimEnd('\', '/')
-        if ($full -eq $prefix -or $full.StartsWith("$prefix\", [StringComparison]::OrdinalIgnoreCase)) { return $true }
+        if ($full -eq $prefix -or $full.StartsWith("$prefix$separator", [StringComparison]::OrdinalIgnoreCase)) { return $true }
     }
     $false
 }
@@ -319,6 +323,8 @@ function Get-BridgeCopilotPath {
         Select-Object -First 1
     if ($command -and $command.Source) { return [string]$command.Source }
 
+    if (-not $script:BridgeIsWindows) { return Find-BridgeUnixCommand -Name 'copilot' }
+
     $wingetPath = Join-Path $HOME 'AppData\Local\Microsoft\WinGet\Packages\GitHub.Copilot_Microsoft.Winget.Source_8wekyb3d8bbwe\copilot.exe'
     if ([System.IO.File]::Exists($wingetPath)) { return $wingetPath }
 
@@ -346,6 +352,8 @@ function Get-BridgeAgencyPath {
         Select-Object -First 1
     if ($command -and $command.Source) { return [string]$command.Source }
 
+    if (-not $script:BridgeIsWindows) { return Find-BridgeUnixCommand -Name 'agency' }
+
     # Agency installs under Roaming and self-updates behind a CurrentVersion
     # junction, so this path stays correct across versions.
     $installed = Join-Path $env:APPDATA 'agency\CurrentVersion\agency.exe'
@@ -370,6 +378,8 @@ function Get-BridgeClaudePath {
         Select-Object -First 1
     if ($command -and $command.Source) { return [string]$command.Source }
 
+    if (-not $script:BridgeIsWindows) { return Find-BridgeUnixCommand -Name 'claude' }
+
     $native = Join-Path $HOME '.local\bin\claude.exe'
     if ([System.IO.File]::Exists($native)) { return $native }
 
@@ -391,9 +401,34 @@ function Get-BridgeCodexPath {
         Select-Object -First 1
     if ($command -and $command.Source) { return [string]$command.Source }
 
+    if (-not $script:BridgeIsWindows) { return Find-BridgeUnixCommand -Name 'codex' }
+
     $npm = Join-Path $env:APPDATA 'npm\codex.cmd'
     if ([System.IO.File]::Exists($npm)) { return $npm }
 
+    $null
+}
+
+function Find-BridgeUnixCommand {
+    <#
+        An agent's command on macOS where a LaunchAgent's minimal PATH would miss it:
+        Homebrew (Apple silicon and Intel), the native installers' ~/.local/bin,
+        Claude's own ~/.claude/local, and npm's global prefix.
+    #>
+    param([Parameter(Mandatory)][string]$Name)
+
+    $dirs = @('/opt/homebrew/bin', '/usr/local/bin', (Join-Path $HOME '.local/bin'),
+        (Join-Path $HOME '.claude/local'), (Join-Path $HOME '.npm-global/bin'), (Join-Path $HOME '.bun/bin'))
+    foreach ($dir in $dirs) {
+        $candidate = Join-Path $dir $Name
+        if ([System.IO.File]::Exists($candidate)) { return $candidate }
+    }
+    # nvm and friends: whatever node is first on PATH, its bin folder.
+    $node = Get-Command node -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($node) {
+        $candidate = Join-Path (Split-Path $node.Source -Parent) $Name
+        if ([System.IO.File]::Exists($candidate)) { return $candidate }
+    }
     $null
 }
 
@@ -433,6 +468,9 @@ function Update-BridgeProcessPath {
     #>
     param([switch]$Force)
 
+    # Windows keeps machine and user PATH in the registry; macOS has neither, and the
+    # LaunchAgent is given the installer's PATH (Find-BridgeUnixCommand covers the rest).
+    if (-not $script:BridgeIsWindows) { return }
     if (-not $Force -and ([DateTimeOffset]::Now - $script:BridgePathRefreshedAt).TotalSeconds -lt 60) { return }
     $script:BridgePathRefreshedAt = [DateTimeOffset]::Now
 
@@ -1149,6 +1187,21 @@ function Get-BridgeResumableSessions {
     @($results)
 }
 
+function Read-BridgeConsoleScreen {
+    <#
+        The visible text of a session's terminal, or '' when it cannot be read: its
+        console on Windows, its tmux pane on macOS.
+    #>
+    param([Parameter(Mandatory)][int]$ProcessId)
+    if (-not $script:BridgeIsWindows) {
+        $pane = Find-BridgeTmuxPane -ProcessId $ProcessId
+        if (-not $pane) { return '' }
+        return Read-BridgeTmuxPane -Pane $pane
+    }
+    Initialize-BridgeConsoleReader
+    [string][CopilotCli.ConsoleReader]::ReadScreen([uint32]$ProcessId)
+}
+
 function Initialize-BridgeConsoleReader {
     <#
         Compiles a small reader for another process's console screen: attach, read the
@@ -1240,8 +1293,7 @@ function Read-BridgeTrustPrompt {
     param([Parameter(Mandatory)][int]$ProcessId)
 
     try {
-        Initialize-BridgeConsoleReader
-        Get-BridgeTrustPromptSelection -Screen ([CopilotCli.ConsoleReader]::ReadScreen([uint32]$ProcessId))
+        Get-BridgeTrustPromptSelection -Screen (Read-BridgeConsoleScreen -ProcessId $ProcessId)
     }
     catch { '' }
 }
@@ -1260,9 +1312,8 @@ function Send-BridgeTrustAnswer {
         [Parameter(Mandatory)][ValidateSet('yes', 'no')][string]$Selection
     )
 
-    Initialize-CopilotConsoleInjector
     $keys = if ($Selection -eq 'yes') { '' } else { "$([char]27)[B" }
-    [string][CopilotCli.ConsoleInjector]::Send([uint32]$ProcessId, $keys, $true, 200)
+    Invoke-BridgeConsoleSend -ProcessId $ProcessId -Text $keys -Submit $true -DelayMs 200
 }
 
 function Start-BridgeCopilotSession {
@@ -1337,6 +1388,14 @@ function Start-BridgeCopilotSession {
         -Resume:$Resume)
 
     try {
+        if (-not $script:BridgeIsWindows) {
+            # macOS: the session runs in a tmux session of its own - which is how the
+            # dashboard types into it - shown in a Terminal window attached to it.
+            $processId = Start-BridgeTmuxSession -Executable $executable -Arguments $arguments `
+                -WorkingDirectory $WorkingDirectory -Name "$launcher-$(Get-Date -Format 'HHmmss')"
+            $process = [pscustomobject]@{ Id = $processId }
+        }
+        else {
         # Start-Process (ShellExecute) rather than a redirected .NET process start:
         # it gives the child its own console instead of letting it inherit the
         # daemon's hidden one, which is what makes the window visible. It refuses an
@@ -1350,6 +1409,7 @@ function Start-BridgeCopilotSession {
         }
         if ($arguments.Count -gt 0) { $startArgs.ArgumentList = ConvertTo-BridgeArgumentString -Arguments $arguments }
         $process = Start-Process @startArgs
+        }
 
         $result.ProcessId = $process.Id
         $result.Launched = $true
@@ -1363,6 +1423,66 @@ function Start-BridgeCopilotSession {
     }
 
     $result
+}
+
+function Start-BridgeTmuxSession {
+    <#
+        Starts a command in a new detached tmux session and opens a terminal window
+        attached to it, returning the command's process id.
+
+        tmux runs a command given as separate arguments directly, with no shell in
+        between, so the pane's process is the agent itself and nothing typed on the
+        dashboard is ever parsed by a shell. The window is opened through AppleScript:
+        Terminal by default, iTerm with `platform.terminal: iTerm`, or none with
+        `none` (the session still runs, and `tmux attach` reaches it). macOS asks once
+        whether the bridge may control that app.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Executable,
+        [AllowEmptyCollection()][string[]]$Arguments = @(),
+        [Parameter(Mandatory)][string]$WorkingDirectory,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    $tmux = Get-BridgeTmuxPath
+    if (-not $tmux) { throw 'tmux is not installed (brew install tmux); the bridge runs macOS sessions inside it' }
+    $session = "bridge-$($Name -replace '[^A-Za-z0-9_-]', '')"
+
+    $new = @('new-session', '-d', '-s', $session, '-c', $WorkingDirectory, '-x', '220', '-y', '50')
+    # The agent inherits the daemon's PATH, which the LaunchAgent sets to the one the
+    # installer saw - node, Homebrew and npm's bin included.
+    if ($env:PATH) { $new += @('-e', "PATH=$($env:PATH)") }
+    $new += '--'
+    $new += $Executable
+    $new += $Arguments
+    & $tmux @new 2>&1 | Out-Null
+    if ($LASTEXITCODE -ne 0) { throw "tmux could not start the session (exit $LASTEXITCODE)" }
+
+    $panePid = 0
+    for ($i = 0; $i -lt 20 -and $panePid -le 0; $i++) {
+        $line = & $tmux list-panes -t $session -F '#{pane_pid}' 2>$null | Select-Object -First 1
+        if ($line -match '^\d+$') { $panePid = [int]$line } else { Start-Sleep -Milliseconds 100 }
+    }
+    if ($panePid -le 0) { throw 'tmux started the session but its process could not be found' }
+
+    Open-BridgeTerminalWindow -Command "'$tmux' attach -t '$session'"
+    $panePid
+}
+
+function Open-BridgeTerminalWindow {
+    <# Opens a macOS terminal window running $Command (already shell-quoted). #>
+    param([Parameter(Mandatory)][string]$Command)
+
+    $app = [string](Get-BridgeSetting 'platform.terminal' 'Terminal')
+    if ($app -eq 'none') { return }
+    $quoted = $Command.Replace('\', '\\').Replace('"', '\"')
+    $script = if ($app -match '^iterm') {
+        "tell application `"iTerm`" to create window with default profile command `"$quoted`""
+    }
+    else {
+        "tell application `"Terminal`"`n  do script `"$quoted`"`n  activate`nend tell"
+    }
+    & osascript -e $script 2>&1 | Out-Null
 }
 
 function Stop-BridgeCopilotSession {
@@ -1478,7 +1598,7 @@ function Test-BridgeSessionRegistered {
             $processId = [int]($entry.ProcessId ?? 0)
             if ($processId -le 0) { continue }
             $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
-            if ($process -and $process.ProcessName -match "^$Launcher") { return $true }
+            if (Test-BridgeAgentProcess -Process $process -Agent $Launcher) { return $true }
         }
         return $false
     }
@@ -1486,7 +1606,7 @@ function Test-BridgeSessionRegistered {
     $directory = Join-Path $script:DecisionBridgeConfig.SessionStateRoot $SessionId
     if (-not [System.IO.Directory]::Exists($directory)) { return $false }
     $livePids = @{}
-    foreach ($process in @(Get-Process -Name 'copilot' -ErrorAction SilentlyContinue)) { $livePids[$process.Id] = $true }
+    foreach ($process in @(Get-BridgeAgentProcesses -Agent 'copilot')) { $livePids[$process.Id] = $true }
     foreach ($lock in [System.IO.Directory]::EnumerateFiles($directory, 'inuse.*.lock')) {
         $name = [System.IO.Path]::GetFileName($lock)
         if ($name -notmatch '^inuse\.(\d+)\.lock$') { continue }

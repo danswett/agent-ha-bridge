@@ -1,0 +1,14 @@
+#!/bin/sh
+# The agent-ha-bridge command on macOS: runs the PowerShell dispatcher beside it.
+# pwsh is looked for where Homebrew puts it too, since a shell's PATH may not have it.
+dir="$(cd "$(dirname "$0")" && pwd)"
+pwsh="$(command -v pwsh)"
+for candidate in /opt/homebrew/bin/pwsh /usr/local/bin/pwsh /usr/local/microsoft/powershell/7/pwsh; do
+    [ -n "$pwsh" ] && break
+    [ -x "$candidate" ] && pwsh="$candidate"
+done
+if [ -z "$pwsh" ]; then
+    echo "agent-ha-bridge needs PowerShell 7: brew install powershell" >&2
+    exit 1
+fi
+exec "$pwsh" -NoProfile -File "$dir/agent-ha-bridge.ps1" "$@"
