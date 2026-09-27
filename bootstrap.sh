@@ -22,11 +22,35 @@ if [ "$(uname -s)" != "Darwin" ]; then
 fi
 
 # Homebrew may be installed but not on this shell's PATH yet.
-for prefix in /opt/homebrew /usr/local; do
-    if ! command -v brew >/dev/null 2>&1 && [ -x "$prefix/bin/brew" ]; then
-        eval "$("$prefix/bin/brew" shellenv)"
+load_brew() {
+    for prefix in /opt/homebrew /usr/local; do
+        if ! command -v brew >/dev/null 2>&1 && [ -x "$prefix/bin/brew" ]; then
+            eval "$("$prefix/bin/brew" shellenv)"
+        fi
+    done
+}
+load_brew
+
+# Without it, offer to install it with its own official installer. That asks for the
+# Mac's password (Homebrew needs admin rights) and may install Apple's command line
+# tools first, so it talks to the terminal directly - under `curl | bash` this
+# script's stdin is the script itself.
+if ! command -v brew >/dev/null 2>&1; then
+    echo "Homebrew is not installed. It is used to install PowerShell 7 and tmux."
+    answer="n"
+    if [ -r /dev/tty ]; then
+        printf "Install Homebrew now? It will ask for your Mac password. [Y/n] "
+        read -r answer < /dev/tty || answer="n"
+        answer="${answer:-y}"
     fi
-done
+    case "$answer" in
+        [Yy]*)
+            step "Installing Homebrew"
+            /bin/bash -c "$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)" < /dev/tty
+            load_brew
+            ;;
+    esac
+fi
 if ! command -v brew >/dev/null 2>&1; then
     echo "Homebrew is needed to install PowerShell and tmux. Install it from https://brew.sh, then run this again." >&2
     exit 1
