@@ -303,6 +303,15 @@ Test-That 'the opening prompt is gone' {
     $newRows -notcontains "text.agent_bridge_${slug}_new_prompt"
 }
 Test-That 'Launch is the last thing on the card' { $newRows[-1] -eq "button.agent_bridge_${slug}_new_session" }
+Test-That 'a launch note shows under the card only when there is something to say' {
+    $note = @($script:SavedConfig.views[0].cards | Where-Object {
+        $_['type'] -eq 'conditional' -and $_['card']['type'] -eq 'markdown' -and
+        [string]$_['card']['content'] -match 'new_session_result'
+    })[0]
+    $null -ne $note -and
+    @($note['conditions'] | ForEach-Object { [string]$_['state_not'] }) -contains '' -and
+    @($note['conditions'] | ForEach-Object { [string]$_['state_not'] }) -contains 'unknown'
+}
 Test-That 'there is no agent row when there is nothing to choose between' {
     $newRows -notcontains "select.agent_bridge_${slug}_new_agent"
 }

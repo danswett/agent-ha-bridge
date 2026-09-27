@@ -64,12 +64,20 @@ try {
     # Local state first, before anything that can block. If Home Assistant is slow or
     # down, the hook still returns promptly and the daemon arms the card from this
     # marker once it can reach Home Assistant again.
+    # The marker carries a field even for a single question, so the daemon answers it
+    # by index. A multi-select question, or one with more questions than the card has
+    # dropdowns for, cannot be driven by keystroke and is left to the terminal.
+    $markerFields = @($parsed.MarkerFields)
+    $terminalOnly = [bool]$parsed.MultiSelect -or ($mode -eq 'multiple_choice' -and $markerFields.Count -eq 0)
+    $toolUseId = if ($event.PSObject.Properties['tool_use_id']) { [string]$event.tool_use_id } else { '' }
     Write-CopilotDecisionMarker -SessionId $sessionId -DecisionId $decisionId `
-        -Question $question -Choices $choices -Combos @() -Fields $fields -Mode $mode
+        -Question $question -Choices $choices -Combos @() -Fields $markerFields -Mode $mode `
+        -TerminalOnly:$terminalOnly -ToolCallId $toolUseId
 
     Write-DecisionBridgeLog -Message (
         "claude AskUserQuestion: session=$($sessionId.Substring(0,[Math]::Min(8,$sessionId.Length))) " +
-        "pid=$owningPid choices=$($choices.Count) fields=$($fields.Count) mode=$mode"
+        "pid=$owningPid choices=$($choices.Count) fields=$($fields.Count) mode=$mode " +
+        "toolUseId=$(if ($toolUseId) { 'yes' } else { 'no' }) terminalOnly=$terminalOnly"
     )
 
     # A hook must never wait on the network; the daemon reconciles whatever a miss

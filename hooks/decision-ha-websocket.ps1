@@ -214,8 +214,17 @@ function Wait-CopilotHaStateChange {
 
             if (-not $arrived) {
                 if ($OnTick) {
-                    # A fault in the tick must not end the wait or drop the socket.
-                    try { & $OnTick } catch { }
+                    # A fault in the tick must not end the wait or drop the socket. Its
+                    # output is captured, never emitted - it would otherwise come back
+                    # as part of this function's result - and a final $true asks for
+                    # the wait to end now (the daemon uses it to reconcile at once).
+                    $stop = $false
+                    try {
+                        $ticked = @(& $OnTick)
+                        if ($ticked.Count -gt 0) { $last = $ticked[-1]; $stop = ($last -is [bool] -and $last) }
+                    }
+                    catch { }
+                    if ($stop) { return $null }
                 }
                 continue
             }
@@ -1119,7 +1128,26 @@ function Save-CopilotSessionDashboard {
             show_header_toggle = $false
             entities = $rows
         }
-        if (-not $MachineSelector) { return $card }
+
+        # What the last press is waiting on, shown only while there is something to
+        # say: "press Launch again to trust this folder", a launch in progress, or a
+        # failure. A successful launch clears it, since the new session card says the
+        # rest. Without this, a press that needed a second press looked like it had
+        # done nothing at all.
+        $resultEntity = Get-BridgeMachineEntityId -Domain 'sensor' -Key 'new_session_result' -Slug $slug
+        $noteConditions = @(
+            @{ entity = $resultEntity; state_not = '' }
+            @{ entity = $resultEntity; state_not = 'unknown' }
+            @{ entity = $resultEntity; state_not = 'unavailable' }
+        )
+        if ($MachineSelector) { $noteConditions = @(@{ entity = $MachineSelector; state = $_.Machine }) + $noteConditions }
+        $note = @{
+            type = 'conditional'
+            conditions = $noteConditions
+            card = @{ type = 'markdown'; content = "{{ states('$resultEntity') }}" }
+        }
+
+        if (-not $MachineSelector) { return @($card, $note) }
 
         # Titles live on the outer card only; a conditional card with a titled child
         # would repeat the heading for whichever machine is selected.
@@ -1129,6 +1157,7 @@ function Save-CopilotSessionDashboard {
             conditions = @(@{ entity = $MachineSelector; state = $_.Machine })
             card = $card
         }
+        $note
     })
 
     if ($MachineSelector) {

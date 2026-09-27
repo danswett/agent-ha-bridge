@@ -167,6 +167,91 @@ function Get-ClaudeActivityFromTranscript {
     }
 }
 
+function Get-ClaudeAskUserState {
+    <#
+        Whether the session's most recent AskUserQuestion is still waiting for an
+        answer, from its transcript.
+
+        The same shape as Get-CopilotAskUserState, which reads Copilot's event format
+        and so never found a Claude question at all: the daemon then treated every
+        Claude question as not yet started, and neither cleared the card after a
+        terminal answer nor delivered one chosen on the dashboard. Here the pair is the
+        assistant's tool_use and the user entry carrying the tool_result with the same
+        id. ResultContent is the answer text Claude recorded
+        ('..."question"="Chosen label"...'), which carries each chosen label verbatim.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$TranscriptPath,
+
+        # The question the card was armed for, from the hook's tool_use_id. The hook
+        # fires before Claude writes the question to the transcript, so "the latest
+        # question" there is briefly the PREVIOUS one - already answered - and the new
+        # card was cleared within seconds of being armed. Naming the question avoids
+        # that entirely: it is pending until a result for this id appears.
+        [string]$ToolCallId = '',
+
+        # Without an id, only a question asked since this moment counts; until one
+        # appears the question is reported as not started, which the daemon waits on.
+        [AllowNull()]$Since = $null
+    )
+
+    $result = [pscustomobject]@{ Started = $false; Pending = $false; ToolCallId = ''; StartedAt = $null; ResultContent = '' }
+    if ([string]::IsNullOrWhiteSpace($TranscriptPath) -or -not (Test-Path -LiteralPath $TranscriptPath)) { return $result }
+
+    $length = (Get-Item -LiteralPath $TranscriptPath).Length
+    $tail = Read-ClaudeTranscriptAppend -Path $TranscriptPath -Offset ([Math]::Max(0L, $length - 2MB)) -MaxTailBytes 2MB
+
+    $latestId = ''
+    $latestAt = $null
+    $answers = @{}
+    # A little slack for the clock: the card is armed a moment before Claude stamps
+    # the question it belongs to.
+    $sinceAt = $null
+    if ($null -ne $Since -and -not [string]::IsNullOrWhiteSpace([string]$Since)) {
+        try { $sinceAt = ([DateTimeOffset]::Parse([string]$Since)).AddSeconds(-10) } catch { $sinceAt = $null }
+    }
+    foreach ($line in @($tail.Lines)) {
+        if ($line -notmatch 'AskUserQuestion|"tool_result"') { continue }
+        $entry = try { $line | ConvertFrom-Json } catch { $null }
+        # Queue and housekeeping entries can mention the tool by name but carry no
+        # message; reading one under StrictMode would throw out of the daemon's pass.
+        if ($null -eq $entry -or -not $entry.PSObject.Properties['message']) { continue }
+        foreach ($block in (Get-ClaudeContentBlocks -Message $entry.message)) {
+            if (-not $block.PSObject.Properties['type']) { continue }
+            if ([string]$block.type -eq 'tool_use' -and $block.PSObject.Properties['name'] -and
+                [string]$block.name -eq 'AskUserQuestion' -and $block.PSObject.Properties['id']) {
+                $at = if ($entry.PSObject.Properties['timestamp']) { $entry.timestamp } else { $null }
+                if ($null -ne $sinceAt) {
+                    # Too old to be the question the card is for.
+                    $when = $null
+                    if ($at -is [datetime]) { $when = [DateTimeOffset]$at.ToUniversalTime() }
+                    elseif ($null -ne $at) { try { $when = [DateTimeOffset]::Parse([string]$at) } catch { } }
+                    if ($null -eq $when -or $when -lt $sinceAt) { continue }
+                }
+                $latestId = [string]$block.id
+                $latestAt = $at
+            }
+            elseif ([string]$block.type -eq 'tool_result' -and $block.PSObject.Properties['tool_use_id']) {
+                $content = if ($block.content -is [string]) { [string]$block.content }
+                           else { (@($block.content) | ForEach-Object { [string]$_.text }) -join ' ' }
+                $answers[[string]$block.tool_use_id] = $content
+            }
+        }
+    }
+
+    # A named question exists from the moment its hook fired, whether or not it has
+    # reached the transcript yet.
+    if (-not [string]::IsNullOrWhiteSpace($ToolCallId)) { $latestId = $ToolCallId }
+
+    if ([string]::IsNullOrWhiteSpace($latestId)) { return $result }
+    $result.Started = $true
+    $result.ToolCallId = $latestId
+    $result.StartedAt = $latestAt
+    $result.Pending = -not $answers.ContainsKey($latestId)
+    if (-not $result.Pending) { $result.ResultContent = [string]$answers[$latestId] }
+    $result
+}
+
 function Read-ClaudeTranscriptAppend {
     <#
         Reads the bytes appended since the last offset.

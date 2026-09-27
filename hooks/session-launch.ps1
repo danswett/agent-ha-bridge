@@ -713,6 +713,122 @@ function Get-BridgeResumableSessions {
     @($results)
 }
 
+function Initialize-BridgeConsoleReader {
+    <#
+        Compiles a small reader for another process's console screen: attach, read the
+        visible rows, detach. Kept apart from the injector so that proven type is
+        untouched.
+    #>
+    if (([Management.Automation.PSTypeName]'CopilotCli.ConsoleReader').Type) { return }
+    Add-Type -Language CSharp -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+using System.Text;
+
+namespace CopilotCli {
+    public static class ConsoleReader {
+        [StructLayout(LayoutKind.Sequential)] private struct COORD { public short X; public short Y; }
+        [StructLayout(LayoutKind.Sequential)] private struct SMALL_RECT { public short Left; public short Top; public short Right; public short Bottom; }
+        [StructLayout(LayoutKind.Sequential)] private struct CONSOLE_SCREEN_BUFFER_INFO {
+            public COORD dwSize; public COORD dwCursorPosition; public ushort wAttributes;
+            public SMALL_RECT srWindow; public COORD dwMaximumWindowSize;
+        }
+
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern bool AttachConsole(uint dwProcessId);
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern bool FreeConsole();
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern IntPtr CreateFileW(string name, uint access, uint share, IntPtr sa, uint disposition, uint flags, IntPtr template);
+        [DllImport("kernel32.dll", SetLastError = true)] private static extern bool CloseHandle(IntPtr h);
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool GetConsoleScreenBufferInfo(IntPtr h, out CONSOLE_SCREEN_BUFFER_INFO info);
+        [DllImport("kernel32.dll", SetLastError = true, CharSet = CharSet.Unicode)]
+        private static extern bool ReadConsoleOutputCharacterW(IntPtr h, [Out] char[] buffer, uint length, COORD at, out uint read);
+
+        // The visible rows of the process's console, one line each, or null when it
+        // cannot be read.
+        public static string ReadScreen(uint processId) {
+            FreeConsole();
+            if (!AttachConsole(processId)) { return null; }
+            IntPtr h = IntPtr.Zero;
+            try {
+                h = CreateFileW("CONOUT$", 0x80000000 | 0x40000000, 1 | 2, IntPtr.Zero, 3, 0, IntPtr.Zero);
+                if (h == new IntPtr(-1)) { return null; }
+                CONSOLE_SCREEN_BUFFER_INFO info;
+                if (!GetConsoleScreenBufferInfo(h, out info)) { return null; }
+                int width = info.dwSize.X;
+                char[] row = new char[width];
+                StringBuilder text = new StringBuilder();
+                for (short y = info.srWindow.Top; y <= info.srWindow.Bottom; y++) {
+                    uint read;
+                    COORD at = new COORD { X = 0, Y = y };
+                    if (ReadConsoleOutputCharacterW(h, row, (uint)width, at, out read)) {
+                        text.Append(new string(row, 0, (int)read).TrimEnd()).Append('\n');
+                    }
+                }
+                return text.ToString();
+            }
+            finally {
+                if (h != IntPtr.Zero && h != new IntPtr(-1)) { CloseHandle(h); }
+                FreeConsole();
+            }
+        }
+    }
+}
+'@
+}
+
+function Get-BridgeTrustPromptSelection {
+    <#
+        Reads Claude's "Do you trust this folder?" question off a console screen.
+        Returns 'yes' or 'no' for the highlighted option, or '' when the question is not
+        on screen. Pure, so it can be tested against captured screens.
+    #>
+    param([AllowEmptyString()][AllowNull()][string]$Screen)
+
+    if ([string]::IsNullOrWhiteSpace($Screen) -or $Screen -notmatch 'Yes, I trust this folder') { return '' }
+    foreach ($line in ($Screen -split "`n")) {
+        if ($line -match '^\s*[>❯›]\s*Yes, I trust this folder') { return 'yes' }
+        if ($line -match '^\s*[>❯›]\s*No, exit') { return 'no' }
+    }
+    ''
+}
+
+function Read-BridgeTrustPrompt {
+    <#
+        Looks at a Claude session's screen for its "Do you trust this folder?" question.
+        Returns 'yes' or 'no' for the highlighted option, or '' when the question is not
+        showing. Whether Claude will ask cannot be predicted reliably from its config -
+        it has honoured entries its own code path would not suggest - so the bridge
+        reads what is actually on screen.
+    #>
+    param([Parameter(Mandatory)][int]$ProcessId)
+
+    try {
+        Initialize-BridgeConsoleReader
+        Get-BridgeTrustPromptSelection -Screen ([CopilotCli.ConsoleReader]::ReadScreen([uint32]$ProcessId))
+    }
+    catch { '' }
+}
+
+function Send-BridgeTrustAnswer {
+    <#
+        Answers Claude's trust question with "Yes, I trust this folder", given which
+        option is highlighted now. Only called after the user explicitly confirmed.
+
+        Never blind: the option list wraps, so one Down too many lands back on
+        "No, exit" and closes the session (verified). From "No" it is Down then Enter;
+        from "Yes" it is Enter alone.
+    #>
+    param(
+        [Parameter(Mandatory)][int]$ProcessId,
+        [Parameter(Mandatory)][ValidateSet('yes', 'no')][string]$Selection
+    )
+
+    Initialize-CopilotConsoleInjector
+    $keys = if ($Selection -eq 'yes') { '' } else { "$([char]27)[B" }
+    [string][CopilotCli.ConsoleInjector]::Send([uint32]$ProcessId, $keys, $true, 200)
+}
+
 function Start-BridgeCopilotSession {
     <#
         Starts a new agent session in its own visible console window, with the chosen
@@ -881,27 +997,20 @@ function Stop-BridgeCopilotSession {
     $result
 }
 
-function Wait-BridgeSessionRegistered {
+function Test-BridgeSessionRegistered {
     <#
-        Waits for the CLI to register the session it was told to create or resume.
+        One look at whether a launched session has registered - no waiting, so the
+        daemon can call it on every pass without stalling.
 
-        The session directory and its `inuse.<pid>.lock` are what the daemon
-        discovers sessions from, so their appearance is the real confirmation that
-        the launch worked - a process id alone only proves something started, not
-        that it got far enough to be a session. Used to report an honest result on
-        the dashboard rather than an optimistic one.
-
-        The lock's pid has to be checked against the live process list rather than
-        taken at face value. A resumed session's directory usually still holds the
-        lock from the run that created it, so simply looking for the file would
-        report instant success for a resume that in fact never started.
+        The session directory and its `inuse.<pid>.lock` are what the daemon discovers
+        Copilot sessions from; Claude and Codex register through their hooks under
+        %TEMP% instead, recording the owning pid. Either way the pid is checked against
+        the running processes: a resumed session's directory usually still holds the
+        lock from the run that created it, so the file alone would report success for a
+        resume that never started.
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$SessionId,
-        [int]$TimeoutSeconds = 25,
-
-        # Claude and Codex have no lock file; their hooks write a registration under
-        # %TEMP% instead, recording the owning pid, and that is waited for.
         [string]$Launcher = 'copilot',
 
         # Codex chooses its own session id, so its registration is recognised as the
@@ -909,50 +1018,56 @@ function Wait-BridgeSessionRegistered {
         [DateTimeOffset]$Since = [DateTimeOffset]::Now.AddMinutes(-1)
     )
 
-    $deadline = [DateTimeOffset]::Now.AddSeconds($TimeoutSeconds)
-
     if ($Launcher -in @('claude', 'codex')) {
         $stateDir = Join-Path $env:TEMP "agent-bridge-$Launcher"
-        while ([DateTimeOffset]::Now -lt $deadline) {
-            if ([System.IO.Directory]::Exists($stateDir)) {
-                $files = if ($Launcher -eq 'claude') {
-                    @(Join-Path $stateDir "$SessionId.json" | Where-Object { [System.IO.File]::Exists($_) } | Get-Item)
-                }
-                else {
-                    @(Get-ChildItem -LiteralPath $stateDir -Filter '*.json' -File -ErrorAction SilentlyContinue |
-                        Where-Object { $_.Name -notlike '*.approval.json' -and $_.LastWriteTime -ge $Since.LocalDateTime })
-                }
-                foreach ($file in $files) {
-                    try { $entry = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json } catch { continue }
-                    $processId = [int]($entry.ProcessId ?? 0)
-                    if ($processId -le 0) { continue }
-                    $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
-                    if ($process -and $process.ProcessName -match "^$Launcher") { return $true }
-                }
-            }
-            Start-Sleep -Milliseconds 500
+        if (-not [System.IO.Directory]::Exists($stateDir)) { return $false }
+        $files = if ($Launcher -eq 'claude') {
+            @(Join-Path $stateDir "$SessionId.json" | Where-Object { [System.IO.File]::Exists($_) } | Get-Item)
+        }
+        else {
+            @(Get-ChildItem -LiteralPath $stateDir -Filter '*.json' -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -notlike '*.approval.json' -and $_.LastWriteTime -ge $Since.LocalDateTime })
+        }
+        foreach ($file in $files) {
+            try { $entry = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json } catch { continue }
+            $processId = [int]($entry.ProcessId ?? 0)
+            if ($processId -le 0) { continue }
+            $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
+            if ($process -and $process.ProcessName -match "^$Launcher") { return $true }
         }
         return $false
     }
 
     $directory = Join-Path $script:DecisionBridgeConfig.SessionStateRoot $SessionId
+    if (-not [System.IO.Directory]::Exists($directory)) { return $false }
+    $livePids = @{}
+    foreach ($process in @(Get-Process -Name 'copilot' -ErrorAction SilentlyContinue)) { $livePids[$process.Id] = $true }
+    foreach ($lock in [System.IO.Directory]::EnumerateFiles($directory, 'inuse.*.lock')) {
+        $name = [System.IO.Path]::GetFileName($lock)
+        if ($name -notmatch '^inuse\.(\d+)\.lock$') { continue }
+        if ($livePids.ContainsKey([int]$Matches[1])) { return $true }
+    }
+    $false
+}
 
+function Wait-BridgeSessionRegistered {
+    <#
+        Waits up to TimeoutSeconds for Test-BridgeSessionRegistered. The daemon no
+        longer waits on a launch - it checks once per pass - but this remains for
+        callers that genuinely want to block.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$SessionId,
+        [int]$TimeoutSeconds = 25,
+        [string]$Launcher = 'copilot',
+        [DateTimeOffset]$Since = [DateTimeOffset]::Now.AddMinutes(-1)
+    )
+
+    $deadline = [DateTimeOffset]::Now.AddSeconds($TimeoutSeconds)
     while ([DateTimeOffset]::Now -lt $deadline) {
-        if ([System.IO.Directory]::Exists($directory)) {
-            $livePids = @{}
-            foreach ($process in @(Get-Process -Name 'copilot' -ErrorAction SilentlyContinue)) {
-                $livePids[$process.Id] = $true
-            }
-
-            foreach ($lock in [System.IO.Directory]::EnumerateFiles($directory, 'inuse.*.lock')) {
-                $name = [System.IO.Path]::GetFileName($lock)
-                if ($name -notmatch '^inuse\.(\d+)\.lock$') { continue }
-                if ($livePids.ContainsKey([int]$Matches[1])) { return $true }
-            }
-        }
+        if (Test-BridgeSessionRegistered -SessionId $SessionId -Launcher $Launcher -Since $Since) { return $true }
         Start-Sleep -Milliseconds 500
     }
-
     $false
 }
 

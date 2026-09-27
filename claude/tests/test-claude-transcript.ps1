@@ -196,6 +196,43 @@ $newTurn = Get-ClaudeActivityFromTranscript -Lines @(
 )
 Test-That 'a new message clears the newest line' { $null -eq $newTurn.Latest }
 
+Write-Host ''
+Write-Host '--- is a question still waiting? ---'
+
+# The daemon used Copilot's reader here, which never found a Claude question, so a
+# Claude card stayed armed forever and a dashboard answer was never delivered.
+$qFile = Join-Path ([IO.Path]::GetTempPath()) "ask-$([guid]::NewGuid().ToString('N').Substring(0,8)).jsonl"
+Set-Content -LiteralPath $qFile -Value @(
+    (New-Line 'assistant' @(@{ type = 'tool_use'; id = 'ask1'; name = 'AskUserQuestion'; input = @{ questions = @() } }))
+    '{"type":"queue-operation","operation":"enqueue","content":"mentions AskUserQuestion but has no message"}'
+)
+$q = Get-ClaudeAskUserState -TranscriptPath $qFile
+Test-That 'an unanswered question is started and pending' { $q.Started -and $q.Pending -and $q.ToolCallId -eq 'ask1' }
+Test-That 'an entry with no message does not throw' { $q.Started }
+
+Add-Content -LiteralPath $qFile -Value (New-Line 'user' @(@{ type = 'tool_result'; tool_use_id = 'ask1'; content = 'Your questions have been answered: "Which?"="SQLite".' }))
+$q = Get-ClaudeAskUserState -TranscriptPath $qFile
+Test-That 'its answer ends the wait' { $q.Started -and -not $q.Pending }
+Test-That 'and carries the chosen label for the mismatch check' { $q.ResultContent -like '*"SQLite"*' }
+
+Add-Content -LiteralPath $qFile -Value (New-Line 'assistant' @(@{ type = 'tool_use'; id = 'ask2'; name = 'AskUserQuestion'; input = @{ questions = @() } }))
+$q = Get-ClaudeAskUserState -TranscriptPath $qFile
+Test-That 'a later question is the one that counts' { $q.ToolCallId -eq 'ask2' -and $q.Pending }
+Test-That 'a missing transcript is simply not started' { -not (Get-ClaudeAskUserState -TranscriptPath 'C:\nope\none.jsonl').Started }
+
+# The hook fires before Claude writes the new question, so for a moment the latest
+# question in the transcript is the previous, answered one. Judging the card by it
+# cleared a brand-new card within seconds. A card judges its own question.
+Add-Content -LiteralPath $qFile -Value (New-Line 'user' @(@{ type = 'tool_result'; tool_use_id = 'ask2'; content = 'answered' }))
+$q = Get-ClaudeAskUserState -TranscriptPath $qFile -ToolCallId 'ask3-not-written-yet'
+Test-That 'a named question not yet in the transcript is pending, not answered' { $q.Started -and $q.Pending -and $q.ToolCallId -eq 'ask3-not-written-yet' }
+$q = Get-ClaudeAskUserState -TranscriptPath $qFile -Since ([DateTimeOffset]::Now.AddMinutes(5).ToString('o'))
+Test-That 'without an id, an older answered question does not count' { -not $q.Started }
+Add-Content -LiteralPath $qFile -Value (New-Line 'user' @(@{ type = 'tool_result'; tool_use_id = 'ask3-not-written-yet'; content = '"Q"="Banana"' }))
+$q = Get-ClaudeAskUserState -TranscriptPath $qFile -ToolCallId 'ask3-not-written-yet'
+Test-That 'and it is answered once its own result appears' { -not $q.Pending -and $q.ResultContent -like '*Banana*' }
+Remove-Item -LiteralPath $qFile -Force -ErrorAction SilentlyContinue
+
 $toolResult = New-Line 'user' @(@{ type = 'tool_result'; tool_use_id = 'x'; content = 'ok' })
 Test-That 'a tool result is not a new turn' {
     -not (Get-ClaudeActivityFromTranscript -Lines @($endOfTurn + $toolResult)).TurnStarted

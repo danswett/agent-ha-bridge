@@ -52,11 +52,19 @@ function ConvertFrom-ClaudeAskUserQuestion {
 
     if ($questions.Count -eq 0) {
         return [pscustomobject]@{
-            Question = 'Claude needs an answer.'
-            Choices  = @()
-            Fields   = @()
+            Question     = 'Claude needs an answer.'
+            Choices      = @()
+            Fields       = @()
+            MarkerFields = @()
+            MultiSelect  = $false
         }
     }
+
+    # Option descriptions carry real decision content, but folded into the option
+    # text they made the dropdown unreadable ("label - description" cut off after a
+    # few words), and the recorded answer - which is the bare label - never matched
+    # what was sent. They are listed under the question instead.
+    $notes = [System.Collections.Generic.List[string]]::new()
 
     $fields = foreach ($question in $questions) {
         $labels = @()
@@ -64,12 +72,10 @@ function ConvertFrom-ClaudeAskUserQuestion {
             $labels = @(
                 foreach ($option in @($question.options)) {
                     $label = if ($option -is [string]) { $option } else { [string]$option.label }
-                    # A description carries real decision content, so it is folded into
-                    # the label rather than dropped - the dashboard shows labels only.
                     if ($option -isnot [string] -and
                         $option.PSObject.Properties.Name -contains 'description' -and
                         $option.description) {
-                        $label = "$label - $($option.description)"
+                        $notes.Add("- **$label** - $([string]$option.description)")
                     }
                     if ($label.Length -gt $script:ClaudeMaxChoiceLength) {
                         $label = $label.Substring(0, $script:ClaudeMaxChoiceLength - 3) + '...'
@@ -96,20 +102,30 @@ function ConvertFrom-ClaudeAskUserQuestion {
 
     $fields = @($fields)
     $prompt = ($fields | ForEach-Object { $_.Title }) -join ' / '
+    $described = if ($notes.Count -gt 0) { "`n`n" + ($notes -join "`n") } else { '' }
+    # A multi-select question is toggled option by option and then submitted, which
+    # the bridge cannot drive reliably by keystroke; it is answered in the terminal.
+    $multiSelect = @($fields | Where-Object { $_.MultiSelect }).Count -gt 0
 
     if ($fields.Count -eq 1) {
         return [pscustomobject]@{
-            Question = Limit-ClaudeText -Text $fields[0].Title
-            Choices  = $fields[0].Options
-            Fields   = @()
+            Question     = Limit-ClaudeText -Text ($fields[0].Title + $described)
+            Choices      = $fields[0].Options
+            Fields       = @()
+            # The daemon drives the answer by index through its field, so the marker
+            # carries it even though the card shows a single plain dropdown.
+            MarkerFields = @($fields[0])
+            MultiSelect  = $multiSelect
         }
     }
 
     if ($fields.Count -le $script:ClaudeMaxFields) {
         return [pscustomobject]@{
-            Question = Limit-ClaudeText -Text $prompt
-            Choices  = @()
-            Fields   = $fields
+            Question     = Limit-ClaudeText -Text ($prompt + $described)
+            Choices      = @()
+            Fields       = $fields
+            MarkerFields = $fields
+            MultiSelect  = $multiSelect
         }
     }
 
@@ -121,9 +137,11 @@ function ConvertFrom-ClaudeAskUserQuestion {
     }
 
     [pscustomobject]@{
-        Question = Limit-ClaudeText -Text (($prompt, ($outline -join "`n")) -join "`n`n")
-        Choices  = @()
-        Fields   = @()
+        Question     = Limit-ClaudeText -Text (($prompt, ($outline -join "`n")) -join "`n`n")
+        Choices      = @()
+        Fields       = @()
+        MarkerFields = @()
+        MultiSelect  = $multiSelect
     }
 }
 

@@ -536,7 +536,11 @@ function Send-CopilotSessionForm {
         [AllowEmptyString()]
         [string[]]$Selections,
 
-        [int]$StepDelayMs = 120
+        [int]$StepDelayMs = 120,
+
+        # Explicit target process, for front ends with no inuse.<pid>.lock (Claude,
+        # Codex). Without it the form could only ever reach a Copilot session.
+        [int]$ProcessId = 0
     )
 
     $result = [pscustomobject]@{ Delivered = $false; ProcessId = $null; Detail = '' }
@@ -567,7 +571,7 @@ function Send-CopilotSessionForm {
     }
     $result.Detail = ($trace -join ' ; ')
 
-    $processId = Get-CopilotSessionProcessId -SessionId $SessionId
+    $processId = if ($ProcessId -gt 0) { $ProcessId } else { Get-CopilotSessionProcessId -SessionId $SessionId }
     if ($null -eq $processId) {
         $result.Detail = 'no live process for session'
         return $result
@@ -636,7 +640,10 @@ function Send-CopilotSessionChoice {
         [Parameter(Mandatory)]
         [int]$ChoiceCount,
 
-        [int]$StepDelayMs = 120
+        [int]$StepDelayMs = 120,
+
+        # Explicit target process, as for Send-CopilotSessionForm.
+        [int]$ProcessId = 0
     )
 
     $result = [pscustomobject]@{
@@ -650,7 +657,7 @@ function Send-CopilotSessionChoice {
         return $result
     }
 
-    $processId = Get-CopilotSessionProcessId -SessionId $SessionId
+    $processId = if ($ProcessId -gt 0) { $ProcessId } else { Get-CopilotSessionProcessId -SessionId $SessionId }
     if ($null -eq $processId) {
         $result.Detail = 'no live process for session'
         return $result

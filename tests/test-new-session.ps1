@@ -308,6 +308,18 @@ Test-That 'allowAllTools maps to never asking codex for approval' {
 Test-That 'the codex prompt is positional, after --' { $cx[-2] -eq '--' -and $cx[-1] -eq 'do it' }
 
 Write-Host ''
+Write-Host '--- reading the trust question off the screen ---'
+
+# Keys are only sent once the question is on screen, and only what the highlight
+# needs: the option list wraps, so one Down too many lands back on "No, exit".
+$noScreen = "Quick safety check: Is this a project you created or one you trust?`n`n > No, exit`n   Yes, I trust this folder`n`nEnter to confirm"
+$yesScreen = "Quick safety check`n   No, exit`n > Yes, I trust this folder`n"
+Test-That 'the default highlight is No' { (Get-BridgeTrustPromptSelection -Screen $noScreen) -eq 'no' }
+Test-That 'a moved highlight reads Yes' { (Get-BridgeTrustPromptSelection -Screen $yesScreen) -eq 'yes' }
+Test-That 'no question on screen reads as nothing' { (Get-BridgeTrustPromptSelection -Screen "Welcome to Claude Code`n> ") -eq '' }
+Test-That 'an unreadable screen reads as nothing' { (Get-BridgeTrustPromptSelection -Screen $null) -eq '' }
+
+Write-Host ''
 Write-Host '--- profile validation ---'
 
 $script:FakeSettings = @{ 'newSession.profiles' = @('work', 'home', 'local') }
@@ -530,9 +542,16 @@ function Start-BridgeCopilotSession {
         SessionId = $SessionId; Resumed = $Resume.IsPresent; Launcher = $Launcher
     }
     $id = if ($SessionId) { $SessionId } else { '11111111-2222-3333-4444-555555555555' }
-    [pscustomobject]@{ Launched = $true; SessionId = $id; ProcessId = 4242; Launcher = 'agency'; Detail = 'started pid 4242' }
+    # This process stands in for the launched one, so it counts as running.
+    [pscustomobject]@{ Launched = $true; SessionId = $id; ProcessId = $PID; Launcher = 'agency'; Detail = "started pid $PID" }
 }
-function Wait-BridgeSessionRegistered { param([string]$SessionId, [int]$TimeoutSeconds = 25, [string]$Launcher = 'copilot', [DateTimeOffset]$Since) $true }
+# What the launched session is doing: registered yet, and what its screen shows.
+$script:FakeRegistered = $false
+$script:FakeTrustScreen = ''
+$script:TrustAnswers = @()
+function Test-BridgeSessionRegistered { param([string]$SessionId, [string]$Launcher, [DateTimeOffset]$Since) $script:FakeRegistered }
+function Read-BridgeTrustPrompt { param([int]$ProcessId) $script:FakeTrustScreen }
+function Send-BridgeTrustAnswer { param([int]$ProcessId, [string]$Selection) $script:TrustAnswers += $Selection; 'ok:2' }
 function Invoke-HomeAssistantService {
     param([string]$Domain, [string]$Service, [hashtable]$Data, [hashtable]$Headers)
     $script:Cleared += "$Domain.$Service"
@@ -584,7 +603,15 @@ Test-That 'a fresh press launches a session' { $script:Launches.Count -eq 1 }
 Test-That 'it launches in the selected workspace' { $script:Launches[0].Directory -eq $alpha }
 Test-That 'it passes the typed prompt' { $script:Launches[0].Prompt -eq 'do the thing' }
 Test-That 'it passes the selected profile' { $script:Launches[0].AgencyProfile -eq 'work' }
-Test-That 'it reports the result' { ($script:Results -join ' ') -match 'Started' }
+Test-That 'it reports the launch while it runs' { ($script:Results -join ' ') -match 'Starting' }
+# The session's own card is the confirmation; the note is cleared so the card shows
+# it only when there is something to say. Registration is checked on a later pass.
+$script:FakeRegistered = $true
+$script:DaemonPendingLaunch.LastCheck = [DateTimeOffset]::MinValue
+Update-DaemonPendingLaunch -Headers $headers
+Test-That 'and clears the note once the session registers' { $script:Results[-1] -eq '' }
+$script:FakeRegistered = $false
+$script:DaemonReconcileNow = $false
 Test-That 'the result names the profile' { ($script:Results -join ' ') -match 'work' }
 Test-That 'it clears the prompt box afterwards' { $script:Cleared -contains 'text.set_value' }
 
@@ -766,6 +793,78 @@ Reset-NewSessionTest -Press '2026-06-01T12:32:00+00:00' -AgentState 'Codex'
 Sync-DaemonNewSession -Headers $headers -Live $noLive
 Test-That 'an agent that is not installed refuses to launch' { $script:Launches.Count -eq 0 }
 Test-That 'and says which agent' { ($script:Results -join ' ') -match "Unknown agent 'Codex'" }
+
+Write-Host ''
+Write-Host '--- following a launch, and Claude asking to trust its folder ---'
+
+# The daemon used to wait up to 25 s on every launch, and longer for a trust answer,
+# stalling replies and streaming. It now follows the launch a pass at a time.
+function Invoke-FollowUp { $script:DaemonPendingLaunch.LastCheck = [DateTimeOffset]::MinValue; Update-DaemonPendingLaunch -Headers $headers }
+
+$script:DaemonPendingLaunch = $null
+$script:FakeRegistered = $false
+$script:FakeTrustScreen = ''
+$script:TrustAnswers = @()
+Reset-NewSessionTest -Press '2026-06-01T12:40:00+00:00' -AgentState 'Claude'
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+Test-That 'a press starts Claude straight away' { $script:Launches.Count -eq 1 -and $script:Launches[0].Launcher -eq 'claude' }
+Test-That 'and returns without waiting for it' { $null -ne $script:DaemonPendingLaunch -and ($script:Results -join ' ') -match 'Starting Claude' }
+
+$script:Results = @()
+$script:FakeTrustScreen = 'no'
+Invoke-FollowUp
+Test-That 'when Claude asks to trust the folder, the note asks for a second press' {
+    ($script:Results -join ' ') -match 'asking whether to trust .* Press Launch again'
+}
+Test-That 'and nothing is answered on the first press alone' { $script:TrustAnswers.Count -eq 0 }
+
+Invoke-FollowUp
+Test-That 'the question is announced once, not on every pass' { @($script:Results | Where-Object { $_ -match 'asking' }).Count -eq 1 }
+
+Reset-NewSessionTest -Press '2026-06-01T12:40:20+00:00' -AgentState 'Claude'
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+Test-That 'a second press confirms instead of starting another session' { $script:Launches.Count -eq 0 -and $script:DaemonPendingLaunch.TrustConfirmed }
+Test-That 'and answers from the highlighted option' { ($script:TrustAnswers -join ',') -eq 'no' }
+
+$script:FakeTrustScreen = ''
+$script:FakeRegistered = $true
+$script:Results = @()
+$script:DaemonReconcileNow = $false
+Invoke-FollowUp
+Test-That 'once it registers the follow-up ends' { $null -eq $script:DaemonPendingLaunch }
+Test-That 'the note clears, since its card says the rest' { $script:Results[-1] -eq '' }
+Test-That 'and a reconcile is asked for at once' { $script:DaemonReconcileNow }
+$script:DaemonReconcileNow = $false
+
+# A question nobody confirms is left for the window, not answered.
+$script:DaemonPendingLaunch = [pscustomobject]@{ SessionId = 's'; ProcessId = $PID; Launcher = 'claude'; Label = 'alpha'; Verb = 'Started'
+    Since = [DateTimeOffset]::Now.AddMinutes(-3); LastCheck = [DateTimeOffset]::MinValue
+    TrustAskedAt = [DateTimeOffset]::Now.AddMinutes(-3); TrustConfirmed = $false; TrustAnswers = 0 }
+$script:FakeRegistered = $false
+$script:FakeTrustScreen = 'no'
+$script:TrustAnswers = @()
+$script:Results = @()
+Invoke-FollowUp
+Test-That 'an unconfirmed question expires after two minutes' { $null -eq $script:DaemonPendingLaunch -and ($script:Results -join ' ') -match 'answer it in its window' }
+Test-That 'without being answered' { $script:TrustAnswers.Count -eq 0 }
+
+Reset-NewSessionTest -Press '2026-06-01T12:41:00+00:00' -AgentState 'Claude'
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+Test-That 'so a later press starts a new session again' { $script:Launches.Count -eq 1 }
+
+$script:DaemonPendingLaunch.ProcessId = 999999
+$script:FakeTrustScreen = ''
+$script:Results = @()
+Invoke-FollowUp
+Test-That 'a session that closes before registering is reported' { $null -eq $script:DaemonPendingLaunch -and ($script:Results -join ' ') -match 'closed before it started' }
+
+$script:DaemonPendingLaunch = [pscustomobject]@{ SessionId = 's'; ProcessId = $PID; Launcher = 'claude'; Label = 'alpha'; Verb = 'Started'
+    Since = [DateTimeOffset]::Now; LastCheck = [DateTimeOffset]::Now; TrustAskedAt = $null; TrustConfirmed = $false; TrustAnswers = 0 }
+$script:FakeRegistered = $true
+Update-DaemonPendingLaunch -Headers $headers
+Test-That 'follow-ups are spaced out, not run on every 100 ms tick' { $null -ne $script:DaemonPendingLaunch }
+$script:DaemonPendingLaunch = $null
+$script:FakeRegistered = $false
 
 Set-AgencySessions -Sessions @(
     @{ session_id = 'f0f0f0f0-1111-2222-3333-444444444444'; summary = 'Earlier work'; folder = $beta; can_resume = $true; updated_at = '2026-09-23T10:00:00Z' }

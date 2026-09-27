@@ -134,6 +134,12 @@ $script:DaemonLive = @{}
 $script:DaemonVerbose = $false
 $script:DaemonRegistrationStamps = @{}
 
+# The session the last Launch press started, followed until it registers (see
+# Update-DaemonPendingLaunch), and a request for a reconcile now rather than at the
+# end of the interval, so a newly registered session's card appears straight away.
+$script:DaemonPendingLaunch = $null
+$script:DaemonReconcileNow = $false
+
 # Sessions whose reply-payload sensor has been checked this run, so the probe costs
 # one Home Assistant read per session rather than one per reconcile.
 $script:DaemonPayloadSensorChecked = @{}
@@ -505,8 +511,12 @@ function Get-LiveClaudeSessions {
     $live = @{}
     foreach ($registration in @(Get-ClaudeSessionRegistrations)) {
         if (-not $registration.IsLive) { continue }
-        $transcript = $registration.TranscriptPath
-        if (-not $transcript -or -not (Test-Path -LiteralPath $transcript)) { continue }
+        # Claude creates the transcript only when the first message is sent, so a
+        # session just started - from the dashboard, typically - has none yet. It is
+        # live all the same, and requiring the file hid it until someone typed in it.
+        # Everything that reads the transcript treats a missing file as no activity.
+        $transcript = [string]$registration.TranscriptPath
+        if ([string]::IsNullOrWhiteSpace($transcript)) { continue }
 
         $live[$registration.SessionId] = [pscustomobject]@{
             SessionId        = $registration.SessionId
@@ -1182,7 +1192,7 @@ function Invoke-PendingReplies {
             # at all. The transcript settles it.
             $stale = $false
             try {
-                $askState = Get-CopilotAskUserState -TranscriptPath $session.Transcript
+                $askState = Get-DaemonAskUserState -Session $session
                 $stale = (-not $askState.Pending)
             }
             catch { }
@@ -1523,7 +1533,7 @@ function Invoke-PendingDecisions {
 
         $session = $Live[$sessionId]
         $node = Get-CopilotMqttNodeId -SessionId $sessionId
-        $askState = Get-CopilotAskUserState -TranscriptPath $session.Transcript
+        $askState = Get-DaemonAskUserState -Session $session -Marker $marker
 
         # The hook writes the marker just before the tool runs, so the start event may
         # not be in the transcript yet. Wait a cycle rather than acting on a stale one.
@@ -1554,7 +1564,8 @@ function Invoke-PendingDecisions {
                     # the keystrokes that caused the problem did not.
                     try {
                         $correction = Get-DaemonAnswerCorrection -Fields @($marker.fields) -Selections $injected
-                        $fix = Send-CopilotSessionPrompt -SessionId $sessionId -Text $correction
+                        $fix = Send-CopilotSessionPrompt -SessionId $sessionId -Text $correction `
+                            -ProcessId (Get-DaemonSessionProcessId -SessionId $sessionId)
                         if ($fix.Delivered) {
                             Write-DaemonLog -Message "sent a correction to $($sessionId.Substring(0,8)) with what was actually chosen"
                         }
@@ -1768,12 +1779,102 @@ function Invoke-PendingDecisions {
 
         # Re-verify the ask_user is still pending right before injecting, so a terminal
         # answer that landed in the last second is never double-answered.
-        $recheck = Get-CopilotAskUserState -TranscriptPath $session.Transcript
+        $recheck = Get-DaemonAskUserState -Session $session -Marker $marker
         if (-not $recheck.Pending) { continue }
 
         [void](Invoke-DaemonDecisionAnswer -SessionId $sessionId -Marker $marker `
             -Answer $answer -IsChoice $isChoice -Selections $selections -Headers $Headers)
     }
+}
+
+function Get-DaemonAskUserState {
+    <#
+        Whether a session's question is still waiting, from its transcript, in the
+        format its agent writes. Copilot's reader cannot see a Claude question at all,
+        which left every Claude card armed forever and its dropdown doing nothing.
+    #>
+    param(
+        [Parameter(Mandatory)]$Session,
+
+        # The pending-decision marker, when there is one: it names the question the
+        # card is for, so a Claude card is judged by its own question's answer rather
+        # than by whichever question the transcript happens to show last.
+        [AllowNull()]$Marker = $null
+    )
+
+    $kind = if ($Session.PSObject.Properties['Kind'] -and $Session.Kind) { [string]$Session.Kind } else { 'copilot' }
+    if ($kind -eq 'claude' -and $script:ClaudeAdapterLoaded) {
+        $toolCallId = ''
+        $since = $null
+        if ($null -ne $Marker) {
+            if ($Marker.PSObject.Properties['toolCallId']) { $toolCallId = [string]$Marker.toolCallId }
+            if ($Marker.PSObject.Properties['armedAt']) { $since = [string]$Marker.armedAt }
+        }
+        return Get-ClaudeAskUserState -TranscriptPath ([string]$Session.Transcript) -ToolCallId $toolCallId -Since $since
+    }
+    Get-CopilotAskUserState -TranscriptPath ([string]$Session.Transcript)
+}
+
+function Get-DaemonSessionProcessId {
+    <#
+        The owning process of a Claude or Codex session, from the live set, or 0 for a
+        Copilot session, which the injector finds by its lock file.
+    #>
+    param([Parameter(Mandatory)][string]$SessionId)
+
+    $known = if ($script:DaemonLive) { $script:DaemonLive[$SessionId] } else { $null }
+    if ($null -ne $known -and $known.PSObject.Properties['Kind'] -and [string]$known.Kind -in @('claude', 'codex') -and
+        $known.PSObject.Properties['ProcessId'] -and [int]$known.ProcessId -gt 0) {
+        return [int]$known.ProcessId
+    }
+    0
+}
+
+function Complete-DaemonClaudeAnswer {
+    <#
+        Makes sure an answer driven into a Claude question was submitted.
+
+        The option is chosen by arrow keys and Enter, but Claude can finish on a review
+        screen that needs one more Enter. If the question is still pending once the keys
+        have had time to land, Enter is pressed once, and the result is reported as
+        delivered only when the transcript shows the question answered. Other agents
+        are returned unchanged.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)]$Delivery,
+        [AllowNull()]$Marker = $null,
+        [int]$WaitMs = 1500
+    )
+
+    $session = if ($script:DaemonLive) { $script:DaemonLive[$SessionId] } else { $null }
+    if ($null -eq $session -or -not $session.PSObject.Properties['Kind'] -or [string]$session.Kind -ne 'claude') { return $Delivery }
+
+    $answered = {
+        $deadline = [DateTimeOffset]::Now.AddMilliseconds($WaitMs)
+        while ([DateTimeOffset]::Now -lt $deadline) {
+            if (-not (Get-DaemonAskUserState -Session $session -Marker $Marker).Pending) { return $true }
+            Start-Sleep -Milliseconds 150
+        }
+        $false
+    }
+
+    if (& $answered) { return $Delivery }
+
+    try {
+        Initialize-CopilotConsoleInjector
+        [void][CopilotCli.ConsoleInjector]::Send([uint32]$Delivery.ProcessId, '', $true, 0)
+    }
+    catch { }
+
+    if (& $answered) {
+        $Delivery.Detail = "$($Delivery.Detail); submitted with an extra Enter"
+        return $Delivery
+    }
+
+    $Delivery.Delivered = $false
+    $Delivery.Detail = "keys sent but the question is still waiting ($($Delivery.Detail))"
+    $Delivery
 }
 
 function Invoke-DaemonDecisionAnswer {
@@ -1794,6 +1895,8 @@ function Invoke-DaemonDecisionAnswer {
 
     $short = $SessionId.Substring(0, [Math]::Min(8, $SessionId.Length))
     $node = Get-CopilotMqttNodeId -SessionId $SessionId
+    # Claude and Codex leave no lock file for the injector to find their process by.
+    $processId = Get-DaemonSessionProcessId -SessionId $SessionId
 
     if ($IsChoice) {
         # The native prompt is one arrow-key option list per field (tabbed when there
@@ -1809,18 +1912,24 @@ function Invoke-DaemonDecisionAnswer {
 
         $delivery = $null
         if ($fields.Count -gt 0 -and $sel.Count -eq $fields.Count) {
-            $delivery = Send-CopilotSessionForm -SessionId $SessionId -Fields $fields -Selections $sel
+            $delivery = Send-CopilotSessionForm -SessionId $SessionId -Fields $fields -Selections $sel -ProcessId $processId
         }
         if ($null -eq $delivery -or -not $delivery.Delivered) {
             if ($null -ne $delivery) {
                 Write-DaemonLog -Message "form injection unavailable for $short ($($delivery.Detail)); falling back to text"
             }
             $delivery = Send-CopilotSessionChoice -SessionId $SessionId -Text $Answer `
-                -ChoiceCount (@($Marker.choices).Count)
+                -ChoiceCount (@($Marker.choices).Count) -ProcessId $processId
         }
     }
     else {
-        $delivery = Send-CopilotSessionPrompt -SessionId $SessionId -Text $Answer
+        $delivery = Send-CopilotSessionPrompt -SessionId $SessionId -Text $Answer -ProcessId $processId
+    }
+
+    # Claude may end on a review screen after the last question's option is chosen, so
+    # a question still pending once the keys have landed gets one Enter to submit it.
+    if ($delivery.Delivered) {
+        $delivery = Complete-DaemonClaudeAnswer -SessionId $SessionId -Delivery $delivery -Marker $Marker
     }
 
     if ($delivery.Delivered) {
@@ -2401,6 +2510,23 @@ function Sync-DaemonNewSession {
     if (-not [DateTimeOffset]::TryParse($press, [ref]$pressedAt)) { return }
     if ($pressedAt -le $script:DaemonStartedAt) { return }
 
+    # A press while a launched Claude session is asking whether to trust its folder
+    # is the user's confirmation, not a request for another session: trusting lets
+    # Claude read, edit and run files there, so the bridge only ever answers it on
+    # this deliberate second press. The answer is sent on the next pass, from the
+    # screen as it is then.
+    $pending = $script:DaemonPendingLaunch
+    if ($null -ne $pending -and $null -ne $pending.TrustAskedAt -and -not $pending.TrustConfirmed) {
+        if (([DateTimeOffset]::Now - $pending.TrustAskedAt).TotalSeconds -le 120) {
+            $pending.TrustConfirmed = $true
+            $pending.LastCheck = [DateTimeOffset]::MinValue
+            Write-DaemonLog -Message "Launch pressed again: trusting the folder for the Claude session in $($pending.Label)"
+            Set-CopilotMqttNewSessionResult -Headers $Headers -Text "Trusting $($pending.Label) for Claude..."
+            Update-DaemonPendingLaunch -Headers $Headers
+            return
+        }
+    }
+
     if ($workspaces.Count -eq 0) {
         Write-DaemonLog -Message 'new session requested but no workspaces are configured'
         Set-CopilotMqttNewSessionResult -Headers $Headers `
@@ -2553,19 +2679,21 @@ function Sync-DaemonNewSession {
     elseif ($agencyProfile) { "$label ($agencyProfile)" }
     else { $label }
 
-    # The process id only proves something started. Waiting for the session's own
-    # lock file proves the CLI got far enough to be a session the daemon can adopt,
-    # so the dashboard reports what actually happened rather than an optimistic
-    # guess. The next reconcile publishes the session itself.
-    if (Wait-BridgeSessionRegistered -SessionId ([string]$launch.SessionId) -Launcher $chosenLauncher -Since $launchedAt) {
-        $short = if ($launch.SessionId) { $launch.SessionId.Substring(0, [Math]::Min(8, $launch.SessionId.Length)) } else { 'a session' }
-        Set-CopilotMqttNewSessionResult -Headers $Headers `
-            -Text "$verb $short in $where at $([DateTimeOffset]::Now.ToString('HH:mm'))"
-    }
-    else {
-        Write-DaemonLog -Message "new session $($launch.SessionId) did not register within the timeout"
-        Set-CopilotMqttNewSessionResult -Headers $Headers `
-            -Text "$verb pid $($launch.ProcessId) in $where, but it has not registered yet"
+    # The process id only proves something started; the session registering proves
+    # it got far enough to be adopted. That is followed up on each pass of the loop
+    # (Update-DaemonPendingLaunch) rather than waited for here: waiting stalled the
+    # whole daemon - replies, streaming, everything - for up to 25 seconds per launch.
+    $script:DaemonPendingLaunch = [pscustomobject]@{
+        SessionId      = [string]$launch.SessionId
+        ProcessId      = [int]$launch.ProcessId
+        Launcher       = $chosenLauncher
+        Label          = [string]$where
+        Verb           = $verb
+        Since          = $launchedAt
+        LastCheck      = [DateTimeOffset]::MinValue
+        TrustAskedAt   = $null
+        TrustConfirmed = $false
+        TrustAnswers   = 0
     }
 
     # A launch changes what is resumable - the session just started is now live, and
@@ -2867,6 +2995,76 @@ function Add-DaemonCardText {
     }
 }
 
+function Update-DaemonPendingLaunch {
+    <#
+        Follows a session launched from the dashboard until it registers, a pass at a
+        time, so the daemon never stalls waiting on it.
+
+        Claude may stop at "Do you trust this folder?" before it registers - and before
+        its SessionStart hook runs - where nobody at the dashboard can see it. Whether
+        it will ask cannot be predicted reliably from its config, so the session's
+        screen is read instead. When the question shows, the launch note asks for a
+        second press of Launch within two minutes; that press sets TrustConfirmed, and
+        the answer is sent from whatever the screen shows then (see
+        Send-BridgeTrustAnswer). Checked at most every 700 ms.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Headers)
+
+    $p = $script:DaemonPendingLaunch
+    if ($null -eq $p) { return }
+    $now = [DateTimeOffset]::Now
+    if (($now - $p.LastCheck).TotalMilliseconds -lt 700) { return }
+    $p.LastCheck = $now
+    $agent = Get-BridgeLauncherLabel -Launcher $p.Launcher
+    $finish = { param([string]$Note, [string]$Log)
+        $script:DaemonPendingLaunch = $null
+        Write-DaemonLog -Message $Log
+        try { Set-CopilotMqttNewSessionResult -Headers $Headers -Text $Note } catch { }
+    }
+
+    if (Test-BridgeSessionRegistered -SessionId $p.SessionId -Launcher $p.Launcher -Since $p.Since) {
+        # The session's own card is the confirmation, so the note is cleared, and a
+        # reconcile is asked for now so the card appears without waiting the interval.
+        $script:DaemonReconcileNow = $true
+        & $finish '' ("$($p.Verb) $agent in $($p.Label); registered after {0:N1} s" -f ($now - $p.Since).TotalSeconds)
+        return
+    }
+
+    if ($p.ProcessId -gt 0 -and $null -eq (Get-Process -Id $p.ProcessId -ErrorAction SilentlyContinue)) {
+        & $finish "$agent in $($p.Label) closed before it started." "launched $agent (pid $($p.ProcessId)) exited before registering"
+        return
+    }
+
+    if ($p.Launcher -eq 'claude' -and $p.ProcessId -gt 0) {
+        $selection = Read-BridgeTrustPrompt -ProcessId $p.ProcessId
+        if ($selection) {
+            if ($p.TrustConfirmed) {
+                if ($p.TrustAnswers -lt 3) {
+                    $p.TrustAnswers++
+                    $sent = Send-BridgeTrustAnswer -ProcessId $p.ProcessId -Selection $selection
+                    Write-DaemonLog -Message "answered Claude's trust question for $($p.Label) (highlight was '$selection'): $sent"
+                }
+            }
+            elseif ($null -eq $p.TrustAskedAt) {
+                $p.TrustAskedAt = $now
+                Write-DaemonLog -Message "Claude in $($p.Label) is asking whether to trust the folder; waiting for a second press"
+                Set-CopilotMqttNewSessionResult -Headers $Headers `
+                    -Text "Claude is asking whether to trust $($p.Label). Press Launch again within 2 minutes to trust it and start."
+            }
+            elseif (($now - $p.TrustAskedAt).TotalSeconds -gt 120) {
+                & $finish "Claude is still asking whether to trust $($p.Label) - answer it in its window." `
+                    "trust confirmation for $($p.Label) expired; left for the window"
+            }
+            return
+        }
+    }
+
+    if (($now - $p.Since).TotalSeconds -gt 90) {
+        & $finish "$agent started in $($p.Label) (pid $($p.ProcessId)) but has not registered - check its window." `
+            "launched $agent (pid $($p.ProcessId)) did not register within 90 s"
+    }
+}
+
 function Invoke-DaemonFastActivity {
     <#
         The fast lane: publishes new transcript activity within one wait tick.
@@ -2885,6 +3083,10 @@ function Invoke-DaemonFastActivity {
         [Parameter(Mandatory)][hashtable]$Headers,
         [Parameter(Mandatory)][hashtable]$State
     )
+
+    # A session launched from the dashboard is followed up here too, so its
+    # registration - or its trust question - is noticed within a second.
+    try { Update-DaemonPendingLaunch -Headers $Headers } catch { }
 
     $live = $script:DaemonLive
     if ($null -eq $live -or $live.Count -eq 0) { return }
@@ -3973,7 +4175,8 @@ function Start-BridgeDaemon {
             # shares state with the reconcile without any locking. A plain script
             # block, not a closure: GetNewClosure() would run it in a new module scope
             # that cannot see this script's functions.
-            $fastLane = { Invoke-DaemonFastActivity -Headers $headers -State $state }
+            # It returns $true to end the wait early when a reconcile is wanted now.
+            $fastLane = { Invoke-DaemonFastActivity -Headers $headers -State $state | Out-Null; [bool]$script:DaemonReconcileNow }
             $hit = Wait-CopilotHaStateChange -EntityIds $watchEntities `
                 -TimeoutSeconds $ReconcileSeconds -OnTick $fastLane -TickMilliseconds 100
             $script:DaemonWatchFailures = 0
@@ -4017,7 +4220,8 @@ function Start-BridgeDaemon {
         # A push hit only shortcuts latency; the sweep in the reconcile does the
         # authoritative delivery, so both paths funnel through the same guarded code.
         if (([DateTimeOffset]::Now - $lastReconcile).TotalSeconds -ge $ReconcileSeconds -or
-            $null -ne $hit) {
+            $null -ne $hit -or $script:DaemonReconcileNow) {
+            $script:DaemonReconcileNow = $false
             try {
                 # The reconcile makes a string of Home Assistant calls, and a
                 # transcript write that lands during it would otherwise wait for all of

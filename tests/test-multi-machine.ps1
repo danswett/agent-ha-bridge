@@ -230,8 +230,10 @@ Test-That 'the picker is the first row on the card' {
     [string]$stack['cards'][0]['entities'][0]['entity'] -eq 'input_select.agent_bridge_target_machine'
 }
 Test-That 'each machine rows are revealed by the picker, not all at once' {
+    # Each machine's launch rows; its launch note is a separate conditional card.
     $conds = @($cards | Where-Object { $_['type'] -eq 'vertical-stack' } | ForEach-Object { $_['cards'] } |
-        Where-Object { $_['type'] -eq 'conditional' } | ForEach-Object { $_['conditions'][0] })
+        Where-Object { $_['type'] -eq 'conditional' -and $_['card']['type'] -eq 'entities' } |
+        ForEach-Object { $_['conditions'][0] })
     @($conds | Where-Object { [string]$_['entity'] -eq 'input_select.agent_bridge_target_machine' }).Count -eq 2 -and
     @($conds | ForEach-Object { [string]$_['state'] }) -contains 'DESKTOP' -and
     @($conds | ForEach-Object { [string]$_['state'] }) -contains 'LAPTOP'

@@ -33,11 +33,20 @@ function Get-Fixture {
 Write-Host '--- single question ---'
 $single = (Get-Fixture 'pretooluse-single.json')
 $parsed = ConvertFrom-ClaudeAskUserQuestion -ToolInput $single.tool_input
-Test-That 'the question text is carried through' { $parsed.Question -eq 'Which database should we use?' } $parsed.Question
+Test-That 'the question text leads' { $parsed.Question.StartsWith('Which database should we use?') } $parsed.Question
 Test-That 'both options become choices' { $parsed.Choices.Count -eq 2 } "$($parsed.Choices.Count)"
-Test-That 'a description is folded into its label' { $parsed.Choices[0] -eq 'PostgreSQL (Recommended) - Best fit for relational data' } $parsed.Choices[0]
+# The label alone is the option. Folding the description in made the dropdown
+# unreadable, and Claude records the bare label, so an injected answer never matched.
+Test-That 'an option is its bare label' { $parsed.Choices[0] -eq 'PostgreSQL (Recommended)' } $parsed.Choices[0]
+Test-That 'its description is listed under the question instead' {
+    $parsed.Question -match [regex]::Escape('**PostgreSQL (Recommended)** - Best fit for relational data')
+} $parsed.Question
 Test-That 'an option without a description stays bare' { $parsed.Choices[1] -eq 'SQLite' } $parsed.Choices[1]
-Test-That 'a single question uses no per-field dropdowns' { $parsed.Fields.Count -eq 0 }
+Test-That 'a single question uses no per-field dropdowns on the card' { $parsed.Fields.Count -eq 0 }
+Test-That 'but the marker carries its field, so it is answered by index' {
+    @($parsed.MarkerFields).Count -eq 1 -and (@($parsed.MarkerFields[0].Options) -join ',') -eq 'PostgreSQL (Recommended),SQLite'
+}
+Test-That 'a single-select question can be answered from the dashboard' { -not $parsed.MultiSelect }
 
 Write-Host '--- several questions ---'
 $multi = (Get-Fixture 'pretooluse-multi.json')
@@ -86,7 +95,15 @@ Test-That 'malformed JSON returns null rather than throwing' { $null -eq (Get-Cl
 Test-That 'empty input returns null' { $null -eq (Get-ClaudeHookEvent -Raw '   ') }
 
 Write-Host '--- owning process lookup ---'
-Test-That 'no claude ancestor resolves to 0' { (Get-ClaudeOwningProcessId -StartPid $PID) -eq 0 }
+# The Windows System process (pid 4) has no claude ancestor wherever the tests run.
+# The test's own process - or anything it starts - does when the tests run inside a
+# Claude session, which made this check fail there for reasons unrelated to the code.
+Test-That 'no claude ancestor resolves to 0' { (Get-ClaudeOwningProcessId -StartPid 4) -eq 0 }
+Test-That 'running inside Claude resolves to that claude process' {
+    $found = Get-ClaudeOwningProcessId -StartPid $PID
+    # Outside Claude there is nothing to find; inside it, the answer must be a claude.
+    $found -eq 0 -or (Get-Process -Id $found).ProcessName -match '^claude'
+}
 Test-That 'an unknown pid resolves to 0' { (Get-ClaudeOwningProcessId -StartPid 999999) -eq 0 }
 
 Write-Host ''

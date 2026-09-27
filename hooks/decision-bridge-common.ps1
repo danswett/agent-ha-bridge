@@ -1239,11 +1239,16 @@ function Write-CopilotDecisionMarker {
         [AllowNull()][object[]]$Combos = @(),
         [AllowNull()][object[]]$Fields = @(),
         [switch]$TerminalOnly,
-        [Parameter(Mandatory)][ValidateSet('freeform', 'multiple_choice')][string]$Mode
+        [Parameter(Mandatory)][ValidateSet('freeform', 'multiple_choice')][string]$Mode,
+
+        # The agent's own id for this question (Claude's tool_use_id), so its answer
+        # is matched to this card and not to an earlier question in the transcript.
+        [string]$ToolCallId = ''
     )
 
     $marker = @{
         decisionId = $DecisionId
+        toolCallId = $ToolCallId
         question = $Question
         choices = @($Choices)
         combos = @($Combos)
