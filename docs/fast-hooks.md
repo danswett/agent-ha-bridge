@@ -240,10 +240,19 @@ program. So:
   counts, the summary. *Done:* `agent-ha-bridge status` shows it (`hooks : native (v) - N
   runs in the last 24 h, M not spooled (x%): reasons; median ms`). A fallback whose script
   also failed is its own reason (`...; fallback failed`): the agent got no bridge at all.
-- [ ] **R7. VERSION 1.12.0, release, verify the assets attached.** In progress: VERSION
-  bumped, draft release created (id 398000817). Dispatching the workflow was refused
-  (the PAT has no Actions permission), so release.yml also runs on a pushed `v*` tag;
-  next: tag the commit with that change, push the tag, check the draft's assets, publish.
+- [x] **R7. VERSION 1.12.0, release, verify the assets attached.** *Released 2026-09-28*
+  (https://github.com/danswett/agent-ha-bridge/releases/tag/v1.12.0), from a37acc6..a63a336.
+  The Windows build was downloaded from the draft, checksum-checked, run (`1.12.0`) and
+  scanned clean by Defender before publishing; after, Install-BridgeNativeHook fetched
+  it from the public release, and DASDESK now runs the released build. Traps hit, for
+  next time:
+  * `gh release upload <tag>` cannot find a draft (a lookup by tag skips drafts);
+    release.yml now attaches by release id.
+  * Deleting a draft's tag (to move it) detaches the draft: its tag becomes
+    `untagged-...`. PATCH `tag_name` back after re-pushing the tag.
+  * The PAT had no Actions permission, so the workflow could not be started by hand;
+    it now also runs on a pushed `v*` tag. The user added the permission afterwards, so
+    `workflow_dispatch` (tag + ref) works for the next release.
 
 ## Resuming
 
