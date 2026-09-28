@@ -1735,6 +1735,14 @@ ha-card {
                 type     = 'custom:agent-bridge-session-card'
                 status   = $statusEntity
                 decision = $decisionEntity
+                # The driver rides on the activity sensor's attributes, so the frame
+                # cannot know who is driving without being told where to look. It was
+                # never given this, and the card treats a missing activity entity as
+                # 'human' - the safe default - so the purple edge could not appear on
+                # any dashboard, whatever the daemon published. The card's own test
+                # sets status, decision and activity by hand, so it passed the whole
+                # time the view that builds it was handing over only two of the three.
+                activity = $activityEntity
                 cards    = $sessionCards
             }
         }

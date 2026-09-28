@@ -376,6 +376,13 @@ Test-That 'a served 1.12.0 card frames each session with the session card' { $nu
 Test-That 'which watches the session status and decision for its glow' {
     $sessionCard.status -eq "sensor.$($sessions[0].Node)_status" -and $sessionCard.decision -eq "select.$($sessions[0].Node)_decision"
 }
+# The driver is an attribute of the activity sensor, so a frame not given that entity
+# reads every session as yours and can never show the purple edge - which is exactly
+# what shipped, on every dashboard, for three releases. The card's own test supplies
+# all three keys itself, so nothing failed while the view handed over only two.
+Test-That 'and the activity entity, without which the agent glow can never fire' {
+    $sessionCard.activity -eq "sensor.$($sessions[0].Node)_activity"
+} "activity=[$(if ($sessionCard.PSObject.Properties['activity']) { $sessionCard.activity } else { '<missing>' })]"
 Test-That 'and holds the session sections' { @($sessionCard.cards | Where-Object { $_.type -eq 'custom:agent-bridge-activity-card' }).Count -eq 1 }
 Save-CopilotSessionDashboard -Sessions $sessions -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.11.3'
 Test-That 'an older served card keeps the styled stack' { (Get-SavedJson) -notmatch 'agent-bridge-session-card' }
