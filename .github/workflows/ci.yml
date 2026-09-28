@@ -89,6 +89,7 @@ jobs:
             'tests/test-new-session.ps1'
             'tests/test-daemon-sessions.ps1'
             'tests/test-daemon-decisions.ps1'
+            'tests/test-daemon-replies.ps1'
             'tests/test-stop-session.ps1'
             'tests/test-verbose-toggle.ps1'
             'codex/tests/test-codex.ps1'

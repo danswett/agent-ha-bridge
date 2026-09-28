@@ -208,6 +208,10 @@ function Invoke-PendingReplies {
 
         A per-session hash guards the brief window between delivering a reply and the
         clear taking effect, so the same text is never injected twice.
+
+        For each session: whether the reply box is free (Test-DaemonReplyBoxFree), then
+        the reply card's payload (Send-DaemonCardPayload), then the text box and its
+        Send button (Send-DaemonReplyBoxText).
     #>
     param(
         [Parameter(Mandatory)][hashtable]$Headers,
@@ -217,228 +221,272 @@ function Invoke-PendingReplies {
 
     foreach ($sessionId in @($State.Keys)) {
         if (-not $Live.ContainsKey($sessionId)) { continue }
-
-        $session = $Live[$sessionId]
-        $node = Get-CopilotMqttNodeId -SessionId $sessionId
-        $replyEntity = "text.${node}_reply"
-        $marker = Get-CopilotDecisionMarker -SessionId $sessionId
-
-        # Read the decision card once and decide who owns the reply box.
-        $armedQuestion = ''
-        try {
-            $decisionState = Get-HomeAssistantState -EntityId "select.${node}_decision" -Headers $Headers
-            $armedQuestion = [string]$decisionState.attributes.question
-        }
-        catch {
-            # Unreadable decision state: treat the reply as a continuation, the common case.
-        }
-
-        if (-not [string]::IsNullOrWhiteSpace($armedQuestion)) {
-            if ($null -ne $marker) {
-                # A live question owns the reply box - Invoke-PendingDecisions reads it
-                # as the free-text field of the form, and reports there if the form is
-                # incomplete. Nothing to do here.
-                continue
-            }
-
-            # Armed card with no marker behind it. Either the old blocking router is
-            # genuinely waiting on it, or the question was already answered and the
-            # card was never torn down - in which case every reply typed here is
-            # dropped silently, which is how a session ends up unable to be replied to
-            # at all. The transcript settles it.
-            $stale = $false
-            try {
-                $askState = Get-DaemonAskUserState -Session $session
-                $stale = (-not $askState.Pending)
-            }
-            catch { }
-
-            if (-not $stale) { continue }
-
-            try {
-                Clear-CopilotMqttDecision -SessionId $sessionId `
-                    -SessionName ([string]$State[$sessionId].Name) `
-                    -Machine ([string]$State[$sessionId].Machine) -Headers $Headers
-                Write-DaemonLog -Message "cleared a stale decision card for $($sessionId.Substring(0,8)) so replies work again"
-            }
-            catch {
-                Write-DaemonLog -Message "could not clear the stale decision card for $sessionId : $($_.Exception.Message)"
-                continue
-            }
-        }
-
+        if (-not (Test-DaemonReplyBoxFree -SessionId $sessionId -Session $Live[$sessionId] -State $State -Headers $Headers)) { continue }
         $entry = $State[$sessionId]
+        if (Send-DaemonCardPayload -SessionId $sessionId -Entry $entry -Headers $Headers) { continue }
+        Send-DaemonReplyBoxText -SessionId $sessionId -Entry $entry -Headers $Headers
+    }
+}
 
-        # The reply card delivers here, and takes precedence over the text box below.
-        #
-        # It sends what is on screen at the instant Send is pressed rather than
-        # whatever Home Assistant last managed to commit, so it needs no arming and
-        # no waiting, and it can carry images and text of any length.
-        $payload = $null
-        try {
-            $payloadState = Get-HomeAssistantState -EntityId "sensor.${node}_reply_payload" -Headers $Headers
-            $payload = Get-BridgeReplyPayload -State $payloadState
+function Test-DaemonReplyBoxFree {
+    <#
+        Whether a session's reply box is free for a reply, rather than owned by a
+        question on its card. Reads the decision card once and decides who owns the
+        box; a question card left over from a question already answered is cleared,
+        which frees it.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)]$Session,
+        [Parameter(Mandatory)][hashtable]$State,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $sessionId = $SessionId
+    $node = Get-CopilotMqttNodeId -SessionId $sessionId
+    $marker = Get-CopilotDecisionMarker -SessionId $sessionId
+
+    $armedQuestion = ''
+    try {
+        $decisionState = Get-HomeAssistantState -EntityId "select.${node}_decision" -Headers $Headers
+        $armedQuestion = [string]$decisionState.attributes.question
+    }
+    catch {
+        # Unreadable decision state: treat the reply as a continuation, the common case.
+    }
+    if ([string]::IsNullOrWhiteSpace($armedQuestion)) { return $true }
+
+    if ($null -ne $marker) {
+        # A live question owns the reply box - Invoke-PendingDecisions reads it as the
+        # free-text field of the form, and reports there if the form is incomplete.
+        # Nothing to do here.
+        return $false
+    }
+
+    # Armed card with no marker behind it. Either the old blocking router is genuinely
+    # waiting on it, or the question was already answered and the card was never torn
+    # down - in which case every reply typed here is dropped silently, which is how a
+    # session ends up unable to be replied to at all. The transcript settles it.
+    $stale = $false
+    try {
+        $askState = Get-DaemonAskUserState -Session $Session
+        $stale = (-not $askState.Pending)
+    }
+    catch { }
+
+    if (-not $stale) { return $false }
+
+    try {
+        Clear-CopilotMqttDecision -SessionId $sessionId `
+            -SessionName ([string]$State[$sessionId].Name) `
+            -Machine ([string]$State[$sessionId].Machine) -Headers $Headers | Out-Null
+        Write-DaemonLog -Message "cleared a stale decision card for $($sessionId.Substring(0,8)) so replies work again"
+    }
+    catch {
+        Write-DaemonLog -Message "could not clear the stale decision card for $sessionId : $($_.Exception.Message)"
+        return $false
+    }
+    $true
+}
+
+function Send-DaemonCardPayload {
+    <#
+        Delivers a new payload from the reply card - text and images - and returns
+        whether there was one. It takes precedence over the text box.
+
+        It sends what is on screen at the instant Send is pressed rather than whatever
+        Home Assistant last managed to commit, so it needs no arming and no waiting, and
+        it can carry images and text of any length.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)]$Entry,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $sessionId = $SessionId
+    $entry = $Entry
+    $node = Get-CopilotMqttNodeId -SessionId $sessionId
+    $payload = $null
+    try {
+        $payloadState = Get-HomeAssistantState -EntityId "sensor.${node}_reply_payload" -Headers $Headers
+        $payload = Get-BridgeReplyPayload -State $payloadState
+    }
+    catch {
+        # No payload sensor yet (a session published before this existed), or it is
+        # unreadable. The text box still works.
+    }
+    if ($null -eq $payload) { return $false }
+
+    $lastPayload = if ($entry.PSObject.Properties['LastReplyPayloadAt']) { [string]$entry.LastReplyPayloadAt } else { '' }
+    if ($payload.Stamp -eq $lastPayload) { return $false }
+
+    # Record the stamp before delivering, not after. Delivery types the reply into the
+    # console one character at a time, which is long enough for the next reconcile to
+    # see the same payload still sitting there and send it a second time.
+    Set-DaemonSessionProperty -Entry $entry -Name 'LastReplyPayloadAt' -Value $payload.Stamp
+
+    try {
+        Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Sending...' -Headers $Headers | Out-Null
+    }
+    catch { }
+
+    $paths = [System.Collections.Generic.List[string]]::new()
+    $fetched = [System.Collections.Generic.List[string]]::new()
+    foreach ($image in @($payload.Images)) {
+        $saved = Save-BridgeReplyAttachment -ImageId $image.Id -Name $image.Name -Headers $Headers
+        if (-not [string]::IsNullOrWhiteSpace($saved)) {
+            $paths.Add($saved)
+            $fetched.Add($image.Id)
         }
-        catch {
-            # No payload sensor yet (a session published before this existed), or it
-            # is unreadable. The text box below still works.
-        }
+    }
 
-        if ($null -ne $payload) {
-            $lastPayload = if ($entry.PSObject.Properties['LastReplyPayloadAt']) { [string]$entry.LastReplyPayloadAt } else { '' }
-            if ($payload.Stamp -ne $lastPayload) {
-                # Record the stamp before delivering, not after. Delivery types the
-                # reply into the console one character at a time, which is long enough
-                # for the next reconcile to see the same payload still sitting there
-                # and send it a second time.
-                Set-DaemonSessionProperty -Entry $entry -Name 'LastReplyPayloadAt' -Value $payload.Stamp
+    $prompt = New-BridgeAttachmentPrompt -Text $payload.Text -Paths $paths.ToArray()
+    if ([string]::IsNullOrWhiteSpace($prompt)) {
+        Write-DaemonLog -Message "reply card payload for $($sessionId.Substring(0,8)) had nothing deliverable"
+        return $true
+    }
 
-                try {
-                    Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Sending...' -Headers $Headers
-                }
-                catch { }
+    $attachmentNote = if ($paths.Count -gt 0) { " with $($paths.Count) attachment(s)" } else { '' }
+    Write-DaemonLog -Message "reply card payload for $($sessionId.Substring(0,8))$attachmentNote"
 
-                $paths = [System.Collections.Generic.List[string]]::new()
-                $fetched = [System.Collections.Generic.List[string]]::new()
-                foreach ($image in @($payload.Images)) {
-                    $saved = Save-BridgeReplyAttachment -ImageId $image.Id -Name $image.Name -Headers $Headers
-                    if (-not [string]::IsNullOrWhiteSpace($saved)) {
-                        $paths.Add($saved)
-                        $fetched.Add($image.Id)
-                    }
-                }
+    Set-DaemonSessionProperty -Entry $entry -Name 'LastReply' -Value $payload.Text
+    [void](Invoke-DaemonReply -SessionId $sessionId -Text $prompt -Headers $Headers `
+        -DisplayText $payload.Text -ClearReplyBox:$false)
 
-                $prompt = New-BridgeAttachmentPrompt -Text $payload.Text -Paths $paths.ToArray()
-                if ([string]::IsNullOrWhiteSpace($prompt)) {
-                    Write-DaemonLog -Message "reply card payload for $($sessionId.Substring(0,8)) had nothing deliverable"
-                    continue
-                }
+    # Only once it is delivered, so a failed send leaves the image in place to be
+    # retried by hand.
+    foreach ($id in $fetched) { Remove-BridgeHomeAssistantImage -ImageId $id | Out-Null }
+    Remove-BridgeStaleAttachment | Out-Null
+    $true
+}
 
-                $attachmentNote = if ($paths.Count -gt 0) { " with $($paths.Count) attachment(s)" } else { '' }
-                Write-DaemonLog -Message "reply card payload for $($sessionId.Substring(0,8))$attachmentNote"
+function Send-DaemonReplyBoxText {
+    <#
+        Delivers the text box's reply when its Send button has been pressed - waiting
+        a moment, and if need be a few passes, for Home Assistant to commit what was
+        typed, and saying so on the card rather than letting a press look ignored.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)]$Entry,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
 
-                Set-DaemonSessionProperty -Entry $entry -Name 'LastReply' -Value $payload.Text
-                [void](Invoke-DaemonReply -SessionId $sessionId -Text $prompt -Headers $Headers `
-                    -DisplayText $payload.Text -ClearReplyBox:$false)
+    $sessionId = $SessionId
+    $entry = $Entry
+    $node = Get-CopilotMqttNodeId -SessionId $sessionId
+    $replyEntity = "text.${node}_reply"
 
-                # Only once it is delivered, so a failed send leaves the image in place
-                # to be retried by hand.
-                foreach ($id in $fetched) { Remove-BridgeHomeAssistantImage -ImageId $id }
-                Remove-BridgeStaleAttachment
-                continue
-            }
-        }
+    # Read the press first. The old order read the reply box first and bailed on a
+    # blank one, which lost the race Home Assistant creates: a text entity commits
+    # when it loses focus, and on a phone the tap that commits it *is* the tap on
+    # Send. The first read could therefore still see the old, blank value, nothing
+    # was sent, and nothing said so - which is why a reply sometimes needed Send
+    # pressed twice.
+    $press = ''
+    try {
+        $btn = Get-HomeAssistantState -EntityId "button.${node}_submit" -Headers $Headers
+        $press = [string]$btn.state
+    }
+    catch {
+        return
+    }
+    if ($press -in @('unknown', 'unavailable', '')) { return }
 
-        # Read the press first. The old order read the reply box first and bailed on a
-        # blank one, which lost the race Home Assistant creates: a text entity commits
-        # when it loses focus, and on a phone the tap that commits it *is* the tap on
-        # Send. The first read could therefore still see the old, blank value, nothing
-        # was sent, and nothing said so - which is why a reply sometimes needed Send
-        # pressed twice.
-        $press = ''
-        try {
-            $btn = Get-HomeAssistantState -EntityId "button.${node}_submit" -Headers $Headers
-            $press = [string]$btn.state
-        }
-        catch {
-            continue
-        }
-        if ($press -in @('unknown', 'unavailable', '')) { continue }
+    $lastSubmit = if ($entry.PSObject.Properties['LastSubmitAt']) { [string]$entry.LastSubmitAt } else { '' }
+    if ($press -eq $lastSubmit) { return }
 
-        $lastSubmit = if ($entry.PSObject.Properties['LastSubmitAt']) { [string]$entry.LastSubmitAt } else { '' }
-        if ($press -eq $lastSubmit) { continue }
+    try {
+        $replyState = Get-HomeAssistantState -EntityId $replyEntity -Headers $Headers
+    }
+    catch {
+        return
+    }
+    $value = [string]$replyState.state
 
+    # Give the commit time to land before concluding there is nothing to send.
+    #
+    # Home Assistant commits a text entity when it loses focus, and the tap that
+    # commits it IS the tap on Send. The daemon is woken by the button's own state
+    # change, so it reads the box within milliseconds of the press - reliably
+    # before the typed value has landed. A single short re-read was not enough:
+    # the first Send of a message regularly reported "Nothing to send" and it took
+    # a second press to get through.
+    #
+    # Polling briefly costs nothing when the value is already there, which is the
+    # common case on the reconcile sweep.
+    $attempts = 0
+    while (($attempts -lt $script:DaemonConfig.ReplyCommitAttempts) -and
+           ([string]::IsNullOrWhiteSpace($value) -or $value -in @('unknown', 'unavailable'))) {
+        $attempts++
+        Start-Sleep -Milliseconds $script:DaemonConfig.ReplyCommitWaitMs
         try {
             $replyState = Get-HomeAssistantState -EntityId $replyEntity -Headers $Headers
-        }
-        catch {
-            continue
-        }
-        $value = [string]$replyState.state
-
-        # Give the commit time to land before concluding there is nothing to send.
-        #
-        # Home Assistant commits a text entity when it loses focus, and the tap that
-        # commits it IS the tap on Send. The daemon is woken by the button's own state
-        # change, so it reads the box within milliseconds of the press - reliably
-        # before the typed value has landed. A single short re-read was not enough:
-        # the first Send of a message regularly reported "Nothing to send" and it took
-        # a second press to get through.
-        #
-        # Polling briefly costs nothing when the value is already there, which is the
-        # common case on the reconcile sweep.
-        $attempts = 0
-        while (($attempts -lt $script:DaemonConfig.ReplyCommitAttempts) -and
-               ([string]::IsNullOrWhiteSpace($value) -or $value -in @('unknown', 'unavailable'))) {
-            $attempts++
-            Start-Sleep -Milliseconds $script:DaemonConfig.ReplyCommitWaitMs
-            try {
-                $replyState = Get-HomeAssistantState -EntityId $replyEntity -Headers $Headers
-                $value = [string]$replyState.state
-            }
-            catch { }
-        }
-
-        # Acknowledge the press immediately - a press that produces no visible change
-        # for even a second reads as a dead button, which is the other half of why it
-        # got pressed twice. Which acknowledgement depends on whether the typed text
-        # has actually reached Home Assistant yet, so it happens in each branch below
-        # rather than unconditionally here: a blanket 'Sending...' on every pass would
-        # overwrite the armed message it is meant to sit alongside.
-        if ([string]::IsNullOrWhiteSpace($value) -or $value -in @('unknown', 'unavailable')) {
-            # The text is almost certainly on screen - it just is not in Home Assistant
-            # yet. A text entity only commits when it loses focus or you press Enter,
-            # and pressing Send does neither: Home Assistant's own history showed three
-            # presses landing before the box was committed even once. Burning the press
-            # here is what forced a second one, so it stays armed instead and fires the
-            # moment the value arrives.
-            $pendingAt = if ($entry.PSObject.Properties['PendingSubmitAt']) { [string]$entry.PendingSubmitAt } else { '' }
-            if ($pendingAt -ne $press) {
-                Set-DaemonSessionProperty -Entry $entry -Name 'PendingSubmitAt' -Value $press
-                Set-DaemonSessionProperty -Entry $entry -Name 'PendingSubmitSince' -Value ([DateTimeOffset]::Now.ToString('o'))
-                try {
-                    Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Waiting for your text' `
-                        -Extra @{ hint = 'Press Enter in the box, or tap outside it, and this sends on its own.' } `
-                        -Headers $Headers
-                }
-                catch { }
-                Write-DaemonLog -Message "send armed for $($sessionId.Substring(0,8)); the typed text has not reached Home Assistant yet"
-                continue
-            }
-
-            $since = [DateTimeOffset]::MinValue
-            if ($entry.PSObject.Properties['PendingSubmitSince']) {
-                try { $since = [DateTimeOffset]::Parse([string]$entry.PendingSubmitSince) } catch { }
-            }
-            if (([DateTimeOffset]::Now - $since).TotalSeconds -lt $script:DaemonConfig.SubmitArmSeconds) {
-                # Still armed; say nothing further and look again next pass.
-                continue
-            }
-
-            # Long enough that the box really was empty. Say so rather than doing
-            # nothing: silence here is indistinguishable from a broken button.
-            Set-DaemonSessionProperty -Entry $entry -Name 'LastSubmitAt' -Value $press
-            Set-DaemonSessionProperty -Entry $entry -Name 'PendingSubmitAt' -Value ''
-            try {
-                Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Nothing to send' `
-                    -Extra @{ hint = 'Type a reply first, then press Send.' } -Headers $Headers
-            }
-            catch { }
-            Write-DaemonLog -Message "send for $($sessionId.Substring(0,8)) gave up waiting for the typed text"
-            continue
-        }
-
-        Set-DaemonSessionProperty -Entry $entry -Name 'LastSubmitAt' -Value $press
-        Set-DaemonSessionProperty -Entry $entry -Name 'PendingSubmitAt' -Value ''
-        Set-DaemonSessionProperty -Entry $entry -Name 'LastReply' -Value $value
-
-        try {
-            Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Sending...' -Headers $Headers
+            $value = [string]$replyState.state
         }
         catch { }
-
-        [void](Invoke-DaemonReply -SessionId $sessionId -Text $value -Headers $Headers)
     }
+
+    # Acknowledge the press immediately - a press that produces no visible change
+    # for even a second reads as a dead button, which is the other half of why it
+    # got pressed twice. Which acknowledgement depends on whether the typed text
+    # has actually reached Home Assistant yet, so it happens in each branch below
+    # rather than unconditionally here: a blanket 'Sending...' on every pass would
+    # overwrite the armed message it is meant to sit alongside.
+    if ([string]::IsNullOrWhiteSpace($value) -or $value -in @('unknown', 'unavailable')) {
+        # The text is almost certainly on screen - it just is not in Home Assistant
+        # yet. A text entity only commits when it loses focus or you press Enter,
+        # and pressing Send does neither: Home Assistant's own history showed three
+        # presses landing before the box was committed even once. Burning the press
+        # here is what forced a second one, so it stays armed instead and fires the
+        # moment the value arrives.
+        $pendingAt = if ($entry.PSObject.Properties['PendingSubmitAt']) { [string]$entry.PendingSubmitAt } else { '' }
+        if ($pendingAt -ne $press) {
+            Set-DaemonSessionProperty -Entry $entry -Name 'PendingSubmitAt' -Value $press
+            Set-DaemonSessionProperty -Entry $entry -Name 'PendingSubmitSince' -Value ([DateTimeOffset]::Now.ToString('o'))
+            try {
+                Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Waiting for your text' `
+                    -Extra @{ hint = 'Press Enter in the box, or tap outside it, and this sends on its own.' } `
+                    -Headers $Headers
+            }
+            catch { }
+            Write-DaemonLog -Message "send armed for $($sessionId.Substring(0,8)); the typed text has not reached Home Assistant yet"
+            return
+        }
+
+        $since = [DateTimeOffset]::MinValue
+        if ($entry.PSObject.Properties['PendingSubmitSince']) {
+            try { $since = [DateTimeOffset]::Parse([string]$entry.PendingSubmitSince) } catch { }
+        }
+        if (([DateTimeOffset]::Now - $since).TotalSeconds -lt $script:DaemonConfig.SubmitArmSeconds) {
+            # Still armed; say nothing further and look again next pass.
+            return
+        }
+
+        # Long enough that the box really was empty. Say so rather than doing
+        # nothing: silence here is indistinguishable from a broken button.
+        Set-DaemonSessionProperty -Entry $entry -Name 'LastSubmitAt' -Value $press
+        Set-DaemonSessionProperty -Entry $entry -Name 'PendingSubmitAt' -Value ''
+        try {
+            Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Nothing to send' `
+                -Extra @{ hint = 'Type a reply first, then press Send.' } -Headers $Headers
+        }
+        catch { }
+        Write-DaemonLog -Message "send for $($sessionId.Substring(0,8)) gave up waiting for the typed text"
+        return
+    }
+
+    Set-DaemonSessionProperty -Entry $entry -Name 'LastSubmitAt' -Value $press
+    Set-DaemonSessionProperty -Entry $entry -Name 'PendingSubmitAt' -Value ''
+    Set-DaemonSessionProperty -Entry $entry -Name 'LastReply' -Value $value
+
+    try {
+        Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Sending...' -Headers $Headers
+    }
+    catch { }
+
+    [void](Invoke-DaemonReply -SessionId $sessionId -Text $value -Headers $Headers)
 }
 
 function Invoke-DaemonReply {
