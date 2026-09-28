@@ -205,7 +205,13 @@ function Get-ClaudeOwningProcessId {
         identifies it unambiguously - and correctly picks the right one when several
         sessions are open.
     #>
-    param([int]$StartPid = $PID, [int]$MaxDepth = 12)
+    param([int]$StartPid = $PID, [int]$MaxDepth = 12, [int[]]$Ancestors = @())
 
+    # Passed only when there is a chain: a bridge-platform.ps1 from before -Ancestors
+    # (mid-update, or a checkout run against an older install) would otherwise refuse
+    # the call, and every hook would quietly lose its session's process.
+    if (@($Ancestors).Count -gt 0) {
+        return Find-BridgeAgentAncestor -Agent 'claude' -StartPid $StartPid -MaxDepth $MaxDepth -Ancestors $Ancestors
+    }
     Find-BridgeAgentAncestor -Agent 'claude' -StartPid $StartPid -MaxDepth $MaxDepth
 }

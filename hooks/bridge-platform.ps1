@@ -216,8 +216,21 @@ function Find-BridgeAgentAncestor {
         returning its id, or 0. How a hook finds the session it belongs to: a hook
         runs as a descendant of its session, so this picks the right one even with
         several open.
+
+        -Ancestors is the chain a hook recorded, nearest first, for when the walk is
+        made after the hook has exited (the daemon, from the native hook's spool). The
+        shells between the hook and the agent have gone by then, so a pid no longer
+        running is skipped rather than ending the walk.
     #>
-    param([Parameter(Mandatory)][string]$Agent, [int]$StartPid = $PID, [int]$MaxDepth = 12)
+    param([Parameter(Mandatory)][string]$Agent, [int]$StartPid = $PID, [int]$MaxDepth = 12, [int[]]$Ancestors = @())
+
+    if (@($Ancestors).Count -gt 0) {
+        foreach ($ancestorPid in @($Ancestors | Select-Object -First $MaxDepth)) {
+            $process = Get-BridgeProcessInfo -ProcessId $ancestorPid
+            if ($process -and (Test-BridgeAgentProcess -Process $process -Agent $Agent)) { return [int]$process.ProcessId }
+        }
+        return 0
+    }
 
     $current = $StartPid
     for ($depth = 0; $depth -lt $MaxDepth; $depth++) {

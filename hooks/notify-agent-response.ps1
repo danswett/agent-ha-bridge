@@ -1,15 +1,9 @@
 <#
     Mirrors a completed Copilot turn to Home Assistant as a notification.
 
-    The session card on the dashboard already carries the full response - the bridge
-    daemon streams it there from the transcript - so this hook only sends the optional
-    out-of-band push, and is a no-op when notifications are disabled.
-
-    It is deliberately non-blocking. An earlier design held the turn open here to carry
-    a dashboard reply back as the next prompt, which deadlocked: while the hook blocks,
-    the CLI queues anything typed in the terminal, so the escape signal it was waiting
-    for could never arrive. Continuation is now the daemon's job, delivered by writing
-    to the session's console.
+    Copilot's agentStop hook; what it does is Invoke-CopilotAgentStopHook
+    (copilot-hooks.ps1). Non-blocking, and it always replies `{}`: response delivery
+    must not affect the completed turn.
 #>
 
 $ErrorActionPreference = 'Stop'
@@ -17,49 +11,12 @@ $ErrorActionPreference = 'Stop'
 try {
     . (Join-Path $PSScriptRoot 'decision-bridge-common.ps1')
     . (Join-Path $PSScriptRoot 'bridge-adapter.ps1')
+    . (Join-Path $PSScriptRoot 'copilot-hooks.ps1')
 
     $rawEvent = [Console]::In.ReadToEnd()
-    if ([string]::IsNullOrWhiteSpace($rawEvent)) {
-        Write-Output '{}'
-        exit 0
+    if (-not [string]::IsNullOrWhiteSpace($rawEvent)) {
+        Invoke-CopilotAgentStopHook -HookEvent ($rawEvent | ConvertFrom-Json) | Out-Null
     }
-
-    $event = $rawEvent | ConvertFrom-Json
-    $sessionId = [string]$event.sessionId
-    $transcriptPath = [string]$event.transcriptPath
-    if (
-        [string]::IsNullOrWhiteSpace($transcriptPath) -or
-        -not (Test-Path -LiteralPath $transcriptPath)
-    ) {
-        $transcriptPath = Join-Path (
-            Join-Path $script:DecisionBridgeConfig.SessionStateRoot $sessionId
-        ) 'events.jsonl'
-    }
-    if (-not (Test-Path -LiteralPath $transcriptPath)) {
-        Write-Output '{}'
-        exit 0
-    }
-
-    # Last assistant message with content is the response that just finished.
-    $response = $null
-    foreach ($line in @(Get-CopilotTranscriptTailLines -Path $transcriptPath)) {
-        if (-not $line.StartsWith('{"type":"assistant.message"')) { continue }
-        try {
-            $content = [string]($line | ConvertFrom-Json).data.content
-            if (-not [string]::IsNullOrWhiteSpace($content)) { $response = $content.Trim() }
-        }
-        catch { continue }
-    }
-    if ([string]::IsNullOrWhiteSpace($response)) {
-        Write-Output '{}'
-        exit 0
-    }
-
-    $display = Get-CopilotSessionDisplay -SessionId $sessionId -WorkingDirectory ([string]$event.cwd)
-
-    Send-BridgeResponseNotification -SessionName $display.Name -Response $response `
-        -Headers (Get-HomeAssistantHeaders) -TitlePrefix 'Copilot response' `
-        -DashboardLabel 'the Agent Sessions dashboard'
 }
 catch {
     try {

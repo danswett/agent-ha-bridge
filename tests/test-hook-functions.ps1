@@ -1,0 +1,131 @@
+#Requires -Version 7.0
+<#
+.SYNOPSIS
+    Tests for the hook bodies as functions (claude-hooks.ps1, codex-hooks.ps1,
+    copilot-hooks.ps1) and for finding a session's process from a recorded chain.
+
+.DESCRIPTION
+    The daemon will run these for events the native hook spools to it (see
+    docs/fast-hooks.md), after the hook has exited: the owning process is then found
+    from the ancestors the hook recorded, and the shells in between have gone. Every
+    Home Assistant call and every file write is replaced by a recorder here.
+#>
+
+Set-StrictMode -Version Latest
+$ErrorActionPreference = 'Stop'
+
+$repo = Join-Path $PSScriptRoot '..'
+. (Join-Path $repo 'hooks/bridge-platform.ps1')
+. (Join-Path $repo 'hooks/decision-bridge-common.ps1')
+. (Join-Path $repo 'hooks/decision-mqtt.ps1')
+. (Join-Path $repo 'hooks/bridge-adapter.ps1')
+. (Join-Path $repo 'claude/hooks/claude-ask-parser.ps1')
+. (Join-Path $repo 'claude/hooks/claude-session.ps1')
+. (Join-Path $repo 'claude/hooks/claude-hooks.ps1')
+. (Join-Path $repo 'codex/hooks/codex-session.ps1')
+. (Join-Path $repo 'codex/hooks/codex-hooks.ps1')
+. (Join-Path $repo 'hooks/copilot-hooks.ps1')
+
+$script:Failures = 0
+function Test-That {
+    param([string]$Name, [scriptblock]$Check, [string]$Detail = '')
+    $ok = $false
+    try { $ok = [bool](& $Check) } catch { $Detail = "threw: $($_.Exception.Message)" }
+    if ($ok) { Write-Host "  PASS  $Name" }
+    else { Write-Host "  FAIL  $Name$(if ($Detail) { " - $Detail" })" -ForegroundColor Red; $script:Failures++ }
+}
+
+# A process table: 10 the hook, 20 a shell that has since exited, 30 claude, 40 the
+# terminal. 50 a codex app-server under 60, a codex window.
+$script:Processes = @{
+    10 = [pscustomobject]@{ ProcessId = 10; ParentProcessId = 20; Name = 'pwsh.exe'; Path = '' }
+    30 = [pscustomobject]@{ ProcessId = 30; ParentProcessId = 40; Name = 'claude.exe'; Path = '' }
+    40 = [pscustomobject]@{ ProcessId = 40; ParentProcessId = 1; Name = 'WindowsTerminal.exe'; Path = '' }
+    50 = [pscustomobject]@{ ProcessId = 50; ParentProcessId = 60; Name = 'codex.exe'; Path = 'C:\x\app-server-daemon\codex.exe' }
+    60 = [pscustomobject]@{ ProcessId = 60; ParentProcessId = 40; Name = 'codex.exe'; Path = 'C:\x\bin\codex.exe' }
+}
+function Get-BridgeProcessInfo { param([int]$ProcessId, [switch]$WithCommandLine) $script:Processes[$ProcessId] }
+
+Write-Host '--- finding the owner from a recorded chain ---'
+Test-That 'a shell that has exited is skipped, not the end of the walk' { (Find-BridgeAgentAncestor -Agent 'claude' -Ancestors @(10, 20, 30, 40)) -eq 30 }
+Test-That 'a chain with no agent in it gives 0' { (Find-BridgeAgentAncestor -Agent 'codex' -Ancestors @(10, 20, 30, 40)) -eq 0 }
+Test-That 'Claude''s lookup uses the chain' { (Get-ClaudeOwningProcessId -Ancestors @(20, 30)) -eq 30 }
+Test-That 'a live walk still stops at an exited process, as before' { (Find-BridgeAgentAncestor -Agent 'claude' -StartPid 10) -eq 0 }
+function Test-CodexWindowClaimed { param([int]$ProcessId, [string]$SessionId) $false }
+Test-That 'Codex walks past its app-server to the window' { (Get-CodexOwningProcessId -SessionId 's' -Ancestors @(10, 20, 50, 60)) -eq 60 }
+
+Write-Host '--- Claude ---'
+$script:Registered = @()
+function Write-ClaudeSessionRegistration { param($SessionId, $TranscriptPath, $WorkingDirectory, $ProcessId, $Status) $script:Registered += [pscustomobject]@{ Id = $SessionId; Pid = $ProcessId; Status = $Status }; 'written' }
+function Resolve-ClaudeTranscriptPath { param($SessionId, $KnownPath) $KnownPath }
+$script:Reachable = $false
+function Enter-BridgeAdapterSession { if ($script:Reachable) { @{ Authorization = 'Bearer t' } } else { $null } }
+function Write-DecisionBridgeLog { param([string]$Message) }
+
+$out = Invoke-ClaudeRegisterHook -HookEvent ([pscustomobject]@{ session_id = 'c1'; transcript_path = 't'; cwd = 'w'; hook_event_name = 'UserPromptSubmit' }) -Ancestors @(20, 30)
+Test-That 'a prompt registers the session as working, owned by claude' { $script:Registered[-1].Pid -eq 30 -and $script:Registered[-1].Status -eq 'working' }
+Test-That 'and writes nothing Claude would see' { $null -eq $out }
+$null = Invoke-ClaudeRegisterHook -HookEvent ([pscustomobject]@{ session_id = 'c1'; transcript_path = 't'; cwd = 'w'; hook_event_name = 'SessionStart' }) -Ancestors @(30)
+Test-That 'SessionStart records no status' { $script:Registered[-1].Status -eq '' }
+$script:Registered = @()
+$null = Invoke-ClaudeRegisterHook -HookEvent ([pscustomobject]@{ session_id = ''; hook_event_name = 'SessionStart' })
+Test-That 'an event without a session is ignored' { $script:Registered.Count -eq 0 }
+
+$out = Invoke-ClaudeStopHook -HookEvent ([pscustomobject]@{ session_id = 'c1'; transcript_path = 't'; cwd = 'w'; last_assistant_message = 'done' }) -Ancestors @(30)
+Test-That 'Stop marks it idle even with Home Assistant away, and says nothing' { $script:Registered[-1].Status -eq 'idle' -and $null -eq $out }
+
+$script:Markers = @()
+function Write-CopilotDecisionMarker { param($SessionId, $DecisionId, $Question, $Choices, $Combos, $Fields, $Mode, [switch]$TerminalOnly, $ToolCallId) $script:Markers += [pscustomobject]@{ Question = $Question; ToolCallId = $ToolCallId } }
+$ask = [pscustomobject]@{
+    session_id = 'c1'; transcript_path = 't'; cwd = 'w'; tool_name = 'AskUserQuestion'; tool_use_id = 'tu1'
+    tool_input = [pscustomobject]@{ questions = @([pscustomobject]@{ question = 'Which?'; header = 'Pick'; multiSelect = $false; options = @([pscustomobject]@{ label = 'A' }, [pscustomobject]@{ label = 'B' }) }) }
+}
+$out = Invoke-ClaudeAskHook -HookEvent $ask -Ancestors @(30)
+Test-That 'a question leaves a marker for the daemon before touching the network' { $script:Markers.Count -eq 1 -and $script:Markers[0].ToolCallId -eq 'tu1' -and $null -eq $out }
+$script:Markers = @()
+$ask.tool_name = 'Bash'
+$null = Invoke-ClaudeAskHook -HookEvent $ask
+Test-That 'any other tool is ignored' { $script:Markers.Count -eq 0 }
+
+$script:Registered = @()
+$null = Invoke-ClaudeNotificationHook -HookEvent ([pscustomobject]@{ session_id = 'c1'; transcript_path = 't'; cwd = 'w'; notification_type = 'permission_prompt'; message = 'Claude needs your permission to use Bash' }) -Ancestors @(30)
+Test-That 'a permission notification marks it waiting' { $script:Registered[-1].Status -eq 'waiting' -and $script:Registered[-1].Pid -eq 30 }
+
+Write-Host '--- Codex ---'
+$script:CodexRegistered = @()
+function Write-CodexSessionRegistration { param($SessionId, $TranscriptPath, $WorkingDirectory, $Model, $Status, $Activity, $ProcessId, [switch]$Ended) $script:CodexRegistered += [pscustomobject]@{ Status = $Status; Activity = $Activity; Pid = $ProcessId; Ended = [bool]$Ended }; 'written' }
+function Test-BridgeDaemonAlive { $true }
+$out = Invoke-CodexHook -HookEvent ([pscustomobject]@{ session_id = 'x1'; hook_event_name = 'PreToolUse'; cwd = 'w'; tool_name = 'shell'; tool_input = [pscustomobject]@{ command = 'ls' } }) -Ancestors @(10, 20, 50, 60)
+Test-That 'a tool call is recorded for the daemon to publish, owned by the window' {
+    $script:CodexRegistered[-1].Status -eq 'working' -and $script:CodexRegistered[-1].Activity -eq 'Running: shell - ls' -and $script:CodexRegistered[-1].Pid -eq 60
+}
+Test-That 'and says nothing' { $null -eq $out }
+$null = Invoke-CodexHook -HookEvent ([pscustomobject]@{ session_id = 'x1'; hook_event_name = 'SessionEnd'; cwd = 'w' }) -Ancestors @(60)
+Test-That 'SessionEnd marks the registration ended' { $script:CodexRegistered[-1].Ended }
+$count = $script:CodexRegistered.Count
+$null = Invoke-CodexHook -HookEvent ([pscustomobject]@{ session_id = 'x1'; hook_event_name = 'SomethingNew'; cwd = 'w' })
+Test-That 'an event it does not know is ignored' { $script:CodexRegistered.Count -eq $count }
+
+Write-Host '--- Copilot ---'
+# The hooks run without strict mode, and the shared ask_user parser relies on that (a
+# missing property reads as $null), so these run as the hook does. The daemon's spool
+# dispatch turns strict mode off around each hook function for the same reason.
+Set-StrictMode -Off
+$script:Reachable = $false
+$script:Markers = @()
+$out = Invoke-CopilotAskUserHook -HookEvent ([pscustomobject]@{ sessionId = 's1'; cwd = 'w'; timestamp = 1; toolArgs = [pscustomobject]@{ question = 'Pick'; choices = @('A', 'B') } })
+Test-That 'ask_user with Home Assistant away writes nothing and leaves the reply to the script' { $null -eq $out -and $script:Markers.Count -eq 0 }
+$script:Sent = @()
+function Send-BridgeNotification { param($Title, $Message, $Headers) $script:Sent += $Title }
+function Get-HomeAssistantHeaders { @{ Authorization = 'Bearer t' } }
+$out = Invoke-CopilotPermissionHook -HookEvent ([pscustomobject]@{ notification_type = 'permission_prompt'; title = ''; message = '' })
+Test-That 'a permission prompt is pushed with a sensible title' { ($script:Sent -join ',') -eq 'Copilot permission needed' -and $null -eq $out }
+
+Write-Host ''
+if ($script:Failures) {
+    Write-Host "$($script:Failures) check(s) failed" -ForegroundColor Red
+    exit 1
+}
+Write-Host 'All hook function checks passed' -ForegroundColor Green
+# Explicit: without it pwsh reports the last external command's exit code.
+exit 0

@@ -107,13 +107,25 @@ function Get-CodexOwningProcessId {
         running; failing that, it takes the newest Codex window no other live
         session has claimed. The app-server is the last resort.
     #>
-    param([int]$StartPid = $PID, [int]$MaxDepth = 12, [string]$SessionId = '')
+    param(
+        [int]$StartPid = $PID, [int]$MaxDepth = 12, [string]$SessionId = '',
 
+        # The chain a hook recorded, nearest first, for a walk made after it exited
+        # (see Find-BridgeAgentAncestor): pids no longer running are skipped.
+        [int[]]$Ancestors = @()
+    )
+
+    $recorded = @($Ancestors | Select-Object -First $MaxDepth)
     $fallback = 0
-    $current = $StartPid
+    $current = if ($recorded.Count -gt 0) { $recorded[0] } else { $StartPid }
     for ($depth = 0; $depth -lt $MaxDepth; $depth++) {
+        if ($recorded.Count -gt 0 -and $depth -ge $recorded.Count) { break }
+        if ($recorded.Count -gt 0) { $current = $recorded[$depth] }
         $process = Get-BridgeProcessInfo -ProcessId $current
-        if (-not $process) { break }
+        if (-not $process) {
+            if ($recorded.Count -gt 0) { continue }
+            break
+        }
         # Exact match: codex-windows-sandbox-setup and codex-command-runner also exist.
         if (Test-BridgeAgentProcess -Process $process -Agent 'codex') {
             if (-not (Test-CodexAppServer -Process $process)) {
@@ -126,6 +138,7 @@ function Get-CodexOwningProcessId {
             }
             if ($fallback -eq 0) { $fallback = [int]$process.ProcessId }
         }
+        if ($recorded.Count -gt 0) { continue }
         if (-not $process.ParentProcessId -or $process.ParentProcessId -eq $current) { break }
         $current = [int]$process.ParentProcessId
     }

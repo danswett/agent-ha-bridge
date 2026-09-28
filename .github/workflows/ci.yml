@@ -93,6 +93,7 @@ jobs:
             'tests/test-daemon-loop.ps1'
             'tests/test-daemon-agents.ps1'
             'tests/test-launchers.ps1'
+            'tests/test-hook-functions.ps1'
             'tests/test-stop-session.ps1'
             'tests/test-verbose-toggle.ps1'
             'codex/tests/test-codex.ps1'

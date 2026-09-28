@@ -119,10 +119,26 @@ program. So:
 
 - [ ] **0. Toolchain.** Go installed on DASDESK (`winget install GoLang.Go`); CI
   job that builds and tests the Go code on Windows and macOS.
-- [ ] **1. Hook bodies into functions.** Each hook script's body moves into a
+- [x] **1. Hook bodies into functions.** Each hook script's body moves into a
   function taking `-Event` and `-Ancestors`; the script calls it with its own
   ancestry. No behaviour change. Tests call the functions with the existing
   fixtures (`claude/fixtures`, `codex/fixtures`).
+  *Done.* `claude/hooks/claude-hooks.ps1` (Invoke-ClaudeRegisterHook, -StopHook, -AskHook,
+  -NotificationHook), `codex/hooks/codex-hooks.ps1` (Invoke-CodexHook),
+  `hooks/copilot-hooks.ps1` (Invoke-CopilotAskUserHook, -AgentStopHook, -PermissionHook).
+  `Find-BridgeAgentAncestor` and `Get-CodexOwningProcessId` take `-Ancestors` (nearest
+  first; exited pids skipped). Test: `tests/test-hook-functions.ps1`. Found on the way,
+  and binding on phase 2:
+  * Pass `-Ancestors` only when there is a chain: an older `bridge-platform.ps1`
+    (mid-update, or a checkout against an older install) rejects the parameter, and a
+    fail-open hook then silently loses its process.
+  * Fail-open hides errors. Check `%TEMP%\agent-decision-bridge.log` for `failed`,
+    not just exit code and stdout.
+  * The hooks run without strict mode and the shared ask_user parser relies on it:
+    the daemon's dispatch must `Set-StrictMode -Off` around each hook function.
+  * `Enter-BridgeAdapterSession` sets a 45 s deadline on every HTTP call in the
+    process (`Set-DecisionBridgeDeadline`). In the daemon that would break all later
+    requests: save and restore `$script:DecisionBridgeDeadline` around each event.
 - [ ] **2. Daemon spool.** New part `hooks/daemon-hookspool.ps1`: drain the spool on
   the fast-lane tick, dispatch by `agent`/`script`, delete each file after (and a
   file that fails twice, logged). Tests drop fixture events into a temp spool.
