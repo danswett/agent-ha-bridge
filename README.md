@@ -82,6 +82,15 @@ each fill the same three roles — intercept a prompt, stream activity, deliver 
   paired with its matching `tool.execution_complete` is the authoritative "answered"
   signal, whichever input produced it — so the two paths can't collide.
 
+**The hooks are fast.** An agent waits for every hook, and starting PowerShell alone
+takes a quarter of a second, so each hook is a small native program,
+`agent-bridge-hook`, that hands the event to the daemon and returns in tens of
+milliseconds (Codex's tool-call hook went from 553 ms to 38 ms). The daemon then runs
+the same PowerShell code the hook would have. When the daemon is not running the
+program runs the PowerShell hook itself, and on a machine without the program the
+agents keep their PowerShell hooks - so the bridge works the same either way, only
+slower. See [docs/fast-hooks.md](docs/fast-hooks.md).
+
 Entities are created on demand per session through **MQTT discovery**, published via
 Home Assistant's own `mqtt.publish` service. **No MQTT broker credentials are needed** —
 only a Home Assistant token.
@@ -572,6 +581,17 @@ Or, from anywhere, `agent-ha-bridge update`.
 Either way your configuration is preserved: the installer reads the existing config,
 backs it up, and keeps your URL, token and settings.
 
+The installer also fetches the native hook built for the release (checked against the
+release's `SHA256SUMS`) and points the agents' hooks at it. When that changes an
+agent's hook command:
+
+* **Codex** asks you to trust the bridge's hook again, once - approve it, or its
+  sessions stop showing on the dashboard.
+* **Claude Code** reads its hooks when a session starts, so sessions already running
+  keep the old ones until restarted. Both kinds work.
+* **Copilot CLI and Agency** use the native hook from Copilot 1.0.88; older versions
+  keep PowerShell hooks.
+
 **Nothing updates itself.** The check is passive and installing is always a deliberate
 action, because this software types into terminals and registers scheduled tasks. Set
 `updates.checkForUpdates` to `false` to turn the check off entirely, or point
@@ -627,7 +647,13 @@ bridge cannot tell, it asks; a scripted uninstall keeps them. `-ClearShared` and
 ```
 
 These are plain PowerShell, need no Home Assistant, and run in a couple of seconds.
-The Claude adapter and the MCP server have their own suites — see their READMEs.
+The Claude adapter and the MCP server have their own suites — see their READMEs. CI
+runs the full list in `.github/workflows/ci.yml`.
+
+The native hook is Go (`hook/`): `go test ./...` there, and `go build -o
+agent-bridge-hook.exe .` (no `.exe` on macOS) for a local build - which the installer
+then uses instead of downloading one, and which `tests/test-native-hook.ps1` runs end
+to end with the daemon's spool.
 
 Nothing in the suite may disturb a real install on the machine running it. The
 installer tests run against `-TargetHome` with `-SkipTask`, `-SkipPath` and

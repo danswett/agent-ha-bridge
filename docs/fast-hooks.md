@@ -120,9 +120,9 @@ program. So:
 - [x] **0. Toolchain.** Go installed on DASDESK (`winget install GoLang.Go`); CI
   job that builds and tests the Go code on Windows and macOS.
   *Done* (the CI job moved into phase 3, with the first Go code). The machine-wide
-  winget install waited on a UAC prompt, so Go 1.27.1 is the portable zip (sha256
-  checked) in `%LOCALAPPDATA%\Programs\go`; use `%LOCALAPPDATA%\Programs\go\bin\go.exe`
-  if `go` is not on PATH. Gate passed 2026-09-27: a minimal Go program that reads and
+  winget install waited on a UAC prompt, so Go was first the portable zip; once the user approved the prompt, Go 1.27.0 is
+  machine-wide (`C:\Program Files\Go`) and the portable copy was removed. `hook/go.mod`
+  asks for 1.27.0. Gate passed 2026-09-27: a minimal Go program that reads and
   parses the event starts in 12.3 ms median (cmd.exe 14.3 ms, pwsh 234 ms), 2.6 MB, and
   Defender's scan found no threats.
 - [x] **1. Hook bodies into functions.** Each hook script's body moves into a
@@ -219,19 +219,25 @@ program. So:
 
 ## Before releasing (1.12.0)
 
-- [ ] **R1. No release race.** The release workflow built only after publishing, so a
+- [x] **R1. No release race.** The release workflow built only after publishing, so a
   machine updating in that minute got no native hook and stayed on PowerShell hooks.
   Now: create the release as a draft, run the workflow for its tag, check the assets,
-  then publish (automatic updates never see drafts).
-- [ ] **R2. Build the release assets in CI on every push** (no upload), so a broken
+  then publish (automatic updates never see drafts). *Done:* release.yml runs only by
+  hand (`tag` + `ref`), and `hook/build-release.sh` is the one build both use.
+- [x] **R2. Build the release assets in CI on every push** (no upload), so a broken
   release build shows up before a release.
-- [ ] **R3. test-claude-install.ps1 in a sandbox TEMP**: it registered a fake session in
+- [x] **R3. test-claude-install.ps1 in a sandbox TEMP**: it registered a fake session in
   the real %TEMP% owned by the Claude running the tests, which the daemon adopted.
-- [ ] **R4. README and release notes**: Codex asks to trust its hook again once; running
+- [x] **R4. README and release notes**: Codex asks to trust its hook again once; running
   Claude sessions pick up new hooks on restart.
-- [ ] **R5. DASDESK leftovers**: the portable Go (the user approved the machine-wide one),
+- [x] **R5. DASDESK leftovers**: the portable Go (the user approved the machine-wide one),
   its zip, and test folders in %TEMP%. Keep the settings backups for now.
-- [ ] **R6. test-dashboard.ps1 writes into the real bridge log**; point it at a temp log.
+- [x] **R6. test-dashboard.ps1 writes into the real bridge log**; point it at a temp log.
+- [ ] **R8. Measure fallbacks** (asked by the user). The native hook appends one line per
+  run to `%TEMP%\agent-bridge-hook.log` (JSON: at, agent, hook, path = spool | fallback |
+  reply, reason, ms), rotated at 1 MB; `Get-BridgeHookStats` summarises a window
+  (total, fallback rate, by reason, median ms). Tests: Go per path, the end-to-end
+  counts, the summary.
 - [ ] **R7. VERSION 1.12.0, release, verify the assets attached.**
 
 ## Resuming

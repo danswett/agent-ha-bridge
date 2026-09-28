@@ -17,6 +17,9 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '..\hooks\decision-bridge-common.ps1')
 . (Join-Path $PSScriptRoot '..\hooks\decision-mqtt.ps1')
 . (Join-Path $PSScriptRoot '..\hooks\decision-ha-websocket.ps1')
+# The failures these checks provoke on purpose went into the machine's real bridge log,
+# where they buried real ones.
+$script:DecisionBridgeConfig.LogFile = Join-Path ([IO.Path]::GetTempPath()) "test-dashboard-$([guid]::NewGuid().ToString('N').Substring(0, 8)).log"
 
 $script:Failures = 0
 function Test-That {
@@ -443,6 +446,7 @@ Test-That 'nothing is deleted when there is no pre-rename dashboard' {
     -not (@($script:SentCommands | Where-Object { $_.type -eq 'lovelace/dashboards/delete' }).Count)
 }
 
+Remove-Item -LiteralPath $script:DecisionBridgeConfig.LogFile -Force -ErrorAction SilentlyContinue
 Write-Host ''
 if ($script:Failures) {
     Write-Host "$($script:Failures) check(s) failed" -ForegroundColor Red

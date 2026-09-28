@@ -38,6 +38,14 @@ Set-Content -LiteralPath (Join-Path $coreHooks 'decision-mqtt.ps1') -Value '# pl
 # $env:TEMP on macOS, and $script:BridgeIsWindows.
 . (Join-Path $PSScriptRoot '../../hooks/bridge-platform.ps1')
 
+# A private TEMP for everything the hooks write. The hooks run as descendants of
+# whatever runs this test - often a live Claude session - and a registration in the
+# real %TEMP% named that session's process as its owner, so the running daemon adopted
+# it and put a phantom card on the dashboard.
+$realTemp = $env:TEMP
+$env:TEMP = Join-Path $sandbox 'temp'
+New-Item -ItemType Directory -Path $env:TEMP -Force | Out-Null
+
 $sessionId = "00000000-0000-4000-8000-$([guid]::NewGuid().ToString('N').Substring(0,12))"
 $registration = Join-Path $env:TEMP "agent-bridge-claude\$sessionId.json"
 
@@ -172,7 +180,7 @@ try {
     }
 }
 finally {
-    Remove-Item -LiteralPath $registration -Force -ErrorAction SilentlyContinue
+    $env:TEMP = $realTemp
     Remove-Item -LiteralPath $sandbox -Recurse -Force -ErrorAction SilentlyContinue
 }
 

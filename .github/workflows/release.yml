@@ -1,17 +1,26 @@
 name: Release assets
 
-# Attaches the native hook (hook/, docs/fast-hooks.md) to each published release,
-# with SHA256SUMS. Updates download the release's source archive, which cannot carry
-# a compiled program, so the installer fetches the build for its machine from here.
+# Attaches the native hook (hook/, docs/fast-hooks.md) to a release, with SHA256SUMS.
+# Updates download the release's source archive, which cannot carry a compiled
+# program, so the installer fetches the build for its machine from here.
+#
+# Run by hand against a DRAFT release, before publishing it:
+#   1. create the release as a draft (tag, target commit, notes);
+#   2. run this workflow with that tag and commit;
+#   3. check the assets are attached, then publish.
+# Publishing first would leave a window in which a machine updating finds no build and
+# keeps its PowerShell hooks until its next update. Automatic updates never see drafts.
 
 on:
-  release:
-    types: [published]
   workflow_dispatch:
     inputs:
       tag:
-        description: Release tag to build and attach to (e.g. v1.12.0)
+        description: The release's tag (e.g. v1.12.0); the release may be a draft
         required: true
+      ref:
+        description: The commit to build - the release's target (a draft's tag does not exist yet)
+        required: true
+        default: main
 
 permissions:
   contents: write
@@ -21,12 +30,12 @@ jobs:
     name: Build and attach the native hook
     runs-on: ubuntu-latest
     env:
-      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      TAG: ${{ inputs.tag }}
       GH_TOKEN: ${{ github.token }}
     steps:
       - uses: actions/checkout@v7
         with:
-          ref: ${{ env.TAG }}
+          ref: ${{ inputs.ref }}
 
       - uses: actions/setup-go@v7
         with:
@@ -38,22 +47,8 @@ jobs:
         run: go test ./...
 
       - name: Build every target
-        working-directory: hook
-        run: |
-          set -euo pipefail
-          version="${TAG#v}"
-          mkdir -p dist
-          for target in windows/amd64 windows/arm64 darwin/amd64 darwin/arm64; do
-            os="${target%/*}"; arch="${target#*/}"
-            name="agent-bridge-hook-${os}-${arch}"
-            [ "$os" = windows ] && name="${name}.exe"
-            # The linker signs darwin/arm64 builds ad hoc, which Apple silicon requires.
-            GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
-              go build -trimpath -ldflags "-s -w -X main.version=${version}" -o "dist/${name}" .
-          done
-          (cd dist && sha256sum agent-bridge-hook-* > SHA256SUMS)
-          cat dist/SHA256SUMS
+        run: bash hook/build-release.sh "${TAG#v}" "$PWD/dist"
 
       - name: Attach to the release
-        working-directory: hook/dist
+        working-directory: dist
         run: gh release upload "$TAG" agent-bridge-hook-* SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"

@@ -202,6 +202,29 @@ jobs:
           Write-Host "Failed on macOS: $($failed -join ', ')"
           if ($failed.Count) { exit 1 }
 
+  release-build:
+    name: Release build of the native hook (no upload)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: hook/go.mod
+          cache-dependency-path: hook/go.sum
+
+      # Exactly what release.yml runs, so a build that would break a release fails here.
+      - name: Build every target, as a release does
+        run: |
+          set -euo pipefail
+          bash hook/build-release.sh 0.0.0-ci "$PWD/dist"
+          for name in agent-bridge-hook-windows-amd64.exe agent-bridge-hook-windows-arm64.exe \
+                      agent-bridge-hook-darwin-amd64 agent-bridge-hook-darwin-arm64; do
+            test -s "dist/$name" || { echo "::error::missing $name"; exit 1; }
+            grep -q " $name\$" dist/SHA256SUMS || { echo "::error::$name not in SHA256SUMS"; exit 1; }
+          done
+          (cd dist && sha256sum -c SHA256SUMS)
+
   node:
     name: MCP server (Node)
     runs-on: ubuntu-latest
