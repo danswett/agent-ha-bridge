@@ -299,6 +299,10 @@ function Sync-DaemonNewSession {
 
         The prompt, workspace, profile and resume choice are read at press time, not
         watched, because they only matter in combination with a press.
+
+        A press is, in order of precedence: the second press that confirms a launched
+        Claude session may trust its folder, the first message for a Codex opened
+        without one, or a new launch.
     #>
     param(
         [Parameter(Mandatory)][hashtable]$Headers,
@@ -306,6 +310,24 @@ function Sync-DaemonNewSession {
     )
 
     if (-not (Get-BridgeSetting 'newSession.enabled' $true)) { return }
+
+    $controls = Get-DaemonNewSessionControls -Live $Live
+    if (-not (Publish-DaemonNewSessionControls -Controls $controls -Headers $Headers)) { return }
+    Set-DaemonNewSessionDefaults -Headers $Headers -Workspaces $controls.Workspaces -Profiles $controls.Profiles `
+        -Resumable $controls.Resumable -Agents $controls.Agents
+
+    if (-not (Test-DaemonNewSessionPressed -Headers $Headers)) { return }
+    if (Confirm-DaemonPendingTrust -Headers $Headers) { return }
+    if (Send-DaemonPendingFirstMessage -Headers $Headers) { return }
+
+    $request = Resolve-DaemonLaunchRequest -Controls $controls -Headers $Headers
+    if ($null -eq $request) { return }
+    Start-DaemonLaunch -Request $request -Headers $Headers
+}
+
+function Get-DaemonNewSessionControls {
+    <# What the launch card offers now: workspaces, agents, profiles, resumable sessions. #>
+    param([Parameter(Mandatory)][hashtable]$Live)
 
     $workspaces = @(Get-BridgeWorkspaceChoices)
     $launcher = Get-BridgeLauncherKind
@@ -318,17 +340,39 @@ function Sync-DaemonNewSession {
     $profiles = @()
     if ($launchers -contains 'agency') { $profiles = @(Get-BridgeAgencyProfiles) }
 
-    $resumable = @(Get-DaemonResumableSessions -LiveSessionIds @($Live.Keys))
+    [pscustomobject]@{
+        Workspaces = $workspaces
+        Launcher   = $launcher
+        Launchers  = $launchers
+        Agents     = $agents
+        Profiles   = $profiles
+        Resumable  = @(Get-DaemonResumableSessions -LiveSessionIds @($Live.Keys))
+    }
+}
 
-    # Re-publish only when the configured list changes, so an unchanged bridge sends
-    # nothing on a normal reconcile.
+function Publish-DaemonNewSessionControls {
+    <#
+        Publishes the launch card's controls when what they offer has changed, so an
+        unchanged bridge sends nothing on a normal reconcile. Returns $false when the
+        publish failed, and the rest of the pass is skipped.
+    #>
+    param(
+        [Parameter(Mandatory)]$Controls,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $workspaces = $Controls.Workspaces
+    $agents = $Controls.Agents
+    $profiles = $Controls.Profiles
+    $resumable = $Controls.Resumable
+    $launcher = $Controls.Launcher
     $signature = (($workspaces | ForEach-Object { "$($_.Label)=$($_.Path)" }) -join '|') +
         "#$launcher#" + ($agents -join ',') + '#' + ($profiles -join ',') +
         '#' + (($resumable | ForEach-Object { [string]$_.SessionId }) -join ',')
     if (-not $script:DaemonNewSessionPublished -or $signature -ne $script:DaemonNewSessionSignature) {
         try {
             Publish-CopilotMqttNewSession -Workspaces $workspaces -Profiles $profiles `
-                -Resumable $resumable -Agents $agents -Headers $Headers
+                -Resumable $resumable -Agents $agents -Headers $Headers | Out-Null
             [void](Set-CopilotMqttNewSessionEntityIds)
             $script:DaemonNewSessionPublished = $true
             $script:DaemonNewSessionSignature = $signature
@@ -336,12 +380,18 @@ function Sync-DaemonNewSession {
         }
         catch {
             Write-DaemonLog -Message "new-session publish failed: $($_.Exception.Message)"
-            return
+            return $false
         }
     }
+    $true
+}
 
-    Set-DaemonNewSessionDefaults -Headers $Headers -Workspaces $workspaces -Profiles $profiles `
-        -Resumable $resumable -Agents $agents
+function Test-DaemonNewSessionPressed {
+    <#
+        Whether Launch has been pressed since the last look - and since this daemon
+        started: a press from before that is history left in a retained value.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Headers)
 
     try {
         $button = Get-HomeAssistantState -EntityId $script:DaemonEntity.NewSession -Headers $Headers
@@ -349,77 +399,107 @@ function Sync-DaemonNewSession {
     }
     catch {
         # The button may not exist yet on a first run.
-        return
+        return $false
     }
 
-    if ($press -in @('unknown', 'unavailable', '')) { return }
-    if ($press -eq $script:DaemonNewSessionLastPress) { return }
+    if ($press -in @('unknown', 'unavailable', '')) { return $false }
+    if ($press -eq $script:DaemonNewSessionLastPress) { return $false }
     $script:DaemonNewSessionLastPress = $press
 
     $pressedAt = [DateTimeOffset]::MinValue
-    if (-not [DateTimeOffset]::TryParse($press, [ref]$pressedAt)) { return }
-    if ($pressedAt -le $script:DaemonStartedAt) { return }
+    if (-not [DateTimeOffset]::TryParse($press, [ref]$pressedAt)) { return $false }
+    $pressedAt -gt $script:DaemonStartedAt
+}
 
-    # A press while a launched Claude session is asking whether to trust its folder
-    # is the user's confirmation, not a request for another session: trusting lets
-    # Claude read, edit and run files there, so the bridge only ever answers it on
-    # this deliberate second press. The answer is sent on the next pass, from the
-    # screen as it is then.
+function Confirm-DaemonPendingTrust {
+    <#
+        Takes a press while a launched Claude session is asking whether to trust its
+        folder as the user's confirmation, not a request for another session: trusting
+        lets Claude read, edit and run files there, so the bridge only ever answers it
+        on this deliberate second press. The answer is sent on the next pass, from the
+        screen as it is then. Returns whether the press was that.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Headers)
+
     $pending = $script:DaemonPendingLaunch
-    if ($null -ne $pending -and $null -ne $pending.TrustAskedAt -and -not $pending.TrustConfirmed) {
-        if (([DateTimeOffset]::Now - $pending.TrustAskedAt).TotalSeconds -le 120) {
-            $pending.TrustConfirmed = $true
-            $pending.LastCheck = [DateTimeOffset]::MinValue
-            Write-DaemonLog -Message "Launch pressed again: trusting the folder for the Claude session in $($pending.Label)"
-            Set-CopilotMqttNewSessionResult -Headers $Headers -Text "Trusting $($pending.Label) for Claude..."
-            Update-DaemonPendingLaunch -Headers $Headers
-            return
-        }
-    }
+    if ($null -eq $pending -or $null -eq $pending.TrustAskedAt -or $pending.TrustConfirmed) { return $false }
+    if (([DateTimeOffset]::Now - $pending.TrustAskedAt).TotalSeconds -gt 120) { return $false }
 
-    # A press while a Codex launched without a first message is still waiting for one
-    # sends the First message box into that window: Codex creates its session - and
-    # so becomes visible here - only on its first message.
-    # Only while Codex is still the chosen agent and there is a message to send: any
-    # other press is a new launch, and the waiting window is left to itself.
+    $pending.TrustConfirmed = $true
+    $pending.LastCheck = [DateTimeOffset]::MinValue
+    Write-DaemonLog -Message "Launch pressed again: trusting the folder for the Claude session in $($pending.Label)"
+    Set-CopilotMqttNewSessionResult -Headers $Headers -Text "Trusting $($pending.Label) for Claude..." | Out-Null
+    Update-DaemonPendingLaunch -Headers $Headers | Out-Null
+    $true
+}
+
+function Send-DaemonPendingFirstMessage {
+    <#
+        Sends the First message box into a Codex launched without a first message:
+        Codex creates its session - and so becomes visible here - only on its first
+        message. Only while Codex is still the chosen agent and there is a message to
+        send: any other press is a new launch, and the waiting window is left to
+        itself. Returns whether the press was dealt with here.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Headers)
+
+    $pending = $script:DaemonPendingLaunch
+    if ($null -eq $pending -or -not $pending.PSObject.Properties['AwaitingFirstMessage'] -or -not $pending.AwaitingFirstMessage) { return $false }
+
     $first = ''
     $firstAgent = ''
-    if ($null -ne $pending -and $pending.PSObject.Properties['AwaitingFirstMessage'] -and $pending.AwaitingFirstMessage) {
-        try { $first = [string](Get-HomeAssistantState -EntityId $script:DaemonEntity.NewPrompt -Headers $Headers).state } catch { }
-        try { $firstAgent = [string](Get-HomeAssistantState -EntityId $script:DaemonEntity.NewAgent -Headers $Headers).state } catch { }
-        if ($first -in @('unknown', 'unavailable')) { $first = '' }
-        $first = $first.Trim()
-        if (-not $first -or ($firstAgent -and (Resolve-BridgeLauncher -Label $firstAgent) -ne 'codex')) {
-            Write-DaemonLog -Message "stopped waiting on the Codex in $($pending.Label) for a first message: a new launch was asked for"
-            $script:DaemonPendingLaunch = $null
-            $pending = $null
-        }
+    try { $first = [string](Get-HomeAssistantState -EntityId $script:DaemonEntity.NewPrompt -Headers $Headers).state } catch { }
+    try { $firstAgent = [string](Get-HomeAssistantState -EntityId $script:DaemonEntity.NewAgent -Headers $Headers).state } catch { }
+    if ($first -in @('unknown', 'unavailable')) { $first = '' }
+    $first = $first.Trim()
+    if (-not $first -or ($firstAgent -and (Resolve-BridgeLauncher -Label $firstAgent) -ne 'codex')) {
+        Write-DaemonLog -Message "stopped waiting on the Codex in $($pending.Label) for a first message: a new launch was asked for"
+        $script:DaemonPendingLaunch = $null
+        return $false
     }
-    if ($null -ne $pending -and $pending.PSObject.Properties['AwaitingFirstMessage'] -and $pending.AwaitingFirstMessage) {
-        $delivery = Send-CopilotSessionPrompt -SessionId 'codex-launch' -ProcessId $pending.ProcessId -Text $first
-        Write-DaemonLog -Message "first message sent to the Codex launched in $($pending.Label) (pid $($pending.ProcessId)): $($delivery.Detail)"
-        if (-not $delivery.Delivered) {
-            Set-CopilotMqttNewSessionResult -Headers $Headers -Text "Couldn't send that to Codex ($($delivery.Detail)) - type it in its window."
-            return
-        }
-        $pending.AwaitingFirstMessage = $false
-        $pending.Since = [DateTimeOffset]::Now
-        $pending.LastCheck = [DateTimeOffset]::MinValue
-        Set-CopilotMqttNewSessionResult -Headers $Headers -Text "Sending your first message to Codex in $($pending.Label)..."
-        try {
-            Invoke-HomeAssistantService -Domain 'text' -Service 'set_value' -Headers $Headers -Data @{
-                entity_id = $script:DaemonEntity.NewPrompt; value = $script:DaemonConfig.ReplyBlankValue
-            }
-        }
-        catch { }
-        return
+
+    $delivery = Send-CopilotSessionPrompt -SessionId 'codex-launch' -ProcessId $pending.ProcessId -Text $first
+    Write-DaemonLog -Message "first message sent to the Codex launched in $($pending.Label) (pid $($pending.ProcessId)): $($delivery.Detail)"
+    if (-not $delivery.Delivered) {
+        Set-CopilotMqttNewSessionResult -Headers $Headers -Text "Couldn't send that to Codex ($($delivery.Detail)) - type it in its window." | Out-Null
+        return $true
     }
+    $pending.AwaitingFirstMessage = $false
+    $pending.Since = [DateTimeOffset]::Now
+    $pending.LastCheck = [DateTimeOffset]::MinValue
+    Set-CopilotMqttNewSessionResult -Headers $Headers -Text "Sending your first message to Codex in $($pending.Label)..." | Out-Null
+    try {
+        Invoke-HomeAssistantService -Domain 'text' -Service 'set_value' -Headers $Headers -Data @{
+            entity_id = $script:DaemonEntity.NewPrompt; value = $script:DaemonConfig.ReplyBlankValue
+        } | Out-Null
+    }
+    catch { }
+    $true
+}
+
+function Resolve-DaemonLaunchRequest {
+    <#
+        Reads what a press asks for - agent, resume, workspace, prompt, profile - and
+        checks it against what is installed and configured. Returns the request, or
+        $null when it is refused, having said why on the card: a value arriving from
+        Home Assistant never picks an executable or a folder unchecked.
+    #>
+    param(
+        [Parameter(Mandatory)]$Controls,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $workspaces = $Controls.Workspaces
+    $launcher = $Controls.Launcher
+    $launchers = $Controls.Launchers
+    $profiles = $Controls.Profiles
+    $resumable = $Controls.Resumable
 
     if ($workspaces.Count -eq 0) {
         Write-DaemonLog -Message 'new session requested but no workspaces are configured'
         Set-CopilotMqttNewSessionResult -Headers $Headers `
-            -Text 'No workspaces configured - add newSession.workspaces to the bridge config'
-        return
+            -Text 'No workspaces configured - add newSession.workspaces to the bridge config' | Out-Null
+        return $null
     }
 
     # The agent. An untouched selector means the default; anything else must name an
@@ -434,8 +514,8 @@ function Sync-DaemonNewSession {
     if ([string]::IsNullOrWhiteSpace($chosenLauncher)) {
         if ($launchers.Count -gt 0) {
             Write-DaemonLog -Message "new session requested with unknown agent '$agentLabel'"
-            Set-CopilotMqttNewSessionResult -Text "Unknown agent '$agentLabel'" -Headers $Headers
-            return
+            Set-CopilotMqttNewSessionResult -Text "Unknown agent '$agentLabel'" -Headers $Headers | Out-Null
+            return $null
         }
         # Nothing is installed: let the launch attempt name what is missing.
         $chosenLauncher = $launcher
@@ -456,8 +536,8 @@ function Sync-DaemonNewSession {
             $resumeSession = @($resumable) | Where-Object { $_.Label -eq $resumeLabel } | Select-Object -First 1
             if ($null -eq $resumeSession) {
                 Write-DaemonLog -Message "resume requested for unknown session '$resumeLabel'"
-                Set-CopilotMqttNewSessionResult -Text "That session is no longer resumable" -Headers $Headers
-                return
+                Set-CopilotMqttNewSessionResult -Text "That session is no longer resumable" -Headers $Headers | Out-Null
+                return $null
             }
         }
     }
@@ -468,8 +548,8 @@ function Sync-DaemonNewSession {
         if ($launchers -notcontains $chosenLauncher) {
             $agentName = Get-BridgeLauncherLabel -Launcher $chosenLauncher
             Write-DaemonLog -Message "resume requested for a $agentName session, but $agentName is not installed"
-            Set-CopilotMqttNewSessionResult -Text "$agentName is not installed here, so that session can't be resumed" -Headers $Headers
-            return
+            Set-CopilotMqttNewSessionResult -Text "$agentName is not installed here, so that session can't be resumed" -Headers $Headers | Out-Null
+            return $null
         }
     }
 
@@ -489,8 +569,8 @@ function Sync-DaemonNewSession {
     $directory = Resolve-BridgeWorkspacePath -Label $label
     if ([string]::IsNullOrWhiteSpace($directory)) {
         Write-DaemonLog -Message "new session requested for unknown workspace '$label'"
-        Set-CopilotMqttNewSessionResult -Text "Unknown workspace '$label'" -Headers $Headers
-        return
+        Set-CopilotMqttNewSessionResult -Text "Unknown workspace '$label'" -Headers $Headers | Out-Null
+        return $null
     }
 
     $prompt = ''
@@ -530,10 +610,39 @@ function Sync-DaemonNewSession {
         $agencyProfile = Resolve-BridgeAgencyProfile -Name $profileLabel
         if ([string]::IsNullOrWhiteSpace($agencyProfile)) {
             Write-DaemonLog -Message "new session requested with unknown profile '$profileLabel'"
-            Set-CopilotMqttNewSessionResult -Text "Unknown profile '$profileLabel'" -Headers $Headers
-            return
+            Set-CopilotMqttNewSessionResult -Text "Unknown profile '$profileLabel'" -Headers $Headers | Out-Null
+            return $null
         }
     }
+
+    [pscustomobject]@{
+        Launcher      = $chosenLauncher
+        Directory     = $directory
+        Label         = $label
+        Prompt        = $prompt
+        AgencyProfile = $agencyProfile
+        ResumeSession = $resumeSession
+        ResumeLabel   = $resumeLabel
+    }
+}
+
+function Start-DaemonLaunch {
+    <#
+        Launches (or resumes) what Resolve-DaemonLaunchRequest settled on, and sets up
+        the follow-up that watches for the session to register.
+    #>
+    param(
+        [Parameter(Mandatory)]$Request,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $chosenLauncher = $Request.Launcher
+    $directory = $Request.Directory
+    $label = $Request.Label
+    $prompt = $Request.Prompt
+    $agencyProfile = $Request.AgencyProfile
+    $resumeSession = $Request.ResumeSession
+    $resumeLabel = $Request.ResumeLabel
 
     if ($null -ne $resumeSession) {
         $resumeDirectory = [string]$resumeSession.Folder
@@ -545,7 +654,7 @@ function Sync-DaemonNewSession {
 
         $short = $resumeSession.SessionId.Substring(0, [Math]::Min(8, $resumeSession.SessionId.Length))
         Write-DaemonLog -Message "resume requested for $short ($resumeDirectory)$(if ($agencyProfile) { " profile '$agencyProfile'" })"
-        Set-CopilotMqttNewSessionResult -Text "Resuming $resumeLabel..." -Headers $Headers
+        Set-CopilotMqttNewSessionResult -Text "Resuming $resumeLabel..." -Headers $Headers | Out-Null
 
         $launchedAt = [DateTimeOffset]::Now
         $launch = Start-BridgeCopilotSession -WorkingDirectory $resumeDirectory -Prompt $prompt `
@@ -555,7 +664,7 @@ function Sync-DaemonNewSession {
         $agentName = Get-BridgeLauncherLabel -Launcher $chosenLauncher
         Write-DaemonLog -Message "new $agentName session requested in '$label' ($directory)$(if ($agencyProfile) { " profile '$agencyProfile'" })$(if ($prompt) { " with prompt: $prompt" })"
         Set-CopilotMqttNewSessionResult -Headers $Headers `
-            -Text "Starting $agentName in $label$(if ($agencyProfile) { " ($agencyProfile)" })..."
+            -Text "Starting $agentName in $label$(if ($agencyProfile) { " ($agencyProfile)" })..." | Out-Null
 
         $launchedAt = [DateTimeOffset]::Now
         $launch = Start-BridgeCopilotSession -WorkingDirectory $directory -Prompt $prompt `
@@ -564,7 +673,7 @@ function Sync-DaemonNewSession {
 
     if (-not $launch.Launched) {
         Write-DaemonLog -Message "new session launch failed: $($launch.Detail)"
-        Set-CopilotMqttNewSessionResult -Text "Launch failed: $($launch.Detail)" -Headers $Headers
+        Set-CopilotMqttNewSessionResult -Text "Launch failed: $($launch.Detail)" -Headers $Headers | Out-Null
         return
     }
 
@@ -618,7 +727,7 @@ function Sync-DaemonNewSession {
             Invoke-HomeAssistantService -Domain 'text' -Service 'set_value' -Headers $Headers -Data @{
                 entity_id = $script:DaemonEntity.NewPrompt
                 value     = $script:DaemonConfig.ReplyBlankValue
-            }
+            } | Out-Null
         }
         catch {
             Write-DaemonLog -Message "could not clear the new-session prompt: $($_.Exception.Message)"
