@@ -53,6 +53,19 @@ jobs:
       - name: Build every target
         run: bash hook/build-release.sh "${TAG#v}" "$PWD/dist"
 
+      # By release id, not `gh release upload <tag>`: looking a release up by its tag
+      # skips drafts ("release not found"), and the release is a draft at this point.
       - name: Attach to the release
         working-directory: dist
-        run: gh release upload "$TAG" agent-bridge-hook-* SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"
+        run: |
+          set -euo pipefail
+          id=$(gh api "repos/$GITHUB_REPOSITORY/releases?per_page=100" --jq ".[] | select(.tag_name == \"$TAG\") | .id" | head -n 1)
+          [ -n "$id" ] || { echo "::error::no release (draft or published) for $TAG"; exit 1; }
+          for file in agent-bridge-hook-* SHA256SUMS; do
+            # Replace an asset a previous run attached.
+            old=$(gh api "repos/$GITHUB_REPOSITORY/releases/$id/assets" --jq ".[] | select(.name == \"$file\") | .id")
+            [ -z "$old" ] || gh api --method DELETE "repos/$GITHUB_REPOSITORY/releases/assets/$old"
+            gh api --method POST -H 'Content-Type: application/octet-stream' \
+              "https://uploads.github.com/repos/$GITHUB_REPOSITORY/releases/$id/assets?name=$file" \
+              --input "$file" --jq '.name + "  " + (.size | tostring) + " bytes"'
+          done
