@@ -282,6 +282,29 @@ program. So:
   restart is no longer cached for five minutes; and a launch note stops insisting the
   session never arrived once it has. The macOS CI job earned its keep - three of the
   four install bugs were Windows assumptions.
+- **1.13.1** (2026-09-28): pressing Install on the update card put it on "Installing"
+  and left it there, with nothing in the log. `Invoke-BridgeSelfUpdate` resolved pwsh
+  with a bare `(Get-Command pwsh).Source`, which throws under StrictMode when the
+  daemon's scheduled-task PATH has no PowerShell folder - after writing the staging
+  folder and updater script, before launching anything. The caller then swallowed it
+  in a `catch` written for a different case. pwsh is now resolved the way install.ps1
+  already resolved it (`Get-BridgePwshPath`, moved into the platform layer), and an
+  update that cannot start clears its own spinner, notifies and logs. Also: a
+  half-installed agent CLI no longer counts as installed - npm links a package's
+  command before its postinstall, so Claude Code's failed postinstall left `claude`
+  on PATH doing nothing and a re-run skipped it; the CLIs must answer `--version`
+  now, so re-running the installer repairs them. And a tmux pane that is gone before
+  it can be read says which reason it was, instead of "its process could not be
+  found".
+- **1.13.2** (2026-09-28): with the failure finally logged, the real cause appeared -
+  `$detached = @{ ... }` inside a function taking `[switch]$Detached`. Names are
+  case-insensitive, so it assigned to the parameter and died converting a hashtable
+  to a SwitchParameter. Only the dashboard button passes `-Detached`, which is why
+  `agent-ha-bridge update` always worked and the button never had. Swept the codebase
+  with the AST for locals differing only in case from a `[switch]` or `[scriptblock]`
+  parameter; this was the only one. Also raised the native hook's latency check from
+  100 ms to 500 ms, after the same CI runner measured 50, 109 and 131 ms on three
+  consecutive runs of identical code.
 
 ## Resuming
 
