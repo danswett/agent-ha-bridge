@@ -68,6 +68,25 @@ ported to Go.
 Why not port the hooks to Go outright: they load 3,000 to 5,500 lines of Home
 Assistant, MQTT and question-parsing code. A second implementation would drift.
 
+## Why Go
+
+Checked with the user before starting (2026-09-27). The native part is small: read
+stdin, record ancestors, check the heartbeat, write a file or run the old hook.
+
+* Startup does not decide it: Go, Rust and C# Native AOT all start in a few ms, well
+  under Windows' ~20 ms process-creation floor. Node measured 58 ms and needs Node.
+* Go builds all four targets from any one machine with no C toolchain, so DASDESK
+  and one CI job can produce them. Rust and C# AOT need a Mac to build for Macs, and
+  C# AOT needs the MSVC C++ build tools, which DASDESK does not have.
+* C# would suit a future port of the whole daemon (the repo already has C#, and
+  PowerShell maps onto it closely). The hook is about 300 lines, so rewriting it
+  then is cheap; it does not justify the toolchain now.
+* Go's known risk: Defender sometimes flags unsigned Go binaries. Hook configs only
+  point at the binary once it has been seen to run, and phase 0 scans it.
+
+Phase 0 gate: a built Go binary must start in under 30 ms on DASDESK and scan clean
+with Defender. If either fails, stop and revisit the choice with the user.
+
 ## Distribution
 
 Updates download the release's source archive, which cannot carry a compiled
