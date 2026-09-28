@@ -171,6 +171,7 @@ jobs:
         run: |
           bash -n bootstrap.sh
           sh -n bin/agent-ha-bridge
+          bash tests/test-bootstrap.sh
 
       - uses: actions/setup-go@v7
         with:

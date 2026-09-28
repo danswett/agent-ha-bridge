@@ -59,12 +59,16 @@ latest_asset() {
         grep -Eo '"browser_download_url": *"[^"]+"' | cut -d'"' -f4 | grep -E "$2" | head -n 1; } || true
 }
 
+# `installer` decides what it has been handed from the file name, so the download has
+# to keep its .pkg suffix - a bare mktemp name is rejected as an invalid package path.
 install_pkg() {
-    local url="$1" pkg
-    pkg="$(mktemp -t bridge-pkg)"
-    curl -fsSL -o "$pkg" "$url" || { rm -f "$pkg"; return 1; }
-    sudo installer -pkg "$pkg" -target / || { rm -f "$pkg"; return 1; }
-    rm -f "$pkg"
+    local url="$1" dir pkg
+    dir="$(mktemp -d -t bridge-pkg)"
+    pkg="$dir/${url##*/}"
+    case "$pkg" in *.pkg | *.mpkg) ;; *) pkg="$dir/download.pkg" ;; esac
+    curl -fsSL -o "$pkg" "$url" || { rm -rf "$dir"; return 1; }
+    sudo installer -pkg "$pkg" -target / || { rm -rf "$dir"; return 1; }
+    rm -rf "$dir"
 }
 
 # ----------------------------------------------------------------- Apple silicon

@@ -648,7 +648,9 @@ bridge cannot tell, it asks; a scripted uninstall keeps them. `-ClearShared` and
 
 These are plain PowerShell, need no Home Assistant, and run in a couple of seconds.
 The Claude adapter and the MCP server have their own suites — see their READMEs. CI
-runs the full list in `.github/workflows/ci.yml`.
+runs the full list in `.github/workflows/ci.yml`, along with `tests/test-bootstrap.sh`
+— what the macOS installer hands to `installer` — on the macOS runner, because it
+needs BSD `mktemp`.
 
 The native hook is Go (`hook/`): `go test ./...` there, and `go build -o
 agent-bridge-hook.exe .` (no `.exe` on macOS) for a local build - which the installer
