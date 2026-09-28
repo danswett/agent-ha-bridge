@@ -464,14 +464,16 @@ function Update-DaemonKnownSession {
         return
     }
 
-    # Re-resolve a session's name when the stored one is stale. Two cases: a session
-    # published before it wrote its workspace file still carries the id fallback -
-    # the real task name usually appears within a reconcile or two of the session
-    # starting - and a session published by an older build carries no harness prefix
-    # at all. Both self-heal on the next reconcile rather than needing the state file
-    # to be cleared by hand.
-    $needsName = ($agent.RefreshName -and [string]$entry.Name -notmatch '^Copilot: ') -or
-                 ([string]$entry.Name -match '^Copilot: [0-9a-f]{8}$')
+    # Re-resolve the name of an agent whose sessions can be renamed while they run.
+    # Copilot's name is whatever its workspace file says, and that changes twice over
+    # a session's life: the id fallback gives way to the first prompt once the file is
+    # written, and renaming the session replaces that with whatever the user typed.
+    # Only comparing it while it still looked generic left a rename showing the old
+    # name for as long as the session lasted, so it is compared every pass - one read
+    # of a small file, against a reconcile that already talks to Home Assistant.
+    # A session of any kind can also be carrying the Copilot id fallback, from a build
+    # that published it before its own adapter loaded; that heals here too.
+    $needsName = [bool]$agent.RefreshName -or ([string]$entry.Name -match '^Copilot: [0-9a-f]{8}$')
     if ($needsName) {
         $workingDirectory = if ($session.PSObject.Properties.Name -contains 'WorkingDirectory' -and $session.WorkingDirectory) {
             [string]$session.WorkingDirectory
@@ -480,12 +482,14 @@ function Update-DaemonKnownSession {
         if ([string]$refreshed.Name -ne [string]$entry.Name) {
             $entry.Name = $refreshed.Name
             try {
+                # Discarded like every other publish here: this runs on any rename, and
+                # what it emits would otherwise ride out through the reconcile.
                 Set-CopilotMqttStatus -SessionId $id -Status ([string]$entry.Status) -Headers $Headers -Attributes @{
                     session = $entry.Name
                     machine = $entry.Machine
                     process_id = $session.ProcessId
                     updated = [DateTimeOffset]::Now.ToString('o')
-                }
+                } | Out-Null
             }
             catch { }
             Write-DaemonLog -Message "renamed $($id.Substring(0,8)) to '$($entry.Name)'"

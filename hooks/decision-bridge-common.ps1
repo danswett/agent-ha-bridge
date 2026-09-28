@@ -1183,6 +1183,12 @@ function Get-CopilotSessionDisplay {
 
     $machine = [Environment]::MachineName
 
+    # A session nobody has renamed is named after its first prompt, which can run to
+    # hundreds of characters and turns the card header into a wall of text. Capped the
+    # way the Claude and Codex adapters cap theirs, and before sanitising so the cut
+    # cannot leave a live delimiter behind.
+    if ($name.Length -gt 120) { $name = $name.Substring(0, 117) + '...' }
+
     # The name comes from the session's own workspace file, which is named after the
     # task, so treat it as untrusted before it reaches a template.
     $name = Remove-CopilotTemplateMarkup -Text $name

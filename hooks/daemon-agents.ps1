@@ -16,7 +16,8 @@
       KnownActivity     reconcile: likewise, for a session already in state
       HookStatus        its hooks record the status, which is authoritative
       InlineReasoning   the card shows its thinking inline, newest line of either kind
-      RefreshName       its name is re-resolved until it carries the harness prefix
+      RefreshName       its sessions can be renamed while they run, so the name is
+                        re-resolved on every reconcile rather than fixed at adoption
       KnowsProcessId    its live sessions carry the owning process id (Copilot's
                         injector finds the process by its lock file instead)
       AskUserState      whether a question it asked is still waiting, from its transcript

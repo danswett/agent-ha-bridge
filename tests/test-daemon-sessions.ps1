@@ -68,7 +68,8 @@ function Set-CopilotMqttEntityIds { param($SessionId) $true }
 function Clear-CopilotMqttDecisionFields { param($SessionId, $SessionName, $Machine, $Headers) }
 function Publish-CopilotMqttSubmitButton { param($SessionId, $SessionName, $Machine, $Headers) }
 # These emit something, as real calls can, to prove none of it leaks into what is returned.
-function Set-CopilotMqttStatus { param($SessionId, $Status, $Headers, $Attributes) 'status-response' }
+function Set-CopilotMqttStatus { param($SessionId, $Status, $Headers, $Attributes) $script:StatusAttributes[$SessionId] = $Attributes; 'status-response' }
+$script:StatusAttributes = @{}
 function Set-CopilotMqttActivity { param($SessionId, $Summary, $Detail, $Headers) }
 function Invoke-HomeAssistantService { param($Domain, $Service, $Headers, $Data) @('service', 'response') }
 function Start-Sleep { param($Milliseconds, $Seconds) }
@@ -84,13 +85,17 @@ function Remove-CopilotMqttSession { param($SessionId, $Headers) $script:Retired
 function Remove-CopilotDecisionMarker { param($SessionId) }
 function Update-DaemonSessionActivity { param($Id, $Entry, $Session, $Headers, $VerboseOn) $script:Streamed += $Id }
 function Test-BridgeSessionWorking { param($SessionId, $Kind, $Transcript, $Status) $false }
-function Get-BridgeSessionDisplay { param($SessionId, $Kind, $WorkingDirectory) [pscustomobject]@{ Name = "Claude: $SessionId"; Machine = 'DESK' } }
+function Get-BridgeSessionDisplay { param($SessionId, $Kind, $WorkingDirectory)
+    $resolved = if ($script:DisplayNames.ContainsKey($SessionId)) { $script:DisplayNames[$SessionId] } else { "Claude: $SessionId" }
+    [pscustomobject]@{ Name = $resolved; Machine = 'DESK' } }
+$script:DisplayNames = @{}
 $script:DaemonDashboardSignature = $null
 $script:DaemonPendingRetire = @()
 $script:Streamed = @()
 
 # Real ids are UUIDs, and the log lines take their first eight characters.
-$script:Ids = @{ s1 = '11111111-0000-4000-8000-000000000001'; s2 = '22222222-0000-4000-8000-000000000002'; s3 = '33333333-0000-4000-8000-000000000003' }
+$script:Ids = @{ s1 = '11111111-0000-4000-8000-000000000001'; s2 = '22222222-0000-4000-8000-000000000002'; s3 = '33333333-0000-4000-8000-000000000003'
+    s4 = '44444444-0000-4000-8000-000000000004'; s5 = '55555555-0000-4000-8000-000000000005' }
 function New-Session { param([string]$Id) [pscustomobject]@{ SessionId = $script:Ids[$Id]; Kind = 'claude'; Transcript = 'C:\nope.jsonl'; WorkingDirectory = 'C:\x'; ProcessId = 1 } }
 $state = @{}
 Sync-DaemonSessions -Headers $headers -State $state -Live @{ $script:Ids.s1 = (New-Session 's1'); $script:Ids.s2 = (New-Session 's2') }
@@ -114,6 +119,30 @@ Test-That 'and are retired on the next' { ($script:Retired -join ',') -eq $scrip
 $rebuilds = @($script:Log | Where-Object { $_ -like 'dashboard rebuilt*' }).Count
 Sync-DaemonSessions -Headers $headers -State $state -Live @{ $script:Ids.s1 = (New-Session 's1') }
 Test-That 'an unchanged pass does not rebuild the dashboard' { @($script:Log | Where-Object { $_ -like 'dashboard rebuilt*' }).Count -eq $rebuilds }
+
+Write-Host '--- a session renamed while it runs ---'
+# Copilot takes its name from its workspace file, which the user can rewrite at any
+# point; the name it was adopted under says nothing about whether it is still current.
+$renamed = $script:Ids.s4
+function New-CopilotSession { param([string]$Id) [pscustomobject]@{ SessionId = $script:Ids[$Id]; Kind = 'copilot'; Transcript = 'C:\nope.jsonl'; WorkingDirectory = 'C:\x'; ProcessId = 1 } }
+$script:DisplayNames[$renamed] = 'Copilot: the whole first prompt, at length'
+$renameState = @{}
+Sync-DaemonSessions -Headers $headers -State $renameState -Live @{ $renamed = (New-CopilotSession 's4') }
+Test-That 'it is adopted under the name its workspace file gave' { $renameState[$renamed].Name -eq 'Copilot: the whole first prompt, at length' }
+
+$script:DisplayNames[$renamed] = 'Copilot: agent-ha-bridge'
+$renameLeak = Sync-DaemonSessions -Headers $headers -State $renameState -Live @{ $renamed = (New-CopilotSession 's4') }
+Test-That 'renaming it is picked up next pass, though the old name looked perfectly real' { $renameState[$renamed].Name -eq 'Copilot: agent-ha-bridge' }
+Test-That 'the new name reaches its status attributes' { $script:StatusAttributes[$renamed].session -eq 'Copilot: agent-ha-bridge' }
+Test-That 'and its card header' { @($script:DashboardSessions | Where-Object { $_.Name -eq 'Copilot: agent-ha-bridge' }).Count -eq 1 }
+Test-That 'and the republish it triggers returns nothing to the reconcile' { $null -eq $renameLeak } ($renameLeak -join ',')
+
+# The other half of the same check: a session of any kind can be holding the Copilot
+# id fallback, from a build that published it before its own adapter had loaded.
+$stale = $script:Ids.s5
+$staleState = @{ $stale = [pscustomobject]@{ Offset = 0; Name = "Copilot: $($stale.Substring(0, 8))"; Machine = 'DESK'; Status = 'idle'; Kind = 'claude' } }
+Sync-DaemonSessions -Headers $headers -State $staleState -Live @{ $stale = (New-Session 's5') }
+Test-That 'a stale id fallback on another agent still heals' { $staleState[$stale].Name -eq "Claude: $stale" }
 
 Remove-Item -LiteralPath $script:DaemonConfig.LogFile -Force -ErrorAction SilentlyContinue
 Write-Host ''

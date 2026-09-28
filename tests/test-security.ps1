@@ -64,6 +64,36 @@ Test-That 'a hostile Claude folder name is neutralised' {
     $display.Name -notmatch '\{\{'
 } (Get-ClaudeSessionDisplay -SessionId 'abc' -WorkingDirectory "C:\repos\{{ states('sun.sun') }}").Name
 
+# A Copilot session is named by its workspace file, so these go through a real one.
+$nameRoot = Join-Path ([System.IO.Path]::GetTempPath()) ("bridge-name-" + [Guid]::NewGuid().ToString('N'))
+$origNameRoot = $script:DecisionBridgeConfig.SessionStateRoot
+function New-CopilotWorkspaceDisplay {
+    param([string]$Id, [string]$Label)
+    $dir = Join-Path $nameRoot $Id
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    Set-Content -LiteralPath (Join-Path $dir 'workspace.yaml') -Value "id: $Id`nname: $Label" -Encoding UTF8
+    Get-CopilotSessionDisplay -SessionId $Id -WorkingDirectory 'C:\x'
+}
+try {
+    $script:DecisionBridgeConfig.SessionStateRoot = $nameRoot
+    $hostileName = New-CopilotWorkspaceDisplay -Id 'sess-evil' -Label "{{ states('sun.sun') }}"
+    Test-That 'a hostile Copilot workspace name is neutralised' { $hostileName.Name -notmatch '\{\{' } $hostileName.Name
+    # An unnamed session is named after its whole first prompt, which is unbounded.
+    $longName = New-CopilotWorkspaceDisplay -Id 'sess-long' -Label ('word ' * 120)
+    Test-That 'a name as long as a first prompt is capped, as Claude''s and Codex''s are' {
+        $longName.Name.Length -eq 120 -and $longName.Name.EndsWith('...')
+    } "$($longName.Name.Length) chars"
+    # 'Copilot: ' plus 107 characters puts the cut between the two braces.
+    $splitName = New-CopilotWorkspaceDisplay -Id 'sess-edge' -Label (('x' * 107) + "{{ states('sun.sun') }}")
+    Test-That 'and a cap landing mid-delimiter still leaves nothing a template would run' {
+        $splitName.Name -notmatch '\{\{'
+    } $splitName.Name
+}
+finally {
+    $script:DecisionBridgeConfig.SessionStateRoot = $origNameRoot
+    Remove-Item -LiteralPath $nameRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 Write-Host '--- session ids used as paths ---'
 $traversals = @('../../../../evil', '..\..\evil', 'a/b/c', 'C:\Windows\System32', '....//evil', '')
 foreach ($candidate in $traversals) {
