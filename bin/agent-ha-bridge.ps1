@@ -188,7 +188,7 @@ function Show-Status {
     }
     elseif (-not $script:BridgeIsWindows) {
         $loaded = [bool](& launchctl print "gui/$(& id -u)/$launchAgentLabel" 2>$null)
-        $daemon = @(Get-BridgeProcessesNamed -Name 'pwsh' | Where-Object { $_.CommandLine -match 'agent-bridge-daemon\.ps1' })
+        $daemon = @(Get-BridgeProcessesNamed -Name 'pwsh' -WithCommandLine | Where-Object { $_.CommandLine -match 'agent-bridge-daemon\.ps1' })
         if ($daemon) { Write-Host "    daemon     : running (pid $($daemon[0].ProcessId))" -ForegroundColor Green }
         elseif ($loaded) { Write-Host '    daemon     : not running - launchd will start it again shortly' -ForegroundColor Yellow }
         else { Write-Host "    daemon     : the '$launchAgentLabel' LaunchAgent is not loaded - run agent-ha-bridge configure" -ForegroundColor Yellow }

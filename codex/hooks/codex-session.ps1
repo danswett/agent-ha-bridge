@@ -112,7 +112,7 @@ function Get-CodexOwningProcessId {
     $fallback = 0
     $current = $StartPid
     for ($depth = 0; $depth -lt $MaxDepth; $depth++) {
-        $process = Get-BridgeProcessInfo -ProcessId $current -WithCommandLine
+        $process = Get-BridgeProcessInfo -ProcessId $current
         if (-not $process) { break }
         # Exact match: codex-windows-sandbox-setup and codex-command-runner also exist.
         if (Test-BridgeAgentProcess -Process $process -Agent 'codex') {
@@ -146,8 +146,18 @@ function Get-CodexOwningProcessId {
 }
 
 function Test-CodexAppServer {
+    <#
+        Whether a codex process is the app-server rather than a terminal window. From
+        its path where that is known (Windows: the daemon runs from
+        ~\.codex\packages\app-server-daemon), which costs nothing; otherwise from its
+        command line, fetched only then.
+    #>
     param([Parameter(Mandatory)][object]$Process)
-    [string]$Process.CommandLine -match '\sapp-server(\s|$)'
+    $path = if ($Process.PSObject.Properties['Path']) { [string]$Process.Path } else { '' }
+    if ($path) { return $path -match '[\\/]app-server-daemon[\\/]' }
+    $commandLine = if ($Process.PSObject.Properties['CommandLine'] -and $Process.CommandLine) { [string]$Process.CommandLine }
+        else { Get-BridgeCommandLine -ProcessId ([int]$Process.ProcessId) }
+    $commandLine -match '\sapp-server(\s|$)'
 }
 
 function Get-CodexRecordedProcessId {

@@ -87,6 +87,7 @@ function ConvertFrom-BridgePsLine {
         ProcessId       = [int]$Matches[1]
         ParentProcessId = [int]$Matches[2]
         Name            = $Matches[4]
+        Path            = ''
         CommandLine     = $null
         CreationDate    = ConvertFrom-BridgeElapsedTime -Elapsed $Matches[3]
     }
@@ -102,19 +103,43 @@ function Get-BridgeCommandLine {
     finally { $global:LASTEXITCODE = 0 }
 }
 
+function ConvertFrom-BridgeProcessObject {
+    <#
+        A Windows Get-Process object in Get-BridgeProcessInfo's shape.
+
+        Get-Process rather than WMI: a WMI query costs about 100 ms, and a hook walking
+        up four or five parents spent most of its second there - time Claude and Codex
+        wait for. The parent and path come from the process itself in a few
+        milliseconds; only the command line needs WMI, so it is fetched on request.
+    #>
+    param([Parameter(Mandatory)]$Process, [switch]$WithCommandLine)
+    $parentId = 0
+    try { $parent = $Process.Parent; if ($parent) { $parentId = [int]$parent.Id } } catch { }
+    [pscustomobject]@{
+        ProcessId       = [int]$Process.Id
+        ParentProcessId = $parentId
+        Name            = "$($Process.ProcessName).exe"
+        Path            = $(try { [string]$Process.Path } catch { '' })
+        CommandLine     = $(if ($WithCommandLine) { Get-BridgeCommandLine -ProcessId $Process.Id } else { $null })
+        CreationDate    = $(try { $Process.StartTime } catch { $null })
+    }
+}
+
 function Get-BridgeProcessInfo {
     <#
-        One process as { ProcessId, ParentProcessId, Name, CommandLine, CreationDate },
-        or $null when it is not running. Name is the executable's file name, with .exe
-        on Windows as WMI reports it. On macOS CommandLine is filled in only with
-        -WithCommandLine, since it costs a second `ps`.
+        One process as { ProcessId, ParentProcessId, Name, Path, CommandLine,
+        CreationDate }, or $null when it is not running. Name is the executable's file
+        name, with .exe on Windows. CommandLine is filled in only with
+        -WithCommandLine: it costs a WMI query on Windows and a second `ps` on macOS.
+        Path is known on Windows only.
     #>
     param([Parameter(Mandatory)][int]$ProcessId, [switch]$WithCommandLine)
 
     if ($ProcessId -le 0) { return $null }
     if ($script:BridgeIsWindows) {
-        return Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue |
-            Select-Object ProcessId, ParentProcessId, Name, CommandLine, CreationDate
+        $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue
+        if (-not $process) { return $null }
+        return ConvertFrom-BridgeProcessObject -Process $process -WithCommandLine:$WithCommandLine
     }
     $info = $null
     try {
@@ -132,18 +157,18 @@ function Get-BridgeProcessInfo {
 function Get-BridgeProcessesNamed {
     <#
         Every running process whose executable is named $Name (without .exe), in the
-        same shape as Get-BridgeProcessInfo, command lines included.
+        same shape as Get-BridgeProcessInfo; with command lines when asked for.
     #>
-    param([Parameter(Mandatory)][string]$Name)
+    param([Parameter(Mandatory)][string]$Name, [switch]$WithCommandLine)
 
     if ($script:BridgeIsWindows) {
-        return @(Get-CimInstance Win32_Process -Filter "Name='$Name.exe'" -ErrorAction SilentlyContinue |
-            Select-Object ProcessId, ParentProcessId, Name, CommandLine, CreationDate)
+        return @(Get-Process -Name $Name -ErrorAction SilentlyContinue |
+            ForEach-Object { ConvertFrom-BridgeProcessObject -Process $_ -WithCommandLine:$WithCommandLine })
     }
     $all = try { @(& /bin/ps -A -o 'pid=,ppid=,etime=,ucomm=' 2>$null) } catch { @() }
     $global:LASTEXITCODE = 0
     @($all | ForEach-Object { ConvertFrom-BridgePsLine -Line $_ } | Where-Object { $_ -and $_.Name -eq $Name } | ForEach-Object {
-        $_.CommandLine = Get-BridgeCommandLine -ProcessId $_.ProcessId
+        if ($WithCommandLine) { $_.CommandLine = Get-BridgeCommandLine -ProcessId $_.ProcessId }
         $_
     })
 }

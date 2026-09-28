@@ -296,7 +296,7 @@ elseif (-not $script:BridgeIsWindows) {
     else { Write-Host '    not registered' }
 
     Write-Step 'Stopping any running daemon'
-    foreach ($proc in @(Get-BridgeProcessesNamed -Name 'pwsh')) {
+    foreach ($proc in @(Get-BridgeProcessesNamed -Name 'pwsh' -WithCommandLine)) {
         if ($proc.ProcessId -ne $PID -and [string]$proc.CommandLine -match 'agent-bridge-(daemon|supervisor)\.ps1') {
             Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
             Write-Host "    stopped pid $($proc.ProcessId)"

@@ -356,6 +356,8 @@ $script:AgencyPresent = $true
 $script:CopilotPresent = $true
 $script:ClaudePresent = $false
 $script:CodexPresent = $false
+# The fakes below change between calls, so nothing may be served from the cache.
+$script:BridgeLauncherCacheSeconds = 0
 function Get-BridgeAgencyPath { if ($script:AgencyPresent) { 'C:\agency.exe' } else { $null } }
 function Get-BridgeCopilotPath { if ($script:CopilotPresent) { 'C:\copilot.exe' } else { $null } }
 function Get-BridgeClaudePath { if ($script:ClaudePresent) { 'C:\claude.exe' } else { $null } }

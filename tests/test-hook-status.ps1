@@ -178,6 +178,8 @@ $script:Started = @()
 $script:Recorded = @()
 $script:Notes = @()
 $script:FakeExit = 0
+# The fake below changes between calls, so nothing may be served from the cache.
+$script:BridgeLauncherCacheSeconds = 0
 function Get-BridgeLauncherPath { param([string]$Launcher) if ($script:Installed[$Launcher]) { "C:\bin\$Launcher.exe" } else { $null } }
 function Get-DaemonClientAdapterInstalled { param([string]$Client) [bool]$script:Adapters[$Client] }
 function Add-DaemonConfiguredClient { param([string]$Client) $script:Recorded += $Client }
@@ -262,6 +264,46 @@ Test-That 'Copilot installed later is set up by the main installer' {
 Test-That 'with Copilot added to the configured clients, not replacing them' { $script:Started[0] -match '-Clients claude,codex,copilot$' }
 
 Write-Host ''
+Write-Host '--- Codex status from its registration ---'
+# The prompt and tool-call hooks only write the registration while the daemon runs;
+# the daemon publishes it. Loaded against a scratch registration folder.
+. (Join-Path $PSScriptRoot '..\codex\hooks\codex-session.ps1')
+$savedCodexLoaded = $script:CodexAdapterLoaded
+$savedCodexRoot = $script:CodexStateRoot
+$script:CodexAdapterLoaded = $true
+$script:CodexStateRoot = Join-Path ([IO.Path]::GetTempPath()) "codex-reg-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+New-Item -ItemType Directory -Path $script:CodexStateRoot -Force | Out-Null
+$script:StatusPublished = @()
+function Set-CopilotMqttStatus { param([string]$SessionId, [string]$Status, [hashtable]$Headers, [hashtable]$Attributes) $script:StatusPublished += $Status }
+try {
+    $codexEntry = [pscustomobject]@{ Name = 'Codex: x'; Machine = 'M'; Status = 'idle'; Offset = 0L }
+    Write-CodexSessionRegistration -SessionId 'cx1' -Status 'working' -Activity 'Prompt: fix it' -ProcessId 42 | Out-Null
+    $codexEntry | Add-Member -NotePropertyName LastMessage -NotePropertyValue 'the previous answer' -Force
+    Test-That 'a changed registration is picked up' { Sync-DaemonCodexHookStatus -Id 'cx1' -Entry $codexEntry -Headers $headers }
+    Test-That 'its status is published' { ($script:StatusPublished -join ',') -eq 'working' -and $codexEntry.Status -eq 'working' }
+    Test-That 'a new prompt starts the card afresh' { -not $codexEntry.LastMessage }
+    Test-That 'an unchanged registration is left alone' { -not (Sync-DaemonCodexHookStatus -Id 'cx1' -Entry $codexEntry -Headers $headers) }
+    Start-Sleep -Milliseconds 30
+    Write-CodexSessionRegistration -SessionId 'cx1' -Status 'working' -Activity 'Running: exec' -ProcessId 42 | Out-Null
+    $codexEntry.LastMessage = 'progress so far'
+    Test-That 'a tool call republishes the card' { Sync-DaemonCodexHookStatus -Id 'cx1' -Entry $codexEntry -Headers $headers }
+    Test-That 'without publishing an unchanged status again' { ($script:StatusPublished -join ',') -eq 'working' }
+    Test-That 'and without clearing what the card shows' { $codexEntry.LastMessage -eq 'progress so far' }
+
+    Remove-Item -LiteralPath (Get-BridgeDaemonHeartbeat) -ErrorAction SilentlyContinue
+    Test-That 'with no daemon heartbeat, hooks publish themselves' { -not (Test-BridgeDaemonAlive) }
+    Set-BridgeDaemonAlive
+    Test-That 'with a fresh one, they leave it to the daemon' { Test-BridgeDaemonAlive }
+    $env:AGENT_BRIDGE_HOOKS_PUBLISH = '1'
+    Test-That 'unless told to publish anyway' { -not (Test-BridgeDaemonAlive) }
+    Remove-Item Env:\AGENT_BRIDGE_HOOKS_PUBLISH
+}
+finally {
+    Remove-Item -LiteralPath $script:CodexStateRoot -Recurse -Force -ErrorAction SilentlyContinue
+    $script:CodexStateRoot = $savedCodexRoot
+    $script:CodexAdapterLoaded = $savedCodexLoaded
+}
+
 Write-Host '--- launch-card notes expire ---'
 # Nothing else clears a note: "setting it up failed" stayed long after it was fixed.
 $script:NoteState = $null

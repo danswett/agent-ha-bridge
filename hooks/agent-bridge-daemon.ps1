@@ -3048,6 +3048,60 @@ function Update-DaemonSessionActivity {
     }
 }
 
+function Sync-DaemonCodexHookStatus {
+    <#
+        Publishes what a Codex hook recorded in its registration - the status, and the
+        status line - when the registration has changed. Returns $true when it did,
+        so the card body is republished beside the new status line.
+
+        The prompt and tool-call hooks used to publish this themselves, and the agent
+        waits for a hook: about half a second per tool call went on Home Assistant.
+        They now only write the registration while the daemon is running (see
+        Test-BridgeDaemonAlive), and this picks it up within a tick.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Id,
+        [Parameter(Mandatory)]$Entry,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    if (-not $script:CodexAdapterLoaded) { return $false }
+    $registration = Join-Path (Get-CodexStateRoot) ((Get-CodexSafeSessionKey -SessionId $Id) + '.json')
+    $stamp = [IO.File]::GetLastWriteTimeUtc($registration).Ticks
+    $key = "codex:$Id"
+    if ($script:DaemonRegistrationStamps.ContainsKey($key) -and $script:DaemonRegistrationStamps[$key] -eq $stamp) { return $false }
+    $script:DaemonRegistrationStamps[$key] = $stamp
+
+    $fresh = try { Get-Content -LiteralPath $registration -Raw | ConvertFrom-Json } catch { $null }
+    if ($null -eq $fresh) { return $false }
+    $status = [string]$fresh.Status
+    $activity = [string]$fresh.Activity
+
+    # A new prompt starts the card afresh, as the hook itself used to.
+    $lastPrompt = if ($Entry.PSObject.Properties['LastPrompt']) { [string]$Entry.LastPrompt } else { '' }
+    if ($activity -like 'Prompt:*' -and $activity -ne $lastPrompt) {
+        foreach ($name in @('LastMessage', 'LastReasoning')) { Set-DaemonSessionProperty -Entry $Entry -Name $name -Value '' }
+        Set-DaemonSessionProperty -Entry $Entry -Name 'LastMessageIsThinking' -Value $false
+        Set-DaemonSessionProperty -Entry $Entry -Name 'LastHistory' -Value @()
+    }
+    Set-DaemonSessionProperty -Entry $Entry -Name 'LastPrompt' -Value $(if ($activity -like 'Prompt:*') { $activity } else { $lastPrompt })
+
+    if ($status -in @('working', 'idle', 'waiting') -and $status -ne [string]$Entry.Status) {
+        try {
+            Set-CopilotMqttStatus -SessionId $Id -Status $status -Headers $Headers -Attributes @{
+                session    = $Entry.Name
+                machine    = $Entry.Machine
+                updated    = [DateTimeOffset]::Now.ToString('o')
+                model      = [string]$fresh.Model
+                process_id = [int]($fresh.ProcessId ?? 0)
+            }
+            $Entry.Status = $status
+        }
+        catch { Write-DaemonLog -Message "codex status publish failed for $Id : $($_.Exception.Message)" }
+    }
+    $true
+}
+
 function Update-DaemonCodexActivity {
     <#
         Streams a Codex session's rollout to its card: the newest thing it said (its
@@ -3064,7 +3118,11 @@ function Update-DaemonCodexActivity {
         [Parameter(Mandatory)]$Entry,
         [Parameter(Mandatory)]$Session,
         [Parameter(Mandatory)][hashtable]$Headers,
-        [bool]$VerboseOn
+        [bool]$VerboseOn,
+
+        # Publish even with nothing new in the rollout: the hooks changed the status
+        # line, which the card shows with what it already has.
+        [switch]$Republish
     )
 
     # The rollout reader ships with the Codex adapter. Without it there is nothing to
@@ -3074,7 +3132,7 @@ function Update-DaemonCodexActivity {
     $append = Read-CodexTranscriptAppend -Path ([string]$Session.Transcript) `
         -Offset ([long]$Entry.Offset) -MaxTailBytes $script:DaemonConfig.MaxTailBytes
     $Entry.Offset = $append.Offset
-    if ($append.Lines.Count -eq 0) { return }
+    if ($append.Lines.Count -eq 0 -and -not $Republish) { return }
 
     $activity = Get-CodexActivityFromTranscript -Lines $append.Lines
     if ($activity.TurnStarted) {
@@ -3082,7 +3140,7 @@ function Update-DaemonCodexActivity {
         Set-DaemonSessionProperty -Entry $Entry -Name 'LastMessageIsThinking' -Value $false
         Set-DaemonSessionProperty -Entry $Entry -Name 'LastHistory' -Value @()
     }
-    if (-not $activity.TurnStarted -and -not $activity.Latest -and @($activity.History).Count -eq 0) { return }
+    if (-not $Republish -and -not $activity.TurnStarted -and -not $activity.Latest -and @($activity.History).Count -eq 0) { return }
 
     if ($activity.Latest) {
         Set-DaemonSessionProperty -Entry $Entry -Name 'LastMessage' -Value ([string]$activity.Latest)
@@ -3459,12 +3517,16 @@ function Invoke-DaemonFastActivity {
         if ($null -eq $entry -or $null -eq $session) { continue }
 
         $kind = if ($entry.PSObject.Properties.Name -contains 'Kind' -and $entry.Kind) { [string]$entry.Kind } else { 'copilot' }
-        # Codex: its status comes from its hooks, and what it says from its rollout.
+        # Codex: what it says comes from its rollout, and its status from the
+        # registration its hooks write - published here, so a hook on every tool call
+        # does not wait on Home Assistant (Sync-DaemonCodexHookStatus).
         if ($kind -eq 'codex') {
+            $republish = Sync-DaemonCodexHookStatus -Id $id -Entry $entry -Headers $Headers
             $length = 0L
-            try { $length = [IO.FileInfo]::new([string]$session.Transcript).Length } catch { continue }
-            if ($length -ne [long]$entry.Offset) {
-                Update-DaemonCodexActivity -Id $id -Entry $entry -Session $session -Headers $Headers -VerboseOn ([bool]$script:DaemonVerbose)
+            try { $length = [IO.FileInfo]::new([string]$session.Transcript).Length } catch { }
+            if ($republish -or ($length -gt 0 -and $length -ne [long]$entry.Offset)) {
+                Update-DaemonCodexActivity -Id $id -Entry $entry -Session $session -Headers $Headers `
+                    -VerboseOn ([bool]$script:DaemonVerbose) -Republish:$republish
             }
             continue
         }
@@ -3508,10 +3570,14 @@ function Sync-DaemonSessions {
     #>
     param(
         [Parameter(Mandatory)][hashtable]$Headers,
-        [Parameter(Mandatory)][hashtable]$State
+        [Parameter(Mandatory)][hashtable]$State,
+
+        # The live sessions, when the caller has just found them - the main loop does,
+        # and scanning twice a pass doubled the cost.
+        [hashtable]$Live
     )
 
-    $live = Get-LiveBridgeSessions
+    $live = if ($null -ne $Live) { $Live } else { Get-LiveBridgeSessions }
     $verbose = Test-VerboseStreaming -Headers $Headers
     # The fast lane streams between reconciles from this snapshot.
     $script:DaemonLive = $live
@@ -4559,7 +4625,7 @@ function Start-BridgeDaemon {
                 # them. The fast lane between steps costs a file-size check per session
                 # when nothing changed.
                 $live = Get-LiveBridgeSessions
-                Sync-DaemonSessions -Headers $headers -State $state
+                Sync-DaemonSessions -Headers $headers -State $state -Live $live
                 Repair-CopilotSessionEntities -Headers $headers -State $state -Live $live
                 Invoke-DaemonFastActivity -Headers $headers -State $state
                 Invoke-PendingDecisions -Headers $headers -State $state -Live $live
@@ -4574,6 +4640,11 @@ function Start-BridgeDaemon {
                 Clear-DaemonStaleNote -Headers $headers
                 Invoke-DaemonFastActivity -Headers $headers -State $state
                 Write-DaemonState -State $state
+                # A pass that got this far talked to Home Assistant, so hooks can skip
+                # their own reachability probe for a while (Test-HomeAssistantReachable),
+                # and it is alive to publish what they record (Test-BridgeDaemonAlive).
+                Set-BridgeHomeAssistantReachable
+                Set-BridgeDaemonAlive
             }
             catch {
                 Write-DaemonLog -Message "reconcile failed: $($_.Exception.Message)"

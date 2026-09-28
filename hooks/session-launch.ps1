@@ -495,13 +495,27 @@ function Update-BridgeProcessPath {
     if (@($added).Count -gt 0) { $env:Path = (@($current) + @($added)) -join ';' }
 }
 
+# How long the installed-agent list is kept. Finding each agent searches PATH and
+# several install folders - about 75 ms for the four - and a reconcile asked four
+# times, which made it half of every pass. A new install is still noticed within a
+# minute, which is also how often PATH itself is refreshed.
+$script:BridgeLauncherCacheSeconds = 60
+$script:BridgeLauncherCache = $null
+
 function Get-BridgeAvailableLaunchers {
     <#
         The launchers installed on this machine, in preference order. This is what the
         dashboard's agent selector offers, so it cannot show a choice that would fail.
     #>
     Update-BridgeProcessPath
-    @(@($script:BridgeLaunchers.Keys) | Where-Object { Get-BridgeLauncherPath -Launcher $_ })
+    $cache = $script:BridgeLauncherCache
+    if ($null -ne $cache -and $cache.Path -eq $env:PATH -and
+        ([DateTimeOffset]::Now - $cache.At).TotalSeconds -lt $script:BridgeLauncherCacheSeconds) {
+        return @($cache.Launchers)
+    }
+    $found = @(@($script:BridgeLaunchers.Keys) | Where-Object { Get-BridgeLauncherPath -Launcher $_ })
+    $script:BridgeLauncherCache = [pscustomobject]@{ At = [DateTimeOffset]::Now; Path = $env:PATH; Launchers = $found }
+    @($found)
 }
 
 function Get-BridgeLauncherLabel {
