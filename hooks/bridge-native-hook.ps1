@@ -65,6 +65,56 @@ function Get-BridgeNativeHookPath {
     $null
 }
 
+# The oldest Copilot CLI seen to run an `exec` hook (a program with no shell): 1.0.88,
+# on DASDESK, 2026-09-27. The docs give no minimum, and an older CLI that did not know
+# `exec` could drop the hook - so older ones keep their PowerShell hooks.
+$script:BridgeCopilotExecMinVersion = [version]'1.0.88'
+
+function Get-BridgeCopilotVersion {
+    <# The installed Copilot CLI's version, from `copilot --version`, or $null. #>
+    $command = Get-Command copilot -ErrorAction SilentlyContinue | Select-Object -First 1
+    if (-not $command) { return $null }
+    try {
+        $text = (& $command.Source --version 2>$null | Out-String)
+        $global:LASTEXITCODE = 0
+        if ($text -match '(\d+\.\d+\.\d+)') { return [version]$Matches[1] }
+    }
+    catch { }
+    $null
+}
+
+function Test-BridgeCopilotRunsExec {
+    <# Whether this machine's Copilot CLI can run the native hook through `exec`. #>
+    param([AllowNull()][version]$Version)
+    $null -ne $Version -and $Version -ge $script:BridgeCopilotExecMinVersion
+}
+
+function ConvertTo-BridgeCopilotExecHook {
+    <#
+        Turns Copilot hook definitions that run a script through PowerShell
+        (`powershell = "& '<script>'"`) into ones that run the native hook with no
+        shell (`exec`, `args`), the script kept as its fallback. `exec` may not be
+        combined with `powershell` or `bash`, so those go. Changes $HookDefs in place.
+    #>
+    param(
+        [Parameter(Mandatory)][System.Collections.IDictionary]$HookDefs,
+        [Parameter(Mandatory)][string]$NativeHook
+    )
+
+    $nativeNames = @{ agentStop = 'agent_stop'; preToolUse = 'ask_user'; notification = 'permission' }
+    foreach ($eventName in @($HookDefs.Keys)) {
+        if (-not $nativeNames.ContainsKey($eventName)) { continue }
+        foreach ($def in $HookDefs[$eventName]) {
+            $scriptPath = ([regex]::Match([string]$def.powershell, "'([^']+)'")).Groups[1].Value
+            if (-not $scriptPath) { continue }
+            $def.Remove('powershell')
+            $def.Remove('bash')
+            $def.exec = $NativeHook
+            $def.args = @('copilot', $nativeNames[$eventName], $scriptPath)
+        }
+    }
+}
+
 function Install-BridgeNativeHook {
     <#
         Puts the native hook in $BinDir: a local build from the checkout when there is

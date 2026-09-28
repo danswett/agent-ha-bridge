@@ -1678,6 +1678,17 @@ if (Test-Path -LiteralPath $legacySkillDir) {
     Write-Host "    $legacySkillDir"
 }
 
+# --------------------------------------------------------------- native hook
+# The fast hook program (docs/fast-hooks.md), before any agent's hooks are written:
+# they point at it only when it is installed and runs. Without it they stay PowerShell.
+Write-Step 'Installing the native hook'
+$nativeRepository = if ($config.PSObject.Properties['updates'] -and $config.updates -and $config.updates.repository) {
+    [string]$config.updates.repository
+} else { 'danswett/agent-ha-bridge' }
+$nativeHook = Install-BridgeNativeHook -RepoRoot $repoRoot -BinDir $binDir -Version $version -Repository $nativeRepository
+if ($nativeHook.Path) { Write-Host "    $($nativeHook.Path) ($($nativeHook.Detail))" }
+else { Write-Host "    skipped: $($nativeHook.Detail); hooks stay PowerShell" -ForegroundColor DarkGray }
+
 # ------------------------------------------------------- configure Copilot CLI
 if ($selectedClients -contains 'copilot') {
     if (-not (Test-BridgeClientInstalled 'copilot')) {
@@ -1717,9 +1728,21 @@ if ($selectedClients -contains 'copilot') {
             }
         )
     }
+    # The native hook, run with no shell (`exec` + `args`), when it is installed and runs
+    # and this Copilot is new enough to take it (Test-BridgeCopilotRunsExec). Agency runs
+    # Copilot and uses these same hooks. The script stays as the native hook's fallback.
+    $copilotVersion = if ($nativeHook.Path) { Get-BridgeCopilotVersion } else { $null }
+    $copilotExec = [bool]$nativeHook.Path -and (Test-BridgeCopilotRunsExec -Version $copilotVersion)
+    if ($copilotExec) {
+        ConvertTo-BridgeCopilotExecHook -HookDefs $hookDefs -NativeHook $nativeHook.Path
+        Write-Host "    through the native hook (Copilot $copilotVersion)"
+    }
+    elseif ($nativeHook.Path) {
+        Write-Host "    PowerShell hooks: Copilot $(if ($copilotVersion) { $copilotVersion } else { 'not found' }) is older than $($script:BridgeCopilotExecMinVersion), the first seen to run the native hook" -ForegroundColor DarkGray
+    }
     # Off Windows the CLI runs a hook's `bash` command, so each gets one that starts
     # the same script under pwsh, by full path - a hook's PATH may not include it.
-    if (-not $script:BridgeIsWindows) {
+    if (-not $script:BridgeIsWindows -and -not $copilotExec) {
         $pwshForHooks = (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source
         foreach ($event in @($hookDefs.Keys)) {
             foreach ($def in $hookDefs[$event]) {
@@ -1820,17 +1843,6 @@ elseif (-not $SkipTask) {
                        'restricted by policy; once that is sorted, run: agent-ha-bridge configure')
     }
 }
-
-# --------------------------------------------------------------- native hook
-# The fast hook program (docs/fast-hooks.md), before the adapters: they point their
-# hooks at it only when it is installed and runs. Without it they stay PowerShell.
-Write-Step 'Installing the native hook'
-$nativeRepository = if ($config.PSObject.Properties['updates'] -and $config.updates -and $config.updates.repository) {
-    [string]$config.updates.repository
-} else { 'danswett/agent-ha-bridge' }
-$nativeHook = Install-BridgeNativeHook -RepoRoot $repoRoot -BinDir $binDir -Version $version -Repository $nativeRepository
-if ($nativeHook.Path) { Write-Host "    $($nativeHook.Path) ($($nativeHook.Detail))" }
-else { Write-Host "    skipped: $($nativeHook.Detail); hooks stay PowerShell" -ForegroundColor DarkGray }
 
 # --------------------------------------------------------- configure adapters
 # Claude, Codex and the MCP server reuse the shared layer just installed, so configure

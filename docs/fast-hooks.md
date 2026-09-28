@@ -197,7 +197,7 @@ program. So:
   PreToolUse 553 -> 38 ms. Claude Code reads hooks at start, so running sessions keep the
   old commands until restarted; Codex asks to trust the changed hook once. The previous
   Claude settings on DASDESK are in `~/.claude/settings.json.pre-native-hook`.
-- [ ] **6. Copilot (and Agency, which runs Copilot and uses its hooks).** Found
+- [x] **6. Copilot (and Agency, which runs Copilot and uses its hooks).** Found
   2026-09-27: Copilot CLI hooks accept `exec` + `args` to run a program with no shell
   (docs.github.com/en/copilot/reference/hooks-reference), e.g.
   `{ "type": "command", "exec": "<agent-bridge-hook>", "args": ["copilot", "ask_user",
@@ -206,7 +206,16 @@ program. So:
   on a crash or non-zero exit. Plan: confirm on DASDESK's Copilot 1.0.88 with a
   throwaway sessionStart hook (no prompt sent), then have install.ps1 write `exec` only
   for a Copilot at or above the confirmed version, keeping the PowerShell entries
-  otherwise. Waiting on the user's OK to start Copilot once for the probe.
+  otherwise. *Done.* Probed 2026-09-27 with the user's OK: a throwaway hook file in
+  `~/.copilot/hooks` using `exec` ran for sessionStart and agentStop and got the event on
+  stdin (hooks fire only once a prompt is sent: `copilot` started with no prompt ran
+  none, even the `powershell` control). install.ps1 now installs the native hook before
+  writing Copilot's hooks and, with Copilot >= 1.0.88 (`Test-BridgeCopilotRunsExec`),
+  writes them as `exec`/`args` (`ConvertTo-BridgeCopilotExecHook`). Live: a real
+  Copilot turn's agentStop went through the spool. Measured: 398 -> 43 ms. Agency
+  (not on DASDESK) uses the same hook file; if it bundles a Copilot older than 1.0.88,
+  the version check cannot see that - watch for it on the first Agency machine.
+  DASDESK's previous file: `~/.copilot/hooks/decision-notifier.json.pre-native-hook.bak`.
 
 ## Resuming
 

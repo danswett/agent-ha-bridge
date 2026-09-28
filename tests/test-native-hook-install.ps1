@@ -42,6 +42,33 @@ try {
     Set-Content -LiteralPath $notAProgram -Value 'not a program'
     Test-That 'nor one that does not run' { -not (Test-BridgeNativeHook -Path $notAProgram) }
 
+    Write-Host '--- Copilot (and Agency) hooks ---'
+    Test-That 'Copilot 1.0.88 and later run the native hook through exec' {
+        (Test-BridgeCopilotRunsExec -Version ([version]'1.0.88')) -and (Test-BridgeCopilotRunsExec -Version ([version]'1.2.0'))
+    }
+    Test-That 'an older Copilot, or none found, keeps PowerShell hooks' {
+        -not (Test-BridgeCopilotRunsExec -Version ([version]'1.0.87')) -and -not (Test-BridgeCopilotRunsExec -Version $null)
+    }
+    $defs = [ordered]@{
+        agentStop = @([ordered]@{ type = 'command'; powershell = "& 'C:\b\hooks\notify-agent-response.ps1'"; timeoutSec = 30 })
+        preToolUse = @([ordered]@{ type = 'command'; matcher = 'ask_user'; powershell = "& 'C:\b\hooks\route-ask-user-v3.ps1'"; bash = 'x'; timeoutSec = 120 })
+        notification = @([ordered]@{ type = 'command'; matcher = 'permission_prompt'; powershell = "& 'C:\b\hooks\notify-home-assistant.ps1'"; timeoutSec = 15 })
+    }
+    ConvertTo-BridgeCopilotExecHook -HookDefs $defs -NativeHook 'C:\b\bin\agent-bridge-hook.exe'
+    $ask = $defs.preToolUse[0]
+    Test-That 'ask_user runs the native hook, its script kept as the fallback' {
+        $ask.exec -eq 'C:\b\bin\agent-bridge-hook.exe' -and ($ask.args -join '|') -eq 'copilot|ask_user|C:\b\hooks\route-ask-user-v3.ps1'
+    }
+    Test-That 'with no powershell or bash left beside exec, which Copilot forbids' { -not $ask.Contains('powershell') -and -not $ask.Contains('bash') }
+    Test-That 'its matcher and timeout are kept' { $ask.matcher -eq 'ask_user' -and $ask.timeoutSec -eq 120 }
+    Test-That 'agentStop and notification name their own hooks' {
+        $defs.agentStop[0].args[1] -eq 'agent_stop' -and $defs.notification[0].args[1] -eq 'permission'
+    }
+    Test-That 'the result is the JSON Copilot reads' {
+        $json = @{ version = 1; hooks = $defs } | ConvertTo-Json -Depth 8 | ConvertFrom-Json
+        $json.hooks.preToolUse[0].exec -and @($json.hooks.preToolUse[0].args).Count -eq 3
+    }
+
     if (-not (Test-Path -LiteralPath $built)) {
         Write-Host "SKIP  the rest: no native hook build at $built (go build in hook/ first)" -ForegroundColor Yellow
     }
