@@ -518,25 +518,25 @@ function Invoke-DaemonReply {
     # send, so that is only the fallback.
     $explicitPid = 0
     $known = if ($script:DaemonLive) { $script:DaemonLive[$SessionId] } else { $null }
-    if ($null -ne $known -and $known.PSObject.Properties['Kind'] -and [string]$known.Kind -in @('claude', 'codex') -and
+    $knownAgent = if ($null -ne $known -and $known.PSObject.Properties['Kind']) { Get-DaemonAgent -Kind ([string]$known.Kind) } else { $null }
+    if ($null -ne $knownAgent -and $knownAgent.KnowsProcessId -and
         $known.PSObject.Properties['ProcessId'] -and [int]$known.ProcessId -gt 0 -and
         $null -ne (Get-Process -Id ([int]$known.ProcessId) -ErrorAction SilentlyContinue)) {
         $explicitPid = [int]$known.ProcessId
     }
-    if ($explicitPid -le 0) {
-        $claudeSession = (Get-LiveClaudeSessions)[$SessionId]
-        if ($null -ne $claudeSession) { $explicitPid = [int]$claudeSession.ProcessId }
-    }
-    if ($explicitPid -le 0) {
-        $codexSession = (Get-LiveCodexSessions)[$SessionId]
-        if ($null -ne $codexSession) { $explicitPid = [int]$codexSession.ProcessId }
+    foreach ($kind in @($script:DaemonAgents.Keys)) {
+        if ($explicitPid -gt 0) { break }
+        $agent = Get-DaemonAgent -Kind $kind
+        if (-not $agent.KnowsProcessId -or -not $agent.FindSessions) { continue }
+        $found = (& $agent.FindSessions)[$SessionId]
+        if ($null -ne $found) { $explicitPid = [int]$found.ProcessId }
     }
 
     # For Claude the transcript shows whether the prompt was really submitted, so the
     # send can be confirmed (Confirm-DaemonClaudeSubmit) rather than assumed.
     $claudeTranscript = ''
     $transcriptBefore = 0L
-    if ($null -ne $known -and [string]$known.Kind -eq 'claude' -and $known.PSObject.Properties['Transcript'] -and
+    if ($null -ne $knownAgent -and $knownAgent.TranscriptConfirmsInput -and $known.PSObject.Properties['Transcript'] -and
         [IO.File]::Exists([string]$known.Transcript)) {
         $claudeTranscript = [string]$known.Transcript
         $transcriptBefore = [IO.FileInfo]::new($claudeTranscript).Length

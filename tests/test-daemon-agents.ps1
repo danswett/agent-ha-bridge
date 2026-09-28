@@ -171,6 +171,56 @@ $script:DaemonLive = @{
 Test-That 'Claude and Codex sessions give their process' { (Get-DaemonSessionProcessId -SessionId 'b') -eq 11 -and (Get-DaemonSessionProcessId -SessionId 'c') -eq 22 }
 Test-That 'Copilot and others leave it to the lock file' { (Get-DaemonSessionProcessId -SessionId 'a') -eq 0 -and (Get-DaemonSessionProcessId -SessionId 'm') -eq 0 }
 
+Write-Host '--- questions and approvals ---'
+function Get-CopilotAskUserState { param($TranscriptPath) [pscustomobject]@{ Reader = 'copilot' } }
+function Get-ClaudeAskUserState { param($TranscriptPath, $ToolCallId, $Since) [pscustomobject]@{ Reader = 'claude'; ToolCallId = $ToolCallId; Since = $Since } }
+$script:ClaudeAdapterLoaded = $true
+$ask = Get-DaemonAskUserState -Session ([pscustomobject]@{ Kind = 'claude'; Transcript = 't' }) -Marker ([pscustomobject]@{ toolCallId = 'tc1'; armedAt = 'then' })
+Test-That 'a Claude question is read by Claude''s reader, for the marker''s own question' { $ask.Reader -eq 'claude' -and $ask.ToolCallId -eq 'tc1' -and $ask.Since -eq 'then' }
+Test-That 'Copilot''s, and an unlisted kind''s, by Copilot''s' {
+    (Get-DaemonAskUserState -Session ([pscustomobject]@{ Kind = 'copilot'; Transcript = 't' })).Reader -eq 'copilot' -and
+    (Get-DaemonAskUserState -Session ([pscustomobject]@{ Transcript = 't' })).Reader -eq 'copilot'
+}
+$script:ClaudeAdapterLoaded = $false
+Test-That 'Claude without its adapter falls back to Copilot''s reader, as before' { (Get-DaemonAskUserState -Session ([pscustomobject]@{ Kind = 'claude'; Transcript = 't' })).Reader -eq 'copilot' }
+
+$script:DaemonLive = @{ cp = [pscustomobject]@{ Kind = 'copilot' } }
+$delivery = [pscustomobject]@{ Delivered = $true; ProcessId = 1 }
+Test-That 'only an agent whose transcript confirms input has its answer checked' { (Complete-DaemonClaudeAnswer -SessionId 'cp' -Delivery $delivery) -eq $delivery }
+Test-That 'Claude alone confirms input from its transcript' {
+    (@($script:DaemonAgents.Keys | Where-Object { (Get-DaemonAgent -Kind $_).TranscriptConfirmsInput }) -join ',') -eq 'claude'
+}
+
+$script:Approved = @()
+function Get-CodexApprovalMarker { param($SessionId) [pscustomobject]@{ id = $SessionId } }
+function Get-HomeAssistantState { param($EntityId, $Headers) [pscustomobject]@{ state = 'Approve' } }
+function Send-CopilotSessionPrompt { param($SessionId, $Text, $ProcessId) $script:Approved += "${SessionId}:$Text"; [pscustomobject]@{ Delivered = $true; ProcessId = $ProcessId; Detail = '' } }
+function Clear-CopilotMqttDecision { param($SessionId, $SessionName, $Machine, $Headers) }
+$cx = '44444444-0000-4000-8000-000000000004'; $cl = '55555555-0000-4000-8000-000000000005'
+$approvalLive = @{ $cx = [pscustomobject]@{ Kind = 'codex'; ProcessId = 9 }; $cl = [pscustomobject]@{ Kind = 'claude'; ProcessId = 8 } }
+$approvalState = @{ $cx = [pscustomobject]@{ Name = 'Codex: x'; Machine = 'M' }; $cl = [pscustomobject]@{ Name = 'Claude: y'; Machine = 'M' } }
+$script:CodexAdapterLoaded = $true
+Invoke-PendingCodexApprovals -Headers @{} -State $approvalState -Live $approvalLive
+Test-That 'a Codex approval is answered, and nothing is typed into Claude' { ($script:Approved -join ',') -eq "${cx}:y" }
+$script:Approved = @(); $script:CodexAdapterLoaded = $false
+Invoke-PendingCodexApprovals -Headers @{} -State $approvalState -Live $approvalLive
+Test-That 'without the Codex adapter, no approval is read' { $script:Approved.Count -eq 0 }
+
+Write-Host '--- a reply finds its process ---'
+$script:Sent = $null
+function Send-CopilotSessionPrompt { param($SessionId, $Text, $ProcessId) $script:Sent = $ProcessId; [pscustomobject]@{ Delivered = $true; ProcessId = $ProcessId; Detail = 'ok' } }
+function Set-DaemonTransientActivity { param($SessionId, $Summary, $Extra, $Headers) }
+function Invoke-HomeAssistantService { param($Domain, $Service, $Headers, $Data) }
+function Get-LiveClaudeSessions { @{} }
+function Get-LiveCodexSessions { @{ $cx = [pscustomobject]@{ Kind = 'codex'; ProcessId = 777 } } }
+$script:DaemonLive = @{}
+$null = Invoke-DaemonReply -SessionId $cx -Text 'hi' -Headers @{}
+Test-That 'a session the last reconcile missed is found by its agent''s own scan' { $script:Sent -eq 777 }
+$script:DaemonLive = @{ $cx = [pscustomobject]@{ Kind = 'copilot'; ProcessId = $PID } }
+function Get-LiveCodexSessions { @{} }
+$null = Invoke-DaemonReply -SessionId $cx -Text 'hi' -Headers @{}
+Test-That 'a Copilot session leaves the process to the lock file' { $script:Sent -eq 0 }
+
 Remove-Item -LiteralPath $script:DaemonConfig.LogFile -Force -ErrorAction SilentlyContinue
 Write-Host ''
 if ($script:Failures) {

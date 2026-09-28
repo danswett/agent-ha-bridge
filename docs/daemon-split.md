@@ -104,8 +104,12 @@ after the Claude and Codex checks, so the table has to name it outright.
   `Display`; flag `KnowsProcessId`. `Get-LiveBridgeSessions` loops the table.
   *Done.* Tests in `test-daemon-agents.ps1` stub `Get-BridgeSessionDisplay` for the
   reconcile checks, so the display checks ask the table directly.
-- [ ] **C. Decisions and replies**. Claude's question parser, Codex approvals,
-  Claude's reply confirmation.
+- [x] **C. Decisions and replies**. Claude's question parser, Codex approvals,
+  Claude's reply confirmation. *Done.* Slots `AskUserState`
+  (inherited), `ApprovalMarker`; flag `TranscriptConfirmsInput` (replies and answers).
+  `Invoke-DaemonReply`'s fallback process scan loops agents with `KnowsProcessId`.
+  `Invoke-PendingCodexApprovals` keeps its name but serves any agent with an
+  `ApprovalMarker`.
 - [ ] **D. Launch** (`session-launch.ps1`, `daemon-launch.ps1`). Arguments,
   resume, transcript location, Codex's first prompt.
 - [ ] **E. Maintenance**. Install notes per client.

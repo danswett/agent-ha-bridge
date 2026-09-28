@@ -19,9 +19,13 @@
       RefreshName       its name is re-resolved until it carries the harness prefix
       KnowsProcessId    its live sessions carry the owning process id (Copilot's
                         injector finds the process by its lock file instead)
+      AskUserState      whether a question it asked is still waiting, from its transcript
+      ApprovalMarker    a pending tool approval its hook recorded, or $null
+      TranscriptConfirmsInput  its transcript shows whether typed input was submitted,
+                        so a reply or an answer is confirmed rather than assumed
 
     Copilot is the default: a slot an entry leaves out, or a kind that is blank or not
-    listed, gets Copilot's Display, ReadAppend, Activity and IsWorking. That is what the old
+    listed, gets Copilot's Display, ReadAppend, Activity, IsWorking and AskUserState. That is what the old
     `else` branches did. Flags are never inherited.
     An entry whose adapter is optional checks that it loaded and falls back the way
     those branches did.
@@ -39,6 +43,7 @@ $script:DaemonAgents = [ordered]@{
         ReadAppend = { param($Path, $Offset) Read-TranscriptAppend -Path $Path -Offset $Offset }
         Activity = { param($Lines, $VerboseMode) Get-ActivityFromEvents -Lines $Lines -VerboseMode $VerboseMode }
         IsWorking = { param($SessionId, $Transcript, $Status) Test-CopilotSessionWorking -SessionId $SessionId }
+        AskUserState = { param($Session, $Marker) Get-CopilotAskUserState -TranscriptPath ([string]$Session.Transcript) }
         RefreshName = $true
     }
 
@@ -97,9 +102,22 @@ $script:DaemonAgents = [ordered]@{
             }
             $changed
         }
+        # Judged by the marker's own question, not whichever one the transcript shows last.
+        AskUserState = {
+            param($Session, $Marker)
+            if (-not $script:ClaudeAdapterLoaded) { return Get-CopilotAskUserState -TranscriptPath ([string]$Session.Transcript) }
+            $toolCallId = ''
+            $since = $null
+            if ($null -ne $Marker) {
+                if ($Marker.PSObject.Properties['toolCallId']) { $toolCallId = [string]$Marker.toolCallId }
+                if ($Marker.PSObject.Properties['armedAt']) { $since = [string]$Marker.armedAt }
+            }
+            Get-ClaudeAskUserState -TranscriptPath ([string]$Session.Transcript) -ToolCallId $toolCallId -Since $since
+        }
         HookStatus = $true
         InlineReasoning = $true
         KnowsProcessId = $true
+        TranscriptConfirmsInput = $true
     }
 
     codex = @{
@@ -110,6 +128,11 @@ $script:DaemonAgents = [ordered]@{
             Get-CodexSessionDisplay -SessionId $SessionId -WorkingDirectory $WorkingDirectory
         }
         KnowsProcessId = $true
+        ApprovalMarker = {
+            param($SessionId)
+            if (-not $script:CodexAdapterLoaded) { return $null }
+            Get-CodexApprovalMarker -SessionId $SessionId
+        }
         # Codex reports its own status: a turn begins at UserPromptSubmit and ends at
         # Stop, both of which the hook records, so there is nothing to infer.
         IsWorking = { param($SessionId, $Transcript, $Status) $Status -eq 'working' }
@@ -153,10 +176,10 @@ function Get-DaemonAgent {
     $own =if ($script:DaemonAgents.Contains($Kind)) { $script:DaemonAgents[$Kind] } else { @{} }
     # Every slot and flag is present, so callers can test one under strict mode.
     $agent = @{
-        FindSessions = $null; PollRegistration = $null; FastActivity = $null; KnownActivity = $null
-        HookStatus = $false; InlineReasoning = $false; RefreshName = $false; KnowsProcessId = $false
+        FindSessions = $null; PollRegistration = $null; FastActivity = $null; KnownActivity = $null; ApprovalMarker = $null
+        HookStatus = $false; InlineReasoning = $false; RefreshName = $false; KnowsProcessId = $false; TranscriptConfirmsInput = $false
     }
-    foreach ($slot in 'Display', 'ReadAppend', 'Activity', 'IsWorking') { $agent[$slot] = $default[$slot] }
+    foreach ($slot in 'Display', 'ReadAppend', 'Activity', 'IsWorking', 'AskUserState') { $agent[$slot] = $default[$slot] }
     foreach ($slot in $own.Keys) { $agent[$slot] = $own[$slot] }
     $script:DaemonAgentCache[$Kind] = $agent
     $agent

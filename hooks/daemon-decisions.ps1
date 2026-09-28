@@ -385,17 +385,7 @@ function Get-DaemonAskUserState {
         [AllowNull()]$Marker = $null
     )
 
-    $kind = if ($Session.PSObject.Properties['Kind'] -and $Session.Kind) { [string]$Session.Kind } else { 'copilot' }
-    if ($kind -eq 'claude' -and $script:ClaudeAdapterLoaded) {
-        $toolCallId = ''
-        $since = $null
-        if ($null -ne $Marker) {
-            if ($Marker.PSObject.Properties['toolCallId']) { $toolCallId = [string]$Marker.toolCallId }
-            if ($Marker.PSObject.Properties['armedAt']) { $since = [string]$Marker.armedAt }
-        }
-        return Get-ClaudeAskUserState -TranscriptPath ([string]$Session.Transcript) -ToolCallId $toolCallId -Since $since
-    }
-    Get-CopilotAskUserState -TranscriptPath ([string]$Session.Transcript)
+    & (Get-DaemonAgent -Kind (Get-DaemonEntryKind -Entry $Session)).AskUserState $Session $Marker
 }
 
 function Complete-DaemonClaudeAnswer {
@@ -405,8 +395,8 @@ function Complete-DaemonClaudeAnswer {
         The option is chosen by arrow keys and Enter, but Claude can finish on a review
         screen that needs one more Enter. If the question is still pending once the keys
         have had time to land, Enter is pressed once, and the result is reported as
-        delivered only when the transcript shows the question answered. Other agents
-        are returned unchanged.
+        delivered only when the transcript shows the question answered. Agents whose
+        transcript cannot show that (TranscriptConfirmsInput) are returned unchanged.
     #>
     param(
         [Parameter(Mandatory)][string]$SessionId,
@@ -416,7 +406,8 @@ function Complete-DaemonClaudeAnswer {
     )
 
     $session = if ($script:DaemonLive) { $script:DaemonLive[$SessionId] } else { $null }
-    if ($null -eq $session -or -not $session.PSObject.Properties['Kind'] -or [string]$session.Kind -ne 'claude') { return $Delivery }
+    if ($null -eq $session -or -not $session.PSObject.Properties['Kind'] -or
+        -not (Get-DaemonAgent -Kind ([string]$session.Kind)).TranscriptConfirmsInput) { return $Delivery }
 
     $answered = {
         $deadline = [DateTimeOffset]::Now.AddMilliseconds($WaitMs)
@@ -545,13 +536,13 @@ function Invoke-PendingCodexApprovals {
         [Parameter(Mandatory)][hashtable]$Live
     )
 
-    if (-not $script:CodexAdapterLoaded) { return }
-
     foreach ($sessionId in @($Live.Keys)) {
         $session = $Live[$sessionId]
-        if ([string]$session.Kind -ne 'codex') { continue }
+        # Only an agent whose hook records approvals (Codex) has any to answer.
+        $readMarker = (Get-DaemonAgent -Kind ([string]$session.Kind)).ApprovalMarker
+        if (-not $readMarker) { continue }
 
-        $marker = Get-CodexApprovalMarker -SessionId $sessionId
+        $marker = & $readMarker $sessionId
         if ($null -eq $marker) { continue }
 
         $node = Get-CopilotMqttNodeId -SessionId $sessionId
