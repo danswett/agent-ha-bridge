@@ -217,6 +217,23 @@ program. So:
   the version check cannot see that - watch for it on the first Agency machine.
   DASDESK's previous file: `~/.copilot/hooks/decision-notifier.json.pre-native-hook.bak`.
 
+## Before releasing (1.12.0)
+
+- [ ] **R1. No release race.** The release workflow built only after publishing, so a
+  machine updating in that minute got no native hook and stayed on PowerShell hooks.
+  Now: create the release as a draft, run the workflow for its tag, check the assets,
+  then publish (automatic updates never see drafts).
+- [ ] **R2. Build the release assets in CI on every push** (no upload), so a broken
+  release build shows up before a release.
+- [ ] **R3. test-claude-install.ps1 in a sandbox TEMP**: it registered a fake session in
+  the real %TEMP% owned by the Claude running the tests, which the daemon adopted.
+- [ ] **R4. README and release notes**: Codex asks to trust its hook again once; running
+  Claude sessions pick up new hooks on restart.
+- [ ] **R5. DASDESK leftovers**: the portable Go (the user approved the machine-wide one),
+  its zip, and test folders in %TEMP%. Keep the settings backups for now.
+- [ ] **R6. test-dashboard.ps1 writes into the real bridge log**; point it at a temp log.
+- [ ] **R7. VERSION 1.12.0, release, verify the assets attached.**
+
 ## Resuming
 
 Read this file, then `git log --oneline -10`. The first unticked phase is next. A
