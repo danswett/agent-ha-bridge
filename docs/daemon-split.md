@@ -110,8 +110,13 @@ after the Claude and Codex checks, so the table has to name it outright.
   resume, transcript location, Codex's first prompt.
 - [ ] **E. Maintenance**. Install notes per client.
 
-C to E are optional: A and B are the code that runs constantly. Stop and ask the
-user before C.
+C to E are optional: A and B are the code that runs constantly. The user approved
+C to E on 2026-09-27; carry on through them without asking.
+
+After A and B a benchmark found the fast lane 25% slower (a fresh agent hashtable per
+session per tick); `526a316` caches agents and Claude's registration path, making a
+tick 20% faster than 1.11.0. Anything on the fast lane path must stay allocation-free:
+use `Get-DaemonAgent` (cached), never build an entry inline.
 
 ### Resuming
 
