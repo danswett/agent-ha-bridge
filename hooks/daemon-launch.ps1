@@ -427,8 +427,9 @@ function Confirm-DaemonPendingTrust {
 
     $pending.TrustConfirmed = $true
     $pending.LastCheck = [DateTimeOffset]::MinValue
-    Write-DaemonLog -Message "Launch pressed again: trusting the folder for the Claude session in $($pending.Label)"
-    Set-CopilotMqttNewSessionResult -Headers $Headers -Text "Trusting $($pending.Label) for Claude..." | Out-Null
+    $agent = Get-BridgeLauncherLabel -Launcher ([string]$pending.Launcher)
+    Write-DaemonLog -Message "Launch pressed again: trusting the folder for the $agent session in $($pending.Label)"
+    Set-CopilotMqttNewSessionResult -Headers $Headers -Text "Trusting $($pending.Label) for $agent..." | Out-Null
     Update-DaemonPendingLaunch -Headers $Headers | Out-Null
     $true
 }
@@ -452,22 +453,23 @@ function Send-DaemonPendingFirstMessage {
     try { $firstAgent = [string](Get-HomeAssistantState -EntityId $script:DaemonEntity.NewAgent -Headers $Headers).state } catch { }
     if ($first -in @('unknown', 'unavailable')) { $first = '' }
     $first = $first.Trim()
-    if (-not $first -or ($firstAgent -and (Resolve-BridgeLauncher -Label $firstAgent) -ne 'codex')) {
-        Write-DaemonLog -Message "stopped waiting on the Codex in $($pending.Label) for a first message: a new launch was asked for"
+    $agent = Get-BridgeLauncherLabel -Launcher ([string]$pending.Launcher)
+    if (-not $first -or ($firstAgent -and (Resolve-BridgeLauncher -Label $firstAgent) -ne [string]$pending.Launcher)) {
+        Write-DaemonLog -Message "stopped waiting on the $agent in $($pending.Label) for a first message: a new launch was asked for"
         $script:DaemonPendingLaunch = $null
         return $false
     }
 
-    $delivery = Send-CopilotSessionPrompt -SessionId 'codex-launch' -ProcessId $pending.ProcessId -Text $first
-    Write-DaemonLog -Message "first message sent to the Codex launched in $($pending.Label) (pid $($pending.ProcessId)): $($delivery.Detail)"
+    $delivery = Send-CopilotSessionPrompt -SessionId "$($pending.Launcher)-launch" -ProcessId $pending.ProcessId -Text $first
+    Write-DaemonLog -Message "first message sent to the $agent launched in $($pending.Label) (pid $($pending.ProcessId)): $($delivery.Detail)"
     if (-not $delivery.Delivered) {
-        Set-CopilotMqttNewSessionResult -Headers $Headers -Text "Couldn't send that to Codex ($($delivery.Detail)) - type it in its window." | Out-Null
+        Set-CopilotMqttNewSessionResult -Headers $Headers -Text "Couldn't send that to $agent ($($delivery.Detail)) - type it in its window." | Out-Null
         return $true
     }
     $pending.AwaitingFirstMessage = $false
     $pending.Since = [DateTimeOffset]::Now
     $pending.LastCheck = [DateTimeOffset]::MinValue
-    Set-CopilotMqttNewSessionResult -Headers $Headers -Text "Sending your first message to Codex in $($pending.Label)..." | Out-Null
+    Set-CopilotMqttNewSessionResult -Headers $Headers -Text "Sending your first message to $agent in $($pending.Label)..." | Out-Null
     try {
         Invoke-HomeAssistantService -Domain 'text' -Service 'set_value' -Headers $Headers -Data @{
             entity_id = $script:DaemonEntity.NewPrompt; value = $script:DaemonConfig.ReplyBlankValue
@@ -587,8 +589,9 @@ function Resolve-DaemonLaunchRequest {
     # bridge could never attach to. It is given a short opening message instead
     # (`newSession.codexStartPrompt`; empty turns this off, and the launch then waits
     # for a first message sent from the card).
-    if ($chosenLauncher -eq 'codex' -and -not $prompt) {
-        $prompt = ([string](Get-BridgeSetting 'newSession.codexStartPrompt' $script:DaemonConfig.CodexStartPrompt)).Trim()
+    $needsFirst = (Get-BridgeLauncher -Launcher $chosenLauncher).NeedsFirstMessage
+    if ($needsFirst -and -not $prompt) {
+        $prompt = ([string](Get-BridgeSetting "newSession.${chosenLauncher}StartPrompt" $script:DaemonConfig.CodexStartPrompt)).Trim()
     }
 
     # The profile only applies under Agency. An untouched selector falls back to the
@@ -710,7 +713,7 @@ function Start-DaemonLaunch {
         TrustAnswers   = 0
         # Codex registers only on its first message, so one opened without a prompt
         # waits for it rather than timing out (Update-DaemonPendingLaunch).
-        AwaitingFirstMessage = ($chosenLauncher -eq 'codex' -and -not $prompt)
+        AwaitingFirstMessage = ((Get-BridgeLauncher -Launcher $chosenLauncher).NeedsFirstMessage -and -not $prompt)
         FirstMessageAsked    = $false
     }
 
@@ -740,7 +743,9 @@ function Test-DaemonLaunchProgressNote {
     param([AllowEmptyString()][AllowNull()][string]$Text)
     $t = ([string]$Text).Trim()
     if (-not $t) { return $false }
-    $t.EndsWith('...') -or $t -like 'Codex is open in *' -or $t -like 'Claude is asking whether to trust *'
+    # "<Agent> is open in ..." and "<Agent> is asking whether to trust ...", for any agent
+    # (see Update-DaemonPendingLaunch); "is still asking" is an outcome, and not matched.
+    $t.EndsWith('...') -or $t -like '* is open in *. It appears here after*' -or $t -like '* is asking whether to trust *'
 }
 
 function Clear-DaemonStaleNote {
@@ -808,24 +813,24 @@ function Update-DaemonPendingLaunch {
         return
     }
 
-    if ($p.Launcher -eq 'claude' -and $p.ProcessId -gt 0) {
+    if ((Get-BridgeLauncher -Launcher $p.Launcher).AnswersTrustPrompt -and $p.ProcessId -gt 0) {
         $selection = Read-BridgeTrustPrompt -ProcessId $p.ProcessId
         if ($selection) {
             if ($p.TrustConfirmed) {
                 if ($p.TrustAnswers -lt 3) {
                     $p.TrustAnswers++
                     $sent = Send-BridgeTrustAnswer -ProcessId $p.ProcessId -Selection $selection
-                    Write-DaemonLog -Message "answered Claude's trust question for $($p.Label) (highlight was '$selection'): $sent"
+                    Write-DaemonLog -Message "answered $agent's trust question for $($p.Label) (highlight was '$selection'): $sent"
                 }
             }
             elseif ($null -eq $p.TrustAskedAt) {
                 $p.TrustAskedAt = $now
-                Write-DaemonLog -Message "Claude in $($p.Label) is asking whether to trust the folder; waiting for a second press"
+                Write-DaemonLog -Message "$agent in $($p.Label) is asking whether to trust the folder; waiting for a second press"
                 Set-CopilotMqttNewSessionResult -Headers $Headers `
-                    -Text "Claude is asking whether to trust $($p.Label). Press Launch again within 2 minutes to trust it and start."
+                    -Text "$agent is asking whether to trust $($p.Label). Press Launch again within 2 minutes to trust it and start."
             }
             elseif (($now - $p.TrustAskedAt).TotalSeconds -gt 120) {
-                & $finish "Claude is still asking whether to trust $($p.Label) - answer it in its window." `
+                & $finish "$agent is still asking whether to trust $($p.Label) - answer it in its window." `
                     "trust confirmation for $($p.Label) expired; left for the window"
             }
             return
@@ -839,12 +844,12 @@ function Update-DaemonPendingLaunch {
     if ($p.PSObject.Properties['AwaitingFirstMessage'] -and $p.AwaitingFirstMessage) {
         if (-not $p.FirstMessageAsked -and ($now - $p.Since).TotalSeconds -ge 4) {
             $p.FirstMessageAsked = $true
-            Write-DaemonLog -Message "Codex in $($p.Label) is open and waiting for its first message"
+            Write-DaemonLog -Message "$agent in $($p.Label) is open and waiting for its first message"
             Set-CopilotMqttNewSessionResult -Headers $Headers `
-                -Text "Codex is open in $($p.Label). It appears here after its first message: type one under First message and press Launch, or type it in its window."
+                -Text "$agent is open in $($p.Label). It appears here after its first message: type one under First message and press Launch, or type it in its window."
         }
         if (($now - $p.Since).TotalMinutes -gt 60) {
-            & $finish '' "Codex in $($p.Label) never got a first message; stopped waiting"
+            & $finish '' "$agent in $($p.Label) never got a first message; stopped waiting"
         }
         return
     }

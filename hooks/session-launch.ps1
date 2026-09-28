@@ -434,25 +434,146 @@ function Find-BridgeUnixCommand {
     $null
 }
 
-# Every agent the bridge can start, keyed by kind, valued by the label shown on the
-# dashboard. The order is the one 'auto' prefers: Agency first, because a machine
-# that has it expects sessions to carry an Agency profile.
+# Every agent the bridge can start, and what differs between them. The order is the
+# one 'auto' prefers: Agency first, because a machine that has it expects sessions to
+# carry an Agency profile. A launcher is not a session kind - Agency starts Copilot
+# sessions - so each names the Kind it produces; the daemon's per-kind table is
+# daemon-agents.ps1.
+#
+#   Label               shown on the dashboard
+#   Kind                the kind of session it starts
+#   Path                its executable, or $null when it is not installed
+#   Usage               when it last ran here and whether it is signed in (for 'auto')
+#   Resumable           its sessions that can be resumed; $Found holds what the
+#                       launchers read before it returned
+#   ResumeOrder         when Resumable is read: a session two sources know is listed
+#                       under the first, so an agent's own files come before Agency,
+#                       which also lists Claude sessions, and Copilot's store last
+#   Arguments           its command line; without one, Copilot's (shared with Agency)
+#   RegistrationFiles   the hook registrations that may be the launched session's;
+#                       without one, Copilot's lock files are checked
+#   ChoosesOwnSessionId it picks its session id, so none is invented for it (Codex)
+#   NeedsFirstMessage   it only registers once sent a first message (Codex)
+#   AnswersTrustPrompt  it asks whether to trust a new folder on start (Claude)
 $script:BridgeLaunchers = [ordered]@{
-    agency  = 'Agency'
-    copilot = 'Copilot'
-    claude  = 'Claude'
-    codex   = 'Codex'
+    agency = @{
+        Label = 'Agency'; Kind = 'copilot'
+        Path = { Get-BridgeAgencyPath }
+        # Agency runs Copilot underneath and keeps its sessions in Copilot's store.
+        Usage = { Get-BridgeCopilotUsage }
+        # Agency knows which of its sessions can resume.
+        Resumable = { param($Limit, $Found) Get-BridgeAgencySessionEntries }
+        ResumeOrder = 3
+    }
+    copilot = @{
+        Label = 'Copilot'; Kind = 'copilot'
+        Path = { Get-BridgeCopilotPath }
+        Usage = { Get-BridgeCopilotUsage }
+        # Copilot's own store fills in when Agency is not installed, or came back empty.
+        Resumable = {
+            param($Limit, $Found)
+            # ContainsKey first: @($null) - Agency not installed - counts as one.
+            if ($Found.ContainsKey('agency') -and @($Found['agency']).Count -gt 0) { return @() }
+            Get-BridgeCopilotSessionEntries -Limit $Limit
+        }
+        ResumeOrder = 4
+    }
+    claude = @{
+        Label = 'Claude'; Kind = 'claude'
+        Path = { Get-BridgeClaudePath }
+        Usage = {
+            $claudeHome = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $HOME '.claude' }
+            [pscustomobject]@{
+                LastUsed = Get-BridgeNewestWriteTime -Path @((Join-Path $claudeHome 'history.jsonl'), (Join-Path $claudeHome 'projects')) -Depth 2
+                SignedIn = (Test-Path -LiteralPath (Join-Path $claudeHome '.credentials.json')) -or [bool]$env:ANTHROPIC_API_KEY
+            }
+        }
+        Resumable = { param($Limit, $Found) Get-BridgeClaudeSessionEntries -Limit $Limit }
+        ResumeOrder = 1
+        Arguments = {
+            param($SessionId, $Model, $AllowAllTools, $Extras, $Resuming, $FlatPrompt)
+            $arguments = @()
+            # Claude refuses an id already in use, so a resume needs `--resume <id>`.
+            if (-not [string]::IsNullOrWhiteSpace($SessionId)) {
+                $arguments += if ($Resuming) { @('--resume', $SessionId) } else { @('--session-id', $SessionId) }
+            }
+            if (-not [string]::IsNullOrWhiteSpace($Model)) { $arguments += @('--model', $Model) }
+            # Opt-in only, as for Copilot.
+            if ($AllowAllTools) { $arguments += '--dangerously-skip-permissions' }
+            $arguments += $Extras
+            if ($FlatPrompt) { $arguments += @('--', $FlatPrompt) }
+            $arguments
+        }
+        RegistrationFiles = {
+            param($StateDir, $SessionId, $Since)
+            @(Join-Path $StateDir "$SessionId.json" | Where-Object { [System.IO.File]::Exists($_) } | Get-Item)
+        }
+        AnswersTrustPrompt = $true
+    }
+    codex = @{
+        Label = 'Codex'; Kind = 'codex'
+        Path = { Get-BridgeCodexPath }
+        Usage = {
+            $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+            [pscustomobject]@{
+                LastUsed = Get-BridgeNewestWriteTime -Path @((Join-Path $codexHome 'history.jsonl'), (Join-Path $codexHome 'sessions')) -Depth 4
+                SignedIn = (Test-Path -LiteralPath (Join-Path $codexHome 'auth.json')) -or [bool]$env:OPENAI_API_KEY
+            }
+        }
+        Resumable = { param($Limit, $Found) Get-BridgeCodexSessionEntries -Limit $Limit }
+        ResumeOrder = 2
+        Arguments = {
+            param($SessionId, $Model, $AllowAllTools, $Extras, $Resuming, $FlatPrompt)
+            # Without its shared background daemon, Codex runs hooks from its own
+            # window's process. Under the daemon - which has no console - Windows opened
+            # a console window for every hook, several a turn, and a reply could not tell
+            # which window was the session's.
+            $arguments = @('--no-daemon')
+            # Reasoning summaries, which the card streams; without this Codex writes its
+            # reasoning encrypted and there is nothing to show.
+            if ([bool](Get-BridgeSetting 'detailedActivity' $true)) { $arguments += @('-c', 'model_reasoning_summary=detailed') }
+            if ($Resuming) { $arguments += 'resume' }
+            if (-not [string]::IsNullOrWhiteSpace($Model)) { $arguments += @('--model', $Model) }
+            # Opt-in only. Codex keeps its sandbox; only approvals go.
+            if ($AllowAllTools) { $arguments += @('--ask-for-approval', 'never') }
+            $arguments += $Extras
+            # `codex resume [OPTIONS] [SESSION_ID] [PROMPT]`: the id is the first positional.
+            if ($Resuming) { $arguments += $SessionId }
+            if ($FlatPrompt) { $arguments += @('--', $FlatPrompt) }
+            $arguments
+        }
+        # Codex chooses its own session id, so its registration is recognised as the
+        # first one written after the launch.
+        RegistrationFiles = {
+            param($StateDir, $SessionId, $Since)
+            @(Get-ChildItem -LiteralPath $StateDir -Filter '*.json' -File -ErrorAction SilentlyContinue |
+                Where-Object { $_.Name -notlike '*.approval.json' -and $_.LastWriteTime -ge $Since.LocalDateTime })
+        }
+        ChoosesOwnSessionId = $true
+        NeedsFirstMessage = $true
+    }
+}
+
+function Get-BridgeLauncher {
+    <# A launcher's entry, with every slot and flag present; an unknown one has none. #>
+    param([AllowEmptyString()][AllowNull()][string]$Launcher)
+
+    $entry = @{
+        Label = $Launcher; Kind = $Launcher; Path = $null; Usage = $null; Resumable = $null; ResumeOrder = 99; Arguments = $null
+        RegistrationFiles = $null; ChoosesOwnSessionId = $false; NeedsFirstMessage = $false; AnswersTrustPrompt = $false
+    }
+    if ($Launcher -and $script:BridgeLaunchers.Contains($Launcher)) {
+        $own = $script:BridgeLaunchers[$Launcher]
+        foreach ($slot in $own.Keys) { $entry[$slot] = $own[$slot] }
+    }
+    $entry
 }
 
 function Get-BridgeLauncherPath {
     param([Parameter(Mandatory)][string]$Launcher)
 
-    switch ($Launcher) {
-        'agency'  { return Get-BridgeAgencyPath }
-        'copilot' { return Get-BridgeCopilotPath }
-        'claude'  { return Get-BridgeClaudePath }
-        'codex'   { return Get-BridgeCodexPath }
-    }
+    $path = (Get-BridgeLauncher -Launcher $Launcher).Path
+    if ($path) { return & $path }
     $null
 }
 
@@ -520,8 +641,7 @@ function Get-BridgeAvailableLaunchers {
 
 function Get-BridgeLauncherLabel {
     param([Parameter(Mandatory)][string]$Launcher)
-    if ($script:BridgeLaunchers.Contains($Launcher)) { return [string]$script:BridgeLaunchers[$Launcher] }
-    $Launcher
+    [string](Get-BridgeLauncher -Launcher $Launcher).Label
 }
 
 function Resolve-BridgeLauncher {
@@ -581,34 +701,21 @@ function Get-BridgeLauncherUsage {
     #>
     param([Parameter(Mandatory)][string]$Launcher)
 
-    $copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { Join-Path $HOME '.copilot' }
-    $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
-    $claudeHome = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $HOME '.claude' }
-
-    switch ($Launcher) {
-        { $_ -in 'agency', 'copilot' } {
-            $state = Join-Path $copilotHome 'session-state'
-            return [pscustomobject]@{
-                LastUsed = Get-BridgeNewestWriteTime -Path @($state) -Depth 2
-                SignedIn = (Test-Path -LiteralPath $state) -or
-                    (Test-Path -LiteralPath (Join-Path $copilotHome 'config.json')) -or
-                    [bool]$env:GH_TOKEN -or [bool]$env:GITHUB_TOKEN -or [bool]$env:COPILOT_GITHUB_TOKEN
-            }
-        }
-        'claude' {
-            return [pscustomobject]@{
-                LastUsed = Get-BridgeNewestWriteTime -Path @((Join-Path $claudeHome 'history.jsonl'), (Join-Path $claudeHome 'projects')) -Depth 2
-                SignedIn = (Test-Path -LiteralPath (Join-Path $claudeHome '.credentials.json')) -or [bool]$env:ANTHROPIC_API_KEY
-            }
-        }
-        'codex' {
-            return [pscustomobject]@{
-                LastUsed = Get-BridgeNewestWriteTime -Path @((Join-Path $codexHome 'history.jsonl'), (Join-Path $codexHome 'sessions')) -Depth 4
-                SignedIn = (Test-Path -LiteralPath (Join-Path $codexHome 'auth.json')) -or [bool]$env:OPENAI_API_KEY
-            }
-        }
-    }
+    $usage = (Get-BridgeLauncher -Launcher $Launcher).Usage
+    if ($usage) { return & $usage }
     [pscustomobject]@{ LastUsed = $null; SignedIn = $false }
+}
+
+function Get-BridgeCopilotUsage {
+    <# Copilot's usage, which Agency shares (see Get-BridgeLauncherUsage). #>
+    $copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { Join-Path $HOME '.copilot' }
+    $state = Join-Path $copilotHome 'session-state'
+    [pscustomobject]@{
+        LastUsed = Get-BridgeNewestWriteTime -Path @($state) -Depth 2
+        SignedIn = (Test-Path -LiteralPath $state) -or
+            (Test-Path -LiteralPath (Join-Path $copilotHome 'config.json')) -or
+            [bool]$env:GH_TOKEN -or [bool]$env:GITHUB_TOKEN -or [bool]$env:COPILOT_GITHUB_TOKEN
+    }
 }
 
 $script:BridgeAutoLauncher = $null
@@ -744,7 +851,7 @@ function Get-BridgeNewSessionArguments {
         [string]$Model = '',
         [switch]$AllowAllTools,
         [string[]]$ExtraArguments = @(),
-        [ValidateSet('copilot', 'agency', 'claude', 'codex')][string]$Launcher = 'copilot',
+        [ValidateScript({ $script:BridgeLaunchers.Contains($_) })][string]$Launcher = 'copilot',
         [string]$AgencyProfile = '',
         [switch]$Resume
     )
@@ -753,32 +860,11 @@ function Get-BridgeNewSessionArguments {
     $extras = @(@($ExtraArguments) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { [string]$_ })
     $resuming = $Resume.IsPresent -and -not [string]::IsNullOrWhiteSpace($SessionId)
 
-    if ($Launcher -in @('claude', 'codex')) {
-        $arguments = @()
-        if ($Launcher -eq 'codex') {
-            # Without its shared background daemon, Codex runs hooks from its own
-            # window's process. Under the daemon - which has no console - Windows opened
-            # a console window for every hook, several a turn, and a reply could not tell
-            # which window was the session's.
-            $arguments += '--no-daemon'
-            # Reasoning summaries, which the card streams; without this Codex writes its
-            # reasoning encrypted and there is nothing to show.
-            if ([bool](Get-BridgeSetting 'detailedActivity' $true)) { $arguments += @('-c', 'model_reasoning_summary=detailed') }
-            if ($resuming) { $arguments += 'resume' }
-        }
-        if ($Launcher -eq 'claude' -and -not [string]::IsNullOrWhiteSpace($SessionId)) {
-            $arguments += if ($resuming) { @('--resume', $SessionId) } else { @('--session-id', $SessionId) }
-        }
-        if (-not [string]::IsNullOrWhiteSpace($Model)) { $arguments += @('--model', $Model) }
-        # Opt-in only, as for Copilot. Codex keeps its sandbox; only approvals go.
-        if ($AllowAllTools.IsPresent) {
-            $arguments += if ($Launcher -eq 'claude') { '--dangerously-skip-permissions' } else { @('--ask-for-approval', 'never') }
-        }
-        $arguments += $extras
-        # `codex resume [OPTIONS] [SESSION_ID] [PROMPT]`: the id is the first positional.
-        if ($Launcher -eq 'codex' -and $resuming) { $arguments += $SessionId }
-        if ($flatPrompt) { $arguments += @('--', $flatPrompt) }
-        return @($arguments)
+    # A launcher with its own command line (Claude, Codex) builds it; Copilot and
+    # Agency share the one below.
+    $own = (Get-BridgeLauncher -Launcher $Launcher).Arguments
+    if ($own) {
+        return @(& $own $SessionId $Model $AllowAllTools.IsPresent $extras $resuming $flatPrompt)
     }
 
     # Copilot-side arguments, identical in both modes.
@@ -1154,11 +1240,15 @@ function Get-BridgeResumableSessions {
 
     $installed = @(Get-BridgeAvailableLaunchers)
     $candidates = @()
-    if ($installed -contains 'claude') { $candidates += @(Get-BridgeClaudeSessionEntries -Limit $Limit) }
-    if ($installed -contains 'codex') { $candidates += @(Get-BridgeCodexSessionEntries -Limit $Limit) }
-    $agency = @()
-    if ($installed -contains 'agency') { $agency = @(Get-BridgeAgencySessionEntries); $candidates += $agency }
-    if ($installed -contains 'copilot' -and $agency.Count -eq 0) { $candidates += @(Get-BridgeCopilotSessionEntries -Limit $Limit) }
+    $found = @{}
+    $byOrder = @($script:BridgeLaunchers.Keys) | Sort-Object { (Get-BridgeLauncher -Launcher $_).ResumeOrder }
+    foreach ($launcher in $byOrder) {
+        if ($installed -notcontains $launcher) { continue }
+        $read = (Get-BridgeLauncher -Launcher $launcher).Resumable
+        if (-not $read) { continue }
+        $found[$launcher] = @(& $read $Limit $found)
+        $candidates += $found[$launcher]
+    }
 
     $excluded = @{}
     foreach ($id in @($Exclude)) {
@@ -1174,7 +1264,7 @@ function Get-BridgeResumableSessions {
 
     # The agent is named in each label once the list holds more than one kind, so a
     # Claude and a Copilot session on the same task can be told apart.
-    $kinds = @($recent | ForEach-Object { if ($_.Launcher -eq 'agency') { 'copilot' } else { $_.Launcher } } | Select-Object -Unique)
+    $kinds = @($recent | ForEach-Object { (Get-BridgeLauncher -Launcher ([string]$_.Launcher)).Kind } | Select-Object -Unique)
     $prefixed = $kinds.Count -gt 1
 
     # Build display labels. Home Assistant needs every option in a select to be
@@ -1399,7 +1489,7 @@ function Start-BridgeCopilotSession {
 
     # Codex picks its own session id and reports it through its hook, so none is
     # invented for it here.
-    if ([string]::IsNullOrWhiteSpace($result.SessionId) -and $launcher -ne 'codex') {
+    if ([string]::IsNullOrWhiteSpace($result.SessionId) -and -not (Get-BridgeLauncher -Launcher $launcher).ChoosesOwnSessionId) {
         $result.SessionId = [guid]::NewGuid().ToString()
     }
 
@@ -1611,16 +1701,13 @@ function Test-BridgeSessionRegistered {
         [DateTimeOffset]$Since = [DateTimeOffset]::Now.AddMinutes(-1)
     )
 
-    if ($Launcher -in @('claude', 'codex')) {
+    # Agents that register through their hooks (Claude, Codex) record the owning pid
+    # under %TEMP%; the rest are Copilot sessions, found by their lock files below.
+    $registrations = (Get-BridgeLauncher -Launcher $Launcher).RegistrationFiles
+    if ($registrations) {
         $stateDir = Join-Path $env:TEMP "agent-bridge-$Launcher"
         if (-not [System.IO.Directory]::Exists($stateDir)) { return $false }
-        $files = if ($Launcher -eq 'claude') {
-            @(Join-Path $stateDir "$SessionId.json" | Where-Object { [System.IO.File]::Exists($_) } | Get-Item)
-        }
-        else {
-            @(Get-ChildItem -LiteralPath $stateDir -Filter '*.json' -File -ErrorAction SilentlyContinue |
-                Where-Object { $_.Name -notlike '*.approval.json' -and $_.LastWriteTime -ge $Since.LocalDateTime })
-        }
+        $files = @(& $registrations $stateDir $SessionId $Since)
         foreach ($file in $files) {
             try { $entry = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json } catch { continue }
             $processId = [int]($entry.ProcessId ?? 0)

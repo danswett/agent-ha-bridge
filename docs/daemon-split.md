@@ -110,8 +110,23 @@ after the Claude and Codex checks, so the table has to name it outright.
   `Invoke-DaemonReply`'s fallback process scan loops agents with `KnowsProcessId`.
   `Invoke-PendingCodexApprovals` keeps its name but serves any agent with an
   `ApprovalMarker`.
-- [ ] **D. Launch** (`session-launch.ps1`, `daemon-launch.ps1`). Arguments,
+- [x] **D. Launch** (`session-launch.ps1`, `daemon-launch.ps1`). Arguments,
   resume, transcript location, Codex's first prompt.
+  Design (decided mid-phase): launchers are not session kinds (Agency launches
+  Copilot sessions), and `session-launch.ps1` loads without the daemon
+  (`test-platform.ps1`). So D adds `$script:BridgeLaunchers` inside
+  `session-launch.ps1`: one entry per launcher (agency, copilot, claude, codex) with
+  its label, path, arguments, resumable sessions, registration check and flags
+  (`ChoosesOwnSessionId`, `NeedsFirstMessage`, `AnswersTrustPrompt`) and the
+  session `Kind` it produces. A new agent is then one launcher entry plus one agent
+  entry. `daemon-launch.ps1` reads the flags via `Get-BridgeLauncher`.
+  *Done.* The `Kind` field is used for the resumable list's labels. Gotchas: the
+  resumable read order is its own slot (`ResumeOrder`: Claude, Codex, Agency,
+  Copilot) because the first source to list a session wins, and Agency lists Claude
+  sessions too; `@($null).Count` is 1, so test `ContainsKey` first. Launch notes are
+  recognised by shape, not agent name (`Test-DaemonLaunchProgressNote`). All 768
+  argument combinations were diffed against 1.11.0: identical. Test:
+  `tests/test-launchers.ps1`.
 - [ ] **E. Maintenance**. Install notes per client.
 
 C to E are optional: A and B are the code that runs constantly. The user approved
