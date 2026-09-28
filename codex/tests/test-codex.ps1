@@ -224,10 +224,11 @@ $script:FakeTree = @{
     60  = [pscustomobject]@{ ProcessId = 60; ParentProcessId = 1; Name = 'codex.exe'; CommandLine = 'codex.exe app-server' }
     50  = [pscustomobject]@{ ProcessId = 50; ParentProcessId = 60; Name = 'pwsh.exe'; CommandLine = 'pwsh -File codex-bridge-hook.ps1' }
 }
-function Get-CimInstance {
-    param([string]$ClassName, [string]$Filter, $ErrorAction)
-    if ($Filter -match 'ProcessId=(\d+)') { return $script:FakeTree[[int]$Matches[1]] }
-    if ($Filter -match "Name='([^']+)'") { $name = $Matches[1]; $script:FakeTree.Values | Where-Object Name -eq $name }
+# The platform layer's lookups stand in for WMI on Windows and ps on macOS alike.
+function Get-BridgeProcessInfo { param([int]$ProcessId, [switch]$WithCommandLine) $script:FakeTree[$ProcessId] }
+function Get-BridgeProcessesNamed {
+    param([string]$Name)
+    @($script:FakeTree.Values | Where-Object { ($_.Name -replace '\.exe$', '') -eq $Name })
 }
 # Registrations go to a scratch folder, not the real one.
 $savedRoot = $script:CodexStateRoot
@@ -265,7 +266,8 @@ try {
 finally {
     Remove-Item -LiteralPath $script:CodexStateRoot -Recurse -Force -ErrorAction SilentlyContinue
     $script:CodexStateRoot = $savedRoot
-    Remove-Item function:Get-CimInstance
+    Remove-Item function:Get-BridgeProcessInfo, function:Get-BridgeProcessesNamed
+    . (Join-Path $PSScriptRoot '../../hooks/bridge-platform.ps1')
 }
 
 Write-Host ''
@@ -274,3 +276,5 @@ if ($script:Failures) {
     exit 1
 }
 Write-Host 'All tests passed' -ForegroundColor Green
+# Explicit: without it pwsh reports the last external command's exit code.
+exit 0

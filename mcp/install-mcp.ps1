@@ -29,6 +29,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Windows/macOS differences; on macOS also makes Join-Path accept '\'.
+. (Join-Path $PSScriptRoot '../hooks/bridge-platform.ps1')
 
 $installHome = if ($TargetHome) { $TargetHome } else { $HOME }
 $bridgeHome  = Join-Path $installHome '.agent-ha-bridge'
@@ -39,6 +41,9 @@ $serverName  = 'home-assistant-bridge'
 # Overridable so a sandbox test never touches the real Claude Desktop config.
 $claudeDesktopConfig = if ($env:BRIDGE_CLAUDE_DESKTOP_CONFIG) {
     $env:BRIDGE_CLAUDE_DESKTOP_CONFIG
+}
+elseif (-not $script:BridgeIsWindows) {
+    Join-Path $HOME 'Library/Application Support/Claude/claude_desktop_config.json'
 }
 else {
     Join-Path $env:APPDATA 'Claude\claude_desktop_config.json'

@@ -35,6 +35,9 @@ New-Item -ItemType Directory -Path $coreHooks -Force | Out-Null
 # The installer only checks that the main bridge is present.
 Set-Content -LiteralPath (Join-Path $coreHooks 'decision-mqtt.ps1') -Value '# placeholder'
 
+# $env:TEMP on macOS, and $script:BridgeIsWindows.
+. (Join-Path $PSScriptRoot '../../hooks/bridge-platform.ps1')
+
 $sessionId = "00000000-0000-4000-8000-$([guid]::NewGuid().ToString('N').Substring(0,12))"
 $registration = Join-Path $env:TEMP "agent-bridge-claude\$sessionId.json"
 
@@ -47,25 +50,36 @@ try {
     $adapter = Join-Path $sandbox '.claude\ha-bridge'
     $settings = Get-Content -LiteralPath (Join-Path $sandbox '.claude\settings.json') -Raw | ConvertFrom-Json
 
-    Test-That 'the hook launcher is installed with the adapter' { Test-Path -LiteralPath (Join-Path $adapter 'run-hook.cmd') }
     foreach ($eventName in @('PreToolUse', 'Notification', 'Stop', 'SessionStart', 'UserPromptSubmit')) {
         Test-That "$eventName is registered" { $null -ne $settings.hooks.$eventName }
     }
     $commands = @($settings.hooks.PSObject.Properties | ForEach-Object { [string]$_.Value[0].hooks[0].command })
-    Test-That 'every hook runs through the launcher' {
-        @($commands | Where-Object { $_ -notlike '"*\run-hook.cmd" "*.ps1"' }).Count -eq 0
+    Test-That 'the Windows/macOS layer is installed with the adapter' { Test-Path -LiteralPath (Join-Path $adapter 'bridge-platform.ps1') }
+    if ($script:BridgeIsWindows) {
+        Test-That 'the hook launcher is installed with the adapter' { Test-Path -LiteralPath (Join-Path $adapter 'run-hook.cmd') }
+        Test-That 'every hook runs through the launcher' {
+            @($commands | Where-Object { $_ -notlike '"*\run-hook.cmd" "*.ps1"' }).Count -eq 0
+        }
+        Test-That 'no hook names a pwsh path, which breaks under Bash or on update' {
+            @($commands | Where-Object { $_ -match 'pwsh' }).Count -eq 0
+        }
     }
-    Test-That 'no hook names a pwsh path, which breaks under Bash or on update' {
-        @($commands | Where-Object { $_ -match 'pwsh' }).Count -eq 0
+    else {
+        # macOS runs hooks through sh, whose PATH may lack Homebrew: pwsh by full path.
+        Test-That 'every hook starts its script under pwsh, named by full path' {
+            @($commands | Where-Object { $_ -notmatch "^'/[^']*/pwsh' -NoProfile -NonInteractive -File '[^']*\.ps1'$" }).Count -eq 0
+        }
     }
 
     Write-Host ''
     Write-Host '--- running a hook the way Claude does ---'
 
-    $bash = @(
-        (Join-Path $env:ProgramFiles 'Git\bin\bash.exe'),
-        (Get-Command bash.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source)
-    ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+    $bash = if (-not $script:BridgeIsWindows) { '/bin/bash' } else {
+        @(
+            (Join-Path $env:ProgramFiles 'Git\bin\bash.exe'),
+            (Get-Command bash.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1 -ExpandProperty Source)
+        ) | Where-Object { $_ -and (Test-Path -LiteralPath $_) } | Select-Object -First 1
+    }
 
     if (-not $bash) {
         Write-Host '  SKIP  Git Bash not found'
@@ -113,3 +127,5 @@ if ($script:Failures -gt 0) {
     exit 1
 }
 Write-Host 'all claude install checks passed' -ForegroundColor Green
+# Explicit: without it pwsh reports the last external command's exit code.
+exit 0

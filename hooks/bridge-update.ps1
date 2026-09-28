@@ -237,9 +237,15 @@ try {
     # the running daemon is detached and survives the scheduled-task restart. Killing it
     # makes the supervisor relaunch a fresh one, which reads the marker above and
     # announces the result.
-    Get-CimInstance Win32_Process -Filter "Name='pwsh.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { `$_.CommandLine -match 'agent-bridge-daemon\.ps1' } |
-        ForEach-Object { Stop-Process -Id `$_.ProcessId -Force -ErrorAction SilentlyContinue }
+    if (`$IsWindows) {
+        Get-CimInstance Win32_Process -Filter "Name='pwsh.exe'" -ErrorAction SilentlyContinue |
+            Where-Object { `$_.CommandLine -match 'agent-bridge-daemon\.ps1' } |
+            ForEach-Object { Stop-Process -Id `$_.ProcessId -Force -ErrorAction SilentlyContinue }
+    }
+    else {
+        # launchd (KeepAlive) starts it again.
+        & pkill -f 'agent-bridge-daemon\.ps1' 2>`$null
+    }
 }
 catch {
     Write-UpdateLog "update FAILED: `$(`$_.Exception.Message)"
@@ -256,9 +262,13 @@ finally {
     $scriptText | Set-Content -LiteralPath $script -Encoding UTF8
 
     if ($Detached) {
-        Start-Process -FilePath (Get-Command pwsh).Source `
-            -ArgumentList '-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$script`"" `
-            -WindowStyle Hidden | Out-Null
+        $detached = @{
+            FilePath     = (Get-Command pwsh).Source
+            ArgumentList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$script`"")
+        }
+        # Not supported, and refused, off Windows.
+        if ($script:BridgeIsWindows) { $detached.WindowStyle = 'Hidden' }
+        Start-Process @detached | Out-Null
         return [pscustomobject]@{ Started = $true; Detail = "updating to $($status.Latest) in the background" }
     }
 

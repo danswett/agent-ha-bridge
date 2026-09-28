@@ -17,6 +17,11 @@
 
 Set-StrictMode -Version Latest
 
+# Windows/macOS differences, before anything reads $env:TEMP. Installed beside this
+# file; in the repository it is the core's copy.
+. $(if (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'bridge-platform.ps1')) { Join-Path $PSScriptRoot 'bridge-platform.ps1' }
+    else { Join-Path $PSScriptRoot '../../hooks/bridge-platform.ps1' })
+
 $script:ClaudeStateRoot = Join-Path $env:TEMP 'agent-bridge-claude'
 $script:ClaudeProjectsRoot = Join-Path $HOME '.claude\projects'
 # A session whose registry entry has not been refreshed in this long is treated as
@@ -160,8 +165,7 @@ function Get-ClaudeSessionRegistrations {
     $cutoff = [DateTimeOffset]::Now.AddMinutes(-$script:ClaudeSessionStaleMinutes)
 
     $livePids = @{}
-    foreach ($process in @(Get-Process -ErrorAction SilentlyContinue |
-                           Where-Object { $_.ProcessName -match '^claude' })) {
+    foreach ($process in @(Get-BridgeAgentProcesses -Agent 'claude')) {
         $livePids[$process.Id] = $true
     }
 

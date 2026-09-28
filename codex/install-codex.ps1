@@ -30,6 +30,8 @@ param(
 )
 
 $ErrorActionPreference = 'Stop'
+# Windows/macOS differences; on macOS also makes Join-Path accept '\'.
+. (Join-Path $PSScriptRoot '../hooks/bridge-platform.ps1')
 
 $installHome = if ($TargetHome) { $TargetHome } else { $HOME }
 $bridgeRoot = Join-Path $installHome '.agent-ha-bridge\codex-bridge'
@@ -43,6 +45,12 @@ function Write-Step { param([string]$Message) Write-Host "==> $Message" -Foregro
 function Get-CodexExecutable {
     $command = Get-Command codex -ErrorAction SilentlyContinue
     if ($command) { return $command.Source }
+    if (-not $script:BridgeIsWindows) {
+        foreach ($candidate in @('/opt/homebrew/bin/codex', '/usr/local/bin/codex', (Join-Path $HOME '.local/bin/codex'))) {
+            if (Test-Path -LiteralPath $candidate) { return $candidate }
+        }
+        return $null
+    }
     # npm does not always create a shim on Windows, so fall back to the vendored binary.
     $vendored = Join-Path $env:APPDATA 'npm\node_modules\@openai\codex\vendor\x86_64-pc-windows-msvc\bin\codex.exe'
     if (Test-Path -LiteralPath $vendored) { return $vendored }
@@ -91,6 +99,10 @@ Get-ChildItem (Join-Path $PSScriptRoot 'hooks') -File | ForEach-Object {
     Copy-Item $_.FullName $hooksTarget -Force
     Write-Host "    $($_.Name)"
 }
+# The hooks run apart from the core, so they carry their own copy of the
+# Windows/macOS layer.
+Copy-Item (Join-Path (Split-Path $PSScriptRoot -Parent) 'hooks/bridge-platform.ps1') $hooksTarget -Force
+Write-Host '    bridge-platform.ps1'
 
 $versionFile = Join-Path (Split-Path $PSScriptRoot -Parent) 'VERSION'
 $version = if (Test-Path -LiteralPath $versionFile) { (Get-Content -LiteralPath $versionFile -Raw).Trim() } else { '1.0.0' }
@@ -111,6 +123,12 @@ if ($hookScript -match '\s') {
                    'hook commands, so hooks may fail. Install under a path without spaces.')
 }
 $command = "pwsh -NoProfile -ExecutionPolicy Bypass -File $hookScript"
+# macOS: by full path, since the hook's PATH need not include Homebrew. It has no space
+# there (/opt/homebrew/bin/pwsh), so it needs no quoting either.
+if (-not $script:BridgeIsWindows) {
+    $pwsh = (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source
+    if ($pwsh -notmatch '\s') { $command = "$pwsh -NoProfile -File $hookScript" }
+}
 
 $events = [ordered]@{}
 # SessionEnd is clamped to a 3 second timeout by Codex, which the hook accounts for.

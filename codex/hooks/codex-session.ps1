@@ -32,6 +32,11 @@
 
 Set-StrictMode -Version Latest
 
+# Windows/macOS differences, before anything reads $env:TEMP. Installed beside this
+# file; in the repository it is the core's copy.
+. $(if (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'bridge-platform.ps1')) { Join-Path $PSScriptRoot 'bridge-platform.ps1' }
+    else { Join-Path $PSScriptRoot '../../hooks/bridge-platform.ps1' })
+
 $script:CodexStateRoot = Join-Path $env:TEMP 'agent-bridge-codex'
 # Codex writes rollouts under CODEX_HOME/sessions/<yyyy>/<MM>/<dd>/.
 $script:CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
@@ -107,10 +112,10 @@ function Get-CodexOwningProcessId {
     $fallback = 0
     $current = $StartPid
     for ($depth = 0; $depth -lt $MaxDepth; $depth++) {
-        $process = Get-CimInstance Win32_Process -Filter "ProcessId=$current" -ErrorAction SilentlyContinue
+        $process = Get-BridgeProcessInfo -ProcessId $current
         if (-not $process) { break }
         # Exact match: codex-windows-sandbox-setup and codex-command-runner also exist.
-        if ($process.Name -match '^codex(\.exe)?$') {
+        if (Test-BridgeAgentProcess -Process $process -Agent 'codex') {
             if (-not (Test-CodexAppServer -Process $process)) {
                 # Under the shared app-server, the window above it can belong to a
                 # different session: take it only if nobody else has.
@@ -126,8 +131,7 @@ function Get-CodexOwningProcessId {
     }
     if ($fallback -eq 0) { return 0 }
 
-    $windows = @(Get-CimInstance Win32_Process -Filter "Name='codex.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { -not (Test-CodexAppServer -Process $_) })
+    $windows = @(Get-BridgeProcessesNamed -Name 'codex' | Where-Object { -not (Test-CodexAppServer -Process $_) })
 
     # The window this session already recorded, while it runs.
     if ($SessionId) {
@@ -142,8 +146,18 @@ function Get-CodexOwningProcessId {
 }
 
 function Test-CodexAppServer {
+    <#
+        Whether a codex process is the app-server rather than a terminal window. From
+        its path where that is known (Windows: the daemon runs from
+        ~\.codex\packages\app-server-daemon), which costs nothing; otherwise from its
+        command line, fetched only then.
+    #>
     param([Parameter(Mandatory)][object]$Process)
-    [string]$Process.CommandLine -match '\sapp-server(\s|$)'
+    $path = if ($Process.PSObject.Properties['Path']) { [string]$Process.Path } else { '' }
+    if ($path) { return $path -match '[\\/]app-server-daemon[\\/]' }
+    $commandLine = if ($Process.PSObject.Properties['CommandLine'] -and $Process.CommandLine) { [string]$Process.CommandLine }
+        else { Get-BridgeCommandLine -ProcessId ([int]$Process.ProcessId) }
+    $commandLine -match '\sapp-server(\s|$)'
 }
 
 function Get-CodexRecordedProcessId {
@@ -236,8 +250,7 @@ function Get-CodexSessionRegistrations {
     $cutoff = [DateTimeOffset]::Now.AddMinutes(-$script:CodexSessionStaleMinutes)
 
     $livePids = @{}
-    foreach ($process in @(Get-Process -ErrorAction SilentlyContinue |
-                           Where-Object { $_.ProcessName -eq 'codex' })) {
+    foreach ($process in @(Get-BridgeAgentProcesses -Agent 'codex')) {
         $livePids[$process.Id] = $true
     }
 

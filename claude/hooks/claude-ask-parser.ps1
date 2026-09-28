@@ -26,6 +26,11 @@
 
 Set-StrictMode -Version Latest
 
+# Windows/macOS differences. Installed beside this file; in the repository it is the
+# core's copy.
+. $(if (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'bridge-platform.ps1')) { Join-Path $PSScriptRoot 'bridge-platform.ps1' }
+    else { Join-Path $PSScriptRoot '../../hooks/bridge-platform.ps1' })
+
 $script:ClaudeMaxFields = 4
 $script:ClaudeMaxQuestionLength = 6000
 $script:ClaudeMaxChoiceLength = 600
@@ -202,13 +207,5 @@ function Get-ClaudeOwningProcessId {
     #>
     param([int]$StartPid = $PID, [int]$MaxDepth = 12)
 
-    $current = $StartPid
-    for ($depth = 0; $depth -lt $MaxDepth; $depth++) {
-        $process = Get-CimInstance Win32_Process -Filter "ProcessId=$current" -ErrorAction SilentlyContinue
-        if (-not $process) { return 0 }
-        if ($process.Name -match '^claude(\.exe)?$') { return [int]$process.ProcessId }
-        if (-not $process.ParentProcessId -or $process.ParentProcessId -eq $current) { return 0 }
-        $current = [int]$process.ParentProcessId
-    }
-    return 0
+    Find-BridgeAgentAncestor -Agent 'claude' -StartPid $StartPid -MaxDepth $MaxDepth
 }

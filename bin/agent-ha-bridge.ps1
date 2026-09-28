@@ -59,8 +59,15 @@ if (-not $isInstalled) { $installerDir = $root }
 # copy of this command from operating on the real install. A clone is not an install,
 # so running out of the repository still means $HOME.
 $bridgeHome = if ($isInstalled) { $root } else { Join-Path $HOME '.agent-ha-bridge' }
+# Windows/macOS differences - $env:TEMP, process lookups - from this install's hooks.
+$platform = Join-Path (Join-Path $root 'hooks') 'bridge-platform.ps1'
+if (Test-Path -LiteralPath $platform) { . $platform }
+else { $script:BridgeIsWindows = [bool]$IsWindows }
 $configPath = Join-Path $bridgeHome 'config.json'
 $taskName = 'AgentBridgeDaemon'
+$launchAgentLabel = 'com.agent-ha-bridge.daemon'
+# pwsh beside this one: pwsh.exe on Windows, pwsh elsewhere.
+$pwshHere = Join-Path $PSHOME $(if ($script:BridgeIsWindows) { 'pwsh.exe' } else { 'pwsh' })
 $daemonLog = Join-Path $env:TEMP 'agent-bridge-daemon.log'
 
 function Write-Step { param([string]$Message) Write-Host "==> $Message" -ForegroundColor Cyan }
@@ -80,7 +87,7 @@ function Invoke-BridgeScript {
         [Parameter(Mandatory)][string]$Path,
         [string[]]$Passthrough = @()
     )
-    $pwsh = Join-Path $PSHOME 'pwsh.exe'
+    $pwsh = $pwshHere
     if (-not (Test-Path -LiteralPath $pwsh)) { $pwsh = 'pwsh' }
     & $pwsh -NoProfile -ExecutionPolicy Bypass -File $Path @Passthrough
     exit $LASTEXITCODE
@@ -175,8 +182,19 @@ function Show-Status {
     if ($config.PSObject.Properties['clients']) { $clients = @($config.clients) }
     Write-Host "    clients    : $(if ($clients) { $clients -join ', ' } else { 'none recorded' })"
 
-    $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
-    if ($task) {
+    $task = if ($script:BridgeIsWindows) { Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue } else { $null }
+    if (-not $script:BridgeIsWindows -and -not (Get-Command Get-BridgeProcessesNamed -ErrorAction SilentlyContinue)) {
+        Write-Host '    daemon     : unknown - the install''s hooks are missing; run agent-ha-bridge configure' -ForegroundColor Yellow
+    }
+    elseif (-not $script:BridgeIsWindows) {
+        $loaded = [bool](& launchctl print "gui/$(& id -u)/$launchAgentLabel" 2>$null)
+        $daemon = @(Get-BridgeProcessesNamed -Name 'pwsh' -WithCommandLine | Where-Object { $_.CommandLine -match 'agent-bridge-daemon\.ps1' })
+        if ($daemon) { Write-Host "    daemon     : running (pid $($daemon[0].ProcessId))" -ForegroundColor Green }
+        elseif ($loaded) { Write-Host '    daemon     : not running - launchd will start it again shortly' -ForegroundColor Yellow }
+        else { Write-Host "    daemon     : the '$launchAgentLabel' LaunchAgent is not loaded - run agent-ha-bridge configure" -ForegroundColor Yellow }
+        if (-not (Get-BridgeTmuxPath)) { Write-Host '    tmux       : not installed - replies from the dashboard need it (brew install tmux)' -ForegroundColor Yellow }
+    }
+    elseif ($task) {
         $daemon = @(Get-CimInstance Win32_Process -Filter "Name='pwsh.exe'" -ErrorAction SilentlyContinue |
             Where-Object { $_.CommandLine -match 'agent-bridge-daemon\.ps1' })
         if ($daemon) {
@@ -216,7 +234,7 @@ function Show-Status {
         Write-Host '    dashboard cards:'
         $previous = $env:AGENT_HA_BRIDGE_CONFIG
         $env:AGENT_HA_BRIDGE_CONFIG = $configPath
-        try { & (Join-Path $PSHOME 'pwsh.exe') -NoProfile -ExecutionPolicy Bypass -File $cardCheck }
+        try { & $pwshHere -NoProfile -ExecutionPolicy Bypass -File $cardCheck }
         catch { Write-Host "    could not check the dashboard cards: $($_.Exception.Message)" -ForegroundColor Yellow }
         finally {
             if ($null -eq $previous) { Remove-Item Env:\AGENT_HA_BRIDGE_CONFIG -ErrorAction SilentlyContinue }
@@ -278,7 +296,7 @@ if ($stale.Count) {
         Set-Content -LiteralPath $temp -Value $script -Encoding UTF8
         $env:AGENT_HA_BRIDGE_CONFIG = $ConfigPath
         Write-Host '    machines:'
-        & (Join-Path $PSHOME 'pwsh.exe') -NoProfile -ExecutionPolicy Bypass -File $temp -HooksDir $HooksDir
+        & $pwshHere -NoProfile -ExecutionPolicy Bypass -File $temp -HooksDir $HooksDir
     }
     catch { Write-Host "    could not list the machines: $($_.Exception.Message)" -ForegroundColor Yellow }
     finally {
@@ -290,6 +308,13 @@ if ($stale.Count) {
 
 function Invoke-Restart {
     Write-Step 'Restarting the bridge daemon'
+    if (-not $script:BridgeIsWindows) {
+        $target = "gui/$(& id -u)/$launchAgentLabel"
+        & launchctl kickstart -k $target 2>&1 | Out-Null
+        if ($LASTEXITCODE -ne 0) { throw "The '$launchAgentLabel' LaunchAgent is not loaded. Run: agent-ha-bridge configure" }
+        Write-Host '    restarted' -ForegroundColor Green
+        return
+    }
     if (-not (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue)) {
         throw "The '$taskName' scheduled task is not registered. Run: agent-ha-bridge configure"
     }

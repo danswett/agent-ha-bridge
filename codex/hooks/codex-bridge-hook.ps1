@@ -137,6 +137,12 @@ try {
     # reconcile.
     if ($eventName -eq 'SessionEnd') { Exit-Silently }
 
+    # A prompt or a tool call is published by the daemon, from the registration just
+    # written, within a tenth of a second - while Codex, which waits for every hook,
+    # carries on. Publishing here cost about half a second a tool call. Only while the
+    # daemon is running: otherwise nothing else would publish it.
+    if ($eventName -in @('UserPromptSubmit', 'PreToolUse') -and (Test-BridgeDaemonAlive)) { Exit-Silently }
+
     $headers = Enter-BridgeAdapterSession
     if (-not $headers) { Exit-Silently }
     $display = Get-CodexSessionDisplay -SessionId $sessionId -WorkingDirectory $workingDirectory

@@ -82,6 +82,9 @@ param(
 $ErrorActionPreference = 'Stop'
 
 $repoRoot = $PSScriptRoot
+# Windows/macOS differences, before any path is built: on macOS it also makes
+# Join-Path accept the Windows separators used throughout.
+. (Join-Path $repoRoot 'hooks/bridge-platform.ps1')
 $installHome = if ($TargetHome) { $TargetHome } else { $HOME }
 
 # The VERSION file is the single source of truth, so the Apps & features entry, the
@@ -102,6 +105,9 @@ $binDir = Join-Path $bridgeHome 'bin'
 $configPath = Join-Path $bridgeHome 'config.json'
 $hookConfigPath = Join-Path $copilotHome 'hooks\decision-notifier.json'
 $taskName = 'AgentBridgeDaemon'
+# The macOS counterpart of the scheduled task.
+$launchAgentLabel = 'com.agent-ha-bridge.daemon'
+$launchAgentPath = Join-Path $installHome "Library/LaunchAgents/$launchAgentLabel.plist"
 # A sandbox install must not collide with the real Add/Remove Programs entry.
 $arpKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\AgentHaBridge' +
           $(if ($TargetHome) { '_Sandbox' } else { '' })
@@ -187,6 +193,35 @@ $script:BridgeDependencies = [ordered]@{
         Package = '@openai/codex'
         Why     = ''
     }
+    tmux = [ordered]@{
+        Label   = 'tmux'
+        Manager = 'brew'
+        Package = 'tmux'
+        Why     = 'on macOS each session runs in tmux, which is how replies from the dashboard reach it'
+    }
+}
+# macOS installs through Homebrew what Windows installs through winget - or, on an
+# Intel Mac, which Homebrew no longer supports, through MacPorts.
+if (-not $script:BridgeIsWindows) {
+    # MacPorts' folder, so the checks below - and anything it installs - are found.
+    if ([IO.Directory]::Exists('/opt/local/bin') -and (($env:PATH -split ':') -notcontains '/opt/local/bin')) {
+        $env:PATH = "$env:PATH`:/opt/local/bin"
+    }
+    $useMacPorts = -not (Get-Command brew -ErrorAction SilentlyContinue) -and
+        ((Get-Command port -ErrorAction SilentlyContinue) -or [IO.File]::Exists('/opt/local/bin/port'))
+    if ($useMacPorts) {
+        $script:BridgeDependencies.pwsh.Manager = 'port'
+        $script:BridgeDependencies.pwsh.Package = 'powershell'
+        $script:BridgeDependencies.node.Manager = 'port'
+        $script:BridgeDependencies.node.Package = 'nodejs22 npm10'
+        $script:BridgeDependencies.tmux.Manager = 'port'
+    }
+    else {
+        $script:BridgeDependencies.pwsh.Manager = 'brew'
+        $script:BridgeDependencies.pwsh.Package = 'powershell'
+        $script:BridgeDependencies.node.Manager = 'brew'
+        $script:BridgeDependencies.node.Package = 'node'
+    }
 }
 
 function Get-BridgeDependencyCommand {
@@ -201,6 +236,9 @@ function Get-BridgeDependencyCommand {
                     '--accept-package-agreements --accept-source-agreements')
         }
         'npm' { return "npm install -g $($dep.Package)" }
+        'brew' { return "brew install $($dep.Package)" }
+        # MacPorts installs system-wide, so it asks for the Mac's password.
+        'port' { return "sudo port -N install $($dep.Package)" }
         default { throw "Unknown package manager '$($dep.Manager)' for '$Name'." }
     }
 }
@@ -228,6 +266,14 @@ function Update-BridgeSessionPath {
         the stored value in so the rest of the install can use what it just installed,
         without discarding anything this shell had of its own.
     #>
+    # macOS has no stored PATH to merge (and separates entries with ':'); Homebrew's
+    # folder is added instead, so something brew just installed is found.
+    if (-not $script:BridgeIsWindows) {
+        foreach ($dir in @('/opt/homebrew/bin', '/usr/local/bin', '/opt/local/bin')) {
+            if ([IO.Directory]::Exists($dir) -and (($env:PATH -split ':') -notcontains $dir)) { $env:PATH = "$env:PATH`:$dir" }
+        }
+        return
+    }
     try {
         $seen = @{}
         $merged = @()
@@ -283,6 +329,7 @@ function Test-BridgeDependencyInstalled {
     switch ($Name) {
         'pwsh' { return [bool](Get-BridgePwshPath) }
         'node' { return [bool](Get-Command npm -ErrorAction SilentlyContinue) }
+        'tmux' { return [bool](Get-BridgeTmuxPath) }
         default { return [bool](Test-BridgeClientInstalled $Name) }
     }
 }
@@ -709,12 +756,14 @@ function Test-BridgeClientInstalled {
         'claude'  { [bool](Get-Command claude -ErrorAction SilentlyContinue) }
         'codex'   {
             if (Get-Command codex -ErrorAction SilentlyContinue) { return $true }
+            if (-not $script:BridgeIsWindows) { return $false }
             # Codex ships through npm and is not on PATH, so look where npm installs it.
             Test-Path -LiteralPath (Join-Path $env:APPDATA 'npm\node_modules\@openai\codex')
         }
         'mcp'     {
             # There is no single "MCP client", but Claude Desktop is the one this can
             # configure automatically, so its presence is the useful pre-select hint.
+            if (-not $script:BridgeIsWindows) { return (Test-Path -LiteralPath (Join-Path $HOME 'Library/Application Support/Claude')) }
             Test-Path -LiteralPath (Join-Path $env:APPDATA 'Claude')
         }
         default { $false }
@@ -900,6 +949,10 @@ function Test-BridgeSecretFileProtected {
 
     try {
         if (-not (Test-Path -LiteralPath $Path)) { return $false }
+        # macOS: owner read/write and nothing else.
+        if (-not $script:BridgeIsWindows) {
+            return ([IO.File]::GetUnixFileMode($Path) -eq ([IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite))
+        }
         $acl = Get-Acl -LiteralPath $Path
         if (-not $acl.AreAccessRulesProtected) { return $false }
         $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
@@ -937,6 +990,11 @@ function Protect-BridgeSecretFile {
         # Nothing to do is the common case on a re-install, and rewriting an identical
         # descriptor is exactly what used to fail.
         if (Test-BridgeSecretFileProtected -Path $Path) { return $true }
+
+        if (-not $script:BridgeIsWindows) {
+            [IO.File]::SetUnixFileMode($Path, ([IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite))
+            return (Test-BridgeSecretFileProtected -Path $Path)
+        }
 
         $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
         $file = Get-Item -LiteralPath $Path -Force
@@ -1208,20 +1266,117 @@ function Install-BridgeCommand {
     )
 
     if (-not (Test-Path -LiteralPath $BinDir)) { New-Item -ItemType Directory -Path $BinDir -Force | Out-Null }
-    foreach ($name in @('agent-ha-bridge.ps1', 'agent-ha-bridge.cmd')) {
+    # macOS: a shell shim in place of the .cmd one.
+    $shim = if ($script:BridgeIsWindows) { 'agent-ha-bridge.cmd' } else { 'agent-ha-bridge' }
+    foreach ($name in @('agent-ha-bridge.ps1', $shim)) {
         $from = Join-Path (Join-Path $RepoRoot 'bin') $name
         if (-not (Test-Path -LiteralPath $from)) { throw "The bridge command source $from is missing." }
         Copy-Item -LiteralPath $from -Destination $BinDir -Force
     }
-    Join-Path $BinDir 'agent-ha-bridge.cmd'
+    $command = Join-Path $BinDir $shim
+    if (-not $script:BridgeIsWindows) {
+        $mode = [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite -bor [IO.UnixFileMode]::UserExecute -bor
+            [IO.UnixFileMode]::GroupRead -bor [IO.UnixFileMode]::GroupExecute -bor [IO.UnixFileMode]::OtherRead -bor [IO.UnixFileMode]::OtherExecute
+        [IO.File]::SetUnixFileMode($command, $mode)
+    }
+    $command
+}
+
+function Get-BridgeLaunchAgentPlist {
+    <#
+        The LaunchAgent that runs the daemon on macOS: at login, restarted whenever it
+        exits (which is how the daemon restarts itself after an update), with the PATH
+        this installer ran with - a LaunchAgent otherwise gets only /usr/bin:/bin, and
+        the agents, node and tmux live in Homebrew and npm folders.
+
+        AbandonProcessGroup keeps a dashboard-started update alive while the installer
+        it runs reloads this agent, which would otherwise kill the daemon's whole group.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Label,
+        [Parameter(Mandatory)][string]$PwshPath,
+        [Parameter(Mandatory)][string]$DaemonPath,
+        [Parameter(Mandatory)][string]$LogPath,
+        [Parameter(Mandatory)][string]$PathValue
+    )
+    $x = { param($s) [Security.SecurityElement]::Escape([string]$s) }
+    @"
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key><string>$(& $x $Label)</string>
+    <key>ProgramArguments</key>
+    <array>
+        <string>$(& $x $PwshPath)</string>
+        <string>-NoProfile</string>
+        <string>-NonInteractive</string>
+        <string>-File</string>
+        <string>$(& $x $DaemonPath)</string>
+    </array>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PATH</key><string>$(& $x $PathValue)</string>
+    </dict>
+    <key>RunAtLoad</key><true/>
+    <key>KeepAlive</key><true/>
+    <key>ThrottleInterval</key><integer>10</integer>
+    <key>AbandonProcessGroup</key><true/>
+    <key>ProcessType</key><string>Interactive</string>
+    <key>StandardOutPath</key><string>$(& $x $LogPath)</string>
+    <key>StandardErrorPath</key><string>$(& $x $LogPath)</string>
+</dict>
+</plist>
+"@
+}
+
+function Register-BridgeLaunchAgent {
+    <#
+        Writes and (re)loads the LaunchAgent. bootout first, so an update replaces a
+        running daemon rather than leaving the old version in memory.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Label,
+        [Parameter(Mandatory)][string]$PlistPath,
+        [Parameter(Mandatory)][string]$Content
+    )
+    $dir = Split-Path $PlistPath -Parent
+    if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
+    Set-Content -LiteralPath $PlistPath -Value $Content -Encoding UTF8
+    $domain = "gui/$(& id -u)"
+    & launchctl bootout "$domain/$Label" 2>$null | Out-Null
+    & launchctl bootstrap $domain $PlistPath 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+    & launchctl kickstart -k "$domain/$Label" 2>&1 | Out-Null
+    [bool](& launchctl print "$domain/$Label" 2>$null)
+}
+
+function Register-BridgeShellPath {
+    <#
+        macOS: puts $Directory on PATH for new terminals, through ~/.zprofile (zsh, the
+        default shell) and ~/.bash_profile when it exists. Marked, so a re-run does
+        not add it twice and the uninstaller can find it.
+    #>
+    param([Parameter(Mandatory)][string]$Directory, [string]$HomeDir = $HOME)
+    $marker = '# agent-ha-bridge'
+    $line = "export PATH=`"$Directory`:`$PATH`" $marker"
+    $changed = $false
+    foreach ($name in @('.zprofile', '.bash_profile')) {
+        $file = Join-Path $HomeDir $name
+        if ($name -ne '.zprofile' -and -not (Test-Path -LiteralPath $file)) { continue }
+        $existing = if (Test-Path -LiteralPath $file) { Get-Content -LiteralPath $file -Raw } else { '' }
+        if ($existing -match [regex]::Escape($marker)) { continue }
+        Add-Content -LiteralPath $file -Value "`n$line"
+        $changed = $true
+    }
+    $changed
 }
 
 # Tests dot-source this script with BRIDGE_INSTALL_NORUN set to load its helper
 # functions without running the install; a real run never sets it.
 if ($env:BRIDGE_INSTALL_NORUN) { return }
 
-if (-not $IsWindows -and $PSVersionTable.PSVersion.Major -ge 6) {
-    throw 'This bridge is Windows-only: reply injection uses AttachConsole/WriteConsoleInput.'
+if (-not $IsWindows -and -not $IsMacOS -and $PSVersionTable.PSVersion.Major -ge 6) {
+    throw 'This bridge runs on Windows and macOS.'
 }
 
 # Windows PowerShell can parse this script but not run it: the hooks, the daemon and
@@ -1261,7 +1416,7 @@ $script:DidMigrate = Invoke-BridgeLayoutMigration `
     -CopilotHome $copilotHome -BridgeHome $bridgeHome -ConfigPath $configPath `
     -LegacyHooksDir $legacyHooksDir -LegacyConfigPath $legacyConfigPath `
     -LegacyBridgeHome $legacyBridgeHome -LegacyArpKey $legacyArpKey `
-    -LegacyTaskName $legacyTaskName -SkipMachineWide:([bool]$TargetHome)
+    -LegacyTaskName $legacyTaskName -SkipMachineWide:([bool]$TargetHome -or -not $script:BridgeIsWindows)
 
 # ---------------------------------------------------------------- hook scripts
 Write-Step "Copying hook scripts to $hooksDir"
@@ -1386,6 +1541,10 @@ if (-not $SkipDependencies) {
         foreach ($client in @($wanted | Where-Object { $_ -ne 'mcp' })) {
             [void](Request-BridgeDependency -Name $client -NonInteractive:$NonInteractive)
         }
+    }
+    # macOS sessions run in tmux: without it they still get cards, but no replies.
+    if (-not $script:BridgeIsWindows) {
+        [void](Request-BridgeDependency -Name 'tmux' -NonInteractive:$NonInteractive)
     }
 }
 
@@ -1557,6 +1716,17 @@ if ($selectedClients -contains 'copilot') {
             }
         )
     }
+    # Off Windows the CLI runs a hook's `bash` command, so each gets one that starts
+    # the same script under pwsh, by full path - a hook's PATH may not include it.
+    if (-not $script:BridgeIsWindows) {
+        $pwshForHooks = (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source
+        foreach ($event in @($hookDefs.Keys)) {
+            foreach ($def in $hookDefs[$event]) {
+                $scriptPath = ([regex]::Match($def.powershell, "'([^']+)'")).Groups[1].Value
+                $def.bash = "'$pwshForHooks' -NoProfile -NonInteractive -File '$scriptPath'"
+            }
+        }
+    }
     @{ version = 1; hooks = $hookDefs } | ConvertTo-Json -Depth 8 |
         Set-Content -LiteralPath $hookConfigPath -Encoding UTF8
     Write-Host "    $hookConfigPath"
@@ -1571,7 +1741,25 @@ elseif (Test-Path -LiteralPath $hookConfigPath) {
 
 # ------------------------------------------------------------- scheduled task
 $taskRegistered = $false
-if (-not $SkipTask) {
+if (-not $SkipTask -and -not $script:BridgeIsWindows) {
+    Write-Step "Registering the '$launchAgentLabel' LaunchAgent"
+    try {
+        if ($TargetHome) { throw 'a -TargetHome sandbox does not register a LaunchAgent' }
+        $pwshPath = (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source
+        $pathValue = @(@($env:PATH -split ':') + @('/opt/homebrew/bin', '/usr/local/bin', '/opt/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin') |
+            Where-Object { $_ } | Select-Object -Unique) -join ':'
+        $plist = Get-BridgeLaunchAgentPlist -Label $launchAgentLabel -PwshPath $pwshPath `
+            -DaemonPath (Join-Path $hooksDir 'agent-bridge-daemon.ps1') `
+            -LogPath (Join-Path $env:TEMP 'agent-bridge-launchd.log') -PathValue $pathValue
+        $taskRegistered = Register-BridgeLaunchAgent -Label $launchAgentLabel -PlistPath $launchAgentPath -Content $plist
+        if ($taskRegistered) { Write-Host '    registered and started' }
+        else { Write-Warning "launchd did not accept $launchAgentPath" }
+    }
+    catch {
+        Write-Warning "Could not register the LaunchAgent: $($_.Exception.Message)"
+    }
+}
+elseif (-not $SkipTask) {
     Write-Step "Registering the '$taskName' scheduled task"
     # wscript + the VBS launcher, not pwsh directly: WScript.Shell.Run(..., 0, False)
     # starts the supervisor with no window at all, while still giving the daemon a real
@@ -1673,6 +1861,17 @@ elseif ($TargetHome) {
     Write-Step 'Leaving PATH alone (-TargetHome)'
     Write-Host "    run it as $commandPath" -ForegroundColor DarkGray
 }
+elseif (-not $script:BridgeIsWindows) {
+    Write-Step 'Putting agent-ha-bridge on your PATH'
+    if (Register-BridgeShellPath -Directory $binDir) {
+        Write-Host "    added $binDir to PATH in ~/.zprofile" -ForegroundColor Green
+        Write-Host '    open a new terminal to use it there' -ForegroundColor DarkGray
+    }
+    else {
+        Write-Host "    $binDir was already on PATH"
+    }
+    if (($env:PATH -split ':') -notcontains $binDir) { $env:PATH = "$binDir`:$env:PATH" }
+}
 else {
     Write-Step 'Putting agent-ha-bridge on your PATH'
     if (Register-BridgePathEntry -Directory $binDir) {
@@ -1693,10 +1892,11 @@ else {
 # list Settings reads, and it avoids the SmartScreen warning an unsigned exe would
 # produce. uninstall.ps1 is copied somewhere stable so the entry keeps working after
 # the cloned repo is deleted.
-Write-Step 'Registering in Apps & features'
 if (-not (Test-Path -LiteralPath $bridgeHome)) { New-Item -ItemType Directory -Path $bridgeHome -Force | Out-Null }
 Copy-Item (Join-Path $repoRoot 'uninstall.ps1') $bridgeHome -Force
 $uninstallScript = Join-Path $bridgeHome 'uninstall.ps1'
+if ($script:BridgeIsWindows) {
+Write-Step 'Registering in Apps & features'
 
 # A sandbox install must uninstall itself, not the real one, so the entry carries its
 # own location. A normal install omits it and lets uninstall.ps1 use $HOME, which also
@@ -1724,11 +1924,13 @@ foreach ($name in $arpValues.Keys) { Set-ItemProperty -Path $arpKey -Name $name 
 Set-ItemProperty -Path $arpKey -Name NoModify -Value 1 -Type DWord
 Set-ItemProperty -Path $arpKey -Name NoRepair -Value 1 -Type DWord
 Write-Host "    'AI coding agent Home Assistant bridge' is now uninstallable from Settings"
+}
 
 Write-Step 'Done'
 if (-not $SkipTask -and -not $taskRegistered) {
     Write-Host ''
-    Write-Host 'The bridge daemon is NOT running: its scheduled task could not be registered.' -ForegroundColor Red
+    $service = if ($script:BridgeIsWindows) { 'its scheduled task' } else { 'its LaunchAgent' }
+    Write-Host "The bridge daemon is NOT running: $service could not be registered." -ForegroundColor Red
     Write-Host 'Nothing below will work until that is fixed - see the warning above.' -ForegroundColor Red
 }
 Write-Host 'Next steps:' -ForegroundColor Yellow
@@ -1751,7 +1953,13 @@ if ($selectedClients -contains 'mcp') {
     $stepNo++
 }
 Write-Host "  $stepNo. Open the Agent Sessions dashboard in Home Assistant."
-Write-Host "     Logs: `$env:TEMP\agent-bridge-daemon.log and agent-decision-bridge.log"
+Write-Host "     Logs: $(Join-Path $env:TEMP 'agent-bridge-daemon.log') and agent-decision-bridge.log"
+if (-not $script:BridgeIsWindows) {
+    $stepNo++
+    Write-Host "  $stepNo. macOS: the dashboard types replies into sessions running in tmux. Sessions it"
+    Write-Host '        launches are; for ones you start yourself, run the agent inside tmux (tmux new claude).'
+    Write-Host '        The first launch asks whether the bridge may control Terminal: allow it.'
+}
 Write-Host ''
 Write-Host 'From now on, manage this install with the agent-ha-bridge command:' -ForegroundColor Yellow
 Write-Host '  agent-ha-bridge status       what is installed, running and connected'

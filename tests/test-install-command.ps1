@@ -98,18 +98,35 @@ Write-Host '--- installing the command ---'
 $binRoot = New-ScratchDir
 try {
     $cmd = Install-BridgeCommand -RepoRoot $repoRoot -BinDir $binRoot
-    Test-That 'it returns the .cmd shim, which is what goes on PATH' {
-        $cmd -eq (Join-Path $binRoot 'agent-ha-bridge.cmd')
-    }
     Test-That 'the shim exists' { Test-Path -LiteralPath $cmd }
     Test-That 'the dispatcher exists beside it' {
         Test-Path -LiteralPath (Join-Path $binRoot 'agent-ha-bridge.ps1')
     }
-    Test-That 'the shim calls the dispatcher next to itself, not an absolute path' {
-        (Get-Content -LiteralPath $cmd -Raw) -match '%~dp0agent-ha-bridge\.ps1'
+    if ($script:BridgeIsWindows) {
+        Test-That 'it returns the .cmd shim, which is what goes on PATH' {
+            $cmd -eq (Join-Path $binRoot 'agent-ha-bridge.cmd')
+        }
+        Test-That 'the shim calls the dispatcher next to itself, not an absolute path' {
+            (Get-Content -LiteralPath $cmd -Raw) -match '%~dp0agent-ha-bridge\.ps1'
+        }
+        Test-That 'the shim falls back to the default pwsh location' {
+            (Get-Content -LiteralPath $cmd -Raw) -match 'PowerShell\\7\\pwsh\.exe'
+        }
     }
-    Test-That 'the shim falls back to the default pwsh location' {
-        (Get-Content -LiteralPath $cmd -Raw) -match 'PowerShell\\7\\pwsh\.exe'
+    else {
+        Test-That 'it returns the shell shim, which is what goes on PATH' {
+            $cmd -eq (Join-Path $binRoot 'agent-ha-bridge')
+        }
+        Test-That 'the shim is executable' {
+            ([IO.File]::GetUnixFileMode($cmd) -band [IO.UnixFileMode]::UserExecute) -ne 0
+        }
+        Test-That 'the shim runs the dispatcher next to itself' {
+            (Get-Content -LiteralPath $cmd -Raw) -match '\$dir/agent-ha-bridge\.ps1'
+        }
+        Test-That 'the shim looks for pwsh where Homebrew puts it' {
+            (Get-Content -LiteralPath $cmd -Raw) -match '/opt/homebrew/bin/pwsh'
+        }
+        Test-That 'the shim runs the command' { $null = & $cmd version 2>&1; $LASTEXITCODE -eq 0 }
     }
     Test-That 'installing again is a no-op that still succeeds' {
         [void](Install-BridgeCommand -RepoRoot $repoRoot -BinDir $binRoot)
@@ -310,7 +327,7 @@ try {
 
     Test-That 'the install succeeds' { $LASTEXITCODE -eq 0 }
     Test-That 'the command is installed' {
-        Test-Path -LiteralPath (Join-Path $sandboxHome 'bin\agent-ha-bridge.cmd')
+        Test-Path -LiteralPath (Join-Path $sandboxHome $(if ($script:BridgeIsWindows) { 'bin\agent-ha-bridge.cmd' } else { 'bin/agent-ha-bridge' }))
     }
     Test-That 'the installer payload is installed' {
         Test-Path -LiteralPath (Join-Path $sandboxHome 'installer\install.ps1')
@@ -341,6 +358,8 @@ try {
         } else { 'absent' }
         $after -eq $realConfigBefore
     }
+    # Apps & features is Windows-only.
+    if ($script:BridgeIsWindows) {
     Test-That 'it registered under the sandbox uninstall key, not the real one' {
         Test-Path -LiteralPath $sandboxArpKey
     }
@@ -357,6 +376,7 @@ try {
         $arp = Get-ItemProperty -LiteralPath $sandboxArpKey
         ([string]$arp.UninstallString -match '-TargetHome') -and
         ([string]$arp.QuietUninstallString -match '-TargetHome')
+    }
     }
 
     Write-Host '--- the installed command reports on the install it came from ---'
@@ -510,3 +530,5 @@ if ($script:Failures) {
     exit 1
 }
 Write-Host 'All checks passed' -ForegroundColor Green
+# Explicit: without it pwsh reports the last external command's exit code.
+exit 0

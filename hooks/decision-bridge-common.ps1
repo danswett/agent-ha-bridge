@@ -18,6 +18,10 @@
     below. See config.example.json in the repository root.
 #>
 
+# Windows/macOS differences (the temporary folder, process lookups, tmux), first so
+# everything below can rely on them.
+. (Join-Path $PSScriptRoot 'bridge-platform.ps1')
+
 function Get-BridgeUserConfig {
     $candidates = @()
     if (-not [string]::IsNullOrWhiteSpace($env:AGENT_HA_BRIDGE_CONFIG)) {
@@ -153,14 +157,55 @@ function Test-HomeAssistantReachable {    <#
     #>
     param([int]$TimeoutSec = 2)
 
+    # Answered recently - by the daemon's last pass or another hook - so no new probe:
+    # it cost every hook about 100 ms, which Claude and Codex wait for.
+    try {
+        $age = ([DateTime]::UtcNow - [IO.File]::GetLastWriteTimeUtc((Get-BridgeReachableMarker))).TotalSeconds
+        if ($age -ge 0 -and $age -lt $script:BridgeReachableFreshSeconds) { return $true }
+    }
+    catch { }
+
     try {
         $null = Invoke-RestMethod -Uri "$($script:DecisionBridgeConfig.HomeAssistantBaseUrl)/api/" `
             -Headers (Get-HomeAssistantHeaders) -TimeoutSec $TimeoutSec
+        Set-BridgeHomeAssistantReachable
         return $true
     }
     catch {
         return $false
     }
+}
+
+# How long a successful contact with Home Assistant vouches for it. The daemon renews
+# it every 15-second pass, so a hook almost never probes; kept short, because a hook
+# that trusts a stale answer spends its budget on a host that has gone.
+$script:BridgeReachableFreshSeconds = 20
+
+function Get-BridgeReachableMarker { Join-Path $env:TEMP 'agent-bridge-ha-reachable' }
+
+function Set-BridgeHomeAssistantReachable {
+    <# Records that Home Assistant just answered. Best effort. #>
+    try { [IO.File]::WriteAllText((Get-BridgeReachableMarker), [DateTimeOffset]::Now.ToString('o')) } catch { }
+}
+
+function Get-BridgeDaemonHeartbeat { Join-Path $env:TEMP 'agent-bridge-daemon.heartbeat' }
+
+function Set-BridgeDaemonAlive {
+    <# The daemon's heartbeat, written each pass. Best effort. #>
+    try { [IO.File]::WriteAllText((Get-BridgeDaemonHeartbeat), [string]$PID) } catch { }
+}
+
+function Test-BridgeDaemonAlive {
+    <#
+        Whether the daemon has completed a pass in the last minute - so a hook can leave
+        publishing to it rather than make the agent wait on Home Assistant. A stopped
+        daemon goes stale, and the hooks go back to publishing themselves.
+    #>
+    # AGENT_BRIDGE_HOOKS_PUBLISH makes hooks publish regardless, for tests that run
+    # them against Home Assistant beside a running daemon.
+    if ($env:AGENT_BRIDGE_HOOKS_PUBLISH) { return $false }
+    try { ([DateTime]::UtcNow - [IO.File]::GetLastWriteTimeUtc((Get-BridgeDaemonHeartbeat))).TotalSeconds -lt 60 }
+    catch { $false }
 }
 
 function Set-DecisionBridgeDeadline {

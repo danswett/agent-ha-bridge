@@ -89,6 +89,30 @@ Test-That 'an unreachable host is detected quickly' {
     (-not $result) -or $sw.Elapsed.TotalSeconds -lt 4
 }
 
+# A recent contact vouches for Home Assistant, so a hook skips the probe - about
+# 100 ms each, which the agent waits for - and only a stale one probes again.
+$savedTemp = $env:TEMP
+$savedBase = $script:DecisionBridgeConfig.HomeAssistantBaseUrl
+$env:TEMP = Join-Path ([IO.Path]::GetTempPath()) "bridge-reach-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+New-Item -ItemType Directory -Path $env:TEMP -Force | Out-Null
+try {
+    # Nothing listens here, so a real probe fails.
+    $script:DecisionBridgeConfig.HomeAssistantBaseUrl = 'http://127.0.0.1:9'
+    Test-That 'with no recent contact, the probe runs (and fails here)' { -not (Test-HomeAssistantReachable -TimeoutSec 1) }
+    Set-BridgeHomeAssistantReachable
+    Test-That 'a contact just now answers without probing' {
+        $sw = [Diagnostics.Stopwatch]::StartNew(); $ok = Test-HomeAssistantReachable -TimeoutSec 1
+        $ok -and $sw.ElapsedMilliseconds -lt 200
+    }
+    [IO.File]::SetLastWriteTimeUtc((Get-BridgeReachableMarker), [DateTime]::UtcNow.AddSeconds(-60))
+    Test-That 'a stale one probes again' { -not (Test-HomeAssistantReachable -TimeoutSec 1) }
+}
+finally {
+    Remove-Item -LiteralPath $env:TEMP -Recurse -Force -ErrorAction SilentlyContinue
+    $env:TEMP = $savedTemp
+    $script:DecisionBridgeConfig.HomeAssistantBaseUrl = $savedBase
+}
+
 Write-Host '--- stale Claude registrations are pruned ---'
 $root = Get-ClaudeStateRoot
 $seeded = @()
@@ -129,9 +153,17 @@ try {
     # stands in for the running session, since only the process name is checked.
     $fakeDir = Join-Path ([IO.Path]::GetTempPath()) "fake-claude-$([guid]::NewGuid().ToString('N').Substring(0,8))"
     New-Item -ItemType Directory -Path $fakeDir -Force | Out-Null
-    $fakeExe = Join-Path $fakeDir 'claude.exe'
-    Copy-Item (Join-Path $env:WINDIR 'System32\PING.EXE') $fakeExe
-    $fake = Start-Process -FilePath $fakeExe -ArgumentList '-n 30 127.0.0.1' -WindowStyle Hidden -PassThru
+    # macOS: a copy of sleep, named claude, plays the same part.
+    if ($script:BridgeIsWindows) {
+        $fakeExe = Join-Path $fakeDir 'claude.exe'
+        Copy-Item (Join-Path $env:WINDIR 'System32\PING.EXE') $fakeExe
+        $fake = Start-Process -FilePath $fakeExe -ArgumentList '-n 30 127.0.0.1' -WindowStyle Hidden -PassThru
+    }
+    else {
+        $fakeExe = Join-Path $fakeDir 'claude'
+        Copy-Item '/bin/sleep' $fakeExe
+        $fake = Start-Process -FilePath $fakeExe -ArgumentList '30' -PassThru
+    }
     try {
         $idle = [guid]::NewGuid().ToString()
         $seeded += $idle
@@ -160,3 +192,5 @@ if ($script:Failures) {
     exit 1
 }
 Write-Host 'All tests passed' -ForegroundColor Green
+# Explicit: without it pwsh reports the last external command's exit code.
+exit 0

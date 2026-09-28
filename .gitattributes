@@ -1,0 +1,3 @@
+# Shell scripts run on macOS and must keep LF line endings wherever they are checked out.
+*.sh text eol=lf
+bin/agent-ha-bridge text eol=lf

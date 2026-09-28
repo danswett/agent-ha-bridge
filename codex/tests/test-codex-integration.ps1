@@ -20,6 +20,10 @@ param()
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+# The hooks run here against Home Assistant beside a running daemon, which would
+# otherwise publish their prompt and tool-call updates for them - and this test
+# session is not one it follows.
+$env:AGENT_BRIDGE_HOOKS_PUBLISH = '1'
 
 $core = Join-Path $HOME '.agent-ha-bridge\hooks'
 if (-not (Test-Path -LiteralPath (Join-Path $core 'bridge-adapter.ps1'))) {
@@ -67,7 +71,10 @@ try {
     Write-Host '--- SessionStart publishes the card as idle ---'
     $r = Invoke-Hook 'sessionstart.json'
     Test-That 'the hook exits 0 silently' { $r.ExitCode -eq 0 -and $r.Output -eq '' } "exit $($r.ExitCode)"
-    Start-Sleep -Milliseconds 1500
+    # Home Assistant creates the entities from MQTT discovery in its own time, so wait
+    # for them rather than a fixed pause, which was sometimes too short.
+    $deadline = (Get-Date).AddSeconds(6)
+    while ((Get-StatusState) -ne 'idle' -and (Get-Date) -lt $deadline) { Start-Sleep -Milliseconds 300 }
     Test-That 'the status sensor exists and reads idle' { (Get-StatusState) -eq 'idle' } (Get-StatusState)
 
     Write-Host '--- PreToolUse shows the running command ---'
@@ -109,3 +116,5 @@ if ($script:Failures) {
     exit 1
 }
 Write-Host 'All checks passed' -ForegroundColor Green
+# Explicit: without it pwsh reports the last external command's exit code.
+exit 0

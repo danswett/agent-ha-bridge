@@ -449,4 +449,5 @@ if ($script:Failures) {
     exit 1
 }
 Write-Host 'All checks passed' -ForegroundColor Green
-
+# Explicit: without it pwsh reports the last external command's exit code.
+exit 0
