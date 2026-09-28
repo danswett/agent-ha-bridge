@@ -54,9 +54,13 @@ load_paths
 
 # The newest release asset of a GitHub repository whose name matches a pattern, or
 # nothing. Never fails: under pipefail a lookup that finds nothing would end the script.
+#
+# `--` before the pattern is load-bearing: the macOS lookup passes "-13-[A-Za-z]+\.pkg$",
+# and grep read a leading hyphen as an option - "grep: unknown option" - so every
+# MacPorts lookup found nothing and the install died reporting no package for this macOS.
 latest_asset() {
     { curl -fsSL "https://api.github.com/repos/$1/releases/latest" |
-        grep -Eo '"browser_download_url": *"[^"]+"' | cut -d'"' -f4 | grep -E "$2" | head -n 1; } || true
+        grep -Eo '"browser_download_url": *"[^"]+"' | cut -d'"' -f4 | grep -E -- "$2" | head -n 1; } || true
 }
 
 # `installer` decides what it has been handed from the file name, so the download has

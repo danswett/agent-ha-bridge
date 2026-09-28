@@ -71,6 +71,42 @@ if install_pkg 'https://example.test/gone.pkg'; then rc=0; else rc=1; fi
 check 'install_pkg reports the failure' "$rc" '1'
 check 'and installer is not reached' "$seen" 'none'
 
+# --- picking a release asset ------------------------------------------------------
+# The macOS lookup asks for "-13-[A-Za-z]+\.pkg$", and a pattern starting with a hyphen
+# was read by grep as an option instead - so every MacPorts lookup found nothing and the
+# install died with "No MacPorts package was found for macOS 13".
+eval "$(awk '/^latest_asset\(\) \{/,/^\}/' "$src")"
+
+# One release's assets, named as macports/macports-base really names them.
+curl() {
+    for v in 10.15-Catalina 11-BigSur 12-Monterey 13-Ventura 14-Sonoma 15-Sequoia 26-Tahoe; do
+        echo "    \"browser_download_url\": \"https://example.test/download/MacPorts-2.12.6-$v.pkg\","
+    done
+    echo '    "browser_download_url": "https://example.test/download/MacPorts-2.12.6.tar.bz2",'
+}
+
+echo '--- picking a release asset ---'
+check 'a macOS-13 package is found' \
+    "$(basename "$(latest_asset macports/macports-base "-13-[A-Za-z]+\.pkg$")")" 'MacPorts-2.12.6-13-Ventura.pkg'
+check 'and the right one, not merely the first' \
+    "$(basename "$(latest_asset macports/macports-base "-15-[A-Za-z]+\.pkg$")")" 'MacPorts-2.12.6-15-Sequoia.pkg'
+check 'a two-digit macOS is not matched by a one-digit pattern' \
+    "$(basename "$(latest_asset macports/macports-base "-1-[A-Za-z]+\.pkg$")")" ''
+check 'a macOS with no package of its own finds nothing, rather than the wrong one' \
+    "$(latest_asset macports/macports-base "-99-[A-Za-z]+\.pkg$")" ''
+
+# PowerShell's pattern has no leading hyphen, which is why that half kept working.
+curl() {
+    echo '    "browser_download_url": "https://example.test/powershell-7.5.4-osx-arm64.pkg",'
+    echo '    "browser_download_url": "https://example.test/powershell-7.5.4-osx-x64.pkg",'
+}
+check 'the PowerShell asset is still found' \
+    "$(basename "$(latest_asset PowerShell/PowerShell 'osx-x64\.pkg$')")" 'powershell-7.5.4-osx-x64.pkg'
+
+curl() { return 22; }
+check 'a lookup that cannot reach GitHub yields nothing rather than failing' \
+    "$(latest_asset macports/macports-base "-13-[A-Za-z]+\.pkg$")" ''
+
 echo ''
 if [ "$fails" -eq 0 ]; then echo 'All bootstrap checks passed'; exit 0; fi
 echo "$fails check(s) failed"
