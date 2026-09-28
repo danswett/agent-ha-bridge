@@ -442,6 +442,25 @@ function Send-DaemonReplyBoxText {
     # rather than unconditionally here: a blanket 'Sending...' on every pass would
     # overwrite the armed message it is meant to sit alongside.
     if ([string]::IsNullOrWhiteSpace($value) -or $value -in @('unknown', 'unavailable')) {
+        # An agent setting the text does so through the API, where the value commits
+        # the moment it is set - so an empty box really is empty, and arming would
+        # leave "Waiting for your text" on the card for the full ten minutes waiting
+        # for a person who is not there. Only a person gets the benefit of the doubt.
+        $pressedBy = if ($entry.PSObject.Properties['Driver']) { [string]$entry.Driver } else { 'human' }
+        if ($pressedBy -eq 'agent') {
+            Set-DaemonSessionProperty -Entry $entry -Name 'LastSubmitAt' -Value $press
+            Set-DaemonSessionProperty -Entry $entry -Name 'PendingSubmitAt' -Value ''
+            # Nothing was sent, so no agent turn is coming. Leaving this armed would
+            # hand the glow to whatever the person types next in the terminal.
+            Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $false
+            try {
+                Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Nothing to send' -Headers $Headers
+            }
+            catch { }
+            Write-DaemonLog -Message "send for $($sessionId.Substring(0,8)) had an empty box and came from an agent; not armed"
+            return
+        }
+
         # The text is almost certainly on screen - it just is not in Home Assistant
         # yet. A text entity only commits when it loses focus or you press Enter,
         # and pressing Send does neither: Home Assistant's own history showed three

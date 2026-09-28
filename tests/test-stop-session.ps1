@@ -372,10 +372,17 @@ $script:Activity = @()
 $script:Replies = @()
 $script:HaStates = @{}
 
+$script:PressUserId = ''
 function Get-HomeAssistantState {
     param([string]$EntityId, [hashtable]$Headers)
     if (-not $script:HaStates.ContainsKey($EntityId)) { throw "no such entity $EntityId" }
-    [pscustomobject]@{ state = $script:HaStates[$EntityId]; attributes = [pscustomobject]@{ question = '' } }
+    [pscustomobject]@{
+        state = $script:HaStates[$EntityId]
+        attributes = [pscustomobject]@{ question = '' }
+        # Home Assistant records the account behind every press; it is what tells an
+        # agent driving the session from the person looking at it.
+        context = [pscustomobject]@{ id = 'c1'; parent_id = $null; user_id = $script:PressUserId }
+    }
 }
 function Set-CopilotMqttActivity {
     param([string]$SessionId, [string]$Summary, $Detail, [hashtable]$Headers)
@@ -389,9 +396,10 @@ function Get-CopilotDecisionMarker { param([string]$SessionId) $null }
 
 $replyNode = Get-CopilotMqttNodeId -SessionId 'bbbbbbbb-1111-2222-3333-444444444444'
 function Reset-SendTest {
-    param([string]$Press, [string]$Reply)
+    param([string]$Press, [string]$Reply, [string]$UserId = '')
     $script:Activity = @()
     $script:Replies = @()
+    $script:PressUserId = $UserId
     $script:HaStates = @{
         "button.${replyNode}_submit"   = $Press
         "text.${replyNode}_reply"      = $Reply
@@ -423,6 +431,42 @@ Test-That 'and the press is kept rather than spent' {
     # Burning it here is what forced a second press: by the time the value arrived,
     # the press that was meant to send it had already been consumed.
     [string]$ctx.State['bbbbbbbb-1111-2222-3333-444444444444'].PendingSubmitAt -eq '2026-06-01T12:05:00+00:00'
+}
+
+Write-Host ''
+Write-Host '--- an agent''s empty box really is empty ---'
+# Arming exists for a person: their text is usually on screen and simply has not been
+# committed to Home Assistant yet. An agent sets the value through the API, where it
+# commits at once - so waiting ten minutes for text that is never coming just leaves
+# "Waiting for your text" sitting on the card. Seen for real, from a test press.
+function Get-BridgeSetting { param($Path, $Default) if ($Path -eq 'homeAssistant.agentUserIds') { return @('agent-user') } $Default }
+
+$ctx = Reset-SendTest -Press '2026-06-01T13:00:00+00:00' -Reply ' ' -UserId 'agent-user'
+Invoke-PendingReplies -Headers $headers -State $ctx.State -Live $ctx.Live
+Test-That 'an agent''s empty press still sends nothing' { $script:Replies.Count -eq 0 }
+Test-That 'it is told the box was empty, not asked to type' {
+    ($script:Activity -contains 'Nothing to send') -and ($script:Activity -notcontains 'Waiting for your text')
+} ($script:Activity -join '|')
+Test-That 'and the press is spent, so nothing stays armed' {
+    $entry = $ctx.State['bbbbbbbb-1111-2222-3333-444444444444']
+    [string]$entry.PendingSubmitAt -eq '' -and [string]$entry.LastSubmitAt -eq '2026-06-01T13:00:00+00:00'
+}
+Test-That 'the session is marked as agent-driven all the same' {
+    [string]$ctx.State['bbbbbbbb-1111-2222-3333-444444444444'].Driver -eq 'agent'
+}
+Test-That 'but the next terminal turn is not stolen by the glow' {
+    # Nothing was sent, so no agent turn is coming; leaving this armed would keep
+    # the purple glow on whatever the person types next at the keyboard.
+    -not $ctx.State['bbbbbbbb-1111-2222-3333-444444444444'].DriverPending
+}
+
+$ctx = Reset-SendTest -Press '2026-06-01T13:05:00+00:00' -Reply ' ' -UserId 'someone-else'
+Invoke-PendingReplies -Headers $headers -State $ctx.State -Live $ctx.Live
+Test-That 'a person still gets the benefit of the doubt' {
+    $script:Activity -contains 'Waiting for your text'
+} ($script:Activity -join '|')
+Test-That 'and their press is still kept' {
+    [string]$ctx.State['bbbbbbbb-1111-2222-3333-444444444444'].PendingSubmitAt -eq '2026-06-01T13:05:00+00:00'
 }
 
 Write-Host ''
