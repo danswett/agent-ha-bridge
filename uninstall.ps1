@@ -422,7 +422,7 @@ if ($TargetHome) {
 elseif (-not $script:BridgeIsWindows) {
     # The line the installer marked in the shell profiles.
     Write-Step 'Removing agent-ha-bridge from your PATH'
-    foreach ($name in @('.zprofile', '.bash_profile')) {
+    foreach ($name in @('.zprofile', '.bash_profile', '.bash_login', '.profile')) {
         $file = Join-Path $installHome $name
         if (-not (Test-Path -LiteralPath $file)) { continue }
         $lines = @(Get-Content -LiteralPath $file)

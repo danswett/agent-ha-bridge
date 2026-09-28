@@ -590,6 +590,22 @@ Test-That 'and reports that it changed nothing' {
 Test-That 'the line it writes puts the folder first, ahead of anything else' {
     (Get-Content -LiteralPath (Join-Path $bashHome '.bash_profile') -Raw) -match ([regex]::Escape("export PATH=`"$binDir`:`$PATH`""))
 }
+# The agent CLIs live in npm's own bin folder, which MacPorts does not reliably put on
+# a bash user's PATH - `codex` was "command not found" right after being installed.
+Test-That 'a second folder is added rather than mistaken for the first' {
+    [void](Register-BridgeShellPath -Directory '/opt/local/bin' -HomeDir $bashHome -Shell '/bin/bash')
+    $body = Get-Content -LiteralPath (Join-Path $bashHome '.bash_profile') -Raw
+    $body -match ([regex]::Escape("export PATH=`"$binDir`:`$PATH`"")) -and
+    $body -match ([regex]::Escape('export PATH="/opt/local/bin:$PATH"'))
+}
+Test-That 'and it too is skipped on a re-run' {
+    -not (Register-BridgeShellPath -Directory '/opt/local/bin' -HomeDir $bashHome -Shell '/bin/bash')
+}
+Test-That 'every line the uninstaller looks for is marked' {
+    @(Get-Content -LiteralPath (Join-Path $bashHome '.bash_profile') |
+        Where-Object { $_ -match 'export PATH=' } |
+        Where-Object { $_ -notmatch '# agent-ha-bridge$' }).Count -eq 0
+}
 foreach ($dir in @($zshHome, $bashHome, $profileHome, $bpHome, $mixedHome)) {
     Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
 }

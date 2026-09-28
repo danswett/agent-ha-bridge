@@ -1529,11 +1529,29 @@ function Register-BridgeShellPath {
     $changed = $false
     foreach ($file in (Get-BridgeShellProfile -HomeDir $HomeDir -Shell $Shell)) {
         $existing = if (Test-Path -LiteralPath $file) { Get-Content -LiteralPath $file -Raw } else { '' }
-        if ($existing -match [regex]::Escape($marker)) { continue }
+        # This exact folder, not merely any bridge line: the CLIs the installer put in
+        # npm's own bin folder need that folder on PATH too, and matching the marker
+        # alone would treat the second call as already done.
+        if ($existing -match [regex]::Escape($line)) { continue }
         Add-Content -LiteralPath $file -Value "`n$line"
         $changed = $true
     }
     $changed
+}
+
+function Get-BridgeNpmBinDir {
+    <#
+        The folder `npm install -g` links its commands into, or ''.
+
+        On a MacPorts Mac that is /opt/local/bin, and MacPorts does not reliably get it
+        onto a bash user's PATH - so `codex` and `claude` came back "command not found"
+        in the very terminal they have to be signed in from, right after the installer
+        had put them there.
+    #>
+    $npm = Get-BridgeNpmPath
+    if ($npm -eq 'npm') { return '' }
+    if ($npm -match '^(.*)/[^/]+$') { return $Matches[1] }
+    ''
 }
 
 # Tests dot-source this script with BRIDGE_INSTALL_NORUN set to load its helper
@@ -2059,6 +2077,19 @@ elseif (-not $script:BridgeIsWindows) {
         Write-Host "    $binDir was already on PATH"
     }
     if (($env:PATH -split ':') -notcontains $binDir) { $env:PATH = "$binDir`:$env:PATH" }
+
+    # The agent CLIs are linked into npm's own bin folder. On a MacPorts Mac that is
+    # /opt/local/bin, which MacPorts does not reliably put on a bash user's PATH - so
+    # they were "command not found" in the terminal they have to be signed in from,
+    # immediately after this installer had installed them.
+    $npmBinDir = Get-BridgeNpmBinDir
+    if ($npmBinDir -and $npmBinDir -ne $binDir -and (Test-Path -LiteralPath $npmBinDir) -and
+        (($env:PATH -split ':') -notcontains $npmBinDir)) {
+        if (Register-BridgeShellPath -Directory $npmBinDir) {
+            Write-Host "    added $npmBinDir, where the agent CLIs are, too" -ForegroundColor Green
+        }
+        $env:PATH = "$npmBinDir`:$env:PATH"
+    }
 }
 else {
     Write-Step 'Putting agent-ha-bridge on your PATH'
