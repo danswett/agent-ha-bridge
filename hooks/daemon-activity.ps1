@@ -677,6 +677,16 @@ function Invoke-DaemonFastActivity {
     # registration - or its trust question - is noticed within a second.
     try { Update-DaemonPendingLaunch -Headers $Headers } catch { }
 
+    # Hook events the native hook handed over, before streaming, so a registration it
+    # carries is in place when the session's activity is read (daemon-hookspool.ps1).
+    # Looked at only when due: listing the folder every tick cost more than the tick.
+    # Test-DaemonHookSpoolDue, inlined - the call alone was a tenth of an idle tick.
+    if (($null -ne $script:DaemonHookSpoolEvents -and $script:DaemonHookSpoolEvents.Count -gt 0) -or
+        $script:DaemonHookSpoolAttempts.Count -gt 0 -or
+        ([DateTime]::UtcNow - $script:DaemonHookSpoolSweptAt).TotalSeconds -ge $script:DaemonHookSpoolSweepSeconds) {
+        try { $null = Invoke-DaemonHookSpool } catch { Write-DaemonLog -Message "hook spool failed: $($_.Exception.Message)" }
+    }
+
     $live = $script:DaemonLive
     if ($null -eq $live -or $live.Count -eq 0) { return }
 

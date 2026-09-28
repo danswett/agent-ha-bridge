@@ -51,6 +51,9 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'decision-inject.ps1')
 . (Join-Path $PSScriptRoot 'bridge-update.ps1')
 . (Join-Path $PSScriptRoot 'session-launch.ps1')
+# What the hooks do, for events the native hook spools here (daemon-hookspool.ps1).
+. (Join-Path $PSScriptRoot 'bridge-adapter.ps1')
+. (Join-Path $PSScriptRoot 'copilot-hooks.ps1')
 
 # This machine's own per-machine entities, resolved once. One Home Assistant is
 # normally shared between machines, so every one of these is scoped to the machine
@@ -260,6 +263,15 @@ if (Test-Path -LiteralPath (Join-Path $claudeHooks 'claude-session.ps1')) {
     catch {
         $script:ClaudeAdapterLoaded = $false
     }
+    # The hook bodies, for spooled events. Apart from the adapter itself, so an adapter
+    # from before they existed still loads.
+    if ($script:ClaudeAdapterLoaded -and (Test-Path -LiteralPath (Join-Path $claudeHooks 'claude-hooks.ps1'))) {
+        try {
+            . (Join-Path $claudeHooks 'claude-ask-parser.ps1')
+            . (Join-Path $claudeHooks 'claude-hooks.ps1')
+        }
+        catch { }
+    }
 }
 
 $script:CodexAdapterLoaded = $false
@@ -272,6 +284,9 @@ if (Test-Path -LiteralPath (Join-Path $codexHooks 'codex-session.ps1')) {
     }
     catch {
         $script:CodexAdapterLoaded = $false
+    }
+    if ($script:CodexAdapterLoaded -and (Test-Path -LiteralPath (Join-Path $codexHooks 'codex-hooks.ps1'))) {
+        try { . (Join-Path $codexHooks 'codex-hooks.ps1') } catch { }
     }
 }
 
@@ -417,6 +432,10 @@ function Initialize-DaemonStartup {
     # Compile the console injector now rather than on the first reply. The compile
     # takes about 650 ms, which the first reply after every start used to wait for.
     try { Initialize-CopilotConsoleInjector } catch { }
+
+    # Hear about hook events the native hook spools, rather than listing the folder on
+    # every tick (daemon-hookspool.ps1).
+    Start-DaemonHookSpoolWatcher
 
     # Detailed activity is a setting now (Test-VerboseStreaming), so the Home Assistant
     # helper the old dashboard toggle drove is removed. A machine still on an older
@@ -738,6 +757,7 @@ function Start-BridgeDaemon {
 . (Join-Path $PSScriptRoot 'daemon-decisions.ps1')
 . (Join-Path $PSScriptRoot 'daemon-launch.ps1')
 . (Join-Path $PSScriptRoot 'daemon-maintenance.ps1')
+. (Join-Path $PSScriptRoot 'daemon-hookspool.ps1')
 
 
 # A second daemon would publish duplicate activity and race on reply delivery.

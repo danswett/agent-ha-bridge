@@ -139,9 +139,21 @@ program. So:
   * `Enter-BridgeAdapterSession` sets a 45 s deadline on every HTTP call in the
     process (`Set-DecisionBridgeDeadline`). In the daemon that would break all later
     requests: save and restore `$script:DecisionBridgeDeadline` around each event.
-- [ ] **2. Daemon spool.** New part `hooks/daemon-hookspool.ps1`: drain the spool on
+- [x] **2. Daemon spool.** New part `hooks/daemon-hookspool.ps1`: drain the spool on
   the fast-lane tick, dispatch by `agent`/`script`, delete each file after (and a
   file that fails twice, logged). Tests drop fixture events into a temp spool.
+  *Done.* `hooks/daemon-hookspool.ps1`; the daemon also loads `bridge-adapter.ps1`,
+  `copilot-hooks.ps1` and each adapter's hook file (guarded, so an older adapter still
+  loads). Test: `tests/test-hook-spool.ps1`. Live: a spooled SessionStart became a
+  registration 88 ms after the rename. Notes:
+  * The daemon already runs under strict mode (the Claude and Codex adapters set it
+    when loaded), so each handler runs in its script's own mode: Claude and Codex
+    strict, Copilot off.
+  * Listing the folder each tick cost 60-100 us on Windows, more than an idle tick.
+    A FileSystemWatcher queues events (no -Action) and the tick reads the queue's
+    count; a sweep every 2 s is the backstop (macOS delivers events later).
+  * Cost: an idle fast-lane tick is ~30 us slower than 1.11.1 (340 -> 369 us, median
+    of 5). Accepted: it buys 400-650 ms off every hook.
 - [ ] **3. The Go hook.** `hook/` (Go module): stdin, ancestry (Windows: toolhelp
   snapshot; macOS: `sysctl kern.proc.pid`), daemon-alive check, spool write,
   fallback exec, fixed output per script. Go tests. Timed against the table above.
