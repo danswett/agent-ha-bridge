@@ -71,6 +71,33 @@ $activity = Get-ActivityFromEvents -Lines @((New-Thought 'thinking'), (New-Reply
 Test-That 'a reply after a thought wins' { $activity.Latest -eq 'and then speaking' -and -not $activity.LatestIsThinking }
 
 Write-Host '--- nothing to say ---'
+Write-Host '--- a new turn is noticed, as it is for Claude and Codex ---'
+# Copilot's reducer was the only one that never reported this, so for a Copilot session
+# the caller believed no turn ever started. Two things rode on that: the reasoning and
+# history carried from the previous turn were never dropped, and - since the same flag
+# is what hands a session back to the person at the keyboard - a card an agent had
+# driven once kept its purple edge for the rest of the session.
+$activity = Get-ActivityFromEvents -Lines @('{"type":"user.message"}') -VerboseMode $true
+Test-That 'a user message starts a new turn' { $activity.TurnStarted }
+
+$activity = Get-ActivityFromEvents -Lines @((New-Thought 'still going'), (New-Tool 'grep')) -VerboseMode $true
+Test-That 'a batch with no user message does not' { -not $activity.TurnStarted }
+
+$activity = Get-ActivityFromEvents -Lines @(
+    (New-Thought 'last turn''s thinking')
+    '{"type":"user.message"}'
+) -VerboseMode $true
+Test-That 'thinking from before the new message is dropped, not carried into it' {
+    [string]::IsNullOrEmpty([string]$activity.Reasoning) -and [string]::IsNullOrEmpty([string]$activity.Latest)
+} "reasoning=[$($activity.Reasoning)] latest=[$($activity.Latest)]"
+Test-That 'and the new turn is still reported' { $activity.TurnStarted }
+
+$activity = Get-ActivityFromEvents -Lines @(
+    '{"type":"user.message"}'
+    (New-Thought 'this turn''s thinking')
+) -VerboseMode $true
+Test-That 'thinking after the new message is kept' { $activity.Latest -eq "this turn's thinking" }
+
 $activity = Get-ActivityFromEvents -Lines @((New-Tool 'grep')) -VerboseMode $true
 Test-That 'a batch of only tool calls has no newest line' { [string]::IsNullOrEmpty([string]$activity.Latest) }
 Test-That 'and is not marked as thinking' { -not $activity.LatestIsThinking }

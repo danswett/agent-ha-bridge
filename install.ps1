@@ -1979,7 +1979,17 @@ Write-Host "    notifications: $(if ($config.notifications.enabled) { $config.no
 # a column of "Custom element doesn't exist" boxes - an install that reports success
 # and then visibly does not work. The file itself can only come from HACS, but a card
 # that is downloaded and merely unregistered is repaired here.
-if ($homeAssistantReady) {
+#
+# This is also the only place the bridge's own reply card is delivered, so gating it on
+# a *verified* connection quietly broke every update: a self-update runs this script
+# with -SkipVerify, which leaves $homeAssistantReady false, so the card was last
+# refreshed by whatever interactive install came before it. Dashboards sat on a card
+# several releases old while every machine reported itself up to date, and a card
+# feature could ship and simply never appear. -SkipVerify means "do not fail the
+# install on the check", not "do not talk to Home Assistant" - so with a token to hand,
+# try. Nothing here throws: the card check reports and returns.
+$canReachHomeAssistant = $homeAssistantReady -or (-not [string]::IsNullOrWhiteSpace($effectiveToken))
+if ($canReachHomeAssistant) {
     Write-Step 'Checking the dashboard frontend cards'
     [void](Invoke-BridgeFrontendCardCheck -HooksDir $hooksDir -ConfigPath $configPath -Register)
 }

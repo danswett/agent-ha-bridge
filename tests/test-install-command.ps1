@@ -321,7 +321,7 @@ $sandboxArpKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\Agen
 try {
     $log = & pwsh -NoProfile -File (Join-Path $repoRoot 'install.ps1') `
         -TargetHome $sandbox -SkipTask -SkipPath -SkipDependencies -SkipVerify -NonInteractive `
-        -Clients copilot -HomeAssistantUrl 'http://ha.invalid:8123' 2>&1
+        -Clients copilot -HomeAssistantUrl 'http://ha.invalid:8123' -Token 'sandbox-token' 2>&1
     $logText = $log -join "`n"
     $sandboxHome = Join-Path $sandbox '.agent-ha-bridge'
 
@@ -346,6 +346,18 @@ try {
         Test-Path -LiteralPath (Join-Path $sandbox '.copilot\hooks\decision-notifier.json')
     }
     Test-That 'it explains that PATH was left alone' { $logText -match 'Leaving PATH alone' }
+    Test-That 'a -SkipVerify install still delivers the dashboard card' {
+        # The reply card is only ever delivered from here, and this step used to be
+        # gated on a *verified* connection. A self-update runs the installer with
+        # -SkipVerify, so no update ever refreshed the card: dashboards sat on a card
+        # several releases old while the machine reported itself fully up to date, and
+        # a card feature could ship and never appear. Reaching a bogus host fails, and
+        # must fail gracefully - what matters is that it was attempted.
+        $logText -match 'Checking the dashboard frontend cards'
+    }
+    Test-That 'and a card that cannot be delivered does not fail the install' {
+        $LASTEXITCODE -eq 0 -and $logText -match 'reply card'
+    }
     Test-That 'it points at the agent-ha-bridge command at the end' {
         $logText -match 'agent-ha-bridge configure'
     }

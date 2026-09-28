@@ -251,6 +251,7 @@ function Get-ActivityFromEvents {
     $status = $null
     $latest = $null
     $latestIsThinking = $false
+    $turnStarted = $false
     $history = New-Object System.Collections.Generic.List[string]
 
     foreach ($line in $Lines) {
@@ -259,7 +260,21 @@ function Get-ActivityFromEvents {
 
         switch ($type) {
             'assistant.turn_start' { $status = 'working'; continue }
-            'user.message' { $status = 'working'; $summary = 'Reading your message'; $history.Add($summary); continue }
+            'user.message' {
+                $status = 'working'
+                $summary = 'Reading your message'
+                $history.Add($summary)
+                # A new message starts a new turn, exactly as it does for Claude.
+                # Without this the caller carried the previous turn's reasoning under
+                # this turn's status - and, since the same flag hands a session back to
+                # the person, a card an agent had driven once kept its purple edge for
+                # the rest of the session however long you typed at the keyboard.
+                $turnStarted = $true
+                $reasoning = $null
+                $latest = $null
+                $latestIsThinking = $false
+                continue
+            }
             'assistant.turn_end' { $status = 'idle'; continue }
         }
 
@@ -326,6 +341,10 @@ function Get-ActivityFromEvents {
         # writes, so a card can show them in the order they happened.
         Latest = $latest
         LatestIsThinking = $latestIsThinking
+        # True when this batch contains the start of a new turn, so the caller drops
+        # the reasoning and history it has been carrying from the last one, and hands
+        # the session back to the person who typed it.
+        TurnStarted = $turnStarted
     }
 }
 
