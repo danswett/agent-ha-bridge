@@ -254,6 +254,14 @@ program. So:
     it now also runs on a pushed `v*` tag. The user added the permission afterwards, so
     `workflow_dispatch` (tag + ref) works for the next release.
 
+## After release
+
+- **1.12.1** (2026-09-28): a finished Claude turn showed `working` - the daemon could
+  record the Stop a few ms before Claude wrote the final message (fixed: only a new user
+  entry resumes work; `tests/test-turn-end.ps1`); the card spinner's ✳ drew as a green
+  emoji on iOS (U+FE0E). Released with the intended process, first time: draft,
+  `workflow_dispatch` (tag + ref), assets checked, publish.
+
 ## Resuming
 
 Read this file, then `git log --oneline -10`. The first unticked phase is next. A
