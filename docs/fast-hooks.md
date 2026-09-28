@@ -268,6 +268,20 @@ program. So:
   answer. Also the daemon's memory, 274 -> ~120 MB private: Home Assistant filters the
   states it reads (/api/template), the C# helpers are compiled once into cached DLLs,
   and DOTNET_GCConserveMemory=7 plus an occasional aggressive collection.
+- **1.13.0** (2026-09-28): a real install on an Intel Mac, which failed at four
+  separate points - `installer` rejects a downloaded package whose name has no `.pkg`
+  on it; `grep -E` read the MacPorts asset pattern (`-13-Ventura.pkg`) as its own
+  options; npm's global folder belongs to root under MacPorts, so the CLIs need
+  elevation, with `node` kept on `PATH` for Claude Code's postinstall; and launchd
+  refuses an entire job whose `StandardOutPath` is under `$TMPDIR`, its own
+  per-session directory ("Bootstrap failed: 5"), so the log moved to
+  `~/Library/Logs`. `PATH` also went to `~/.zprofile` only, which bash never reads.
+  Also: choices are tappable rows, not a dropdown that ran off a phone screen (card
+  1.13.0); Copilot's reasoning shows inline like Claude's; a renamed session renames
+  its card and its device; a failed dashboard-card read during a Home Assistant
+  restart is no longer cached for five minutes; and a launch note stops insisting the
+  session never arrived once it has. The macOS CI job earned its keep - three of the
+  four install bugs were Windows assumptions.
 
 ## Resuming
 
