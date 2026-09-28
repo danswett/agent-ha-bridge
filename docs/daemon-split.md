@@ -62,6 +62,9 @@ Along the seams they already have, each piece testable on its own:
 
 One function per commit, with the suite run each time.
 
+**Status: done** (last commit `0396d87`). New tests: `test-daemon-sessions.ps1`,
+`test-daemon-decisions.ps1`, `test-daemon-replies.ps1`, `test-daemon-loop.ps1`.
+
 ## Step 3 - one place per agent
 
 "If Codex, else Claude, else Copilot" is scattered across discovery, activity,
@@ -69,3 +72,45 @@ replies and the fast lane, which is why adding Codex touched so many places. A s
 table per agent - how to find its sessions, read its activity, find its process,
 confirm a reply - lets the shared code call through it. The next agent is then one
 table rather than edits in six files.
+
+About 37 branches in 9 files. Copilot is often not named: it is whatever is left
+after the Claude and Codex checks, so the table has to name it outright.
+
+### Design
+
+* New part `hooks/daemon-agents.ps1`, dot-sourced first. It holds
+  `$script:DaemonAgents`: an ordered table keyed by kind (`copilot`, `claude`,
+  `codex`), each entry a hashtable of script blocks and flags.
+* `Get-DaemonAgent -Kind` returns an entry; a blank or unknown kind gets
+  `copilot`, as the old `else` did. `Get-DaemonEntryKind -Entry` replaces the
+  repeated `if ($entry.Kind) ... else 'copilot'`.
+* Behaviour is kept exactly, including a missing adapter: an entry's script block
+  checks `$script:ClaudeAdapterLoaded` / `$script:CodexAdapterLoaded` itself and
+  falls back the way the old branch did. No behaviour change in this step.
+* Shared code calls `& $agent.ReadAppend ...`, or tests a flag. An agent without
+  a slot gets the shared default.
+
+### Phases (one commit each; tick here in the same commit)
+
+- [ ] **A. Activity** (`daemon-activity.ps1`, `Update-DaemonKnownSession` in
+  `daemon-sessions.ps1`). Slots: `ReadAppend`, `Activity`, `IsWorking`,
+  `PollRegistration` (Claude's hook-status watch in the fast lane),
+  `FastActivity` / `KnownActivity` (Codex streams its own card), flags
+  `HookStatus`, `InlineReasoning`, `RefreshName` (Copilot). Test:
+  `tests/test-daemon-agents.ps1`.
+- [ ] **B. Discovery** (`daemon-discovery.ps1`). Slots: `FindSessions`,
+  `Display`; flag `KnowsProcessId`. `Get-LiveBridgeSessions` loops the table.
+- [ ] **C. Decisions and replies**. Claude's question parser, Codex approvals,
+  Claude's reply confirmation.
+- [ ] **D. Launch** (`session-launch.ps1`, `daemon-launch.ps1`). Arguments,
+  resume, transcript location, Codex's first prompt.
+- [ ] **E. Maintenance**. Install notes per client.
+
+C to E are optional: A and B are the code that runs constantly. Stop and ask the
+user before C.
+
+### Resuming
+
+Read this section, then `git log --oneline -8`. The first unticked phase is next.
+A half-done phase is never committed, so `git status` shows any work in progress:
+finish it or `git checkout` it.
