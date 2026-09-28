@@ -271,6 +271,10 @@ function Sync-DaemonSessions {
     <#
         Brings the published Home Assistant entities in line with the live sessions,
         and streams any new transcript activity.
+
+        One pass, in order: drop sessions that have exited, adopt new ones, update
+        known ones, publish this machine's status and heartbeat, rebuild the dashboard
+        if what it shows has changed, and retire the previous pass's exited sessions.
     #>
     param(
         [Parameter(Mandatory)][hashtable]$Headers,
@@ -300,219 +304,280 @@ function Sync-DaemonSessions {
     }
 
     foreach ($session in $live.Values) {
-        $id = $session.SessionId
-        $entry = $State[$id]
-
+        $entry = $State[$session.SessionId]
         if ($null -eq $entry) {
-            $kind = if ($session.PSObject.Properties.Name -contains 'Kind') { [string]$session.Kind } else { 'copilot' }
-            $workingDirectory = if ($session.PSObject.Properties.Name -contains 'WorkingDirectory' -and $session.WorkingDirectory) {
-                [string]$session.WorkingDirectory
-            } else { 'Unknown folder' }
-            $display = Get-BridgeSessionDisplay -SessionId $id -Kind $kind -WorkingDirectory $workingDirectory
-            $node = Get-CopilotMqttNodeId -SessionId $id
+            $entry = Add-DaemonSession -Session $session -Headers $Headers
+            if ($null -ne $entry) { $State[$session.SessionId] = $entry }
+            continue
+        }
+        Update-DaemonKnownSession -Session $session -Entry $entry -Headers $Headers -VerboseOn $verbose
+    }
 
-            # Only publish the entity set if it does not already exist. The ask_user
-            # router publishes a session's entities on demand and then arms its
-            # decision selector; a blind re-publish here would reset that selector to
-            # Idle and blank a live question. When the entities already exist, adopt
-            # the session into state without touching them.
-            $alreadyPublished = $false
+    $descriptors = @(Get-DaemonSessionDescriptors -State $State -Headers $Headers)
+    $capabilities = Get-DaemonLaunchCapabilities
+    Publish-DaemonGlobalStatus -Descriptors $descriptors -Capabilities $capabilities -Headers $Headers
+    Publish-DaemonOnlineHeartbeat -Headers $Headers
+    $dashboardCurrent = Sync-DaemonDashboard -Descriptors $descriptors -Capabilities $capabilities -Headers $Headers
+    Complete-DaemonSessionRetirement -Gone $goneSessions -DashboardCurrent $dashboardCurrent -Headers $Headers
+}
+
+function Add-DaemonSession {
+    <#
+        Adopts a session the daemon has not seen: publishes its entities (or adopts
+        ones a hook already published), makes sure the per-field slots and Submit
+        button exist, publishes its first status, and returns its state entry - or
+        $null when publishing failed, so it is tried again next pass.
+    #>
+    param(
+        [Parameter(Mandatory)]$Session,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $session = $Session
+    $id = $session.SessionId
+    $kind = if ($session.PSObject.Properties.Name -contains 'Kind') { [string]$session.Kind } else { 'copilot' }
+    $workingDirectory = if ($session.PSObject.Properties.Name -contains 'WorkingDirectory' -and $session.WorkingDirectory) {
+        [string]$session.WorkingDirectory
+    } else { 'Unknown folder' }
+    $display = Get-BridgeSessionDisplay -SessionId $id -Kind $kind -WorkingDirectory $workingDirectory
+    $node = Get-CopilotMqttNodeId -SessionId $id
+
+    # Only publish the entity set if it does not already exist. The ask_user
+    # router publishes a session's entities on demand and then arms its
+    # decision selector; a blind re-publish here would reset that selector to
+    # Idle and blank a live question. When the entities already exist, adopt
+    # the session into state without touching them.
+    $alreadyPublished = $false
+    try {
+        $probe = Get-HomeAssistantState -EntityId "select.${node}_decision" -Headers $Headers
+        $alreadyPublished = ($null -ne $probe -and [string]$probe.state -notin @('unavailable', ''))
+    }
+    catch {
+        $alreadyPublished = $false
+    }
+
+    if (-not $alreadyPublished) {
+        try {
+            Publish-CopilotMqttSession -SessionId $id -SessionName $display.Name `
+                -Machine $display.Machine -Headers $Headers | Out-Null
+            # Discovery needs a moment to register before the ids can be forced.
+            Start-Sleep -Milliseconds 1500
+            [void](Set-CopilotMqttEntityIds -SessionId $id)
+            Write-DaemonLog -Message "published session $($id.Substring(0,8)) as '$($display.Name)'"
+        }
+        catch {
+            Write-DaemonLog -Message "publish failed for $id : $($_.Exception.Message)"
+            return $null
+        }
+    }
+    else {
+        Write-DaemonLog -Message "adopted existing session $($id.Substring(0,8)) as '$($display.Name)'"
+    }
+
+    # Ensure the per-field dropdown slots and the Submit button exist for every
+    # session, including adopted ones and sessions published before either was
+    # introduced. The dashboard's cards reference them unconditionally, so a
+    # missing entity renders an "Entity not found" box on the session card.
+    try {
+        $probeField = $null
+        try { $probeField = Get-HomeAssistantState -EntityId "select.${node}_f1" -Headers $Headers }
+        catch { $probeField = $null }
+        # Every call below discards its output: this function returns the state entry,
+        # and anything a call emits would be returned with it.
+        if ($null -eq $probeField) {
+            Clear-CopilotMqttDecisionFields -SessionId $id -SessionName $display.Name `
+                -Machine $display.Machine -Headers $Headers | Out-Null
+            Write-DaemonLog -Message "provisioned field slots for $($id.Substring(0,8))"
+        }
+
+        $probeSubmit = $null
+        try { $probeSubmit = Get-HomeAssistantState -EntityId "button.${node}_submit" -Headers $Headers }
+        catch { $probeSubmit = $null }
+        if ($null -eq $probeSubmit) {
+            Publish-CopilotMqttSubmitButton -SessionId $id -SessionName $display.Name `
+                -Machine $display.Machine -Headers $Headers | Out-Null
+            Write-DaemonLog -Message "provisioned submit button for $($id.Substring(0,8))"
+        }
+    }
+    catch {
+        Write-DaemonLog -Message "provisioning failed for $id : $($_.Exception.Message)"
+    }
+
+    $sessionStatus = if ($session.PSObject.Properties.Name -contains 'Status') { [string]$session.Status } else { '' }
+    $initialStatus = if (Test-BridgeSessionWorking -SessionId $id -Kind $kind -Transcript $session.Transcript -Status $sessionStatus) { 'working' } else { 'idle' }
+    $initialActivity = if ($session.PSObject.Properties.Name -contains 'Activity' -and $session.Activity) {
+        # Codex hooks record the real activity - the prompt, the running tool,
+        # the reply - so a placeholder would be a downgrade.
+        [string]$session.Activity
+    } elseif ($initialStatus -eq 'working') { 'Working' } else { 'Idle' }
+    try {
+        Set-CopilotMqttStatus -SessionId $id -Status $initialStatus -Headers $Headers -Attributes @{
+            session = $display.Name
+            machine = $display.Machine
+            process_id = $session.ProcessId
+            updated = [DateTimeOffset]::Now.ToString('o')
+        } | Out-Null
+        Set-CopilotMqttActivity -SessionId $id -Summary $initialActivity `
+            -Detail @{ session = $display.Name; machine = $display.Machine } -Headers $Headers | Out-Null
+        # Prime the reply box to empty so the card shows a blank field rather
+        # than 'unknown' before the box has ever been used.
+        Invoke-HomeAssistantService -Domain 'text' -Service 'set_value' -Headers $Headers `
+            -Data @{ entity_id = "text.${node}_reply"; value = $script:DaemonConfig.ReplyBlankValue } | Out-Null
+    }
+    catch {
+        Write-DaemonLog -Message "initial status publish failed for $id : $($_.Exception.Message)"
+    }
+
+    [pscustomobject]@{
+        # A session with no transcript yet starts at offset 0, so the first
+        # bytes it writes are picked up rather than skipped.
+        Offset = if ([IO.File]::Exists($session.Transcript)) {
+            (Get-Item -LiteralPath $session.Transcript).Length
+        } else { 0 }
+        Name = $display.Name
+        Machine = $display.Machine
+        Status = $initialStatus
+        Kind = $kind
+    }
+}
+
+function Update-DaemonKnownSession {
+    <#
+        One pass for a session already in state: re-resolves a stale name, then streams
+        what it has done since the last pass onto its card.
+    #>
+    param(
+        [Parameter(Mandatory)]$Session,
+        [Parameter(Mandatory)]$Entry,
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [bool]$VerboseOn
+    )
+
+    $session = $Session
+    $entry = $Entry
+    $id = $session.SessionId
+    $entryKind = if ($entry.PSObject.Properties.Name -contains 'Kind' -and $entry.Kind) { [string]$entry.Kind } else { 'copilot' }
+    # Codex publishes its status from its hooks; what it says - progress notes, the
+    # answer, reasoning, tool calls - is read from its rollout, here and in the fast
+    # lane (Update-DaemonCodexActivity).
+    if ($entryKind -eq 'codex') {
+        Update-DaemonCodexActivity -Id $id -Entry $entry -Session $session -Headers $Headers -VerboseOn $VerboseOn
+        return
+    }
+
+    # Re-resolve a session's name when the stored one is stale. Two cases: a session
+    # published before it wrote its workspace file still carries the id fallback -
+    # the real task name usually appears within a reconcile or two of the session
+    # starting - and a session published by an older build carries no harness prefix
+    # at all. Both self-heal on the next reconcile rather than needing the state file
+    # to be cleared by hand.
+    $needsName = ($entryKind -eq 'copilot' -and [string]$entry.Name -notmatch '^Copilot: ') -or
+                 ([string]$entry.Name -match '^Copilot: [0-9a-f]{8}$')
+    if ($needsName) {
+        $workingDirectory = if ($session.PSObject.Properties.Name -contains 'WorkingDirectory' -and $session.WorkingDirectory) {
+            [string]$session.WorkingDirectory
+        } else { 'Unknown folder' }
+        $refreshed = Get-BridgeSessionDisplay -SessionId $id -Kind $entryKind -WorkingDirectory $workingDirectory
+        if ([string]$refreshed.Name -ne [string]$entry.Name) {
+            $entry.Name = $refreshed.Name
             try {
-                $probe = Get-HomeAssistantState -EntityId "select.${node}_decision" -Headers $Headers
-                $alreadyPublished = ($null -ne $probe -and [string]$probe.state -notin @('unavailable', ''))
-            }
-            catch {
-                $alreadyPublished = $false
-            }
-
-            if (-not $alreadyPublished) {
-                try {
-                    Publish-CopilotMqttSession -SessionId $id -SessionName $display.Name `
-                        -Machine $display.Machine -Headers $Headers | Out-Null
-                    # Discovery needs a moment to register before the ids can be forced.
-                    Start-Sleep -Milliseconds 1500
-                    [void](Set-CopilotMqttEntityIds -SessionId $id)
-                    Write-DaemonLog -Message "published session $($id.Substring(0,8)) as '$($display.Name)'"
-                }
-                catch {
-                    Write-DaemonLog -Message "publish failed for $id : $($_.Exception.Message)"
-                    continue
-                }
-            }
-            else {
-                Write-DaemonLog -Message "adopted existing session $($id.Substring(0,8)) as '$($display.Name)'"
-            }
-
-            # Ensure the per-field dropdown slots and the Submit button exist for every
-            # session, including adopted ones and sessions published before either was
-            # introduced. The dashboard's cards reference them unconditionally, so a
-            # missing entity renders an "Entity not found" box on the session card.
-            try {
-                $probeField = $null
-                try { $probeField = Get-HomeAssistantState -EntityId "select.${node}_f1" -Headers $Headers }
-                catch { $probeField = $null }
-                if ($null -eq $probeField) {
-                    Clear-CopilotMqttDecisionFields -SessionId $id -SessionName $display.Name `
-                        -Machine $display.Machine -Headers $Headers
-                    Write-DaemonLog -Message "provisioned field slots for $($id.Substring(0,8))"
-                }
-
-                $probeSubmit = $null
-                try { $probeSubmit = Get-HomeAssistantState -EntityId "button.${node}_submit" -Headers $Headers }
-                catch { $probeSubmit = $null }
-                if ($null -eq $probeSubmit) {
-                    Publish-CopilotMqttSubmitButton -SessionId $id -SessionName $display.Name `
-                        -Machine $display.Machine -Headers $Headers
-                    Write-DaemonLog -Message "provisioned submit button for $($id.Substring(0,8))"
-                }
-            }
-            catch {
-                Write-DaemonLog -Message "provisioning failed for $id : $($_.Exception.Message)"
-            }
-
-            $sessionStatus = if ($session.PSObject.Properties.Name -contains 'Status') { [string]$session.Status } else { '' }
-            $initialStatus = if (Test-BridgeSessionWorking -SessionId $id -Kind $kind -Transcript $session.Transcript -Status $sessionStatus) { 'working' } else { 'idle' }
-            $initialActivity = if ($session.PSObject.Properties.Name -contains 'Activity' -and $session.Activity) {
-                # Codex hooks record the real activity - the prompt, the running tool,
-                # the reply - so a placeholder would be a downgrade.
-                [string]$session.Activity
-            } elseif ($initialStatus -eq 'working') { 'Working' } else { 'Idle' }
-            try {
-                Set-CopilotMqttStatus -SessionId $id -Status $initialStatus -Headers $Headers -Attributes @{
-                    session = $display.Name
-                    machine = $display.Machine
+                Set-CopilotMqttStatus -SessionId $id -Status ([string]$entry.Status) -Headers $Headers -Attributes @{
+                    session = $entry.Name
+                    machine = $entry.Machine
                     process_id = $session.ProcessId
                     updated = [DateTimeOffset]::Now.ToString('o')
                 }
-                Set-CopilotMqttActivity -SessionId $id -Summary $initialActivity `
-                    -Detail @{ session = $display.Name; machine = $display.Machine } -Headers $Headers
-                    # Prime the reply box to empty so the card shows a blank field rather
-                    # than 'unknown' before the box has ever been used.
-                    Invoke-HomeAssistantService -Domain 'text' -Service 'set_value' -Headers $Headers `
-                        -Data @{ entity_id = "text.${node}_reply"; value = $script:DaemonConfig.ReplyBlankValue }
             }
-            catch {
-                Write-DaemonLog -Message "initial status publish failed for $id : $($_.Exception.Message)"
-            }
-
-            $entry = [pscustomobject]@{
-                # A session with no transcript yet starts at offset 0, so the first
-                # bytes it writes are picked up rather than skipped.
-                Offset = if ([IO.File]::Exists($session.Transcript)) {
-                    (Get-Item -LiteralPath $session.Transcript).Length
-                } else { 0 }
-                Name = $display.Name
-                Machine = $display.Machine
-                Status = $initialStatus
-                Kind = $kind
-            }
-            $State[$id] = $entry
-            continue
+            catch { }
+            Write-DaemonLog -Message "renamed $($id.Substring(0,8)) to '$($entry.Name)'"
         }
-
-        $entryKind = if ($entry.PSObject.Properties.Name -contains 'Kind' -and $entry.Kind) { [string]$entry.Kind } else { 'copilot' }
-        # Codex publishes its status from its hooks; what it says - progress notes, the
-        # answer, reasoning, tool calls - is read from its rollout, here and in the fast
-        # lane (Update-DaemonCodexActivity).
-        if ($entryKind -eq 'codex') {
-            Update-DaemonCodexActivity -Id $id -Entry $entry -Session $session -Headers $Headers -VerboseOn $verbose
-            continue
-        }
-
-        # A session published before it wrote its workspace file only had a generic
-        # name to go on. Names are otherwise resolved once, so re-resolve while the
-        # stored one is still the fallback; the real task name usually appears within
-        # a reconcile or two of the session starting.
-        # Re-resolve a session's name when the stored one is stale. Two cases: a
-        # session published before it wrote its workspace file still carries the id
-        # fallback, and a session published by an older build carries no harness
-        # prefix at all. Both self-heal on the next reconcile rather than needing the
-        # state file to be cleared by hand.
-        $needsName = ($entryKind -eq 'copilot' -and [string]$entry.Name -notmatch '^Copilot: ') -or
-                     ([string]$entry.Name -match '^Copilot: [0-9a-f]{8}$')
-        if ($needsName) {
-            $workingDirectory = if ($session.PSObject.Properties.Name -contains 'WorkingDirectory' -and $session.WorkingDirectory) {
-                [string]$session.WorkingDirectory
-            } else { 'Unknown folder' }
-            $refreshed = Get-BridgeSessionDisplay -SessionId $id -Kind $entryKind -WorkingDirectory $workingDirectory
-            if ([string]$refreshed.Name -ne [string]$entry.Name) {
-                $entry.Name = $refreshed.Name
-                try {
-                    Set-CopilotMqttStatus -SessionId $id -Status ([string]$entry.Status) -Headers $Headers -Attributes @{
-                        session = $entry.Name
-                        machine = $entry.Machine
-                        process_id = $session.ProcessId
-                        updated = [DateTimeOffset]::Now.ToString('o')
-                    }
-                }
-                catch { }
-                Write-DaemonLog -Message "renamed $($id.Substring(0,8)) to '$($entry.Name)'"
-            }
-        }
-
-        Update-DaemonSessionActivity -Id $id -Entry $entry -Session $session -Headers $Headers -VerboseOn $verbose
     }
 
-    # Keep the global count sensor and the dashboard in step with the live set. The
-    # dashboard is only rebuilt when the set of sessions actually changes, because a
-    # rebuild replaces the whole Lovelace config and is far heavier than a state
-    # publish; turn-by-turn activity rides on the per-session entities the dashboard
-    # already points at.
-    $descriptors = @(
-        foreach ($id in ($State.Keys | Sort-Object)) {
-            $entry = $State[$id]
-            [pscustomobject]@{
-                Node = Get-CopilotMqttNodeId -SessionId $id
-                Name = $entry.Name
-                Machine = $entry.Machine
-                Kind = if ($entry.PSObject.Properties.Name -contains 'Kind' -and $entry.Kind) { [string]$entry.Kind } else { 'copilot' }
-            }
-        }
-        # MCP clients join here and nowhere else. They are deliberately kept out of
-        # $State and out of Get-LiveBridgeSessions: the MCP server owns those entities
-        # and withdraws them itself, so a daemon that adopted them would eventually
-        # "retire" a live client's entities out from under it. Rendering is the only
-        # thing the daemon should do with them.
-        foreach ($mcp in (Get-LiveMcpSessions -Headers $Headers).Values) {
-            [pscustomobject]@{
-                Node = $mcp.Node
-                Name = $mcp.Name
-                Machine = ''
-                Kind = 'mcp'
-            }
-        }
+    Update-DaemonSessionActivity -Id $id -Entry $entry -Session $session -Headers $Headers -VerboseOn $VerboseOn
+}
+
+function Get-DaemonSessionDescriptors {
+    <#
+        What this machine is running, as the dashboard and the global status sensor
+        describe it: every session in state, and the live MCP clients.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$State,
+        [Parameter(Mandatory)][hashtable]$Headers
     )
 
-    # The global count sensor only needs re-publishing when the live set (names,
-    # machines, nodes) changes, or periodically as a re-assert against a Home
-    # Assistant restart dropping retained state. Republishing three retained messages
-    # every reconcile - each stamped with a fresh 'updated' time that defeats payload
-    # equality - was needless idle traffic and MQTT churn.
-    #
-    # It is also this machine's presence marker and the only thing other machines read
-    # to learn what it is running, so the capability flags travel with it: a peer has
-    # no other way to know whether to draw a profile or resume row on this machine's
-    # launch card.
+    foreach ($id in ($State.Keys | Sort-Object)) {
+        $entry = $State[$id]
+        [pscustomobject]@{
+            Node = Get-CopilotMqttNodeId -SessionId $id
+            Name = $entry.Name
+            Machine = $entry.Machine
+            Kind = if ($entry.PSObject.Properties.Name -contains 'Kind' -and $entry.Kind) { [string]$entry.Kind } else { 'copilot' }
+        }
+    }
+    # MCP clients join here and nowhere else. They are deliberately kept out of
+    # $State and out of Get-LiveBridgeSessions: the MCP server owns those entities
+    # and withdraws them itself, so a daemon that adopted them would eventually
+    # "retire" a live client's entities out from under it. Rendering is the only
+    # thing the daemon should do with them.
+    foreach ($mcp in (Get-LiveMcpSessions -Headers $Headers).Values) {
+        [pscustomobject]@{
+            Node = $mcp.Node
+            Name = $mcp.Name
+            Machine = ''
+            Kind = 'mcp'
+        }
+    }
+}
+
+function Get-DaemonLaunchCapabilities {
+    <#
+        What this machine's launch card can offer - a profile row, a resume row, an
+        agent row - which travels with its global status so that a peer rendering the
+        shared dashboard knows which rows to draw for it.
+    #>
     $newSessionEnabled = [bool](Get-BridgeSetting 'newSession.enabled' $true)
     $installedLaunchers = @(Get-BridgeAvailableLaunchers)
     $includeProfile = $newSessionEnabled -and $installedLaunchers -contains 'agency'
     # Every agent's sessions can be resumed now, not only Agency's.
     $includeResume = $newSessionEnabled -and $installedLaunchers.Count -gt 0
     $includeAgent = $newSessionEnabled -and $installedLaunchers.Count -gt 1
-    $capabilities = @{
+    @{
         newSession = $newSessionEnabled
         profile    = [bool]$includeProfile
         resume     = [bool]$includeResume
         agent      = [bool]$includeAgent
     }
+}
 
-    $globalSignature = (($descriptors | ForEach-Object { "$($_.Node)=$($_.Name)=$($_.Machine)" }) -join '|') +
-        "#$($capabilities.newSession)$($capabilities.profile)$($capabilities.resume)$($capabilities.agent)"
+function Publish-DaemonGlobalStatus {
+    <#
+        Publishes this machine's global status sensor - its sessions and launch
+        capabilities - when they change, or periodically as a re-assert.
+
+        Only then, because republishing three retained messages every reconcile - each
+        stamped with a fresh 'updated' time that defeats payload equality - was
+        needless idle traffic and MQTT churn. The periodic re-assert covers a Home
+        Assistant restart dropping retained state.
+
+        It is also this machine's presence marker and the only thing other machines
+        read to learn what it is running, which is why the capability flags travel
+        with it: a peer has no other way to know whether to draw a profile or resume
+        row on this machine's launch card.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Descriptors,
+        [Parameter(Mandatory)][hashtable]$Capabilities,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $globalSignature = (($Descriptors | ForEach-Object { "$($_.Node)=$($_.Name)=$($_.Machine)" }) -join '|') +
+        "#$($Capabilities.newSession)$($Capabilities.profile)$($Capabilities.resume)$($Capabilities.agent)"
     $globalStale = ([DateTimeOffset]::Now - $script:DaemonGlobalLastPublish).TotalSeconds -ge $script:DaemonConfig.GlobalReassertSeconds
     if ($globalSignature -ne $script:DaemonGlobalSignature -or $globalStale) {
         try {
-            Publish-CopilotMqttGlobalStatus -Headers $Headers -Capabilities $capabilities -Sessions @(
-                $descriptors | ForEach-Object {
+            Publish-CopilotMqttGlobalStatus -Headers $Headers -Capabilities $Capabilities -Sessions @(
+                $Descriptors | ForEach-Object {
                     @{ name = $_.Name; machine = $_.Machine; node = $_.Node; kind = [string]$_.Kind }
                 }
             )
@@ -523,12 +588,18 @@ function Sync-DaemonSessions {
             Write-DaemonLog -Message "global status publish failed: $($_.Exception.Message)"
         }
     }
+}
 
-    # Liveness, on its own short cadence. Everything above is retained so that a
-    # machine which is switched off is still *known*; this is the one signal that says
-    # it is actually running, so it has to keep arriving. The sensor itself is declared
-    # at startup, well before this, because an unretained beat that outruns its own
-    # discovery config is simply dropped.
+function Publish-DaemonOnlineHeartbeat {
+    <#
+        Liveness, on its own short cadence. Everything else is retained so that a
+        machine which is switched off is still *known*; this is the one signal that
+        says it is actually running, so it has to keep arriving. The sensor itself is
+        declared at startup, well before this, because an unretained beat that outruns
+        its own discovery config is simply dropped.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Headers)
+
     if (([DateTimeOffset]::Now - $script:DaemonOnlineLastPublish).TotalSeconds -ge $script:DaemonConfig.OnlineHeartbeatSeconds) {
         try {
             Publish-CopilotMqttMachineHeartbeat -Slug $script:DaemonMachineSlug -Headers $Headers
@@ -538,19 +609,27 @@ function Sync-DaemonSessions {
             Write-DaemonLog -Message "online heartbeat failed: $($_.Exception.Message)"
         }
     }
+}
 
-    # Everything every machine is running, so the single shared dashboard shows the
-    # whole picture rather than only whichever machine rebuilt it last.
-    #
-    # Deduplicated by node because an MCP client is discovered directly by every
-    # daemon *and* reported in each of their session lists, so it would otherwise
-    # appear once per machine. The local descriptor wins: it is first-hand.
-    $peers = @(Get-DaemonPeerMachines -Headers $Headers)
+function Get-DaemonAllDescriptors {
+    <#
+        Everything every machine is running, so the single shared dashboard shows the
+        whole picture rather than only whichever machine rebuilt it last.
+
+        Deduplicated by node because an MCP client is discovered directly by every
+        daemon *and* reported in each of their session lists, so it would otherwise
+        appear once per machine. The local descriptor wins: it is first-hand.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Descriptors,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Peers
+    )
+
     $seenNodes = [System.Collections.Generic.HashSet[string]]::new(
-        [string[]]@($descriptors | ForEach-Object { [string]$_.Node }),
+        [string[]]@($Descriptors | ForEach-Object { [string]$_.Node }),
         [StringComparer]::OrdinalIgnoreCase)
-    $allDescriptors = @($descriptors)
-    foreach ($peer in $peers) {
+    $allDescriptors = @($Descriptors)
+    foreach ($peer in $Peers) {
         # A machine that is not running has no live sessions. Its entities are retained,
         # so the ones it had when it stopped are still there and would otherwise render
         # as live cards showing whatever they last said - a session frozen mid-answer,
@@ -568,21 +647,33 @@ function Sync-DaemonSessions {
             }
         }
     }
+    $allDescriptors
+}
+
+function Get-DaemonMachineCards {
+    <#
+        Every registered machine with the launch rows its card should show: this one
+        from its own capabilities, the others from what their global status reports.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Capabilities,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Peers
+    )
 
     $machineCards = @(
         [pscustomobject]@{
             Slug = $script:DaemonMachineSlug
             Machine = $script:DaemonMachineName
-            IncludeProfile = [bool]$includeProfile
-            IncludeResume = [bool]$includeResume
-            IncludeAgent = [bool]$includeAgent
+            IncludeProfile = [bool]$Capabilities.profile
+            IncludeResume = [bool]$Capabilities.resume
+            IncludeAgent = [bool]$Capabilities.agent
             # This daemon is the one running the code, so it is online by definition -
             # and saying so here means the launch picker is never empty while its own
             # heartbeat sensor is still being created.
             Online = $true
         }
     )
-    foreach ($peer in $peers) {
+    foreach ($peer in $Peers) {
         $peerCaps = $peer.Capabilities
         $peerProfile = $false
         $peerResume = $false
@@ -603,52 +694,75 @@ function Sync-DaemonSessions {
     }
     # Stable order, so two machines rebuilding independently generate byte-identical
     # dashboards and neither keeps overwriting the other's ordering.
-    $machineCards = @($machineCards | Sort-Object -Property Slug)
+    @($machineCards | Sort-Object -Property Slug)
+}
+
+function Repair-DaemonMachinePicker {
+    <#
+        Moves the machine picker off a machine that has gone.
+
+        Home Assistant sets the selection to 'unknown' when the option it was on is
+        removed, and it does so asynchronously - so repairing it as part of the rebuild
+        races that and loses. The launch rows are conditional on the selection matching
+        a machine name, so an unknown selection renders a dropdown with nothing
+        underneath it. Checked on every reconcile instead, off the cached state list,
+        so it costs nothing until something actually looks wrong.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$OnlineNames)
+
+    if ($OnlineNames.Count -le 1) { return }
+    $selectorId = "input_select.$($script:BridgeMachineSelectorId)"
+    $selectorState = ''
+    foreach ($snapshotEntry in @($script:DaemonStatesCache)) {
+        if ($null -eq $snapshotEntry) { continue }
+        if ([string]$snapshotEntry.entity_id -eq $selectorId) {
+            $selectorState = [string]$snapshotEntry.state
+            break
+        }
+    }
+    if ($selectorState -and $OnlineNames -notcontains $selectorState) {
+        try {
+            # Re-reads the live state before writing, so a stale snapshot costs a
+            # read rather than a needless change under whoever is looking at it.
+            if (Repair-BridgeMachineSelection -EntityId $selectorId -Options $OnlineNames) {
+                Write-DaemonLog -Message "machine picker was on '$selectorState', which is gone; moved it to $($OnlineNames[0])"
+            }
+        }
+        catch { }
+    }
+}
+
+function Sync-DaemonDashboard {
+    <#
+        Rebuilds the shared dashboard when what it shows has changed, and returns
+        whether it is now current.
+
+        Only then, because a rebuild replaces the whole Lovelace config and is far
+        heavier than a state publish; turn-by-turn activity rides on the per-session
+        entities the dashboard already points at. The card header carries the session
+        name, so a rename rebuilds it too - a signature of node ids alone would leave
+        a renamed session showing its old generic title until the set of sessions
+        happened to change. The machine list joins it for the same reason: a machine
+        appearing, disappearing or going offline changes the controls even when no
+        session did. The served card URL joins it because a card upgrade changes which
+        cards the dashboard can use.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Descriptors,
+        [Parameter(Mandatory)][hashtable]$Capabilities,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $peers = @(Get-DaemonPeerMachines -Headers $Headers)
+    $allDescriptors = @(Get-DaemonAllDescriptors -Descriptors $Descriptors -Peers $peers)
+    $machineCards = @(Get-DaemonMachineCards -Capabilities $Capabilities -Peers $peers)
 
     # Only machines that are actually running can start a session, so the picker lists
     # those. Every registered machine still appears in the machines card, online or
     # not, because a machine you expected to see and cannot is information too.
     $onlineNames = @($machineCards | Where-Object { $_.Online } | ForEach-Object { [string]$_.Machine })
+    Repair-DaemonMachinePicker -OnlineNames $onlineNames
 
-    # The picker can end up pointing at a machine that has gone. Home Assistant sets
-    # the selection to 'unknown' when the option it was on is removed, and it does so
-    # asynchronously - so repairing it as part of the rebuild races that and loses.
-    # The launch rows are conditional on the selection matching a machine name, so an
-    # unknown selection renders a dropdown with nothing underneath it.
-    #
-    # Checked here on every reconcile instead, off the cached state list, so it costs
-    # nothing until something actually looks wrong.
-    if ($onlineNames.Count -gt 1) {
-        $selectorId = "input_select.$($script:BridgeMachineSelectorId)"
-        $selectorState = ''
-        # Deliberately not $state: this function takes a [hashtable]$State parameter,
-        # PowerShell variable names are case-insensitive, and assigning a state object
-        # to a typed parameter is a hard failure - it crash-looped the daemon.
-        foreach ($snapshotEntry in @($script:DaemonStatesCache)) {
-            if ($null -eq $snapshotEntry) { continue }
-            if ([string]$snapshotEntry.entity_id -eq $selectorId) {
-                $selectorState = [string]$snapshotEntry.state
-                break
-            }
-        }
-        if ($selectorState -and $onlineNames -notcontains $selectorState) {
-            try {
-                # Re-reads the live state before writing, so a stale snapshot costs a
-                # read rather than a needless change under whoever is looking at it.
-                if (Repair-BridgeMachineSelection -EntityId $selectorId -Options $onlineNames) {
-                    Write-DaemonLog -Message "machine picker was on '$selectorState', which is gone; moved it to $($onlineNames[0])"
-                }
-            }
-            catch { }
-        }
-    }
-
-    # The card header carries the session name, so a rename has to rebuild the
-    # dashboard too - a signature of node ids alone would leave a renamed session
-    # showing its old generic title until the set of sessions happened to change. The
-    # machine list joins it for the same reason: a machine appearing, disappearing or
-    # going offline changes the controls even when no session did. The served card
-    # URL joins it because a card upgrade changes which cards the dashboard can use.
     $replyCardUrl = Get-BridgeServedReplyCardUrl
     $signature = (@($allDescriptors | Sort-Object -Property Node | ForEach-Object { "$($_.Node)=$($_.Name)" }) -join '|') +
         '#' + (@($machineCards | ForEach-Object { "$($_.Slug):$($_.IncludeProfile)$($_.IncludeResume)$($_.IncludeAgent):$($_.Online)" }) -join ',') +
@@ -657,9 +771,10 @@ function Sync-DaemonSessions {
         try {
             [void](Set-CopilotMqttGlobalEntityId)
             $selector = Initialize-BridgeMachineSelector -Machines $onlineNames
+            # Discarded: this function returns whether the dashboard is current.
             Save-CopilotSessionDashboard -Sessions @($allDescriptors | Sort-Object -Property Node) `
                 -Machines $machineCards -MachineSelector $selector `
-                -ReplyCardUrl $replyCardUrl
+                -ReplyCardUrl $replyCardUrl | Out-Null
             $script:DaemonDashboardSignature = $signature
             Write-DaemonLog -Message ("dashboard rebuilt for $($allDescriptors.Count) session(s) across " +
                 "$($machineCards.Count) machine(s), $($onlineNames.Count) online")
@@ -668,21 +783,32 @@ function Sync-DaemonSessions {
             Write-DaemonLog -Message "dashboard rebuild failed: $($_.Exception.Message)"
         }
     }
+    $signature -eq $script:DaemonDashboardSignature
+}
 
-    # Retire the previous pass's exited sessions now, and queue this pass's for the
-    # next one.
-    #
-    # Rebuilding the dashboard first already removed their cards, but a browser holds
-    # the old Lovelace config until it is pushed the new one - so tearing the entities
-    # down in the same breath is exactly what made a just-ended session sit there as a
-    # card full of unknowns. Waiting a pass lets the frontend catch up first, and by
-    # then nothing is pointing at them.
-    #
-    # Only safe because the startup sweep clears orphans: a daemon that dies between
-    # the queue and the removal leaves entities behind, and that sweep is what comes
-    # back for them.
-    $retirePlan = Update-DaemonRetireQueue -Queued $script:DaemonPendingRetire -Gone $goneSessions `
-        -DashboardCurrent ($signature -eq $script:DaemonDashboardSignature)
+function Complete-DaemonSessionRetirement {
+    <#
+        Retires the previous pass's exited sessions now, and queues this pass's for
+        the next one.
+
+        Rebuilding the dashboard first already removed their cards, but a browser holds
+        the old Lovelace config until it is pushed the new one - so tearing the entities
+        down in the same breath is exactly what made a just-ended session sit there as
+        a card full of unknowns. Waiting a pass lets the frontend catch up first, and by
+        then nothing is pointing at them.
+
+        Only safe because the startup sweep clears orphans: a daemon that dies between
+        the queue and the removal leaves entities behind, and that sweep is what comes
+        back for them.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Gone,
+        [Parameter(Mandatory)][bool]$DashboardCurrent,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $retirePlan = Update-DaemonRetireQueue -Queued $script:DaemonPendingRetire -Gone $Gone `
+        -DashboardCurrent $DashboardCurrent
     $script:DaemonPendingRetire = @($retirePlan.Queue)
     foreach ($known in @($retirePlan.Retire)) {
         try {
