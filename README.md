@@ -345,6 +345,12 @@ Giving the agent its own account is what makes the difference real:
 3. Find the user's id under *Settings → People → <the user>*; it is the long hex string
    in the URL. Put it in `homeAssistant.agentUserIds`.
 
+   Read it from that URL, not from the token. A long-lived token is a JWT whose `iss`
+   claim looks exactly like a user id but is the *refresh token's* id, and using it
+   means nothing is ever marked as agent-driven. If the URL is awkward to get at, have
+   the agent change something with its own token and read `context.user_id` back off
+   the resulting state — that is the same id the bridge compares against.
+
 A session whose last reply came from one of those ids is drawn with a purple edge —
 steady while idle, pulsing while it works — and hands back to the ordinary colours the
 moment you reply yourself or type in the session's own window. With no ids configured
