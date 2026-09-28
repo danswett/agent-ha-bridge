@@ -361,6 +361,32 @@ program. So:
   and an unreached check is believed for fifteen minutes; 404 still counts as reached,
   being an answer. A cache written before this has no `Reached` field and is read as it
   always was.
+- **1.14.2** (2026-09-28): two more, both found by driving a real session from the
+  dashboard rather than by reading code. A Claude session launched on the Mac ran,
+  answered, and never got a card: `Get-Process -Name` is an exact match and
+  `Get-BridgeAgentProcesses` asked only for `claude` and `node`, but Claude Code ships
+  a Bun-compiled binary that calls itself **claude.exe on macOS** - `Get-Process` there
+  returns literally `53859 claude.exe`. That set decides the liveness of every Claude
+  registration, so an empty one marked every open session dead and
+  `Get-LiveClaudeSessions` returned nothing. `bun` is now gathered too, for the same
+  reason: the filter accepts a CLI running under it but one could never be a candidate.
+  Separately, a Codex card could never glow, because Codex builds its own detail rather
+  than using the shared path and simply never set `driver`; a missing driver reads as
+  yours, so every Codex card was drawn as yours however it had been driven. The restart
+  prime had the same gap.
+
+  The lesson is in how both hid. `Test-BridgeAgentProcess` has stripped `.exe` since it
+  was written and a test asserted it did - passing the whole time on a candidate the
+  gatherer never handed it. The driver had a test for mapping a user id and a test for
+  recording the press, and none for the value reaching the card. Both features were
+  tested at their two ends and broken through the middle, which no amount of adding
+  cases at either end would have caught. `tests/test-driver-card.ps1` and the new block
+  in `test-platform.ps1` drive the real functions instead.
+
+  Worth knowing before hunting a missing glow: it needs a token belonging to the
+  *agent's* account. A person and an id in `agentUserIds` are only two of the three
+  steps, and with the agent still pressing on your own token every press is correctly
+  read as yours - the feature works and nothing ever lights up.
 
 ## Resuming
 
