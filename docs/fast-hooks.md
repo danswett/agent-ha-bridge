@@ -317,6 +317,28 @@ program. So:
   being written: parsing threw into the same catch with the offset already past it, so
   the loss was permanent. It now withholds a partial trailing line and rewinds by its
   length, as the Codex reader always has.
+- **1.14.0** (2026-09-28): cards now show a purple edge while an agent is driving the
+  session rather than you - steady when idle, pulsing while it works, and back to the
+  ordinary colours the moment you reply yourself or type in the session's own window.
+  The account behind the Submit press is the only thing that can tell them apart,
+  because the dashboard and the API are the same door, so it needs the agent to have
+  its own login and its id in `homeAssistant.agentUserIds`; with none configured
+  nothing is ever marked, deliberately. Reading that id off the token does not work
+  and costs an afternoon to notice: a long-lived token's `iss` claim is the refresh
+  token's id, in exactly the shape of a user id, and the comparison simply never
+  matches. Also: the install ends by checking itself - daemon up, Home Assistant
+  answering, each chosen CLI actually running, tmux present, command on PATH - and
+  says so in green, rather than printing the same next steps whether or not any of it
+  worked. `launchctl bootout` returns before launchd has unloaded, so registering the
+  LaunchAgent printed "Bootstrap failed: 5: Input/output error" on installs that then
+  worked; it now waits for the job to go and only speaks if the `load -w` fallback
+  fails too. A launch waiting on Claude's "do you trust the files in this folder?" is
+  no longer dropped at 90 seconds - that had stopped the window being read at all, so
+  the flow written to answer that question had nothing to work with and pressing
+  Launch again was the only way back. And an agent pressing Send with an empty box no
+  longer arms a ten-minute "Waiting for your text": that benefit of the doubt is for a
+  person, whose text is on screen but uncommitted, while a value set through the API
+  commits at once, so an empty box really is empty.
 
 ## Resuming
 
