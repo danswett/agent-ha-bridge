@@ -123,6 +123,80 @@ finally {
 }
 
 Write-Host ''
+Write-Host '--- the shapes Copilot actually writes ---'
+# Counted from one real session's events.jsonl: 518 assistant messages in three
+# shapes, and 224 of them carry no reasoningText at all. Reading that field directly
+# throws under StrictMode, inside a catch, so those 224 were dropped in silence - the
+# card kept whatever the last message with thinking in it had said.
+$shapeWithReasoning = '{"type":"assistant.message","data":{"apiCallId":"a","content":"with thinking","interactionId":"i","messageId":"m","model":"x","originatingMessageId":"o","reasoningBlocks":[],"reasoningOpaque":"z","reasoningText":"the thought","rte":1,"toolRequests":[],"turnId":"t"}}'
+$shapeNoReasoning = '{"type":"assistant.message","data":{"apiCallId":"a","content":"the final answer","interactionId":"i","messageId":"m","model":"x","originatingMessageId":"o","rte":1,"toolRequests":[],"turnId":"t"}}'
+$shapeMinimal = '{"type":"assistant.message","data":{"content":"a short one","messageId":"m","toolRequests":[]}}'
+
+$withReasoning = Get-ActivityFromEvents -Lines @($shapeWithReasoning) -VerboseMode $false
+Test-That 'a message carrying thinking still works' {
+    $withReasoning.Latest -eq 'with thinking' -and $withReasoning.Reasoning -eq 'the thought'
+} "$($withReasoning.Latest)"
+
+$noReasoning = Get-ActivityFromEvents -Lines @($shapeNoReasoning) -VerboseMode $false
+Test-That 'a message with no reasoningText is not thrown away' {
+    $noReasoning.Latest -eq 'the final answer'
+} "$($noReasoning.Latest)"
+Test-That 'and is published as the response' { $noReasoning.Response -eq 'the final answer' } "$($noReasoning.Response)"
+Test-That 'and is not mistaken for thinking' { -not $noReasoning.LatestIsThinking }
+
+$minimal = Get-ActivityFromEvents -Lines @($shapeMinimal) -VerboseMode $false
+Test-That 'the shortest shape is read too' { $minimal.Latest -eq 'a short one' } "$($minimal.Latest)"
+
+Test-That 'a later answer without thinking beats an earlier one with it' {
+    (Get-ActivityFromEvents -Lines @($shapeWithReasoning, $shapeNoReasoning) -VerboseMode $false).Latest -eq 'the final answer'
+}
+Test-That 'a tool call with no toolName does not drop the batch' {
+    $mixed = Get-ActivityFromEvents -Lines @('{"type":"tool.execution_start","data":{"nothing":1}}', $shapeNoReasoning) -VerboseMode $false
+    $mixed.Latest -eq 'the final answer'
+}
+Test-That 'an event with no data at all is survivable' {
+    $bare = Get-ActivityFromEvents -Lines @('{"type":"assistant.message"}', $shapeMinimal) -VerboseMode $false
+    $bare.Latest -eq 'a short one'
+}
+
+Write-Host ''
+Write-Host '--- a message still being written is not lost ---'
+# The bug this covers: the reader advanced the offset past a half-written final line
+# and handed it to the parser anyway. ConvertFrom-Json threw, the throw was swallowed,
+# and the message was never read again - so a turn's final answer never reached the
+# card, which sat on the previous line while the status said idle.
+$tailFile = Join-Path ([IO.Path]::GetTempPath()) ("copilot-tail-" + [Guid]::NewGuid().ToString('N') + '.jsonl')
+try {
+    $whole = '{"type":"assistant.message","data":{"content":"first"}}' + "`n"
+    [IO.File]::WriteAllText($tailFile, $whole)
+    $firstRead = Read-TranscriptAppend -Path $tailFile -Offset 0
+    Test-That 'a complete line is read' { @($firstRead.Lines).Count -eq 1 } "$(@($firstRead.Lines).Count)"
+
+    # The second message, flushed in two parts - what the fast lane sees every 100 ms.
+    $half = '{"type":"assistant.message","data":{"content":"the final ans'
+    [IO.File]::AppendAllText($tailFile, $half)
+    $partial = Read-TranscriptAppend -Path $tailFile -Offset $firstRead.Offset
+    Test-That 'a half-written line is withheld, not parsed' { @($partial.Lines).Count -eq 0 } "$(@($partial.Lines).Count)"
+    Test-That 'and the offset does not move past it' { $partial.Offset -eq $firstRead.Offset } "$($partial.Offset) vs $($firstRead.Offset)"
+
+    [IO.File]::AppendAllText($tailFile, 'wer"}}' + "`n")
+    $complete = Read-TranscriptAppend -Path $tailFile -Offset $partial.Offset
+    Test-That 'once complete it is read, whole' {
+        @($complete.Lines).Count -eq 1 -and $complete.Lines[0] -match 'the final answer'
+    } "$(@($complete.Lines).Count)"
+    $reduced = Get-ActivityFromEvents -Lines @($complete.Lines) -VerboseMode $false
+    Test-That 'so the turn''s last answer is what the card would show' {
+        $reduced.Latest -eq 'the final answer'
+    } "$($reduced.Latest)"
+    Test-That 'and nothing is read twice' {
+        @((Read-TranscriptAppend -Path $tailFile -Offset $complete.Offset).Lines).Count -eq 0
+    }
+}
+finally {
+    Remove-Item -LiteralPath $tailFile -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host ''
 if ($script:Failures) {
     Write-Host "$($script:Failures) check(s) failed" -ForegroundColor Red
     exit 1

@@ -173,13 +173,34 @@ function Read-TranscriptAppend {
         }
 
         [void]$stream.Seek($start, [IO.SeekOrigin]::Begin)
-        $reader = [IO.StreamReader]::new($stream, [Text.UTF8Encoding]::new($false))
-        $text = $reader.ReadToEnd()
+        $buffer = New-Object byte[] ($length - $start)
+        $read = $stream.Read($buffer, 0, $buffer.Length)
+        $text = [Text.Encoding]::UTF8.GetString($buffer, 0, $read)
 
-        $result.Offset = $length
-        $result.Lines = @(
-            ($text -split "`n") | Where-Object { $_.Trim().StartsWith('{') }
-        )
+        # A line still being written is withheld, and the offset is rewound by its
+        # length so it is read again once it is complete.
+        #
+        # Without this the offset moved past a half-written line, ConvertFrom-Json
+        # threw on it, and the throw was swallowed - so that message never reached
+        # the card at all. It hit the turn's final answer most of all: that is the
+        # largest thing written, the fast lane reads every 100 ms, and the write is
+        # the last of the turn, so nothing afterwards ever corrected it. The card
+        # then sat on the previous message while the status said idle.
+        #
+        # Codex's own reader has always done this; this is the shared reader Copilot
+        # uses, and Claude falls back to.
+        $lines = $text -split "`n"
+        $trailing = 0
+        if (-not $text.EndsWith("`n") -and $lines.Count -gt 0) {
+            $trailing = [Text.Encoding]::UTF8.GetByteCount($lines[-1])
+            $lines = if ($lines.Count -ge 2) { $lines[0..($lines.Count - 2)] } else { @() }
+        }
+
+        # From what was actually read, not $length: a short read must not skip bytes.
+        $result.Offset = $start + $read - $trailing
+        # StartsWith('{') also drops a partial *leading* line, which MaxTailBytes can
+        # cut into when a session has written more than the tail in one go.
+        $result.Lines = @($lines | Where-Object { $_.Trim().StartsWith('{') })
     }
     catch {
         return $result
@@ -189,6 +210,26 @@ function Read-TranscriptAppend {
     }
 
     $result
+}
+
+function Get-BridgeEventField {
+    <#
+        A field from a transcript event's data, or '' when the event has no such field.
+
+        Not `$parsed.data.field`: the daemon runs under StrictMode, where reading a
+        property that is not there throws - and these reads sit inside a catch that
+        drops the whole event without a word. Copilot writes assistant messages in
+        more than one shape, and only some carry reasoningText: in one real session
+        224 of 518 messages had no such field, so nearly half of everything said was
+        silently thrown away. The card then showed the last message that happened to
+        include thinking, which is why it lagged behind and missed turns' final
+        answers while the status said idle.
+    #>
+    param($Data, [Parameter(Mandatory)][string]$Name)
+
+    if ($null -eq $Data) { return '' }
+    if (@($Data.PSObject.Properties.Name) -notcontains $Name) { return '' }
+    [string]$Data.$Name
 }
 
 function Get-ActivityFromEvents {
@@ -225,7 +266,7 @@ function Get-ActivityFromEvents {
         if ($type -eq 'tool.execution_start') {
             try {
                 $parsed = $line | ConvertFrom-Json
-                $tool = [string]$parsed.data.toolName
+                $tool = Get-BridgeEventField -Data $parsed.data -Name 'toolName'
                 if (-not [string]::IsNullOrWhiteSpace($tool)) {
                     $summary = "Running: $tool"
                     $history.Add($summary)
@@ -248,13 +289,13 @@ function Get-ActivityFromEvents {
                 # the card when verbose is on. That lets a verbose toggle show or hide
                 # the existing reasoning instantly, without waiting for the session to
                 # think again.
-                $text = [string]$parsed.data.reasoningText
+                $text = Get-BridgeEventField -Data $parsed.data -Name 'reasoningText'
                 if (-not [string]::IsNullOrWhiteSpace($text)) {
                     $reasoning = $text.Trim()
                     $latest = $reasoning
                     $latestIsThinking = $true
                 }
-                $content = [string]$parsed.data.content
+                $content = Get-BridgeEventField -Data $parsed.data -Name 'content'
                 if (-not [string]::IsNullOrWhiteSpace($content)) {
                     # The short summary is the first line, for the sensor state (capped
                     # at 255 chars); the full content is kept separately so the card can
