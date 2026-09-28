@@ -838,7 +838,8 @@ function Test-BridgeActivityCardServed {
         True when the served reply-card file includes agent-bridge-activity-card (or,
         with -MinimumVersion, whatever element shipped in that version), read from
         the `?v=` cache-buster on its resource URL. The activity card first shipped in
-        card version 1.10.0; agent-bridge-session-card in 1.12.0.
+        card version 1.10.0; agent-bridge-session-card in 1.12.0;
+        agent-bridge-choices-card in 1.13.0.
     #>
     param(
         [AllowEmptyString()][AllowNull()][string]$ReplyCardUrl,
@@ -883,6 +884,7 @@ function Get-BridgeServedReplyCardUrl {
     }
 
     $found = ''
+    $readFailed = $false
     try {
         foreach ($resource in @(& $Resources)) {
             if ($null -eq $resource) { continue }
@@ -897,10 +899,17 @@ function Get-BridgeServedReplyCardUrl {
         }
     }
     catch {
-        # Unreadable resource list: fall back to the plain text box rather than risk
-        # an error box where the reply box should be.
-        $found = ''
+        $readFailed = $true
     }
+
+    # A read that failed says nothing about whether the card is registered, and Home
+    # Assistant restarting is exactly when it fails. Answering '' there - and then
+    # caching it - rebuilt the dashboard without the session, activity and launch
+    # cards for the length of the cache, so every restart visibly downgraded it to the
+    # pre-card layout. The last answer that was actually read is kept instead, and the
+    # cache stamp is left alone so the next pass tries again rather than waiting it out.
+    # A successful read that finds nothing is different, and still means no card.
+    if ($readFailed) { return $script:BridgeReplyCardUrlCache }
 
     $script:BridgeReplyCardUrlCache = $found
     $script:BridgeReplyCardUrlCachedAt = Get-Date
@@ -1384,6 +1393,23 @@ ha-select, mwc-select { width: 100%; }
         # only "Cancel request" - so labelling it "Answer" made it read as one more
         # question to fill in, sitting right where the last field should be. The two
         # cases are split by whether the first field slot is carrying options.
+        # The rows come from the custom card when Home Assistant serves a build that
+        # has it; the dropdown stays as the fallback. Home Assistant's own select
+        # sizes its menu to the longest option and will not wrap, so on a phone a
+        # question whose answers are sentences ran off the right edge unreadable.
+        $answerInner = @{
+            type = 'entities'
+            show_header_toggle = $false
+            card_mod = @{ style = $selectRowCard }
+            entities = @(@{ entity = $decisionEntity; name = 'Answer'; card_mod = @{ style = $selectRow } })
+        }
+        if (Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.13.0') {
+            $answerInner = @{
+                type     = 'custom:agent-bridge-choices-card'
+                card_mod = @{ style = $bareChild }
+                decision = $decisionEntity
+            }
+        }
         $answerCard = @{
             type = 'conditional'
             conditions = @(
@@ -1392,12 +1418,7 @@ ha-select, mwc-select { width: 100%; }
                 @{ condition = 'state'; entity = $decisionEntity; state_not = 'unavailable' }
                 @{ condition = 'state'; entity = "select.${node}_f1"; state = 'Idle' }
             )
-            card = @{
-                type = 'entities'
-                show_header_toggle = $false
-                card_mod = @{ style = $selectRowCard }
-                entities = @(@{ entity = $decisionEntity; name = 'Answer'; card_mod = @{ style = $selectRow } })
-            }
+            card = $answerInner
         }
 
         # On a multi-field question the per-field dropdowns carry the answer and the

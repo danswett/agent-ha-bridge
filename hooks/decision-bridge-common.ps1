@@ -109,7 +109,15 @@ function Test-DecisionTransientHttpError {
         [System.Management.Automation.ErrorRecord]$ErrorRecord
     )
 
-    $response = $ErrorRecord.Exception.Response
+    # Not every exception carries a Response: a connection that was refused outright -
+    # exactly what a restarting Home Assistant produces - throws without one. Reading
+    # it unguarded under Set-StrictMode -Version Latest threw "The property 'Response'
+    # cannot be found on this object" from inside the very check meant to say "retry
+    # this", so the caller treated a restart as a permanent failure.
+    $response = $null
+    if ($ErrorRecord.Exception.PSObject.Properties['Response']) {
+        $response = $ErrorRecord.Exception.Response
+    }
     if ($null -ne $response) {
         $status = 0
         try { $status = [int]$response.StatusCode } catch { $status = 0 }

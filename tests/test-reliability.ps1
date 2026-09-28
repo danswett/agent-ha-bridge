@@ -37,6 +37,30 @@ function Test-That {
     }
 }
 
+Write-Host '--- classifying a failure under StrictMode ---'
+# Not every exception carries a Response. A connection refused by a restarting Home
+# Assistant arrives without one, and reading it unguarded threw "The property
+# 'Response' cannot be found on this object" from inside the check that decides
+# whether to retry - so a restart was treated as a permanent failure. Seen live on
+# 2026-09-28: three publishes failed that way while Home Assistant came back up.
+function New-BridgeErrorRecord {
+    param([Parameter(Mandatory)][string]$Message, [switch]$WithResponse)
+    try {
+        if ($WithResponse) { throw [System.Net.WebException]::new($Message) }
+        throw [System.InvalidOperationException]::new($Message)
+    }
+    catch { return $_ }
+}
+Test-That 'an exception carrying no Response is still classified, not thrown on' {
+    Test-DecisionTransientHttpError -ErrorRecord (New-BridgeErrorRecord -Message 'Unable to connect to the remote server')
+}
+Test-That 'and a real error without one is still permanent' {
+    -not (Test-DecisionTransientHttpError -ErrorRecord (New-BridgeErrorRecord -Message 'Entity not found'))
+}
+Test-That 'an exception that does carry one is read as before' {
+    Test-DecisionTransientHttpError -ErrorRecord (New-BridgeErrorRecord -Message 'The operation has timed out' -WithResponse)
+}
+
 Write-Host '--- the request budget under StrictMode ---'
 Test-That 'no deadline set means no limit' {
     (Get-DecisionBridgeRemainingSeconds) -eq [double]::PositiveInfinity

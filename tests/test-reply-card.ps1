@@ -436,9 +436,23 @@ Test-That 'a resource entry with no url does not throw' {
         @([pscustomobject]@{ type = 'module' }, $null)
     }) -eq ''
 }
-# Falling back to the text box is the safe answer when Home Assistant cannot be asked.
-Test-That 'an unreadable resource list falls back rather than throwing' {
-    (Get-BridgeServedReplyCardUrl -CacheSeconds 0 -Resources { throw 'no websocket' }) -eq ''
+# Home Assistant restarting is exactly when this read fails, and answering "no card"
+# there rebuilt the dashboard without its session, activity and launch cards - for the
+# length of the cache, so a restart visibly downgraded it to the pre-card layout.
+Test-That 'an unreadable resource list keeps the last answer rather than dropping the cards' {
+    [void](Get-BridgeServedReplyCardUrl -CacheSeconds 0 -Resources {
+        @([pscustomobject]@{ url = '/local/agent-bridge-reply-card.js?v=1.13.0' })
+    })
+    (Get-BridgeServedReplyCardUrl -CacheSeconds 0 -Resources { throw 'no websocket' }) -eq '/local/agent-bridge-reply-card.js?v=1.13.0'
+}
+Test-That 'and the real answer comes back once it can be read again' {
+    (Get-BridgeServedReplyCardUrl -CacheSeconds 0 -Resources {
+        @([pscustomobject]@{ url = '/local/agent-bridge-reply-card.js?v=1.13.1' })
+    }) -eq '/local/agent-bridge-reply-card.js?v=1.13.1'
+}
+# A read that succeeded and found nothing is different: the card really is not there.
+Test-That 'a successful read that finds nothing still means no card' {
+    (Get-BridgeServedReplyCardUrl -CacheSeconds 0 -Resources { @() }) -eq ''
 }
 
 # An inline card's base64 body contains slashes, so it is recognised by its fragment.
