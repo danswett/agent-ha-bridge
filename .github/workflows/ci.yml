@@ -125,6 +125,7 @@ jobs:
             'codex/tests/test-codex.ps1'
             'claude/tests/test-claude-ask-parser.ps1'
             'claude/tests/test-claude-transcript.ps1'
+            'claude/tests/test-claude-install.ps1'
           )
           $failed = @()
           foreach ($suite in $suites) {

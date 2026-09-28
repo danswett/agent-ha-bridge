@@ -55,6 +55,12 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
 # design. cmd resolves pwsh the way Windows does, whichever way it was installed.
 $hookLauncher = Join-Path $adapterDir 'run-hook.cmd'
 
+# The native hook (docs/fast-hooks.md), when the main installer put one in place that
+# runs: each hook then starts in tens of milliseconds, not half a second, and falls back
+# to its PowerShell script itself whenever the daemon is not running.
+. (Join-Path $PSScriptRoot '../hooks/bridge-native-hook.ps1')
+$nativeHook = Get-BridgeNativeHookPath -BridgeHome (Join-Path $installHome '.agent-ha-bridge')
+
 function Get-Settings {
     if (-not (Test-Path -LiteralPath $settingsPath)) { return @{} }
     $raw = Get-Content -LiteralPath $settingsPath -Raw -Encoding UTF8
@@ -110,19 +116,30 @@ function Add-BridgeHook {
         [string]$EventName,
         [string]$Matcher,
         [string]$ScriptName,
-        [int]$TimeoutSeconds
+        [int]$TimeoutSeconds,
+
+        # The native hook's name for this one (register, stop, ask, notification).
+        [string]$NativeName
     )
 
     if (-not $Settings.ContainsKey('hooks')) { $Settings['hooks'] = @{} }
     $hooks = $Settings['hooks']
     if (-not $hooks.ContainsKey($EventName)) { $hooks[$EventName] = @() }
 
-    $command = '"{0}" "{1}"' -f $hookLauncher, (Join-Path $adapterDir $ScriptName)
-    # macOS runs hook commands through sh, so pwsh is named directly - by full path,
-    # since a hook's PATH need not include Homebrew.
-    if (-not $script:BridgeIsWindows) {
+    $scriptPath = Join-Path $adapterDir $ScriptName
+    if ($nativeHook -and $NativeName) {
+        # The script stays on the command line as the native hook's fallback.
+        $command = if ($script:BridgeIsWindows) { '"{0}" claude {1} "{2}"' -f $nativeHook, $NativeName, $scriptPath }
+            else { "'{0}' claude {1} '{2}'" -f $nativeHook, $NativeName, $scriptPath }
+    }
+    elseif ($script:BridgeIsWindows) {
+        $command = '"{0}" "{1}"' -f $hookLauncher, $scriptPath
+    }
+    else {
+        # macOS runs hook commands through sh, so pwsh is named directly - by full path,
+        # since a hook's PATH need not include Homebrew.
         $pwsh = (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source
-        $command = "'{0}' -NoProfile -NonInteractive -File '{1}'" -f $pwsh, (Join-Path $adapterDir $ScriptName)
+        $command = "'{0}' -NoProfile -NonInteractive -File '{1}'" -f $pwsh, $scriptPath
     }
     $entry = [ordered]@{
         matcher = $Matcher
@@ -181,22 +198,23 @@ Write-Host '    bridge-platform.ps1'
 Write-Step "Registering hooks in $settingsPath"
 $settings = Remove-BridgeHooks -Settings (Get-Settings)
 $settings = Add-BridgeHook -Settings $settings -EventName 'PreToolUse' -Matcher 'AskUserQuestion' `
-    -ScriptName 'route-askuserquestion.ps1' -TimeoutSeconds 30
+    -ScriptName 'route-askuserquestion.ps1' -TimeoutSeconds 30 -NativeName 'ask'
 # Notification is what carries permission prompts and idle waits, and unlike
 # AskUserQuestion it is present in every build.
 $settings = Add-BridgeHook -Settings $settings -EventName 'Notification' -Matcher '' `
-    -ScriptName 'route-notification.ps1' -TimeoutSeconds 30
+    -ScriptName 'route-notification.ps1' -TimeoutSeconds 30 -NativeName 'notification'
 $settings = Add-BridgeHook -Settings $settings -EventName 'Stop' -Matcher '' `
-    -ScriptName 'notify-claude-stop.ps1' -TimeoutSeconds 30
+    -ScriptName 'notify-claude-stop.ps1' -TimeoutSeconds 30 -NativeName 'stop'
 # SessionStart makes a session visible the moment it opens rather than after its first
 # turn, and is what lets a dashboard launch confirm it started. UserPromptSubmit
 # covers a session that was already open when this ran.
 $settings = Add-BridgeHook -Settings $settings -EventName 'SessionStart' -Matcher '' `
-    -ScriptName 'register-claude-session.ps1' -TimeoutSeconds 15
+    -ScriptName 'register-claude-session.ps1' -TimeoutSeconds 15 -NativeName 'register'
 $settings = Add-BridgeHook -Settings $settings -EventName 'UserPromptSubmit' -Matcher '' `
-    -ScriptName 'register-claude-session.ps1' -TimeoutSeconds 15
+    -ScriptName 'register-claude-session.ps1' -TimeoutSeconds 15 -NativeName 'register'
 Save-Settings -Settings $settings
 Write-Host '    PreToolUse (AskUserQuestion), Notification, Stop, SessionStart and UserPromptSubmit registered'
+if ($nativeHook) { Write-Host "    through the native hook: $nativeHook" }
 
 Write-Step 'Done'
 Write-Host ''

@@ -186,8 +186,17 @@ program. So:
   a staged copy must keep `.exe` or Windows will not run it to check it; and in tests,
   never name a variable `` or `` - Test-That's own parameters shadow them
   inside a check (caught three times).
-- [ ] **5. Wire Claude and Codex.** Settings/hooks point at the binary; measure;
+- [x] **5. Wire Claude and Codex.** Settings/hooks point at the binary; measure;
   release.
+  *Done on DASDESK; release pending the user's go-ahead.* `install-claude.ps1` and
+  `install-codex.ps1` write `<agent-bridge-hook> <agent> <hook> <script>` when
+  `Get-BridgeNativeHookPath` finds a working program (Codex only from a path with no
+  space: it cannot quote). Measured 2026-09-27, the installed commands run as the agent
+  runs them, median of 7: Claude UserPromptSubmit 608 -> 82 ms, Claude Stop 777 -> 80 ms
+  (both include ~40 ms of Git Bash, which Claude Code always uses on Windows), Codex
+  PreToolUse 553 -> 38 ms. Claude Code reads hooks at start, so running sessions keep the
+  old commands until restarted; Codex asks to trust the changed hook once. The previous
+  Claude settings on DASDESK are in `~/.claude/settings.json.pre-native-hook`.
 - [ ] **6. Copilot**, if its hook config can run a plain command.
 
 ## Resuming

@@ -130,6 +130,16 @@ if (-not $script:BridgeIsWindows) {
     if ($pwsh -notmatch '\s') { $command = "$pwsh -NoProfile -File $hookScript" }
 }
 
+# The native hook (docs/fast-hooks.md), when the main installer put one in place that
+# runs: a hook - one on every tool call - then takes tens of milliseconds, not half a
+# second, and falls back to the script itself whenever the daemon is not running. Unquoted
+# like the rest, so only from a path without a space. Changing the command makes Codex
+# ask for the hooks to be trusted again, once.
+. (Join-Path $PSScriptRoot '../hooks/bridge-native-hook.ps1')
+$nativeHook = Get-BridgeNativeHookPath -BridgeHome (Join-Path $installHome '.agent-ha-bridge')
+$usesNativeHook = $nativeHook -and $nativeHook -notmatch '\s' -and $hookScript -notmatch '\s'
+if ($usesNativeHook) { $command = "$nativeHook codex hook $hookScript" }
+
 $events = [ordered]@{}
 # SessionEnd is clamped to a 3 second timeout by Codex, which the hook accounts for.
 # PermissionRequest runs before Codex shows its own approval UI; the hook writes
@@ -144,6 +154,7 @@ foreach ($eventName in @('SessionStart', 'UserPromptSubmit', 'PermissionRequest'
     description = 'Copilot Home Assistant bridge'
     hooks       = $events
 } | ConvertTo-Json -Depth 10 | Set-Content (Join-Path $pluginRoot 'hooks.json') -Encoding UTF8
+if ($usesNativeHook) { Write-Host "    hooks run through the native hook: $nativeHook" }
 
 Write-Step 'Registering the local marketplace'
 $marketplaceDir = Join-Path $bridgeRoot '.agents\plugins'

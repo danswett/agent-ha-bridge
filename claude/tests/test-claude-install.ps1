@@ -106,6 +106,61 @@ try {
     }
 
     Write-Host ''
+    Write-Host '--- with the native hook installed ---'
+    $nativeName = if ($script:BridgeIsWindows) { 'agent-bridge-hook.exe' } else { 'agent-bridge-hook' }
+    $built = if ($env:AGENT_BRIDGE_HOOK_BIN) { $env:AGENT_BRIDGE_HOOK_BIN } else { Join-Path $PSScriptRoot "..\..\hook\$nativeName" }
+    if (-not (Test-Path -LiteralPath $built)) {
+        Write-Host "  SKIP  no native hook build at $built"
+    }
+    else {
+        $nativeBin = Join-Path $sandbox '.agent-ha-bridge\bin'
+        New-Item -ItemType Directory -Path $nativeBin -Force | Out-Null
+        Copy-Item -LiteralPath $built -Destination (Join-Path $nativeBin $nativeName)
+        & (Join-Path $PSScriptRoot '..\install-claude.ps1') -TargetHome $sandbox *> $null
+        $settings = Get-Content -LiteralPath (Join-Path $sandbox '.claude\settings.json') -Raw | ConvertFrom-Json
+        $nativeCommands = @($settings.hooks.PSObject.Properties | ForEach-Object { [string]$_.Value[0].hooks[0].command })
+        Test-That 'every hook runs through the native hook, its script kept as the fallback' {
+            $pattern = if ($script:BridgeIsWindows) { '^"[^"]*\\agent-bridge-hook\.exe" claude (register|stop|ask|notification) "[^"]*\.ps1"$' }
+                else { "^'[^']*/agent-bridge-hook' claude (register|stop|ask|notification) '[^']*\.ps1'$" }
+            @($nativeCommands | Where-Object { $_ -notmatch $pattern }).Count -eq 0
+        } ($nativeCommands -join ' | ')
+        Test-That 'each names the right hook' {
+            ([string]$settings.hooks.Stop[0].hooks[0].command) -match ' claude stop .*notify-claude-stop\.ps1' -and
+            ([string]$settings.hooks.PreToolUse[0].hooks[0].command) -match ' claude ask .*route-askuserquestion\.ps1'
+        }
+
+        if ($bash) {
+            # A private TEMP, so the real daemon never sees these.
+            $sandboxTemp = Join-Path $sandbox 'temp'
+            New-Item -ItemType Directory -Path $sandboxTemp -Force | Out-Null
+            $savedTemp = $env:TEMP
+            $env:TEMP = $sandboxTemp
+            try {
+                $command = [string]$settings.hooks.SessionStart[0].hooks[0].command
+                $payload = @{ session_id = $sessionId; transcript_path = 'C:\nowhere\t.jsonl'; cwd = $sandbox; hook_event_name = 'SessionStart' } | ConvertTo-Json -Compress
+
+                # No daemon heartbeat here: the native hook runs the PowerShell script.
+                $output = $payload | & $bash -c $command 2>&1
+                Test-That 'with no daemon, the script runs through the native hook, under Bash' {
+                    $LASTEXITCODE -eq 0 -and [string]::IsNullOrWhiteSpace(($output | Out-String)) -and
+                    (Test-Path -LiteralPath (Join-Path $sandboxTemp "agent-bridge-claude\$sessionId.json"))
+                } ($output | Out-String)
+
+                # A fresh heartbeat: the event is spooled for the daemon instead.
+                [IO.File]::WriteAllText((Join-Path $sandboxTemp 'agent-bridge-daemon.heartbeat'), '1')
+                $output = $payload | & $bash -c $command 2>&1
+                Test-That 'with the daemon running, the event is spooled for it, and nothing printed' {
+                    $LASTEXITCODE -eq 0 -and [string]::IsNullOrWhiteSpace(($output | Out-String)) -and
+                    @(Get-ChildItem (Join-Path $sandboxTemp 'agent-bridge-spool') -Filter '*.json' -ErrorAction SilentlyContinue).Count -eq 1
+                } ($output | Out-String)
+            }
+            finally {
+                $env:TEMP = $savedTemp
+            }
+        }
+    }
+
+    Write-Host ''
     Write-Host '--- uninstall ---'
     & (Join-Path $PSScriptRoot '..\install-claude.ps1') -TargetHome $sandbox -Uninstall *> $null
     $after = Get-Content -LiteralPath (Join-Path $sandbox '.claude\settings.json') -Raw | ConvertFrom-Json
