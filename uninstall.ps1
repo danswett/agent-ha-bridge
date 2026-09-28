@@ -336,7 +336,7 @@ $files = @(
     'agent-bridge-launch.vbs', 'route-ask-user-v3.ps1', 'notify-agent-response.ps1',
     'notify-home-assistant.ps1', 'bridge-adapter.ps1', 'bridge-update.ps1',
     'bridge-frontend-cards.ps1', 'session-launch.ps1', 'bridge-platform.ps1', 'VERSION',
-    'copilot-hooks.ps1', 'daemon-agents.ps1', 'daemon-discovery.ps1', 'daemon-activity.ps1', 'daemon-sessions.ps1', 'daemon-replies.ps1',
+    'copilot-hooks.ps1', 'bridge-native-hook.ps1', 'daemon-agents.ps1', 'daemon-discovery.ps1', 'daemon-activity.ps1', 'daemon-sessions.ps1', 'daemon-replies.ps1',
     'daemon-decisions.ps1', 'daemon-launch.ps1', 'daemon-maintenance.ps1', 'daemon-hookspool.ps1'
 )
 foreach ($name in $files) {

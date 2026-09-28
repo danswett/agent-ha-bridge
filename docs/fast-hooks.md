@@ -173,8 +173,19 @@ program. So:
   PowerShell hook. Found on the way: a fallback that fails to run had pwsh print its
   error to stdout ahead of Copilot's reply; the fallback's output is now buffered and
   passed on only when it succeeded.
-- [ ] **4. Distribution.** Release assets + checksums from CI; install and update
+- [x] **4. Distribution.** Release assets + checksums from CI; install and update
   fetch them; hook configs switch to the binary when it works.
+  *Done,* except the config switch, which is phase 5. `.github/workflows/release.yml`
+  builds the four targets on a published release (version stamped from the tag) and
+  uploads them with `SHA256SUMS`; it also runs by hand for a tag. **It has not run
+  yet: check it on the first release that carries `hook/`.** `hooks/bridge-native-hook.ps1`
+  (`Install-BridgeNativeHook`, `Get-BridgeNativeHookPath`) is used by install.ps1 before
+  the adapters are configured: a checkout's local build wins, otherwise the release
+  build, checksum-checked and seen to run. Test: `tests/test-native-hook-install.ps1`.
+  On DASDESK it is installed from the local build (`--version` says `dev`). Gotchas:
+  a staged copy must keep `.exe` or Windows will not run it to check it; and in tests,
+  never name a variable `` or `` - Test-That's own parameters shadow them
+  inside a check (caught three times).
 - [ ] **5. Wire Claude and Codex.** Settings/hooks point at the binary; measure;
   release.
 - [ ] **6. Copilot**, if its hook config can run a plain command.

@@ -119,6 +119,7 @@ jobs:
             'tests/test-hook-functions.ps1'
             'tests/test-hook-spool.ps1'
             'tests/test-native-hook.ps1'
+            'tests/test-native-hook-install.ps1'
             'tests/test-stop-session.ps1'
             'tests/test-verbose-toggle.ps1'
             'codex/tests/test-codex.ps1'

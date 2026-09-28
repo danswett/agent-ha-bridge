@@ -1,0 +1,59 @@
+name: Release assets
+
+# Attaches the native hook (hook/, docs/fast-hooks.md) to each published release,
+# with SHA256SUMS. Updates download the release's source archive, which cannot carry
+# a compiled program, so the installer fetches the build for its machine from here.
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: Release tag to build and attach to (e.g. v1.12.0)
+        required: true
+
+permissions:
+  contents: write
+
+jobs:
+  native-hook:
+    name: Build and attach the native hook
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ github.event.release.tag_name || inputs.tag }}
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: ${{ env.TAG }}
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: hook/go.mod
+          cache-dependency-path: hook/go.sum
+
+      - name: Test
+        working-directory: hook
+        run: go test ./...
+
+      - name: Build every target
+        working-directory: hook
+        run: |
+          set -euo pipefail
+          version="${TAG#v}"
+          mkdir -p dist
+          for target in windows/amd64 windows/arm64 darwin/amd64 darwin/arm64; do
+            os="${target%/*}"; arch="${target#*/}"
+            name="agent-bridge-hook-${os}-${arch}"
+            [ "$os" = windows ] && name="${name}.exe"
+            # The linker signs darwin/arm64 builds ad hoc, which Apple silicon requires.
+            GOOS="$os" GOARCH="$arch" CGO_ENABLED=0 \
+              go build -trimpath -ldflags "-s -w -X main.version=${version}" -o "dist/${name}" .
+          done
+          (cd dist && sha256sum agent-bridge-hook-* > SHA256SUMS)
+          cat dist/SHA256SUMS
+
+      - name: Attach to the release
+        working-directory: hook/dist
+        run: gh release upload "$TAG" agent-bridge-hook-* SHA256SUMS --clobber --repo "$GITHUB_REPOSITORY"

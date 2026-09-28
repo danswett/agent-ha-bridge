@@ -85,6 +85,7 @@ $repoRoot = $PSScriptRoot
 # Windows/macOS differences, before any path is built: on macOS it also makes
 # Join-Path accept the Windows separators used throughout.
 . (Join-Path $repoRoot 'hooks/bridge-platform.ps1')
+. (Join-Path $repoRoot 'hooks/bridge-native-hook.ps1')
 $installHome = if ($TargetHome) { $TargetHome } else { $HOME }
 
 # The VERSION file is the single source of truth, so the Apps & features entry, the
@@ -1819,6 +1820,17 @@ elseif (-not $SkipTask) {
                        'restricted by policy; once that is sorted, run: agent-ha-bridge configure')
     }
 }
+
+# --------------------------------------------------------------- native hook
+# The fast hook program (docs/fast-hooks.md), before the adapters: they point their
+# hooks at it only when it is installed and runs. Without it they stay PowerShell.
+Write-Step 'Installing the native hook'
+$nativeRepository = if ($config.PSObject.Properties['updates'] -and $config.updates -and $config.updates.repository) {
+    [string]$config.updates.repository
+} else { 'danswett/agent-ha-bridge' }
+$nativeHook = Install-BridgeNativeHook -RepoRoot $repoRoot -BinDir $binDir -Version $version -Repository $nativeRepository
+if ($nativeHook.Path) { Write-Host "    $($nativeHook.Path) ($($nativeHook.Detail))" }
+else { Write-Host "    skipped: $($nativeHook.Detail); hooks stay PowerShell" -ForegroundColor DarkGray }
 
 # --------------------------------------------------------- configure adapters
 # Claude, Codex and the MCP server reuse the shared layer just installed, so configure
