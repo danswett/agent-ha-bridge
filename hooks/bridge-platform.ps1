@@ -250,11 +250,26 @@ function Test-BridgeAgentProcess {
 }
 
 function Get-BridgeAgentProcesses {
-    <# Every running process of an agent's CLI, as Get-Process objects. #>
+    <#
+        Every running process of an agent's CLI, as Get-Process objects.
+
+        Names are tried with and without .exe, and Test-BridgeAgentProcess strips it
+        again. That is not Windows belt-and-braces: Claude Code ships a Bun-compiled
+        binary that reports itself as claude.exe on macOS too, and Get-Process -Name is
+        an exact match, so asking only for 'claude' returned nothing. The liveness of
+        every Claude registration is decided by this set, so an empty one read every
+        live session as dead and the sessions simply never got a card - while the
+        window was open and answering.
+
+        bun is fetched for the same reason it is accepted below: a CLI run under it
+        would otherwise never be a candidate, and the check for it could never fire.
+    #>
     param([Parameter(Mandatory)][string]$Agent)
     if ($script:BridgeIsWindows) { return @(Get-Process -Name $Agent -ErrorAction SilentlyContinue) }
-    @(@(Get-Process -Name $Agent -ErrorAction SilentlyContinue) + @(Get-Process -Name 'node' -ErrorAction SilentlyContinue) |
-        Where-Object { Test-BridgeAgentProcess -Process $_ -Agent $Agent })
+    $candidates = @(@($Agent, "$Agent.exe", 'node', 'bun') | ForEach-Object {
+        Get-Process -Name $_ -ErrorAction SilentlyContinue
+    })
+    @($candidates | Sort-Object -Property Id -Unique | Where-Object { Test-BridgeAgentProcess -Process $_ -Agent $Agent })
 }
 
 function Find-BridgeAgentAncestor {

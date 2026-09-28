@@ -79,6 +79,35 @@ if (-not $script:BridgeIsWindows) {
     }
 }
 
+Write-Host '--- gathering an agent''s processes ---'
+# The check above strips .exe, and passed from the day it was written - on a candidate
+# it was never actually handed. Get-Process -Name is an exact match, and this gathered
+# only 'claude' and 'node', so the claude.exe that Claude Code's Bun-compiled binary
+# calls itself on macOS was never a candidate at all. Every Claude registration then
+# read as dead and a live, answering session never got a card. Forced off the Windows
+# branch so the real one is exercised wherever this runs.
+$wasWindows = $script:BridgeIsWindows
+$script:BridgeIsWindows = $false
+$script:Asked = @()
+$script:Running = @{ 'claude.exe' = [pscustomobject]@{ Id = 53859; ProcessName = 'claude.exe' } }
+function Get-Process {
+    param([string]$Name, $ErrorAction)
+    $script:Asked += $Name
+    if ($script:Running.ContainsKey($Name)) { $script:Running[$Name] }
+}
+$found = @(Get-BridgeAgentProcesses -Agent 'claude')
+Test-That 'the .exe name is asked for as well as the bare one' {
+    ($script:Asked -contains 'claude') -and ($script:Asked -contains 'claude.exe')
+} ($script:Asked -join ',')
+Test-That 'so a claude.exe process is found, not missed' {
+    $found.Count -eq 1 -and [int]$found[0].Id -eq 53859
+} "found $($found.Count)"
+Test-That 'and bun is a candidate, so the check that accepts it can fire' {
+    $script:Asked -contains 'bun'
+} ($script:Asked -join ',')
+Remove-Item function:Get-Process
+$script:BridgeIsWindows = $wasWindows
+
 Write-Host '--- finding the session a hook belongs to ---'
 $script:Tree = @{
     30 = [pscustomobject]@{ ProcessId = 30; ParentProcessId = 20; Name = 'pwsh'; CommandLine = 'pwsh -File hook.ps1' }
