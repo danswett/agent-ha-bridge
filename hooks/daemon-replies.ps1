@@ -263,6 +263,23 @@ function Test-DaemonReplyBoxFree {
         return $false
     }
 
+    # A Codex approval arms the same card through a different marker: its
+    # PermissionRequest hook, not ask_user. Only the ask_user marker was looked for
+    # here, so a live approval always fell through to the staleness check below, which
+    # asks the transcript about an ask_user that was never there, concluded the card
+    # was a leftover and tore it down. This runs for every live session on every
+    # reconcile, so an approval card was reset to Idle within seconds of appearing,
+    # every time: a choice made on the dashboard landed on a selector whose options had
+    # just been emptied and was rejected, and the prompt could only be answered in the
+    # terminal.
+    $approvalMarker = $null
+    try {
+        $readApproval = (Get-DaemonAgent -Kind ([string]$Session.Kind)).ApprovalMarker
+        if ($readApproval) { $approvalMarker = & $readApproval $sessionId }
+    }
+    catch { }
+    if ($null -ne $approvalMarker) { return $false }
+
     # Armed card with no marker behind it. Either the old blocking router is genuinely
     # waiting on it, or the question was already answered and the card was never torn
     # down - in which case every reply typed here is dropped silently, which is how a

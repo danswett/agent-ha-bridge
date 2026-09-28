@@ -65,6 +65,36 @@ Test-That 'a card left over from an answered question is cleared, freeing it' {
 $script:Ha = @{}
 Test-That 'an unreadable card is treated as free - a reply is the common case' { (Test-DaemonReplyBoxFree -SessionId $sid -Session $session -State $state -Headers $headers) -eq $true }
 
+Write-Host '--- a Codex approval owns the card too ---'
+# It arms the same selector, but through its PermissionRequest hook rather than
+# ask_user, so Get-CopilotDecisionMarker returns nothing for it. Only that marker was
+# checked, so a live approval fell through to the staleness check - which asks the
+# transcript about an ask_user that never existed, always answers "not pending", and
+# tore the card down. This runs for every live session on every reconcile, so the
+# dropdown was reset to Idle within seconds of appearing and a pick made on it was
+# rejected against an emptied option list: the prompt could only be answered in the
+# terminal.
+$script:ApprovalMarker = $null
+function Get-DaemonAgent { param($Kind) [pscustomobject]@{ ApprovalMarker = { param($id) $script:ApprovalMarker } } }
+$codexSession = [pscustomobject]@{ SessionId = $sid; Kind = 'codex' }
+$script:Ha = @{ "select.${node}_decision" =
+    [pscustomobject]@{ state = 'Awaiting answer...'; attributes = [pscustomobject]@{ question = 'Approve agent-ha-bridge restart?' } } }
+$script:Marker = $null
+$script:Pending = $false
+$script:ApprovalMarker = [pscustomobject]@{ decisionId = 'a1' }
+$clearedBefore = $script:Cleared
+Test-That 'a live Codex approval owns the card' {
+    (Test-DaemonReplyBoxFree -SessionId $sid -Session $codexSession -State $state -Headers $headers) -eq $false
+}
+Test-That 'and it is not torn down as a stale card' { $script:Cleared -eq $clearedBefore } "cleared $($script:Cleared - $clearedBefore) time(s)"
+$script:ApprovalMarker = $null
+Test-That 'once the approval is gone the card is cleared as before' {
+    ((Test-DaemonReplyBoxFree -SessionId $sid -Session $codexSession -State $state -Headers $headers) -eq $true) -and
+        $script:Cleared -eq ($clearedBefore + 1)
+}
+Remove-Item function:Get-DaemonAgent
+$script:Ha = @{}
+
 Write-Host '--- a payload from the reply card ---'
 $script:Replies = @(); $script:Removed = @(); $script:Saved = @()
 function Invoke-DaemonReply { param($SessionId, $Text, $Headers, $DisplayText, [switch]$ClearReplyBox) $script:Replies += [pscustomobject]@{ Text = $Text; StampAtDelivery = $state[$sid].LastReplyPayloadAt }; $true }
