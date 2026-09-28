@@ -197,7 +197,16 @@ program. So:
   PreToolUse 553 -> 38 ms. Claude Code reads hooks at start, so running sessions keep the
   old commands until restarted; Codex asks to trust the changed hook once. The previous
   Claude settings on DASDESK are in `~/.claude/settings.json.pre-native-hook`.
-- [ ] **6. Copilot**, if its hook config can run a plain command.
+- [ ] **6. Copilot (and Agency, which runs Copilot and uses its hooks).** Found
+  2026-09-27: Copilot CLI hooks accept `exec` + `args` to run a program with no shell
+  (docs.github.com/en/copilot/reference/hooks-reference), e.g.
+  `{ "type": "command", "exec": "<agent-bridge-hook>", "args": ["copilot", "ask_user",
+  "<route-ask-user-v3.ps1>"], "timeoutSec": 120 }`. `exec` must not be combined with
+  `powershell`, and no minimum version is documented; preToolUse hooks are fail-closed
+  on a crash or non-zero exit. Plan: confirm on DASDESK's Copilot 1.0.88 with a
+  throwaway sessionStart hook (no prompt sent), then have install.ps1 write `exec` only
+  for a Copilot at or above the confirmed version, keeping the PowerShell entries
+  otherwise. Waiting on the user's OK to start Copilot once for the probe.
 
 ## Resuming
 
