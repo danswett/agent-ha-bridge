@@ -1327,7 +1327,8 @@ function Initialize-BridgeConsoleReader {
         untouched.
     #>
     if (([Management.Automation.PSTypeName]'CopilotCli.ConsoleReader').Type) { return }
-    Add-Type -Language CSharp -TypeDefinition @'
+    # Compiled once into a cached DLL rather than in this process (Add-BridgeCompiledType).
+    Add-BridgeCompiledType -TypeName 'CopilotCli.ConsoleReader' -Source @'
 using System;
 using System.Runtime.InteropServices;
 using System.Text;

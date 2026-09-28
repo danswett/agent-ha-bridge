@@ -110,14 +110,31 @@ function Get-LiveCodexSessions {
     $live
 }
 
+# Only the bridge's own entities (agent_bridge_*) and the MCP server's (mcp_*), rendered
+# by Home Assistant itself as a JSON list of { entity_id, state, attributes }.
+$script:DaemonBridgeStatesTemplate = @'
+{%- set ns = namespace(out=[]) -%}
+{%- for s in states if s.object_id.startswith('agent_bridge_') or s.object_id.startswith('mcp_') -%}
+{%- set ns.out = ns.out + [{'entity_id': s.entity_id, 'state': s.state, 'attributes': dict(s.attributes)}] -%}
+{%- endfor -%}
+{{ ns.out | to_json }}
+'@
+$script:DaemonStatesTemplateRefused = $false
+
 function Get-DaemonHomeAssistantStates {
     <#
-        Every Home Assistant state, cached for a short while.
+        The Home Assistant states the daemon reads - the bridge's own entities and the MCP
+        server's - cached for a short while.
 
-        Two scans need the full state list - MCP clients and peer machines - and both
-        change slowly, so they share one read rather than each paying for an O(all
-        entities) fetch on every reconcile. Failure throws; each caller decides whether
-        to fall back to its own last known good set.
+        Three things read them - MCP clients, peer machines and the orphan sweep - and
+        all change slowly, so they share one read per reconcile interval.
+
+        Home Assistant filters them (DaemonBridgeStatesTemplate, through /api/template):
+        the full /api/states list was 5,354 entities and 2.4 MB of JSON on DASDESK, of
+        which the bridge uses about 40. Parsing it every reconcile, and caching it, held
+        about 180 MB of the daemon's memory; the filtered list is 12 KB. A Home Assistant
+        that refuses templates gets the full list, as before. Failure throws; each
+        caller decides whether to fall back to its own last known good set.
     #>
     param([Parameter(Mandatory)][hashtable]$Headers)
 
@@ -126,11 +143,43 @@ function Get-DaemonHomeAssistantStates {
         return ,$script:DaemonStatesCache
     }
 
-    $states = Invoke-DecisionHttpRequest -Parameters @{
-        Method = 'Get'
-        Uri = "$($script:DecisionBridgeConfig.HomeAssistantBaseUrl)/api/states"
-        Headers = $Headers
-        TimeoutSec = 15
+    $base = $script:DecisionBridgeConfig.HomeAssistantBaseUrl
+    $states = $null
+    $filtered = $false
+    if (-not $script:DaemonStatesTemplateRefused) {
+        try {
+            $rendered = Invoke-DecisionHttpRequest -Parameters @{
+                Method = 'Post'
+                Uri = "$base/api/template"
+                Headers = $Headers
+                ContentType = 'application/json'
+                Body = (@{ template = $script:DaemonBridgeStatesTemplate } | ConvertTo-Json -Compress)
+                TimeoutSec = 15
+            }
+            # Home Assistant answers text/plain, so the JSON arrives as a string.
+            # -NoEnumerate keeps an empty list a list rather than nothing at all.
+            $states = if ($rendered -is [string]) { $rendered | ConvertFrom-Json -NoEnumerate } else { $rendered }
+            $filtered = $true
+        }
+        catch {
+            # A refusal (a 4xx - an older Home Assistant, or a token not allowed to
+            # render templates) is permanent, so stop asking; anything else is tried
+            # again next time. Either way the full list serves for now.
+            $code = 0
+            try { $code = [int]$_.Exception.Response.StatusCode } catch { }
+            if ($code -ge 400 -and $code -lt 500) {
+                $script:DaemonStatesTemplateRefused = $true
+                Write-DaemonLog -Message "Home Assistant refused the filtered state read ($code); reading every state instead"
+            }
+        }
+    }
+    if (-not $filtered) {
+        $states = Invoke-DecisionHttpRequest -Parameters @{
+            Method = 'Get'
+            Uri = "$base/api/states"
+            Headers = $Headers
+            TimeoutSec = 15
+        }
     }
     $script:DaemonStatesCache = @($states)
     $script:DaemonStatesCacheAt = [DateTimeOffset]::Now

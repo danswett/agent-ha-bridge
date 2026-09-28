@@ -1318,6 +1318,7 @@ function Get-BridgeLaunchAgentPlist {
     <key>EnvironmentVariables</key>
     <dict>
         <key>PATH</key><string>$(& $x $PathValue)</string>
+        <key>DOTNET_GCConserveMemory</key><string>7</string>
     </dict>
     <key>RunAtLoad</key><true/>
     <key>KeepAlive</key><true/>

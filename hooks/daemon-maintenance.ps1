@@ -1,14 +1,44 @@
 <#
     Bridge daemon: keeping the install current.
 
-    Update checks and their outcome on the dashboard, and setting up agents
-    installed after the bridge.
+    Update checks and their outcome on the dashboard, setting up agents installed
+    after the bridge, and handing unused memory back.
 
     Part of agent-bridge-daemon.ps1, which dot-sources it into its own scope after
     declaring the shared $script: state; see docs/daemon-split.md.
     Shared state it changes: DaemonClientSetup, DaemonRestartRequested,
-    DaemonUpdateAvailable, DaemonUpdateLastPress, DaemonUpdatePublished.
+    DaemonUpdateAvailable, DaemonUpdateLastPress, DaemonUpdatePublished,
+    DaemonMemoryTrimmedAt.
 #>
+
+$script:DaemonMemoryTrimmedAt = [DateTimeOffset]::MinValue
+
+function Invoke-DaemonMemoryTrim {
+    <#
+        Hands memory the garbage collector is holding in reserve back to the system.
+
+        The daemon's live objects are about 30 MB, but each reconcile allocates in a
+        burst and .NET keeps what it grew to - 150-180 MB more, measured on DASDESK -
+        ready for the next one. DOTNET_GCConserveMemory (set by the supervisor) keeps
+        that lower; this returns the rest. It is a full, blocking collection of about
+        25 ms, so it runs at most every $IntervalSeconds, and only when the reserve is
+        worth it. Returns whether it ran.
+    #>
+    param(
+        [int]$IntervalSeconds = 300,
+        [long]$MinimumReserveBytes = 48MB,
+        [DateTimeOffset]$Now = [DateTimeOffset]::Now,
+        # The collector's own figures, from [GC]::GetGCMemoryInfo(); replaced by tests.
+        [scriptblock]$Measure = { $info = [GC]::GetGCMemoryInfo(); [pscustomobject]@{ Committed = $info.TotalCommittedBytes; Heap = $info.HeapSizeBytes } }
+    )
+
+    if (($Now - $script:DaemonMemoryTrimmedAt).TotalSeconds -lt $IntervalSeconds) { return $false }
+    $memory = & $Measure
+    if (($memory.Committed - $memory.Heap) -lt $MinimumReserveBytes) { return $false }
+    $script:DaemonMemoryTrimmedAt = $Now
+    [GC]::Collect(2, [GCCollectionMode]::Aggressive, $true, $true)
+    $true
+}
 
 function Invoke-DaemonUpdateOutcome {
     <#

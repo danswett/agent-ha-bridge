@@ -45,6 +45,13 @@ Write-SupervisorLog -Message "supervisor starting (pid $PID)"
 $backoffSeconds = 5
 $maxBackoff = 120
 
+# Asks .NET's garbage collector to hand memory back rather than keep it for the next
+# burst: the daemon's live objects are about 30 MB, but after each reconcile the
+# collector held 150-180 MB more in reserve. 7 measured about 90 MB steady instead of
+# 160 on DASDESK (see Invoke-DaemonMemoryTrim for the rest). Read by the runtime at
+# start, so it is set here, where the daemon inherits it.
+$env:DOTNET_GCConserveMemory = '7'
+
 try {
     while ($true) {
         $started = [DateTimeOffset]::Now

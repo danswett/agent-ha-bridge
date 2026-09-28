@@ -735,6 +735,8 @@ function Start-BridgeDaemon {
             $script:DaemonReconcileNow = $false
             Invoke-DaemonReconcile -Headers $headers -State $state
             $lastReconcile = [DateTimeOffset]::Now
+            # Straight after the reconcile, when the collector holds most in reserve.
+            try { $null = Invoke-DaemonMemoryTrim } catch { }
 
             # A newly installed adapter is only loaded at startup, so the daemon ends
             # here and the supervisor starts it again a few seconds later. State was

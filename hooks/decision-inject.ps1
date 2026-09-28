@@ -62,7 +62,8 @@ function Initialize-CopilotConsoleInjector {
     # The Windows console API; macOS goes through tmux instead (Invoke-BridgeConsoleSend).
     if (-not $script:BridgeIsWindows) { return }
     if (-not ([Management.Automation.PSTypeName]$script:CopilotInjectorTypeName).Type) {
-        Add-Type -Language CSharp -TypeDefinition @'
+        # Compiled once into a cached DLL rather than in this process (Add-BridgeCompiledType).
+        Add-BridgeCompiledType -TypeName $script:CopilotInjectorTypeName -Source @'
 using System;
 using System.Collections.Generic;
 using System.Runtime.InteropServices;

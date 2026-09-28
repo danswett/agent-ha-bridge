@@ -34,6 +34,53 @@ function Initialize-BridgePlatform {
 }
 Initialize-BridgePlatform
 
+function Add-BridgeCompiledType {
+    <#
+        Adds a C# type the way `Add-Type -TypeDefinition` does, without loading the C#
+        compiler into this process.
+
+        Add-Type compiles in-process with Roslyn, which stays loaded for the life of the
+        process: about 60 MB of the daemon, for two small types whose source never
+        changes. Instead the source is compiled once, by a short-lived pwsh, into a DLL
+        named by a hash of the source and this PowerShell's version, under
+        ~/.agent-ha-bridge/cache; every later start just loads that DLL. Anything that
+        goes wrong falls back to compiling in-process, as before.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$TypeName,
+        [Parameter(Mandatory)][string]$Source,
+        [string]$CacheDir = (Join-Path $HOME '.agent-ha-bridge\cache')
+    )
+
+    if (([Management.Automation.PSTypeName]$TypeName).Type) { return }
+    try {
+        $bytes = [Text.Encoding]::UTF8.GetBytes("$($PSVersionTable.PSVersion)`n$Source")
+        $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).Substring(0, 16).ToLowerInvariant()
+        $dll = Join-Path $CacheDir "$TypeName-$hash.dll"
+        if (-not [IO.File]::Exists($dll)) {
+            [void][IO.Directory]::CreateDirectory($CacheDir)
+            $sourceFile = Join-Path $CacheDir "$TypeName-$hash.cs"
+            $partial = "$dll.$PID.tmp"
+            [IO.File]::WriteAllText($sourceFile, $Source)
+            $pwsh = (Get-Process -Id $PID).Path
+            & $pwsh -NoProfile -NonInteractive -Command "Add-Type -TypeDefinition ([IO.File]::ReadAllText('$sourceFile')) -OutputAssembly '$partial' -OutputType Library" 2>$null
+            $global:LASTEXITCODE = 0
+            Remove-Item -LiteralPath $sourceFile -Force -ErrorAction SilentlyContinue
+            # Renamed into place, so another process never loads half a file; if one got
+            # there first, its copy is as good.
+            if ([IO.File]::Exists($partial)) {
+                try { [IO.File]::Move($partial, $dll) } catch { Remove-Item -LiteralPath $partial -Force -ErrorAction SilentlyContinue }
+            }
+        }
+        if ([IO.File]::Exists($dll)) {
+            Add-Type -Path $dll
+            if (([Management.Automation.PSTypeName]$TypeName).Type) { return }
+        }
+    }
+    catch { }
+    Add-Type -Language CSharp -TypeDefinition $Source
+}
+
 if (-not $script:BridgeIsWindows) {
     function Join-Path {
         <#
