@@ -117,8 +117,14 @@ program. So:
 
 ## Phases (one commit each; tick here in the same commit)
 
-- [ ] **0. Toolchain.** Go installed on DASDESK (`winget install GoLang.Go`); CI
+- [x] **0. Toolchain.** Go installed on DASDESK (`winget install GoLang.Go`); CI
   job that builds and tests the Go code on Windows and macOS.
+  *Done* (the CI job moved into phase 3, with the first Go code). The machine-wide
+  winget install waited on a UAC prompt, so Go 1.27.1 is the portable zip (sha256
+  checked) in `%LOCALAPPDATA%\Programs\go`; use `%LOCALAPPDATA%\Programs\go\bin\go.exe`
+  if `go` is not on PATH. Gate passed 2026-09-27: a minimal Go program that reads and
+  parses the event starts in 12.3 ms median (cmd.exe 14.3 ms, pwsh 234 ms), 2.6 MB, and
+  Defender's scan found no threats.
 - [x] **1. Hook bodies into functions.** Each hook script's body moves into a
   function taking `-Event` and `-Ancestors`; the script calls it with its own
   ancestry. No behaviour change. Tests call the functions with the existing
