@@ -225,6 +225,73 @@ if (-not $script:BridgeIsWindows) {
     }
 }
 
+# Whether `npm install -g` has to be elevated, worked out once and cached. $null until
+# asked, because npm may not be installed yet when the catalogue above is built.
+$script:BridgeNpmNeedsSudo = $null
+
+function Test-BridgeNpmNeedsSudo {
+    <#
+        Whether npm's global folder needs root to write to.
+
+        On an Intel Mac, Node and npm come from MacPorts, whose global folder is
+        /opt/local/lib/node_modules - owned by root. Every `npm install -g` therefore
+        died with "EACCES: permission denied, mkdir '/opt/local/lib/node_modules/...'",
+        and the advice printed afterwards was the same command that had just failed.
+        Homebrew's prefix is owned by the user, and Windows keeps global packages under
+        the profile, so neither needs this.
+
+        Decided by trying to create a folder rather than by reading ownership: the
+        question is only ever "can this user write here", and a probe answers it
+        without having to reason about groups, ACLs or who owns what.
+    #>
+    # Cache first, so this is the seam a test can set on any platform.
+    if ($null -ne $script:BridgeNpmNeedsSudo) { return $script:BridgeNpmNeedsSudo }
+    if ($script:BridgeIsWindows) { $script:BridgeNpmNeedsSudo = $false; return $false }
+
+    $needs = $false
+    try {
+        $prefix = ([string](& npm prefix -g 2>$null | Select-Object -First 1)).Trim()
+        if ($prefix) {
+            # npm creates the leaf itself, so the nearest folder that exists is the one
+            # that has to be writable.
+            $dir = Join-Path $prefix 'lib/node_modules'
+            while ($dir -and -not [IO.Directory]::Exists($dir)) {
+                $parent = Split-Path -Parent $dir
+                if ($parent -eq $dir) { break }
+                $dir = $parent
+            }
+            if ($dir -and [IO.Directory]::Exists($dir)) {
+                $probe = Join-Path $dir (".agent-ha-bridge-probe-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+                try {
+                    New-Item -ItemType Directory -Path $probe -ErrorAction Stop | Out-Null
+                    Remove-Item -LiteralPath $probe -Force -Recurse -ErrorAction SilentlyContinue
+                }
+                catch { $needs = $true }
+            }
+        }
+    }
+    catch { }
+
+    $script:BridgeNpmNeedsSudo = $needs
+    $needs
+}
+
+function Get-BridgeNpmPath {
+    <#
+        npm's full path, because sudo does not keep the PATH that found it.
+
+        `sudo npm` answers "sudo: npm: command not found" on a MacPorts Mac: sudo
+        resets the environment, and the PATH it substitutes does not include
+        /opt/local/bin. Only an absolute path survives that.
+    #>
+    $command = Get-Command npm -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($command -and $command.Source) { return [string]$command.Source }
+    foreach ($candidate in @('/opt/local/bin/npm', '/opt/homebrew/bin/npm', '/usr/local/bin/npm')) {
+        if ([IO.File]::Exists($candidate)) { return $candidate }
+    }
+    'npm'
+}
+
 function Get-BridgeDependencyCommand {
     <# The exact command line that installs a dependency. #>
     param([Parameter(Mandatory)][string]$Name)
@@ -236,7 +303,13 @@ function Get-BridgeDependencyCommand {
             return ("winget install --id $($dep.Package) --source winget --exact " +
                     '--accept-package-agreements --accept-source-agreements')
         }
-        'npm' { return "npm install -g $($dep.Package)" }
+        'npm' {
+            # -H so npm caches as root rather than leaving root-owned files in the
+            # user's own ~/.npm, which would break their next unelevated npm; and npm
+            # by full path, because sudo drops the PATH that found it.
+            if (Test-BridgeNpmNeedsSudo) { return "sudo -H $(Get-BridgeNpmPath) install -g $($dep.Package)" }
+            return "npm install -g $($dep.Package)"
+        }
         'brew' { return "brew install $($dep.Package)" }
         # MacPorts installs system-wide, so it asks for the Mac's password.
         'port' { return "sudo port -N install $($dep.Package)" }
@@ -859,8 +932,13 @@ function Get-BridgeHomeAssistantCandidate {
 
     if (-not $Resolver) {
         $Resolver = {
-            $resolved = Resolve-DnsName -Name 'homeassistant.local' -Type A -ErrorAction Stop
-            @($resolved | Where-Object IPAddress | Select-Object -Expand IPAddress)
+            # [System.Net.Dns] rather than Resolve-DnsName: that cmdlet ships only with
+            # Windows, so on a Mac the lookup threw and every address candidate was
+            # dropped - leaving discovery with nothing but the two host names. This goes
+            # through the system resolver on both, which on macOS is what answers mDNS.
+            @([System.Net.Dns]::GetHostAddresses('homeassistant.local') |
+                Where-Object { $_.AddressFamily -eq [System.Net.Sockets.AddressFamily]::InterNetwork } |
+                ForEach-Object { $_.IPAddressToString })
         }
     }
 

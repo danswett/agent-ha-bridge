@@ -62,8 +62,41 @@ Test-That 'through MacPorts it is a system install, so sudo, and never a prompt 
     (Get-BridgeDependencyCommand -Name 'tmux') -eq 'sudo port -N install tmux'
 }
 $script:BridgeDependencies.tmux.Manager = $savedManager
+# Pinned, so these assert the catalogue rather than whatever npm prefix this machine
+# happens to have.
+$savedNpmSudo = $script:BridgeNpmNeedsSudo
+$script:BridgeNpmNeedsSudo = $false
 Test-That 'the Copilot CLI is the published npm package' {
     (Get-BridgeDependencyCommand -Name 'copilot') -eq 'npm install -g @github/copilot'
+}
+# Node from MacPorts keeps global packages in root-owned /opt/local/lib/node_modules, so
+# every `npm install -g` died with EACCES - and the advice printed afterwards was the
+# same command that had just failed.
+$script:BridgeNpmNeedsSudo = $true
+Test-That 'an npm folder this user cannot write to is installed into with sudo' {
+    $cmd = Get-BridgeDependencyCommand -Name 'copilot'
+    $cmd -like 'sudo -H *' -and $cmd -like '* install -g @github/copilot'
+} (Get-BridgeDependencyCommand -Name 'copilot')
+Test-That 'and -H, so npm does not leave root-owned files in the user''s own cache' {
+    (Get-BridgeDependencyCommand -Name 'claude') -match '^sudo -H '
+}
+# `sudo npm` answers "sudo: npm: command not found" on a MacPorts Mac: sudo replaces
+# PATH with one that has no /opt/local/bin, so only an absolute path survives.
+Test-That 'npm is named by the path that survives sudo dropping PATH' {
+    $cmd = Get-BridgeDependencyCommand -Name 'codex'
+    (($cmd -replace '^sudo -H ', '') -replace ' install -g .*$', '') -eq (Get-BridgeNpmPath)
+} (Get-BridgeDependencyCommand -Name 'codex')
+Test-That 'and that path is absolute wherever npm is really installed' {
+    -not (Get-Command npm -CommandType Application -ErrorAction SilentlyContinue) -or
+    (Split-Path -Path (Get-BridgeNpmPath) -IsAbsolute)
+} (Get-BridgeNpmPath)
+$script:BridgeNpmNeedsSudo = $false
+Test-That 'a writable one is installed into as this user, with no sudo at all' {
+    (Get-BridgeDependencyCommand -Name 'codex') -eq 'npm install -g @openai/codex'
+}
+Test-That 'Windows never elevates an npm install' {
+    $script:BridgeNpmNeedsSudo = $null
+    -not $script:BridgeIsWindows -or -not (Test-BridgeNpmNeedsSudo)
 }
 Test-That 'Claude Code is the published npm package' {
     (Get-BridgeDependencyCommand -Name 'claude') -eq 'npm install -g @anthropic-ai/claude-code'
@@ -71,6 +104,7 @@ Test-That 'Claude Code is the published npm package' {
 Test-That 'Codex CLI is the published npm package' {
     (Get-BridgeDependencyCommand -Name 'codex') -eq 'npm install -g @openai/codex'
 }
+$script:BridgeNpmNeedsSudo = $savedNpmSudo
 Test-That 'an unknown dependency throws' {
     $threw = $false
     try { Get-BridgeDependencyCommand -Name 'emacs' } catch { $threw = $true }

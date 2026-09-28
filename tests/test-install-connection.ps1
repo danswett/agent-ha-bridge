@@ -246,6 +246,19 @@ Test-That 'a DNS failure still leaves a usable list' {
 Test-That 'a resolver returning nothing is handled' {
     @(Get-BridgeHomeAssistantCandidate -Resolver { @() }).Count -ge 4
 }
+# Resolve-DnsName ships only with Windows. On a Mac the default resolver threw, the
+# catch swallowed it, and every address candidate was dropped - so discovery had
+# nothing but the two host names to go on and reported no Home Assistant found.
+Test-That 'the default address lookup is not the Windows-only cmdlet' {
+    # Read from the syntax tree, not the text: the comment beside it names the cmdlet.
+    $ast = (Get-Command Get-BridgeHomeAssistantCandidate).ScriptBlock.Ast
+    $calls = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)
+    @($calls | Where-Object { "$($_.GetCommandName())" -eq 'Resolve-DnsName' }).Count -eq 0
+}
+Test-That 'and it runs on this platform, whichever it is' {
+    $list = @(Get-BridgeHomeAssistantCandidate)
+    ($list -contains 'http://homeassistant.local:8123') -and ($list -contains 'http://localhost:8123')
+}
 
 Write-Host '--- an old or damaged config does not end the install ---'
 $example = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\config.example.json') -Raw -Encoding UTF8 | ConvertFrom-Json
