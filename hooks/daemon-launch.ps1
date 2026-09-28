@@ -743,9 +743,11 @@ function Test-DaemonLaunchProgressNote {
     param([AllowEmptyString()][AllowNull()][string]$Text)
     $t = ([string]$Text).Trim()
     if (-not $t) { return $false }
-    # "<Agent> is open in ..." and "<Agent> is asking whether to trust ...", for any agent
-    # (see Update-DaemonPendingLaunch); "is still asking" is an outcome, and not matched.
-    $t.EndsWith('...') -or $t -like '* is open in *. It appears here after*' -or $t -like '* is asking whether to trust *'
+    # "<Agent> is open in ...", "<Agent> is asking whether to trust ..." and "<Agent> in
+    # <folder> is asking you to trust ...", for any agent (see Update-DaemonPendingLaunch);
+    # "is still asking" is an outcome, and not matched.
+    $t.EndsWith('...') -or $t -like '* is open in *. It appears here after*' -or
+        $t -like '* is asking whether to trust *' -or $t -like '* is asking you to trust *'
 }
 
 function Clear-DaemonStaleNote {
@@ -835,6 +837,33 @@ function Update-DaemonPendingLaunch {
             }
             return
         }
+    }
+
+    # A question only the agent's window can answer (Codex's hook review) holds the
+    # session back from registering. The window is read every couple of seconds until
+    # one shows; the note then says what to do, and the launch waits for it.
+    $blocking = (Get-BridgeLauncher -Launcher $p.Launcher).BlockingPrompt
+    $blocked = $p.PSObject.Properties['BlockedAt'] -and $null -ne $p.BlockedAt
+    if ($blocking -and $p.ProcessId -gt 0 -and -not $blocked -and ($now - $p.Since).TotalSeconds -ge 3) {
+        $lastLook = if ($p.PSObject.Properties['ScreenReadAt']) { $p.ScreenReadAt } else { [DateTimeOffset]::MinValue }
+        if (($now - $lastLook).TotalSeconds -ge 2) {
+            Set-DaemonSessionProperty -Entry $p -Name 'ScreenReadAt' -Value $now
+            $note = $null
+            try { $note = & $blocking (Read-BridgeConsoleScreen -ProcessId $p.ProcessId) } catch { }
+            if ($note) {
+                Set-DaemonSessionProperty -Entry $p -Name 'BlockedAt' -Value $now
+                $blocked = $true
+                Write-DaemonLog -Message "$agent in $($p.Label) is waiting on a question in its window: $note"
+                try { Set-CopilotMqttNewSessionResult -Headers $Headers -Text ($note -f $p.Label) } catch { }
+            }
+        }
+    }
+    if ($blocked) {
+        if (($now - $p.BlockedAt).TotalMinutes -gt 10) {
+            & $finish "$agent in $($p.Label) is still waiting on a question in its window - answer it there." `
+                "launched $agent (pid $($p.ProcessId)) still blocked after 10 minutes; stopped waiting"
+        }
+        return
     }
 
     # A Codex opened without a first message has no session until it gets one. Once

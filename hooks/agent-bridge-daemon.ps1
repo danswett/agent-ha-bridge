@@ -414,7 +414,10 @@ function Initialize-DaemonStartup {
     $state = $State
     $live = $Live
 
-    Write-DaemonLog -Message "daemon starting (pid $PID), $($live.Count) live session(s)"
+    # The collector setting the supervisor passes (Invoke-DaemonMemoryTrim), so a daemon
+    # holding too much memory can be told apart from one that never got it.
+    $gcConserve = if ($env:DOTNET_GCConserveMemory) { $env:DOTNET_GCConserveMemory } else { 'unset' }
+    Write-DaemonLog -Message "daemon starting (pid $PID), $($live.Count) live session(s); GC conserve-memory $gcConserve"
 
     # A launch being followed does not survive a restart, so a note about one in
     # progress ("Starting...", "Codex is open in...", "press Launch again to trust")

@@ -112,6 +112,39 @@ Test-That 'an outcome is not' {
     -not (Test-DaemonLaunchProgressNote -Text '')
 }
 
+Write-Host '--- a question only the window can answer ---'
+# Seen on DASDESK after 1.12.0: Codex stopped at its hook review, never registered,
+# and the launch just said "has not registered" after 90 s.
+$reviewScreen = "  Hooks need review`n  6 hooks are new or changed.`n› 1. Review hooks`n  2. Trust all and continue"
+Test-That 'Codex recognises its hook review' { (& (Get-BridgeLauncher -Launcher 'codex').BlockingPrompt $reviewScreen) -match "Trust all and continue" }
+Test-That 'and nothing else' { $null -eq (& (Get-BridgeLauncher -Launcher 'codex').BlockingPrompt 'OpenAI Codex ready') }
+Test-That 'the other launchers have no such check' { $null -eq (Get-BridgeLauncher -Launcher 'copilot').BlockingPrompt }
+Test-That 'its note counts as a launch in progress' {
+    Test-DaemonLaunchProgressNote -Text ((& (Get-BridgeLauncher -Launcher 'codex').BlockingPrompt $reviewScreen) -f 'repo')
+}
+
+$script:Notes = @()
+function Set-CopilotMqttNewSessionResult { param([hashtable]$Headers, [string]$Text) $script:Notes += $Text }
+function Test-BridgeSessionRegistered { param($SessionId, $Launcher, $Since) $false }
+$script:Screen = $reviewScreen
+function Read-BridgeConsoleScreen { param([int]$ProcessId) $script:Screen }
+$started = [DateTimeOffset]::Now.AddSeconds(-5)
+$script:DaemonPendingLaunch = [pscustomobject]@{
+    SessionId = ''; Launcher = 'codex'; ProcessId = $PID; Label = 'repo'; Verb = 'Started'; Since = $started
+    LastCheck = [DateTimeOffset]::MinValue; TrustAskedAt = $null; TrustConfirmed = $false; TrustAnswers = 0
+    AwaitingFirstMessage = $false; FirstMessageAsked = $false
+}
+Update-DaemonPendingLaunch -Headers @{}
+Test-That 'the card says what the window is asking, within seconds' { ($script:Notes -join '|') -match "Codex in repo is asking you to trust the bridge's hooks" } ($script:Notes -join '|')
+$script:DaemonPendingLaunch.Since = [DateTimeOffset]::Now.AddMinutes(-5)
+$script:DaemonPendingLaunch.LastCheck = [DateTimeOffset]::MinValue
+Update-DaemonPendingLaunch -Headers @{}
+Test-That 'and the launch waits for an answer past the usual 90 s' { $null -ne $script:DaemonPendingLaunch }
+$script:DaemonPendingLaunch.BlockedAt = [DateTimeOffset]::Now.AddMinutes(-11)
+$script:DaemonPendingLaunch.LastCheck = [DateTimeOffset]::MinValue
+Update-DaemonPendingLaunch -Headers @{}
+Test-That 'but not forever' { $null -eq $script:DaemonPendingLaunch -and $script:Notes[-1] -match 'still waiting on a question in its window' }
+
 Remove-Item -LiteralPath $script:DaemonConfig.LogFile -Force -ErrorAction SilentlyContinue
 Write-Host ''
 if ($script:Failures) {

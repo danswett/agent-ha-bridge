@@ -455,6 +455,9 @@ function Find-BridgeUnixCommand {
 #   ChoosesOwnSessionId it picks its session id, so none is invented for it (Codex)
 #   NeedsFirstMessage   it only registers once sent a first message (Codex)
 #   AnswersTrustPrompt  it asks whether to trust a new folder on start (Claude)
+#   BlockingPrompt      given the launched window's screen, the note to show when the
+#                       agent is stuck on a question only its window can answer (Codex's
+#                       hook review), or $null
 $script:BridgeLaunchers = [ordered]@{
     agency = @{
         Label = 'Agency'; Kind = 'copilot'
@@ -551,6 +554,16 @@ $script:BridgeLaunchers = [ordered]@{
         }
         ChoosesOwnSessionId = $true
         NeedsFirstMessage = $true
+        # Codex asks, in its window, for the bridge's hooks to be trusted - once, and
+        # again whenever they change (1.12.0 changed them). Until someone answers, no
+        # hook runs and the session never registers, so the dashboard says so.
+        BlockingPrompt = {
+            param([string]$Screen)
+            if ($Screen -match 'Hooks need review') {
+                return "Codex in {0} is asking you to trust the bridge's hooks - it asks once after they change. Choose 'Trust all and continue' in its window, and it appears here."
+            }
+            $null
+        }
     }
 }
 
@@ -561,6 +574,7 @@ function Get-BridgeLauncher {
     $entry = @{
         Label = $Launcher; Kind = $Launcher; Path = $null; Usage = $null; Resumable = $null; ResumeOrder = 99; Arguments = $null
         RegistrationFiles = $null; ChoosesOwnSessionId = $false; NeedsFirstMessage = $false; AnswersTrustPrompt = $false
+        BlockingPrompt = $null
     }
     if ($Launcher -and $script:BridgeLaunchers.Contains($Launcher)) {
         $own = $script:BridgeLaunchers[$Launcher]
