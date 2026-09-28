@@ -173,6 +173,93 @@ func TestIgnoresWhatTheScriptWouldIgnore(t *testing.T) {
 	}
 }
 
+func readLog(t *testing.T, temp string) []outcomeLine {
+	t.Helper()
+	body, err := os.ReadFile(filepath.Join(temp, logName))
+	if err != nil {
+		return nil
+	}
+	var lines []outcomeLine
+	for _, raw := range strings.Split(strings.TrimSpace(string(body)), "\n") {
+		var line outcomeLine
+		if err := json.Unmarshal([]byte(raw), &line); err != nil {
+			t.Fatalf("log line %q is not JSON: %v", raw, err)
+		}
+		lines = append(lines, line)
+	}
+	return lines
+}
+
+func TestRecordsEveryPath(t *testing.T) {
+	cases := []struct {
+		name         string
+		heartbeatAge time.Duration
+		env          string
+		args         []string
+		stdin        string
+		fallbackErr  error
+		breakSpool   bool
+		wantPath     string
+		wantReason   string
+	}{
+		{name: "spooled", heartbeatAge: 0, args: []string{"claude", "stop", "s.ps1"}, stdin: `{}`, wantPath: "spool"},
+		{name: "no heartbeat", heartbeatAge: -1, args: []string{"claude", "stop", "s.ps1"}, stdin: `{}`, wantPath: "fallback", wantReason: "no daemon heartbeat"},
+		{name: "stale heartbeat", heartbeatAge: 5 * time.Minute, args: []string{"codex", "hook", "s.ps1"}, stdin: `{}`, wantPath: "fallback", wantReason: "daemon heartbeat 300s old"},
+		{name: "override", heartbeatAge: 0, env: "1", args: []string{"claude", "stop", "s.ps1"}, stdin: `{}`, wantPath: "fallback", wantReason: "AGENT_BRIDGE_HOOKS_PUBLISH set"},
+		{name: "fallback fails", heartbeatAge: -1, args: []string{"claude", "stop", "s.ps1"}, stdin: `{}`, fallbackErr: errors.New("no pwsh"), wantPath: "reply", wantReason: "no daemon heartbeat; fallback failed: no pwsh"},
+		{name: "no fallback script", heartbeatAge: -1, args: []string{"copilot", "permission"}, stdin: `{}`, wantPath: "reply", wantReason: "no daemon heartbeat"},
+		{name: "unusable event", heartbeatAge: 0, args: []string{"claude", "stop", "s.ps1"}, stdin: `not json`, wantPath: "reply", wantReason: "unusable event"},
+		{name: "spool fails", heartbeatAge: 0, args: []string{"claude", "stop", "s.ps1"}, stdin: `{}`, breakSpool: true, wantPath: "fallback", wantReason: "spool failed: "},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			temp, _ := setup(t, c.heartbeatAge)
+			t.Setenv("AGENT_BRIDGE_HOOKS_PUBLISH", c.env)
+			if c.fallbackErr != nil {
+				runFallback = func(string, []byte, io.Writer) error { return c.fallbackErr }
+			}
+			if c.breakSpool {
+				// A file where the spool folder should be.
+				os.WriteFile(filepath.Join(temp, "agent-bridge-spool"), []byte("x"), 0o600)
+			}
+			invoke(c.args, c.stdin)
+			lines := readLog(t, temp)
+			if len(lines) != 1 {
+				t.Fatalf("log has %d lines, want 1", len(lines))
+			}
+			got := lines[0]
+			if got.Path != c.wantPath || !strings.HasPrefix(got.Reason, c.wantReason) || (c.wantReason == "" && got.Reason != "") {
+				t.Errorf("recorded path=%q reason=%q, want path=%q reason starting %q", got.Path, got.Reason, c.wantPath, c.wantReason)
+			}
+			if got.Agent != c.args[0] || got.Hook != c.args[1] || got.At == "" || got.Ms < 0 {
+				t.Errorf("recorded %+v", got)
+			}
+		})
+	}
+}
+
+func TestRecordsNothingForUnknownHooks(t *testing.T) {
+	temp, _ := setup(t, 0)
+	invoke([]string{"gemini", "stop"}, `{}`)
+	invoke([]string{"--version"}, ``)
+	if lines := readLog(t, temp); len(lines) != 0 {
+		t.Errorf("logged %v", lines)
+	}
+}
+
+func TestLogRotatesAtAMegabyte(t *testing.T) {
+	temp, _ := setup(t, 0)
+	path := filepath.Join(temp, logName)
+	os.WriteFile(path, bytes.Repeat([]byte("x"), logMaxBytes), 0o600)
+	invoke([]string{"claude", "stop"}, `{}`)
+	if info, err := os.Stat(path + ".1"); err != nil || info.Size() != logMaxBytes {
+		t.Fatalf("the full log was not kept as %s.1", logName)
+	}
+	if lines := readLog(t, temp); len(lines) != 1 {
+		t.Errorf("new log has %d lines, want 1", len(lines))
+	}
+}
+
 func TestVersion(t *testing.T) {
 	if got := invoke([]string{"--version"}, ""); strings.TrimSpace(got) != version {
 		t.Errorf("--version printed %q", got)

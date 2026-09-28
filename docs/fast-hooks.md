@@ -233,11 +233,13 @@ program. So:
 - [x] **R5. DASDESK leftovers**: the portable Go (the user approved the machine-wide one),
   its zip, and test folders in %TEMP%. Keep the settings backups for now.
 - [x] **R6. test-dashboard.ps1 writes into the real bridge log**; point it at a temp log.
-- [ ] **R8. Measure fallbacks** (asked by the user). The native hook appends one line per
+- [x] **R8. Measure fallbacks** (asked by the user). The native hook appends one line per
   run to `%TEMP%\agent-bridge-hook.log` (JSON: at, agent, hook, path = spool | fallback |
   reply, reason, ms), rotated at 1 MB; `Get-BridgeHookStats` summarises a window
   (total, fallback rate, by reason, median ms). Tests: Go per path, the end-to-end
-  counts, the summary.
+  counts, the summary. *Done:* `agent-ha-bridge status` shows it (`hooks : native (v) - N
+  runs in the last 24 h, M not spooled (x%): reasons; median ms`). A fallback whose script
+  also failed is its own reason (`...; fallback failed`): the agent got no bridge at all.
 - [ ] **R7. VERSION 1.12.0, release, verify the assets attached.**
 
 ## Resuming

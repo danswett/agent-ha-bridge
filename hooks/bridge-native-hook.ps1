@@ -65,6 +65,88 @@ function Get-BridgeNativeHookPath {
     $null
 }
 
+function Get-BridgeHookStats {
+    <#
+        How the native hook has been doing: from the line it logs for every run
+        (%TEMP%\agent-bridge-hook.log, and the rotated .1), over the last $Hours.
+
+        A run's path is `spool` (handed to the daemon - the fast path), `fallback` (the
+        PowerShell hook ran instead) or `reply` (neither: the fixed reply alone, e.g. an
+        event the hook could not use). NotSpooled / Total is the fallback rate; ByReason
+        says why, with numbers in reasons folded together ("daemon heartbeat Ns old").
+    #>
+    param(
+        [double]$Hours = 24,
+        [string]$LogPath = (Join-Path $env:TEMP 'agent-bridge-hook.log'),
+        [DateTimeOffset]$Now = [DateTimeOffset]::Now
+    )
+
+    $since = $Now.AddHours(-$Hours)
+    $runs = [System.Collections.Generic.List[object]]::new()
+    foreach ($path in @("$LogPath.1", $LogPath)) {
+        if (-not [IO.File]::Exists($path)) { continue }
+        foreach ($line in [IO.File]::ReadLines($path)) {
+            if ([string]::IsNullOrWhiteSpace($line)) { continue }
+            try { $run = $line | ConvertFrom-Json } catch { continue }
+            $at = [DateTimeOffset]::MinValue
+            if (-not $run.PSObject.Properties['at'] -or -not [DateTimeOffset]::TryParse([string]$run.at, [ref]$at) -or $at -lt $since -or $at -gt $Now) { continue }
+            $runs.Add($run)
+        }
+    }
+
+    $count = { param($Path) @($runs | Where-Object { [string]$_.path -eq $Path }).Count }
+    $percentile = { param([object[]]$Values, [double]$P)
+        $sorted = @($Values | Sort-Object)
+        if ($sorted.Count -eq 0) { return $null }
+        $sorted[[int][Math]::Min($sorted.Count - 1, [Math]::Floor($P * $sorted.Count))]
+    }
+    $notSpooled = @($runs | Where-Object { [string]$_.path -ne 'spool' })
+    $byReason = [ordered]@{}
+    foreach ($group in ($notSpooled | Group-Object { (([string]$_.reason -split ':')[0] -replace '\d+', 'N').Trim() } | Sort-Object Count -Descending)) {
+        $byReason[$(if ($group.Name) { $group.Name } else { '(none)' })] = $group.Count
+    }
+    $byHook = [ordered]@{}
+    foreach ($group in ($runs | Group-Object { "$($_.agent)/$($_.hook)" } | Sort-Object Name)) {
+        $byHook[$group.Name] = [pscustomobject]@{
+            Total = $group.Count
+            NotSpooled = @($group.Group | Where-Object { [string]$_.path -ne 'spool' }).Count
+        }
+    }
+    $allMs = @($runs | ForEach-Object { [double]$_.ms })
+    $spoolMs = @($runs | Where-Object { [string]$_.path -eq 'spool' } | ForEach-Object { [double]$_.ms })
+    $fallbackMs = @($runs | Where-Object { [string]$_.path -eq 'fallback' } | ForEach-Object { [double]$_.ms })
+
+    [pscustomobject]@{
+        Since = $since
+        Total = $runs.Count
+        Spooled = & $count 'spool'
+        Fallback = & $count 'fallback'
+        ReplyOnly = & $count 'reply'
+        NotSpooled = $notSpooled.Count
+        FallbackRate = if ($runs.Count) { [Math]::Round($notSpooled.Count / $runs.Count, 4) } else { 0 }
+        ByReason = $byReason
+        ByHook = $byHook
+        MedianMs = & $percentile $allMs 0.5
+        P95Ms = & $percentile $allMs 0.95
+        SpoolMedianMs = & $percentile $spoolMs 0.5
+        FallbackMedianMs = & $percentile $fallbackMs 0.5
+    }
+}
+
+function Format-BridgeHookStats {
+    <# One line for `agent-ha-bridge status`: runs, how many fell back and why, typical wait. #>
+    param([Parameter(Mandatory)]$Stats, [double]$Hours = 24)
+
+    if ($Stats.Total -eq 0) { return "no runs in the last $Hours h" }
+    $text = "$($Stats.Total) runs in the last $Hours h, $($Stats.NotSpooled) not spooled ($([Math]::Round(100 * $Stats.FallbackRate, 1))%)"
+    if ($Stats.NotSpooled) {
+        $text += ': ' + (@($Stats.ByReason.GetEnumerator() | ForEach-Object { "$($_.Key) x$($_.Value)" }) -join ', ')
+    }
+    $text += "; median $($Stats.MedianMs) ms"
+    if ($null -ne $Stats.FallbackMedianMs) { $text += " (fallbacks $($Stats.FallbackMedianMs) ms)" }
+    $text
+}
+
 # The oldest Copilot CLI seen to run an `exec` hook (a program with no shell): 1.0.88,
 # on DASDESK, 2026-09-27. The docs give no minimum, and an older CLI that did not know
 # `exec` could drop the hook - so older ones keep their PowerShell hooks.

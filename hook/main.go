@@ -95,27 +95,48 @@ func run(args []string, stdin io.Reader, stdout io.Writer, now time.Time) (code 
 	event, _ := io.ReadAll(io.LimitReader(stdin, maxEventBytes))
 	temp := tempDir()
 
-	if !daemonAlive(temp, now) {
-		if fallback != "" && runFallback(fallback, event, stdout) == nil {
-			return 0
+	// Every run from here is recorded (record), so how often the PowerShell path is
+	// taken, and why, can be measured (Get-BridgeHookStats).
+	outcome := outcomeLine{Agent: args[0], Hook: args[1]}
+	defer func() { record(temp, outcome, now) }()
+
+	// fallBack runs the PowerShell hook, or - when there is none, or it fails - prints
+	// the fixed reply, and notes which.
+	fallBack := func(reason string) {
+		outcome.Reason = reason
+		if fallback == "" {
+			outcome.Path = "reply"
+			io.WriteString(stdout, reply)
+			return
 		}
-		io.WriteString(stdout, reply)
+		if err := runFallback(fallback, event, stdout); err != nil {
+			outcome.Path = "reply"
+			outcome.Reason = reason + "; fallback failed: " + err.Error()
+			io.WriteString(stdout, reply)
+			return
+		}
+		outcome.Path = "fallback"
+	}
+
+	if alive, why := daemonState(temp, now); !alive {
+		fallBack(why)
 		return 0
 	}
 
 	// An event the PowerShell hook could not parse either: it would do nothing.
 	trimmed := bytes.TrimSpace(event)
 	if len(trimmed) == 0 || !json.Valid(trimmed) {
+		outcome.Path, outcome.Reason = "reply", "unusable event"
 		io.WriteString(stdout, reply)
 		return 0
 	}
 
 	if err := spool(temp, args[0], args[1], trimmed, ancestry(os.Getppid(), maxAncestors), now); err != nil {
 		// The daemon cannot be reached this way; the PowerShell hook still works.
-		if fallback != "" && runFallback(fallback, event, stdout) == nil {
-			return 0
-		}
+		fallBack("spool failed: " + err.Error())
+		return 0
 	}
+	outcome.Path = "spool"
 	io.WriteString(stdout, reply)
 	return 0
 }
@@ -130,17 +151,63 @@ func tempDir() string {
 	return strings.TrimRight(os.TempDir(), "/")
 }
 
-// daemonAlive mirrors Test-BridgeDaemonAlive.
-func daemonAlive(temp string, now time.Time) bool {
+// daemonState mirrors Test-BridgeDaemonAlive, and says why the daemon does not count
+// as running when it does not.
+func daemonState(temp string, now time.Time) (bool, string) {
 	// Hooks publish for themselves under this, for tests beside a running daemon.
 	if os.Getenv("AGENT_BRIDGE_HOOKS_PUBLISH") != "" {
-		return false
+		return false, "AGENT_BRIDGE_HOOKS_PUBLISH set"
 	}
 	info, err := os.Stat(filepath.Join(temp, "agent-bridge-daemon.heartbeat"))
 	if err != nil {
-		return false
+		return false, "no daemon heartbeat"
 	}
-	return now.Sub(info.ModTime()) < heartbeatMaxAge
+	if age := now.Sub(info.ModTime()); age >= heartbeatMaxAge {
+		return false, fmt.Sprintf("daemon heartbeat %ds old", int(age.Seconds()))
+	}
+	return true, ""
+}
+
+// The record of one run, one JSON line in agent-bridge-hook.log. Path is spool (the
+// daemon does the work), fallback (the PowerShell hook ran) or reply (neither: the
+// fixed reply alone); Reason says why it was not spool.
+type outcomeLine struct {
+	At     string `json:"at"`
+	Agent  string `json:"agent"`
+	Hook   string `json:"hook"`
+	Path   string `json:"path"`
+	Reason string `json:"reason,omitempty"`
+	Ms     int64  `json:"ms"`
+}
+
+// When this process started, for how long the agent waited on it.
+var started = time.Now()
+
+const (
+	logName     = "agent-bridge-hook.log"
+	logMaxBytes = 1 << 20
+)
+
+// record appends the outcome to the log, keeping one previous log once it reaches a
+// megabyte. Best effort: a hook never fails for want of a log line.
+func record(temp string, outcome outcomeLine, now time.Time) {
+	defer func() { recover() }()
+	outcome.At = now.Format(time.RFC3339Nano)
+	outcome.Ms = time.Since(started).Milliseconds()
+	line, err := json.Marshal(outcome)
+	if err != nil {
+		return
+	}
+	path := filepath.Join(temp, logName)
+	if info, err := os.Stat(path); err == nil && info.Size() >= logMaxBytes {
+		os.Rename(path, path+".1")
+	}
+	file, err := os.OpenFile(path, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0o600)
+	if err != nil {
+		return
+	}
+	defer file.Close()
+	file.Write(append(line, '\n'))
 }
 
 type spooled struct {

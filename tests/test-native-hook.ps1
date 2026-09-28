@@ -89,6 +89,19 @@ try {
     $reply = '{"toolArgs":{}}' | & $binary copilot ask_user (Join-Path $temp 'no-such-script.ps1')
     Test-That 'a Copilot reply survives a fallback that cannot run' { ($reply | Out-String).Trim() -eq '{"permissionDecision":"allow"}' }
     Test-That 'and the hook always exits 0' { $LASTEXITCODE -eq 0 }
+
+    Write-Host '--- measuring it ---'
+    . (Join-Path $PSScriptRoot '..\hooks\bridge-native-hook.ps1')
+    $stats = Get-BridgeHookStats -LogPath (Join-Path $temp 'agent-bridge-hook.log') -Hours 1
+    Test-That 'every run is logged' { $stats.Total -eq 7 } "total $($stats.Total)"
+    Test-That 'the five with the daemon running were spooled' { $stats.Spooled -eq 5 }
+    Test-That 'the one with it stopped fell back to PowerShell, for that reason' {
+        $stats.Fallback -eq 1 -and $stats.ByReason['daemon heartbeat Ns old'] -eq 1 -and
+        # A fallback that could not run is counted apart: the agent got no bridge at all.
+        $stats.ByReason['daemon heartbeat Ns old; fallback failed'] -eq 1
+    } (($stats.ByReason.GetEnumerator() | ForEach-Object { "$($_.Key)=$($_.Value)" }) -join ', ')
+    Test-That 'and the one whose fallback could not run gave the fixed reply' { $stats.ReplyOnly -eq 1 }
+    Test-That 'the spooled runs are the fast ones' { $stats.SpoolMedianMs -lt $stats.FallbackMedianMs } "spool $($stats.SpoolMedianMs) ms, fallback $($stats.FallbackMedianMs) ms"
 }
 finally {
     $env:TEMP = $savedTemp

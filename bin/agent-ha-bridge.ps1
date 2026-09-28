@@ -208,6 +208,20 @@ function Show-Status {
         Write-Host "    daemon     : the '$taskName' scheduled task is not registered" -ForegroundColor Yellow
     }
 
+    # The native hook (docs/fast-hooks.md), and how often it has fallen back to PowerShell.
+    $nativeLib = Join-Path (Join-Path $root 'hooks') 'bridge-native-hook.ps1'
+    if (Test-Path -LiteralPath $nativeLib) {
+        . $nativeLib
+        $nativePath = Get-BridgeNativeHookPath -BridgeHome $bridgeHome
+        if ($nativePath) {
+            $nativeVersion = (& $nativePath --version 2>$null | Out-String).Trim()
+            Write-Host "    hooks      : native ($nativeVersion) - $(Format-BridgeHookStats -Stats (Get-BridgeHookStats -Hours 24) -Hours 24)"
+        }
+        else {
+            Write-Host '    hooks      : PowerShell - the native hook is not installed (agent-ha-bridge update fetches it)' -ForegroundColor Yellow
+        }
+    }
+
     $base = ([string]$config.homeAssistant.baseUrl).TrimEnd('/')
     $token = [string]$config.homeAssistant.token
     if (-not $token -and $config.homeAssistant.tokenEnvVar) {
