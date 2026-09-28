@@ -234,13 +234,14 @@ function Get-LiveMcpSessions {
 }
 
 function Get-LiveBridgeSessions {
-    <# Every live session across the front ends the bridge supports. #>
-    $live = Get-LiveCopilotSessions
-    foreach ($entry in (Get-LiveClaudeSessions).GetEnumerator()) {
-        $live[$entry.Key] = $entry.Value
-    }
-    foreach ($entry in (Get-LiveCodexSessions).GetEnumerator()) {
-        $live[$entry.Key] = $entry.Value
+    <# Every live session across the front ends the bridge supports (see daemon-agents.ps1). #>
+    $live = @{}
+    foreach ($kind in @($script:DaemonAgents.Keys)) {
+        $find = (Get-DaemonAgent -Kind $kind).FindSessions
+        if (-not $find) { continue }
+        foreach ($entry in (& $find).GetEnumerator()) {
+            $live[$entry.Key] = $entry.Value
+        }
     }
     $live
 }
@@ -286,13 +287,7 @@ function Get-BridgeSessionDisplay {
         [string]$WorkingDirectory = 'Unknown folder'
     )
 
-    if ($Kind -eq 'claude' -and $script:ClaudeAdapterLoaded) {
-        return Get-ClaudeSessionDisplay -SessionId $SessionId -WorkingDirectory $WorkingDirectory
-    }
-    if ($Kind -eq 'codex' -and $script:CodexAdapterLoaded) {
-        return Get-CodexSessionDisplay -SessionId $SessionId -WorkingDirectory $WorkingDirectory
-    }
-    Get-CopilotSessionDisplay -SessionId $SessionId -WorkingDirectory $WorkingDirectory
+    & (Get-DaemonAgent -Kind $Kind).Display $SessionId $WorkingDirectory
 }
 
 function Get-DaemonSessionProcessId {
@@ -303,7 +298,7 @@ function Get-DaemonSessionProcessId {
     param([Parameter(Mandatory)][string]$SessionId)
 
     $known = if ($script:DaemonLive) { $script:DaemonLive[$SessionId] } else { $null }
-    if ($null -ne $known -and $known.PSObject.Properties['Kind'] -and [string]$known.Kind -in @('claude', 'codex') -and
+    if ($null -ne $known -and $known.PSObject.Properties['Kind'] -and (Get-DaemonAgent -Kind ([string]$known.Kind)).KnowsProcessId -and
         $known.PSObject.Properties['ProcessId'] -and [int]$known.ProcessId -gt 0) {
         return [int]$known.ProcessId
     }

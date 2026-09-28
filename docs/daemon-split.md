@@ -100,8 +100,10 @@ after the Claude and Codex checks, so the table has to name it outright.
   `tests/test-daemon-agents.ps1`. *Done.* Gotchas: `Get-DaemonAgent` must return every
   slot and flag (strict mode throws on a missing hashtable key); an unlisted kind
   (`mcp`) gets Copilot's slots but no flags, since the old checks named Copilot.
-- [ ] **B. Discovery** (`daemon-discovery.ps1`). Slots: `FindSessions`,
+- [x] **B. Discovery** (`daemon-discovery.ps1`). Slots: `FindSessions`,
   `Display`; flag `KnowsProcessId`. `Get-LiveBridgeSessions` loops the table.
+  *Done.* Tests in `test-daemon-agents.ps1` stub `Get-BridgeSessionDisplay` for the
+  reconcile checks, so the display checks ask the table directly.
 - [ ] **C. Decisions and replies**. Claude's question parser, Codex approvals,
   Claude's reply confirmation.
 - [ ] **D. Launch** (`session-launch.ps1`, `daemon-launch.ps1`). Arguments,

@@ -6,6 +6,8 @@
     for each agent by name. A new agent is a new entry here.
 
     Slots (script blocks) and flags:
+      FindSessions      its live sessions, keyed by id
+      Display           a session's name and machine, for its card
       ReadAppend        transcript lines written since an offset
       Activity          what those lines say, for the card
       IsWorking         whether a session is busy when first seen
@@ -15,9 +17,11 @@
       HookStatus        its hooks record the status, which is authoritative
       InlineReasoning   the card shows its thinking inline, newest line of either kind
       RefreshName       its name is re-resolved until it carries the harness prefix
+      KnowsProcessId    its live sessions carry the owning process id (Copilot's
+                        injector finds the process by its lock file instead)
 
     Copilot is the default: a slot an entry leaves out, or a kind that is blank or not
-    listed, gets Copilot's ReadAppend, Activity and IsWorking. That is what the old
+    listed, gets Copilot's Display, ReadAppend, Activity and IsWorking. That is what the old
     `else` branches did. Flags are never inherited.
     An entry whose adapter is optional checks that it loaded and falls back the way
     those branches did.
@@ -30,6 +34,8 @@
 
 $script:DaemonAgents = [ordered]@{
     copilot = @{
+        FindSessions = { Get-LiveCopilotSessions }
+        Display = { param($SessionId, $WorkingDirectory) Get-CopilotSessionDisplay -SessionId $SessionId -WorkingDirectory $WorkingDirectory }
         ReadAppend = { param($Path, $Offset) Read-TranscriptAppend -Path $Path -Offset $Offset }
         Activity = { param($Lines, $VerboseMode) Get-ActivityFromEvents -Lines $Lines -VerboseMode $VerboseMode }
         IsWorking = { param($SessionId, $Transcript, $Status) Test-CopilotSessionWorking -SessionId $SessionId }
@@ -37,6 +43,12 @@ $script:DaemonAgents = [ordered]@{
     }
 
     claude = @{
+        FindSessions = { Get-LiveClaudeSessions }
+        Display = {
+            param($SessionId, $WorkingDirectory)
+            if (-not $script:ClaudeAdapterLoaded) { return Get-CopilotSessionDisplay -SessionId $SessionId -WorkingDirectory $WorkingDirectory }
+            Get-ClaudeSessionDisplay -SessionId $SessionId -WorkingDirectory $WorkingDirectory
+        }
         ReadAppend = {
             param($Path, $Offset)
             if (-not $script:ClaudeAdapterLoaded) { return Read-TranscriptAppend -Path $Path -Offset $Offset }
@@ -82,9 +94,17 @@ $script:DaemonAgents = [ordered]@{
         }
         HookStatus = $true
         InlineReasoning = $true
+        KnowsProcessId = $true
     }
 
     codex = @{
+        FindSessions = { Get-LiveCodexSessions }
+        Display = {
+            param($SessionId, $WorkingDirectory)
+            if (-not $script:CodexAdapterLoaded) { return Get-CopilotSessionDisplay -SessionId $SessionId -WorkingDirectory $WorkingDirectory }
+            Get-CodexSessionDisplay -SessionId $SessionId -WorkingDirectory $WorkingDirectory
+        }
+        KnowsProcessId = $true
         # Codex reports its own status: a turn begins at UserPromptSubmit and ends at
         # Stop, both of which the hook records, so there is nothing to infer.
         IsWorking = { param($SessionId, $Transcript, $Status) $Status -eq 'working' }
@@ -121,10 +141,10 @@ function Get-DaemonAgent {
     $own = if ($script:DaemonAgents.Contains($Kind)) { $script:DaemonAgents[$Kind] } else { @{} }
     # Every slot and flag is present, so callers can test one under strict mode.
     $agent = @{
-        PollRegistration = $null; FastActivity = $null; KnownActivity = $null
-        HookStatus = $false; InlineReasoning = $false; RefreshName = $false
+        FindSessions = $null; PollRegistration = $null; FastActivity = $null; KnownActivity = $null
+        HookStatus = $false; InlineReasoning = $false; RefreshName = $false; KnowsProcessId = $false
     }
-    foreach ($slot in 'ReadAppend', 'Activity', 'IsWorking') { $agent[$slot] = $default[$slot] }
+    foreach ($slot in 'Display', 'ReadAppend', 'Activity', 'IsWorking') { $agent[$slot] = $default[$slot] }
     foreach ($slot in $own.Keys) { $agent[$slot] = $own[$slot] }
     $agent
 }

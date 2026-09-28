@@ -141,6 +141,36 @@ $script:Named = $false
 $null = Get-Routed { Update-DaemonKnownSession -Session ([pscustomobject]@{ SessionId = '33333333-0000-4000-8000-000000000003' }) -Entry ([pscustomobject]@{ Kind = 'mcp'; Name = 'Cursor'; Status = 'idle'; Machine = 'M' }) -Headers @{} -VerboseOn $true }
 Test-That 'an unlisted kind''s name is left as it is' { -not $script:Named }
 
+Write-Host '--- discovery ---'
+function Get-LiveCopilotSessions { @{ a = [pscustomobject]@{ Kind = 'copilot'; Who = 'copilot' }; shared = [pscustomobject]@{ Who = 'copilot' } } }
+function Get-LiveClaudeSessions { @{ b = [pscustomobject]@{ Kind = 'claude'; Who = 'claude' }; shared = [pscustomobject]@{ Who = 'claude' } } }
+function Get-LiveCodexSessions { @{ c = [pscustomobject]@{ Kind = 'codex'; Who = 'codex' } } }
+$found = Get-LiveBridgeSessions
+Test-That 'every agent''s sessions are found' { (@($found.Keys | Sort-Object) -join ',') -eq 'a,b,c,shared' }
+Test-That 'a later agent wins an id clash, as Claude over Copilot did' { $found.shared.Who -eq 'claude' }
+
+function Get-CopilotSessionDisplay { param($SessionId, $WorkingDirectory) 'copilot-name' }
+function Get-ClaudeSessionDisplay { param($SessionId, $WorkingDirectory) 'claude-name' }
+function Get-CodexSessionDisplay { param($SessionId, $WorkingDirectory) 'codex-name' }
+$script:ClaudeAdapterLoaded = $true; $script:CodexAdapterLoaded = $true
+# Get-BridgeSessionDisplay is stubbed above for the reconcile, so the table is asked directly.
+function Get-Display { param([string]$Kind) & (Get-DaemonAgent -Kind $Kind).Display 's' 'dir' }
+Test-That 'each agent names its own sessions' {
+    (Get-Display 'claude') -eq 'claude-name' -and (Get-Display 'codex') -eq 'codex-name' -and
+    (Get-Display 'copilot') -eq 'copilot-name' -and (Get-Display 'mcp') -eq 'copilot-name'
+}
+$script:CodexAdapterLoaded = $false
+Test-That 'Codex without its adapter is named as Copilot names it, as before' { (Get-Display 'codex') -eq 'copilot-name' }
+
+$script:DaemonLive = @{
+    b = [pscustomobject]@{ Kind = 'claude'; ProcessId = 11 }
+    c = [pscustomobject]@{ Kind = 'codex'; ProcessId = 22 }
+    a = [pscustomobject]@{ Kind = 'copilot'; ProcessId = 33 }
+    m = [pscustomobject]@{ Kind = 'mcp'; ProcessId = 44 }
+}
+Test-That 'Claude and Codex sessions give their process' { (Get-DaemonSessionProcessId -SessionId 'b') -eq 11 -and (Get-DaemonSessionProcessId -SessionId 'c') -eq 22 }
+Test-That 'Copilot and others leave it to the lock file' { (Get-DaemonSessionProcessId -SessionId 'a') -eq 0 -and (Get-DaemonSessionProcessId -SessionId 'm') -eq 0 }
+
 Remove-Item -LiteralPath $script:DaemonConfig.LogFile -Force -ErrorAction SilentlyContinue
 Write-Host ''
 if ($script:Failures) {
