@@ -73,6 +73,10 @@ Test-That 'the Copilot CLI is the published npm package' {
 # every `npm install -g` died with EACCES - and the advice printed afterwards was the
 # same command that had just failed.
 $script:BridgeNpmNeedsSudo = $true
+# Pinned to a MacPorts layout: elevating only happens on macOS, so asserting against
+# whatever npm path this machine has would describe a command that can never be built.
+$realNpmPath = ${function:Get-BridgeNpmPath}
+function Get-BridgeNpmPath { '/opt/local/bin/npm' }
 Test-That 'an npm folder this user cannot write to is installed into with sudo' {
     $cmd = Get-BridgeDependencyCommand -Name 'copilot'
     $cmd -like 'sudo -H *' -and $cmd -like '* install -g @github/copilot'
@@ -83,13 +87,20 @@ Test-That 'and -H, so npm does not leave root-owned files in the user''s own cac
 # `sudo npm` answers "sudo: npm: command not found" on a MacPorts Mac: sudo replaces
 # PATH with one that has no /opt/local/bin, so only an absolute path survives.
 Test-That 'npm is named by the path that survives sudo dropping PATH' {
-    $cmd = Get-BridgeDependencyCommand -Name 'codex'
-    (($cmd -replace '^sudo -H ', '') -replace ' install -g .*$', '') -eq (Get-BridgeNpmPath)
+    (Get-BridgeDependencyCommand -Name 'codex') -match '\s/opt/local/bin/npm install -g @openai/codex$'
 } (Get-BridgeDependencyCommand -Name 'codex')
-Test-That 'and that path is absolute wherever npm is really installed' {
-    -not (Get-Command npm -CommandType Application -ErrorAction SilentlyContinue) -or
-    (Split-Path -Path (Get-BridgeNpmPath) -IsAbsolute)
-} (Get-BridgeNpmPath)
+# The same reset broke Claude Code, whose postinstall runs `node install.cjs`: npm
+# unpacked it, then the script died with "sh: node: command not found".
+Test-That 'node stays on PATH, for a package whose postinstall shells out to it' {
+    (Get-BridgeDependencyCommand -Name 'claude') -match '^sudo -H env PATH=/opt/local/bin:'
+} (Get-BridgeDependencyCommand -Name 'claude')
+Test-That 'and that PATH still has the system folders sudo would have given it' {
+    (Get-BridgeDependencyCommand -Name 'claude') -match 'PATH=\S*:/usr/bin:/bin:'
+}
+Test-That 'the folder is split POSIX-style, not with this host''s separator' {
+    (Get-BridgeDependencyCommand -Name 'claude') -notmatch '\\'
+}
+${function:Get-BridgeNpmPath} = $realNpmPath
 $script:BridgeNpmNeedsSudo = $false
 Test-That 'a writable one is installed into as this user, with no sudo at all' {
     (Get-BridgeDependencyCommand -Name 'codex') -eq 'npm install -g @openai/codex'

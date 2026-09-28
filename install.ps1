@@ -304,10 +304,21 @@ function Get-BridgeDependencyCommand {
                     '--accept-package-agreements --accept-source-agreements')
         }
         'npm' {
-            # -H so npm caches as root rather than leaving root-owned files in the
-            # user's own ~/.npm, which would break their next unelevated npm; and npm
-            # by full path, because sudo drops the PATH that found it.
-            if (Test-BridgeNpmNeedsSudo) { return "sudo -H $(Get-BridgeNpmPath) install -g $($dep.Package)" }
+            if (Test-BridgeNpmNeedsSudo) {
+                $npm = Get-BridgeNpmPath
+                # Elevating only ever happens on macOS, where this path is POSIX, so the
+                # folder is taken by splitting on '/': Split-Path would answer with the
+                # host's own separator instead.
+                $binDir = if ($npm -match '^(.*)/[^/]+$') { $Matches[1] } else { '/usr/local/bin' }
+                # -H so npm caches as root rather than leaving root-owned files in the
+                # user's own ~/.npm, which would break their next unelevated npm; npm by
+                # full path, because sudo drops the PATH that found it; and `env PATH=`
+                # carrying node's own folder, because a package whose postinstall shells
+                # out to node - Claude Code's runs `node install.cjs` - otherwise fails
+                # with "sh: node: command not found" after npm has already unpacked it.
+                return ("sudo -H env PATH=${binDir}:/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin " +
+                        "$npm install -g $($dep.Package)")
+            }
             return "npm install -g $($dep.Package)"
         }
         'brew' { return "brew install $($dep.Package)" }
