@@ -525,6 +525,76 @@ Test-That 'none of the interactive runs touched the real user PATH' {
 }
 
 Write-Host ''
+Write-Host '--- the command lands on PATH in a file the shell actually reads ---'
+# On a Mac whose shell is bash, the line went into ~/.zprofile alone - which bash never
+# reads - so `agent-ha-bridge` stayed "command not found" however many terminals were
+# opened. bash reads the FIRST of ~/.bash_profile, ~/.bash_login, ~/.profile.
+function New-ProfileHome {
+    param([string[]]$Existing = @())
+    $dir = Join-Path ([IO.Path]::GetTempPath()) ("bridge-profile-" + [Guid]::NewGuid().ToString('N'))
+    New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    foreach ($name in $Existing) { Set-Content -LiteralPath (Join-Path $dir $name) -Value '# theirs' -Encoding utf8 }
+    $dir
+}
+function Get-Marked {
+    param([string]$Dir)
+    @(Get-ChildItem -LiteralPath $Dir -Force -File |
+        Where-Object { (Get-Content -LiteralPath $_.FullName -Raw) -match 'agent-ha-bridge' } |
+        ForEach-Object { $_.Name } | Sort-Object)
+}
+
+$binDir = '/Users/x/.agent-ha-bridge/bin'
+$zshHome = New-ProfileHome
+[void](Register-BridgeShellPath -Directory $binDir -HomeDir $zshHome -Shell '/bin/zsh')
+Test-That 'a zsh shell gets ~/.zprofile' { (Get-Marked $zshHome) -join ',' -eq '.zprofile' } ((Get-Marked $zshHome) -join ',')
+
+$bashHome = New-ProfileHome
+[void](Register-BridgeShellPath -Directory $binDir -HomeDir $bashHome -Shell '/bin/bash')
+Test-That 'a bash shell with no profile at all gets one bash reads' {
+    (Get-Marked $bashHome) -contains '.bash_profile'
+} ((Get-Marked $bashHome) -join ',')
+
+# Creating ~/.bash_profile here would orphan ~/.profile, where MacPorts puts its own
+# PATH line - bash stops reading it the moment ~/.bash_profile exists.
+$profileHome = New-ProfileHome -Existing @('.profile')
+[void](Register-BridgeShellPath -Directory $binDir -HomeDir $profileHome -Shell '/bin/bash')
+Test-That 'an existing ~/.profile is appended to, not orphaned by a new ~/.bash_profile' {
+    ((Get-Marked $profileHome) -contains '.profile') -and
+    -not (Test-Path -LiteralPath (Join-Path $profileHome '.bash_profile'))
+} ((Get-Marked $profileHome) -join ',')
+Test-That 'and what was already in it is kept' {
+    (Get-Content -LiteralPath (Join-Path $profileHome '.profile') -Raw) -match '# theirs'
+}
+
+$bpHome = New-ProfileHome -Existing @('.bash_profile', '.profile')
+[void](Register-BridgeShellPath -Directory $binDir -HomeDir $bpHome -Shell '/bin/bash')
+Test-That 'the first file bash reads wins, and the others are left alone' {
+    (Get-Marked $bpHome) -join ',' -eq '.bash_profile,.zprofile'
+} ((Get-Marked $bpHome) -join ',')
+
+# A zsh $SHELL but bash files present: someone who switched shells keeps working.
+$mixedHome = New-ProfileHome -Existing @('.bash_profile')
+[void](Register-BridgeShellPath -Directory $binDir -HomeDir $mixedHome -Shell '/bin/zsh')
+Test-That 'an existing bash profile is still covered whatever $SHELL says' {
+    (Get-Marked $mixedHome) -contains '.bash_profile'
+} ((Get-Marked $mixedHome) -join ',')
+
+Test-That 'a re-run does not add the line twice' {
+    $before = (Get-Content -LiteralPath (Join-Path $bashHome '.bash_profile') -Raw)
+    [void](Register-BridgeShellPath -Directory $binDir -HomeDir $bashHome -Shell '/bin/bash')
+    (Get-Content -LiteralPath (Join-Path $bashHome '.bash_profile') -Raw) -eq $before
+}
+Test-That 'and reports that it changed nothing' {
+    -not (Register-BridgeShellPath -Directory $binDir -HomeDir $bashHome -Shell '/bin/bash')
+}
+Test-That 'the line it writes puts the folder first, ahead of anything else' {
+    (Get-Content -LiteralPath (Join-Path $bashHome '.bash_profile') -Raw) -match ([regex]::Escape("export PATH=`"$binDir`:`$PATH`""))
+}
+foreach ($dir in @($zshHome, $bashHome, $profileHome, $bpHome, $mixedHome)) {
+    Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host ''
 if ($script:Failures) {
     Write-Host "$($script:Failures) check(s) failed" -ForegroundColor Red
     exit 1

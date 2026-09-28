@@ -1441,19 +1441,54 @@ function Register-BridgeLaunchAgent {
     [bool](& launchctl print "$domain/$Label" 2>$null)
 }
 
+function Get-BridgeShellProfile {
+    <#
+        The profile files a login shell will actually read, for putting a folder on PATH.
+
+        ~/.zprofile covers zsh, the default since Catalina. bash is the awkward one: it
+        reads the FIRST of ~/.bash_profile, ~/.bash_login and ~/.profile and ignores the
+        rest, so creating ~/.bash_profile when someone only has ~/.profile would orphan
+        whatever is already in it - MacPorts puts its own PATH line there. The one that
+        exists is appended to instead, and a new ~/.bash_profile written only when there
+        is none at all.
+
+        Before this, ~/.bash_profile was written only if it already existed, so anyone
+        whose shell is bash got the line in ~/.zprofile alone - a file bash never reads
+        - and `agent-ha-bridge` stayed "command not found" however many terminals they
+        opened.
+    #>
+    param([string]$HomeDir = $HOME, [AllowEmptyString()][AllowNull()][string]$Shell = $env:SHELL)
+
+    $files = [System.Collections.Generic.List[string]]::new()
+    $files.Add((Join-Path $HomeDir '.zprofile'))
+
+    $usesBash = ([string]$Shell) -match 'bash' -or
+        (Test-Path -LiteralPath (Join-Path $HomeDir '.bash_profile')) -or
+        (Test-Path -LiteralPath (Join-Path $HomeDir '.bash_login'))
+    if ($usesBash) {
+        $first = @('.bash_profile', '.bash_login', '.profile') |
+            ForEach-Object { Join-Path $HomeDir $_ } |
+            Where-Object { Test-Path -LiteralPath $_ } |
+            Select-Object -First 1
+        if (-not $first) { $first = Join-Path $HomeDir '.bash_profile' }
+        $files.Add($first)
+    }
+
+    @($files | Select-Object -Unique)
+}
+
 function Register-BridgeShellPath {
     <#
-        macOS: puts $Directory on PATH for new terminals, through ~/.zprofile (zsh, the
-        default shell) and ~/.bash_profile when it exists. Marked, so a re-run does
+        macOS: puts $Directory on PATH for new terminals, through whichever profile
+        files the login shell reads (Get-BridgeShellProfile). Marked, so a re-run does
         not add it twice and the uninstaller can find it.
     #>
-    param([Parameter(Mandatory)][string]$Directory, [string]$HomeDir = $HOME)
+    param([Parameter(Mandatory)][string]$Directory, [string]$HomeDir = $HOME,
+          [AllowEmptyString()][AllowNull()][string]$Shell = $env:SHELL)
     $marker = '# agent-ha-bridge'
     $line = "export PATH=`"$Directory`:`$PATH`" $marker"
     $changed = $false
-    foreach ($name in @('.zprofile', '.bash_profile')) {
-        $file = Join-Path $HomeDir $name
-        if ($name -ne '.zprofile' -and -not (Test-Path -LiteralPath $file)) { continue }
+    foreach ($file in (Get-BridgeShellProfile -HomeDir $HomeDir -Shell $Shell)) {
         $existing = if (Test-Path -LiteralPath $file) { Get-Content -LiteralPath $file -Raw } else { '' }
         if ($existing -match [regex]::Escape($marker)) { continue }
         Add-Content -LiteralPath $file -Value "`n$line"
