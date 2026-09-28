@@ -595,6 +595,31 @@ foreach ($dir in @($zshHome, $bashHome, $profileHome, $bpHome, $mixedHome)) {
 }
 
 Write-Host ''
+Write-Host '--- launchd is handed a log path it can actually open ---'
+# StandardOutPath under $TMPDIR (/var/folders/<hash>/T) is refused at bootstrap with
+# "Bootstrap failed: 5: Input/output error" - that is launchd's own per-session
+# directory, and the daemon then never starts at all.
+$logHome = Join-Path ([IO.Path]::GetTempPath()) ("bridge-launchd-" + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $logHome -Force | Out-Null
+$logPath = Get-BridgeLaunchAgentLogPath -HomeDir $logHome
+Test-That 'the log goes under ~/Library/Logs, not the temp folder' {
+    $logPath -match 'Library[\\/]Logs[\\/]agent-ha-bridge[\\/]launchd\.log$'
+} $logPath
+Test-That 'and its folder is created, so launchd has somewhere to write' {
+    Test-Path -LiteralPath (Split-Path -Parent $logPath)
+}
+Test-That 'asking twice is harmless' {
+    (Get-BridgeLaunchAgentLogPath -HomeDir $logHome) -eq $logPath
+}
+$plist = Get-BridgeLaunchAgentPlist -Label 'com.agent-ha-bridge.daemon' -PwshPath '/usr/local/bin/pwsh' `
+    -DaemonPath '/Users/x/.agent-ha-bridge/hooks/agent-bridge-daemon.ps1' -LogPath $logPath -PathValue '/usr/bin:/bin'
+Test-That 'the plist points launchd at that path, both streams' {
+    ([regex]::Matches($plist, [regex]::Escape($logPath))).Count -eq 2
+}
+Test-That 'and never at the temp folder' { $plist -notmatch '/var/folders/' }
+Remove-Item -LiteralPath $logHome -Recurse -Force -ErrorAction SilentlyContinue
+
+Write-Host ''
 if ($script:Failures) {
     Write-Host "$($script:Failures) check(s) failed" -ForegroundColor Red
     exit 1

@@ -1421,10 +1421,36 @@ function Get-BridgeLaunchAgentPlist {
 "@
 }
 
+function Get-BridgeLaunchAgentLogPath {
+    <#
+        Where launchd itself writes the job's stdout and stderr.
+
+        Not $TMPDIR. On macOS that is /var/folders/<hash>/T, launchd's own per-user
+        per-session directory, and a job whose StandardOutPath lives there is rejected
+        at bootstrap with "Bootstrap failed: 5: Input/output error" - launchd cannot
+        open the file in the context it is bootstrapping into, and the whole daemon
+        then never starts. ~/Library/Logs is the documented place for this and always
+        exists for the user launchd is running the job as.
+    #>
+    param([string]$HomeDir = $HOME)
+
+    $dir = Join-Path (Join-Path $HomeDir 'Library/Logs') 'agent-ha-bridge'
+    if (-not (Test-Path -LiteralPath $dir)) {
+        New-Item -ItemType Directory -Path $dir -Force | Out-Null
+    }
+    Join-Path $dir 'launchd.log'
+}
+
 function Register-BridgeLaunchAgent {
     <#
         Writes and (re)loads the LaunchAgent. bootout first, so an update replaces a
         running daemon rather than leaving the old version in memory.
+
+        launchctl reports failures on stderr and in its exit code, not by throwing, so
+        both are captured: a bootstrap that fails silently used to leave nothing but
+        "launchd did not accept <path>", which says nothing about why. The plist is
+        linted first for the same reason, and a failed bootstrap falls back to the
+        older `load -w`, which still works where bootstrap refuses.
     #>
     param(
         [Parameter(Mandatory)][string]$Label,
@@ -1434,9 +1460,22 @@ function Register-BridgeLaunchAgent {
     $dir = Split-Path $PlistPath -Parent
     if (-not (Test-Path -LiteralPath $dir)) { New-Item -ItemType Directory -Path $dir -Force | Out-Null }
     Set-Content -LiteralPath $PlistPath -Value $Content -Encoding UTF8
+
+    $lint = @(& plutil -lint $PlistPath 2>&1 | ForEach-Object { [string]$_ })
+    if ($LASTEXITCODE -ne 0) {
+        Write-Warning "The LaunchAgent file is not valid: $($lint -join ' ')"
+        return $false
+    }
+
     $domain = "gui/$(& id -u)"
     & launchctl bootout "$domain/$Label" 2>$null | Out-Null
-    & launchctl bootstrap $domain $PlistPath 2>&1 | ForEach-Object { Write-Host "    $_" -ForegroundColor DarkGray }
+    $out = @(& launchctl bootstrap $domain $PlistPath 2>&1 | ForEach-Object { [string]$_ })
+    if ($LASTEXITCODE -ne 0) {
+        foreach ($line in $out) { Write-Host "    $line" -ForegroundColor DarkGray }
+        # The older API takes jobs bootstrap has been known to refuse.
+        $out = @(& launchctl load -w $PlistPath 2>&1 | ForEach-Object { [string]$_ })
+        foreach ($line in $out) { Write-Host "    $line" -ForegroundColor DarkGray }
+    }
     & launchctl kickstart -k "$domain/$Label" 2>&1 | Out-Null
     [bool](& launchctl print "$domain/$Label" 2>$null)
 }
@@ -1899,7 +1938,7 @@ if (-not $SkipTask -and -not $script:BridgeIsWindows) {
             Where-Object { $_ } | Select-Object -Unique) -join ':'
         $plist = Get-BridgeLaunchAgentPlist -Label $launchAgentLabel -PwshPath $pwshPath `
             -DaemonPath (Join-Path $hooksDir 'agent-bridge-daemon.ps1') `
-            -LogPath (Join-Path $env:TEMP 'agent-bridge-launchd.log') -PathValue $pathValue
+            -LogPath (Get-BridgeLaunchAgentLogPath) -PathValue $pathValue
         $taskRegistered = Register-BridgeLaunchAgent -Label $launchAgentLabel -PlistPath $launchAgentPath -Content $plist
         if ($taskRegistered) { Write-Host '    registered and started' }
         else { Write-Warning "launchd did not accept $launchAgentPath" }
@@ -2013,7 +2052,7 @@ elseif ($TargetHome) {
 elseif (-not $script:BridgeIsWindows) {
     Write-Step 'Putting agent-ha-bridge on your PATH'
     if (Register-BridgeShellPath -Directory $binDir) {
-        Write-Host "    added $binDir to PATH in ~/.zprofile" -ForegroundColor Green
+        Write-Host "    added $binDir to PATH in $((Get-BridgeShellProfile | ForEach-Object { '~/' + (Split-Path -Leaf $_) }) -join ' and ')" -ForegroundColor Green
         Write-Host '    open a new terminal to use it there' -ForegroundColor DarkGray
     }
     else {
