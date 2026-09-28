@@ -913,12 +913,34 @@ function Update-DaemonPendingLaunch {
         return
     }
 
-    if (($now - $p.Since).TotalSeconds -gt 90) {
+    $slowNoted = $p.PSObject.Properties['SlowNotePosted'] -and $p.SlowNotePosted
+    if (-not $slowNoted -and ($now - $p.Since).TotalSeconds -gt 90) {
+        Set-DaemonSessionProperty -Entry $p -Name 'SlowNotePosted' -Value $true
         # Deliberately not "has not registered": a first-ever launch has to sign in and
         # approve hooks first, and this often registers minutes later. Saying it may
         # still be starting keeps the note true when that happens; the session
         # registering clears it (Clear-DaemonLaunchNoteOnRegistration).
-        & $finish "$agent started in $($p.Label) (pid $($p.ProcessId)) and may still be starting - check its window." `
-            "launched $agent (pid $($p.ProcessId)) did not register within 90 s"
+        Write-DaemonLog -Message "launched $agent (pid $($p.ProcessId)) has not registered within 90 s; still watching"
+        try {
+            Set-CopilotMqttNewSessionResult -Headers $Headers `
+                -Text "$agent started in $($p.Label) (pid $($p.ProcessId)) and may still be starting - check its window."
+        }
+        catch { }
+    }
+
+    # The launch stays under watch instead of being dropped at 90 seconds.
+    #
+    # Dropping it stopped the window being read at all, and a trust prompt - Claude's
+    # "do you trust the files in this folder?" - often appears after that, or is simply
+    # not drawn yet on the first sweep. The two-press flow that answers it then had
+    # nothing left to work with, so pressing Launch again was the only way back. Seen
+    # exactly that way: a first launch waited the 90 seconds and gave up, and the next
+    # one found the prompt in two seconds.
+    #
+    # The process exiting ends this above, and so does registering; ten minutes is the
+    # backstop, as it is for a window already known to be blocked.
+    if (($now - $p.Since).TotalMinutes -gt 10) {
+        & $finish "$agent in $($p.Label) never registered - check its window." `
+            "launched $agent (pid $($p.ProcessId)) did not register within 10 minutes; stopped waiting"
     }
 }

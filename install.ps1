@@ -849,6 +849,123 @@ function Test-BridgeClientInstalled {
     }
 }
 
+function Get-BridgeDaemonProcess {
+    <# The running daemon, or nothing. Same test on both platforms. #>
+    @(Get-BridgeProcessesNamed -Name 'pwsh' -WithCommandLine |
+        Where-Object { $_.CommandLine -match 'agent-bridge-daemon\.ps1' })
+}
+
+function Get-BridgeInstallHealth {
+    <#
+        The checks behind the install's closing verdict, as { Name, Ok, Detail, Fix }.
+
+        Kept apart from the printing so the verdict can be tested without installing
+        anything, and so each check is one plain fact rather than a wall of output
+        nobody reads. They are deliberately the things that have actually gone wrong
+        on a real machine: a daemon that never started, an agent CLI that is on PATH
+        but does not run, a command the shell still cannot find.
+
+        Every probe is injectable for the same reason.
+    #>
+    param(
+        [AllowEmptyCollection()][string[]]$Clients = @(),
+        [scriptblock]$DaemonProbe,
+        [scriptblock]$ClientProbe,
+        [scriptblock]$CommandProbe,
+        [scriptblock]$ConnectionProbe,
+        [scriptblock]$TmuxProbe,
+        [bool]$OnWindows = $script:BridgeIsWindows
+    )
+
+    if (-not $DaemonProbe)     { $DaemonProbe     = { [bool](Get-BridgeDaemonProcess) } }
+    if (-not $ClientProbe)     { $ClientProbe     = { param($name) [bool](Test-BridgeClientRunnable -Name $name) } }
+    if (-not $CommandProbe)    { $CommandProbe    = { [bool](Get-Command 'agent-ha-bridge' -ErrorAction SilentlyContinue) } }
+    if (-not $ConnectionProbe) { $ConnectionProbe = { [pscustomobject]@{ Ok = $false; Version = ''; Error = 'not checked' } } }
+    if (-not $TmuxProbe)       { $TmuxProbe       = { [bool](Get-BridgeTmuxPath) } }
+
+    $checks = [System.Collections.Generic.List[object]]::new()
+
+    $checks.Add([pscustomobject]@{
+        Name   = 'The bridge daemon is running'
+        Ok     = [bool](& $DaemonProbe)
+        Detail = ''
+        Fix    = 'run: agent-ha-bridge restart'
+    })
+
+    $connection = & $ConnectionProbe
+    $connectionOk = [bool]($connection -and $connection.Ok)
+    $checks.Add([pscustomobject]@{
+        Name   = 'Home Assistant answers'
+        Ok     = $connectionOk
+        Detail = if ($connectionOk) { [string]$connection.Version } elseif ($connection) { [string]$connection.Error } else { 'no answer' }
+        Fix    = 'run: agent-ha-bridge configure'
+    })
+
+    # 'mcp' is a client config, not a command, so there is nothing to run.
+    foreach ($client in @($Clients | Where-Object { $_ -and $_ -ne 'mcp' })) {
+        $label = [string]$script:BridgeDependencies[$client].Label
+        if (-not $label) { $label = $client }
+        $checks.Add([pscustomobject]@{
+            Name   = "$label runs"
+            Ok     = [bool](& $ClientProbe $client)
+            Detail = ''
+            Fix    = "run: agent-ha-bridge configure -Clients $client"
+        })
+    }
+
+    if (-not $OnWindows) {
+        $checks.Add([pscustomobject]@{
+            Name   = 'tmux is installed, so replies can be typed into sessions'
+            Ok     = [bool](& $TmuxProbe)
+            Detail = ''
+            Fix    = 'install tmux, then run: agent-ha-bridge configure'
+        })
+    }
+
+    $checks.Add([pscustomobject]@{
+        Name   = 'The agent-ha-bridge command is on PATH'
+        Ok     = [bool](& $CommandProbe)
+        Detail = ''
+        Fix    = 'open a new terminal - the PATH line only applies to new ones'
+    })
+
+    @($checks)
+}
+
+function Show-BridgeInstallVerdict {
+    <#
+        Prints the checks and a single verdict, and says whether everything passed.
+
+        The install used to end on a list of next steps whether or not any of it had
+        worked, so "Bootstrap failed" scrolling past a working install read as a
+        failure and a genuinely broken one read as a success. This says which it was.
+    #>
+    param([AllowEmptyCollection()]$Checks)
+
+    Write-Host ''
+    Write-Host 'Checking the install:' -ForegroundColor Cyan
+    foreach ($check in @($Checks)) {
+        $mark = if ($check.Ok) { '[ ok ]' } else { '[ !! ]' }
+        $colour = if ($check.Ok) { 'Green' } else { 'Red' }
+        $line = "  $mark $($check.Name)"
+        if ($check.Detail) { $line += " - $($check.Detail)" }
+        Write-Host $line -ForegroundColor $colour
+    }
+
+    $failed = @(@($Checks) | Where-Object { -not $_.Ok })
+    Write-Host ''
+    if ($failed.Count -eq 0) {
+        Write-Host 'All good: the bridge is installed, running and connected.' -ForegroundColor Green
+        return $true
+    }
+    $one = ($failed.Count -eq 1)
+    Write-Host "$($failed.Count) thing$(if (-not $one) { 's' }) still need$(if ($one) { 's' }) attention:" -ForegroundColor Red
+    foreach ($check in $failed) {
+        Write-Host "  - $($check.Name) -> $($check.Fix)" -ForegroundColor Yellow
+    }
+    $false
+}
+
 function Test-BridgeClientRunnable {
     <# An agent CLI that is on PATH and actually runs. #>
     param([Parameter(Mandatory)][string]$Name)
@@ -1473,12 +1590,27 @@ function Register-BridgeLaunchAgent {
 
     $domain = "gui/$(& id -u)"
     & launchctl bootout "$domain/$Label" 2>$null | Out-Null
+    # bootout returns before launchd has finished tearing the job down, and
+    # bootstrapping a label that is still loaded fails with
+    # "Bootstrap failed: 5: Input/output error". Waiting for it to actually go means
+    # the normal path succeeds instead of leaning on the fallback below.
+    for ($i = 0; $i -lt 20; $i++) {
+        & launchctl print "$domain/$Label" *> $null
+        if ($LASTEXITCODE -ne 0) { break }
+        Start-Sleep -Milliseconds 100
+    }
+
     $out = @(& launchctl bootstrap $domain $PlistPath 2>&1 | ForEach-Object { [string]$_ })
     if ($LASTEXITCODE -ne 0) {
-        foreach ($line in $out) { Write-Host "    $line" -ForegroundColor DarkGray }
-        # The older API takes jobs bootstrap has been known to refuse.
-        $out = @(& launchctl load -w $PlistPath 2>&1 | ForEach-Object { [string]$_ })
-        foreach ($line in $out) { Write-Host "    $line" -ForegroundColor DarkGray }
+        # Not printed yet. bootstrap refusing a job that the older API still takes is
+        # common and recoverable, and printing "Bootstrap failed: 5: Input/output
+        # error" for something that then worked perfectly reads as a broken install -
+        # which is exactly how it was read. Only a fallback that also fails is worth
+        # showing, and then both messages are.
+        $fallback = @(& launchctl load -w $PlistPath 2>&1 | ForEach-Object { [string]$_ })
+        if ($LASTEXITCODE -ne 0) {
+            foreach ($line in @($out + $fallback)) { Write-Host "    $line" -ForegroundColor DarkGray }
+        }
     }
     & launchctl kickstart -k "$domain/$Label" 2>&1 | Out-Null
     [bool](& launchctl print "$domain/$Label" 2>$null)
@@ -2194,3 +2326,23 @@ if ($selectedClients -notcontains 'mcp') {
     Write-Host 'Want an MCP client too (Claude Desktop, Cursor, ChatGPT)? Run' -ForegroundColor DarkGray
     Write-Host '`agent-ha-bridge configure -Clients mcp`, or add it in the picker. See mcp/README.md.' -ForegroundColor DarkGray
 }
+
+# The verdict goes last, so it is what is left on screen. Until now the install ended
+# on the same list of next steps whether or not any of it had worked: a recovered
+# "Bootstrap failed" scrolling past looked like a broken install, and a genuinely
+# broken one looked fine.
+if (-not $SkipTask) {
+    # The daemon is started by the task or LaunchAgent that was just registered, and
+    # that takes a moment; a verdict of "not running" a second too early would be
+    # wrong more often than right.
+    for ($i = 0; $i -lt 15; $i++) {
+        if (Get-BridgeDaemonProcess) { break }
+        Start-Sleep -Milliseconds 400
+    }
+}
+$health = Get-BridgeInstallHealth -Clients $selectedClients -ConnectionProbe {
+    Test-BridgeHomeAssistantConnection -BaseUrl ([string]$config.homeAssistant.baseUrl) -Token $effectiveToken -TimeoutSec 10
+}
+# Printed, not exited on: this same script runs unattended for a self-update, and a
+# missing tmux or a half-installed agent must not be reported as a failed update.
+[void](Show-BridgeInstallVerdict -Checks $health)

@@ -287,6 +287,53 @@ finally {
     Remove-Item -LiteralPath $fakeBin -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+Write-Host '--- the install says whether it actually worked ---'
+# The install used to end on the same "Next steps" list whether or not any of it had
+# worked, so a recovered "Bootstrap failed: 5" scrolling past read as a broken
+# install, and a genuinely broken one read as a success.
+$allGood = Get-BridgeInstallHealth -Clients @('copilot', 'claude') -OnWindows $true `
+    -DaemonProbe { $true } -CommandProbe { $true } -ClientProbe { param($n) $true } `
+    -ConnectionProbe { [pscustomobject]@{ Ok = $true; Version = '2026.9.4'; Error = '' } }
+Test-That 'every check passes when everything is in place' {
+    @($allGood | Where-Object { -not $_.Ok }).Count -eq 0
+} (($allGood | Where-Object { -not $_.Ok } | ForEach-Object { $_.Name }) -join ', ')
+Test-That 'the daemon, Home Assistant, both clients and the command are all checked' {
+    @($allGood).Count -eq 5
+} "$(@($allGood).Count)"
+Test-That 'the connected version is shown, not just a tick' {
+    @($allGood | Where-Object { $_.Detail -eq '2026.9.4' }).Count -eq 1
+}
+Test-That 'no tmux check on Windows' { @($allGood | Where-Object { $_.Name -match 'tmux' }).Count -eq 0 }
+Test-That 'and one on macOS' {
+    $mac = Get-BridgeInstallHealth -Clients @() -OnWindows $false -DaemonProbe { $true } -CommandProbe { $true } `
+        -TmuxProbe { $false } -ConnectionProbe { [pscustomobject]@{ Ok = $true; Version = 'x'; Error = '' } }
+    @($mac | Where-Object { $_.Name -match 'tmux' -and -not $_.Ok }).Count -eq 1
+}
+Test-That 'mcp is not probed as a command, because it is not one' {
+    $withMcp = Get-BridgeInstallHealth -Clients @('mcp') -OnWindows $true -DaemonProbe { $true } -CommandProbe { $true } `
+        -ClientProbe { param($n) throw "mcp must not be run as a command" } `
+        -ConnectionProbe { [pscustomobject]@{ Ok = $true; Version = 'x'; Error = '' } }
+    @($withMcp).Count -eq 3
+}
+
+$halfBroken = Get-BridgeInstallHealth -Clients @('claude') -OnWindows $true `
+    -DaemonProbe { $false } -CommandProbe { $true } -ClientProbe { param($n) $false } `
+    -ConnectionProbe { [pscustomobject]@{ Ok = $false; Version = ''; Error = 'no Home Assistant token' } }
+Test-That 'a dead daemon is caught' { @($halfBroken | Where-Object { $_.Name -match 'daemon' -and -not $_.Ok }).Count -eq 1 }
+Test-That 'a half-installed agent is caught, the same way the launcher catches it' {
+    @($halfBroken | Where-Object { $_.Name -match 'Claude Code' -and -not $_.Ok }).Count -eq 1
+}
+Test-That 'and the connection error is carried through, not swallowed' {
+    @($halfBroken | Where-Object { $_.Detail -eq 'no Home Assistant token' }).Count -eq 1
+}
+Test-That 'every failed check offers something to do about it' {
+    @($halfBroken | Where-Object { -not $_.Ok -and [string]::IsNullOrWhiteSpace($_.Fix) }).Count -eq 0
+}
+Test-That 'the verdict is true only when nothing failed' {
+    (Show-BridgeInstallVerdict -Checks $allGood 6>$null) -eq $true -and
+    (Show-BridgeInstallVerdict -Checks $halfBroken 6>$null) -eq $false
+}
+
 Write-Host ''
 if ($script:Failures) {
     Write-Host "$($script:Failures) check(s) failed" -ForegroundColor Red

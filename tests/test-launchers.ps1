@@ -148,6 +148,55 @@ Update-DaemonPendingLaunch -Headers @{}
 Test-That 'but not forever' { $null -eq $script:DaemonPendingLaunch -and $script:Notes[-1] -match 'still waiting on a question in its window' }
 
 Write-Host ''
+Write-Host '--- a slow launch is still watched, so a late trust prompt is caught ---'
+# What happened on the Mac: Claude was launched, put up its "do you trust the files in
+# this folder?" question, and the launch was dropped at 90 seconds - which stopped the
+# window being read at all, so the two-press flow that answers it had nothing left to
+# work with. The first launch gave up after 90 s; the next one found the prompt in two.
+$script:Notes = @()
+$script:TrustPrompt = ''
+function Read-BridgeTrustPrompt { param([int]$ProcessId) $script:TrustPrompt }
+function Send-BridgeTrustAnswer { param([int]$ProcessId, [string]$Selection) 'ok' }
+$script:DaemonPendingLaunch = [pscustomobject]@{
+    SessionId = ''; Launcher = 'claude'; ProcessId = $otherPid; Label = 'danswett'; Verb = 'Started'
+    Since = [DateTimeOffset]::Now.AddSeconds(-100)
+    LastCheck = [DateTimeOffset]::MinValue; TrustAskedAt = $null; TrustConfirmed = $false; TrustAnswers = 0
+    AwaitingFirstMessage = $false; FirstMessageAsked = $false
+}
+Update-DaemonPendingLaunch -Headers @{}
+Test-That 'past 90 s the card says it may still be starting' {
+    $script:Notes[-1] -match 'may still be starting'
+} ($script:Notes -join '|')
+Test-That 'but the launch is still being watched' { $null -ne $script:DaemonPendingLaunch }
+
+$noteCount = @($script:Notes).Count
+$script:DaemonPendingLaunch.LastCheck = [DateTimeOffset]::MinValue
+Update-DaemonPendingLaunch -Headers @{}
+Test-That 'and the note is not repeated on every pass' { @($script:Notes).Count -eq $noteCount } "$(@($script:Notes).Count) vs $noteCount"
+
+# The prompt Claude actually puts up, appearing well after the 90 seconds.
+$script:TrustPrompt = 'yes'
+$script:DaemonPendingLaunch.LastCheck = [DateTimeOffset]::MinValue
+Update-DaemonPendingLaunch -Headers @{}
+Test-That 'a trust question that appears after 90 s is still caught' {
+    $script:Notes[-1] -match 'is asking whether to trust danswett'
+} ($script:Notes[-1])
+Test-That 'and the launch is kept so the second press can answer it' { $null -ne $script:DaemonPendingLaunch }
+
+$script:DaemonPendingLaunch.TrustConfirmed = $true
+$script:DaemonPendingLaunch.LastCheck = [DateTimeOffset]::MinValue
+Update-DaemonPendingLaunch -Headers @{}
+Test-That 'a second press answers it' { $script:DaemonPendingLaunch.TrustAnswers -eq 1 } "$($script:DaemonPendingLaunch.TrustAnswers)"
+
+$script:TrustPrompt = ''
+$script:DaemonPendingLaunch.Since = [DateTimeOffset]::Now.AddMinutes(-11)
+$script:DaemonPendingLaunch.LastCheck = [DateTimeOffset]::MinValue
+Update-DaemonPendingLaunch -Headers @{}
+Test-That 'and it does give up eventually' {
+    $null -eq $script:DaemonPendingLaunch -and $script:Notes[-1] -match 'never registered'
+} ($script:Notes[-1])
+
+Write-Host ''
 Write-Host '--- when a tmux pane is gone before it can be read, say why ---'
 # tmux returns 0 from new-session as soon as the session exists, so an agent that
 # cannot start still looks like a successful launch. The old message named the
