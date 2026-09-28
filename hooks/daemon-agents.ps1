@@ -28,8 +28,8 @@
 
     Part of agent-bridge-daemon.ps1, which dot-sources it into its own scope after
     declaring the shared $script: state; see docs/daemon-split.md.
-    Shared state it changes: DaemonAgents; DaemonRegistrationStamps (Claude's
-    PollRegistration).
+    Shared state it changes: DaemonAgents, DaemonAgentCache; DaemonRegistrationStamps
+    and ClaudeRegistrationPaths (Claude's PollRegistration).
 #>
 
 $script:DaemonAgents = [ordered]@{
@@ -75,7 +75,12 @@ $script:DaemonAgents = [ordered]@{
             param($Id, $Session)
             if (-not $script:ClaudeAdapterLoaded) { return $false }
             $changed = $false
-            $registration = Join-Path $env:TEMP "agent-bridge-claude\$(Get-ClaudeSafeSessionKey -SessionId $Id).json"
+            # The path never changes, and building it was most of a tick's cost.
+            $registration = $script:ClaudeRegistrationPaths[$Id]
+            if (-not $registration) {
+                $registration = Join-Path $env:TEMP "agent-bridge-claude\$(Get-ClaudeSafeSessionKey -SessionId $Id).json"
+                $script:ClaudeRegistrationPaths[$Id] = $registration
+            }
             $stamp = [IO.File]::GetLastWriteTimeUtc($registration).Ticks
             if (-not $script:DaemonRegistrationStamps.ContainsKey($Id) -or $script:DaemonRegistrationStamps[$Id] -ne $stamp) {
                 $script:DaemonRegistrationStamps[$Id] = $stamp
@@ -130,15 +135,22 @@ $script:DaemonAgents = [ordered]@{
     }
 }
 
+$script:DaemonAgentCache = @{}
+$script:ClaudeRegistrationPaths = @{}
+
 function Get-DaemonAgent {
     <# The entry for a kind of session, with Copilot's slots filling any it leaves out. #>
     param([AllowEmptyString()][AllowNull()][string]$Kind)
 
+    if (-not $Kind) { $Kind = 'copilot' }
+    # Resolved once per kind: the fast lane asks for every session ten times a second.
+    $cached = $script:DaemonAgentCache[$Kind]
+    if ($null -ne $cached) { return $cached }
+
     # An unlisted kind (an MCP client's, say) gets Copilot's slots but none of its
     # flags: the old checks named Copilot for those.
     $default = $script:DaemonAgents['copilot']
-    if (-not $Kind) { $Kind = 'copilot' }
-    $own = if ($script:DaemonAgents.Contains($Kind)) { $script:DaemonAgents[$Kind] } else { @{} }
+    $own =if ($script:DaemonAgents.Contains($Kind)) { $script:DaemonAgents[$Kind] } else { @{} }
     # Every slot and flag is present, so callers can test one under strict mode.
     $agent = @{
         FindSessions = $null; PollRegistration = $null; FastActivity = $null; KnownActivity = $null
@@ -146,12 +158,13 @@ function Get-DaemonAgent {
     }
     foreach ($slot in 'Display', 'ReadAppend', 'Activity', 'IsWorking') { $agent[$slot] = $default[$slot] }
     foreach ($slot in $own.Keys) { $agent[$slot] = $own[$slot] }
+    $script:DaemonAgentCache[$Kind] = $agent
     $agent
 }
 
 function Get-DaemonEntryKind {
     <# A state entry's or live session's kind; one recorded before kinds existed is Copilot's. #>
     param($Entry)
-    if ($null -ne $Entry -and $Entry.PSObject.Properties.Name -contains 'Kind' -and $Entry.Kind) { return [string]$Entry.Kind }
+    if ($null -ne $Entry -and $Entry.PSObject.Properties['Kind'] -and $Entry.Kind) { return [string]$Entry.Kind }
     'copilot'
 }
