@@ -305,6 +305,18 @@ program. So:
   parameter; this was the only one. Also raised the native hook's latency check from
   100 ms to 500 ms, after the same CI runner measured 50, 109 and 131 ms on three
   consecutive runs of identical code.
+- **1.13.3** (2026-09-28): a card sat on `idle` showing a line from mid-turn, with the
+  turn's answer missing. `Get-ActivityFromEvents` read `data.reasoningText` directly;
+  under StrictMode a missing property throws, and that read is inside a `catch` that
+  drops the whole event silently. Copilot writes assistant messages in several shapes
+  and only some carry it - 224 of 518 in one real session had none - so nearly half of
+  everything said was discarded and the card kept the last message that happened to
+  include thinking. A final answer is usually plain text, so it was the likeliest
+  thing to vanish. Fields now go through `Get-BridgeEventField`. `Read-TranscriptAppend`
+  compounded it by setting the offset to the file length while returning a line still
+  being written: parsing threw into the same catch with the offset already past it, so
+  the loss was permanent. It now withholds a partial trailing line and rewinds by its
+  length, as the Codex reader always has.
 
 ## Resuming
 
