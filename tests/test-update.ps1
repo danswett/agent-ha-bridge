@@ -204,6 +204,26 @@ Test-That 'a non-existent TargetHome is refused, never interpolated' {
     ($bogus.Started -eq $false) -and ($bogus.Detail -match 'not an existing directory')
 }
 
+Write-Host '--- the Install button path really launches the updater ---'
+# -Detached is used only by the dashboard button, which is why this being broken never
+# showed up in `agent-ha-bridge update`: that takes the other branch.
+$script:LaunchedWith = $null
+function Start-Process {
+    param($FilePath, $ArgumentList, $WindowStyle, [switch]$PassThru, $ErrorAction)
+    $script:LaunchedWith = [pscustomobject]@{ FilePath = $FilePath; ArgumentList = @($ArgumentList) }
+}
+$detachedRun = Invoke-BridgeSelfUpdate -Detached
+Test-That 'a detached update reports that it started' { $detachedRun.Started -eq $true } "$($detachedRun.Detail)"
+Test-That 'and really launched pwsh with the generated script' {
+    $null -ne $script:LaunchedWith -and
+    $script:LaunchedWith.FilePath -match 'pwsh' -and
+    (($script:LaunchedWith.ArgumentList) -join ' ') -match 'run-update\.ps1'
+} "$(if ($script:LaunchedWith) { $script:LaunchedWith.FilePath } else { 'nothing launched' })"
+# The detached updater removes its own staging folder; nothing actually ran here.
+Get-ChildItem ([IO.Path]::GetTempPath()) -Directory -Filter 'agent-ha-bridge-update-*' -ErrorAction SilentlyContinue |
+    Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) } |
+    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+
 Write-Host '--- an updater that cannot be launched fails cleanly and leaves nothing behind ---'
 Test-That 'pwsh is resolvable here' { [bool](Get-BridgePwshPath) } "$(Get-BridgePwshPath)"
 # The real failure this came from: the daemon's PATH, set by a scheduled task, had no

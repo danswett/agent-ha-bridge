@@ -272,13 +272,18 @@ finally {
     $scriptText | Set-Content -LiteralPath $script -Encoding UTF8
 
     if ($Detached) {
-        $detached = @{
+        # Not $detached: PowerShell variable names are case-insensitive, so that name
+        # assigns to this function's own [switch]$Detached parameter and dies trying to
+        # make a SwitchParameter out of a hashtable. That is why pressing Install did
+        # nothing - the button is the only caller that passes -Detached, so running
+        # `agent-ha-bridge update` by hand worked and the card never did.
+        $launch = @{
             FilePath     = $pwshPath
             ArgumentList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$script`"")
         }
         # Not supported, and refused, off Windows.
-        if ($script:BridgeIsWindows) { $detached.WindowStyle = 'Hidden' }
-        Start-Process @detached | Out-Null
+        if ($script:BridgeIsWindows) { $launch.WindowStyle = 'Hidden' }
+        Start-Process @launch | Out-Null
         return [pscustomobject]@{ Started = $true; Detail = "updating to $($status.Latest) in the background" }
     }
 
