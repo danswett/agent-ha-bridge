@@ -129,8 +129,10 @@ function Test-BridgeSessionRegistered { param($SessionId, $Launcher, $Since) $fa
 $script:Screen = $reviewScreen
 function Read-BridgeConsoleScreen { param([int]$ProcessId) $script:Screen }
 $started = [DateTimeOffset]::Now.AddSeconds(-5)
+# A running process that is not this one: the daemon never reads its own console.
+$otherPid = (Get-Process -Id $PID).Parent.Id
 $script:DaemonPendingLaunch = [pscustomobject]@{
-    SessionId = ''; Launcher = 'codex'; ProcessId = $PID; Label = 'repo'; Verb = 'Started'; Since = $started
+    SessionId = ''; Launcher = 'codex'; ProcessId = $otherPid; Label = 'repo'; Verb = 'Started'; Since = $started
     LastCheck = [DateTimeOffset]::MinValue; TrustAskedAt = $null; TrustConfirmed = $false; TrustAnswers = 0
     AwaitingFirstMessage = $false; FirstMessageAsked = $false
 }
