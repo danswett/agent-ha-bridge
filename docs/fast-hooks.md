@@ -261,6 +261,13 @@ program. So:
   entry resumes work; `tests/test-turn-end.ps1`); the card spinner's ✳ drew as a green
   emoji on iOS (U+FE0E). Released with the intended process, first time: draft,
   `workflow_dispatch` (tag + ref), assets checked, publish.
+- **1.12.2** (2026-09-28): after 1.12.0 changed the hook command, a Codex launched
+  from the dashboard stopped at Codex's own "Hooks need review" and the card only said
+  "has not registered"; launchers now have a `BlockingPrompt` the launch follow-up
+  checks against the new window's screen (never its own), and the card says what to
+  answer. Also the daemon's memory, 274 -> ~120 MB private: Home Assistant filters the
+  states it reads (/api/template), the C# helpers are compiled once into cached DLLs,
+  and DOTNET_GCConserveMemory=7 plus an occasional aggressive collection.
 
 ## Resuming
 
