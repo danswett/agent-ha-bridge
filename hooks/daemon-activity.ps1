@@ -34,11 +34,7 @@ function Read-BridgeTranscriptAppend {
         [string]$Kind = 'copilot'
     )
 
-    if ($Kind -eq 'claude' -and $script:ClaudeAdapterLoaded) {
-        return Read-ClaudeTranscriptAppend -Path $Path -Offset $Offset `
-            -MaxTailBytes $script:DaemonConfig.MaxTailBytes
-    }
-    Read-TranscriptAppend -Path $Path -Offset $Offset
+    & (Get-DaemonAgent -Kind $Kind).ReadAppend $Path $Offset
 }
 
 function Get-BridgeActivity {
@@ -48,10 +44,7 @@ function Get-BridgeActivity {
         [string]$Kind = 'copilot'
     )
 
-    if ($Kind -eq 'claude' -and $script:ClaudeAdapterLoaded) {
-        return Get-ClaudeActivityFromTranscript -Lines $Lines -VerboseMode $VerboseMode
-    }
-    Get-ActivityFromEvents -Lines $Lines -VerboseMode $VerboseMode
+    & (Get-DaemonAgent -Kind $Kind).Activity $Lines $VerboseMode
 }
 
 function Test-BridgeSessionWorking {
@@ -62,18 +55,7 @@ function Test-BridgeSessionWorking {
         [string]$Status
     )
 
-    # Codex reports its own status: a turn begins at UserPromptSubmit and ends at
-    # Stop, both of which the hook records, so there is nothing to infer.
-    if ($Kind -eq 'codex') { return ($Status -eq 'working') }
-
-    if ($Kind -ne 'claude') { return Test-CopilotSessionWorking -SessionId $SessionId }
-    if (-not $script:ClaudeAdapterLoaded -or -not $Transcript) { return $false }
-    # Claude writes no turn-end entry, so freshness is the best available signal at
-    # adoption time; the Stop hook corrects it authoritatively at the next turn end.
-    try {
-        return ([DateTime]::UtcNow - [IO.File]::GetLastWriteTimeUtc($Transcript)).TotalSeconds -lt 20
-    }
-    catch { return $false }
+    [bool](& (Get-DaemonAgent -Kind $Kind).IsWorking $SessionId $Transcript $Status)
 }
 
 function Sync-DaemonHookStatus {
@@ -142,9 +124,9 @@ function Get-DaemonStartupStatus {
         [Parameter(Mandatory)]$Entry
     )
 
-    $kind = if ($Entry.PSObject.Properties.Name -contains 'Kind' -and $Entry.Kind) { [string]$Entry.Kind } else { 'copilot' }
+    $kind = Get-DaemonEntryKind -Entry $Entry
 
-    if ($kind -eq 'claude' -and $Session.PSObject.Properties['HookStatus'] -and
+    if ((Get-DaemonAgent -Kind $kind).HookStatus -and $Session.PSObject.Properties['HookStatus'] -and
         [string]$Session.HookStatus -in @('working', 'waiting', 'idle')) {
         return [string]$Session.HookStatus
     }
@@ -351,14 +333,15 @@ function Update-DaemonSessionActivity {
 
     # Names the body below has always used.
     $id = $Id; $entry = $Entry; $session = $Session; $verbose = $VerboseOn
-    $entryKind = if ($entry.PSObject.Properties.Name -contains 'Kind' -and $entry.Kind) { [string]$entry.Kind } else { 'copilot' }
+    $entryKind = Get-DaemonEntryKind -Entry $entry
+    $agent = Get-DaemonAgent -Kind $entryKind
 
     # Claude's hooks set the status directly (idle at Stop, waiting at a
     # notification, working at a new prompt). Adopt it here before reading the
     # transcript, or this loop keeps believing its own stale copy and never
     # republishes 'working' when the session carries on.
     $hookStatusAt = $null
-    if ($entryKind -eq 'claude') {
+    if ($agent.HookStatus) {
         $hookStatusAt = Sync-DaemonHookStatus -Entry $entry -Session $session -SessionId $id -Headers $Headers
     }
 
@@ -467,7 +450,7 @@ function Update-DaemonSessionActivity {
     if ($entry.PSObject.Properties['LastHistory']) { $entry.LastHistory = $detail.history }
     else { $entry | Add-Member -NotePropertyName LastHistory -NotePropertyValue $detail.history -Force }
     # The newest line of either kind, for Claude (see Add-DaemonCardText).
-    if ($entryKind -eq 'claude') {
+    if ($agent.InlineReasoning) {
         $lastMessage = if (-not $turnStarted -and $entry.PSObject.Properties['LastMessage']) { [string]$entry.LastMessage } else { '' }
         $lastIsThinking = if (-not $turnStarted -and $entry.PSObject.Properties['LastMessageIsThinking']) { [bool]$entry.LastMessageIsThinking } else { $false }
         if ($activity.PSObject.Properties['Latest'] -and -not [string]::IsNullOrWhiteSpace([string]$activity.Latest)) {
@@ -638,11 +621,11 @@ function Add-DaemonCardText {
         [bool]$VerboseOn
     )
 
-    $kind = if ($Entry.PSObject.Properties.Name -contains 'Kind' -and $Entry.Kind) { [string]$Entry.Kind } else { 'copilot' }
+    $inline = [bool](Get-DaemonAgent -Kind (Get-DaemonEntryKind -Entry $Entry)).InlineReasoning
     $shown = if ($Entry.PSObject.Properties['LastResponse']) { [string]$Entry.LastResponse } else { '' }
     $shownKind = 'text'
 
-    if ($kind -eq 'claude') {
+    if ($inline) {
         $lastMessage = if ($Entry.PSObject.Properties['LastMessage']) { [string]$Entry.LastMessage } else { '' }
         if ($VerboseOn -and -not [string]::IsNullOrWhiteSpace($lastMessage)) {
             $shown = $lastMessage
@@ -663,7 +646,7 @@ function Add-DaemonCardText {
     # Claude's reasoning is already inline, in order; repeating it below would put it
     # out of order again.
     $reasoning = if ($Entry.PSObject.Properties['LastReasoning']) { [string]$Entry.LastReasoning } else { '' }
-    if ($VerboseOn -and $kind -ne 'claude' -and -not [string]::IsNullOrWhiteSpace($reasoning)) {
+    if ($VerboseOn -and -not $inline -and -not [string]::IsNullOrWhiteSpace($reasoning)) {
         if ($reasoning.Length -gt $script:DaemonConfig.ReasoningMaxChars) {
             $reasoning = $reasoning.Substring(0, $script:DaemonConfig.ReasoningMaxChars).TrimEnd() + '…'
         }
@@ -702,40 +685,16 @@ function Invoke-DaemonFastActivity {
         $session = $live[$id]
         if ($null -eq $entry -or $null -eq $session) { continue }
 
-        $kind = if ($entry.PSObject.Properties.Name -contains 'Kind' -and $entry.Kind) { [string]$entry.Kind } else { 'copilot' }
-        # Codex: what it says comes from its rollout, and its status from the
-        # registration its hooks write - published here, so a hook on every tool call
-        # does not wait on Home Assistant (Sync-DaemonCodexHookStatus).
-        if ($kind -eq 'codex') {
-            $republish = Sync-DaemonCodexHookStatus -Id $id -Entry $entry -Headers $Headers
-            $length = 0L
-            try { $length = [IO.FileInfo]::new([string]$session.Transcript).Length } catch { }
-            if ($republish -or ($length -gt 0 -and $length -ne [long]$entry.Offset)) {
-                Update-DaemonCodexActivity -Id $id -Entry $entry -Session $session -Headers $Headers `
-                    -VerboseOn ([bool]$script:DaemonVerbose) -Republish:$republish
-            }
+        $agent = Get-DaemonAgent -Kind (Get-DaemonEntryKind -Entry $entry)
+        # An agent that streams its own card (Codex) does so here, in place of the
+        # shared path below.
+        if ($agent.FastActivity) {
+            & $agent.FastActivity $id $entry $session $Headers | Out-Null
             continue
         }
 
         $changed = $false
-
-        if ($kind -eq 'claude' -and $script:ClaudeAdapterLoaded) {
-            $registration = Join-Path $env:TEMP "agent-bridge-claude\$(Get-ClaudeSafeSessionKey -SessionId $id).json"
-            $stamp = [IO.File]::GetLastWriteTimeUtc($registration).Ticks
-            if (-not $script:DaemonRegistrationStamps.ContainsKey($id) -or $script:DaemonRegistrationStamps[$id] -ne $stamp) {
-                $script:DaemonRegistrationStamps[$id] = $stamp
-                try {
-                    $fresh = Get-Content -LiteralPath $registration -Raw | ConvertFrom-Json
-                    foreach ($field in @('HookStatus', 'HookStatusAt')) {
-                        if ($fresh.PSObject.Properties[$field]) {
-                            $session | Add-Member -NotePropertyName $field -NotePropertyValue ([string]$fresh.$field) -Force
-                        }
-                    }
-                    $changed = $true
-                }
-                catch { }
-            }
-        }
+        if ($agent.PollRegistration) { $changed = [bool](& $agent.PollRegistration $id $session) }
 
         $transcript = [string]$session.Transcript
         if (-not $changed) {

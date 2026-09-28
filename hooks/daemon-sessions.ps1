@@ -456,12 +456,11 @@ function Update-DaemonKnownSession {
     $session = $Session
     $entry = $Entry
     $id = $session.SessionId
-    $entryKind = if ($entry.PSObject.Properties.Name -contains 'Kind' -and $entry.Kind) { [string]$entry.Kind } else { 'copilot' }
-    # Codex publishes its status from its hooks; what it says - progress notes, the
-    # answer, reasoning, tool calls - is read from its rollout, here and in the fast
-    # lane (Update-DaemonCodexActivity).
-    if ($entryKind -eq 'codex') {
-        Update-DaemonCodexActivity -Id $id -Entry $entry -Session $session -Headers $Headers -VerboseOn $VerboseOn
+    $entryKind = Get-DaemonEntryKind -Entry $entry
+    $agent = Get-DaemonAgent -Kind $entryKind
+    # An agent that streams its own card (Codex) does so here and in the fast lane.
+    if ($agent.KnownActivity) {
+        & $agent.KnownActivity $id $entry $session $Headers $VerboseOn
         return
     }
 
@@ -471,7 +470,7 @@ function Update-DaemonKnownSession {
     # starting - and a session published by an older build carries no harness prefix
     # at all. Both self-heal on the next reconcile rather than needing the state file
     # to be cleared by hand.
-    $needsName = ($entryKind -eq 'copilot' -and [string]$entry.Name -notmatch '^Copilot: ') -or
+    $needsName = ($agent.RefreshName -and [string]$entry.Name -notmatch '^Copilot: ') -or
                  ([string]$entry.Name -match '^Copilot: [0-9a-f]{8}$')
     if ($needsName) {
         $workingDirectory = if ($session.PSObject.Properties.Name -contains 'WorkingDirectory' -and $session.WorkingDirectory) {

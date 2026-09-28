@@ -92,12 +92,14 @@ after the Claude and Codex checks, so the table has to name it outright.
 
 ### Phases (one commit each; tick here in the same commit)
 
-- [ ] **A. Activity** (`daemon-activity.ps1`, `Update-DaemonKnownSession` in
+- [x] **A. Activity** (`daemon-activity.ps1`, `Update-DaemonKnownSession` in
   `daemon-sessions.ps1`). Slots: `ReadAppend`, `Activity`, `IsWorking`,
   `PollRegistration` (Claude's hook-status watch in the fast lane),
   `FastActivity` / `KnownActivity` (Codex streams its own card), flags
   `HookStatus`, `InlineReasoning`, `RefreshName` (Copilot). Test:
-  `tests/test-daemon-agents.ps1`.
+  `tests/test-daemon-agents.ps1`. *Done.* Gotchas: `Get-DaemonAgent` must return every
+  slot and flag (strict mode throws on a missing hashtable key); an unlisted kind
+  (`mcp`) gets Copilot's slots but no flags, since the old checks named Copilot.
 - [ ] **B. Discovery** (`daemon-discovery.ps1`). Slots: `FindSessions`,
   `Display`; flag `KnowsProcessId`. `Get-LiveBridgeSessions` loops the table.
 - [ ] **C. Decisions and replies**. Claude's question parser, Codex approvals,

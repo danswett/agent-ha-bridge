@@ -730,6 +730,7 @@ function Start-BridgeDaemon {
 
 # The daemon's parts, each responsible for one area (see docs/daemon-split.md).
 # Dot-sourced into this scope, so the $script: state declared above is shared.
+. (Join-Path $PSScriptRoot 'daemon-agents.ps1')
 . (Join-Path $PSScriptRoot 'daemon-discovery.ps1')
 . (Join-Path $PSScriptRoot 'daemon-activity.ps1')
 . (Join-Path $PSScriptRoot 'daemon-sessions.ps1')
