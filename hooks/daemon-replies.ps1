@@ -765,6 +765,9 @@ function Resolve-DaemonPrimedCard {
     if ($Entry.PSObject.Properties['LastHistory'] -and $Entry.LastHistory) {
         $detail['history'] = @($Entry.LastHistory)
     }
+    # Driver is persisted with the entry, so a restart restores the glow rather than
+    # quietly handing a session an agent is still driving back to you.
+    $detail['driver'] = if ($Entry.PSObject.Properties['Driver'] -and $Entry.Driver) { [string]$Entry.Driver } else { 'human' }
     Add-DaemonCardText -Entry $Entry -Detail $detail -VerboseOn $VerboseOn
 
     [pscustomobject]@{ Summary = $summary; Detail = $detail }

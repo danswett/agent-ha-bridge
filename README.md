@@ -670,6 +670,7 @@ bridge cannot tell, it asks; a scripted uninstall keeps them. `-ClearShared` and
 .\tests\test-update.ps1           # version comparison, release cache, failure safety
 .\tests\test-update-outcome.ps1   # install spinner + updated/failed notification
 .\tests\test-restart-restore.ps1  # a daemon restart restores cards instead of blanking them
+.\tests\test-driver-card.ps1      # the agent/human driver reaching the card, on every path that publishes one
 .\tests\test-new-session.ps1      # launching a session: argument quoting, the workspace allowlist, press handling
 .\tests\test-stop-session.ps1     # ending a session: graceful /exit, terminate fallback, press handling
 .\tests\test-install-clients.ps1  # installer client selection (‑Clients, persisted, defaults, first-install picker)

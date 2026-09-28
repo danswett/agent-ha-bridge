@@ -678,6 +678,17 @@ function Update-DaemonCodexActivity {
     Set-DaemonSessionProperty -Entry $Entry -Name 'LastHistory' -Value $history
 
     $detail = @{ session = $Entry.Name; machine = $Entry.Machine }
+    # Who last drove this session. Codex publishes its own card rather than going
+    # through the shared path, so without this its detail carried no driver at all and
+    # every Codex card read as yours however it had been driven - the one agent whose
+    # glow never worked. Same rule as the shared path: a turn that starts without a
+    # reply having just come through Home Assistant was typed in the terminal, which is
+    # the person, so it hands the session back to them.
+    if ($activity.TurnStarted -and -not ($Entry.PSObject.Properties['DriverPending'] -and $Entry.DriverPending)) {
+        Set-DaemonSessionProperty -Entry $Entry -Name 'Driver' -Value 'human'
+    }
+    Set-DaemonSessionProperty -Entry $Entry -Name 'DriverPending' -Value $false
+    $detail['driver'] = if ($Entry.PSObject.Properties['Driver'] -and $Entry.Driver) { [string]$Entry.Driver } else { 'human' }
     if ($history.Count) { $detail['history'] = $history }
     $message = if ($Entry.PSObject.Properties['LastMessage']) { [string]$Entry.LastMessage } else { '' }
     $thinking = $Entry.PSObject.Properties['LastMessageIsThinking'] -and [bool]$Entry.LastMessageIsThinking
