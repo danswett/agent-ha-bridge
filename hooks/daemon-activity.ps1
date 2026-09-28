@@ -353,17 +353,32 @@ function Update-DaemonSessionActivity {
 
     # Work written before the hook that stopped the turn is that turn's tail, not
     # a resumption; only activity newer than the hook may flip it back to working.
+    #
+    # Newer means a new user entry - a prompt, or a tool result - after the hook:
+    # Claude writes nothing of its own after a turn ends without one. Comparing any
+    # entry's time with the hook's was a race once hooks became fast: the daemon can
+    # record the Stop a few milliseconds before Claude writes that turn's final message,
+    # and that message then looked like new work, flipping the card back to working.
     $staleTail = $false
-    if ($null -ne $hookStatusAt -and [string]$entry.Status -in @('idle', 'waiting') -and
-        $activity.PSObject.Properties['LastActivityAt']) {
-        $staleTail = ($null -eq $activity.LastActivityAt) -or ($activity.LastActivityAt -le $hookStatusAt)
+    $newStatus = $activity.Status
+    if ($null -ne $hookStatusAt -and [string]$entry.Status -in @('idle', 'waiting')) {
+        if ($activity.PSObject.Properties['LastUserAt']) {
+            $staleTail = ($null -eq $activity.LastUserAt) -or ($activity.LastUserAt -le $hookStatusAt)
+            # A tool result on its own - a permission prompt answered - sets no status,
+            # and what follows it may arrive in a later read with no user entry of its
+            # own. So the user entry is itself the sign that work has resumed.
+            if (-not $staleTail) { $newStatus = 'working' }
+        }
+        elseif ($activity.PSObject.Properties['LastActivityAt']) {
+            $staleTail = ($null -eq $activity.LastActivityAt) -or ($activity.LastActivityAt -le $hookStatusAt)
+        }
     }
 
-    if (-not $staleTail -and -not [string]::IsNullOrWhiteSpace($activity.Status) -and
-        $activity.Status -ne [string]$entry.Status) {
-        $entry.Status = $activity.Status
+    if (-not $staleTail -and -not [string]::IsNullOrWhiteSpace($newStatus) -and
+        $newStatus -ne [string]$entry.Status) {
+        $entry.Status = $newStatus
         try {
-            Set-CopilotMqttStatus -SessionId $id -Status $activity.Status -Headers $Headers -Attributes @{
+            Set-CopilotMqttStatus -SessionId $id -Status $newStatus -Headers $Headers -Attributes @{
                 session = $entry.Name
                 machine = $entry.Machine
                 process_id = $session.ProcessId

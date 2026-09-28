@@ -16,12 +16,14 @@
  * daemon downloads them and attaches them to the prompt.
  */
 
-const CARD_VERSION = '1.12.2';
+const CARD_VERSION = '1.12.3';
 
 // The working line, in the style of Claude Code's own spinner: its glyph cycle, and a
 // word picked once per turn. Claude Code does not record which word it chose, so the
 // card picks its own from the same kind of list.
-const SPINNER_GLYPHS = ['·', '✢', '✳', '✶', '✻', '✽', '✻', '✶', '✳', '✢'];
+// Each followed by U+FE0E, which asks for the plain character: without it iOS draws ✳
+// (U+2733) as an emoji - a green square - and the spinner flashed green once a cycle.
+const SPINNER_GLYPHS = ['·', '✢', '✳', '✶', '✻', '✽', '✻', '✶', '✳', '✢'].map((g) => `${g}︎`);
 const SPINNER_VERBS = [
   'Thinking', 'Pondering', 'Slithering', 'Brewing', 'Conjuring', 'Noodling', 'Percolating',
   'Mulling', 'Cogitating', 'Simmering', 'Ruminating', 'Tinkering', 'Churning', 'Musing',
@@ -446,8 +448,8 @@ class AgentBridgeActivityCard extends HTMLElement {
       /* A thinking summary shown as the newest line, as the terminal shows it. */
       .response.thinking { font-style: italic; color: var(--secondary-text-color); }
       .response.thinking::before { content: '🧠'; float: left; margin: 0 6px 0 0; font-style: normal; }
-      .working { margin-top: 8px; color: var(--agent-bridge-spinner-color, #d97757); font-variant-numeric: tabular-nums; }
-      .working .glyph { display: inline-block; width: 1.1em; text-align: center; }
+      .working { margin: 8px 0 6px; color: var(--agent-bridge-spinner-color, #d97757); font-variant-numeric: tabular-nums; }
+      .working .glyph { display: inline-block; width: 1.1em; text-align: center; font-variant-emoji: text; }
       .working .elapsed { color: var(--secondary-text-color); }
       [hidden] { display: none !important; }
     `;

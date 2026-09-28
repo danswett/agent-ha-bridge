@@ -61,6 +61,7 @@ function Get-ClaudeActivityFromTranscript {
     $status = $null
     $turnStarted = $false
     $lastActivityAt = $null
+    $lastUserAt = $null
     $latest = $null
     $latestIsThinking = $false
     $history = New-Object System.Collections.Generic.List[string]
@@ -90,6 +91,7 @@ function Get-ClaudeActivityFromTranscript {
                         [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$at)
                 }
             if ($parsed -and ($null -eq $lastActivityAt -or $at -gt $lastActivityAt)) { $lastActivityAt = $at }
+            if ($parsed -and $type -eq 'user' -and ($null -eq $lastUserAt -or $at -gt $lastUserAt)) { $lastUserAt = $at }
         }
 
         if ($type -eq 'user') {
@@ -159,6 +161,10 @@ function Get-ClaudeActivityFromTranscript {
         TurnStarted = $turnStarted
         # Time of the newest user or assistant entry in the batch, or $null.
         LastActivityAt = $lastActivityAt
+        # Time of the newest user entry - a prompt or a tool result - or $null. Only one
+        # of these can start work again once a hook has ended the turn: Claude writes
+        # nothing of its own after a turn without one.
+        LastUserAt = $lastUserAt
         # The newest message of either kind, and whether it was a thinking summary.
         # Claude Code shows thinking summaries and replies in one stream, so this is
         # what matches the terminal's order; Response alone runs behind it.

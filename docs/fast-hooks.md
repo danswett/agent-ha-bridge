@@ -194,8 +194,8 @@ program. So:
   space: it cannot quote). Measured 2026-09-27, the installed commands run as the agent
   runs them, median of 7: Claude UserPromptSubmit 608 -> 82 ms, Claude Stop 777 -> 80 ms
   (both include ~40 ms of Git Bash, which Claude Code always uses on Windows), Codex
-  PreToolUse 553 -> 38 ms. Claude Code reads hooks at start, so running sessions keep the
-  old commands until restarted; Codex asks to trust the changed hook once. The previous
+  PreToolUse 553 -> 38 ms. Claude Code picks the changed hooks up in running sessions (seen
+  2026-09-28: this session's hooks ran natively without a restart); Codex asks to trust the changed hook once. The previous
   Claude settings on DASDESK are in `~/.claude/settings.json.pre-native-hook`.
 - [x] **6. Copilot (and Agency, which runs Copilot and uses its hooks).** Found
   2026-09-27: Copilot CLI hooks accept `exec` + `args` to run a program with no shell
@@ -229,7 +229,7 @@ program. So:
 - [x] **R3. test-claude-install.ps1 in a sandbox TEMP**: it registered a fake session in
   the real %TEMP% owned by the Claude running the tests, which the daemon adopted.
 - [x] **R4. README and release notes**: Codex asks to trust its hook again once; running
-  Claude sessions pick up new hooks on restart.
+  Claude sessions pick up new hooks without a restart.
 - [x] **R5. DASDESK leftovers**: the portable Go (the user approved the machine-wide one),
   its zip, and test folders in %TEMP%. Keep the settings backups for now.
 - [x] **R6. test-dashboard.ps1 writes into the real bridge log**; point it at a temp log.

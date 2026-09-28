@@ -587,8 +587,8 @@ agent's hook command:
 
 * **Codex** asks you to trust the bridge's hook again, once - approve it, or its
   sessions stop showing on the dashboard.
-* **Claude Code** reads its hooks when a session starts, so sessions already running
-  keep the old ones until restarted. Both kinds work.
+* **Claude Code** picks up the new hooks by itself, even in sessions already running;
+  there is nothing to restart.
 * **Copilot CLI and Agency** use the native hook from Copilot 1.0.88; older versions
   keep PowerShell hooks.
 

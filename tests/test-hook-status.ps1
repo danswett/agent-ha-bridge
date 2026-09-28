@@ -290,13 +290,19 @@ try {
     Test-That 'without publishing an unchanged status again' { ($script:StatusPublished -join ',') -eq 'working' }
     Test-That 'and without clearing what the card shows' { $codexEntry.LastMessage -eq 'progress so far' }
 
-    Remove-Item -LiteralPath (Get-BridgeDaemonHeartbeat) -ErrorAction SilentlyContinue
-    Test-That 'with no daemon heartbeat, hooks publish themselves' { -not (Test-BridgeDaemonAlive) }
-    Set-BridgeDaemonAlive
-    Test-That 'with a fresh one, they leave it to the daemon' { Test-BridgeDaemonAlive }
-    $env:AGENT_BRIDGE_HOOKS_PUBLISH = '1'
-    Test-That 'unless told to publish anyway' { -not (Test-BridgeDaemonAlive) }
-    Remove-Item Env:\AGENT_BRIDGE_HOOKS_PUBLISH
+    # A private TEMP: the real heartbeat is what every hook on this machine checks, and
+    # deleting it sent them all to their slow PowerShell path for the duration.
+    $realTemp = $env:TEMP
+    $env:TEMP = $script:CodexStateRoot
+    try {
+        Test-That 'with no daemon heartbeat, hooks publish themselves' { -not (Test-BridgeDaemonAlive) }
+        Set-BridgeDaemonAlive
+        Test-That 'with a fresh one, they leave it to the daemon' { Test-BridgeDaemonAlive }
+        $env:AGENT_BRIDGE_HOOKS_PUBLISH = '1'
+        Test-That 'unless told to publish anyway' { -not (Test-BridgeDaemonAlive) }
+        Remove-Item Env:\AGENT_BRIDGE_HOOKS_PUBLISH
+    }
+    finally { $env:TEMP = $realTemp }
 }
 finally {
     Remove-Item -LiteralPath $script:CodexStateRoot -Recurse -Force -ErrorAction SilentlyContinue
