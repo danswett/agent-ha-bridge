@@ -47,9 +47,14 @@ Test-That 'Codex gets Copilot''s readers for the slots it leaves out' { (Get-Dae
 Test-That 'an unlisted kind gets Copilot''s readers' { (Get-DaemonAgent -Kind 'mcp').IsWorking -eq $script:DaemonAgents.copilot.IsWorking }
 Test-That 'but none of its flags' { -not (Get-DaemonAgent -Kind 'mcp').RefreshName }
 Test-That 'a blank kind gets Copilot''s flags too' { (Get-DaemonAgent -Kind '').RefreshName }
-Test-That 'only Claude has hook status and inline reasoning' {
-    @($script:DaemonAgents.Keys | Where-Object { (Get-DaemonAgent -Kind $_).HookStatus -or (Get-DaemonAgent -Kind $_).InlineReasoning }) -join ',' -eq 'claude'
+Test-That 'only Claude has hook status' {
+    @($script:DaemonAgents.Keys | Where-Object { (Get-DaemonAgent -Kind $_).HookStatus }) -join ',' -eq 'claude'
 }
+# Codex is inline too, but lays its own card out and never reaches Add-DaemonCardText.
+Test-That 'Claude and Copilot, which interleave thinking with text, show it inline' {
+    @($script:DaemonAgents.Keys | Where-Object { (Get-DaemonAgent -Kind $_).InlineReasoning }) -join ',' -eq 'copilot,claude'
+}
+Test-That 'an unlisted kind does not, so it keeps the expander' { -not (Get-DaemonAgent -Kind 'mcp').InlineReasoning }
 
 Write-Host '--- reading a transcript ---'
 $script:ClaudeAdapterLoaded = $true
@@ -87,7 +92,16 @@ $card = @{}; Add-DaemonCardText -Entry $entry -Detail $card -VerboseOn $true
 Test-That 'Claude shows its newest line, thinking included, inline' { $card.response -eq 'thought' -and $card.response_kind -eq 'reasoning' -and -not $card.ContainsKey('reasoning') }
 $entry.Kind = 'copilot'
 $card = @{}; Add-DaemonCardText -Entry $entry -Detail $card -VerboseOn $true
-Test-That 'Copilot shows its answer, with the reasoning below it' { $card.response -eq 'answer' -and $card.reasoning -eq 'why' }
+Test-That 'and so does Copilot, rather than an expander under an older line' { $card.response -eq 'thought' -and $card.response_kind -eq 'reasoning' -and -not $card.ContainsKey('reasoning') }
+$entry.LastMessageIsThinking = $false; $entry.LastMessage = 'the reply'
+$card = @{}; Add-DaemonCardText -Entry $entry -Detail $card -VerboseOn $true
+Test-That 'a newest line that is text is not marked as thinking' { $card.response -eq 'the reply' -and $card.response_kind -eq 'text' }
+$card = @{}; Add-DaemonCardText -Entry $entry -Detail $card -VerboseOn $false
+Test-That 'with Detailed activity off it falls back to the last answer' { $card.response -eq 'answer' -and -not $card.ContainsKey('reasoning') }
+# An MCP client publishes its own attributes and does not interleave the two.
+$expander = [pscustomobject]@{ Kind = 'mcp'; LastResponse = 'answer'; LastReasoning = 'why' }
+$card = @{}; Add-DaemonCardText -Entry $expander -Detail $card -VerboseOn $true
+Test-That 'an agent that does not interleave keeps the expander' { $card.response -eq 'answer' -and $card.reasoning -eq 'why' }
 
 Write-Host '--- the fast lane ---'
 function Update-DaemonPendingLaunch { param($Headers) }

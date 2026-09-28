@@ -68,6 +68,9 @@ $script:DaemonAgents = [ordered]@{
             ' Restart any running sessions so they pick it up.'
         }
         RefreshName = $true
+        # Copilot writes its thinking as messages of its own, interleaved with the ones
+        # carrying text, so the card can show them in order (Add-DaemonCardText).
+        InlineReasoning = $true
     }
 
     claude = @{

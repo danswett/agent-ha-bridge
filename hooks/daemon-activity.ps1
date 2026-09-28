@@ -208,6 +208,8 @@ function Get-ActivityFromEvents {
     $reasoning = $null
     $response = $null
     $status = $null
+    $latest = $null
+    $latestIsThinking = $false
     $history = New-Object System.Collections.Generic.List[string]
 
     foreach ($line in $Lines) {
@@ -236,6 +238,22 @@ function Get-ActivityFromEvents {
         if ($type -eq 'assistant.message') {
             try {
                 $parsed = $line | ConvertFrom-Json
+                # Within one message the thinking comes first and whatever it produced
+                # second, so both are recorded in that order and the later one is what
+                # the card shows as the newest line.
+                #
+                # Reasoning is captured unconditionally, regardless of the verbose
+                # toggle. Capture and display are deliberately decoupled: the daemon
+                # always keeps the latest reasoning in state, and only publishes it to
+                # the card when verbose is on. That lets a verbose toggle show or hide
+                # the existing reasoning instantly, without waiting for the session to
+                # think again.
+                $text = [string]$parsed.data.reasoningText
+                if (-not [string]::IsNullOrWhiteSpace($text)) {
+                    $reasoning = $text.Trim()
+                    $latest = $reasoning
+                    $latestIsThinking = $true
+                }
                 $content = [string]$parsed.data.content
                 if (-not [string]::IsNullOrWhiteSpace($content)) {
                     # The short summary is the first line, for the sensor state (capped
@@ -247,15 +265,9 @@ function Get-ActivityFromEvents {
                         $history.Add($summary)
                     }
                     $response = $content.Trim()
+                    $latest = $response
+                    $latestIsThinking = $false
                 }
-                # Reasoning is captured unconditionally, regardless of the verbose
-                # toggle. Capture and display are deliberately decoupled: the daemon
-                # always keeps the latest reasoning in state, and only publishes it to
-                # the card when verbose is on. That lets a verbose toggle show or hide
-                # the existing reasoning instantly, without waiting for the session to
-                # think again.
-                $text = [string]$parsed.data.reasoningText
-                if (-not [string]::IsNullOrWhiteSpace($text)) { $reasoning = $text.Trim() }
             }
             catch { }
             continue
@@ -268,6 +280,11 @@ function Get-ActivityFromEvents {
         Response = $response
         Status = $status
         History = @($history)
+        # The newest line of either kind, and which kind it is. Copilot interleaves
+        # thinking-only messages with ones that also carry text, the same shape Claude
+        # writes, so a card can show them in the order they happened.
+        Latest = $latest
+        LatestIsThinking = $latestIsThinking
     }
 }
 
@@ -464,7 +481,8 @@ function Update-DaemonSessionActivity {
     # can restore the whole card rather than blanking it.
     if ($entry.PSObject.Properties['LastHistory']) { $entry.LastHistory = $detail.history }
     else { $entry | Add-Member -NotePropertyName LastHistory -NotePropertyValue $detail.history -Force }
-    # The newest line of either kind, for Claude (see Add-DaemonCardText).
+    # The newest line of either kind, for the agents that interleave thinking with
+    # text (see Add-DaemonCardText).
     if ($agent.InlineReasoning) {
         $lastMessage = if (-not $turnStarted -and $entry.PSObject.Properties['LastMessage']) { [string]$entry.LastMessage } else { '' }
         $lastIsThinking = if (-not $turnStarted -and $entry.PSObject.Properties['LastMessageIsThinking']) { [bool]$entry.LastMessageIsThinking } else { $false }
@@ -620,12 +638,14 @@ function Add-DaemonCardText {
         Puts the card's main text (and, where it applies, the reasoning expander) into
         an activity update, from a session's remembered state.
 
-        Claude Code shows its thinking summaries and its replies in one stream, in the
-        order they happen. Showing the last reply as the response and the last thought
-        in an expander below it put an older line above a newer one, so the card read as
-        out of order against the terminal. With Detailed activity on, a Claude card
-        instead shows the newest line of either kind, and `response_kind` says whether
-        it is reasoning. Other agents keep the separate expander.
+        Claude Code and Copilot both show their thinking and their replies in one
+        stream, in the order they happen. Showing the last reply as the response and
+        the last thought in an expander below it put an older line above a newer one,
+        so the card read as out of order against the terminal. With Detailed activity
+        on, such a card instead shows the newest line of either kind, and
+        `response_kind` says whether it is reasoning. An agent that does not interleave
+        the two keeps the separate expander. (Codex is inline as well, but lays its own
+        card out in Update-DaemonCodexActivity and never comes through here.)
 
         Shared by the live update, the verbose toggle and the restart restore, so all
         three lay the card out the same way.
@@ -658,8 +678,8 @@ function Add-DaemonCardText {
         $Detail['response_kind'] = $shownKind
     }
 
-    # Claude's reasoning is already inline, in order; repeating it below would put it
-    # out of order again.
+    # Claude's and Copilot's reasoning is already inline, in order; repeating it below
+    # would put it out of order again.
     $reasoning = if ($Entry.PSObject.Properties['LastReasoning']) { [string]$Entry.LastReasoning } else { '' }
     if ($VerboseOn -and -not $inline -and -not [string]::IsNullOrWhiteSpace($reasoning)) {
         if ($reasoning.Length -gt $script:DaemonConfig.ReasoningMaxChars) {

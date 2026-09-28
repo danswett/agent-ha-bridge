@@ -631,6 +631,7 @@ bridge cannot tell, it asks; a scripted uninstall keeps them. `-ClearShared` and
 .\tests\test-bridge-adapter.ps1   # shared adapter orchestration (entities, status, notifications)
 .\tests\test-dashboard.ps1        # generated dashboard: title, view, session summary + version
 .\tests\test-security.ps1         # template injection, path and topic safety, token handling
+.\tests\test-copilot-activity.ps1 # Copilot's transcript reader, and the inline thinking on its card
 .\tests\test-reliability.ps1      # request budget, StrictMode safety, stale-state pruning
 .\tests\test-update.ps1           # version comparison, release cache, failure safety
 .\tests\test-update-outcome.ps1   # install spinner + updated/failed notification

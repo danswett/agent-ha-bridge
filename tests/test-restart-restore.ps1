@@ -52,21 +52,37 @@ Write-Host '--- a working session with full history is restored, not blanked ---
 $entry = New-Entry @{
     LastSummary   = 'Running: grep'
     LastReasoning = 'I should search the config first'
+    LastMessage   = 'I should search the config first'
+    LastMessageIsThinking = $true
     LastResponse  = 'Here is the result.'
     LastHistory   = @('Reading your message', 'Running: grep')
 }
 $card = Resolve-DaemonPrimedCard -Entry $entry -Status 'working' -VerboseOn $true
 Test-That 'the real summary is kept' { $card.Summary -eq 'Running: grep' }
-Test-That 'the reasoning is restored when verbose is on' { $card.Detail['reasoning'] -eq 'I should search the config first' }
-Test-That 'the last response is restored' { $card.Detail['response'] -eq 'Here is the result.' }
+Test-That 'the newest line is restored when verbose is on, marked as thinking' {
+    $card.Detail['response'] -eq 'I should search the config first' -and $card.Detail['response_kind'] -eq 'reasoning'
+}
+Test-That 'and not repeated in an expander under it' { -not $card.Detail.ContainsKey('reasoning') }
 Test-That 'the history is restored' { @($card.Detail['history']).Count -eq 2 }
 Test-That 'session and machine are carried' { $card.Detail['session'] -eq 'my task' -and $card.Detail['machine'] -eq 'DSWETT-HOME' }
 
 Write-Host '--- reasoning is withheld when verbose is off ---'
 $card = Resolve-DaemonPrimedCard -Entry $entry -Status 'working' -VerboseOn $false
+Test-That 'the last answer takes its place' { $card.Detail['response'] -eq 'Here is the result.' -and $card.Detail['response_kind'] -eq 'text' }
 Test-That 'no reasoning key when verbose is off' { -not $card.Detail.ContainsKey('reasoning') }
 Test-That 'the summary is still restored' { $card.Summary -eq 'Running: grep' }
 Test-That 'verbose flag reflects off' { $card.Detail['verbose'] -eq $false }
+
+Write-Host '--- an agent that does not interleave keeps its expander ---'
+# An MCP client, which publishes its own attributes rather than a single stream.
+$expander = New-Entry @{ Kind = 'mcp'; LastReasoning = 'I should search the config first'; LastResponse = 'Here is the result.' }
+$card = Resolve-DaemonPrimedCard -Entry $expander -Status 'working' -VerboseOn $true
+Test-That 'its answer is restored with the reasoning below it' {
+    $card.Detail['response'] -eq 'Here is the result.' -and $card.Detail['reasoning'] -eq 'I should search the config first'
+}
+Test-That 'and withheld when verbose is off' {
+    -not (Resolve-DaemonPrimedCard -Entry $expander -Status 'working' -VerboseOn $false).Detail.ContainsKey('reasoning')
+}
 
 Write-Host '--- a session with no remembered activity falls back cleanly ---'
 $bare = New-Entry
@@ -78,7 +94,7 @@ Test-That 'no reasoning/response/history keys when nothing is remembered' {
 }
 
 Write-Host '--- empty remembered fields do not produce empty attributes ---'
-$blank = New-Entry @{ LastSummary = '  '; LastReasoning = ''; LastResponse = $null }
+$blank = New-Entry @{ Kind = 'mcp'; LastSummary = '  '; LastReasoning = ''; LastResponse = $null }
 $card = Resolve-DaemonPrimedCard -Entry $blank -Status 'working' -VerboseOn $true
 Test-That 'blank summary falls back to a label' { $card.Summary -eq 'Working' }
 Test-That 'blank reasoning is not published' { -not $card.Detail.ContainsKey('reasoning') }
