@@ -238,9 +238,90 @@ function New-CopilotMqttDeviceBlock {
 
     @{
         identifiers = @($Node)
-        name = "Copilot: $SessionName"
+        # Already carries its harness prefix - "Copilot: ...", "Claude: ...", "Codex:
+        # ..." - from the adapter that named it. Prefixing again here is what produced
+        # devices called "Copilot: Copilot: 6fcbab0c", and "Copilot: Claude: repo" on
+        # every Claude session.
+        name = $SessionName
         manufacturer = 'AI CLI bridge'
         model = $Machine
+    }
+}
+
+function New-CopilotMqttSensorConfigs {
+    <#
+        The discovery configs for a session's two sensors, which the daemon owns.
+
+        Shared by the initial publish and by a rename, so the two cannot drift: a
+        rename republishes exactly these, and nothing else.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Node,
+        [Parameter(Mandatory)]$Topics,
+        [Parameter(Mandatory)][hashtable]$Device,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Availability
+    )
+
+    @(
+        @{
+            Object = 'status'
+            Config = @{
+                name = 'Status'
+                unique_id = "${Node}_status"
+                state_topic = $Topics.StatusState
+                json_attributes_topic = $Topics.StatusAttributes
+                icon = 'mdi:robot'
+                device = $Device
+                availability = $Availability
+            }
+        }
+        # Live activity. The state is a short label; the full text, including reasoning
+        # when the verbose toggle is on, rides in the attributes.
+        @{
+            Object = 'activity'
+            Config = @{
+                name = 'Activity'
+                unique_id = "${Node}_activity"
+                state_topic = $Topics.ActivityState
+                json_attributes_topic = $Topics.ActivityAttributes
+                icon = 'mdi:pulse'
+                device = $Device
+                availability = $Availability
+            }
+        }
+    )
+}
+
+function Update-CopilotMqttSessionName {
+    <#
+        Renames a session's device, so the names Home Assistant shows follow a rename
+        instead of keeping whatever the session was called when it was adopted - which
+        for Copilot is normally the id, because the workspace file naming it is written
+        after the daemon first sees the session.
+
+        Every entity of a session shares one device block, so renaming it through any
+        of them renames the device and every entity name derived from it. The two
+        sensors are the ones used because they are the only entities with nothing to
+        lose: they take their state from a retained state topic, while the selects, the
+        reply box and the buttons are optimistic, and republishing one of those would
+        reset a live question to Idle.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][string]$SessionName,
+        [Parameter(Mandatory)][string]$Machine,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $topics = Get-CopilotMqttTopics -SessionId $SessionId
+    $node = $topics.Node
+    $device = New-CopilotMqttDeviceBlock -Node $node -SessionName $SessionName -Machine $Machine
+    $availability = @(@{ topic = $topics.Availability; payload_available = 'online'; payload_not_available = 'offline' })
+    $prefix = $script:CopilotMqttConfig.DiscoveryPrefix
+
+    foreach ($entry in (New-CopilotMqttSensorConfigs -Node $node -Topics $topics -Device $device -Availability $availability)) {
+        Publish-CopilotMqttMessage -Topic "$prefix/sensor/$node/$($entry.Object)/config" `
+            -Payload ($entry.Config | ConvertTo-Json -Depth 8 -Compress) -Headers $Headers -Retain
     }
 }
 
@@ -316,36 +397,15 @@ function Publish-CopilotMqttSession {
     $replyPayload = New-CopilotMqttReplyPayloadConfig -Node $node -Device $device `
         -Availability $availability -Topic $topics.ReplyPayload
 
-    # Sensors are published by the daemon, so these keep a state topic.
-    $status = @{
-        name = 'Status'
-        unique_id = "${node}_status"
-        state_topic = $topics.StatusState
-        json_attributes_topic = $topics.StatusAttributes
-        icon = 'mdi:robot'
-        device = $device
-        availability = $availability
-    }
-
-    # Live activity. The state is a short label; the full text, including reasoning
-    # when the verbose toggle is on, rides in the attributes.
-    $activity = @{
-        name = 'Activity'
-        unique_id = "${node}_activity"
-        state_topic = $topics.ActivityState
-        json_attributes_topic = $topics.ActivityAttributes
-        icon = 'mdi:pulse'
-        device = $device
-        availability = $availability
-    }
+    # Sensors are published by the daemon, so these keep a state topic. Built by the
+    # helper a rename reuses, so the two paths publish the same configs.
+    $sensors = @(New-CopilotMqttSensorConfigs -Node $node -Topics $topics -Device $device -Availability $availability)
 
     $map = @(
         @{ Component = 'select'; Object = 'decision'; Config = $decision }
         @{ Component = 'text'; Object = 'reply'; Config = $reply }
         @{ Component = 'sensor'; Object = 'replypayload'; Config = $replyPayload }
-        @{ Component = 'sensor'; Object = 'status'; Config = $status }
-        @{ Component = 'sensor'; Object = 'activity'; Config = $activity }
-    )
+    ) + @($sensors | ForEach-Object { @{ Component = 'sensor'; Object = $_.Object; Config = $_.Config } })
 
     foreach ($entry in $map) {
         $topic = "$prefix/$($entry.Component)/$node/$($entry.Object)/config"

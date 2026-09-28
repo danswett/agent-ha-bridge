@@ -203,6 +203,43 @@ Test-That 'it has a node-scoped unique id' { $stopCfg.Payload -match "`"unique_i
 Test-That 'it is named End session' { $stopCfg.Payload -match '"name":"End session"' }
 Test-That 'it carries the session availability topic' { $stopCfg.Payload -match '"availability"' }
 
+Write-Host ''
+Write-Host '--- the device is named as the session is, once ---'
+# The session name already carries its harness prefix, so prefixing again here is what
+# produced devices called "Copilot: Copilot: 6fcbab0c" - and, on a Claude session,
+# "Copilot: Claude: repo".
+$script:MqttMsgs = @()
+[void](Publish-CopilotMqttSession -SessionId 'aaaaaaaa-1111-2222-3333-444444444444' -SessionName 'Copilot: my task' -Machine 'M' -Headers $headers)
+$statusCfg = ($script:MqttMsgs | Where-Object { $_.Topic -match "/sensor/$node/status/config$" } | Select-Object -First 1)
+Test-That 'the device takes the session name verbatim' { $statusCfg.Payload -match '"name":"Copilot: my task"' }
+Test-That 'and is not prefixed a second time' { $statusCfg.Payload -notmatch 'Copilot: Copilot:' }
+$script:MqttMsgs = @()
+[void](Publish-CopilotMqttSession -SessionId 'aaaaaaaa-1111-2222-3333-444444444444' -SessionName 'Claude: repo' -Machine 'M' -Headers $headers)
+Test-That 'another agent''s session keeps its own prefix' {
+    ($script:MqttMsgs | Where-Object { $_.Topic -match "/sensor/$node/status/config$" }).Payload -match '"name":"Claude: repo"'
+}
+
+Write-Host ''
+Write-Host '--- renaming a session renames its device, and touches nothing else ---'
+$script:MqttMsgs = @()
+Update-CopilotMqttSessionName -SessionId 'aaaaaaaa-1111-2222-3333-444444444444' `
+    -SessionName 'Copilot: agent-ha-bridge' -Machine 'M' -Headers $headers
+$renamed = @($script:MqttMsgs | Where-Object { $_.Topic -match "/sensor/$node/(status|activity)/config$" })
+Test-That 'both sensors are republished' { $renamed.Count -eq 2 }
+Test-That 'under the new name' { @($renamed | Where-Object { $_.Payload -match '"name":"Copilot: agent-ha-bridge"' }).Count -eq 2 }
+Test-That 'retained, or the rename would not stick' { @($script:MqttMsgs).Count -eq 2 }
+# Republishing an optimistic entity resets it, which would blank a question mid-flight.
+Test-That 'no select, text or button is republished' {
+    @($script:MqttMsgs | Where-Object { $_.Topic -match '/(select|text|button)/' }).Count -eq 0
+}
+Test-That 'the sensors keep their state topics, so the card does not blank' {
+    @($renamed | Where-Object { $_.Payload -match '"state_topic"' }).Count -eq 2
+}
+Test-That 'and the rename returns nothing to its caller' {
+    $null -eq (Update-CopilotMqttSessionName -SessionId 'aaaaaaaa-1111-2222-3333-444444444444' `
+        -SessionName 'Copilot: agent-ha-bridge' -Machine 'M' -Headers $headers)
+}
+
 $script:MqttMsgs = @()
 Remove-CopilotMqttSession -SessionId 'aaaaaaaa-1111-2222-3333-444444444444' -Headers $headers
 $cleared = ($script:MqttMsgs | Where-Object { $_.Topic -match "/button/$node/stop/config$" } | Select-Object -First 1)

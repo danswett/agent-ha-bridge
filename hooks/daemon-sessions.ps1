@@ -490,6 +490,10 @@ function Update-DaemonKnownSession {
                     process_id = $session.ProcessId
                     updated = [DateTimeOffset]::Now.ToString('o')
                 } | Out-Null
+                # The card reads the name above; this is what carries it to the names
+                # Home Assistant itself shows, which are built from the device's.
+                Update-CopilotMqttSessionName -SessionId $id -SessionName ([string]$entry.Name) `
+                    -Machine ([string]$entry.Machine) -Headers $Headers | Out-Null
             }
             catch { }
             Write-DaemonLog -Message "renamed $($id.Substring(0,8)) to '$($entry.Name)'"
