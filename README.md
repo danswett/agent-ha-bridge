@@ -131,6 +131,10 @@ cd agent-ha-bridge
 
 ### macOS
 
+> **Preview.** macOS support passes the full test suite on macOS in CI, including
+> replies typed into a live tmux session, but has not yet had much use on real Macs.
+> Please report anything that misbehaves, with the output of `agent-ha-bridge logs`.
+
 The one-liner, in Terminal:
 
 ```bash
