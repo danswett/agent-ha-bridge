@@ -391,17 +391,13 @@ function Set-DaemonSessionProperty {
     else { $Entry | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force }
 }
 
-function Start-BridgeDaemon {
-    $headers = Get-HomeAssistantHeaders
-    $state = Read-DaemonState
-
-    # Deliberately no pruning here. Sync-DaemonSessions retires anything that is no
-    # longer live, which both removes its Home Assistant entities and drops it from
-    # state. Pruning first would discard the record while leaving the published
-    # entities behind as orphans.
-    $live = Get-LiveBridgeSessions
-    # Seed the fast lane, so streaming starts now rather than after the first reconcile.
-    $script:DaemonLive = $live
+function Initialize-DaemonStartup {
+    # Once per start, before the first pass: tidy what an earlier daemon or an older
+    # bridge left behind, and get ready for the first reply.
+    param([hashtable]$Headers, [hashtable]$State, [hashtable]$Live)
+    $headers = $Headers
+    $state = $State
+    $live = $Live
 
     Write-DaemonLog -Message "daemon starting (pid $PID), $($live.Count) live session(s)"
 
@@ -465,13 +461,20 @@ function Start-BridgeDaemon {
     }
 
     Clear-CopilotMqttOrphans -Headers $headers -Live $live
+}
 
+function Restore-DaemonSessionCards {
     # Prime every live session's status and activity up front. Persisted state makes
     # a session "already known", so the first reconcile skips the new-session branch
     # that sets these; without priming, an idle session that produced no new
     # transcript activity would sit at 'unknown' on the dashboard after a restart.
     # This is a handful of publishes once per daemon start, so it is done
     # unconditionally rather than guarded.
+    param([hashtable]$Headers, [hashtable]$State, [hashtable]$Live)
+    $headers = $Headers
+    $state = $State
+    $live = $Live
+
     Sync-DaemonSessions -Headers $headers -State $state
     # Reasoning is only shown while the verbose toggle is on, matching the reconcile,
     # so read it once for the restore below.
@@ -528,6 +531,163 @@ function Start-BridgeDaemon {
             Write-DaemonLog -Message "status prime failed for $sid : $($_.Exception.Message)"
         }
     }
+}
+
+function Get-DaemonWatchEntities {
+    # Watch every live session's reply box and decision selector, plus the Live
+    # Verbose toggle. The subscription returns the instant Home Assistant pushes a
+    # change, so an answer is injected and a verbose toggle reflected immediately.
+    # Both are also backed by the authoritative sweep in the reconcile below, which
+    # catches anything that lands between watch windows.
+    param([hashtable]$State)
+    $watchEntities = @(
+        foreach ($sessionId in @($State.Keys)) {
+            $node = Get-CopilotMqttNodeId -SessionId $sessionId
+            "text.${node}_reply"
+            "select.${node}_decision"
+            "button.${node}_submit"
+            # The reply card publishes here rather than to the text box. Left out,
+            # a card reply waited for the 15-second reconcile to be noticed.
+            "sensor.${node}_reply_payload"
+            # End session, likewise: left out, a press sat unnoticed for up to 15 s.
+            "button.${node}_stop"
+        }
+    ) +
+        # Launch too: left out, a press sat unnoticed for up to 15 s with nothing
+        # on the card to say it had been seen.
+        @($script:DaemonEntity.NewSession)
+    , $watchEntities
+}
+
+function Wait-DaemonChange {
+    # Waits for a watched entity to change, or for the reconcile interval to pass,
+    # streaming activity meanwhile. Returns the change, or $null.
+    param([hashtable]$Headers, [hashtable]$State, [string[]]$WatchEntities)
+    $headers = $Headers
+    $state = $State
+
+    $hit = $null
+    try {
+        # The fast lane runs on every tick of the wait, on this thread, so it
+        # shares state with the reconcile without any locking. A plain script
+        # block, not a closure: GetNewClosure() would run it in a new module scope
+        # that cannot see this script's functions.
+        # It returns $true to end the wait early when a reconcile is wanted now.
+        $fastLane = { Invoke-DaemonFastActivity -Headers $headers -State $state | Out-Null; [bool]$script:DaemonReconcileNow }
+        $hit = Wait-CopilotHaStateChange -EntityIds $WatchEntities `
+            -TimeoutSeconds $ReconcileSeconds -OnTick $fastLane -TickMilliseconds 100
+        $script:DaemonWatchFailures = 0
+    }
+    catch {
+        # A normal timeout returns $null and is not an error; only a genuine
+        # connection failure lands here. Back off exponentially (capped) so a
+        # Home Assistant outage does not spin a tight reconnect loop.
+        $script:DaemonWatchFailures++
+        $backoff = [int][Math]::Min(2 * [Math]::Pow(2, $script:DaemonWatchFailures - 1), 60)
+        Write-DaemonLog -Message "watch failed (attempt $($script:DaemonWatchFailures)): $($_.Exception.Message); retrying in ${backoff}s"
+        Start-Sleep -Seconds $backoff
+    }
+    $hit
+}
+
+function Invoke-DaemonHit {
+    # Acts at once on a press that should not wait for the reconcile.
+    param($Hit, [hashtable]$Headers, [hashtable]$State)
+    $hit = $Hit
+    $headers = $Headers
+    $state = $State
+    if ($null -eq $hit) { return }
+
+    # A reply from the dashboard is delivered before anything else. The reconcile
+    # below would get to it too, but only after a string of unrelated Home
+    # Assistant calls. The payload stamp and submit press are recorded before
+    # delivery, so the reconcile's own pass cannot send it a second time.
+    if ($hit.EntityId -match '_(reply|reply_payload|submit)$') {
+        try {
+            Invoke-PendingReplies -Headers $headers -State $state -Live $script:DaemonLive
+        }
+        catch {
+            Write-DaemonLog -Message "reply delivery failed: $($_.Exception.Message)"
+        }
+    }
+
+    # End session is acted on before the reconcile below, not inside it: the
+    # reconcile then finds the session gone and drops its card in the same pass.
+    # Inside the reconcile the stop came after the check for exited sessions, so
+    # the card stayed up until the next pass.
+    if ($hit.EntityId -match '_stop$') {
+        try {
+            Invoke-PendingStops -Headers $headers -State $state -Live $script:DaemonLive
+        }
+        catch {
+            Write-DaemonLog -Message "end session failed: $($_.Exception.Message)"
+        }
+    }
+
+    # Launch, likewise at once: its "Starting..." note is the feedback that the
+    # press landed, and waiting for the next reconcile left it up to 15 s late.
+    if ($hit.EntityId -eq $script:DaemonEntity.NewSession) {
+        try {
+            $liveNow = if ($script:DaemonLive -is [hashtable]) { $script:DaemonLive } else { @{} }
+            Sync-DaemonNewSession -Headers $headers -Live $liveNow
+        }
+        catch {
+            Write-DaemonLog -Message "launch failed: $($_.Exception.Message)"
+        }
+    }
+}
+
+function Invoke-DaemonReconcile {
+    # One authoritative pass over everything the daemon keeps in step.
+    param([hashtable]$Headers, [hashtable]$State)
+    $headers = $Headers
+    $state = $State
+    try {
+        # The reconcile makes a string of Home Assistant calls, and a
+        # transcript write that lands during it would otherwise wait for all of
+        # them. The fast lane between steps costs a file-size check per session
+        # when nothing changed.
+        $live = Get-LiveBridgeSessions
+        Sync-DaemonSessions -Headers $headers -State $state -Live $live
+        Repair-CopilotSessionEntities -Headers $headers -State $state -Live $live
+        Invoke-DaemonFastActivity -Headers $headers -State $state
+        Invoke-PendingDecisions -Headers $headers -State $state -Live $live
+        Invoke-PendingReplies -Headers $headers -State $state -Live $live
+        Invoke-DaemonFastActivity -Headers $headers -State $state
+        Invoke-PendingCodexApprovals -Headers $headers -State $state -Live $live
+        Invoke-PendingStops -Headers $headers -State $state -Live $live
+        Invoke-DaemonFastActivity -Headers $headers -State $state
+        Sync-DaemonUpdateStatus -Headers $headers
+        Sync-DaemonNewSession -Headers $headers -Live $live
+        Sync-DaemonClients -Headers $headers
+        Clear-DaemonStaleNote -Headers $headers
+        Invoke-DaemonFastActivity -Headers $headers -State $state
+        Write-DaemonState -State $state
+        # A pass that got this far talked to Home Assistant, so hooks can skip
+        # their own reachability probe for a while (Test-HomeAssistantReachable),
+        # and it is alive to publish what they record (Test-BridgeDaemonAlive).
+        Set-BridgeHomeAssistantReachable
+        Set-BridgeDaemonAlive
+    }
+    catch {
+        Write-DaemonLog -Message "reconcile failed: $($_.Exception.Message)"
+    }
+}
+
+function Start-BridgeDaemon {
+    $headers = Get-HomeAssistantHeaders
+    $state = Read-DaemonState
+
+    # Deliberately no pruning here. Sync-DaemonSessions retires anything that is no
+    # longer live, which both removes its Home Assistant entities and drops it from
+    # state. Pruning first would discard the record while leaving the published
+    # entities behind as orphans.
+    $live = Get-LiveBridgeSessions
+    # Seed the fast lane, so streaming starts now rather than after the first reconcile.
+    $script:DaemonLive = $live
+
+    Initialize-DaemonStartup -Headers $headers -State $state -Live $live
+    Restore-DaemonSessionCards -Headers $headers -State $state -Live $live
     Repair-CopilotSessionEntities -Headers $headers -State $state -Live $live
     Invoke-PendingDecisions -Headers $headers -State $state -Live $live
     Invoke-PendingReplies -Headers $headers -State $state -Live $live
@@ -545,123 +705,16 @@ function Start-BridgeDaemon {
     $lastReconcile = [DateTimeOffset]::Now
 
     while ($true) {
-        # Watch every live session's reply box and decision selector, plus the Live
-        # Verbose toggle. The subscription returns the instant Home Assistant pushes a
-        # change, so an answer is injected and a verbose toggle reflected immediately.
-        # Both are also backed by the authoritative sweep in the reconcile below, which
-        # catches anything that lands between watch windows.
-        $watchEntities = @(
-            foreach ($sessionId in @($state.Keys)) {
-                $node = Get-CopilotMqttNodeId -SessionId $sessionId
-                "text.${node}_reply"
-                "select.${node}_decision"
-                "button.${node}_submit"
-                # The reply card publishes here rather than to the text box. Left out,
-                # a card reply waited for the 15-second reconcile to be noticed.
-                "sensor.${node}_reply_payload"
-                # End session, likewise: left out, a press sat unnoticed for up to 15 s.
-                "button.${node}_stop"
-            }
-        ) +
-            # Launch too: left out, a press sat unnoticed for up to 15 s with nothing
-            # on the card to say it had been seen.
-            @($script:DaemonEntity.NewSession)
-
-        $hit = $null
-        try {
-            # The fast lane runs on every tick of the wait, on this thread, so it
-            # shares state with the reconcile without any locking. A plain script
-            # block, not a closure: GetNewClosure() would run it in a new module scope
-            # that cannot see this script's functions.
-            # It returns $true to end the wait early when a reconcile is wanted now.
-            $fastLane = { Invoke-DaemonFastActivity -Headers $headers -State $state | Out-Null; [bool]$script:DaemonReconcileNow }
-            $hit = Wait-CopilotHaStateChange -EntityIds $watchEntities `
-                -TimeoutSeconds $ReconcileSeconds -OnTick $fastLane -TickMilliseconds 100
-            $script:DaemonWatchFailures = 0
-        }
-        catch {
-            # A normal timeout returns $null and is not an error; only a genuine
-            # connection failure lands here. Back off exponentially (capped) so a
-            # Home Assistant outage does not spin a tight reconnect loop.
-            $script:DaemonWatchFailures++
-            $backoff = [int][Math]::Min(2 * [Math]::Pow(2, $script:DaemonWatchFailures - 1), 60)
-            Write-DaemonLog -Message "watch failed (attempt $($script:DaemonWatchFailures)): $($_.Exception.Message); retrying in ${backoff}s"
-            Start-Sleep -Seconds $backoff
-        }
-
-        # A reply from the dashboard is delivered before anything else. The reconcile
-        # below would get to it too, but only after a string of unrelated Home
-        # Assistant calls. The payload stamp and submit press are recorded before
-        # delivery, so the reconcile's own pass cannot send it a second time.
-        if ($null -ne $hit -and $hit.EntityId -match '_(reply|reply_payload|submit)$') {
-            try {
-                Invoke-PendingReplies -Headers $headers -State $state -Live $script:DaemonLive
-            }
-            catch {
-                Write-DaemonLog -Message "reply delivery failed: $($_.Exception.Message)"
-            }
-        }
-
-        # End session is acted on before the reconcile below, not inside it: the
-        # reconcile then finds the session gone and drops its card in the same pass.
-        # Inside the reconcile the stop came after the check for exited sessions, so
-        # the card stayed up until the next pass.
-        if ($null -ne $hit -and $hit.EntityId -match '_stop$') {
-            try {
-                Invoke-PendingStops -Headers $headers -State $state -Live $script:DaemonLive
-            }
-            catch {
-                Write-DaemonLog -Message "end session failed: $($_.Exception.Message)"
-            }
-        }
-
-        # Launch, likewise at once: its "Starting..." note is the feedback that the
-        # press landed, and waiting for the next reconcile left it up to 15 s late.
-        if ($null -ne $hit -and $hit.EntityId -eq $script:DaemonEntity.NewSession) {
-            try {
-                $liveNow = if ($script:DaemonLive -is [hashtable]) { $script:DaemonLive } else { @{} }
-                Sync-DaemonNewSession -Headers $headers -Live $liveNow
-            }
-            catch {
-                Write-DaemonLog -Message "launch failed: $($_.Exception.Message)"
-            }
-        }
+        $watchEntities = Get-DaemonWatchEntities -State $state
+        $hit = Wait-DaemonChange -Headers $headers -State $state -WatchEntities $watchEntities
+        Invoke-DaemonHit -Hit $hit -Headers $headers -State $state
 
         # A push hit only shortcuts latency; the sweep in the reconcile does the
         # authoritative delivery, so both paths funnel through the same guarded code.
         if (([DateTimeOffset]::Now - $lastReconcile).TotalSeconds -ge $ReconcileSeconds -or
             $null -ne $hit -or $script:DaemonReconcileNow) {
             $script:DaemonReconcileNow = $false
-            try {
-                # The reconcile makes a string of Home Assistant calls, and a
-                # transcript write that lands during it would otherwise wait for all of
-                # them. The fast lane between steps costs a file-size check per session
-                # when nothing changed.
-                $live = Get-LiveBridgeSessions
-                Sync-DaemonSessions -Headers $headers -State $state -Live $live
-                Repair-CopilotSessionEntities -Headers $headers -State $state -Live $live
-                Invoke-DaemonFastActivity -Headers $headers -State $state
-                Invoke-PendingDecisions -Headers $headers -State $state -Live $live
-                Invoke-PendingReplies -Headers $headers -State $state -Live $live
-                Invoke-DaemonFastActivity -Headers $headers -State $state
-                Invoke-PendingCodexApprovals -Headers $headers -State $state -Live $live
-                Invoke-PendingStops -Headers $headers -State $state -Live $live
-                Invoke-DaemonFastActivity -Headers $headers -State $state
-                Sync-DaemonUpdateStatus -Headers $headers
-                Sync-DaemonNewSession -Headers $headers -Live $live
-                Sync-DaemonClients -Headers $headers
-                Clear-DaemonStaleNote -Headers $headers
-                Invoke-DaemonFastActivity -Headers $headers -State $state
-                Write-DaemonState -State $state
-                # A pass that got this far talked to Home Assistant, so hooks can skip
-                # their own reachability probe for a while (Test-HomeAssistantReachable),
-                # and it is alive to publish what they record (Test-BridgeDaemonAlive).
-                Set-BridgeHomeAssistantReachable
-                Set-BridgeDaemonAlive
-            }
-            catch {
-                Write-DaemonLog -Message "reconcile failed: $($_.Exception.Message)"
-            }
+            Invoke-DaemonReconcile -Headers $headers -State $state
             $lastReconcile = [DateTimeOffset]::Now
 
             # A newly installed adapter is only loaded at startup, so the daemon ends
