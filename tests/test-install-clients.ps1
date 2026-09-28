@@ -211,6 +211,82 @@ Test-That 'this suite runs with input redirected, so it reports non-interactive'
     ([Console]::IsInputRedirected) -eq (-not (Test-BridgeConsoleInteractive))
 }
 
+Write-Host '--- a command that exists is not the same as a command that works ---'
+# npm writes a package's bin entry before it runs the package's postinstall, so a
+# postinstall that fails leaves the command on PATH doing nothing. The installer has
+# to notice, or re-running it skips the one thing that is actually broken.
+$probePwsh = Get-BridgePwshPath
+Test-That 'pwsh is available to probe with' { [bool]$probePwsh } "$probePwsh"
+
+$missingExe = Join-Path ([IO.Path]::GetTempPath()) 'bridge-no-such-agent-ffff'
+$probeGood = Invoke-BridgeCommandProbe -Executable $probePwsh -Arguments @('-NoProfile', '-Command', 'exit 0')
+Test-That 'a command that exits 0 is reported as having run' {
+    $probeGood.Ran -and -not $probeGood.TimedOut -and $probeGood.ExitCode -eq 0
+} "ran=$($probeGood.Ran) code=$($probeGood.ExitCode)"
+
+$probeBad = Invoke-BridgeCommandProbe -Executable $probePwsh `
+    -Arguments @('-NoProfile', '-Command', 'Write-Error cannot-find-module; exit 1')
+Test-That 'a command that fails reports its exit code' { $probeBad.Ran -and $probeBad.ExitCode -eq 1 } "code=$($probeBad.ExitCode)"
+Test-That 'and what it said, so the failure can be quoted back' { $probeBad.Output -match 'cannot-find-module' } $probeBad.Output
+
+$probeSlow = Invoke-BridgeCommandProbe -Executable $probePwsh `
+    -Arguments @('-NoProfile', '-Command', 'Start-Sleep -Seconds 30') -TimeoutMs 1500
+Test-That 'a command that never answers is killed, not waited on' { $probeSlow.TimedOut } "timedOut=$($probeSlow.TimedOut)"
+
+$probeMissing = Invoke-BridgeCommandProbe -Executable $missingExe
+Test-That 'a command that cannot be executed at all is not reported as run' { -not $probeMissing.Ran }
+
+Test-That 'Test-BridgeCommandRuns agrees that pwsh runs' { Test-BridgeCommandRuns -Executable $probePwsh }
+Test-That 'and that a missing file does not' { -not (Test-BridgeCommandRuns -Executable $missingExe) }
+
+Write-Host '--- a half-installed agent CLI counts as missing, so a re-run repairs it ---'
+# The exact shape of the Claude Code failure on macOS: `claude` on PATH, because npm
+# linked it, but its postinstall never finished, so it exits non-zero immediately.
+$fakeBin = Join-Path ([IO.Path]::GetTempPath()) ("bridge-fakebin-" + [Guid]::NewGuid().ToString('N'))
+New-Item -ItemType Directory -Path $fakeBin -Force | Out-Null
+$pathBefore = $env:PATH
+function Write-FakeAgent {
+    param([string]$Directory, [string]$Command, [int]$Exit)
+    if ($script:BridgeIsWindows) {
+        $file = Join-Path $Directory "$Command.cmd"
+        Set-Content -LiteralPath $file -Encoding ascii -Value @(
+            '@echo off'
+            $(if ($Exit -eq 0) { 'echo 1.2.3' } else { 'echo postinstall never ran 1>&2' })
+            "exit /b $Exit"
+        )
+    }
+    else {
+        $file = Join-Path $Directory $Command
+        Set-Content -LiteralPath $file -Encoding ascii -Value @(
+            '#!/bin/sh'
+            $(if ($Exit -eq 0) { 'echo 1.2.3' } else { 'echo postinstall never ran >&2' })
+            "exit $Exit"
+        )
+        & /bin/chmod '+x' $file
+    }
+    $file
+}
+try {
+    $env:PATH = $fakeBin + [IO.Path]::PathSeparator + $env:PATH
+
+    [void](Write-FakeAgent -Directory $fakeBin -Command 'claude' -Exit 1)
+    Test-That 'a claude that is on PATH but exits non-zero is not "installed"' {
+        -not (Test-BridgeClientInstalled 'claude')
+    }
+    Test-That 'so the installer would offer to install it again' {
+        -not (Test-BridgeDependencyInstalled 'claude')
+    }
+
+    [void](Write-FakeAgent -Directory $fakeBin -Command 'claude' -Exit 0)
+    Test-That 'and a claude that answers --version is' {
+        Test-BridgeClientInstalled 'claude'
+    }
+}
+finally {
+    $env:PATH = $pathBefore
+    Remove-Item -LiteralPath $fakeBin -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 Write-Host ''
 if ($script:Failures) {
     Write-Host "$($script:Failures) check(s) failed" -ForegroundColor Red

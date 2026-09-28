@@ -290,6 +290,82 @@ function Find-BridgeAgentAncestor {
     0
 }
 
+function Invoke-BridgeCommandProbe {
+    <#
+        Runs a command with a deadline and reports what it did: its exit code, what it
+        wrote to either stream, and whether it had to be killed.
+
+        Both the installer and the launcher use this to ask an agent for its version,
+        which is the cheapest way to tell a working install from a shim left behind by
+        a half-finished one - npm writes a package's `bin` entry before running its
+        postinstall, so a postinstall that fails leaves a command that exists, is on
+        PATH, and does nothing. The deadline matters because the launcher calls this
+        from inside the daemon: an agent that waits for input rather than answering
+        must not hold a launch open.
+
+        Arguments are handed to Start-Process as they are, which does its own quoting
+        on Windows - fine for the plain flags this is for, not for arguments that
+        contain quotes of their own.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Executable,
+        [string[]]$Arguments = @('--version'),
+        [int]$TimeoutMs = 5000
+    )
+
+    $out = [IO.Path]::GetTempFileName()
+    $err = [IO.Path]::GetTempFileName()
+    $result = [pscustomobject]@{ ExitCode = -1; Output = ''; TimedOut = $false; Ran = $false }
+    try {
+        $start = @{
+            FilePath               = $Executable
+            ArgumentList           = $Arguments
+            RedirectStandardOutput = $out
+            RedirectStandardError  = $err
+            PassThru               = $true
+            NoNewWindow            = $true
+            ErrorAction            = 'Stop'
+        }
+        $process = Start-Process @start
+        $result.Ran = $true
+        if ($process.WaitForExit($TimeoutMs)) {
+            $result.ExitCode = $process.ExitCode
+        }
+        else {
+            $result.TimedOut = $true
+            try { $process.Kill($true) } catch { }
+        }
+        $text = @(
+            (Get-Content -LiteralPath $out -Raw -ErrorAction SilentlyContinue)
+            (Get-Content -LiteralPath $err -Raw -ErrorAction SilentlyContinue)
+        ) -join ' '
+        $result.Output = ($text -replace '\s+', ' ').Trim()
+    }
+    catch {
+        # Start-Process throws outright when the file cannot be executed at all.
+        $result.Output = ($_.Exception.Message -replace '\s+', ' ').Trim()
+    }
+    finally {
+        Remove-Item -LiteralPath $out, $err -Force -ErrorAction SilentlyContinue
+    }
+    $result
+}
+
+function Test-BridgeCommandRuns {
+    <#
+        Whether a command is not merely present but actually runs. Answers --version
+        with a zero exit code is the bar: every agent CLI supports it, and none of
+        them treat it as work.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Executable,
+        [int]$TimeoutMs = 5000
+    )
+
+    $probe = Invoke-BridgeCommandProbe -Executable $Executable -TimeoutMs $TimeoutMs
+    [bool]($probe.Ran -and -not $probe.TimedOut -and $probe.ExitCode -eq 0)
+}
+
 # --------------------------------------------------------------------------- tmux
 
 function Get-BridgeTmuxPath {

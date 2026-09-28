@@ -147,6 +147,59 @@ $script:DaemonPendingLaunch.LastCheck = [DateTimeOffset]::MinValue
 Update-DaemonPendingLaunch -Headers @{}
 Test-That 'but not forever' { $null -eq $script:DaemonPendingLaunch -and $script:Notes[-1] -match 'still waiting on a question in its window' }
 
+Write-Host ''
+Write-Host '--- when a tmux pane is gone before it can be read, say why ---'
+# tmux returns 0 from new-session as soon as the session exists, so an agent that
+# cannot start still looks like a successful launch. The old message named the
+# symptom ("its process could not be found") and read like a bridge fault.
+$fakeAgent = Join-Path ([IO.Path]::GetTempPath()) ("bridge-agent-" + [Guid]::NewGuid().ToString('N'))
+Set-Content -LiteralPath $fakeAgent -Value 'placeholder' -Encoding ascii
+try {
+    $gone = Join-Path ([IO.Path]::GetTempPath()) 'bridge-agent-not-here-ffff'
+    $sayGone = Get-BridgeAgentStartFailure -Executable $gone -Probe { throw 'must not probe a file that is not there' }
+    Test-That 'a missing executable says the agent is not installed' {
+        $sayGone -match 'not installed' -and $sayGone -match ([regex]::Escape($gone))
+    } $sayGone
+
+    $sayUnrunnable = Get-BridgeAgentStartFailure -Executable $fakeAgent `
+        -Probe { [pscustomobject]@{ Ran = $false; TimedOut = $false; ExitCode = -1; Output = 'Permission denied' } }
+    Test-That 'one that cannot be executed says so, and why' {
+        $sayUnrunnable -match 'could not be run' -and $sayUnrunnable -match 'Permission denied'
+    } $sayUnrunnable
+
+    $sayHung = Get-BridgeAgentStartFailure -Executable $fakeAgent `
+        -Probe { [pscustomobject]@{ Ran = $true; TimedOut = $true; ExitCode = -1; Output = '' } }
+    Test-That 'one that never answers points at signing in' {
+        $sayHung -match 'signed in'
+    } $sayHung
+
+    $sayBroken = Get-BridgeAgentStartFailure -Executable $fakeAgent `
+        -Probe { [pscustomobject]@{ Ran = $true; TimedOut = $false; ExitCode = 1; Output = 'Cannot find module install.cjs' } }
+    Test-That 'a half-installed agent is named as the cause' {
+        $sayBroken -match 'does not run' -and $sayBroken -match 'reinstall'
+    } $sayBroken
+    Test-That 'and quotes what it actually said' { $sayBroken -match 'install\.cjs' } $sayBroken
+
+    $sayLong = Get-BridgeAgentStartFailure -Executable $fakeAgent `
+        -Probe { [pscustomobject]@{ Ran = $true; TimedOut = $false; ExitCode = 1; Output = ('x' * 500) } }
+    Test-That 'a wall of output is trimmed, not pasted into the card' {
+        $sayLong -notmatch 'x{300}' -and $sayLong -match 'x\.\.\.'
+    } "len=$($sayLong.Length)"
+
+    $sayExited = Get-BridgeAgentStartFailure -Executable $fakeAgent `
+        -Probe { [pscustomobject]@{ Ran = $true; TimedOut = $false; ExitCode = 0; Output = '1.2.3' } }
+    Test-That 'an agent that runs but exits at once is not blamed on the install' {
+        $sayExited -match 'exited as soon as it started' -and $sayExited -notmatch 'reinstall'
+    } $sayExited
+
+    Test-That 'none of these still say "could not be found"' {
+        @($sayGone, $sayUnrunnable, $sayHung, $sayBroken, $sayExited) -notmatch 'process could not be found'
+    }
+}
+finally {
+    Remove-Item -LiteralPath $fakeAgent -Force -ErrorAction SilentlyContinue
+}
+
 Remove-Item -LiteralPath $script:DaemonConfig.LogFile -Force -ErrorAction SilentlyContinue
 Write-Host ''
 if ($script:Failures) {

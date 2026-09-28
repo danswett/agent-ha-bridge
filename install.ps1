@@ -834,13 +834,23 @@ function ConvertTo-BridgeClientList {
 }
 
 function Test-BridgeClientInstalled {
-    <# Best-effort detection so the picker can pre-select what is actually present. #>
+    <#
+        Best-effort detection so the picker can pre-select what is actually present,
+        and so a re-run reinstalls what is broken.
+
+        Presence alone is not enough. npm writes a package's `bin` entry before it
+        runs the package's postinstall, so a postinstall that fails - as Claude
+        Code's did on macOS whenever `node` was missing from an elevated PATH - leaves
+        `claude` on PATH doing nothing. Reporting that as installed meant re-running
+        the installer skipped it, and the only symptom was a session that died the
+        instant it launched. So the agent CLIs have to answer --version too.
+    #>
     param([Parameter(Mandatory)][string]$Client)
     switch ($Client) {
-        'copilot' { [bool](Get-Command copilot -ErrorAction SilentlyContinue) }
-        'claude'  { [bool](Get-Command claude -ErrorAction SilentlyContinue) }
+        'copilot' { [bool](Test-BridgeClientRunnable -Name 'copilot') }
+        'claude'  { [bool](Test-BridgeClientRunnable -Name 'claude') }
         'codex'   {
-            if (Get-Command codex -ErrorAction SilentlyContinue) { return $true }
+            if (Test-BridgeClientRunnable -Name 'codex') { return $true }
             if (-not $script:BridgeIsWindows) { return $false }
             # Codex ships through npm and is not on PATH, so look where npm installs it.
             Test-Path -LiteralPath (Join-Path $env:APPDATA 'npm\node_modules\@openai\codex')
@@ -853,6 +863,16 @@ function Test-BridgeClientInstalled {
         }
         default { $false }
     }
+}
+
+function Test-BridgeClientRunnable {
+    <# An agent CLI that is on PATH and actually runs. #>
+    param([Parameter(Mandatory)][string]$Name)
+
+    $command = Get-Command $Name -CommandType Application -ErrorAction SilentlyContinue |
+        Select-Object -First 1
+    if (-not $command -or -not $command.Source) { return $false }
+    Test-BridgeCommandRuns -Executable ([string]$command.Source)
 }
 
 function Resolve-BridgeClients {

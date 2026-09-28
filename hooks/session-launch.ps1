@@ -1552,10 +1552,57 @@ function Start-BridgeCopilotSession {
         $result.Detail = $detail
     }
     catch {
-        $result.Detail = "launch failed: $($_.Exception.Message)"
+        # No "launch failed" prefix: both callers already say that, and the other
+        # Detail messages here are bare too.
+        $result.Detail = $_.Exception.Message
     }
 
     $result
+}
+
+function Get-BridgeAgentStartFailure {
+    <#
+        Why a tmux pane was gone before its process could be read.
+
+        tmux returns 0 from `new-session` as soon as the session exists, so a command
+        that cannot be executed - or that exits immediately - still looks like a
+        successful start, and tmux tears the session down before the pane can be
+        listed. "its process could not be found" described that symptom and read like
+        a fault in the bridge, when it is almost always the agent itself: npm writes
+        its `claude` shim before running the package's postinstall, so a postinstall
+        that fails leaves a command that exists, is on PATH, and does nothing.
+
+        So say which it is, and quote what the agent said when asked for its version.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Executable,
+        [scriptblock]$Probe
+    )
+
+    if (-not [System.IO.File]::Exists($Executable)) {
+        return "$Executable does not exist - the agent is not installed on this machine"
+    }
+
+    if (-not $Probe) { $Probe = { param($exe) Invoke-BridgeCommandProbe -Executable $exe } }
+    # Not $probe: PowerShell variable names are case-insensitive, so that would assign
+    # the result back into the [scriptblock]$Probe parameter and throw on the cast.
+    $outcome = & $Probe $Executable
+
+    if ($null -eq $outcome -or -not $outcome.Ran) {
+        $why = if ($outcome -and $outcome.Output) { ": $($outcome.Output)" } else { '' }
+        return "$Executable could not be run$why - reinstall the agent"
+    }
+    if ($outcome.TimedOut) {
+        return "$Executable did not answer --version - it may be waiting to be signed in; run it in a terminal once"
+    }
+    if ($outcome.ExitCode -eq 0) {
+        return "$Executable runs, but the session exited as soon as it started - run it in a terminal to see why"
+    }
+
+    $detail = [string]$outcome.Output
+    if ($detail.Length -gt 200) { $detail = $detail.Substring(0, 200) + '...' }
+    if (-not $detail) { $detail = "exit $($outcome.ExitCode)" }
+    return "$Executable is installed but does not run ($detail) - reinstall the agent"
 }
 
 function Start-BridgeTmuxSession {
@@ -1596,7 +1643,7 @@ function Start-BridgeTmuxSession {
         $line = & $tmux list-panes -t $session -F '#{pane_pid}' 2>$null | Select-Object -First 1
         if ($line -match '^\d+$') { $panePid = [int]$line } else { Start-Sleep -Milliseconds 100 }
     }
-    if ($panePid -le 0) { throw 'tmux started the session but its process could not be found' }
+    if ($panePid -le 0) { throw (Get-BridgeAgentStartFailure -Executable $Executable) }
 
     Open-BridgeTerminalWindow -Command "'$tmux' attach -t '$session'"
     $panePid
