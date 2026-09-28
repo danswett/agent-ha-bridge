@@ -160,9 +160,19 @@ program. So:
     count; a sweep every 2 s is the backstop (macOS delivers events later).
   * Cost: an idle fast-lane tick is ~30 us slower than 1.11.1 (340 -> 369 us, median
     of 5). Accepted: it buys 400-650 ms off every hook.
-- [ ] **3. The Go hook.** `hook/` (Go module): stdin, ancestry (Windows: toolhelp
+- [x] **3. The Go hook.** `hook/` (Go module): stdin, ancestry (Windows: toolhelp
   snapshot; macOS: `sysctl kern.proc.pid`), daemon-alive check, spool write,
   fallback exec, fixed output per script. Go tests. Timed against the table above.
+  *Done.* `hook/` (module `github.com/danswett/agent-ha-bridge/hook`, needs
+  `golang.org/x/sys`): `agent-bridge-hook <agent> <hook> [fallback-script]`; hooks
+  are claude/register, claude/stop, claude/ask, claude/notification, codex/hook,
+  copilot/ask_user, copilot/agent_stop, copilot/permission. `--version` prints the
+  version (`-ldflags -X main.version=`). CI vets, tests and builds all four targets
+  on Windows and macOS. End to end (`tests/test-native-hook.ps1`, real binary + the
+  daemon's spool code): the agent waits 37 ms median, against 450 ms for the
+  PowerShell hook. Found on the way: a fallback that fails to run had pwsh print its
+  error to stdout ahead of Copilot's reply; the fallback's output is now buffered and
+  passed on only when it succeeded.
 - [ ] **4. Distribution.** Release assets + checksums from CI; install and update
   fetch them; hook configs switch to the binary when it works.
 - [ ] **5. Wire Claude and Codex.** Settings/hooks point at the binary; measure;

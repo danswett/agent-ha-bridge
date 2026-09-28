@@ -65,6 +65,29 @@ jobs:
           }
           if ($findings -and @($findings).Count) { throw "$(@($findings).Count) PSScriptAnalyzer finding(s)" }
 
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: hook/go.mod
+          cache-dependency-path: hook/go.sum
+
+      - name: Native hook (Go) - vet, test, build every target
+        shell: pwsh
+        working-directory: hook
+        run: |
+          go vet ./...
+          if ($LASTEXITCODE) { throw 'go vet failed' }
+          go test ./...
+          if ($LASTEXITCODE) { throw 'go test failed' }
+          foreach ($target in 'windows/amd64', 'windows/arm64', 'darwin/amd64', 'darwin/arm64') {
+            $env:GOOS, $env:GOARCH = $target -split '/'
+            go build -trimpath -ldflags '-s -w' -o NUL .
+            if ($LASTEXITCODE) { throw "build for $target failed" }
+          }
+          $env:GOOS = ''; $env:GOARCH = ''
+          # The one test-native-hook.ps1 runs.
+          go build -trimpath -ldflags '-s -w' -o agent-bridge-hook.exe .
+          if ($LASTEXITCODE) { throw 'build failed' }
+
       - name: PowerShell test suites (Home Assistant free)
         shell: pwsh
         run: |
@@ -95,6 +118,7 @@ jobs:
             'tests/test-launchers.ps1'
             'tests/test-hook-functions.ps1'
             'tests/test-hook-spool.ps1'
+            'tests/test-native-hook.ps1'
             'tests/test-stop-session.ps1'
             'tests/test-verbose-toggle.ps1'
             'codex/tests/test-codex.ps1'
@@ -142,6 +166,18 @@ jobs:
         run: |
           bash -n bootstrap.sh
           sh -n bin/agent-ha-bridge
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: hook/go.mod
+          cache-dependency-path: hook/go.sum
+
+      - name: Native hook (Go) - vet, test, build
+        working-directory: hook
+        run: |
+          go vet ./...
+          go test ./...
+          go build -trimpath -ldflags '-s -w' -o agent-bridge-hook .
 
       - name: Test suites on macOS
         shell: pwsh

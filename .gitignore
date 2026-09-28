@@ -16,3 +16,8 @@ desktop.ini
 
 # MCP server
 mcp/node_modules/
+
+# The native hook, built locally or in CI (release builds are attached to releases)
+hook/agent-bridge-hook
+hook/agent-bridge-hook.exe
+hook/dist/
