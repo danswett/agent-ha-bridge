@@ -178,11 +178,40 @@ function Sync-DaemonUpdateStatus {
         catch {
             Write-DaemonLog -Message "could not show update spinner: $($_.Exception.Message)"
         }
-        $result = Invoke-BridgeSelfUpdate -Detached
+
+        # Its own try: an update that cannot even be started has to clear the spinner
+        # itself. The failure notice further up is driven by the outcome file the
+        # updater writes, and a launch that never happened never writes one - so this
+        # used to leave the card saying "Installing" until the next self-update, with
+        # nothing in the log to say why.
+        $result = $null
+        try {
+            $result = Invoke-BridgeSelfUpdate -Detached
+        }
+        catch {
+            $result = [pscustomobject]@{ Started = $false; Detail = $_.Exception.Message }
+        }
         Write-DaemonLog -Message "self-update: $($result.Detail)"
+        if (-not $result.Started) {
+            try {
+                Publish-CopilotMqttUpdate -InstalledVersion $status.Installed -LatestVersion $latest `
+                    -ReleaseUrl $status.Url -ReleaseNotes $status.Notes -Headers $Headers
+                Invoke-HomeAssistantService -Domain 'persistent_notification' -Service 'create' `
+                    -Data @{
+                        title           = "Bridge update failed on $($script:DaemonMachineName)"
+                        message         = "The bridge update did not start: $($result.Detail)"
+                        notification_id = "agent_bridge_update_$($script:DaemonMachineSlug)"
+                    } -Headers $Headers
+            }
+            catch {
+                Write-DaemonLog -Message "could not clear the update spinner: $($_.Exception.Message)"
+            }
+        }
     }
     catch {
-        # The button may not exist yet on a first run.
+        # The button may not exist yet on a first run - but say so rather than losing
+        # a real failure, which is how a stuck "Installing" went unexplained.
+        Write-DaemonLog -Message "update install check skipped: $($_.Exception.Message)"
     }
 }
 

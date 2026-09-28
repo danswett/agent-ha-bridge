@@ -328,22 +328,6 @@ function Get-BridgeDependencyCommand {
     }
 }
 
-function Get-BridgePwshPath {
-    <#
-        pwsh.exe, wherever it is. Get-Command alone is not enough straight after a
-        winget install: this process's PATH predates it, so the well-known install
-        locations are checked as well.
-    #>
-    $command = Get-Command pwsh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
-    if ($command) { return $command.Source }
-    $roots = @($env:ProgramFiles, ${env:ProgramFiles(x86)}) | Where-Object { $_ }
-    foreach ($root in $roots) {
-        $candidate = Join-Path $root 'PowerShell\7\pwsh.exe'
-        if (Test-Path -LiteralPath $candidate) { return $candidate }
-    }
-    $null
-}
-
 function Update-BridgeSessionPath {
     <#
         winget and npm update the stored PATH, not this process's copy of it, so a

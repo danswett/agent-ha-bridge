@@ -204,6 +204,25 @@ Test-That 'a non-existent TargetHome is refused, never interpolated' {
     ($bogus.Started -eq $false) -and ($bogus.Detail -match 'not an existing directory')
 }
 
+Write-Host '--- an updater that cannot be launched fails cleanly and leaves nothing behind ---'
+Test-That 'pwsh is resolvable here' { [bool](Get-BridgePwshPath) } "$(Get-BridgePwshPath)"
+# The real failure this came from: the daemon's PATH, set by a scheduled task, had no
+# PowerShell folder. The old code created the staging folder and wrote the updater
+# script, then threw on a bare (Get-Command pwsh).Source - so nothing ran, a staging
+# folder was orphaned, and the caller's empty catch meant the card sat on "Installing"
+# with not one line in the log to say why.
+$stagingPattern = 'agent-ha-bridge-update-*'
+$stagingBefore = @(Get-ChildItem ([IO.Path]::GetTempPath()) -Directory -Filter $stagingPattern -ErrorAction SilentlyContinue).Count
+function Get-BridgePwshPath { $null }
+$noPwsh = Invoke-BridgeSelfUpdate -Detached
+Test-That 'a pwsh that cannot be found is reported, not thrown' {
+    ($noPwsh.Started -eq $false) -and ($noPwsh.Detail -match 'could not find pwsh')
+} "$($noPwsh.Detail)"
+$stagingAfter = @(Get-ChildItem ([IO.Path]::GetTempPath()) -Directory -Filter $stagingPattern -ErrorAction SilentlyContinue).Count
+Test-That 'and no half-written staging folder is left behind' {
+    $stagingAfter -eq $stagingBefore
+} "before=$stagingBefore after=$stagingAfter"
+
 Write-Host ''
 if ($script:Failures) {
     Write-Host "$($script:Failures) test(s) failed" -ForegroundColor Red

@@ -366,6 +366,35 @@ function Test-BridgeCommandRuns {
     [bool]($probe.Ran -and -not $probe.TimedOut -and $probe.ExitCode -eq 0)
 }
 
+function Get-BridgePwshPath {
+    <#
+        pwsh, wherever it is.
+
+        Get-Command alone is not enough in two places that matter: straight after a
+        winget install, where this process's PATH predates it, and inside the daemon,
+        which a scheduled task or LaunchAgent starts with a PATH that need not include
+        PowerShell's own folder. A bare `(Get-Command pwsh).Source` also throws under
+        StrictMode when the lookup fails, rather than returning nothing, so callers
+        that meant to degrade gracefully did not.
+    #>
+    $command = Get-Command pwsh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($command) { return $command.Source }
+
+    $candidates = if ($script:BridgeIsWindows) {
+        @($env:ProgramFiles, ${env:ProgramFiles(x86)}) |
+            Where-Object { $_ } |
+            ForEach-Object { Join-Path $_ 'PowerShell\7\pwsh.exe' }
+    }
+    else {
+        @('/usr/local/bin/pwsh', '/opt/homebrew/bin/pwsh', '/opt/local/bin/pwsh',
+            '/usr/bin/pwsh', '/usr/local/microsoft/powershell/7/pwsh')
+    }
+    foreach ($candidate in $candidates) {
+        if ([IO.File]::Exists($candidate)) { return $candidate }
+    }
+    $null
+}
+
 # --------------------------------------------------------------------------- tmux
 
 function Get-BridgeTmuxPath {

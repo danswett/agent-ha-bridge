@@ -258,12 +258,22 @@ finally {
 "@
 
     if ($ScriptOnly) { return $scriptText }
+
+    # Resolved before anything is written: a bare (Get-Command pwsh).Source throws
+    # under StrictMode when the daemon's PATH has no PowerShell folder, which left a
+    # staging directory behind, no updater running, and - because the caller swallowed
+    # the exception - a card that sat on "Installing" for ever.
+    $pwshPath = Get-BridgePwshPath
+    if (-not $pwshPath) {
+        return [pscustomobject]@{ Started = $false; Detail = 'could not find pwsh to run the updater' }
+    }
+
     New-Item -ItemType Directory -Path $staging -Force | Out-Null
     $scriptText | Set-Content -LiteralPath $script -Encoding UTF8
 
     if ($Detached) {
         $detached = @{
-            FilePath     = (Get-Command pwsh).Source
+            FilePath     = $pwshPath
             ArgumentList = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', "`"$script`"")
         }
         # Not supported, and refused, off Windows.
@@ -275,6 +285,6 @@ finally {
     # The child's own output would otherwise be returned alongside the result object,
     # leaving callers with an array instead of the object they expect. The updater
     # writes its progress to agent-bridge-update.log, so nothing is lost.
-    & (Get-Command pwsh).Source -NoProfile -ExecutionPolicy Bypass -File $script *>&1 | Out-Null
+    & $pwshPath -NoProfile -ExecutionPolicy Bypass -File $script *>&1 | Out-Null
     [pscustomobject]@{ Started = $true; Detail = "updated to $($status.Latest)" }
 }
