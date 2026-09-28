@@ -241,7 +241,9 @@ program. So:
   runs in the last 24 h, M not spooled (x%): reasons; median ms`). A fallback whose script
   also failed is its own reason (`...; fallback failed`): the agent got no bridge at all.
 - [ ] **R7. VERSION 1.12.0, release, verify the assets attached.** In progress: VERSION
-  bumped; next a draft release, the workflow for its tag, a check of the assets, publish.
+  bumped, draft release created (id 398000817). Dispatching the workflow was refused
+  (the PAT has no Actions permission), so release.yml also runs on a pushed `v*` tag;
+  next: tag the commit with that change, push the tag, check the draft's assets, publish.
 
 ## Resuming
 
