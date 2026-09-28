@@ -374,6 +374,10 @@ function Add-DaemonSession {
         Write-DaemonLog -Message "adopted existing session $($id.Substring(0,8)) as '$($display.Name)'"
     }
 
+    # A session registering says any launch note about one not registering is out of
+    # date, whichever launch wrote it.
+    try { Clear-DaemonLaunchNoteOnRegistration -Headers $Headers } catch { }
+
     # Ensure the per-field dropdown slots and the Submit button exist for every
     # session, including adopted ones and sessions published before either was
     # introduced. The dashboard's cards reference them unconditionally, so a

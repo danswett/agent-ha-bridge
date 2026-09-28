@@ -775,6 +775,34 @@ function Clear-DaemonStaleNote {
     catch { }
 }
 
+function Clear-DaemonLaunchNoteOnRegistration {
+    <#
+        Drops the launch note once a session has actually registered.
+
+        A launch gives up waiting after 90 seconds and leaves "started ... but has not
+        registered - check its window". That is short for a first-ever launch, which
+        has to sign in and approve the agent's hooks first: seen on a Mac where Codex
+        registered three minutes after the note was written, so the note sat there
+        insisting the session had not arrived while its own card sat next to it. The
+        ten-minute expiry cleared it eventually, long after it had become untrue.
+
+        A session registering is the proof that note is obsolete, whichever launch it
+        came from. A launch still being followed keeps its own note: that one is
+        current, and Update-DaemonPendingLaunch clears it itself.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Headers)
+
+    if ($null -ne $script:DaemonPendingLaunch) { return }
+    try {
+        $state = Get-HomeAssistantState -EntityId $script:DaemonEntity.NewResult -Headers $Headers
+        $text = [string]$state.state
+        if ([string]::IsNullOrWhiteSpace($text) -or $text -in @('unknown', 'unavailable')) { return }
+        Set-CopilotMqttNewSessionResult -Headers $Headers -Text ''
+        Write-DaemonLog -Message "cleared the launch note now a session has registered: $text"
+    }
+    catch { }
+}
+
 function Update-DaemonPendingLaunch {
     <#
         Follows a session launched from the dashboard until it registers, a pass at a
@@ -886,7 +914,11 @@ function Update-DaemonPendingLaunch {
     }
 
     if (($now - $p.Since).TotalSeconds -gt 90) {
-        & $finish "$agent started in $($p.Label) (pid $($p.ProcessId)) but has not registered - check its window." `
+        # Deliberately not "has not registered": a first-ever launch has to sign in and
+        # approve hooks first, and this often registers minutes later. Saying it may
+        # still be starting keeps the note true when that happens; the session
+        # registering clears it (Clear-DaemonLaunchNoteOnRegistration).
+        & $finish "$agent started in $($p.Label) (pid $($p.ProcessId)) and may still be starting - check its window." `
             "launched $agent (pid $($p.ProcessId)) did not register within 90 s"
     }
 }

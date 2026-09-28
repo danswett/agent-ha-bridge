@@ -79,6 +79,7 @@ function Publish-CopilotMqttGlobalStatus { param($Headers, $Capabilities, $Sessi
 function Publish-CopilotMqttMachineHeartbeat { param($Slug, $Headers) }
 function Get-BridgeServedReplyCardUrl { '' }
 function Set-CopilotMqttGlobalEntityId { $true }
+function Clear-DaemonLaunchNoteOnRegistration { param($Headers) $script:NoteCleared = ($script:NoteCleared + 1) }
 function Initialize-BridgeMachineSelector { param($Machines) '' }
 function Save-CopilotSessionDashboard { param($Sessions, $Machines, $MachineSelector, $ReplyCardUrl) $script:DashboardSessions = @($Sessions); 'saved' }
 function Remove-CopilotMqttSession { param($SessionId, $Headers) $script:Retired += $SessionId }
@@ -92,6 +93,7 @@ $script:DisplayNames = @{}
 $script:DaemonDashboardSignature = $null
 $script:DaemonPendingRetire = @()
 $script:Streamed = @()
+$script:NoteCleared = 0
 
 # Real ids are UUIDs, and the log lines take their first eight characters.
 $script:Ids = @{ s1 = '11111111-0000-4000-8000-000000000001'; s2 = '22222222-0000-4000-8000-000000000002'; s3 = '33333333-0000-4000-8000-000000000003'
@@ -100,6 +102,9 @@ function New-Session { param([string]$Id) [pscustomobject]@{ SessionId = $script
 $state = @{}
 Sync-DaemonSessions -Headers $headers -State $state -Live @{ $script:Ids.s1 = (New-Session 's1'); $script:Ids.s2 = (New-Session 's2') }
 Test-That 'new sessions are published and adopted into state' { (@($script:Published | Sort-Object) -join ',') -eq (@($script:Ids.s1, $script:Ids.s2) -join ',') -and $state.Count -eq 2 }
+# A session registering is what says a launch note about one not registering is out of
+# date - the 90-second wait is short for a first launch that has to sign in first.
+Test-That 'and each one clears any launch note still claiming it never arrived' { $script:NoteCleared -eq 2 }
 Test-That 'with an entry that starts at the transcript''s end' { $state[$script:Ids.s1].Offset -eq 0 -and $state[$script:Ids.s1].Kind -eq 'claude' }
 Test-That 'and the dashboard is built with them' { @($script:DashboardSessions).Count -eq 2 }
 Test-That 'the global status lists them' { @($script:GlobalSessions).Count -eq 2 }
