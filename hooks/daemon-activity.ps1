@@ -509,6 +509,16 @@ function Update-DaemonSessionActivity {
         verbose = $verbose
         updated = [DateTimeOffset]::Now.ToString('o')
     }
+    # Who last drove this session, so the card can show at a glance that it is being
+    # driven remotely by an agent rather than by the person looking at it. A turn that
+    # starts without a reply coming through Home Assistant was typed in the terminal,
+    # which is the person - so a new turn hands it back to them unless the reply path
+    # said otherwise a moment ago.
+    if ($turnStarted -and -not ($entry.PSObject.Properties['DriverPending'] -and $entry.DriverPending)) {
+        Set-DaemonSessionProperty -Entry $entry -Name 'Driver' -Value 'human'
+    }
+    Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $false
+    $detail['driver'] = if ($entry.PSObject.Properties['Driver'] -and $entry.Driver) { [string]$entry.Driver } else { 'human' }
     # The history is a rolling trail across batches, not just this batch: the
     # daemon reads the transcript every few seconds, so a single batch usually
     # holds one or two steps and the trail would otherwise never show more.

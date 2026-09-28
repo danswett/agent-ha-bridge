@@ -16,7 +16,7 @@
  * daemon downloads them and attaches them to the prompt.
  */
 
-const CARD_VERSION = '1.13.0';
+const CARD_VERSION = '1.14.0';
 
 // The working line, in the style of Claude Code's own spinner: its glyph cycle, and a
 // word picked once per turn. Claude Code does not record which word it chose, so the
@@ -847,6 +847,21 @@ class AgentBridgeSessionCard extends HTMLElement {
         }
         .frame.working { border-color: var(--primary-color); animation: cpwork 1.6s ease-in-out infinite; }
         .frame.waiting { border-color: var(--warning-color); animation: cpwait 1.6s ease-in-out infinite; }
+        /* Driven through Home Assistant by an agent rather than by you. The pulse is
+           the same shape so "something is happening" still reads at a glance; only
+           the colour changes, and it holds a steady purple edge while idle so a
+           session left under an agent's control still says so. */
+        .frame.agent { border-color: var(--agent-bridge-agent-color, #a855f7); }
+        .frame.agent.working,
+        .frame.agent.waiting {
+          border-color: var(--agent-bridge-agent-color, #a855f7);
+          animation: cpagent 1.6s ease-in-out infinite;
+        }
+        @keyframes cpagent {
+          0%   { box-shadow: 0 0 6px 0px var(--agent-bridge-agent-color, #a855f7); }
+          50%  { box-shadow: 0 0 18px 3px var(--agent-bridge-agent-color, #a855f7); }
+          100% { box-shadow: 0 0 6px 0px var(--agent-bridge-agent-color, #a855f7); }
+        }
         @keyframes cpwork {
           0%   { box-shadow: 0 0 6px 0px var(--primary-color); }
           50%  { box-shadow: 0 0 16px 2px var(--primary-color); }
@@ -916,14 +931,21 @@ class AgentBridgeSessionCard extends HTMLElement {
     const states = this._hass.states;
     const decision = this._config.decision ? states[this._config.decision] : undefined;
     const status = this._config.status ? states[this._config.status] : undefined;
+    const activity = this._config.activity ? states[this._config.activity] : undefined;
     const waiting = !!(decision && decision.attributes && decision.attributes.question);
     const state = waiting ? 'waiting' : (status && status.state === 'working' ? 'working' : '');
-    if (state === this._state) { return; }
+    // Who last drove this session. Absent on a card served by an older daemon, which
+    // reads as yours - the safe way round, since a wrong glow is worse than none.
+    const driver = (activity && activity.attributes && activity.attributes.driver) || 'human';
+    const key = `${state}\u0001${driver}`;
+    if (key === this._stateKey) { return; }
     // A question arriving opens a folded session: it is waiting on you.
     if (state === 'waiting' && this._collapsed) { this._setCollapsed(false); }
+    this._stateKey = key;
     this._state = state;
     this._frame.classList.toggle('waiting', state === 'waiting');
     this._frame.classList.toggle('working', state === 'working');
+    this._frame.classList.toggle('agent', driver === 'agent');
   }
 }
 

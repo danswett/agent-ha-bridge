@@ -473,6 +473,60 @@ Test-That 'nothing is deleted when there is no pre-rename dashboard' {
     -not (@($script:SentCommands | Where-Object { $_.type -eq 'lovelace/dashboards/delete' }).Count)
 }
 
+Write-Host ''
+Write-Host '--- who is driving a session ---'
+# An agent driving a session sets the reply text and presses Submit, exactly as the
+# dashboard does for a person, so the two arrive as identical service calls. The Home
+# Assistant account behind the press is the only thing that differs - and only if the
+# agent has an account of its own, which is why this is configured, never guessed.
+function New-PressState {
+    param([AllowEmptyString()][AllowNull()][string]$UserId, [switch]$NoContext)
+    if ($NoContext) { return [pscustomobject]@{ entity_id = 'button.x'; state = 'ts' } }
+    [pscustomobject]@{
+        entity_id = 'button.x'; state = 'ts'
+        context = [pscustomobject]@{ id = 'abc'; parent_id = $null; user_id = $UserId }
+    }
+}
+$script:AgentIds = @()
+function Get-BridgeSetting {
+    param($Path, $Default)
+    if ($Path -eq 'homeAssistant.agentUserIds') { return $script:AgentIds }
+    $Default
+}
+
+Test-That 'the user is read off the press' {
+    (Get-BridgeStateUserId -State (New-PressState -UserId 'user-1')) -eq 'user-1'
+}
+Test-That 'a state with no context at all is handled, not thrown on' {
+    (Get-BridgeStateUserId -State (New-PressState -NoContext)) -eq ''
+}
+Test-That 'and so is no state' { (Get-BridgeStateUserId -State $null) -eq '' }
+
+$script:AgentIds = @()
+Test-That 'with no agent configured, nothing is an agent' { -not (Test-BridgeAgentUserId -UserId 'user-1') }
+Test-That 'so a session reads as yours' {
+    (Get-BridgeDriverFromState -State (New-PressState -UserId 'user-1')) -eq 'human'
+}
+
+$script:AgentIds = @('agent-user')
+Test-That 'the configured agent is recognised' { Test-BridgeAgentUserId -UserId 'agent-user' }
+Test-That 'anyone else is not' { -not (Test-BridgeAgentUserId -UserId 'user-1') }
+Test-That 'a press from the agent marks the session agent-driven' {
+    (Get-BridgeDriverFromState -State (New-PressState -UserId 'agent-user')) -eq 'agent'
+}
+Test-That 'a press from you does not' {
+    (Get-BridgeDriverFromState -State (New-PressState -UserId 'user-1')) -eq 'human'
+}
+Test-That 'a press carrying no user - an automation, say - is not an agent' {
+    (Get-BridgeDriverFromState -State (New-PressState -UserId '')) -eq 'human'
+}
+$script:AgentIds = @('  agent-user  ')
+Test-That 'whitespace around a configured id does not stop it matching' {
+    Test-BridgeAgentUserId -UserId 'agent-user'
+}
+$script:AgentIds = @('', '   ')
+Test-That 'and a blank entry never matches a blank user' { -not (Test-BridgeAgentUserId -UserId '') }
+
 Remove-Item -LiteralPath $script:DecisionBridgeConfig.LogFile -Force -ErrorAction SilentlyContinue
 Write-Host ''
 if ($script:Failures) {

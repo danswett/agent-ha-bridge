@@ -1051,6 +1051,56 @@ function Repair-DecisionToolArguments {
     }
 }
 
+function Get-BridgeStateUserId {
+    <#
+        The Home Assistant user behind a state change, or '' when there is none.
+
+        Every state Home Assistant returns carries a context, and a service call made
+        by a person through the dashboard, or by a token through the API, records that
+        account's id in it. StrictMode makes the nested reads throw when a state has no
+        context at all, so each step is checked rather than assumed.
+    #>
+    param($State)
+
+    if ($null -eq $State) { return '' }
+    if (@($State.PSObject.Properties.Name) -notcontains 'context') { return '' }
+    $context = $State.context
+    if ($null -eq $context) { return '' }
+    if (@($context.PSObject.Properties.Name) -notcontains 'user_id') { return '' }
+    [string]$context.user_id
+}
+
+function Test-BridgeAgentUserId {
+    <#
+        Whether a Home Assistant user is an agent driving sessions remotely.
+
+        An agent driving a session does exactly what a person does - set the reply
+        text, press Submit - so the two arrive as identical service calls and nothing
+        within them tells one from the other. Giving the agent its own Home Assistant
+        account is what makes the difference visible: the user id on the press becomes
+        the only honest signal there is, and the logbook starts attributing those
+        actions to the agent rather than to you.
+
+        Configured as homeAssistant.agentUserIds. With none configured nothing is ever
+        an agent, which is the right default - better no glow at all than a wrong one.
+    #>
+    param([AllowEmptyString()][AllowNull()][string]$UserId)
+
+    if ([string]::IsNullOrWhiteSpace($UserId)) { return $false }
+    $configured = @(@(Get-BridgeSetting 'homeAssistant.agentUserIds' @()) |
+        ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+    if ($configured.Count -eq 0) { return $false }
+    $configured -contains $UserId.Trim()
+}
+
+function Get-BridgeDriverFromState {
+    <# 'agent' or 'human', from the context on the state that carried the input. #>
+    param($State)
+
+    if (Test-BridgeAgentUserId -UserId (Get-BridgeStateUserId -State $State)) { return 'agent' }
+    'human'
+}
+
 function Get-HomeAssistantHeaders {
     <#
         Resolves the Home Assistant long-lived access token.

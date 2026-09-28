@@ -397,6 +397,13 @@ function Send-DaemonReplyBoxText {
     $lastSubmit = if ($entry.PSObject.Properties['LastSubmitAt']) { [string]$entry.LastSubmitAt } else { '' }
     if ($press -eq $lastSubmit) { return }
 
+    # Who pressed it. The card glows while an agent is driving, and this is the only
+    # place that can tell: the press itself carries the account behind it. Pending,
+    # because the turn this is about to start would otherwise be read as typed in the
+    # terminal and hand the session straight back to the person.
+    Set-DaemonSessionProperty -Entry $entry -Name 'Driver' -Value (Get-BridgeDriverFromState -State $btn)
+    Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $true
+
     try {
         $replyState = Get-HomeAssistantState -EntityId $replyEntity -Headers $Headers
     }

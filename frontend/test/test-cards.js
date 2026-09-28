@@ -84,8 +84,8 @@ const sourcePath = path.join(__dirname, '..', 'agent-bridge-reply-card.js');
 const source = fs.readFileSync(sourcePath, 'utf8');
 const context = vm.createContext(sandbox);
 // A classic script, so a trailing expression is what exposes its classes for testing.
-vm.runInContext(`${source}\n;globalThis.__cards = { AgentBridgeChoicesCard, CARD_VERSION };`, context, { filename: sourcePath });
-const { AgentBridgeChoicesCard, CARD_VERSION } = sandbox.__cards;
+vm.runInContext(`${source}\n;globalThis.__cards = { AgentBridgeChoicesCard, AgentBridgeSessionCard, CARD_VERSION };`, context, { filename: sourcePath });
+const { AgentBridgeChoicesCard, AgentBridgeSessionCard, CARD_VERSION } = sandbox.__cards;
 
 // --- the harness ------------------------------------------------------------------
 
@@ -165,10 +165,61 @@ check('the element is registered under its own name',
   /customElements\.define\('agent-bridge-choices-card'/.test(source));
 check('and offered in the card picker',
   sandbox.window.customCards.some((c) => c.type === 'agent-bridge-choices-card'));
-check('the card version is the one the dashboard gates the card on', CARD_VERSION === '1.13.0', CARD_VERSION);
+check('the card version is the one the dashboard gates the card on', CARD_VERSION === '1.14.0', CARD_VERSION);
 check('"decision" is required', (() => {
   try { new AgentBridgeChoicesCard().setConfig({}); return false; } catch (e) { return /decision/.test(e.message); }
 })());
+
+console.log('');
+console.log('--- a session driven by an agent is marked as one ---');
+// An agent driving a session does what you do - set the reply text, press Submit - so
+// the two arrive as identical service calls. The daemon tells them apart by the Home
+// Assistant account behind the press and publishes it as `driver`; the card turns that
+// into a purple edge, so a session being driven remotely says so at a glance.
+const S_STATUS = 'sensor.agent_bridge_abc_status';
+const S_ACTIVITY = 'sensor.agent_bridge_abc_activity';
+const S_DECISION = 'select.agent_bridge_abc_decision';
+
+function renderSession({ status, driver, question }) {
+  const card = Object.create(AgentBridgeSessionCard.prototype);
+  card._frame = new FakeElement('div');
+  card._collapsed = false;
+  card._setCollapsed = () => { card._collapsed = false; };
+  card._config = { status: S_STATUS, activity: S_ACTIVITY, decision: S_DECISION };
+  const activityAttrs = {};
+  if (driver !== undefined) { activityAttrs.driver = driver; }
+  card._hass = {
+    states: {
+      [S_STATUS]: { state: status || 'idle', attributes: {} },
+      [S_ACTIVITY]: { state: 'x', attributes: activityAttrs },
+      [S_DECISION]: { state: 'Idle', attributes: question ? { question } : {} },
+    },
+  };
+  card._renderState();
+  return card._frame.classList;
+}
+
+check('a session you are driving has no agent glow',
+  renderSession({ status: 'working', driver: 'human' }).contains('agent') === false);
+check('and still shows it is working',
+  renderSession({ status: 'working', driver: 'human' }).contains('working'));
+check('a session an agent is driving is marked',
+  renderSession({ status: 'working', driver: 'agent' }).contains('agent'));
+check('and keeps its working pulse, so the purple replaces the colour not the motion',
+  renderSession({ status: 'working', driver: 'agent' }).contains('working'));
+check('an idle session left under an agent still says so',
+  renderSession({ status: 'idle', driver: 'agent' }).contains('agent'));
+check('a question an agent asked for is still marked waiting',
+  (() => {
+    const cl = renderSession({ status: 'idle', driver: 'agent', question: 'Which one?' });
+    return cl.contains('waiting') && cl.contains('agent');
+  })());
+check('a card served by an older daemon, with no driver at all, reads as yours',
+  renderSession({ status: 'working' }).contains('agent') === false);
+check('the purple is a variable, so a theme can change it',
+  /--agent-bridge-agent-color/.test(source));
+check('and the glow has its own keyframes rather than reusing the working one',
+  /@keyframes cpagent/.test(source));
 
 console.log('');
 if (failures) {

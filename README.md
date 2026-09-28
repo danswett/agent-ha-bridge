@@ -297,6 +297,7 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `homeAssistant.baseUrl` | e.g. `http://homeassistant.local:8123` |
 | `homeAssistant.token` | Long-lived access token |
 | `homeAssistant.tokenEnvVar` | Read the token from this env var instead (default `AGENT_HA_TOKEN`; `COPILOT_HA_TOKEN` still works) |
+| `homeAssistant.agentUserIds` | Home Assistant user ids that count as an agent rather than you. A session whose last reply came from one of them gets a purple edge on its card, so a session being driven remotely says so at a glance. Empty by default, which means nothing is ever marked — see [Telling an agent's turn from yours](#telling-an-agents-turn-from-yours) |
 | `dashboard.urlPath` | Lovelace dashboard slug (default `agent-decisions`) |
 | `notifications.enabled` / `.service` | Optional notify-style service |
 | `copilot.sessionStateRoot` | Override the Copilot CLI's session-state location if not `~/.copilot/session-state` |
@@ -324,6 +325,33 @@ never in the repo). See [`config.example.json`](config.example.json).
 
 Prefer keeping the token out of a file? Leave `token` empty and set `AGENT_HA_TOKEN`
 in your environment.
+
+### Telling an agent's turn from yours
+
+An agent can drive a session on another machine through the same entities the
+dashboard uses: set `text.…_reply`, press `button.…_submit`, read `sensor.…_activity`.
+That is useful — it is how a session on a Mac can be debugged from a Windows box — but
+it means the bridge cannot tell an agent's reply from yours. Both arrive as the same
+two service calls, carrying the same Home Assistant account, because the dashboard and
+the API are the same door.
+
+Giving the agent its own account is what makes the difference real:
+
+1. *Settings → People → Add person*, with **Allow login** on. Call it whatever you
+   like — `Copilot`, say — and make it a non-administrator.
+2. Log in as that user once and create a long-lived token for it (*Profile →
+   Security → Long-lived access tokens*). Hand that token to the agent; leave your own
+   `homeAssistant.token` alone, since the daemon still runs as you.
+3. Find the user's id under *Settings → People → <the user>*; it is the long hex string
+   in the URL. Put it in `homeAssistant.agentUserIds`.
+
+A session whose last reply came from one of those ids is drawn with a purple edge —
+steady while idle, pulsing while it works — and hands back to the ordinary colours the
+moment you reply yourself or type in the session's own window. With no ids configured
+nothing is ever marked, which is deliberate: a glow that lies is worse than no glow.
+
+The same change makes Home Assistant's own logbook honest, since those actions are
+then attributed to the agent rather than to you.
 
 ---
 
