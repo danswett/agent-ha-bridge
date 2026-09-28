@@ -139,6 +139,70 @@ try {
     # interval re-polls rather than trusting the cache.
     Test-That 'a short interval re-polls a 2h-old cache' { $null -eq (Get-BridgeLatestRelease -CheckHours 1) }
 
+    Write-Host '--- a check that never reached GitHub is not an answer ---'
+    # Publishing 1.14.0 meant checking repeatedly, which exhausted the unauthenticated
+    # rate limit (60/hour/IP). The 403s were cached exactly like a real reply, so every
+    # machine reported itself up to date on 1.13.3 and `update` said "already on
+    # 1.13.3" minutes after the release went live. A failed check is now believed for
+    # minutes, not hours. The bogus tag is the tell: if it comes back, the cache was
+    # trusted; if null comes back, the mocked outage was re-polled.
+    [pscustomobject]@{
+        CheckedAt = [DateTimeOffset]::Now.AddMinutes(-30).ToString('o')
+        Reached   = $false
+        Release   = [pscustomobject]@{ Tag = 'v9.9.9'; Url = 'x'; Zip = 'x'; Notes = ''; Name = ''; Published = '' }
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
+    Test-That 'a 30-minute-old failure is re-polled, not trusted for six hours' {
+        $null -eq (Get-BridgeLatestRelease)
+    }
+
+    [pscustomobject]@{
+        CheckedAt = [DateTimeOffset]::Now.AddMinutes(-5).ToString('o')
+        Reached   = $false
+        Release   = [pscustomobject]@{ Tag = 'v9.9.9'; Url = 'x'; Zip = 'x'; Notes = ''; Name = ''; Published = '' }
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
+    Test-That 'but a five-minute-old one is, so an outage is not hammered' {
+        (Get-BridgeLatestRelease).Tag -eq 'v9.9.9'
+    }
+
+    [pscustomobject]@{
+        CheckedAt = [DateTimeOffset]::Now.AddHours(-2).ToString('o')
+        Reached   = $true
+        Release   = [pscustomobject]@{ Tag = 'v9.9.9'; Url = 'x'; Zip = 'x'; Notes = ''; Name = ''; Published = '' }
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
+    Test-That 'a real answer is still believed for the full interval' {
+        (Get-BridgeLatestRelease).Tag -eq 'v9.9.9'
+    }
+
+    # A cache written by an older version has no Reached field at all, and must keep
+    # the behaviour it was written under rather than being re-polled every 15 minutes.
+    [pscustomobject]@{
+        CheckedAt = [DateTimeOffset]::Now.AddHours(-2).ToString('o')
+        Release   = [pscustomobject]@{ Tag = 'v9.9.9'; Url = 'x'; Zip = 'x'; Notes = ''; Name = ''; Published = '' }
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
+    Test-That 'a cache from an older version is read as before' {
+        (Get-BridgeLatestRelease).Tag -eq 'v9.9.9'
+    }
+
+    Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+    $null = Get-BridgeLatestRelease -Force
+    Test-That 'an unreachable GitHub is recorded as unreached' {
+        ((Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json).Reached) -eq $false
+    }
+
+    # 404 is the one failure that is also an answer - the repository exists and has no
+    # releases - so it is cached like a reply rather than retried every 15 minutes.
+    function Invoke-RestMethod {
+        $response = [System.Net.Http.HttpResponseMessage]::new([System.Net.HttpStatusCode]::NotFound)
+        throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('Not Found', $response)
+    }
+    Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+    $null = Get-BridgeLatestRelease -Force
+    Test-That 'a repository with no releases counts as reached' {
+        $written = Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json
+        $written.Reached -and $null -eq $written.Release
+    }
+    function Invoke-RestMethod { throw 'network disabled in test' }
+
     Write-Host '--- failure is survivable ---'
     Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
     $script:DecisionBridgeConfig.UpdateRepositoryOverride = $null

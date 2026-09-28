@@ -29,6 +29,13 @@ $script:BridgeUpdateConfig = @{
     # within a few hours and still barely touches the unauthenticated GitHub rate
     # limit (60/hour/IP). Tunable with updates.checkHours in the config.
     CheckHours    = [double](Get-BridgeSetting 'updates.checkHours' 6)
+    # How long a check that could not reach GitHub is believed for. A rate-limited or
+    # briefly unreachable API used to be cached like an answer, so one bad moment hid
+    # a release for the full six hours - which is exactly what happened on the day
+    # 1.14.0 shipped, when checking repeatedly while publishing exhausted the
+    # unauthenticated limit and every machine then reported itself up to date. Short
+    # enough to recover on its own, long enough not to hammer anything.
+    RetryMinutes  = 15
     UserAgent     = 'agent-ha-bridge'
     RequestTimeout = 15
 }
@@ -83,6 +90,10 @@ function Get-BridgeLatestRelease {
 
         Returns $null when the check is skipped, fails, or the repository has no
         releases yet - an update check must never be able to break the daemon.
+
+        A check that could not reach GitHub is cached separately from one that did:
+        believing a rate-limited moment for six hours reports the machine up to date
+        when it is not.
     #>
     param(
         [switch]$Force,
@@ -97,19 +108,31 @@ function Get-BridgeLatestRelease {
 
     if (-not $Force -and $null -ne $cache -and $cache.PSObject.Properties.Name -contains 'CheckedAt') {
         $age = ([DateTimeOffset]::Now - [DateTimeOffset]::Parse($cache.CheckedAt)).TotalHours
-        if ($age -lt $CheckHours) {
+        # A check that never reached GitHub is not an answer, so it is believed for
+        # minutes rather than hours. Without this, one rate-limited moment reports the
+        # machine up to date until the next full check comes round.
+        $window = $CheckHours
+        if ($cache.PSObject.Properties.Name -contains 'Reached' -and -not $cache.Reached) {
+            $window = [Math]::Min($CheckHours, $script:BridgeUpdateConfig.RetryMinutes / 60)
+        }
+        if ($age -lt $window) {
             if ($cache.PSObject.Properties.Name -contains 'Release' -and $cache.Release) { return $cache.Release }
             return $null
         }
     }
 
     $release = $null
+    # Whether GitHub answered at all, as opposed to what it said. A repository with no
+    # releases yet answers 404, which is a real and stable answer; a rate limit, a
+    # timeout or a dropped connection is not, and must not be cached like one.
+    $reached = $false
     try {
         $repository = Get-BridgeUpdateRepository
         $response = Invoke-RestMethod -Uri "https://api.github.com/repos/$repository/releases/latest" `
             -Headers @{ 'User-Agent' = $script:BridgeUpdateConfig.UserAgent; Accept = 'application/vnd.github+json' } `
             -TimeoutSec $script:BridgeUpdateConfig.RequestTimeout
 
+        $reached = $true
         $release = [pscustomobject]@{
             Tag       = [string]$response.tag_name
             Name      = [string]$response.name
@@ -120,14 +143,18 @@ function Get-BridgeLatestRelease {
         }
     }
     catch {
-        # A 404 means no releases yet; anything else is a network or rate-limit
-        # problem. Both are recorded as "checked" so the failure is not retried on
-        # every reconcile.
+        # 404 is the one failure that is also an answer: the repository exists and has
+        # no releases. Everything else - 403 for a rate limit, 5xx, a timeout, no
+        # network - is retried within minutes instead of hours.
         $release = $null
+        $status = 0
+        try { $status = [int]$_.Exception.Response.StatusCode } catch { $status = 0 }
+        $reached = ($status -eq 404)
     }
 
     [pscustomobject]@{
         CheckedAt = [DateTimeOffset]::Now.ToString('o')
+        Reached   = $reached
         Release   = $release
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
 
