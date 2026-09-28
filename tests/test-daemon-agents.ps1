@@ -227,14 +227,15 @@ Test-That 'Copilot, Claude and Codex each have an adapter the daemon can set up'
 }
 Test-That 'an unlisted kind has none, and is refused' { try { Get-DaemonClientAdapterInstalled -Client 'mcp'; $false } catch { $true } }
 Test-That 'the adapter check answers yes or no' { (Get-DaemonClientAdapterInstalled -Client 'claude') -is [bool] }
-$script:DaemonInstallerPayload = 'C:\payload'
+$payload = Join-Path ([IO.Path]::GetTempPath()) 'bridge-payload'
+$script:DaemonInstallerPayload = $payload
 function Get-BridgeSetting { param($Path, $Default) if ($Path -eq 'clients') { @('claude') } else { $Default } }
 $copilotSetup = Get-DaemonClientInstaller -Client 'copilot'
 Test-That 'Copilot is set up by the main installer, with itself added to the clients' {
-    $copilotSetup.Path -eq (Join-Path 'C:\payload' 'install.ps1') -and $copilotSetup.Arguments -eq '-NonInteractive -Clients claude,copilot'
+    $copilotSetup.Path -eq (Join-Path $payload 'install.ps1') -and $copilotSetup.Arguments -eq '-NonInteractive -Clients claude,copilot'
 }
 $claudeSetup = Get-DaemonClientInstaller -Client 'claude'
-Test-That 'the others by their own installer' { $claudeSetup.Path -eq (Join-Path 'C:\payload' 'claude\install-claude.ps1') -and $claudeSetup.Arguments -eq '' }
+Test-That 'the others by their own installer' { $claudeSetup.Path -eq (Join-Path $payload 'claude\install-claude.ps1') -and $claudeSetup.Arguments -eq '' }
 $script:DaemonInstallerPayload = $null
 function Get-BridgeLauncherUsage { param($Launcher) [pscustomobject]@{ SignedIn = $script:SignedIn } }
 $script:SignedIn = $false
