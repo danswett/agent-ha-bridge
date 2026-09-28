@@ -339,6 +339,28 @@ program. So:
   longer arms a ten-minute "Waiting for your text": that benefit of the doubt is for a
   person, whose text is on screen but uncommitted, while a value set through the API
   commits at once, so an empty box really is empty.
+- **1.14.1** (2026-09-28): 1.14.0's purple glow could not be seen, for two independent
+  reasons. No update had ever refreshed the dashboard card: cards are delivered by
+  `install.ps1`, gated on `$homeAssistantReady`, and a self-update runs the installer
+  with `-SkipVerify`, which never sets it. A dashboard was serving card 1.13.0 while
+  the machine reported itself fully up to date on 1.13.3 - so the glow was installed,
+  published as an attribute, and had no code in the browser to draw it. This is not
+  specific to the glow: any card change could ship and simply never appear, which is
+  the part worth remembering. `-SkipVerify` means "do not fail the install on the
+  check", not "do not talk to Home Assistant". Second, `TurnStarted` came only from
+  the Claude and Codex reducers, so for a Copilot session the caller believed no turn
+  ever began; that flag is what hands a session back to the person at the keyboard, so
+  a card an agent had driven once kept its purple edge for the rest of the session, and
+  the reasoning and history carried from the previous turn were never cleared either. A
+  user message now starts a turn, and anything reasoned before it in the same batch
+  belongs to the turn that ended, exactly as `claude-transcript.ps1` has always done it.
+  Separately, publishing 1.14.0 exhausted GitHub's unauthenticated rate limit (60 an
+  hour, per IP) and the 403s were cached exactly like a real reply, so `update` answered
+  "already on 1.13.3" minutes after 1.14.0 went live, on every machine, for six hours.
+  The cache now records whether GitHub was reached at all, separately from what it said,
+  and an unreached check is believed for fifteen minutes; 404 still counts as reached,
+  being an answer. A cache written before this has no `Reached` field and is read as it
+  always was.
 
 ## Resuming
 
