@@ -240,7 +240,8 @@ program. So:
   counts, the summary. *Done:* `agent-ha-bridge status` shows it (`hooks : native (v) - N
   runs in the last 24 h, M not spooled (x%): reasons; median ms`). A fallback whose script
   also failed is its own reason (`...; fallback failed`): the agent got no bridge at all.
-- [ ] **R7. VERSION 1.12.0, release, verify the assets attached.**
+- [ ] **R7. VERSION 1.12.0, release, verify the assets attached.** In progress: VERSION
+  bumped; next a draft release, the workflow for its tag, a check of the assets, publish.
 
 ## Resuming
 
