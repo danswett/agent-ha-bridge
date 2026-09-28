@@ -632,7 +632,15 @@ $plist = Get-BridgeLaunchAgentPlist -Label 'com.agent-ha-bridge.daemon' -PwshPat
 Test-That 'the plist points launchd at that path, both streams' {
     ([regex]::Matches($plist, [regex]::Escape($logPath))).Count -eq 2
 }
-Test-That 'and never at the temp folder' { $plist -notmatch '/var/folders/' }
+# Not a search for "/var/folders/": the fake home above is itself under the temp
+# folder, because that is where a test is allowed to write, and on macOS
+# GetTempPath() *is* /var/folders/<hash>/T. So the path legitimately contains it.
+# What must never happen is the log landing in that folder itself, which is the
+# arrangement launchd refuses - so compare the folder the log sits in.
+$tempRoot = [IO.Path]::GetTempPath().TrimEnd('\', '/')
+Test-That 'and never in the temp folder itself, which launchd refuses to open' {
+    (Split-Path -Parent $logPath).TrimEnd('\', '/') -ne $tempRoot
+} $tempRoot
 Remove-Item -LiteralPath $logHome -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host ''
