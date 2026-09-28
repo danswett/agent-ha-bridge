@@ -844,7 +844,9 @@ function Update-DaemonPendingLaunch {
     # one shows; the note then says what to do, and the launch waits for it.
     $blocking = (Get-BridgeLauncher -Launcher $p.Launcher).BlockingPrompt
     $blocked = $p.PSObject.Properties['BlockedAt'] -and $null -ne $p.BlockedAt
-    if ($blocking -and $p.ProcessId -gt 0 -and -not $blocked -and ($now - $p.Since).TotalSeconds -ge 3) {
+    # Never this process's own: reading a screen attaches to that console and detaches
+    # after, which would leave this process with none.
+    if ($blocking -and $p.ProcessId -gt 0 -and $p.ProcessId -ne $PID -and -not $blocked -and ($now - $p.Since).TotalSeconds -ge 3) {
         $lastLook = if ($p.PSObject.Properties['ScreenReadAt']) { $p.ScreenReadAt } else { [DateTimeOffset]::MinValue }
         if (($now - $lastLook).TotalSeconds -ge 2) {
             Set-DaemonSessionProperty -Entry $p -Name 'ScreenReadAt' -Value $now
