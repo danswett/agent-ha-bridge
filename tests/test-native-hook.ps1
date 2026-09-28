@@ -62,7 +62,15 @@ try {
     }
     $median = @($times | Sort-Object)[2]
     Test-That 'Claude''s hook replies with nothing' { [string]::IsNullOrEmpty(($reply | Out-String).Trim()) }
-    Test-That "the agent waits under 100 ms (median $([int]$median) ms)" { $median -lt 100 }
+    # 500 ms, not the 100 ms this used to ask for. What matters is that the agent is
+    # not waiting for a PowerShell start - the fallback path, which costs the best part
+    # of a second - and this is a whole process spawn measured on whatever shared
+    # hardware CI hands out. The same runner produced medians of 50, 109 and 131 ms on
+    # three consecutive runs of identical code, so a 100 ms gate failed at random while
+    # proving nothing. The measured figure stays in the name, so a real slowdown is
+    # still visible in the log, and 'the spooled runs are the fast ones' below is the
+    # comparison that actually holds the guarantee.
+    Test-That "the agent waits under 500 ms (median $([int]$median) ms)" { $median -lt 500 }
     Test-That 'each run leaves one complete spool file' {
         @(Get-ChildItem $script:DaemonHookSpoolDirectory -Filter '*.json').Count -eq 5 -and
         @(Get-ChildItem $script:DaemonHookSpoolDirectory -Filter '*.tmp').Count -eq 0
