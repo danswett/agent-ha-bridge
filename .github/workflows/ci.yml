@@ -174,6 +174,11 @@ jobs:
           sh -n bin/agent-ha-bridge
           bash tests/test-bootstrap.sh
 
+      - name: Dashboard cards (JavaScript)
+        run: |
+          node --check frontend/agent-bridge-reply-card.js
+          node frontend/test/test-cards.js
+
       - uses: actions/setup-go@v7
         with:
           go-version-file: hook/go.mod

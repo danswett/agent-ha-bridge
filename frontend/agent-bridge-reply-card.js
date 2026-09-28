@@ -16,7 +16,7 @@
  * daemon downloads them and attaches them to the prompt.
  */
 
-const CARD_VERSION = '1.12.3';
+const CARD_VERSION = '1.13.0';
 
 // The working line, in the style of Claude Code's own spinner: its glyph cycle, and a
 // word picked once per turn. Claude Code does not record which word it chose, so the
@@ -642,6 +642,122 @@ class AgentBridgeActivityCard extends HTMLElement {
 }
 
 /*
+ * The answer to a single-choice question, as tappable rows rather than a dropdown.
+ *
+ * Home Assistant's own select control sizes its menu to the longest option and will
+ * not wrap, so on a phone a question with real sentences for answers ran off the
+ * right edge and the choices could not be read at all. Rows in the card wrap onto as
+ * many lines as they need and are the same on every screen.
+ *
+ * The options come from the select entity the bridge arms, so nothing about the
+ * answer path changes: a tap is the same `select_option` call the dropdown made.
+ * 'Awaiting answer...' is the parked state the bridge drives the selector to, not a
+ * choice, so it is never offered; 'Cancel request' is, but as a quieter row at the
+ * bottom, because it withdraws the question rather than answering it.
+ */
+const CHOICE_PLACEHOLDER = 'Awaiting answer...';
+const CHOICE_CANCEL = 'Cancel request';
+
+class AgentBridgeChoicesCard extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: 'open' });
+    this._last = '';
+    this._sent = '';
+  }
+
+  setConfig(config) {
+    if (!config || !config.decision) {
+      throw new Error('agent-bridge-choices-card: "decision" is required');
+    }
+    this._config = Object.assign({}, config);
+    this._last = '';
+    if (this._hass) { this._render(); }
+  }
+
+  set hass(hass) {
+    this._hass = hass;
+    if (this._config) { this._render(); }
+  }
+
+  getCardSize() { return 2; }
+
+  _build() {
+    this._built = true;
+    this.shadowRoot.innerHTML = `
+      <style>
+        ha-card { padding: 0; background: none; box-shadow: none; border: none; }
+        .choices { display: flex; flex-direction: column; gap: 6px; }
+        button {
+          /* Wrapping is the whole point: the text decides the height, not the row. */
+          white-space: normal; overflow-wrap: anywhere; text-align: left;
+          width: 100%; min-height: 44px; padding: 10px 12px; box-sizing: border-box;
+          font: inherit; line-height: 1.35; color: var(--primary-text-color);
+          background: var(--secondary-background-color, rgba(127,127,127,0.1));
+          border: 1px solid var(--divider-color); border-radius: 8px; cursor: pointer;
+        }
+        button:hover { border-color: var(--primary-color); }
+        button:active { background: var(--divider-color); }
+        button:focus-visible { outline: 2px solid var(--primary-color); outline-offset: 1px; }
+        button.cancel {
+          color: var(--secondary-text-color); background: none;
+          min-height: 36px; font-size: 0.92em;
+        }
+        /* While the answer is on its way, so a second tap cannot send another. */
+        .choices.sending button { opacity: 0.5; cursor: default; pointer-events: none; }
+        [hidden] { display: none !important; }
+      </style>
+      <ha-card><div class="choices"></div></ha-card>`;
+    this._els = { list: this.shadowRoot.querySelector('.choices') };
+  }
+
+  _render() {
+    if (!this._built) { this._build(); }
+    const entityId = this._config.decision;
+    const entity = this._hass ? this._hass.states[entityId] : undefined;
+    const state = entity ? String(entity.state) : '';
+    const options = entity && entity.attributes && Array.isArray(entity.attributes.options)
+      ? entity.attributes.options.map(String).filter((o) => o && o !== CHOICE_PLACEHOLDER)
+      : [];
+
+    // Nothing is waiting: an unarmed selector sits on Idle, and a session that has
+    // gone leaves its entity unknown.
+    const waiting = state !== '' && state !== 'Idle' && state !== 'unknown' && state !== 'unavailable';
+    const show = waiting && options.length > 0;
+    this.hidden = !show;
+    if (!show) { this._sent = ''; return; }
+
+    // The answer has landed once the selector is no longer parked on the placeholder.
+    if (this._sent && state !== CHOICE_PLACEHOLDER) { this._sent = ''; }
+    this._els.list.classList.toggle('sending', !!this._sent);
+
+    const signature = `${entityId}\u0001${options.join('\u0001')}`;
+    if (signature === this._last) { return; }
+    this._last = signature;
+
+    this._els.list.textContent = '';
+    for (const option of options) {
+      const button = document.createElement('button');
+      button.type = 'button';
+      button.textContent = option;
+      if (option === CHOICE_CANCEL) { button.classList.add('cancel'); }
+      button.addEventListener('click', () => this._choose(option));
+      this._els.list.appendChild(button);
+    }
+  }
+
+  _choose(option) {
+    if (this._sent || !this._hass) { return; }
+    this._sent = option;
+    this._els.list.classList.add('sending');
+    this._hass.callService('select', 'select_option', {
+      entity_id: this._config.decision,
+      option,
+    });
+  }
+}
+
+/*
  * One session's cards on a single surface: the border, background and state glow
  * (working, waiting on you) drawn here, the section cards inside it.
  *
@@ -1068,6 +1184,9 @@ if (!customElements.get('agent-bridge-session-card')) {
 if (!customElements.get('agent-bridge-activity-card')) {
   customElements.define('agent-bridge-activity-card', AgentBridgeActivityCard);
 }
+if (!customElements.get('agent-bridge-choices-card')) {
+  customElements.define('agent-bridge-choices-card', AgentBridgeChoicesCard);
+}
 
 window.customCards = window.customCards || [];
 window.customCards.push({
@@ -1079,6 +1198,11 @@ window.customCards.push({
   type: 'agent-bridge-activity-card',
   name: 'Agent Bridge Activity',
   description: 'Live status, response and reasoning for a bridged session, updated in place.',
+});
+window.customCards.push({
+  type: 'agent-bridge-choices-card',
+  name: 'Agent Bridge Choices',
+  description: 'The answers to a waiting question, as rows that wrap instead of a dropdown.',
 });
 
 console.info(`%c AGENT-BRIDGE-REPLY-CARD %c ${CARD_VERSION} `,

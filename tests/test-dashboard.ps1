@@ -380,6 +380,33 @@ Test-That 'and holds the session sections' { @($sessionCard.cards | Where-Object
 Save-CopilotSessionDashboard -Sessions $sessions -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.11.3'
 Test-That 'an older served card keeps the styled stack' { (Get-SavedJson) -notmatch 'agent-bridge-session-card' }
 
+Write-Host ''
+Write-Host '--- a waiting question is answered by rows, not a dropdown ---'
+# Home Assistant's select sizes its menu to the longest option and will not wrap, so on
+# a phone a question whose answers are sentences ran off the edge of the screen.
+Save-CopilotSessionDashboard -Sessions $sessions -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.13.0'
+$rowsCard = $script:SavedConfig | ConvertTo-Json -Depth 40 | ConvertFrom-Json -Depth 40
+$rowsSession = @($rowsCard.views[0].cards | Where-Object { $_.type -eq 'custom:agent-bridge-session-card' }) | Select-Object -First 1
+$answer = @($rowsSession.cards | Where-Object {
+    $_.type -eq 'conditional' -and "$($_.card.type)" -eq 'custom:agent-bridge-choices-card'
+})[0]
+Test-That 'a served 1.13.0 card answers with the choices card' { $null -ne $answer }
+Test-That 'pointed at the session''s decision entity' { $answer.card.decision -eq "select.$($sessions[0].Node)_decision" }
+Test-That 'it is transparent like every other section' { "$($answer.card.card_mod.style)" -match 'background:\s*none' }
+Test-That 'and still only while no field dropdown is in play' {
+    @($answer.conditions | Where-Object { "$($_.entity)" -match '_f1$' -and "$($_.state)" -eq 'Idle' }).Count -eq 1
+}
+Test-That 'the dropdown row is gone with it' {
+    @($rowsSession.cards | Where-Object {
+        $_.type -eq 'conditional' -and "$($_.card.type)" -eq 'entities' -and
+        "$($_.card.entities[0].entity)" -match '_decision$'
+    }).Count -eq 0
+}
+Save-CopilotSessionDashboard -Sessions $sessions -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.12.3'
+Test-That 'an older served card keeps the dropdown, not an error box' {
+    (Get-SavedJson) -notmatch 'agent-bridge-choices-card'
+}
+
 Write-Host '--- the dashboard is provisioned before it is written to ---'
 # Invoke-CopilotHaWebSocket hands back each command's `result` already unwrapped, so
 # a caller that reaches for `.result` again finds nothing and silently creates no
