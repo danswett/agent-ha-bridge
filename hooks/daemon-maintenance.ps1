@@ -158,34 +158,23 @@ function Sync-DaemonUpdateStatus {
 
 function Get-DaemonClientAdapterInstalled {
     <# Whether a client's bridge adapter is in place, from the files its installer leaves. #>
-    param([Parameter(Mandatory)][ValidateSet('claude', 'codex', 'copilot')][string]$Client)
+    param([Parameter(Mandatory)][ValidateScript({ $null -ne (Get-DaemonAgent -Kind $_).AdapterInstalled })][string]$Client)
 
-    switch ($Client) {
-        'claude'  { return Test-Path -LiteralPath (Join-Path $HOME '.claude\ha-bridge\claude-session.ps1') }
-        'codex'   { return Test-Path -LiteralPath (Join-Path $HOME '.agent-ha-bridge\codex-bridge\plugins\agent-ha-bridge\hooks\codex-session.ps1') }
-        'copilot' { return Test-Path -LiteralPath (Join-Path $HOME '.copilot\hooks\decision-notifier.json') }
-    }
+    [bool](& (Get-DaemonAgent -Kind $Client).AdapterInstalled)
 }
 
 function Get-DaemonClientInstaller {
     <#
         How to install a client's adapter: the installer shipped with the bridge, and
-        its arguments. Copilot's hooks are written by the main installer, which also
-        removes them whenever Copilot is not among the configured clients - so it is
-        run with Copilot added to the list, which makes the setup stick.
+        its arguments - the agent's own (Copilot's, see daemon-agents.ps1), or its
+        folder's install-<client>.ps1.
     #>
     param([Parameter(Mandatory)][string]$Client)
 
     # $script:DaemonInstallerPayload lets a test point this at a fake payload.
     $payload = if ($script:DaemonInstallerPayload) { $script:DaemonInstallerPayload } else { Join-Path $HOME '.agent-ha-bridge\installer' }
-    if ($Client -eq 'copilot') {
-        $clients = @(@(Get-BridgeSetting 'clients' @()) | ForEach-Object { [string]$_ } | Where-Object { $_ })
-        if ($clients -notcontains 'copilot') { $clients += 'copilot' }
-        return [pscustomobject]@{
-            Path      = Join-Path $payload 'install.ps1'
-            Arguments = "-NonInteractive -Clients $($clients -join ',')"
-        }
-    }
+    $own = (Get-DaemonAgent -Kind $Client).Installer
+    if ($own) { return & $own $payload }
     [pscustomobject]@{ Path = Join-Path $payload "$Client\install-$Client.ps1"; Arguments = '' }
 }
 
@@ -232,7 +221,9 @@ function Sync-DaemonClients {
 
     if (-not [bool](Get-BridgeSetting 'autoConfigureClients' $true)) { return }
 
-    foreach ($client in @('claude', 'codex', 'copilot')) {
+    # Every agent with an adapter the daemon can set up (see daemon-agents.ps1).
+    $clients = @($script:DaemonAgents.Keys | Where-Object { $null -ne (Get-DaemonAgent -Kind $_).AdapterInstalled })
+    foreach ($client in $clients) {
         $job = $script:DaemonClientSetup[$client]
 
         if ($null -ne $job) {
@@ -243,9 +234,8 @@ function Sync-DaemonClients {
                 try { Add-DaemonConfiguredClient -Client $client } catch { Write-DaemonLog -Message "could not record $client in the config: $($_.Exception.Message)" }
                 Write-DaemonLog -Message "set up the $label adapter (log: $($job.Log)); restarting to load it"
                 $note = "$label found and set up for the dashboard."
-                if ($client -eq 'codex') { $note += ' Open Codex once and approve the agent-ha-bridge hooks so its sessions show here.' }
-                elseif ($client -eq 'copilot' -and -not (Get-BridgeLauncherUsage -Launcher 'copilot').SignedIn) { $note += ' Run copilot once and sign in (/login) before launching it from here.' }
-                else { $note += ' Restart any running sessions so they pick it up.' }
+                $setupNote = (Get-DaemonAgent -Kind $client).SetupNote
+                $note += if ($setupNote) { & $setupNote } else { ' Restart any running sessions so they pick it up.' }
                 try { Set-CopilotMqttNewSessionResult -Headers $Headers -Text $note } catch { }
                 $script:DaemonRestartRequested = "load the $label adapter"
             }

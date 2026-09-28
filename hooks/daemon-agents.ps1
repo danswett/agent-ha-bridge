@@ -23,6 +23,11 @@
       ApprovalMarker    a pending tool approval its hook recorded, or $null
       TranscriptConfirmsInput  its transcript shows whether typed input was submitted,
                         so a reply or an answer is confirmed rather than assumed
+      AdapterInstalled  whether its bridge adapter is in place; an agent without this
+                        slot has no adapter the daemon can set up
+      Installer         how to install its adapter, given the installer payload; without
+                        one, <kind>\install-<kind>.ps1 with no arguments
+      SetupNote         what the launch note adds once its adapter is set up
 
     Copilot is the default: a slot an entry leaves out, or a kind that is blank or not
     listed, gets Copilot's Display, ReadAppend, Activity, IsWorking and AskUserState. That is what the old
@@ -44,6 +49,23 @@ $script:DaemonAgents = [ordered]@{
         Activity = { param($Lines, $VerboseMode) Get-ActivityFromEvents -Lines $Lines -VerboseMode $VerboseMode }
         IsWorking = { param($SessionId, $Transcript, $Status) Test-CopilotSessionWorking -SessionId $SessionId }
         AskUserState = { param($Session, $Marker) Get-CopilotAskUserState -TranscriptPath ([string]$Session.Transcript) }
+        AdapterInstalled = { Test-Path -LiteralPath (Join-Path $HOME '.copilot\hooks\decision-notifier.json') }
+        # Copilot's hooks are written by the main installer, which also removes them
+        # whenever Copilot is not among the configured clients - so it is run with
+        # Copilot added to the list, which makes the setup stick.
+        Installer = {
+            param($Payload)
+            $clients = @(@(Get-BridgeSetting 'clients' @()) | ForEach-Object { [string]$_ } | Where-Object { $_ })
+            if ($clients -notcontains 'copilot') { $clients += 'copilot' }
+            [pscustomobject]@{
+                Path      = Join-Path $Payload 'install.ps1'
+                Arguments = "-NonInteractive -Clients $($clients -join ',')"
+            }
+        }
+        SetupNote = {
+            if (-not (Get-BridgeLauncherUsage -Launcher 'copilot').SignedIn) { return ' Run copilot once and sign in (/login) before launching it from here.' }
+            ' Restart any running sessions so they pick it up.'
+        }
         RefreshName = $true
     }
 
@@ -114,6 +136,7 @@ $script:DaemonAgents = [ordered]@{
             }
             Get-ClaudeAskUserState -TranscriptPath ([string]$Session.Transcript) -ToolCallId $toolCallId -Since $since
         }
+        AdapterInstalled = { Test-Path -LiteralPath (Join-Path $HOME '.claude\ha-bridge\claude-session.ps1') }
         HookStatus = $true
         InlineReasoning = $true
         KnowsProcessId = $true
@@ -128,6 +151,9 @@ $script:DaemonAgents = [ordered]@{
             Get-CodexSessionDisplay -SessionId $SessionId -WorkingDirectory $WorkingDirectory
         }
         KnowsProcessId = $true
+        AdapterInstalled = { Test-Path -LiteralPath (Join-Path $HOME '.agent-ha-bridge\codex-bridge\plugins\agent-ha-bridge\hooks\codex-session.ps1') }
+        # Codex asks, inside Codex, for its hooks to be trusted once; that is left to the user.
+        SetupNote = { ' Open Codex once and approve the agent-ha-bridge hooks so its sessions show here.' }
         ApprovalMarker = {
             param($SessionId)
             if (-not $script:CodexAdapterLoaded) { return $null }
@@ -177,6 +203,7 @@ function Get-DaemonAgent {
     # Every slot and flag is present, so callers can test one under strict mode.
     $agent = @{
         FindSessions = $null; PollRegistration = $null; FastActivity = $null; KnownActivity = $null; ApprovalMarker = $null
+        AdapterInstalled = $null; Installer = $null; SetupNote = $null
         HookStatus = $false; InlineReasoning = $false; RefreshName = $false; KnowsProcessId = $false; TranscriptConfirmsInput = $false
     }
     foreach ($slot in 'Display', 'ReadAppend', 'Activity', 'IsWorking', 'AskUserState') { $agent[$slot] = $default[$slot] }

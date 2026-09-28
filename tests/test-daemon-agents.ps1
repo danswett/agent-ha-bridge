@@ -221,6 +221,27 @@ function Get-LiveCodexSessions { @{} }
 $null = Invoke-DaemonReply -SessionId $cx -Text 'hi' -Headers @{}
 Test-That 'a Copilot session leaves the process to the lock file' { $script:Sent -eq 0 }
 
+Write-Host '--- setting up an adapter ---'
+Test-That 'Copilot, Claude and Codex each have an adapter the daemon can set up' {
+    (@($script:DaemonAgents.Keys | Where-Object { $null -ne (Get-DaemonAgent -Kind $_).AdapterInstalled }) -join ',') -eq 'copilot,claude,codex'
+}
+Test-That 'an unlisted kind has none, and is refused' { try { Get-DaemonClientAdapterInstalled -Client 'mcp'; $false } catch { $true } }
+Test-That 'the adapter check answers yes or no' { (Get-DaemonClientAdapterInstalled -Client 'claude') -is [bool] }
+$script:DaemonInstallerPayload = 'C:\payload'
+function Get-BridgeSetting { param($Path, $Default) if ($Path -eq 'clients') { @('claude') } else { $Default } }
+$copilotSetup = Get-DaemonClientInstaller -Client 'copilot'
+Test-That 'Copilot is set up by the main installer, with itself added to the clients' {
+    $copilotSetup.Path -eq (Join-Path 'C:\payload' 'install.ps1') -and $copilotSetup.Arguments -eq '-NonInteractive -Clients claude,copilot'
+}
+$claudeSetup = Get-DaemonClientInstaller -Client 'claude'
+Test-That 'the others by their own installer' { $claudeSetup.Path -eq (Join-Path 'C:\payload' 'claude\install-claude.ps1') -and $claudeSetup.Arguments -eq '' }
+$script:DaemonInstallerPayload = $null
+function Get-BridgeLauncherUsage { param($Launcher) [pscustomobject]@{ SignedIn = $script:SignedIn } }
+$script:SignedIn = $false
+Test-That 'the note after setup asks Codex''s user to approve its hooks' { (& (Get-DaemonAgent -Kind 'codex').SetupNote) -match 'approve the agent-ha-bridge hooks' }
+Test-That 'and Copilot''s to sign in, when it has not' { (& (Get-DaemonAgent -Kind 'copilot').SetupNote) -match 'sign in' }
+$script:SignedIn = $true
+Test-That 'otherwise to restart running sessions' { (& (Get-DaemonAgent -Kind 'copilot').SetupNote) -match 'Restart any running sessions' }
 Remove-Item -LiteralPath $script:DaemonConfig.LogFile -Force -ErrorAction SilentlyContinue
 Write-Host ''
 if ($script:Failures) {

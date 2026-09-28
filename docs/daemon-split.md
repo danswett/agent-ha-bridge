@@ -127,7 +127,14 @@ after the Claude and Codex checks, so the table has to name it outright.
   recognised by shape, not agent name (`Test-DaemonLaunchProgressNote`). All 768
   argument combinations were diffed against 1.11.0: identical. Test:
   `tests/test-launchers.ps1`.
-- [ ] **E. Maintenance**. Install notes per client.
+- [x] **E. Maintenance**. Install notes per client. *Done.* Agent slots
+  `AdapterInstalled`, `Installer` (Copilot's; others use `<kind>\install-<kind>.ps1`)
+  and `SetupNote`; `Sync-DaemonClients` loops the agents that have an adapter.
+
+**Step 3 status: done.** Adding an agent now means one entry in `daemon-agents.ps1`,
+one in `BridgeLaunchers` (`session-launch.ps1`) and its adapter. Still named per agent,
+by design: the adapter loading at the top of `agent-bridge-daemon.ps1` (runs before
+the parts load), Agency's profiles, and comments describing today's agents.
 
 C to E are optional: A and B are the code that runs constantly. The user approved
 C to E on 2026-09-27; carry on through them without asking.
