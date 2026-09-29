@@ -2018,24 +2018,213 @@ function Start-BridgeTmuxSession {
     }
     if ($panePid -le 0) { throw (Get-BridgeAgentStartFailure -Executable $Executable) }
 
-    Open-BridgeTerminalWindow -Command "'$tmux' attach -t '$session'"
+    Open-BridgeTerminalWindow -Command "'$tmux' attach -t '$session'" `
+        -Title (Get-BridgeTerminalWindowTitle -ProcessId $panePid)
     $panePid
 }
 
 function Open-BridgeTerminalWindow {
-    <# Opens a macOS terminal window running $Command (already shell-quoted). #>
-    param([Parameter(Mandatory)][string]$Command)
+    <#
+        Opens a macOS terminal window running $Command (already shell-quoted).
+
+        The window is tagged with $Title so it can be found and closed again when the
+        session ends. Nothing else identifies it: the window runs `tmux attach`, whose
+        process is not the agent and is gone by the time anything wants to tidy up, so
+        without a tag the only way to find it would be to guess - and guessing wrong
+        means closing a window of the user's with their own work in it.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Command,
+        [AllowEmptyString()][string]$Title = ''
+    )
 
     $app = [string](Get-BridgeSetting 'platform.terminal' 'Terminal')
     if ($app -eq 'none') { return }
     $quoted = $Command.Replace('\', '\\').Replace('"', '\"')
+    $safeTitle = $Title.Replace('\', '\\').Replace('"', '\"')
     $script = if ($app -match '^iterm') {
-        "tell application `"iTerm`" to create window with default profile command `"$quoted`""
+        # iTerm names the session rather than the tab, and `create window` hands back
+        # the window whose current session it is.
+        @"
+tell application "iTerm"
+  set w to (create window with default profile command "$quoted")
+  try
+    tell current session of w to set name to "$safeTitle"
+  end try
+end tell
+"@
     }
     else {
-        "tell application `"Terminal`"`n  do script `"$quoted`"`n  activate`nend tell"
+        # `do script` returns the tab it started in, which is what carries the title.
+        @"
+tell application "Terminal"
+  set t to do script "$quoted"
+  try
+    set custom title of t to "$safeTitle"
+  end try
+  activate
+end tell
+"@
     }
     & osascript -e $script 2>&1 | Out-Null
+}
+
+function Get-BridgeTerminalWindowTitle {
+    <#
+        The tag put on the terminal window opened for a session.
+
+        Keyed on the process the window was opened for, because that is the one thing
+        both ends have: the launcher knows it the moment tmux reports the pane, and
+        the daemon still has it when the session is stopped. A session id would not
+        do - Codex chooses its own, and does so after the window is already open.
+    #>
+    param([Parameter(Mandatory)][int]$ProcessId)
+    "agent-bridge:$ProcessId"
+}
+
+function Close-BridgeTerminalWindow {
+    <#
+        Closes the terminal window the bridge opened for a session, by its tag.
+
+        macOS needs this and Windows does not. There, the bridge starts the CLI with
+        its own console and closing the window is a matter of ending that process. On
+        a Mac the session runs inside tmux and the window is a separate Terminal
+        window running `tmux attach`: when the agent exits, tmux tears its session
+        down and the attach returns, but the window stays open showing a dead shell.
+        The pid the daemon has is the tmux *pane's* - the agent itself - so there is
+        no process left whose death would take the window with it.
+
+        Only ever called for a window the bridge opened, and only ever closes one
+        carrying this bridge's tag, so a terminal the user opened is never touched.
+        A window with something still running in it is left alone rather than closed,
+        because the confirmation macOS raises for that is modal and there is nobody
+        at the keyboard to answer it.
+
+        Best effort: a window that has already been closed, a terminal that is not
+        running, or an osascript that fails must not stop a session from ending.
+        Returns whether a window was closed.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Title,
+
+        # How long to give tmux to finish tearing down before the window is judged
+        # busy. The attach returns on its own once the session is gone; closing in
+        # that gap would find the window still running something and leave it.
+        [double]$SettleSeconds = 6
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Title)) { return $false }
+    $app = [string](Get-BridgeSetting 'platform.terminal' 'Terminal')
+    if ($app -eq 'none') { return $false }
+    if ($script:BridgeIsWindows) { return $false }
+    $waitTicks = [Math]::Max(1, [int][Math]::Round($SettleSeconds / 0.5))
+
+    $safeTitle = $Title.Replace('\', '\\').Replace('"', '\"')
+    # Two things had to be got right here, both learned from a real Mac.
+    #
+    # Windows are addressed by id through `window id N`, Terminal's own by-id
+    # specifier - not as the references `repeat with w in windows` hands out, and not
+    # through `first window whose id is N`. The plain references are positional
+    # (`window 1`, `window 2`), so closing the first shifts every later one down and
+    # the rest of the list then points at whatever moved into that slot; on a real Mac
+    # that closed a window belonging to a *different* session, leaving its tmux
+    # detached with no window and its card still on the dashboard. A `whose` filter
+    # fares no better here - Terminal resolved one to the wrong window too.
+    #
+    # And `close` is never called on a busy window. `saving no` suppresses the *save*
+    # prompt; the "terminate running processes?" confirmation is a different dialog
+    # and it is modal. Closing a busy window therefore does not fail - it puts a
+    # dialog on the user's screen and waits, and every later attempt queues another
+    # behind it. That is what left windows stuck open and unclosable through repeated
+    # attempts. So the window is given a few seconds to go idle first, which is all
+    # tmux needs to finish tearing down and let the attach return, and if something
+    # is still running after that the window is left alone - much the better outcome
+    # than a modal dialog nobody is at the keyboard to answer.
+    #
+    # What comes back is how many actually went, counted by looking again - not how
+    # many matched. `close` is wrapped in `try` because a window that has already gone
+    # must not throw, and that same `try` will swallow a close that genuinely failed;
+    # returning the matched count would then report success for a window still sitting
+    # on screen. Measured on a real Mac, where exactly that happened.
+    $script = if ($app -match '^iterm') {
+        @"
+tell application "iTerm"
+  set doomed to {}
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        try
+          if name of s is "$safeTitle" then
+            set wid to id of w
+            if doomed does not contain wid then set end of doomed to wid
+          end if
+        end try
+      end repeat
+    end repeat
+  end repeat
+  repeat with wid in doomed
+    try
+      close (window id wid)
+    end try
+  end repeat
+  delay 0.3
+  set remaining to 0
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        try
+          if name of s is "$safeTitle" then set remaining to remaining + 1
+        end try
+      end repeat
+    end repeat
+  end repeat
+  return ((count of doomed) - remaining)
+end tell
+"@
+    }
+    else {
+        @"
+tell application "Terminal"
+  set doomed to {}
+  repeat with w in windows
+    repeat with t in tabs of w
+      try
+        if custom title of t is "$safeTitle" then
+          set wid to id of w
+          if doomed does not contain wid then set end of doomed to wid
+        end if
+      end try
+    end repeat
+  end repeat
+  repeat with wid in doomed
+    try
+      set target to (window id wid)
+      repeat $waitTicks times
+        if (busy of target) is false then exit repeat
+        delay 0.5
+      end repeat
+      if (busy of target) is false then close target saving no
+    end try
+  end repeat
+  delay 0.3
+  set remaining to 0
+  repeat with w in windows
+    repeat with t in tabs of w
+      try
+        if custom title of t is "$safeTitle" then set remaining to remaining + 1
+      end try
+    end repeat
+  end repeat
+  return ((count of doomed) - remaining)
+end tell
+"@
+    }
+
+    try {
+        $out = (& osascript -e $script 2>&1 | Out-String).Trim()
+        return ($out -match '^[1-9]')
+    }
+    catch { return $false }
 }
 
 function Stop-BridgeCopilotSession {
