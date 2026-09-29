@@ -297,8 +297,8 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `homeAssistant.baseUrl` | e.g. `http://homeassistant.local:8123` |
 | `homeAssistant.token` | Long-lived access token |
 | `homeAssistant.tokenEnvVar` | Read the token from this env var instead (default `AGENT_HA_TOKEN`; `COPILOT_HA_TOKEN` still works) |
-| `homeAssistant.agentUserIds` | Home Assistant user ids that count as an agent rather than you. A session an agent starts or replies to gets a purple edge on its card, so a session being driven remotely says so at a glance. Empty by default, which means nothing is ever marked — see [Telling an agent's turn from yours](#telling-an-agents-turn-from-yours) |
-| `homeAssistant.agentToken` | The long-lived token belonging to that agent account. Handed to the MCP server and to every session the bridge launches, so an agent drives the bridge as itself; the daemon and the hooks keep using `homeAssistant.token`. Without it an agent presses with your token and nothing is ever marked — the two settings are useless apart, and `agent-ha-bridge status` says so when only one is set |
+| `homeAssistant.agentUserIds` | Home Assistant user ids that count as an agent rather than you. A session an agent starts or replies to gets a purple edge on its card, so a session being driven remotely says so at a glance. Written for you from `agentToken` — see [Telling an agent's turn from yours](#telling-an-agents-turn-from-yours) |
+| `homeAssistant.agentToken` | A long-lived token for a *separate* Home Assistant account standing for the agent. Handed to the MCP server and to every session the bridge launches, so an agent drives the bridge as itself; the daemon and hooks keep using `homeAssistant.token`. Set it with `agent-ha-bridge configure -AgentToken <token>`, which also fills in `agentUserIds` |
 | `homeAssistant.agentTokenEnvVar` | Read the agent token from this env var instead (default `AGENT_HA_AGENT_TOKEN`) |
 | `dashboard.urlPath` | Lovelace dashboard slug (default `agent-decisions`) |
 | `notifications.enabled` / `.service` | Optional notify-style service |
@@ -343,24 +343,31 @@ Giving the agent its own account is what makes the difference real:
 
 1. *Settings → People → Add person*, with **Allow login** on. Call it whatever you
    like — `Copilot`, say — and make it a non-administrator.
-2. Log in as that user once and create a long-lived token for it (*Profile →
-   Security → Long-lived access tokens*). Put it in `homeAssistant.agentToken`, and
-   leave your own `homeAssistant.token` alone: the daemon, the hooks and the dashboard
-   provisioning still run as you. The bridge hands the agent token to the MCP server
-   and into the environment of every session it launches (`AGENT_HA_AGENT_TOKEN`), so
-   an agent that goes on to drive another session does so as itself.
-3. Find the user's id under *Settings → People → <the user>*; it is the long hex string
-   in the URL. Put it in `homeAssistant.agentUserIds`.
+2. Log in as that user once (a private browser window is easiest) and create a
+   long-lived token for it (*Profile → Security → Long-lived access tokens*).
+3. Hand it to the installer:
 
-   Read it from that URL, not from the token. A long-lived token is a JWT whose `iss`
-   claim looks exactly like a user id but is the *refresh token's* id, and using it
-   means nothing is ever marked as agent-driven. If the URL is awkward to get at, have
-   the agent change something with its own token and read `context.user_id` back off
-   the resulting state — that is the same id the bridge compares against.
+   ```powershell
+   agent-ha-bridge configure -AgentToken <the token>
+   ```
 
-Steps 2 and 3 are useless apart, and having only one of them fails silently: the
-dashboard simply never marks anything. `agent-ha-bridge status` and the installer both
-say so when only one is set.
+   An interactive install offers this step on its own; `homeAssistant.agentToken` in
+   the config, or the `AGENT_HA_AGENT_TOKEN` environment variable, does the same.
+
+That is the whole setup — there is no user id to copy. The installer reads the account
+back off the token (`auth/current_user`) and writes `agentUserIds` itself, because that
+was the one step in this flow with a silent wrong answer available: a long-lived token
+is a JWT whose `iss` claim looks exactly like a user id but is the *refresh token's*
+id, and using it means nothing is ever marked and nothing ever says why.
+
+It also refuses two tokens rather than storing them to fail quietly later: one Home
+Assistant rejects, and one belonging to *your own* account — which authenticates
+perfectly and can never mark anything.
+
+Your own `homeAssistant.token` is left alone; the daemon, the hooks and the dashboard
+provisioning still run as you. The agent token goes to the MCP server and into the
+environment of every session the bridge launches (`AGENT_HA_AGENT_TOKEN`), so an agent
+that goes on to drive another session does so as itself.
 
 A session an agent starts or replies to is drawn with a purple edge — steady while
 idle, pulsing while it works — and hands back to the ordinary colours the moment you

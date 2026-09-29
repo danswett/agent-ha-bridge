@@ -24,6 +24,14 @@
     repository. Omit it to keep an existing token, or to supply one via the
     AGENT_HA_TOKEN environment variable instead.
 
+.PARAMETER AgentToken
+    A long-lived access token belonging to a *separate* Home Assistant account that
+    stands for the agent. What an agent does through the bridge is then attributed to
+    that account instead of to you, which is the only thing that can tell an agent's
+    turn from yours. The matching user id is read back from the token and stored for
+    you. Omit it to keep an existing one, or to supply one via the
+    AGENT_HA_AGENT_TOKEN environment variable instead.
+
 .PARAMETER NotifyService
     Optional Home Assistant notify-style service for out-of-band alerts, e.g.
     notify.mobile_app_pixel. Omit to disable notifications.
@@ -68,6 +76,7 @@
 param(
     [string]$HomeAssistantUrl,
     [string]$Token,
+    [string]$AgentToken,
     [string]$NotifyService,
     [string]$TickerCategory,
     [string]$TargetHome,
@@ -776,6 +785,151 @@ function Test-BridgeHomeAssistantConnection {
     }
     catch { }
 
+    $result
+}
+
+function Get-BridgeHomeAssistantUser {
+    <#
+        Which Home Assistant account a token belongs to.
+
+        This is what makes an agent identity configurable rather than transcribed.
+        The user id is otherwise copied by hand out of a Settings URL, and the obvious
+        shortcut - reading it off the token - is a trap: a long-lived token is a JWT
+        whose `iss` claim looks exactly like a user id but is the *refresh token's*
+        id, so using it means nothing is ever marked and nothing ever says why.
+        `auth/current_user` answers it properly, from the account the token actually
+        authenticates as.
+
+        WebSocket rather than REST because Home Assistant offers this nowhere else.
+        Always returns an object rather than throwing: a rejected token is an ordinary
+        outcome here - it is exactly what a revoked or half-pasted one looks like -
+        and the caller offers another go.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$BaseUrl,
+        [AllowEmptyString()][AllowNull()][string]$Token,
+        [int]$TimeoutSec = 20
+    )
+
+    $result = [pscustomobject]@{ Ok = $false; Id = ''; Name = ''; IsAdmin = $false; Rejected = $false; Error = '' }
+    if ([string]::IsNullOrWhiteSpace($BaseUrl)) { $result.Error = 'no Home Assistant URL'; return $result }
+    if ([string]::IsNullOrWhiteSpace($Token)) { $result.Error = 'no token'; return $result }
+
+    $wsUrl = (([string]$BaseUrl).TrimEnd('/') -replace '^http', 'ws') + '/api/websocket'
+    $ws = $null
+    try {
+        $cancel = [Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds($TimeoutSec))
+        $ws = [System.Net.WebSockets.ClientWebSocket]::new()
+        $ws.ConnectAsync([Uri]$wsUrl, $cancel.Token).Wait()
+
+        $buffer = [byte[]]::new(65536)
+        # Scriptblocks, not nested functions: a function declared inside a function is
+        # defined in that scope every call, and PowerShell has been known to lose its
+        # footing over it in odd ways.
+        $receive = {
+            $segment = [ArraySegment[byte]]::new($buffer)
+            $got = $ws.ReceiveAsync($segment, $cancel.Token).GetAwaiter().GetResult()
+            [Text.Encoding]::UTF8.GetString($buffer, 0, $got.Count)
+        }
+        $send = {
+            param($Message)
+            $bytes = [Text.Encoding]::UTF8.GetBytes($Message)
+            $ws.SendAsync([ArraySegment[byte]]::new($bytes), [Net.WebSockets.WebSocketMessageType]::Text, $true, $cancel.Token).Wait()
+        }
+
+        [void](& $receive)   # auth_required
+        & $send (@{ type = 'auth'; access_token = $Token } | ConvertTo-Json -Compress)
+        $auth = (& $receive) | ConvertFrom-Json
+        if ([string]$auth.type -ne 'auth_ok') {
+            # Home Assistant answered and said no. Worth separating from "could not
+            # ask": one means the token is bad, the other means the network is, and
+            # only the first justifies telling someone their token is no good.
+            $result.Rejected = $true
+            $result.Error = 'Home Assistant rejected the token'
+            return $result
+        }
+
+        & $send (@{ id = 1; type = 'auth/current_user' } | ConvertTo-Json -Compress)
+        $answer = (& $receive) | ConvertFrom-Json
+        if (-not $answer.success) { $result.Error = 'Home Assistant would not say who the token belongs to'; return $result }
+
+        $result.Id = [string]$answer.result.id
+        $result.Name = [string]$answer.result.name
+        $result.IsAdmin = [bool]$answer.result.is_admin
+        $result.Ok = -not [string]::IsNullOrWhiteSpace($result.Id)
+        if (-not $result.Ok) { $result.Error = 'Home Assistant returned no user id' }
+        $result
+    }
+    catch {
+        $result.Error = $_.Exception.InnerException ? $_.Exception.InnerException.Message : $_.Exception.Message
+        $result
+    }
+    finally { if ($ws) { $ws.Dispose() } }
+}
+
+function Resolve-BridgeAgentIdentity {
+    <#
+        What to do with a candidate agent token: store it, or refuse it and say why.
+
+        Split out of the install flow so the decision is testable on its own. The two
+        refusals are the point of it, because both fail *silently* if simply stored -
+        the dashboard marks nothing, forever, with no error anywhere:
+
+          * a token Home Assistant rejects, which is what a revoked or half-pasted one
+            looks like (this machine had one saved from a previous attempt that had
+            since stopped working, and nothing ever said so);
+          * a token belonging to your own account, which authenticates perfectly and
+            is indistinguishable from you by construction - the whole feature rests on
+            the two being different accounts.
+
+        On success it also carries the user id read back off the token, so the caller
+        never has to ask anyone to copy one.
+
+        -Lookup is the seam: it takes a URL and a token and answers like
+        Get-BridgeHomeAssistantUser.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$BaseUrl,
+        [AllowEmptyString()][AllowNull()][string]$AgentToken,
+        [AllowEmptyString()][AllowNull()][string]$OwnToken,
+        [scriptblock]$Lookup = $null
+    )
+
+    if (-not $Lookup) { $Lookup = { param($Url, $Tok) Get-BridgeHomeAssistantUser -BaseUrl $Url -Token $Tok } }
+
+    $result = [pscustomobject]@{
+        Store = $false; Token = ''; UserId = ''; Name = ''; IsAdmin = $false; Warning = ''
+    }
+    if ([string]::IsNullOrWhiteSpace($AgentToken)) { return $result }
+
+    $agent = & $Lookup $BaseUrl $AgentToken
+    if (-not $agent.Ok) {
+        $rejected = $agent.PSObject.Properties['Rejected'] -and $agent.Rejected
+        $result.Warning = if ($rejected) {
+            "The agent token was not accepted ($($agent.Error)), so it has not been saved. " +
+            'Create a fresh one on that account and re-run with -AgentToken.'
+        }
+        else {
+            # The network, not the token. Saying "your token is no good" here would be
+            # a guess, and a discouraging one.
+            "Could not check the agent token ($($agent.Error)), so it has not been saved. Try again."
+        }
+        return $result
+    }
+
+    $own = & $Lookup $BaseUrl $OwnToken
+    if ($own.Ok -and $agent.Id -eq $own.Id) {
+        $result.Warning = "That token belongs to '$($agent.Name)' - the same account as the bridge's own token. " +
+                          'An agent using it is indistinguishable from you, so it has not been saved. ' +
+                          'Create a separate Home Assistant user for the agent.'
+        return $result
+    }
+
+    $result.Store = $true
+    $result.Token = [string]$AgentToken
+    $result.UserId = [string]$agent.Id
+    $result.Name = [string]$agent.Name
+    $result.IsAdmin = [bool]$agent.IsAdmin
     $result
 }
 
@@ -1810,6 +1964,11 @@ if ($PSBoundParameters.ContainsKey('HomeAssistantUrl') -and $HomeAssistantUrl) {
 if ($PSBoundParameters.ContainsKey('Token') -and $Token) {
     $config.homeAssistant.token = $Token
 }
+# -AgentToken is deliberately NOT stored here. It is a *candidate* until the agent
+# identity step below has asked Home Assistant who it belongs to: storing it first
+# means a revoked token, or one minted on your own account, is persisted anyway and
+# then fails silently for the life of the install - which is the exact failure the
+# check exists to prevent.
 if ($PSBoundParameters.ContainsKey('NotifyService') -and $NotifyService) {
     $config.notifications.enabled = $true
     $config.notifications.service = $NotifyService
@@ -1968,6 +2127,61 @@ else {
     $homeAssistantReady = $true
 }
 
+# ------------------------------------------------------- the agent's own identity
+#
+# Optional, and skipped without complaint. What it buys is the only honest way to
+# tell an agent's turn from yours: an agent drives the bridge through the same
+# entities you do, so the account behind the press is the one signal that separates
+# them, and that needs an account of its own.
+#
+# The user id is read back from the token rather than asked for. It used to be copied
+# by hand out of a Settings URL - the one step in this whole flow with a silent wrong
+# answer available, since a long-lived token's `iss` claim looks exactly like a user
+# id and is not one.
+if ($homeAssistantReady) {
+    # Candidate order: what was passed, then what is already configured, then the
+    # environment. Only the check below decides whether any of it is stored.
+    $agentTokenValue = ''
+    if ($PSBoundParameters.ContainsKey('AgentToken') -and $AgentToken) { $agentTokenValue = [string]$AgentToken }
+    if (-not $agentTokenValue) { $agentTokenValue = [string]$config.homeAssistant.agentToken }
+    if (-not $agentTokenValue) {
+        $agentEnvVar = [string]$config.homeAssistant.agentTokenEnvVar
+        if (-not $agentEnvVar) { $agentEnvVar = 'AGENT_HA_AGENT_TOKEN' }
+        $agentTokenValue = [string][Environment]::GetEnvironmentVariable($agentEnvVar)
+    }
+
+    if (-not $agentTokenValue -and -not $NonInteractive -and (Test-BridgeConsoleInteractive)) {
+        Write-Host ''
+        Write-Host 'Optional: give the agent its own Home Assistant account.' -ForegroundColor Yellow
+        Write-Host '    Without one, a session an agent starts or replies to is indistinguishable'
+        Write-Host '    from one you drove yourself, and is never marked on the dashboard.'
+        if (Read-BridgeYesNo -Prompt '    Set that up now?' -Default $false) {
+            Write-Host "    1. Open $base/config/person and add a person with 'Allow login' on -"
+            Write-Host '       call it Copilot, and leave it a non-administrator'
+            Write-Host '    2. Log in as that user (a private browser window is easiest)'
+            Write-Host '    3. On its profile, Security -> Long-lived access tokens -> Create token'
+            $enteredAgent = Read-Host '    Paste the agent token here (Enter to skip)'
+            if (-not [string]::IsNullOrWhiteSpace($enteredAgent)) { $agentTokenValue = $enteredAgent.Trim() }
+        }
+    }
+
+    if ($agentTokenValue) {
+        Write-Step 'Checking the agent account'
+        $identity = Resolve-BridgeAgentIdentity -BaseUrl $base -AgentToken $agentTokenValue -OwnToken $effectiveToken
+        if ($identity.Store) {
+            $config.homeAssistant.agentToken = $identity.Token
+            # Written from the token, never asked for: this is the step that used to
+            # have a silent wrong answer available.
+            $config.homeAssistant.agentUserIds = @($identity.UserId)
+            Write-Host "    agent account: $($identity.Name) ($($identity.UserId))" -ForegroundColor Green
+            if ($identity.IsAdmin) {
+                Write-Host '                   it is an administrator; a non-admin is plenty for driving sessions' -ForegroundColor Yellow
+            }
+        }
+        else { Write-Warning $identity.Warning }
+    }
+}
+
 # Record what was installed, so the update check can compare against the newest
 # release without guessing.
 if (-not $config.PSObject.Properties.Name.Contains('updates')) {
@@ -1992,6 +2206,10 @@ $config | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $configPath -Encodi
 [void](Protect-BridgeSecretFile -Path $configPath)
 Write-Host "    baseUrl      : $($config.homeAssistant.baseUrl)"
 Write-Host "    token        : $(if ($config.homeAssistant.token) { 'set in config' } else { "from `$env:$($config.homeAssistant.tokenEnvVar)" })"
+Write-Host "    agent account: $(
+    if ($config.homeAssistant.agentToken -and @($config.homeAssistant.agentUserIds).Count) { 'set - agent-driven sessions are marked' }
+    elseif ($config.homeAssistant.agentToken -or @($config.homeAssistant.agentUserIds).Count) { 'half set - see the warning below' }
+    else { 'none - an agent drives the bridge as you' })"
 Write-Host "    notifications: $(if ($config.notifications.enabled) { $config.notifications.service } else { 'disabled' })"
 
 function Get-BridgeInstallAgentIdentityWarning {

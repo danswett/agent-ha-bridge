@@ -320,6 +320,68 @@ try {
 }
 finally { Remove-Item -LiteralPath $scratch -Force -ErrorAction SilentlyContinue }
 
+# ---------------------------------------------------- the agent's own identity
+# An agent drives the bridge through the same entities you do, so the account behind
+# the press is the only thing that separates its turn from yours. Both refusals below
+# fail silently if the token is simply stored: the dashboard marks nothing, forever,
+# with no error anywhere. One of them had already happened on the author's machine -
+# a token saved from an earlier attempt had since been revoked, and nothing said so.
+Write-Host ''
+Write-Host '--- the agent identity the installer will store ---'
+
+$you = [pscustomobject]@{ Ok = $true; Id = 'owner-id'; Name = 'Dan Swett'; IsAdmin = $true; Error = '' }
+$bot = [pscustomobject]@{ Ok = $true; Id = 'agent-id'; Name = 'Copilot'; IsAdmin = $false; Error = '' }
+$dud = [pscustomobject]@{ Ok = $false; Id = ''; Name = ''; IsAdmin = $false; Rejected = $true; Error = 'Home Assistant rejected the token' }
+# Not the same thing: the network failed, so the token is unjudged rather than bad.
+$unreachable = [pscustomobject]@{ Ok = $false; Id = ''; Name = ''; IsAdmin = $false; Rejected = $false; Error = 'connection refused' }
+
+# The seam answers by token, the way the real lookup does.
+$lookup = { param($Url, $Tok)
+    switch ($Tok) { 'agent-token' { $bot } 'own-token' { $you } 'admin-agent' { [pscustomobject]@{ Ok = $true; Id = 'agent-id'; Name = 'Copilot'; IsAdmin = $true; Error = '' } } default { $dud } }
+}
+
+$good = Resolve-BridgeAgentIdentity -BaseUrl 'http://ha.test:8123' -AgentToken 'agent-token' -OwnToken 'own-token' -Lookup $lookup
+Test-That 'a token on its own account is stored' { $good.Store }
+Test-That 'and its user id comes off the token, so nobody copies one by hand' { $good.UserId -eq 'agent-id' } $good.UserId
+Test-That 'the account is named, so the install says what it just wired up' { $good.Name -eq 'Copilot' }
+Test-That 'nothing is warned about' { $good.Warning -eq '' } $good.Warning
+
+$same = Resolve-BridgeAgentIdentity -BaseUrl 'http://ha.test:8123' -AgentToken 'own-token' -OwnToken 'own-token' -Lookup $lookup
+Test-That 'a second token on your OWN account is refused' { -not $same.Store }
+Test-That 'and nothing is left to store' { $same.Token -eq '' -and $same.UserId -eq '' }
+Test-That 'the refusal says why, since it would otherwise mark nothing forever' {
+    $same.Warning -match 'same account' -and $same.Warning -match 'indistinguishable'
+} $same.Warning
+
+$revoked = Resolve-BridgeAgentIdentity -BaseUrl 'http://ha.test:8123' -AgentToken 'stale-token' -OwnToken 'own-token' -Lookup $lookup
+Test-That 'a token Home Assistant rejects is not saved as a dud' { -not $revoked.Store }
+Test-That 'and says so, rather than failing quietly later' { $revoked.Warning -match 'not accepted' } $revoked.Warning
+
+# Telling "your token is bad" from "I could not ask" matters: the first is worth
+# acting on, the second is the network and saying it is the token would be a guess.
+$offline = { param($Url, $Tok) if ($Tok -eq 'own-token') { $you } else { $unreachable } }
+$unjudged = Resolve-BridgeAgentIdentity -BaseUrl 'http://ha.test:8123' -AgentToken 'agent-token' -OwnToken 'own-token' -Lookup $offline
+Test-That 'a token that could not be checked is also not stored' { -not $unjudged.Store }
+Test-That 'but is not called bad, because nothing judged it' {
+    $unjudged.Warning -match 'Could not check' -and $unjudged.Warning -notmatch 'not accepted'
+} $unjudged.Warning
+
+$none = Resolve-BridgeAgentIdentity -BaseUrl 'http://ha.test:8123' -AgentToken '' -OwnToken 'own-token' -Lookup $lookup
+Test-That 'no agent token at all is not an error - the whole step is optional' {
+    -not $none.Store -and $none.Warning -eq ''
+} $none.Warning
+
+$adminBot = Resolve-BridgeAgentIdentity -BaseUrl 'http://ha.test:8123' -AgentToken 'admin-agent' -OwnToken 'own-token' -Lookup $lookup
+Test-That 'an administrator agent account is still stored, only remarked on' {
+    $adminBot.Store -and $adminBot.IsAdmin
+}
+
+# A daemon token that cannot be checked must not turn into "same account" by accident:
+# the comparison only refuses when the owner lookup actually succeeded.
+$unknownOwner = { param($Url, $Tok) if ($Tok -eq 'agent-token') { $bot } else { $dud } }
+$stillOk = Resolve-BridgeAgentIdentity -BaseUrl 'http://ha.test:8123' -AgentToken 'agent-token' -OwnToken 'own-token' -Lookup $unknownOwner
+Test-That 'an unreadable owner token does not block a good agent token' { $stillOk.Store }
+
 Write-Host ''
 if ($script:Failures) {
     Write-Host "$($script:Failures) check(s) failed" -ForegroundColor Red

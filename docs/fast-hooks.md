@@ -521,6 +521,30 @@ program. So:
   follows both the whole way, and `tests/verify-permissions-live.ps1` proves the
   discovery payload against a real Home Assistant, because 1.14.1 and 1.14.4 were both
   features that passed their tests and could not appear in a browser.
+- **1.17.1** (2026-09-29): the agent account is set up by the installer rather than by
+  hand. `install.ps1 -AgentToken <token>` (and `agent-ha-bridge configure -AgentToken`,
+  and an offer during an interactive install) stores it *and* reads the account back
+  off the token with `auth/current_user`, so `agentUserIds` is written for you.
+
+  That removes the one step in the flow with a silent wrong answer available. The id
+  was copied by hand out of a Settings URL, and the obvious shortcut - reading it off
+  the token - is a trap: a long-lived token is a JWT whose `iss` claim looks exactly
+  like a user id but is the refresh token's, so it never matches and nothing says why.
+  Nothing has to copy it now.
+
+  Two tokens are refused rather than stored to fail quietly later, both of which had
+  already happened here. One Home Assistant rejects - a stale token saved by an earlier
+  session had since been revoked, and nothing had ever reported it - and one belonging
+  to *your own* account, which authenticates perfectly and can never mark anything,
+  since the whole mechanism rests on the two accounts differing. A token that merely
+  could not be checked is reported differently from one that was refused: only Home
+  Assistant answering "no" justifies telling someone their token is bad.
+
+  `-AgentToken` is deliberately not written to the config when it is bound, only after
+  the check. Doing it at bind time - the first shape of this - persisted a refused
+  token anyway, which is exactly the failure the check exists to prevent, and the
+  scratch install that caught it showed `agentToken` set beside an empty
+  `agentUserIds`.
 
 ## Next: let a Copilot permission prompt be approved from Home Assistant
 
