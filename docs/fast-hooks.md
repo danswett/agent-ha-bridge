@@ -454,6 +454,18 @@ program. So:
   (`tests/test-http-guard.ps1`). And the answer-mismatch warning turns out to be a
   false alarm on any question built from value/label pairs - see below; the correction
   it injects tells the agent to disregard an answer that was right.
+- **1.15.1** (2026-09-28): that false alarm, fixed. A question now carries the schema
+  value of every option beside the label shown on the card, and the check that an
+  answer survived delivery accepts either name - the card and the injector work in
+  labels, the CLI records values (`release=cut_now`, `glow=true`), and comparing only
+  labels meant every `oneOf` form and every yes/no field failed. The warning keeps its
+  teeth: an option next to the one picked differs under both names. Proven on the
+  question that authorised this release, whose two fields were sent as `Yes` and
+  `(Recommended) The four measured performance items` and recorded as `release=true,
+  next=perf_items` - the completion check ran, cleared the card and said nothing, where
+  the same form had fired a correction twice earlier the same evening. Anyone answering
+  from a phone on 1.15.0 is being contradicted on good answers, which is the reason
+  this is a release and not just a commit.
 
 ## Next: let a Copilot permission prompt be approved from Home Assistant
 
