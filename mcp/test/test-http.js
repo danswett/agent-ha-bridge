@@ -21,9 +21,9 @@ let failures = 0;
 // The details logged below include a raw socket response and a header value built to
 // contain control characters, so they are folded onto one line before being printed:
 // a newline in a log line is how one entry is made to look like two (CodeQL
-// js/log-injection). The two separate constant patterns are deliberate: CodeQL reads
-// the replaced string off a constant regex, so neither a character class nor an
-// alternation like `/\n|\r/g` is recognised as a sanitizer.
+// js/log-injection). Keep it, but it does not clear the alert - see the same note in
+// harness.js. No replace-based sanitizer is recognised by this query for JavaScript,
+// so the alert is dismissed as used-in-tests rather than escaped away.
 const oneLine = (value) => String(value).replace(/\n/g, ' ').replace(/\r/g, ' ').replace(/[\u0000-\u001f\u007f]/g, '?');
 const check = (name, ok, detail = '') => {
   const line = `  ${ok ? 'PASS' : 'FAIL'}  ${oneLine(name)}${detail ? ` - ${oneLine(detail)}` : ''}`;

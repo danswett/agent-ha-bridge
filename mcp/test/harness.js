@@ -28,10 +28,13 @@ if (!baseUrl || !token) {
 let failures = 0;
 // A name or detail can carry whatever HA_BASE_URL and the instance put in it, and a
 // newline in a log line is how one entry is made to look like two (CodeQL
-// js/log-injection). The two separate constant patterns are deliberate: CodeQL reads
-// the replaced string off a constant regex, so neither a character class nor an
-// alternation like `/\n|\r/g` is recognised as a sanitizer - both were tried and the
-// alert stayed open, moving down with the line numbers.
+// js/log-injection). Keep it, but do not expect it to clear the alert: three shapes
+// were tried - a character class, the alternation `/\n|\r/g` that CodeQL's own
+// guidance shows, and two separate constant patterns - and the SARIF code flow showed
+// taint passing straight through every replace each time. This query has no
+// replace-based sanitizer for JavaScript, so the alert is dismissed as used-in-tests
+// rather than escaped away. The scrub still earns its place: a newline here really can
+// forge a PASS line in the output.
 const oneLine = (value) => String(value).replace(/\n/g, ' ').replace(/\r/g, ' ').replace(/[\u0000-\u001f\u007f]/g, '?');
 const check = (name, ok, detail = '') => {
   const line = `  ${ok ? 'PASS' : 'FAIL'}  ${oneLine(name)}${detail ? ` - ${oneLine(detail)}` : ''}`;
