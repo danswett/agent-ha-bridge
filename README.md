@@ -308,8 +308,8 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `newSession.codexStartPrompt` | The first message a Codex launched without one is given, so it creates its session and attaches. Empty: the launch waits for a first message sent from the card |
 | `detailedActivity` | `true` (default): cards carry reasoning and each tool call. `false`: status and responses only |
 | `platform.terminal` | macOS: the window a launched session opens in - `Terminal` (default), `iTerm`, or `none` (the session still runs; `tmux attach` reaches it) |
-| `newSession.profiles` | Agency profiles offered on the dashboard (default `["work","home","local"]`) |
-| `newSession.defaultProfile` | Profile preselected on the card (default: the first in `profiles`) |
+| `newSession.profiles` | Restrict which Agency profiles the dashboard offers, and in what order (default: all of them, read from `agency config profiles`). Names this machine's Agency does not have are dropped |
+| `newSession.defaultProfile` | Profile preselected on the card (default: the first offered) |
 | `newSession.defaultWorkspace` | Workspace label preselected on the card (default: the first in `workspaces`) |
 | `newSession.workspaces` | Directories offered as launch targets — a path string, or `{ "label": …, "path": … }`. Add `"isolate": true` to give every launch there a git worktree of its own. Folders recent Claude/Codex sessions worked in are added after these, and the home folder is offered if the list would otherwise be empty |
 | `newSession.worktreeRoot` | Where isolated launches get their worktrees (default `~/repos/wt`). One directory, outside every repository: it is what marks a worktree as the bridge's to tidy up |
@@ -473,7 +473,7 @@ press **Launch**. Nothing has to be filled in first.
 |---|---|
 | **Resume** | `New session` (the default), or one of your recent resumable sessions |
 | **Workspace** | Where a new session starts. Ignored for a resume, which reopens in its own folder |
-| **Profile** | The Agency profile, applied to new and resumed sessions alike |
+| **Profile** | The Agency profile, applied to new and resumed sessions alike. Only the profiles that machine's Agency actually has, so the row is absent on one that has none |
 | **Launch** | Starts it |
 | **Last launch** | What the previous press actually did |
 | **Opening prompt** | Optional. A first instruction, if you want one |
@@ -549,6 +549,14 @@ Because the same directory is routinely opened under different profiles, the pro
 its own dropdown rather than a property of the workspace. Set `newSession.launcher` to
 `copilot` to bypass Agency entirely; the profile and resume rows then disappear from
 the card.
+
+The dropdown offers what `agency config profiles` reports on that machine, refreshed
+every ten minutes, so it can only name a profile that exists there. A machine whose
+Agency has none — a newly set-up one, before whatever syncs your Agency config has run
+on it — gets no Profile row, and its launches pass no profile and use Agency's base
+configuration. This matters because `agency copilot --profile-only work` on a machine
+with no `work` profile exits before Copilot starts, and the window closes too fast to
+read the error.
 
 Agency takes `--session-id` itself and uses that UUID for both its own session and the
 underlying Copilot one, so the daemon still knows the session id before the process

@@ -242,6 +242,32 @@ $staleState = @{ $stale = [pscustomobject]@{ Offset = 0; Name = "Copilot: $($sta
 Sync-DaemonSessions -Headers $headers -State $staleState -Live @{ $stale = (New-Session 's5') }
 Test-That 'a stale id fallback on another agent still heals' { $staleState[$stale].Name -eq "Claude: $stale" }
 
+Write-Host ''
+Write-Host '--- what this machine''s launch card can offer ---'
+# The profile row is only worth drawing when there are profiles to choose between. A
+# machine whose Agency has none - a new one, before whatever syncs the Agency config
+# has run on it - used to get a row offering three that did not exist there, and
+# every launch from it died before Copilot started.
+$script:FakeLaunchers = @('agency', 'copilot')
+$script:FakeProfiles = @('work', 'home')
+function Get-BridgeAvailableLaunchers { @($script:FakeLaunchers) }
+function Get-BridgeAgencyProfiles { @($script:FakeProfiles) }
+function Get-BridgeSetting {
+    param([Parameter(Mandatory)][string]$Path, $Default = $null)
+    if ($Path -eq 'newSession.enabled') { return $true }
+    $Default
+}
+Test-That 'Agency with profiles gets a profile row' { (Get-DaemonLaunchCapabilities).profile }
+$script:FakeProfiles = @()
+Test-That 'Agency with none gets no profile row' { -not (Get-DaemonLaunchCapabilities).profile }
+Test-That 'though the rest of the card is untouched' {
+    $caps = Get-DaemonLaunchCapabilities
+    $caps.newSession -and $caps.resume -and $caps.agent -and $caps.tuning
+}
+$script:FakeProfiles = @('work', 'home')
+$script:FakeLaunchers = @('copilot')
+Test-That 'and a machine without Agency never gets one' { -not (Get-DaemonLaunchCapabilities).profile }
+
 Remove-Item -LiteralPath $script:DaemonConfig.LogFile -Force -ErrorAction SilentlyContinue
 Write-Host ''
 if ($script:Failures) {

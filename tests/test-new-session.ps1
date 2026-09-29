@@ -138,6 +138,14 @@ function Get-BridgeSetting {
 $script:FakeDiscovered = @()
 function Get-BridgeDiscoveredWorkspaces { @($script:FakeDiscovered) }
 
+# Profile discovery shells out to `agency config profiles`, so it is shadowed too: a
+# test run must not depend on which profiles the machine running it happens to have,
+# nor pay for a process launch per call. The real one is kept, so the section on
+# profiles below can still exercise it - caching and all - against a fake probe.
+$script:RealAgencyProfileList = ${function:Get-BridgeAgencyProfileList}
+$script:FakeProfiles = [pscustomobject]@{ Ok = $true; Profiles = @('work', 'home', 'local') }
+function Get-BridgeAgencyProfileList { $script:FakeProfiles }
+
 Write-Host ''
 Write-Host '--- the workspace list ---'
 
@@ -341,17 +349,160 @@ Test-That 'no question on screen reads as nothing' { (Get-BridgeTrustPromptSelec
 Test-That 'an unreadable screen reads as nothing' { (Get-BridgeTrustPromptSelection -Screen $null) -eq '' }
 
 Write-Host ''
-Write-Host '--- profile validation ---'
+Write-Host '--- the profiles this machine actually has ---'
 
-$script:FakeSettings = @{ 'newSession.profiles' = @('work', 'home', 'local') }
-Test-That 'configured profiles are offered' { (Get-BridgeAgencyProfiles) -join ',' -eq 'work,home,local' }
+# Agency's own listing, as `agency config profiles` prints it.
+$listing = @'
+Profiles:
+  home
+    MCPs: none
+    Plugins: none
+  local
+    MCPs: ado, github
+    Plugins: none
+  work
+    MCPs: none
+    Plugins: none
+
+'@
+Test-That 'every profile in a listing is read' {
+    (@(Get-BridgeAgencyProfileNames -Text $listing) -join ',') -eq 'home,local,work'
+}
+Test-That 'what each one contains is not read as a profile of its own' {
+    @(Get-BridgeAgencyProfileNames -Text $listing) -notcontains 'MCPs: none'
+}
+# The case this whole path exists for: Agency installed, its config never synced here.
+Test-That 'a machine with no profiles has none' {
+    @(Get-BridgeAgencyProfileNames -Text "No profiles configured.`n").Count -eq 0
+}
+Test-That 'and so does output that says nothing at all' { @(Get-BridgeAgencyProfileNames -Text '').Count -eq 0 }
+Test-That 'anything printed after the listing is not a profile' {
+    (@(Get-BridgeAgencyProfileNames -Text "Profiles:`n  work`n`nActivate with: agency copilot --profile <name>`n") -join ',') -eq 'work'
+}
+
+$script:ProbeCalls = 0
+$script:ProbeArguments = @()
+$script:ProbeWorkingDirectory = ''
+$script:ProbeResult = [pscustomobject]@{ Ran = $true; TimedOut = $false; ExitCode = 0; Output = ''; StandardOutput = $listing }
+function Invoke-BridgeCommandProbe {
+    param([string]$Executable, [string[]]$Arguments = @(), [int]$TimeoutMs = 5000, [string]$WorkingDirectory = '')
+    $script:ProbeCalls++
+    $script:ProbeArguments = @($Arguments)
+    $script:ProbeWorkingDirectory = [string]$WorkingDirectory
+    $script:ProbeResult
+}
+
+$script:BridgeAgencyProfileCache = $null
+$asked = & $script:RealAgencyProfileList -Path 'C:\agency.exe'
+Test-That 'Agency is asked what it has' { $asked.Ok -and (@($asked.Profiles) -join ',') -eq 'home,local,work' }
+Test-That 'with the subcommand that lists them' { ($script:ProbeArguments -join ' ') -eq 'config profiles' }
+# Agency merges any agency.yaml found from the current directory upwards, so asking
+# from inside a repository that has one would offer profiles that exist only there.
+Test-That 'from the home directory, not from wherever the daemon is running' {
+    $script:ProbeWorkingDirectory -eq $HOME
+}
+$again = & $script:RealAgencyProfileList -Path 'C:\agency.exe'
+Test-That 'a second look inside the window is served from the cache' {
+    $script:ProbeCalls -eq 1 -and (@($again.Profiles) -join ',') -eq 'home,local,work'
+}
+
+# "Could not be asked" and "has none" are different answers, and the caller treats
+# them differently: the first keeps whatever is configured, the second overrides it.
+$script:BridgeAgencyProfileCache = $null
+$script:ProbeResult = [pscustomobject]@{ Ran = $true; TimedOut = $true; ExitCode = -1; Output = ''; StandardOutput = '' }
+Test-That 'an Agency that does not answer is not read as having none' {
+    -not (& $script:RealAgencyProfileList -Path 'C:\agency.exe').Ok
+}
+$script:BridgeAgencyProfileCache = $null
+$script:ProbeResult = [pscustomobject]@{ Ran = $true; TimedOut = $false; ExitCode = 2; Output = 'unrecognized subcommand'; StandardOutput = '' }
+Test-That 'nor is one too old to know the subcommand' {
+    -not (& $script:RealAgencyProfileList -Path 'C:\agency.exe').Ok
+}
+
+# Each adapter ships its own copy of bridge-platform.ps1 and the daemon loads whichever
+# is installed, so a bridge running from a checkout against an older install can be
+# holding a probe from before this asked for stdout on its own. Losing the profiles
+# then - or worse, throwing inside a reconcile pass - is not on.
+$script:BridgeAgencyProfileCache = $null
+$script:ProbeResult = [pscustomobject]@{ Ran = $true; TimedOut = $false; ExitCode = 0; Output = 'Profiles: home local work' }
+Test-That 'a probe from before this could not answer, rather than answering nothing' {
+    -not (& $script:RealAgencyProfileList -Path 'C:\agency.exe').Ok
+}
+$script:BridgeAgencyProfileCache = $null
+$countingProbe = ${function:Invoke-BridgeCommandProbe}
+function Invoke-BridgeCommandProbe {
+    param([string]$Executable, [string[]]$Arguments = @(), [int]$TimeoutMs = 5000)
+    [pscustomobject]@{ Ran = $true; TimedOut = $false; ExitCode = 0; Output = '' }
+}
+Test-That 'and one that has no working directory to be given does not throw' {
+    -not (& $script:RealAgencyProfileList -Path 'C:\agency.exe').Ok
+}
+${function:Invoke-BridgeCommandProbe} = $countingProbe
+
+$savedAgencyPath = ${function:Get-BridgeAgencyPath}
+function Get-BridgeAgencyPath { $null }
+$script:BridgeAgencyProfileCache = $null
+$script:ProbeCalls = 0
+Test-That 'and with no Agency installed, nothing is run at all' {
+    $none = & $script:RealAgencyProfileList
+    -not $none.Ok -and $script:ProbeCalls -eq 0
+}
+${function:Get-BridgeAgencyPath} = $savedAgencyPath
+$script:BridgeAgencyProfileCache = $null
+
+Write-Host ''
+Write-Host '--- which of them the card offers ---'
+
+$script:FakeSettings = @{}
+$script:FakeProfiles = [pscustomobject]@{ Ok = $true; Profiles = @('work', 'home', 'local') }
+Test-That 'with nothing configured, every profile the machine has is offered' {
+    (Get-BridgeAgencyProfiles) -join ',' -eq 'work,home,local'
+}
 Test-That 'a known profile resolves' { (Resolve-BridgeAgencyProfile -Name 'home') -eq 'home' }
 Test-That 'an unknown profile is refused' { $null -eq (Resolve-BridgeAgencyProfile -Name 'prod') }
 Test-That 'an injected profile string is refused' { $null -eq (Resolve-BridgeAgencyProfile -Name 'work --yolo') }
 Test-That 'an empty profile is refused' { $null -eq (Resolve-BridgeAgencyProfile -Name '') }
 
+# A configured list picks and orders among the profiles that exist. It is no longer a
+# way to name one that does not: `agency copilot --profile-only work` on a machine
+# with no `work` exits 1 before Copilot starts, and the window closes too fast to read.
+$script:FakeSettings = @{ 'newSession.profiles' = @('local', 'work') }
+Test-That 'a configured list chooses among them, in its own order' {
+    (Get-BridgeAgencyProfiles) -join ',' -eq 'local,work'
+}
+$script:FakeSettings = @{ 'newSession.profiles' = @('work', 'gone') }
+Test-That 'and a name this machine does not have is dropped from it' {
+    (Get-BridgeAgencyProfiles) -join ',' -eq 'work'
+}
+$script:FakeSettings = @{ 'newSession.profiles' = @('gone', 'also-gone') }
+Test-That 'a configured list that is entirely stale falls back to the real ones' {
+    (Get-BridgeAgencyProfiles) -join ',' -eq 'work,home,local'
+}
+
+# A new machine: Agency installed, no profiles yet. Nothing is offered, and a launch
+# passes none - which runs Agency's base config, and that always works.
+$script:FakeProfiles = [pscustomobject]@{ Ok = $true; Profiles = @() }
+$script:FakeSettings = @{ 'newSession.profiles' = @('work', 'home', 'local') }
+Test-That 'a machine whose Agency has no profiles offers none' { @(Get-BridgeAgencyProfiles).Count -eq 0 }
+Test-That 'and asks for none when a launch needs a default' { (Get-BridgeDefaultAgencyProfile) -eq '' }
+Test-That 'and no --profile-only reaches the command line' {
+    (Get-BridgeNewSessionArguments -SessionId $sid -Launcher 'agency' -AgencyProfile '') -notcontains '--profile-only'
+}
+
+# Ok = $false is "Agency could not be asked", and dropping the configured list on that
+# would quietly change what every launch here runs with.
+$script:FakeProfiles = [pscustomobject]@{ Ok = $false; Profiles = @() }
+$script:FakeSettings = @{ 'newSession.profiles' = @('work', 'home') }
+Test-That 'an Agency that cannot be asked leaves the configured list alone' {
+    (Get-BridgeAgencyProfiles) -join ',' -eq 'work,home'
+}
 $script:FakeSettings = @{}
-Test-That 'the default profile list is work, home, local' { (Get-BridgeAgencyProfiles) -join ',' -eq 'work,home,local' }
+Test-That 'and with nothing configured either, no profile is offered' {
+    @(Get-BridgeAgencyProfiles).Count -eq 0
+}
+
+# Back to a machine with the usual three, for everything below.
+$script:FakeProfiles = [pscustomobject]@{ Ok = $true; Profiles = @('work', 'home', 'local') }
 
 Write-Host ''
 Write-Host '--- model, effort and context ---'

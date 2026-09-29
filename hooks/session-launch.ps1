@@ -1389,23 +1389,154 @@ function Get-BridgeTuningArguments {
     @(& $entry[$Axis].Arguments $resolved)
 }
 
+function Get-BridgeAgencyProfileNames {
+    <#
+        The profile names in `agency config profiles` output.
+
+        Its shape is a heading, each profile indented under it, and each profile's
+        MCPs and plugins indented further again:
+
+            Profiles:
+              home
+                MCPs: none
+                Plugins: none
+
+        so a name is an indented line with no colon in it. Matched on the absence of a
+        colon rather than on an exact indent, so a re-indented listing still parses. A
+        machine with no profiles prints "No profiles configured." and no heading at
+        all, which yields nothing - which is the answer.
+    #>
+    param([AllowEmptyString()][AllowNull()][string]$Text)
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { return @() }
+
+    $names = New-Object System.Collections.Generic.List[string]
+    $listing = $false
+    foreach ($line in ($Text -split '\r?\n')) {
+        if ($line -match '^\s*Profiles:\s*$') { $listing = $true; continue }
+        if (-not $listing) { continue }
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        # Back at column zero: the listing is over and this is something else.
+        if ($line -notmatch '^\s') { break }
+        if ($line -match ':') { continue }
+        $name = $line.Trim()
+        if ($name -and -not $names.Contains($name)) { $names.Add($name) }
+    }
+    $names.ToArray()
+}
+
+# How long a discovered profile list is kept. Asking Agency costs a process launch -
+# 0.3 s measured warm - which is far too much to spend on every reconcile, and the
+# list only changes when the config defining it does. Ten minutes bounds how long the
+# card can be offering the previous set; restarting the bridge re-reads it at once.
+$script:BridgeAgencyProfileCacheMinutes = 10
+$script:BridgeAgencyProfileCache = $null
+
+function Get-BridgeAgencyProfileList {
+    <#
+        Which profiles Agency actually has here, as @{ Ok; Profiles }.
+
+        Ok is false only when Agency could not be asked at all - not installed, too
+        old for `config profiles`, or the call failed - which is a different thing
+        from a machine that genuinely has none, and the two fall back differently in
+        Get-BridgeAgencyProfiles.
+    #>
+    param([string]$Path)
+
+    # The clock is checked before anything else, deliberately: resolving agency.exe
+    # searches PATH and the install folder, and several callers ask once per
+    # reconcile. The same trap Get-BridgeCopilotModelList documents.
+    $cached = $script:BridgeAgencyProfileCache
+    if ($null -ne $cached -and ([DateTimeOffset]::Now - $cached.At).TotalMinutes -lt $script:BridgeAgencyProfileCacheMinutes) {
+        return [pscustomobject]@{ Ok = [bool]$cached.Ok; Profiles = @($cached.Profiles) }
+    }
+
+    if (-not $Path) { $Path = Get-BridgeAgencyPath }
+
+    $ok = $false
+    $found = @()
+    if (-not [string]::IsNullOrWhiteSpace($Path)) {
+        # Run from the home directory rather than wherever the daemon happens to be:
+        # Agency merges any agency.yaml found from the current directory upwards, so
+        # asking from inside a repository that has one would offer profiles that exist
+        # only there - and a launch in any other workspace would then fail.
+        #
+        # Ten seconds, where the probe's own default is five: this runs once every ten
+        # minutes, and a timeout costs the card its profiles until the next one.
+        $ask = @{ Executable = $Path; Arguments = @('config', 'profiles'); TimeoutMs = 10000 }
+        # -WorkingDirectory only if the probe actually loaded has it. Each adapter
+        # ships its own copy of bridge-platform.ps1 and the daemon loads whichever is
+        # installed, so a checkout run against an older install can be holding a probe
+        # from before this parameter existed - the same reason Get-ClaudeOwningProcessId
+        # passes -Ancestors conditionally. Unguarded, the parameter binding throws and
+        # takes the whole reconcile pass with it.
+        $probeCommand = Get-Command Invoke-BridgeCommandProbe -ErrorAction SilentlyContinue
+        if ($probeCommand -and $probeCommand.Parameters.ContainsKey('WorkingDirectory')) {
+            $ask.WorkingDirectory = $HOME
+        }
+        $probe = $null
+        try { $probe = Invoke-BridgeCommandProbe @ask } catch { }
+        # An older probe returns only the flattened Output, whose lines are gone. That
+        # counts as "could not be asked" rather than "has none", so a machine mid-update
+        # keeps offering what it is configured with instead of losing its profiles.
+        if ($null -ne $probe -and $probe.Ran -and -not $probe.TimedOut -and $probe.ExitCode -eq 0 -and
+            $probe.PSObject.Properties['StandardOutput']) {
+            $ok = $true
+            $found = @(Get-BridgeAgencyProfileNames -Text ([string]$probe.StandardOutput))
+        }
+    }
+
+    # Cached either way, a failure included: a machine where this cannot work should
+    # not pay for it on every reconcile. An Agency installed or configured in the
+    # meantime is picked up when the cache expires.
+    $script:BridgeAgencyProfileCache = [pscustomobject]@{ At = [DateTimeOffset]::Now; Ok = $ok; Profiles = @($found) }
+    [pscustomobject]@{ Ok = $ok; Profiles = @($found) }
+}
+
 function Get-BridgeAgencyProfiles {
     <#
-        The Agency profiles offered on the dashboard.
+        The Agency profiles offered on the dashboard: the ones this machine has.
 
-        Read from config rather than by shelling out to `agency config profiles` on
-        every reconcile: that call costs a process launch and a config-cache read,
-        and the profile list changes about as often as the config file does.
+        Asked of Agency rather than taken from a list in config, because a list naming
+        a profile Agency does not have is a Launch button that cannot work.
+        `agency copilot --profile-only work` on a machine with no `work` profile exits
+        1 with "unknown profile `work` (available profiles: ...)" before Copilot
+        starts, and the window closes far too fast to read; all the dashboard shows is
+        "closed before it started". That is exactly what a newly installed machine
+        looks like until whatever syncs the Agency config has run on it, and the
+        built-in work/home/local list - right for the machine it was written on - made
+        every launch there fail.
+
+        `newSession.profiles` still applies where it is set, as the subset and the
+        order to offer, but only of profiles that exist: it is no longer a way to name
+        one that does not, since filtering is the whole point.
     #>
-    $configured = @(Get-BridgeSetting 'newSession.profiles' @('work', 'home', 'local'))
-    @($configured | ForEach-Object { [string]$_ } | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $configured = @(Get-BridgeSetting 'newSession.profiles' @() |
+        ForEach-Object { [string]$_ } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+
+    $discovered = Get-BridgeAgencyProfileList
+    # Agency could not be asked. A configured list is then all there is to go on, and
+    # with none, no profile is offered at all - which launches Agency's base config,
+    # and that always works.
+    if (-not $discovered.Ok) { return @($configured) }
+
+    $present = @($discovered.Profiles)
+    if ($configured.Count -eq 0) { return $present }
+
+    $filtered = @($configured | Where-Object { $present -contains $_ })
+    # A configured list naming nothing that exists is stale rather than deliberate -
+    # the same "the sync has not run here yet" case - so the machine's own profiles
+    # are offered rather than an empty row.
+    if ($filtered.Count -eq 0) { return $present }
+    $filtered
 }
 
 function Resolve-BridgeAgencyProfile {
     <#
-        Validates a profile name coming from Home Assistant against the configured
-        list, for the same reason workspaces are resolved by label: a value arriving
-        from outside is never passed to a command line unchecked.
+        Validates a profile name coming from Home Assistant against the profiles this
+        machine has, for the same reason workspaces are resolved by label: a value
+        arriving from outside is never passed to a command line unchecked.
     #>
     param([string]$Name)
 
@@ -1418,9 +1549,10 @@ function Resolve-BridgeAgencyProfile {
 function Get-BridgeDefaultAgencyProfile {
     <#
         The Agency profile a launch uses when nothing has been chosen, from
-        `newSession.defaultProfile`. Falls back to the first configured profile for
-        the same reason the workspace does: pressing Launch must never require a
-        preceding selection.
+        `newSession.defaultProfile`. Falls back to the first offered profile for the
+        same reason the workspace does: pressing Launch must never require a preceding
+        selection. Empty when the machine has no profiles, and a launch then passes
+        none.
     #>
     $profiles = @(Get-BridgeAgencyProfiles)
     if ($profiles.Count -eq 0) { return '' }

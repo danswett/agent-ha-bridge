@@ -427,7 +427,8 @@ function Get-DaemonNewSessionControls {
     # Assigned in two steps deliberately: `$x = if (...) { @(...) } else { @() }`
     # collapses an empty array to $null, and StrictMode then throws on .Count.
     # Profiles are offered whenever Agency is installed, since it can be chosen as the
-    # agent at launch time even when it is not the default.
+    # agent at launch time even when it is not the default - and only the ones Agency
+    # actually has here, which on a machine that has none is no row at all.
     $profiles = @()
     if ($launchers -contains 'agency') { $profiles = @(Get-BridgeAgencyProfiles) }
 
@@ -777,8 +778,9 @@ function Resolve-DaemonLaunchRequest {
     }
 
     # The profile only applies under Agency. An untouched selector falls back to the
-    # first configured profile, and an unrecognised one is refused outright rather
-    # than passed to a command line.
+    # first offered profile, and one this machine's Agency does not have is refused
+    # outright rather than passed to a command line - Agency would exit 1 on it
+    # before Copilot started, closing the window too fast to read.
     $agencyProfile = ''
     if ($chosenLauncher -eq 'agency' -and $profiles.Count -gt 0) {
         $profileLabel = ''
@@ -794,8 +796,11 @@ function Resolve-DaemonLaunchRequest {
 
         $agencyProfile = Resolve-BridgeAgencyProfile -Name $profileLabel
         if ([string]::IsNullOrWhiteSpace($agencyProfile)) {
-            Write-DaemonLog -Message "new session requested with unknown profile '$profileLabel'"
-            Set-CopilotMqttNewSessionResult -Text "Unknown profile '$profileLabel'" -Headers $Headers | Out-Null
+            Write-DaemonLog -Message "new session requested with unknown profile '$profileLabel' (this machine has: $($profiles -join ', '))"
+            # Named, because the reason is almost always that this machine's Agency
+            # config is not the one the profile was chosen from.
+            Set-CopilotMqttNewSessionResult -Headers $Headers `
+                -Text "Unknown profile '$profileLabel' - this machine has $($profiles -join ', ')" | Out-Null
             return $null
         }
     }
