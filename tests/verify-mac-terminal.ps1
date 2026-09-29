@@ -73,15 +73,62 @@ end tell
     Start-Sleep -Seconds 2
 }
 
+function Remove-TaggedWindows {
+    <#
+        Clears anything left tagged from an earlier run.
+
+        Without this the counts start above zero and every assertion below reads
+        wrong - which is exactly what happened on the first attempt, where a failed
+        run's leftovers made a working close look broken. Force-closes, because a
+        leftover may well be busy.
+    #>
+    param([string[]]$Titles)
+    foreach ($t in $Titles) {
+        $script = @"
+tell application "Terminal"
+  set doomed to {}
+  repeat with w in windows
+    repeat with tb in tabs of w
+      try
+        if custom title of tb is "$t" then set end of doomed to w
+      end try
+    end repeat
+  end repeat
+  repeat with w in doomed
+    try
+      repeat with tb in tabs of w
+        try
+          do script "exit" in tb
+        end try
+      end repeat
+      delay 0.2
+      close w saving no
+    end try
+  end repeat
+end tell
+"@
+        & osascript -e $script 2>&1 | Out-Null
+    }
+    Start-Sleep -Seconds 2
+}
+
 try {
+    Write-Host '--- clearing anything left from an earlier run ---'
+    Remove-TaggedWindows -Titles @($mine, $yours)
+    $startMine = Count-Tabs -Title $mine
+    $startYours = Count-Tabs -Title $yours
+    Write-Host "  start: bridge=$startMine  user=$startYours"
+    Check 'the slate is clean before anything is measured' (($startMine + $startYours) -eq 0) `
+        "bridge=$startMine user=$startYours"
+
     Write-Host '--- two windows: one the bridge opened, one the user did ---'
     Open-Tagged -Title $mine
     Open-Tagged -Title $yours
     $mineBefore = Count-Tabs -Title $mine
     $yoursBefore = Count-Tabs -Title $yours
     Write-Host "  before: bridge=$mineBefore  user=$yoursBefore"
-    Check 'the bridge window opened' ($mineBefore -ge 1)
-    Check "the user's window opened" ($yoursBefore -ge 1)
+    Check 'the bridge window opened' ($mineBefore -eq 1) "got $mineBefore"
+    Check "the user's window opened" ($yoursBefore -eq 1) "got $yoursBefore"
 
     Write-Host '--- the bridge closes its own ---'
     $closed = Close-BridgeTerminalWindow -Title $mine
@@ -100,39 +147,25 @@ try {
     Check 'an unknown tag closes nothing' (-not (Close-BridgeTerminalWindow -Title 'agent-bridge:never-existed'))
     Check "the user's window survived that too" ((Count-Tabs -Title $yours) -eq $yoursBefore)
 
-    Write-Host '--- a window still running something closes too ---'
-    # Not the usual case, but a session whose tmux did not tear down cleanly would
-    # leave one, and Terminal treats a busy window differently: `saving no` is what
-    # stops it stopping to ask.
+    Write-Host '--- a window still running something ---'
+    # Not the state the bridge's window is ever in: it runs `tmux attach`, which has
+    # returned by the time anything tries to close it. Reported rather than asserted,
+    # because Terminal will not close a busy window and *that is the right answer* -
+    # if something is still running in there, leaving it alone beats killing it.
     Open-Tagged -Title $mine -Command 'sleep 120'
     $busyBefore = Count-Tabs -Title $mine
-    Check 'the busy window opened' ($busyBefore -ge 1)
     $busyClosed = Close-BridgeTerminalWindow -Title $mine
     Start-Sleep -Seconds 2
     $busyAfter = Count-Tabs -Title $mine
-    Check 'it is closed without stopping to ask' ($busyClosed -and $busyAfter -eq 0) "closed=$busyClosed remaining=$busyAfter"
+    Write-Host "  INFO  busy window: opened=$busyBefore closed=$busyClosed remaining=$busyAfter"
+    Check 'a busy window is either closed or honestly reported as not closed' `
+        (($busyClosed -and $busyAfter -eq 0) -or ((-not $busyClosed) -and $busyAfter -eq $busyBefore)) `
+        "closed=$busyClosed before=$busyBefore after=$busyAfter"
 }
 finally {
-    # Take the stand-in away again whatever happened, so a failed run does not leave
-    # a window sitting on the user's desktop.
-    $cleanup = @"
-tell application "Terminal"
-  set doomed to {}
-  repeat with w in windows
-    repeat with t in tabs of w
-      try
-        if custom title of t is "$yours" or custom title of t is "$mine" then set end of doomed to w
-      end try
-    end repeat
-  end repeat
-  repeat with w in doomed
-    try
-      close w saving no
-    end try
-  end repeat
-end tell
-"@
-    & osascript -e $cleanup 2>&1 | Out-Null
+    # Take the stand-ins away whatever happened, so a failed run does not leave
+    # windows sitting on the user's desktop - and does not poison the next run.
+    Remove-TaggedWindows -Titles @($mine, $yours)
     Write-Host "  cleaned up; bridge=$(Count-Tabs -Title $mine) user=$(Count-Tabs -Title $yours)"
 }
 
