@@ -335,6 +335,21 @@ function Set-DaemonNewSessionDefaults {
         }
     }
     catch { }
+
+    # Permissions open on whatever this machine's newSession.allowAllTools would have
+    # done, so the control states the existing behaviour instead of quietly changing
+    # it. Only while it holds nothing meaningful - a value someone picked survives
+    # every reconcile, exactly like the workspace and the tuning axes.
+    try {
+        $current = [string](Get-HomeAssistantState -EntityId $script:DaemonEntity.NewPermissions -Headers $Headers).state
+        $valid = @(Get-BridgePermissionOptions)
+        if ($current -in $stale -or $valid -notcontains $current) {
+            $option = Get-BridgePermissionLabel -AllowAllTools ([bool](Get-BridgeSetting 'newSession.allowAllTools' $false))
+            Invoke-HomeAssistantService -Domain 'select' -Service 'select_option' -Headers $Headers `
+                -Data @{ entity_id = $script:DaemonEntity.NewPermissions; option = $option }
+        }
+    }
+    catch { }
 }
 
 function Sync-DaemonNewSession {
@@ -540,6 +555,53 @@ function Confirm-DaemonPendingTrust {
     $true
 }
 
+function Get-DaemonLaunchPrompt {
+    <#
+        The first message the launch card is offering, from whichever of its two
+        boxes carries it.
+
+        The card publishes the whole prompt to the payload sensor, whose attribute has
+        no length limit; the text entity beside it is what a dashboard running an
+        older card still writes, and Home Assistant caps that at 255 characters. The
+        payload wins when it has anything in it, so a long handover prompt arrives
+        whole instead of cut off mid-sentence.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Headers)
+
+    try {
+        $payload = Get-BridgeReplyPayload -State (Get-HomeAssistantState `
+            -EntityId $script:DaemonEntity.NewPromptPayload -Headers $Headers)
+        if ($null -ne $payload -and -not [string]::IsNullOrWhiteSpace([string]$payload.Text)) {
+            return ([string]$payload.Text).Trim()
+        }
+    }
+    catch {
+        # No payload sensor yet (a machine published before this existed), or it is
+        # unreadable. The text box still works, within its 255 characters.
+    }
+
+    $typed = ''
+    try { $typed = [string](Get-HomeAssistantState -EntityId $script:DaemonEntity.NewPrompt -Headers $Headers).state } catch { }
+    if ($typed -in @('unknown', 'unavailable')) { $typed = '' }
+    $typed.Trim()
+}
+
+function Clear-DaemonLaunchPrompt {
+    <#
+        Empties both prompt boxes once their text has been used, so the next press
+        does not silently repeat the last prompt.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Headers)
+
+    try {
+        Invoke-HomeAssistantService -Domain 'text' -Service 'set_value' -Headers $Headers -Data @{
+            entity_id = $script:DaemonEntity.NewPrompt; value = $script:DaemonConfig.ReplyBlankValue
+        } | Out-Null
+    }
+    catch { }
+    try { Clear-CopilotMqttNewSessionPrompt -Headers $Headers | Out-Null } catch { }
+}
+
 function Send-DaemonPendingFirstMessage {
     <#
         Sends the First message box into a Codex launched without a first message:
@@ -555,7 +617,7 @@ function Send-DaemonPendingFirstMessage {
 
     $first = ''
     $firstAgent = ''
-    try { $first = [string](Get-HomeAssistantState -EntityId $script:DaemonEntity.NewPrompt -Headers $Headers).state } catch { }
+    try { $first = Get-DaemonLaunchPrompt -Headers $Headers } catch { }
     try { $firstAgent = [string](Get-HomeAssistantState -EntityId $script:DaemonEntity.NewAgent -Headers $Headers).state } catch { }
     if ($first -in @('unknown', 'unavailable')) { $first = '' }
     $first = $first.Trim()
@@ -576,12 +638,7 @@ function Send-DaemonPendingFirstMessage {
     $pending.Since = [DateTimeOffset]::Now
     $pending.LastCheck = [DateTimeOffset]::MinValue
     Set-CopilotMqttNewSessionResult -Headers $Headers -Text "Sending your first message to $agent in $($pending.Label)..." | Out-Null
-    try {
-        Invoke-HomeAssistantService -Domain 'text' -Service 'set_value' -Headers $Headers -Data @{
-            entity_id = $script:DaemonEntity.NewPrompt; value = $script:DaemonConfig.ReplyBlankValue
-        } | Out-Null
-    }
-    catch { }
+    Clear-DaemonLaunchPrompt -Headers $Headers
     $true
 }
 
@@ -682,11 +739,7 @@ function Resolve-DaemonLaunchRequest {
     }
 
     $prompt = ''
-    try {
-        $promptState = Get-HomeAssistantState -EntityId $script:DaemonEntity.NewPrompt -Headers $Headers
-        $prompt = [string]$promptState.state
-    }
-    catch { }
+    try { $prompt = Get-DaemonLaunchPrompt -Headers $Headers } catch { }
     if ($prompt -in @('unknown', 'unavailable')) { $prompt = '' }
     $prompt = $prompt.Trim()
 
@@ -744,6 +797,20 @@ function Resolve-DaemonLaunchRequest {
         $tuning[$axis] = Resolve-BridgeTuningValue -Launcher $chosenLauncher -Axis $axis -Value $raw
     }
 
+    # Permissions, from the selector rather than from this machine's config, so the
+    # person (or agent) pressing Launch decides rather than whichever machine happens
+    # to run the session. The config is still the answer when the selector cannot be
+    # read - a machine mid-upgrade that has not published it yet, or Home Assistant
+    # refusing the read - so behaviour is unchanged until the entity exists.
+    $allowAllTools = [bool](Get-BridgeSetting 'newSession.allowAllTools' $false)
+    try {
+        $permissionState = [string](Get-HomeAssistantState -EntityId $script:DaemonEntity.NewPermissions -Headers $Headers).state
+        if ($permissionState -notin @('unknown', 'unavailable', '')) {
+            $allowAllTools = Test-BridgePermissionAllowsAll -Value $permissionState
+        }
+    }
+    catch { }
+
     [pscustomobject]@{
         Launcher      = $chosenLauncher
         Directory     = $directory
@@ -753,6 +820,7 @@ function Resolve-DaemonLaunchRequest {
         Model         = [string]$tuning['model']
         Effort        = [string]$tuning['effort']
         Context       = [string]$tuning['context']
+        AllowAllTools = $allowAllTools
         ResumeSession = $resumeSession
         ResumeLabel   = $resumeLabel
     }
@@ -781,8 +849,16 @@ function Start-DaemonLaunch {
     $model = & $prop 'Model'
     $effort = & $prop 'Effort'
     $context = & $prop 'Context'
+    # Same defensiveness, but this one decides whether a session runs unattended, so
+    # a request that does not carry it falls back to the config rather than to $false
+    # - an older caller must keep launching exactly as it did.
+    $allowAllTools = if ($Request.PSObject.Properties['AllowAllTools']) {
+        [bool]$Request.AllowAllTools
+    }
+    else { [bool](Get-BridgeSetting 'newSession.allowAllTools' $false) }
     # For the log line and the card note: "gpt-5.4 · xhigh · long_context", or nothing.
     $tuningNote = (@($model, $effort, $context) | Where-Object { $_ }) -join ' / '
+    if ($allowAllTools) { $tuningNote = (@($tuningNote, 'allow all') | Where-Object { $_ }) -join ' / ' }
 
     if ($null -ne $resumeSession) {
         $resumeDirectory = [string]$resumeSession.Folder
@@ -799,7 +875,7 @@ function Start-DaemonLaunch {
         $launchedAt = [DateTimeOffset]::Now
         $launch = Start-BridgeCopilotSession -WorkingDirectory $resumeDirectory -Prompt $prompt `
             -AgencyProfile $agencyProfile -SessionId ([string]$resumeSession.SessionId) -Launcher $chosenLauncher `
-            -Model $model -Effort $effort -Context $context -Resume
+            -Model $model -Effort $effort -Context $context -AllowAllTools:$allowAllTools -Resume
     }
     else {
         $agentName = Get-BridgeLauncherLabel -Launcher $chosenLauncher
@@ -810,7 +886,7 @@ function Start-DaemonLaunch {
         $launchedAt = [DateTimeOffset]::Now
         $launch = Start-BridgeCopilotSession -WorkingDirectory $directory -Prompt $prompt `
             -AgencyProfile $agencyProfile -Launcher $chosenLauncher `
-            -Model $model -Effort $effort -Context $context
+            -Model $model -Effort $effort -Context $context -AllowAllTools:$allowAllTools
     }
 
     if (-not $launch.Launched) {
@@ -871,7 +947,15 @@ function Start-DaemonLaunch {
         Since          = $launchedAt
         LastCheck      = [DateTimeOffset]::MinValue
         TrustAskedAt   = $null
-        TrustConfirmed = $false
+        # Allow all means "launch without permission prompts", and Claude's folder
+        # trust dialog is one - the one flag that cannot waive it, because Claude only
+        # skips that dialog in non-interactive mode and a bridge window is deliberately
+        # interactive. Left needing a second press, an unattended launch simply stops
+        # there with nobody at the keyboard, which is the deadlock the setting exists
+        # to avoid. The folder is one of the configured workspaces and the choice was
+        # made on the press, so the confirmation this stands in for has already
+        # happened; an ordinary launch still asks for its second press.
+        TrustConfirmed = $allowAllTools
         TrustAnswers   = 0
         # Who pressed Launch, carried from the press to whichever session it produces:
         # a session an agent started should show as agent-driven from the moment it
@@ -890,18 +974,9 @@ function Start-DaemonLaunch {
     $script:DaemonNewSessionSignature = ''
 
     # Clear the prompt box so the next launch starts from a blank field instead of
-    # silently reusing the previous prompt.
-    if ($prompt) {
-        try {
-            Invoke-HomeAssistantService -Domain 'text' -Service 'set_value' -Headers $Headers -Data @{
-                entity_id = $script:DaemonEntity.NewPrompt
-                value     = $script:DaemonConfig.ReplyBlankValue
-            } | Out-Null
-        }
-        catch {
-            Write-DaemonLog -Message "could not clear the new-session prompt: $($_.Exception.Message)"
-        }
-    }
+    # silently reusing the previous prompt. Both boxes: the payload topic is retained,
+    # so a long prompt left there would start the next session too.
+    if ($prompt) { Clear-DaemonLaunchPrompt -Headers $Headers }
 }
 
 function Resolve-DaemonLaunchTuning {

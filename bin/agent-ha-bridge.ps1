@@ -257,6 +257,13 @@ function Show-Status {
     }
     Write-Host "    dashboard  : $base/$slug"
 
+    # Both halves of the agent identity or neither; with only one, the purple edge is
+    # off for good and nothing else ever says so.
+    $identityWarning = Get-BridgeStatusAgentIdentityWarning -HooksDir (Join-Path $bridgeHome 'hooks')
+    if ($identityWarning) {
+        Write-Host "    agent id   : $identityWarning" -ForegroundColor Yellow
+    }
+
     Write-Host '    home assistant:'
     try {
         Show-HomeAssistantStatus -BaseUrl $base -Token $token -InstallerPath (Get-BridgeScript 'install.ps1')
@@ -304,6 +311,29 @@ function Get-BridgeStatusDaemonPid {
         [int](Get-BridgeDaemonPid)
     }
     catch { 0 }
+}
+
+function Get-BridgeStatusAgentIdentityWarning {
+    <#
+        Why an agent-driven session can never be marked as one, or '' when it can.
+
+        Asked of the installed library for the same reason the pid is: the rule that
+        decides it lives with the code that reads the config, and a copy here would
+        drift. Dot-sourced inside the function on purpose - see above.
+
+        Returns '' when the library is too old to answer, so an install mid-upgrade
+        says nothing rather than claiming everything is fine.
+    #>
+    param([Parameter(Mandatory)][string]$HooksDir)
+
+    $lib = Join-Path $HooksDir 'decision-bridge-common.ps1'
+    if (-not (Test-Path -LiteralPath $lib)) { return '' }
+    try {
+        . $lib
+        if (-not (Get-Command Get-BridgeAgentIdentityWarning -ErrorAction SilentlyContinue)) { return '' }
+        [string](Get-BridgeAgentIdentityWarning)
+    }
+    catch { '' }
 }
 
 function Show-BridgeMachines {

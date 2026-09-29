@@ -652,6 +652,7 @@ function Set-CopilotMqttNewSessionEntityIds {
     $wanted = @{}
     foreach ($pair in @(
         @('text',   'new_prompt'),
+        @('sensor', 'new_prompt_payload'),
         @('select', 'new_workspace'),
         @('select', 'new_profile'),
         @('select', 'new_agent'),
@@ -659,6 +660,7 @@ function Set-CopilotMqttNewSessionEntityIds {
         @('select', 'new_effort'),
         @('select', 'new_context'),
         @('select', 'new_resume'),
+        @('select', 'new_permissions'),
         @('button', 'new_session'),
         @('sensor', 'new_session_result')
     )) {
@@ -999,6 +1001,9 @@ function Save-CopilotSessionDashboard {
         # Whether to show the model, effort and context rows.
         [switch]$IncludeTuning,
 
+        # Whether to show the permissions row.
+        [switch]$IncludePermissions,
+
         # Resource URL of the reply card, or empty when Home Assistant is not serving
         # it. Empty falls back to the plain text box and Send button: a Lovelace view
         # that references a custom card which does not exist renders an error box
@@ -1022,6 +1027,7 @@ function Save-CopilotSessionDashboard {
             IncludeResume = [bool]$IncludeResume
             IncludeAgent = [bool]$IncludeAgent
             IncludeTuning = [bool]$IncludeTuning
+            IncludePermissions = [bool]$IncludePermissions
         })
     }
     $multiMachine = $machineList.Count -gt 1
@@ -1198,6 +1204,14 @@ function Save-CopilotSessionDashboard {
                 }
             }
         }
+        # Permissions last of the settings: it applies whatever else is chosen, and it
+        # is the one worth reading immediately before pressing Launch.
+        if ($_.PSObject.Properties['IncludePermissions'] -and $_.IncludePermissions) {
+            $rows += @{
+                entity = (Get-BridgeMachineEntityId -Domain 'select' -Key 'new_permissions' -Slug $slug)
+                name   = 'Permissions'
+            }
+        }
         # The optional first message. It had been dropped as an input nobody reached
         # for, but Codex creates no session until it gets one - without it a Codex
         # launch runs in a window the dashboard can never see - and for any agent it
@@ -1276,6 +1290,15 @@ function Save-CopilotSessionDashboard {
         # worked while the rows never appeared; gating them says plainly that this
         # dashboard has no tuning rows until the card that draws them is served.
         $tuningCard = Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.16.0'
+        # The permissions row arrived with card 1.17.0, and is gated for the same
+        # reason: an older card would silently drop the key, leaving a dashboard that
+        # looks like it offers the choice and does not.
+        $permissionsCard = Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.17.0'
+        # The long prompt arrived with card 1.18.0. An older card writes the text
+        # entity, which Home Assistant caps at 255 characters; a card that knows this
+        # topic publishes the whole thing instead. Gated the same way, so an old card
+        # is never handed a key it would drop.
+        $promptPayloadCard = Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.18.0'
         $launchMachines = @($onlineList | ForEach-Object {
             $slug = $_.Slug
             $entry = [ordered]@{
@@ -1294,6 +1317,12 @@ function Save-CopilotSessionDashboard {
                 foreach ($axis in @(Get-BridgeTuningAxes)) {
                     $entry[$axis] = Get-BridgeMachineEntityId -Domain 'select' -Key "new_$axis" -Slug $slug
                 }
+            }
+            if ($permissionsCard -and $_.PSObject.Properties['IncludePermissions'] -and $_.IncludePermissions) {
+                $entry.permissions = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_permissions' -Slug $slug
+            }
+            if ($promptPayloadCard) {
+                $entry.promptTopic = "$(Get-CopilotMqttMachineTopicRoot -Slug $slug)/newsession/promptpayload"
             }
             $entry
         })

@@ -16,7 +16,7 @@
  * daemon downloads them and attaches them to the prompt.
  */
 
-const CARD_VERSION = '1.16.0';
+const CARD_VERSION = '1.18.0';
 
 // The working line, in the style of Claude Code's own spinner: its glyph cycle, and a
 // word picked once per turn. Claude Code does not record which word it chose, so the
@@ -1062,6 +1062,10 @@ const LAUNCH_TUNING = ['model', 'effort', 'context'];
 // The option that means "pass nothing and let the agent decide". Worth a row, but
 // not worth a word in the collapsed summary.
 const LAUNCH_TUNING_DEFAULT = 'Agent default';
+// Permissions. The cautious option is the selector's first, and is not worth a word
+// in the collapsed summary - "Allow all" is, because it is the one worth noticing
+// before pressing Launch.
+const LAUNCH_ALLOW_ALL = 'Allow all';
 
 class AgentBridgeLaunchCard extends HTMLElement {
   constructor() {
@@ -1119,7 +1123,17 @@ class AgentBridgeLaunchCard extends HTMLElement {
           background: var(--secondary-background-color, rgba(127,127,127,0.1));
           border: 1px solid var(--divider-color); border-radius: 8px;
         }
-        select:focus, input:focus { outline: none; border-color: var(--primary-color); }
+        /* The prompt box takes a whole handover, so it grows instead of scrolling a
+           single line, and resizes vertically only - a horizontal drag would push it
+           out of the card on a phone. */
+        textarea[data-key="prompt"] {
+          min-width: 0; box-sizing: border-box; padding: 7px 8px;
+          font: inherit; color: var(--primary-text-color);
+          background: var(--secondary-background-color, rgba(127,127,127,0.1));
+          border: 1px solid var(--divider-color); border-radius: 8px;
+          resize: vertical; min-height: 34px; max-height: 40vh;
+        }
+        select:focus, input:focus, textarea:focus { outline: none; border-color: var(--primary-color); }
         .dim { opacity: 0.45; }
         .note { margin-top: 10px; font-size: 0.92em; color: var(--secondary-text-color); display: flex; gap: 6px; align-items: baseline; }
         .note .spin { color: var(--agent-bridge-spinner-color, #d97757); }
@@ -1142,7 +1156,8 @@ class AgentBridgeLaunchCard extends HTMLElement {
           <label class="f-model"><span>Model</span><select data-key="model"></select></label>
           <label class="f-effort"><span>Effort</span><select data-key="effort"></select></label>
           <label class="f-context"><span>Context</span><select data-key="context"></select></label>
-          <label class="f-prompt wide"><span>First message (optional)</span><input data-key="prompt" type="text" placeholder="Start with a task, or leave empty"></label>
+          <label class="f-permissions"><span>Permissions</span><select data-key="permissions"></select></label>
+          <label class="f-prompt wide"><span>First message (optional)</span><textarea data-key="prompt" rows="3" placeholder="Start with a task, or paste the full context to hand over"></textarea></label>
         </div>
         <div class="note" hidden><span class="spin"></span><span class="text"></span></div>
       </ha-card>`;
@@ -1150,7 +1165,7 @@ class AgentBridgeLaunchCard extends HTMLElement {
     this._els = {
       card: $('ha-card'), toggle: $('.toggle'), name: $('.name'), summary: $('.summary'),
       launch: $('button.launch'), fields: $('.fields'), note: $('.note'), spin: $('.note .spin'), text: $('.note .text'),
-      prompt: $('input[data-key="prompt"]'),
+      prompt: $('textarea[data-key="prompt"]'),
     };
     this._els.name.textContent = this._config.title;
 
@@ -1165,7 +1180,12 @@ class AgentBridgeLaunchCard extends HTMLElement {
     this.shadowRoot.querySelectorAll('select').forEach((select) => {
       select.addEventListener('change', () => this._choose(select.dataset.key, select.value));
     });
-    this._els.prompt.addEventListener('keydown', (ev) => { if (ev.key === 'Enter') { ev.preventDefault(); this._launch(); } });
+    // Enter now starts a new line: the box takes a whole handover, not one line. So
+    // the keyboard shortcut moves to Ctrl/Cmd+Enter, which is what the reply box
+    // already uses for the same reason.
+    this._els.prompt.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' && (ev.ctrlKey || ev.metaKey)) { ev.preventDefault(); this._launch(); }
+    });
     this._els.launch.addEventListener('click', () => this._launch());
   }
 
@@ -1205,8 +1225,22 @@ class AgentBridgeLaunchCard extends HTMLElement {
     try {
       // The prompt is written before the press: the daemon reads it when it sees
       // the press, and a value still sitting in this box would otherwise be missed.
+      //
+      // Over MQTT when the machine offers the topic, because a text entity is capped
+      // at 255 characters and a handover prompt is routinely longer than that - it
+      // used to be truncated on the way through, with nothing to say so. The text
+      // entity is still written when there is no topic, so a dashboard talking to an
+      // older bridge keeps working.
       const typed = this._els.prompt.value.trim();
-      if (m.prompt && typed !== this._state(m.prompt).trim()) {
+      if (m.promptTopic) {
+        await this._hass.callService('mqtt', 'publish', {
+          topic: m.promptTopic,
+          payload: JSON.stringify({ at: new Date().toISOString(), text: typed, card_version: CARD_VERSION }),
+          qos: 0,
+          retain: true,
+        });
+      }
+      else if (m.prompt && typed !== this._state(m.prompt).trim()) {
         await this._hass.callService('text', 'set_value', { entity_id: m.prompt, value: typed || LAUNCH_BLANK });
       }
       await this._hass.callService('button', 'press', { entity_id: m.launch });
@@ -1258,6 +1292,7 @@ class AgentBridgeLaunchCard extends HTMLElement {
     for (const axis of LAUNCH_TUNING) {
       this._fill(q(`select[data-key="${axis}"]`), m[axis], q(`.f-${axis}`));
     }
+    this._fill(q('select[data-key="permissions"]'), m.permissions, q('.f-permissions'));
 
     // A resume brings its own agent and folder, so those choices step back.
     const resume = m.resume ? this._state(m.resume) : '';
@@ -1276,16 +1311,24 @@ class AgentBridgeLaunchCard extends HTMLElement {
       .map((axis) => (m[axis] ? this._state(m[axis]) : ''))
       .filter((value) => value && value !== LAUNCH_TUNING_DEFAULT && !['unknown', 'unavailable'].includes(value));
 
-    const promptState = this._state(m.prompt);
-    if (this.shadowRoot.activeElement !== this._els.prompt && !this._els.prompt.value && promptState.trim() &&
-        !['unknown', 'unavailable'].includes(promptState)) {
+    // Restore a prompt typed on another device, but only when the text entity is
+    // what carries it. With the payload topic the box is the source of truth and the
+    // entity is left blank, so reading it back would wipe what is being typed here.
+    const promptState = m.promptTopic ? '' : this._state(m.prompt);
+    if (!m.promptTopic && this.shadowRoot.activeElement !== this._els.prompt && !this._els.prompt.value &&
+        promptState.trim() && !['unknown', 'unavailable'].includes(promptState)) {
       this._els.prompt.value = promptState.trim();
     }
 
     const workspace = this._state(m.workspace);
     const bits = resuming ? [`Resume: ${resume}`] : [agent, workspace].filter((b) => b && !['unknown', 'unavailable'].includes(b));
     if (machines.length > 1) { bits.unshift(m.machine); }
-    this._els.summary.textContent = bits.concat(tuning).join(' · ');
+    // Allow all earns a place in the collapsed summary; asking is the quiet default
+    // and would only be noise. It applies to a resume too, so it sits outside that
+    // branch.
+    const permissions = m.permissions ? this._state(m.permissions) : '';
+    const extras = permissions === LAUNCH_ALLOW_ALL ? tuning.concat(LAUNCH_ALLOW_ALL) : tuning;
+    this._els.summary.textContent = bits.concat(extras).join(' · ');
     this._els.launch.textContent = resuming ? 'Resume' : 'Launch';
 
     // The note: the daemon's word on the last press, or "Launching..." from the

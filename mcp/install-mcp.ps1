@@ -98,6 +98,21 @@ if (-not (Test-Path -LiteralPath $configPath)) {
 }
 $config = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $baseUrl = [string]$config.homeAssistant.baseUrl
+# Deliberately the bridge's own token, not homeAssistant.agentToken, even though this
+# server is the agent's door into Home Assistant.
+#
+# This server *provisions*: entities.js sends config/entity_registry/update to force
+# deterministic entity ids, and dashboard.js sends lovelace/dashboards/create and
+# lovelace/config/save. All three are admin-only - measured, not assumed: as a plain
+# user every one of them comes back `unauthorized`, while reading states and calling
+# services still work. Handing this server the agent token would therefore either
+# break provisioning or force the agent account to be an administrator, and the whole
+# point of a separate account is that it need not be one.
+#
+# Nothing is lost by it. The account behind a press only matters where the bridge
+# reads it back - a reply, or a launch - and this server presses neither; it publishes
+# a question and waits. The agent token goes where that signal is actually read: the
+# environment of every session the bridge launches.
 $token = [string]$config.homeAssistant.token
 if (-not $token -and $config.homeAssistant.tokenEnvVar) {
     $token = [Environment]::GetEnvironmentVariable([string]$config.homeAssistant.tokenEnvVar)

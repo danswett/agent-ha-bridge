@@ -422,6 +422,52 @@ Test-That 'a card too old to draw them is not handed them' {
     -not @($oldCompact['machines'])[0].Contains('model')
 }
 
+# Permissions. The machine that runs the session is not always the one choosing, so
+# the row has to reach the dashboard the peer draws - the row and the card entry were
+# both added at once, and each fails invisibly on its own.
+Save-CopilotSessionDashboard -Sessions $sessions -IncludeAgent -IncludeTuning -IncludePermissions
+$permCard = @($script:SavedConfig.views[0].cards | Where-Object { $_['type'] -eq 'vertical-stack' } | ForEach-Object { $_['cards'] } |
+    Where-Object { $_.ContainsKey('title') -and $_['title'] -eq 'Start a new session' })[0]
+$permRows = @($permCard.entities | ForEach-Object { if ($_.ContainsKey('entity')) { [string]$_['entity'] } else { '' } })
+Test-That 'the permissions row is shown when the machine offers it' {
+    $permRows -contains "select.agent_bridge_${slug}_new_permissions"
+}
+Test-That 'it sits below the settings it applies to, and above Launch' {
+    $permRows.IndexOf("select.agent_bridge_${slug}_new_permissions") -gt $permRows.IndexOf("select.agent_bridge_${slug}_new_model") -and
+    $permRows.IndexOf("select.agent_bridge_${slug}_new_permissions") -lt $permRows.IndexOf("button.agent_bridge_${slug}_new_session")
+}
+Test-That 'a machine that does not offer it gets no such row' {
+    $tunedRows -notcontains "select.agent_bridge_${slug}_new_permissions"
+}
+
+Save-CopilotSessionDashboard -Sessions $sessions -IncludeAgent -IncludeTuning -IncludePermissions -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.17.0'
+$permCompact = @($script:SavedConfig.views[0].cards | Where-Object { $_['type'] -eq 'custom:agent-bridge-launch-card' })[0]
+Test-That 'the compact card is handed the permissions entity' {
+    @($permCompact['machines'])[0]['permissions'] -eq "select.agent_bridge_${slug}_new_permissions"
+} ([string](@($permCompact['machines'])[0]['permissions']))
+Save-CopilotSessionDashboard -Sessions $sessions -IncludeAgent -IncludeTuning -IncludePermissions -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.16.0'
+$preCompact = @($script:SavedConfig.views[0].cards | Where-Object { $_['type'] -eq 'custom:agent-bridge-launch-card' })[0]
+Test-That 'and a card too old to draw it is not, so it is never silently dropped' {
+    -not @($preCompact['machines'])[0].Contains('permissions')
+}
+
+# The long first message arrived with 1.18.0. A card that knows the topic publishes
+# the whole prompt there; an older one writes the text entity, which Home Assistant
+# caps at 255 characters.
+Save-CopilotSessionDashboard -Sessions $sessions -IncludeAgent -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.18.0'
+$promptCompact = @($script:SavedConfig.views[0].cards | Where-Object { $_['type'] -eq 'custom:agent-bridge-launch-card' })[0]
+Test-That 'a 1.18.0 card is told where to publish a long first message' {
+    @($promptCompact['machines'])[0]['promptTopic'] -match 'newsession/promptpayload$'
+} ([string](@($promptCompact['machines'])[0]['promptTopic']))
+Test-That 'and still gets the text entity, so it has something to fall back on' {
+    @($promptCompact['machines'])[0]['prompt'] -eq "text.agent_bridge_${slug}_new_prompt"
+}
+Save-CopilotSessionDashboard -Sessions $sessions -IncludeAgent -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.17.0'
+$oldPromptCompact = @($script:SavedConfig.views[0].cards | Where-Object { $_['type'] -eq 'custom:agent-bridge-launch-card' })[0]
+Test-That 'a 1.17.0 card is not handed a key it would drop' {
+    -not @($oldPromptCompact['machines'])[0].Contains('promptTopic')
+}
+
 Write-Host ''
 Write-Host '--- the session header updates in place when the card supports it ---'
 # The markdown header re-renders wholesale on every attribute change, collapsing the

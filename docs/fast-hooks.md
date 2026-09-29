@@ -480,6 +480,92 @@ program. So:
   transcript is no longer re-parsed when it has not changed (96.7 ms to 1.35 ms on a
   277 MB file) and `status` reads the daemon's pid from the heartbeat it already writes
   instead of scanning every process (223 ms to 7.7 ms).
+- **1.17.0** (2026-09-29): two settings that were each configured, documented and
+  inert, because in both cases the middle was missing.
+
+  The purple "an agent is driving this" edge had never appeared and could not. It is
+  decided by the Home Assistant account behind the press, and `agentUserIds` names that
+  account - but the bridge held exactly **one** token, yours, and handed it to
+  everything: the config file, the MCP server's env block, every session it launched.
+  An agent had nothing else to press with, so every press it made was read as yours,
+  correctly, and the edge stayed off however the feature was configured. Checked
+  against the live instance: the press that started a session on the Mac carried the
+  owner's user id, not the agent's. There is now a `homeAssistant.agentToken` for the
+  agent account's own token, handed to the MCP server and into each launched session as
+  `AGENT_HA_AGENT_TOKEN`, while the daemon and hooks keep using `homeAssistant.token` -
+  they act for you and should. The two halves are useless apart and fail *silently*
+  when only one is set, so `agent-ha-bridge status` and the installer now say so
+  instead of leaving a dashboard that never lights up.
+
+  `newSession.allowAllTools` was read from the config of the machine that *runs* the
+  session, not the one choosing. A launch onto another machine therefore took that
+  machine's setting, invisible and unchangeable from where Launch was pressed - so a
+  session started from a phone could stop dead on a permission prompt with nobody at
+  the keyboard. It is now a **Permissions** row on the launch card, opening on the
+  local `allowAllTools` so the control states the existing behaviour rather than
+  changing it, and left alone once picked. Unclear values - unknown, unavailable, a
+  peer that has not published the selector - all read as *Ask permission*: the failure
+  direction has to be a prompt, not unearned blanket approval, which is also why the
+  comparison is case-sensitive.
+
+  **Allow all** now also answers Claude's folder-trust dialog instead of waiting for a
+  second Launch press. That dialog is the one prompt `--dangerously-skip-permissions`
+  cannot waive - Claude skips it only in non-interactive mode (`-p`, or a non-TTY) and
+  a bridge window is deliberately interactive - so an unattended launch stopped there,
+  which is exactly the deadlock the setting exists to avoid. Ordinary launches still
+  ask for their second press.
+
+  The lesson is the same one 1.14.2 recorded, in a new place. Both features had tests
+  at each end - a user id mapped, a flag translated per agent - and nothing following a
+  value from the config through to the thing that consumed it. `tests/test-launch-permissions.ps1`
+  follows both the whole way, and `tests/verify-permissions-live.ps1` proves the
+  discovery payload against a real Home Assistant, because 1.14.1 and 1.14.4 were both
+  features that passed their tests and could not appear in a browser.
+- **1.17.1** (2026-09-29): the agent account is set up by the installer rather than by
+  hand. `install.ps1 -AgentToken <token>` (and `agent-ha-bridge configure -AgentToken`,
+  and an offer during an interactive install) stores it *and* reads the account back
+  off the token with `auth/current_user`, so `agentUserIds` is written for you.
+
+  That removes the one step in the flow with a silent wrong answer available. The id
+  was copied by hand out of a Settings URL, and the obvious shortcut - reading it off
+  the token - is a trap: a long-lived token is a JWT whose `iss` claim looks exactly
+  like a user id but is the refresh token's, so it never matches and nothing says why.
+  Nothing has to copy it now.
+
+  Two tokens are refused rather than stored to fail quietly later, both of which had
+  already happened here. One Home Assistant rejects - a stale token saved by an earlier
+  session had since been revoked, and nothing had ever reported it - and one belonging
+  to *your own* account, which authenticates perfectly and can never mark anything,
+  since the whole mechanism rests on the two accounts differing. A token that merely
+  could not be checked is reported differently from one that was refused: only Home
+  Assistant answering "no" justifies telling someone their token is bad.
+
+  `-AgentToken` is deliberately not written to the config when it is bound, only after
+  the check. Doing it at bind time - the first shape of this - persisted a refused
+  token anyway, which is exactly the failure the check exists to prevent, and the
+  scratch install that caught it showed `agentToken` set beside an empty
+  `agentUserIds`.
+- **1.17.2** (2026-09-29): the agent account does not need to be an administrator, and
+  the MCP server is no longer given its token - which it briefly was, and which would
+  have forced exactly the privilege a separate account exists to avoid.
+
+  Measured against a real instance rather than reasoned about, and the first pass got
+  it wrong: probing `config/entity_registry/list` and `lovelace/dashboards/list` as a
+  plain user showed both *allowed*, which reads as "admin is unnecessary" until you
+  notice those are reads and Home Assistant gates the writes. The operations the MCP
+  server actually performs - `config/entity_registry/update` for deterministic entity
+  ids, `lovelace/dashboards/create` and `lovelace/config/save` for its dashboard - all
+  return `unauthorized` to a plain user, with `config/auth/list` as the control proving
+  the demotion had bitten. Reading states and calling services stay allowed, and those
+  are the whole of driving a session.
+
+  So the token splits by what each side does rather than by whose door it is. The MCP
+  server provisions, keeps using yours, and presses nothing whose account the bridge
+  ever reads back - it publishes a question and waits - so attributing it buys nothing
+  and costs the privilege. The agent token goes only where that account is read back:
+  the environment of every launched session, all of which a non-administrator can do.
+  The README's advice to make that account a non-administrator is therefore right,
+  which it would not have been an hour earlier.
 
 ## Next: let a Copilot permission prompt be approved from Home Assistant
 

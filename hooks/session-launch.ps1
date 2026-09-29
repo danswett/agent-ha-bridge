@@ -1790,6 +1790,14 @@ function Start-BridgeCopilotSession {
         [AllowEmptyString()][string]$Effort = '',
         [AllowEmptyString()][string]$Context = '',
 
+        # Launch without permission prompts. Chosen per launch on the card, because
+        # the machine that runs the session is not always the one choosing: a session
+        # started on a Mac from a Windows dashboard used to take the Mac's
+        # newSession.allowAllTools, unseen and unchangeable from where Launch was
+        # pressed. Not passed at all - from the command line, or from a daemon too old
+        # to send it - still means that config setting.
+        [bool]$AllowAllTools = [bool](Get-BridgeSetting 'newSession.allowAllTools' $false),
+
         # Resuming an existing session rather than creating one. Copilot and Agency
         # resume whenever --session-id names a session that exists; Claude and Codex
         # need their own resume syntax (Get-BridgeNewSessionArguments).
@@ -1857,18 +1865,26 @@ function Start-BridgeCopilotSession {
         -Model $chosen['model'] `
         -Effort $chosen['effort'] `
         -Context $chosen['context'] `
-        -AllowAllTools:([bool](Get-BridgeSetting 'newSession.allowAllTools' $false)) `
+        -AllowAllTools:$AllowAllTools `
         -ExtraArguments @(Get-BridgeSetting 'newSession.extraArgs' @()) `
         -Launcher $launcher `
         -AgencyProfile $AgencyProfile `
         -Resume:$Resume)
+
+    # The agent account's token, so a session the bridge starts can go on and drive
+    # the bridge as itself rather than as the person who owns the daemon's token.
+    # Without this a session an agent launches is indistinguishable from one you
+    # launched, because the only thing that tells them apart is the account on the
+    # press - see Get-BridgeAgentToken.
+    $agentEnv = Get-BridgeAgentTokenEnvironment
 
     try {
         if (-not $script:BridgeIsWindows) {
             # macOS: the session runs in a tmux session of its own - which is how the
             # dashboard types into it - shown in a Terminal window attached to it.
             $processId = Start-BridgeTmuxSession -Executable $executable -Arguments $arguments `
-                -WorkingDirectory $WorkingDirectory -Name "$launcher-$(Get-Date -Format 'HHmmss')"
+                -WorkingDirectory $WorkingDirectory -Name "$launcher-$(Get-Date -Format 'HHmmss')" `
+                -Environment $agentEnv
             $process = [pscustomobject]@{ Id = $processId }
         }
         else {
@@ -1876,6 +1892,14 @@ function Start-BridgeCopilotSession {
         # it gives the child its own console instead of letting it inherit the
         # daemon's hidden one, which is what makes the window visible. It refuses an
         # empty -ArgumentList, so none is passed when there are no arguments.
+        #
+        # ShellExecute takes no environment of its own, so the variable is set on this
+        # process for the child to inherit. Harmless here: nothing the bridge itself
+        # runs reads this name - Get-HomeAssistantHeaders resolves the daemon's own
+        # token, and only from homeAssistant.token or homeAssistant.tokenEnvVar.
+        if ($null -ne $agentEnv) {
+            [Environment]::SetEnvironmentVariable($agentEnv.Name, $agentEnv.Value, 'Process')
+        }
         $startArgs = @{
             FilePath         = $executable
             WorkingDirectory = $WorkingDirectory
@@ -1964,7 +1988,12 @@ function Start-BridgeTmuxSession {
         [Parameter(Mandatory)][string]$Executable,
         [AllowEmptyCollection()][string[]]$Arguments = @(),
         [Parameter(Mandatory)][string]$WorkingDirectory,
-        [Parameter(Mandatory)][string]$Name
+        [Parameter(Mandatory)][string]$Name,
+
+        # An extra variable for the session's environment, as Name/Value, or $null.
+        # tmux does not inherit the caller's environment, which is why PATH is passed
+        # below and why anything else the session needs has to come the same way.
+        $Environment = $null
     )
 
     $tmux = Get-BridgeTmuxPath
@@ -1975,6 +2004,7 @@ function Start-BridgeTmuxSession {
     # The agent inherits the daemon's PATH, which the LaunchAgent sets to the one the
     # installer saw - node, Homebrew and npm's bin included.
     if ($env:PATH) { $new += @('-e', "PATH=$($env:PATH)") }
+    if ($null -ne $Environment -and $Environment.Name) { $new += @('-e', "$($Environment.Name)=$($Environment.Value)") }
     $new += '--'
     $new += $Executable
     $new += $Arguments

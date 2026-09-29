@@ -62,11 +62,11 @@ function seedLaunchParts(slots) {
     slots[sel] = new FakeElement(sel === 'button.launch' ? 'button' : 'div');
   }
   slots['.toggle'].parentElement = head;
-  slots['input[data-key="prompt"]'] = new FakeElement('input');
-  slots['input[data-key="prompt"]'].value = '';
+  slots['textarea[data-key="prompt"]'] = new FakeElement('textarea');
+  slots['textarea[data-key="prompt"]'].value = '';
   // One select and one label per field, keyed exactly as the card asks for them.
   const selects = [];
-  for (const key of ['machine', 'resume', 'agent', 'workspace', 'profile', 'model', 'effort', 'context']) {
+  for (const key of ['machine', 'resume', 'agent', 'workspace', 'profile', 'model', 'effort', 'context', 'permissions']) {
     const select = new FakeElement('select');
     select.dataset.key = key;
     select.value = '';
@@ -93,6 +93,7 @@ function makeShadow() {
  * script, so a trailing expression is what exposes them.
  */
 function loadCards() {
+  const sandboxTimers = [];
   const sandbox = {
     console: { info() {}, log() {} },
     window: { customCards: [] },
@@ -105,6 +106,11 @@ function loadCards() {
     },
     CustomEvent: class { constructor(type, init) { this.type = type; Object.assign(this, init); } },
     localStorage: { getItem: () => null, setItem: () => {} },
+    // The launch card arms a timer while a press is in flight. Recorded rather than
+    // run: a real timer would keep the test process alive for its full delay, and
+    // nothing here needs it to fire.
+    setTimeout: (fn, ms) => { sandboxTimers.push({ fn, ms }); return sandboxTimers.length; },
+    clearTimeout: (id) => { if (id) { sandboxTimers[id - 1] = null; } },
   };
   sandbox.globalThis = sandbox;
 

@@ -2,7 +2,10 @@
   "homeAssistant": {
     "baseUrl": "http://homeassistant.local:8123",
     "token": "",
-    "tokenEnvVar": "AGENT_HA_TOKEN"
+    "tokenEnvVar": "AGENT_HA_TOKEN",
+    "agentUserIds": [],
+    "agentToken": "",
+    "agentTokenEnvVar": "AGENT_HA_AGENT_TOKEN"
   },
   "dashboard": {
     "urlPath": "agent-decisions"

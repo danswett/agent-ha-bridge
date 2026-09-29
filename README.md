@@ -297,7 +297,9 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `homeAssistant.baseUrl` | e.g. `http://homeassistant.local:8123` |
 | `homeAssistant.token` | Long-lived access token |
 | `homeAssistant.tokenEnvVar` | Read the token from this env var instead (default `AGENT_HA_TOKEN`; `COPILOT_HA_TOKEN` still works) |
-| `homeAssistant.agentUserIds` | Home Assistant user ids that count as an agent rather than you. A session whose last reply came from one of them gets a purple edge on its card, so a session being driven remotely says so at a glance. Empty by default, which means nothing is ever marked — see [Telling an agent's turn from yours](#telling-an-agents-turn-from-yours) |
+| `homeAssistant.agentUserIds` | Home Assistant user ids that count as an agent rather than you. A session an agent starts or replies to gets a purple edge on its card, so a session being driven remotely says so at a glance. Written for you from `agentToken` — see [Telling an agent's turn from yours](#telling-an-agents-turn-from-yours) |
+| `homeAssistant.agentToken` | A long-lived token for a *separate* Home Assistant account standing for the agent. Handed to every session the bridge launches, so an agent driving another session does so as itself; the daemon, the hooks and the MCP server keep using `homeAssistant.token`. Set it with `agent-ha-bridge configure -AgentToken <token>`, which also fills in `agentUserIds` |
+| `homeAssistant.agentTokenEnvVar` | Read the agent token from this env var instead (default `AGENT_HA_AGENT_TOKEN`) |
 | `dashboard.urlPath` | Lovelace dashboard slug (default `agent-decisions`) |
 | `notifications.enabled` / `.service` | Optional notify-style service |
 | `copilot.sessionStateRoot` | Override the Copilot CLI's session-state location if not `~/.copilot/session-state` |
@@ -316,7 +318,7 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `newSession.model` | Model preselected on the card (default: **Agent default** — the CLI's own choice). Applies to Copilot and Agency; `newSession.model.claude` / `.codex` do the same per agent |
 | `newSession.effort.<agent>` / `.context.<agent>` | Reasoning effort and context window preselected on the card, per agent (`copilot`, `claude`, `codex`; Agency reads Copilot's) |
 | `newSession.models.<agent>` | Replace the model list the card offers, e.g. `"models": { "copilot": ["auto", "claude-opus-5"] }`. Copilot's is otherwise read from `copilot help config`; `efforts.<agent>` and `contexts.<agent>` do the same for the other two axes |
-| `newSession.allowAllTools` | Launch without permission prompts (default `false`): `--allow-all` for Copilot, `--dangerously-skip-permissions` for Claude, `--ask-for-approval never` for Codex |
+| `newSession.allowAllTools` | What the card's **Permissions** row opens on (default `false`). **Allow all** launches without permission prompts: `--allow-all` for Copilot, `--dangerously-skip-permissions` for Claude, `--ask-for-approval never` for Codex, and it answers Claude's folder-trust dialog rather than waiting for a second press. The card decides each launch, so a session started on another machine no longer silently takes that machine's setting |
 | `newSession.extraArgs` | Extra CLI arguments for launched sessions, e.g. `["--plan"]` |
 | `newSession.copilotPath` | Full path to `copilot.exe` if it is not on the daemon's PATH |
 | `newSession.agencyPath` | Full path to `agency.exe` if it is not on the daemon's PATH |
@@ -341,22 +343,44 @@ Giving the agent its own account is what makes the difference real:
 
 1. *Settings → People → Add person*, with **Allow login** on. Call it whatever you
    like — `Copilot`, say — and make it a non-administrator.
-2. Log in as that user once and create a long-lived token for it (*Profile →
-   Security → Long-lived access tokens*). Hand that token to the agent; leave your own
-   `homeAssistant.token` alone, since the daemon still runs as you.
-3. Find the user's id under *Settings → People → <the user>*; it is the long hex string
-   in the URL. Put it in `homeAssistant.agentUserIds`.
+2. Log in as that user once (a private browser window is easiest) and create a
+   long-lived token for it (*Profile → Security → Long-lived access tokens*).
+3. Hand it to the installer:
 
-   Read it from that URL, not from the token. A long-lived token is a JWT whose `iss`
-   claim looks exactly like a user id but is the *refresh token's* id, and using it
-   means nothing is ever marked as agent-driven. If the URL is awkward to get at, have
-   the agent change something with its own token and read `context.user_id` back off
-   the resulting state — that is the same id the bridge compares against.
+   ```powershell
+   agent-ha-bridge configure -AgentToken <the token>
+   ```
 
-A session whose last reply came from one of those ids is drawn with a purple edge —
-steady while idle, pulsing while it works — and hands back to the ordinary colours the
-moment you reply yourself or type in the session's own window. With no ids configured
-nothing is ever marked, which is deliberate: a glow that lies is worse than no glow.
+   An interactive install offers this step on its own; `homeAssistant.agentToken` in
+   the config, or the `AGENT_HA_AGENT_TOKEN` environment variable, does the same.
+
+That is the whole setup — there is no user id to copy. The installer reads the account
+back off the token (`auth/current_user`) and writes `agentUserIds` itself, because that
+was the one step in this flow with a silent wrong answer available: a long-lived token
+is a JWT whose `iss` claim looks exactly like a user id but is the *refresh token's*
+id, and using it means nothing is ever marked and nothing ever says why.
+
+It also refuses two tokens rather than storing them to fail quietly later: one Home
+Assistant rejects, and one belonging to *your own* account — which authenticates
+perfectly and can never mark anything.
+
+Your own `homeAssistant.token` is left alone; the daemon, the hooks and the dashboard
+provisioning still run as you. The agent token goes into the environment of every
+session the bridge launches (`AGENT_HA_AGENT_TOKEN`), so an agent that goes on to
+drive another session does so as itself.
+
+**A non-administrator is genuinely enough**, and the split is deliberate. Driving a
+session is service calls and state reads, both of which a plain user may do. The MCP
+server is not given this token precisely because it *provisions* — it renames entities
+to deterministic ids and creates its own dashboard, and `config/entity_registry/update`,
+`lovelace/dashboards/create` and `lovelace/config/save` all return `unauthorized` to a
+plain user (measured against a real instance, with `config/auth/list` as the control).
+It keeps using yours, and presses nothing whose account the bridge ever reads back.
+
+A session an agent starts or replies to is drawn with a purple edge — steady while
+idle, pulsing while it works — and hands back to the ordinary colours the moment you
+reply yourself or type in the session's own window. With nothing configured nothing is
+ever marked, which is deliberate: a glow that lies is worse than no glow.
 
 The same change makes Home Assistant's own logbook honest, since those actions are
 then attributed to the agent rather than to you.
@@ -550,8 +574,11 @@ A few deliberate choices:
 - **Launch is a button, not the text box.** Home Assistant commits a text entity as soon
   as it loses focus, so acting on the typed value alone would spawn a session the moment
   you clicked away.
-- **The opening prompt is capped at 255 characters**, the Home Assistant limit for an
-  MQTT `text` entity. Launch with a short prompt and continue in the reply box.
+- **The opening prompt is as long as you need it to be.** The launch card publishes it
+  over MQTT, the same way the reply box sends a long reply, so a whole handover — the
+  context, the constraints, what has already been tried — can start the session. A
+  dashboard still on an older card falls back to a plain `text` entity, which Home
+  Assistant caps at 255 characters.
 
 The **Last launch** row reports what happened. It confirms success only once the new
 session has actually registered itself, not merely when a process started.
