@@ -873,8 +873,9 @@ function Test-BridgeActivityCardServed {
         with -MinimumVersion, whatever element shipped in that version), read from
         the `?v=` cache-buster on its resource URL. The activity card first shipped in
         card version 1.10.0; agent-bridge-session-card in 1.12.0;
-        agent-bridge-choices-card in 1.13.0, and its whole-form shape - a labelled
-        group of rows per field, replacing the per-field dropdowns - in 1.15.0.
+        agent-bridge-choices-card in 1.13.0, its whole-form shape - a labelled
+        group of rows per field, replacing the per-field dropdowns - in 1.15.0, and
+        agent-bridge-status-card in 1.19.0.
     #>
     param(
         [AllowEmptyString()][AllowNull()][string]$ReplyCardUrl,
@@ -969,7 +970,8 @@ function Save-CopilotSessionDashboard {
 
         Live count and pending-decision count are rendered as Jinja templates over the
         exact entity ids, so they stay current between rebuilds as turn state and
-        armed questions change.
+        armed questions change. From card 1.19.0 the status card counts them itself,
+        which also picks up a machine that came online since the last rebuild.
     #>
     param(
         [Parameter(Mandatory)]
@@ -1136,6 +1138,36 @@ function Save-CopilotSessionDashboard {
         $machinesCard = @{
             type = 'vertical-stack'
             cards = @(@{ type = 'markdown'; content = '### Machines' }) + $machineRows
+        }
+    }
+
+    # From card 1.19.0 the summary and the machines list are one card that folds, in
+    # the shape of the launch card below: the counts on the line you always see, and
+    # a row per machine with its Detail switch behind a chevron. As two markdown
+    # cards they took a third of a phone screen to say "three sessions, nothing
+    # waiting", and the switches sat in a list you had to match up to names by eye.
+    $statusCard = $null
+    if (Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.19.0') {
+        $statusCard = [ordered]@{
+            type      = 'custom:agent-bridge-status-card'
+            title     = 'Agent sessions'
+            decisions = @($decisionEntities)
+            # Every machine that has ever registered, live or not - the card decides
+            # what to show from the liveness entity, so a machine going offline does
+            # not need the dashboard rebuilt to read as offline.
+            machines  = @($machineList | ForEach-Object {
+                $entry = [ordered]@{
+                    machine  = [string]$_.Machine
+                    online   = Get-BridgeMachineEntityId -Domain 'binary_sensor' -Key 'online' -Slug $_.Slug
+                    sessions = Get-BridgeMachineEntityId -Domain 'sensor' -Key 'sessions' -Slug $_.Slug
+                    version  = Get-BridgeMachineEntityId -Domain 'update' -Key 'update' -Slug $_.Slug
+                }
+                if ($_.PSObject.Properties['IncludeDetailed'] -and $_.IncludeDetailed) {
+                    $entry.detailed = Get-BridgeMachineEntityId -Domain 'input_boolean' -Key 'detailed_activity' -Slug $_.Slug
+                }
+                if ($_.PSObject.Properties['IsDev'] -and $_.IsDev) { $entry.dev = $true }
+                $entry
+            })
         }
     }
 
@@ -1336,8 +1368,12 @@ function Save-CopilotSessionDashboard {
     }
 
     # The control panel is a plain card pair at the top of the masonry flow.
-    $controlCards = @($agentSessionsCard)
-    if ($machinesCard) { $controlCards += $machinesCard }
+    $controlCards = @()
+    if ($statusCard) { $controlCards = @($statusCard) }
+    else {
+        $controlCards = @($agentSessionsCard)
+        if ($machinesCard) { $controlCards += $machinesCard }
+    }
     $controlCards += $updateCards + $newSessionCards
 
     $sessionSections = foreach ($session in $Sessions) {
