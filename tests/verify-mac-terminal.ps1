@@ -120,23 +120,27 @@ function Remove-TaggedWindows {
         # Only ever applied to windows carrying these test tags.
         $ttyScript = @"
 tell application "Terminal"
-  set found to {}
+  set out to ""
   repeat with w in windows
     repeat with tb in tabs of w
       try
-        if custom title of tb is "$t" then set end of found to tty of tb
+        if custom title of tb is "$t" then set out to out & (tty of tb) & linefeed
       end try
     end repeat
   end repeat
-  set AppleScript's text item delimiters to " "
-  return found as text
+  return out
 end tell
 "@
-        $ttys = (& osascript -e $ttyScript 2>&1 | Out-String).Trim()
-        foreach ($tty in ($ttys -split '\s+' | Where-Object { $_ -match '^/dev/tty' })) {
+        # Accumulated with linefeed rather than joined through AppleScript's text item
+        # delimiters: the delimiter version returned nothing usable, so no tty was
+        # ever killed and the busy window survived cleanup with the failure invisible.
+        $ttys = @((& osascript -e $ttyScript 2>&1 | Out-String) -split "`r?`n" |
+            ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^/dev/tty' })
+        foreach ($tty in $ttys) {
             & pkill -t ([System.IO.Path]::GetFileName($tty)) 2>&1 | Out-Null
         }
-        Start-Sleep -Milliseconds 400
+        if ($pass -eq 1) { Write-Host "  cleanup [$t]: ttys $(if ($ttys.Count) { $ttys -join ',' } else { '<none>' })" }
+        Start-Sleep -Milliseconds 600
 
         # Closed by id for the same reason the bridge does: the references
         # `repeat with w in windows` yields are positional, so closing one shifts
@@ -253,6 +257,14 @@ try {
     Write-Host '--- once what it was running ends, it goes ---'
     # Which is the bridge's own case: the window runs `tmux attach`, and that returns
     # when the session is torn down.
+    #
+    # The busy window from the case above is cleared first. Leaving it standing is
+    # the correct outcome there, but it is still a tagged window, so counting
+    # straight afterwards reads it as this case's failure - which is exactly what it
+    # did, reporting a close that had in fact worked as broken.
+    Remove-TaggedWindows -Titles @($mine)
+    $settleStart = Count-Tabs -Title $mine
+    Check 'the busy window is out of the way first' ($settleStart -eq 0) "still $settleStart"
     Open-Tagged -Title $mine -Command 'sleep 4'
     $settleClosed = Close-BridgeTerminalWindow -Title $mine -SettleSeconds 15
     Start-Sleep -Seconds 2
