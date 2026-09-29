@@ -419,6 +419,37 @@ function Add-DaemonSession {
     # opened at a keyboard has none, and its card simply shows no settings line
     # rather than guessing at the agent's defaults.
     $tuning = Get-DaemonSessionTuning -SessionId $id -Session $session
+
+    # Who the card is born believing is driving. Without this the first publish
+    # carries no driver at all, and a card with no driver reads as human - blue -
+    # until the session's next activity update supplies one. For a session that
+    # launches and then waits, that update may never come: one launched by an agent
+    # sat on the dashboard showing blue indefinitely until it was replied to. The
+    # same publish runs when a session is re-adopted, so a daemon restart or a
+    # re-prime was blanking the driver of every session it touched.
+    $initialDriver = ''
+    if ($script:DaemonLaunchDrivers.ContainsKey($id)) {
+        # Peeked rather than taken - the block further down takes it, stamps it on the
+        # state entry and logs it. Taking it here would silently disable all that.
+        $initialDriver = [string]$script:DaemonLaunchDrivers[$id].Driver
+    }
+    elseif ($alreadyPublished) {
+        # Carried over from the card, which outlives the daemon. A session being
+        # re-adopted has no launch record - it did not just start, and the record does
+        # not survive a restart - so its own published state is the only thing that
+        # still knows who was driving it.
+        try {
+            $priorActivity = Get-HomeAssistantState -EntityId "sensor.${node}_activity" -Headers $Headers
+            if ($null -ne $priorActivity -and $priorActivity.PSObject.Properties['attributes'] -and
+                $null -ne $priorActivity.attributes -and
+                $priorActivity.attributes.PSObject.Properties['driver']) {
+                $initialDriver = [string]$priorActivity.attributes.driver
+            }
+        }
+        catch { $initialDriver = '' }
+    }
+    if ([string]::IsNullOrWhiteSpace($initialDriver)) { $initialDriver = 'human' }
+
     try {
         Set-CopilotMqttStatus -SessionId $id -Status $initialStatus -Headers $Headers -Attributes (
             Add-DaemonTuningAttributes -Attributes @{
@@ -428,7 +459,8 @@ function Add-DaemonSession {
                 updated = [DateTimeOffset]::Now.ToString('o')
             } -Tuning $tuning) | Out-Null
         Set-CopilotMqttActivity -SessionId $id -Summary $initialActivity `
-            -Detail @{ session = $display.Name; machine = $display.Machine } -Headers $Headers | Out-Null
+            -Detail @{ session = $display.Name; machine = $display.Machine; driver = $initialDriver } `
+            -Headers $Headers | Out-Null
         # Prime the reply box to empty so the card shows a blank field rather
         # than 'unknown' before the box has ever been used.
         Invoke-HomeAssistantService -Domain 'text' -Service 'set_value' -Headers $Headers `
@@ -468,6 +500,12 @@ function Add-DaemonSession {
         Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $true
         $script:DaemonLaunchDrivers.Remove($id)
         Write-DaemonLog -Message "session $($id.Substring(0,8)) was launched by an agent; showing it as agent-driven"
+    }
+    elseif ($initialDriver -ne 'human') {
+        # Carried over from the card when a session is re-adopted. The entry is built
+        # fresh on every restart, so without this the driver read off the card above
+        # would be published once and then lost again at the next activity update.
+        Set-DaemonSessionProperty -Entry $entry -Name 'Driver' -Value $initialDriver
     }
     $entry
 }
