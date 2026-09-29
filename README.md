@@ -311,7 +311,10 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `newSession.profiles` | Agency profiles offered on the dashboard (default `["work","home","local"]`) |
 | `newSession.defaultProfile` | Profile preselected on the card (default: the first in `profiles`) |
 | `newSession.defaultWorkspace` | Workspace label preselected on the card (default: the first in `workspaces`) |
-| `newSession.workspaces` | Directories offered as launch targets — a path string, or `{ "label": …, "path": … }`. Folders recent Claude/Codex sessions worked in are added after these, and the home folder is offered if the list would otherwise be empty |
+| `newSession.workspaces` | Directories offered as launch targets — a path string, or `{ "label": …, "path": … }`. Add `"isolate": true` to give every launch there a git worktree of its own. Folders recent Claude/Codex sessions worked in are added after these, and the home folder is offered if the list would otherwise be empty |
+| `newSession.worktreeRoot` | Where isolated launches get their worktrees (default `~/repos/wt`). One directory, outside every repository: it is what marks a worktree as the bridge's to tidy up |
+| `newSession.worktreeLimit` | How many worktrees one repository may have at once (default `10`). At the cap a launch runs in the repository itself rather than failing |
+| `newSession.worktreeIdleHours` | How old a finished worktree must be before it is removed (default `12`) |
 | `newSession.discoverWorkspaces` | Set to `false` to offer only the configured workspaces (default `true`). System folders such as `C:\Windows\System32` are never discovered |
 | `newSession.discoverCount` | How many discovered folders to offer (default `8`) |
 | `newSession.resumeCount` | How many recent sessions the Resume dropdown offers (default `12`) |
@@ -556,7 +559,7 @@ Configure the workspace list first, or the card has nothing to offer:
 ```jsonc
 "newSession": {
   "workspaces": [
-    { "label": "Bridge", "path": "~/repos/agent-ha-bridge" },
+    { "label": "Bridge", "path": "~/repos/agent-ha-bridge", "isolate": true },
     "~/repos/my-app"
   ]
 }
@@ -568,6 +571,20 @@ A few deliberate choices:
   daemon resolves that label against this list. A path typed or injected anywhere else
   is never executed, so the config file — not Home Assistant — decides where a session
   may start.
+- **`isolate` keeps concurrent sessions off each other.** Several agent sessions working
+  in one repository share a checkout, and so share one `HEAD`, one index and one branch
+  list — a `git checkout` in one rewrites the files under all the others. With
+  `"isolate": true` each fresh launch gets a git worktree of its own instead, made at
+  launch from the remote's default branch. The dropdown still lists the repository, not
+  the worktrees: you pick **Bridge** and never see them. Resumes are unaffected, since a
+  resumed session belongs in the directory it was already running in.
+- **Nothing unmerged is ever cleaned up.** Finished worktrees are removed before each
+  launch, and a worktree counts as finished only if it has no uncommitted or untracked
+  files, no branch checked out, no commit of its own on a detached HEAD, has not been
+  worked in recently, and is older than `newSession.worktreeIdleHours`. Anything else
+  stays until you deal with it. If git is missing or the workspace is not a repository,
+  the session launches in the directory itself and the daemon log says why — isolation
+  is never worth a launch that does not happen.
 - **Tools are not auto-approved.** Launched sessions get no `--allow-all` unless
   you set `newSession.allowAllTools`. Permission prompts already route to Home
   Assistant, so an unattended session still asks before it acts.
@@ -736,6 +753,7 @@ bridge cannot tell, it asks; a scripted uninstall keeps them. `-ClearShared` and
 .\tests\test-bridge-adapter.ps1   # shared adapter orchestration (entities, status, notifications)
 .\tests\test-dashboard.ps1        # generated dashboard: title, view, session summary + version
 .\tests\test-status-card.ps1      # the Agent sessions card, end to end: real config, really published entities
+.\tests\test-worktree-isolation.ps1 # a worktree per launch, and that pruning cannot reach unmerged work
 .\tests\test-security.ps1         # template injection, path and topic safety, token handling
 .\tests\test-copilot-activity.ps1 # Copilot's transcript reader, and the inline thinking on its card
 .\tests\test-reliability.ps1      # request budget, StrictMode safety, stale-state pruning
