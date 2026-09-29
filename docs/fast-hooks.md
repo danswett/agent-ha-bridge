@@ -431,6 +431,11 @@ program. So:
 
 ## Next: the choices card should answer a whole form
 
+**First, though:** Dans-MBP went offline on 1.14.4 and never took 1.14.5, so a question
+on that machine still cannot be answered from the dashboard. Press its **Install Bridge
+Update** button (`button.agent_bridge_dans_mbp_install_update`) once it is back - the
+owner has already agreed to this. DSWETT-HOME is on 1.14.5.
+
 Not started. Multi-field questions still render as Home Assistant's native `select`
 dropdowns, and they are bad in two specific ways the row buttons already solve: a
 native select commits on blur, so an answer needs a tap away and then Send, and it
