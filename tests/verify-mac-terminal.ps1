@@ -298,8 +298,34 @@ try {
 finally {
     # Take the stand-ins away whatever happened, so a failed run does not leave
     # windows sitting on the user's desktop - and does not poison the next run.
-    Remove-TaggedWindows -Titles @($mine, $yours)
-    Write-Host "  cleaned up; bridge=$(Count-Tabs -Title $mine) user=$(Count-Tabs -Title $yours)"
+    # Retried, because a window Terminal is still animating shut is counted as
+    # present and one pass can report a leftover that is already on its way out.
+    $left = 0
+    foreach ($attempt in 1..3) {
+        Remove-TaggedWindows -Titles @($mine, $yours)
+        $left = (Count-Tabs -Title $mine) + (Count-Tabs -Title $yours)
+        if ($left -eq 0) { break }
+        Start-Sleep -Seconds 2
+    }
+    Write-Host "  cleaned up; $left left"
+    if ($left -gt 0) {
+        $names = @"
+tell application "Terminal"
+  set out to ""
+  repeat with w in windows
+    repeat with tb in tabs of w
+      try
+        if custom title of tb is "$mine" or custom title of tb is "$yours" then
+          set out to out & (name of w) & " tty=" & (tty of tb) & " busy=" & ((busy of tb) as text) & linefeed
+        end if
+      end try
+    end repeat
+  end repeat
+  return out
+end tell
+"@
+        Write-Host "  still there:`n$((& osascript -e $names 2>&1 | Out-String).Trim())"
+    }
 }
 
 if ($failures -gt 0) { Write-Host "RESULT: $failures FAILED" -ForegroundColor Red; exit 1 }
