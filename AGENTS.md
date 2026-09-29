@@ -30,6 +30,11 @@ git -C $wt switch --detach origin/main           # hand the slot back
 git -C $wt branch -D feat/<topic>
 ```
 
+Hand the slot back in that order, *after* the merge. `gh pr merge --delete-branch`
+cannot delete a branch that is checked out in a worktree: it prints a warning and
+suggests `git worktree remove`. Do not do that - the slot is meant to be reused.
+Detach it and delete the branch yourself instead.
+
 A slot is a complete working copy: the full suite runs there, and the installer still
 marks an install from one as `(dev)` (a worktree's `.git` is a file, and `Test-Path`
 returns true for it).
@@ -48,6 +53,7 @@ Including one-line and documentation changes.
 4. Wait for CI to be green. If it fails on something you did not touch, check whether
    `main` is already failing the same way and say so rather than merging into red.
 5. `gh pr merge <n> --squash --delete-branch`.
+6. Hand the slot back: detach it, then delete the local branch.
 
 ## Tests
 
