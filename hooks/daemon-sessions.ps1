@@ -418,7 +418,7 @@ function Add-DaemonSession {
     # What this session was started with, when the bridge started it. A session
     # opened at a keyboard has none, and its card simply shows no settings line
     # rather than guessing at the agent's defaults.
-    $tuning = Get-DaemonSessionTuning -SessionId $id -Session $session -Kind $kind
+    $tuning = Get-DaemonSessionTuning -SessionId $id -Session $session
     try {
         Set-CopilotMqttStatus -SessionId $id -Status $initialStatus -Headers $Headers -Attributes (
             Add-DaemonTuningAttributes -Attributes @{
@@ -488,12 +488,11 @@ function Get-DaemonSessionTuning {
     #>
     param(
         [Parameter(Mandatory)][string]$SessionId,
-        $Session = $null,
-        [AllowEmptyString()][string]$Kind = ''
+        $Session = $null
     )
 
     $launched = $null
-    try { $launched = Resolve-DaemonLaunchTuning -SessionId $SessionId -Kind $Kind } catch { }
+    try { $launched = Resolve-DaemonLaunchTuning -SessionId $SessionId } catch { }
 
     $field = { param($Source, $Name)
         if ($null -ne $Source -and $Source.PSObject.Properties[$Name]) { [string]$Source.$Name } else { '' } }

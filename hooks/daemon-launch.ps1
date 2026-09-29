@@ -824,8 +824,7 @@ function Start-DaemonLaunch {
     # Remember what this session was started with, so its card can say so. The
     # command line is the only record of effort and context - neither appears in a
     # transcript, and no agent reports them back - so if it is not kept here it is
-    # gone. Keyed by session id, and under the pending key for Codex, which picks its
-    # own id and is claimed by Resolve-DaemonLaunchTuning once it registers.
+    # gone.
     #
     # Read defensively: what actually started the session is stubbed in tests and
     # replaceable in principle, and a result without these three should cost the card
@@ -835,13 +834,13 @@ function Start-DaemonLaunch {
         Model   = & $launched 'Model'
         Effort  = & $launched 'Effort'
         Context = & $launched 'Context'
-        # The kind of session this launch produces, so a pending record can only ever
-        # be claimed by a session of that kind: Agency and Copilot both make 'copilot'
-        # sessions, and Codex - the only agent that files a pending record at all -
-        # makes 'codex' ones.
-        Kind    = [string](Get-BridgeLauncher -Launcher $chosenLauncher).Kind
         At      = $launchedAt
     }
+    # Copilot, Agency and Claude register under the id the bridge invented, so the
+    # record is filed under it straight away. Codex picks its own, so its launch waits
+    # under the pending key until Update-DaemonPendingLaunch learns which session it
+    # actually produced and moves it across - the same answer, from the same place,
+    # that stamps the launch's driver.
     $tuningKey = if ($launch.SessionId) { [string]$launch.SessionId } else { $script:DaemonPendingTuningKey }
     $script:DaemonLaunchedTuning[$tuningKey] = $launchTuning
 
@@ -910,33 +909,37 @@ function Resolve-DaemonLaunchTuning {
         What a session now being adopted was launched with, or $null when the bridge
         did not launch it.
 
-        Exact id first. Codex chooses its own id, so a launch for it is filed under a
-        pending key instead and claimed by the first session of that kind to appear
-        within two minutes of it - the same window Update-DaemonPendingLaunch follows
-        a launch over, and the same "first registration after the launch" rule its
-        RegistrationFiles matcher already uses. Matching the kind as well keeps a
-        Claude session opened at the keyboard from inheriting a pending Codex launch's
-        settings. Claimed once and then dropped, so nothing can inherit it twice.
+        Keyed by the id the session actually registered under: an agent that takes
+        `--session-id` is filed under it at launch, and one that picks its own
+        (Codex) is moved across by Update-DaemonPendingLaunch, which is the one place
+        that knows which session a launch produced. Deciding that here as well - by
+        age, or by kind - would be a second guess at a question already answered, and
+        a wrong one means a session wearing somebody else's settings.
+
+        Taken rather than read, so a later session that happens to reuse an id cannot
+        inherit them.
     #>
-    param(
-        [Parameter(Mandatory)][string]$SessionId,
-        [AllowEmptyString()][string]$Kind = ''
-    )
+    param([Parameter(Mandatory)][string]$SessionId)
 
-    if ($script:DaemonLaunchedTuning.ContainsKey($SessionId)) {
-        $exact = $script:DaemonLaunchedTuning[$SessionId]
-        [void]$script:DaemonLaunchedTuning.Remove($SessionId)
-        return $exact
+    if (-not $script:DaemonLaunchedTuning.ContainsKey($SessionId)) { return $null }
+    $record = $script:DaemonLaunchedTuning[$SessionId]
+    [void]$script:DaemonLaunchedTuning.Remove($SessionId)
+    $record
+}
+
+function Clear-DaemonStaleLaunchTuning {
+    <#
+        Drops launch records whose session never appeared - a publish that kept
+        failing, a window closed before it registered, or a Codex that never got a
+        first message. Without this a record would sit under the pending key for the
+        life of the daemon, waiting for an id that never comes, and the next launch
+        of that agent would find it there.
+    #>
+    foreach ($key in @($script:DaemonLaunchedTuning.Keys)) {
+        if (([DateTimeOffset]::Now - $script:DaemonLaunchedTuning[$key].At).TotalMinutes -gt 15) {
+            [void]$script:DaemonLaunchedTuning.Remove($key)
+        }
     }
-
-    $key = $script:DaemonPendingTuningKey
-    if (-not $script:DaemonLaunchedTuning.ContainsKey($key)) { return $null }
-    $pending = $script:DaemonLaunchedTuning[$key]
-    $pendingKind = if ($pending.PSObject.Properties['Kind']) { [string]$pending.Kind } else { '' }
-    if ($Kind -and $pendingKind -and $Kind -ne $pendingKind) { return $null }
-    [void]$script:DaemonLaunchedTuning.Remove($key)
-    if (([DateTimeOffset]::Now - $pending.At).TotalMinutes -gt 2) { return $null }
-    $pending
 }
 
 function Test-DaemonLaunchProgressNote {
@@ -1036,7 +1039,11 @@ function Update-DaemonPendingLaunch {
         # actually registered under rather than the one it was offered - Codex picks
         # its own. Read from the same check that just said it had registered, so the
         # two can never name different sessions.
-        if ($p.Driver -eq 'agent') {
+        #
+        # The settings the launch chose need the same answer for the same reason, so
+        # both are taken from one call rather than each guessing separately.
+        $pendingTuning = $script:DaemonLaunchedTuning[$script:DaemonPendingTuningKey]
+        if ($p.Driver -eq 'agent' -or $null -ne $pendingTuning) {
             $registeredId = Get-BridgeRegisteredSessionId -SessionId $p.SessionId -Launcher $p.Launcher -Since $p.Since
             if (-not [string]::IsNullOrWhiteSpace($registeredId)) {
                 # A launch whose session is never adopted - a publish that keeps
@@ -1047,9 +1054,19 @@ function Update-DaemonPendingLaunch {
                         $script:DaemonLaunchDrivers.Remove($stale)
                     }
                 }
-                $script:DaemonLaunchDrivers[$registeredId] = @{ Driver = $p.Driver; At = [DateTimeOffset]::Now }
+                if ($p.Driver -eq 'agent') {
+                    $script:DaemonLaunchDrivers[$registeredId] = @{ Driver = $p.Driver; At = [DateTimeOffset]::Now }
+                }
+                # Move the launch's settings onto the id the session really registered
+                # under. Only an agent that picks its own id (Codex) is ever waiting
+                # here; the rest were filed under their id at launch.
+                if ($null -ne $pendingTuning) {
+                    [void]$script:DaemonLaunchedTuning.Remove($script:DaemonPendingTuningKey)
+                    $script:DaemonLaunchedTuning[$registeredId] = $pendingTuning
+                }
             }
         }
+        Clear-DaemonStaleLaunchTuning
         # The session's own card is the confirmation, so the note is cleared, and a
         # reconcile is asked for now so the card appears without waiting the interval.
         $script:DaemonReconcileNow = $true

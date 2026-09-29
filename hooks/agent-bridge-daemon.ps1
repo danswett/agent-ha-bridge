@@ -241,8 +241,8 @@ $script:DaemonLaunchedPids = @{}
 
 # Model, reasoning effort and context window per session the bridge launched, keyed
 # by session id - and under DaemonPendingTuningKey for an agent that picks its own
-# id (Codex), until the session that appears claims it. Cleared as each session is
-# adopted, so this only ever holds launches still waiting to register.
+# id (Codex), until Update-DaemonPendingLaunch learns which session the launch
+# produced and moves the record onto that id.
 #
 # The command line is the only record: effort and context appear in no transcript and
 # no agent reports them back, so what is not kept here cannot be shown anywhere. Once

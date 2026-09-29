@@ -96,22 +96,35 @@ Test-That 'a session the bridge did not launch carries nothing' {
 
 # Codex picks its own id, so its launch is filed under a pending key and claimed by
 # the first session to appear - the same rule its registration matcher already uses.
+# Codex picks its own id, so its launch waits under the pending key until
+# Update-DaemonPendingLaunch learns which session it produced and moves the record
+# across. Nothing claims a pending record by guesswork, so an unrelated session
+# adopted in the meantime gets nothing.
 $script:DaemonLaunchedTuning = @{ $script:DaemonPendingTuningKey = [pscustomobject]@{
-    Model = 'gpt-5.3-codex'; Effort = 'high'; Context = ''; Kind = 'codex'; At = [DateTimeOffset]::Now } }
-Test-That 'an agent that chose its own id still claims its launch' {
-    (Get-DaemonSessionTuning -SessionId 'some-id-codex-picked' -Kind 'codex').Effort -eq 'high'
-}
-# Re-seeded: the claim above consumed the record, which is itself the point.
-$script:DaemonLaunchedTuning = @{ $script:DaemonPendingTuningKey = [pscustomobject]@{
-    Model = 'gpt-5.3-codex'; Effort = 'high'; Context = ''; Kind = 'codex'; At = [DateTimeOffset]::Now } }
-Test-That 'but a session of another kind, opened at the keyboard, does not' {
-    (Get-DaemonSessionTuning -SessionId 'typed-by-hand' -Kind 'claude').Effort -eq '' -and
+    Model = 'gpt-5.3-codex'; Effort = 'high'; Context = ''; At = [DateTimeOffset]::Now } }
+Test-That 'a session adopted while a launch is still pending claims nothing' {
+    (Get-DaemonSessionTuning -SessionId 'opened-by-hand').Effort -eq '' -and
     $script:DaemonLaunchedTuning.ContainsKey($script:DaemonPendingTuningKey)
 }
+Test-That 'and once the launch is re-keyed onto the id it registered under, that session gets it' {
+    $real = 'codex-picked-this-id'
+    $script:DaemonLaunchedTuning[$real] = $script:DaemonLaunchedTuning[$script:DaemonPendingTuningKey]
+    [void]$script:DaemonLaunchedTuning.Remove($script:DaemonPendingTuningKey)
+    (Get-DaemonSessionTuning -SessionId $real).Effort -eq 'high'
+}
+# A launch whose session never appears would otherwise sit here for the life of the
+# daemon, and the next launch of that agent would find it waiting.
 $script:DaemonLaunchedTuning = @{ $script:DaemonPendingTuningKey = [pscustomobject]@{
-    Model = 'gpt-5.3-codex'; Effort = 'high'; Context = ''; Kind = 'codex'; At = [DateTimeOffset]::Now.AddMinutes(-10) } }
-Test-That 'and a session opened long after a launch does not inherit its settings' {
-    (Get-DaemonSessionTuning -SessionId 'opened-by-hand' -Kind 'codex').Effort -eq ''
+    Model = 'gpt-5.3-codex'; Effort = 'high'; Context = ''; At = [DateTimeOffset]::Now.AddMinutes(-20) } }
+Clear-DaemonStaleLaunchTuning
+Test-That 'a launch that never registered is eventually dropped' {
+    $script:DaemonLaunchedTuning.Count -eq 0
+}
+$script:DaemonLaunchedTuning = @{ 'fresh-one' = [pscustomobject]@{
+    Model = 'gpt-5.4'; Effort = ''; Context = ''; At = [DateTimeOffset]::Now } }
+Clear-DaemonStaleLaunchTuning
+Test-That 'while one still waiting on its session is left alone' {
+    $script:DaemonLaunchedTuning.ContainsKey('fresh-one')
 }
 
 # Codex names its model on every hook call, which beats the launch record for the same
