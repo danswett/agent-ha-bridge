@@ -1448,6 +1448,44 @@ function Test-BridgeAgentUserId {
     $configured -contains $UserId.Trim()
 }
 
+function Get-BridgeThoughtLine {
+    <#
+        A thought reduced to one line for the activity trail.
+
+        The trail is a list on a phone, so a thought joins it the way the agent's own
+        text does - first line only, trimmed - rather than as the paragraphs it
+        usually is. It is prefixed rather than left bare because the trail mixes
+        kinds: "Running: view" is something the agent did and a thought is something
+        it considered, and a reader needs to tell them apart at a glance.
+
+        Returns '' for nothing worth showing, so a caller can skip it.
+    #>
+    param(
+        [AllowEmptyString()][AllowNull()][string]$Text,
+        [int]$MaxChars = 120
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Text)) { return '' }
+    $first = (($Text -replace "`r", '') -split "`n" |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) } |
+        Select-Object -First 1)
+    if ([string]::IsNullOrWhiteSpace($first)) { return '' }
+
+    # Reasoning usually opens with its own heading - "**Checking the config**" or
+    # "## Checking the config" - which is the best one-line summary there is, but only
+    # once its markup is off.
+    $line = $first.Trim()
+    $line = $line -replace '^\s*#{1,6}\s+', ''
+    $line = $line -replace '^\*\*(.+?)\*\*\s*$', '$1'
+    $line = $line.Trim()
+    if ([string]::IsNullOrWhiteSpace($line)) { return '' }
+
+    if ($line.Length -gt $MaxChars) {
+        $line = $line.Substring(0, [Math]::Max(1, $MaxChars - 1)).TrimEnd() +([char]0x2026)
+    }
+    "Thinking: $line"
+}
+
 function Get-BridgeDriverFromState {
     <# 'agent' or 'human', from the context on the state that carried the input. #>
     param($State)

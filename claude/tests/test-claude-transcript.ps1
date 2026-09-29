@@ -11,6 +11,7 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+. (Join-Path $PSScriptRoot '..\..\hooks\decision-bridge-common.ps1')
 . (Join-Path $PSScriptRoot '..\hooks\claude-transcript.ps1')
 
 $script:Failures = 0
@@ -42,6 +43,20 @@ Test-That 'thinking is captured as reasoning' {
 } $activity.Reasoning
 Test-That 'a user message appears in the history' { $activity.History -contains 'Reading your message' }
 Test-That 'a tool call appears in the history' { $activity.History -contains 'Running: Read' }
+
+# Thinking joins the trail only when Detailed activity is on. Without it the trail
+# showed what Claude did and never what it was weighing, and the newest thought was
+# erased by the next one before anyone could read it.
+Test-That 'without detail, thinking stays out of the trail' {
+    -not @($activity.History | Where-Object { $_ -like 'Thinking:*' })
+} (@($activity.History) -join ' | ')
+$detailed = Get-ClaudeActivityFromTranscript -Lines $lines -VerboseMode $true
+Test-That 'with detail, the thinking is a step in the trail' {
+    @($detailed.History | Where-Object { $_ -like 'Thinking:*' }).Count -gt 0
+} (@($detailed.History) -join ' | ')
+Test-That 'and what it did is still there beside it' {
+    $detailed.History -contains 'Running: Read'
+}
 
 Write-Host '--- entries that must be ignored ---'
 Test-That 'a sidechain tool call is excluded' {

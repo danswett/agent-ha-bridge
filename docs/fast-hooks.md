@@ -711,14 +711,56 @@ Still open here: the hold-off lives in the process that met the rejection. That 
 daemon, which is the one that loops, but a hook is a fresh process each time and starts
 with a clear slate - worth a shared marker if hooks are ever seen contributing to this.
 
-Also open: **thinking never enters the history trail.** `History` only ever receives
-`Reading your message`, `Running: <tool>` and, for Copilot, assistant text; reasoning is
-published only as the single newest line (`response` with `response_kind: reasoning`).
-The daemon publishes every few seconds, so a thought superseded within that window is
-never seen and cannot be recovered from the trail, which is capped at
-`ActivityHistory = 12`. Raised twice by the owner. It affects every inline agent's
-trail, so it wants a decision - put thinking in the trail (capped in length, probably
-only with Detailed activity on), or publish per line rather than per reconcile.
+Done 2026-09-28: **thinking now enters the history trail**, and the Detailed activity
+switch is back to control it. Raised twice by the owner.
+
+The note used to offer two options - put thinking in the trail, or publish per line
+rather than per reconcile - and the second turns out not to be an option at all.
+Thinking was missing because the reducers never added it: `History` received
+`Reading your message`, `Running: <tool>` and assistant text, and a thought was only
+ever kept as the single newest line, overwritten by the next. Publishing ten times more
+often would still have produced a trail with no thinking in it. It would not have
+helped in the way it sounds like it would, either: transcripts arrive in bursts, and
+per-line publishing would mean seventeen card updates inside a few hundred
+milliseconds - a flicker, not more information.
+
+The scale was larger than the note implied. In the last four megabytes of a real
+session **every assistant message carried thinking - 113 of 113 - and 51 carried
+nothing else**, so the trail was missing most of what the agent did between tool calls.
+
+A thought now joins the trail where it happened, as `Thinking: <first line>` -
+`Get-BridgeThoughtLine`, shared by all three readers so they mark one the same way, and
+first-line-only because the trail is a list on a phone while reasoning is paragraphs. A
+markdown heading loses its markup, since that is usually the best one-line summary
+there is. `ActivityHistoryDetailed = 24` is used while detail is on: almost every
+message carries a thought, so at the ordinary depth turning detail on would have cost
+you actions to gain thoughts.
+
+**The switch had to come back for any of this to be a choice.** Detailed activity had
+become a `detailedActivity` setting in a file on each machine, defaulting to on, and
+the daemon deleted the old helper on every start - so gating thinking on it would have
+meant thinking always, for everyone, with no way to turn it off from the phone. The
+reasoning for removing it ("it only changed what an update carries; folding session
+cards does that job") was true then and is not now.
+
+It is per machine, because one machine may be doing something you want to watch closely
+while the others are not, and it reuses `Initialize-CopilotVerboseToggle` - a
+storage-backed `input_boolean`, which Home Assistant restores across a restart - rather
+than an MQTT switch, which would need the bridge to subscribe to a command topic it has
+no subscriber for. The setting remains the default for a machine whose helper does not
+exist yet, and for one that cannot reach Home Assistant, so a headless install behaves
+as it did.
+
+Three things have to agree and none is visible from either end: Home Assistant
+slugifies a helper's *name* into its id, the daemon polls it by entity id every
+reconcile, and the dashboard draws a row by entity id. Get one wrong and the symptom is
+identical and silent - a switch that draws, presses, and changes nothing.
+`tests/test-detailed-activity.ps1` asserts the three against each other and then
+follows the switch through to whether a thought reaches the trail. Five mutations fail
+it. One initially did **not**: with the fallback setting left saying on, a
+`Test-VerboseStreaming` that never read the switch still returned on and the test
+passed. The setting is now held *off* while the switch is asserted on, so only the
+switch can account for the answer.
 
 ## A performance pass, measured (2026-09-28)
 

@@ -81,7 +81,13 @@ $script:DaemonEntity = @{
 
 $script:DaemonConfig = @{
     MutexName = 'Local\AgentBridgeDaemon'
-    VerboseToggle = 'input_boolean.agent_bridge_detailed_activity'
+    # Per machine, so one machine can be watched in detail while the others are not.
+    # Home Assistant slugifies a helper's name into its id, so the name is built from
+    # the same slug the entity id is, and the id itself comes from
+    # Get-BridgeMachineEntityId - which exists so a reader and a writer cannot drift.
+    VerboseHelperId = "agent_bridge_${script:DaemonMachineSlug}_detailed_activity"
+    VerboseHelperName = "Agent Bridge $($script:DaemonMachineSlug -replace '_', ' ') Detailed Activity"
+    VerboseToggle = (Get-BridgeMachineEntityId -Domain 'input_boolean' -Key 'detailed_activity' -Slug $script:DaemonMachineSlug)
     LogFile = (Join-Path $env:TEMP 'agent-bridge-daemon.log')
     StateFile = (Join-Path $env:TEMP 'agent-bridge-daemon-state.json')
     # Written by the self-updater when an install finishes, read by whichever daemon
@@ -97,6 +103,9 @@ $script:DaemonConfig = @{
     # burst cannot stall the loop.
     MaxTailBytes = 512000
     ActivityHistory = 12
+    # The trail while Detailed activity is on, where thoughts join the actions and
+    # roughly double how fast it fills.
+    ActivityHistoryDetailed = 24
     ResponseMaxChars = 6000
     ReasoningMaxChars = 4000
     # Re-publish the global status at least this often even when the live set is
@@ -404,17 +413,38 @@ function Write-DaemonState {
 
 function Test-VerboseStreaming {
     <#
-        Whether cards carry the model's reasoning and each tool call, from the
-        `detailedActivity` setting (on by default).
+        Whether cards carry the model's reasoning, each tool call, and the agent's
+        thinking in the activity trail.
 
-        This was a dashboard toggle, a whole card of its own. It never changed how
-        often anything is published - activity goes out on every transcript change
-        either way - only what an update carries, and folding session cards now does
-        the job it was for: keeping busy sessions from flooding the page.
+        This was a dashboard toggle, then a `detailedActivity` setting, and is a
+        switch again - per machine. The reason it came back is that what it controls
+        grew: it used to decide only how much an update carried, which folding the
+        session cards had already made bearable. It now also decides whether thinking
+        joins the trail, and since almost every message an agent writes carries a
+        thought, that roughly doubles how fast the trail fills and halves how far back
+        it reaches. That is a judgement about the phone you are holding, so it belongs
+        somewhere you can reach from it.
+
+        The setting is the default for a machine whose switch does not exist yet - a
+        first run, or a headless install - so nothing changes for one that never sees
+        the dashboard. An unreachable Home Assistant falls back to it too, rather than
+        quietly turning detail off.
     #>
     param([hashtable]$Headers)
 
-    [bool](Get-BridgeSetting 'detailedActivity' $true)
+    $fallback = [bool](Get-BridgeSetting 'detailedActivity' $true)
+    $entityId = [string]$script:DaemonConfig.VerboseToggle
+    if ([string]::IsNullOrWhiteSpace($entityId)) { return $fallback }
+
+    try {
+        $headers = if ($Headers) { $Headers } else { Get-HomeAssistantHeaders }
+        $state = Get-DaemonEntityState -EntityId $entityId -Headers $headers
+        $value = [string]$state.state
+        if ($value -eq 'on') { return $true }
+        if ($value -eq 'off') { return $false }
+    }
+    catch { }
+    $fallback
 }
 
 function Set-DaemonSessionProperty {
@@ -462,14 +492,24 @@ function Initialize-DaemonStartup {
     # every tick (daemon-hookspool.ps1).
     Start-DaemonHookSpoolWatcher
 
-    # Detailed activity is a setting now (Test-VerboseStreaming), so the Home Assistant
-    # helper the old dashboard toggle drove is removed. A machine still on an older
-    # bridge recreates it and draws its toggle until it updates, which is harmless.
-    $script:DaemonVerbose = Test-VerboseStreaming
+    # Detailed activity decides how much each card update carries, and now also whether
+    # the agent's thinking joins the activity trail. That is a choice about the phone
+    # you are reading it on, so it is a switch again rather than a setting in a file on
+    # each machine: per machine, because one of them may be doing something you want to
+    # watch closely while the others are not.
+    #
+    # The setting stays as the default for a machine whose helper does not exist yet,
+    # which keeps a headless or first-run install behaving exactly as before.
     try {
-        if (Remove-CopilotVerboseToggle) { Write-DaemonLog -Message 'removed the Detailed activity helper; it is the detailedActivity setting now' }
+        if (Initialize-CopilotVerboseToggle -HelperId $script:DaemonConfig.VerboseHelperId `
+                -Name $script:DaemonConfig.VerboseHelperName `
+                -DisplayName "Detailed activity ($script:DaemonMachineName)" `
+                -LegacyHelperId 'agent_bridge_detailed_activity') {
+            Write-DaemonLog -Message "Detailed activity switch ready: $($script:DaemonConfig.VerboseToggle)"
+        }
     }
-    catch { }
+    catch { Write-DaemonLog -Message "could not provision the Detailed activity switch: $($_.Exception.Message)" }
+    $script:DaemonVerbose = Test-VerboseStreaming
 
     # Sweep the entities published under the old `copilot_cli_*` / `copilot_<hex>`
     # ids. Retained discovery configs outlive a rename, so without this the renamed

@@ -1124,6 +1124,28 @@ function Save-CopilotSessionDashboard {
         }
     })
 
+    # How much each card says. Per machine, because one machine may be doing something
+    # you want to watch closely while the others are not, and one card rather than one
+    # per machine because it is a preference, not a control you reach for often.
+    #
+    # It is here rather than on a card of its own - which is what it had before it was
+    # briefly a setting in a file - because this is where you are standing when you
+    # decide the trail is too noisy, or not detailed enough.
+    $detailCard = $null
+    $detailRows = @($onlineList | ForEach-Object {
+        @{
+            entity = (Get-BridgeMachineEntityId -Domain 'input_boolean' -Key 'detailed_activity' -Slug $_.Slug)
+            name = if ($multiMachine) { $_.Machine } else { 'Show thinking and every tool call' }
+        }
+    })
+    if ($detailRows.Count -gt 0) {
+        $detailCard = @{
+            type = 'entities'
+            title = 'Detailed activity'
+            entities = $detailRows
+        }
+    }
+
     # Starting a new session. Placed with the controls rather than among the session
     # cards because it belongs to the bridge, not to any one session, and it stays
     # visible when nothing is running at all - which is exactly when it is needed.
@@ -1275,6 +1297,7 @@ function Save-CopilotSessionDashboard {
     # The control panel is a plain card pair at the top of the masonry flow.
     $controlCards = @($agentSessionsCard)
     if ($machinesCard) { $controlCards += $machinesCard }
+    if ($detailCard) { $controlCards += $detailCard }
     $controlCards += $updateCards + $newSessionCards
 
     $sessionSections = foreach ($session in $Sessions) {
