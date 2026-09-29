@@ -20,6 +20,9 @@ param()
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+# This suite means to use a real Home Assistant, which the guard in
+# decision-bridge-common.ps1 otherwise refuses for anything under a tests directory.
+$env:BRIDGE_ALLOW_TEST_HTTP = '1'
 # The hooks run here against Home Assistant beside a running daemon, which would
 # otherwise publish their prompt and tool-call updates for them - and this test
 # session is not one it follows.

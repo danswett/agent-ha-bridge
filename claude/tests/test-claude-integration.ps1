@@ -21,6 +21,9 @@ param()
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+# This suite means to use a real Home Assistant, which the guard in
+# decision-bridge-common.ps1 otherwise refuses for anything under a tests directory.
+$env:BRIDGE_ALLOW_TEST_HTTP = '1'
 
 $core = Join-Path $HOME '.agent-ha-bridge\hooks'
 if (-not (Test-Path -LiteralPath (Join-Path $core 'decision-mqtt.ps1'))) {

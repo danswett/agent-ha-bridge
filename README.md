@@ -662,6 +662,7 @@ bridge cannot tell, it asks; a scripted uninstall keeps them. `-ClearShared` and
 ```powershell
 .\tests\test-decision-args.ps1    # ask_user argument parsing and recovery
 .\tests\test-decision-retry.ps1   # HTTP retry / transient-failure classification
+.\tests\test-http-guard.ps1      # a suite cannot reach a real Home Assistant
 .\tests\test-bridge-adapter.ps1   # shared adapter orchestration (entities, status, notifications)
 .\tests\test-dashboard.ps1        # generated dashboard: title, view, session summary + version
 .\tests\test-security.ps1         # template injection, path and topic safety, token handling

@@ -94,6 +94,7 @@ jobs:
           $suites = @(
             'tests/test-decision-args.ps1'
             'tests/test-decision-retry.ps1'
+            'tests/test-http-guard.ps1'
             'tests/test-decision-select-race.ps1'
             'tests/test-bridge-adapter.ps1'
             'tests/test-dashboard.ps1'
