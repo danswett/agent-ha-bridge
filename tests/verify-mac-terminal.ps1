@@ -38,7 +38,7 @@ $yours = "a window of my own $PID"
 # wrong - and one leftover could not be cleared at all, having had its shell killed.
 # Unique tags mean a run can only ever see its own windows.
 
-function Count-Tabs {
+function Get-TabCount {
     param([string]$Title)
     $script = @"
 tell application "Terminal"
@@ -56,7 +56,7 @@ end tell
     [int]((& osascript -e $script 2>&1 | Out-String).Trim())
 }
 
-function Count-Modals {
+function Get-ModalCount {
     <#
         How many sheets or dialogs Terminal currently has up.
 
@@ -149,13 +149,19 @@ end tell
         $killed = @()
         foreach ($tty in $ttys) {
             $short = [System.IO.Path]::GetFileName($tty)
-            foreach ($line in @(& ps -t $short -o pid=,comm= 2>$null)) {
+            # The BSD tool by absolute path, as hooks/bridge-platform.ps1 does: a bare
+            # `ps` is a PowerShell alias for Get-Process on some hosts, and `-t <tty>`
+            # is exactly the lookup Get-Process cannot do.
+            foreach ($line in @(& /bin/ps -t $short -o pid=,comm= 2>$null)) {
                 $parts = $line.Trim() -split '\s+', 2
                 if ($parts.Count -lt 2 -or $parts[0] -notmatch '^\d+$') { continue }
                 if ([int]$parts[0] -eq $PID) { continue }
                 $name = [System.IO.Path]::GetFileName($parts[1])
                 if ($shells -contains $name) { continue }
-                & kill -9 $parts[0] 2>&1 | Out-Null
+                # Process.Kill() under the hood, which is SIGKILL on macOS - the same
+                # `kill -9` this used to shell out for. Silent because a process that
+                # exited on its own between the listing and here is not a failure.
+                Stop-Process -Id ([int]$parts[0]) -Force -ErrorAction SilentlyContinue
                 $killed += "$($parts[0]):$name"
             }
         }
@@ -196,19 +202,19 @@ end tell
 
 try {
     Write-Host '--- clearing anything left from an earlier run ---'
-    Write-Host "  dialogs waiting on screen before cleanup: $(Count-Modals)"
+    Write-Host "  dialogs waiting on screen before cleanup: $(Get-ModalCount)"
     Remove-TaggedWindows -Titles @($mine, $yours)
-    $startMine = Count-Tabs -Title $mine
-    $startYours = Count-Tabs -Title $yours
-    Write-Host "  start: bridge=$startMine  user=$startYours  dialogs=$(Count-Modals)"
+    $startMine = Get-TabCount -Title $mine
+    $startYours = Get-TabCount -Title $yours
+    Write-Host "  start: bridge=$startMine  user=$startYours  dialogs=$(Get-ModalCount)"
     Check 'the slate is clean before anything is measured' (($startMine + $startYours) -eq 0) `
         "bridge=$startMine user=$startYours"
 
     Write-Host '--- two windows: one the bridge opened, one the user did ---'
     Open-Tagged -Title $mine
     Open-Tagged -Title $yours
-    $mineBefore = Count-Tabs -Title $mine
-    $yoursBefore = Count-Tabs -Title $yours
+    $mineBefore = Get-TabCount -Title $mine
+    $yoursBefore = Get-TabCount -Title $yours
     Write-Host "  before: bridge=$mineBefore  user=$yoursBefore"
     Check 'the bridge window opened' ($mineBefore -eq 1) "got $mineBefore"
     Check "the user's window opened" ($yoursBefore -eq 1) "got $yoursBefore"
@@ -216,8 +222,8 @@ try {
     Write-Host '--- the bridge closes its own ---'
     $closed = Close-BridgeTerminalWindow -Title $mine
     Start-Sleep -Seconds 2
-    $mineAfter = Count-Tabs -Title $mine
-    $yoursAfter = Count-Tabs -Title $yours
+    $mineAfter = Get-TabCount -Title $mine
+    $yoursAfter = Get-TabCount -Title $yours
     Write-Host "  after : bridge=$mineAfter  user=$yoursAfter"
 
     Check 'it reports that it closed one' $closed
@@ -228,7 +234,7 @@ try {
     Write-Host '--- and closing again is harmless ---'
     Check 'a second close finds nothing and says so' (-not (Close-BridgeTerminalWindow -Title $mine))
     Check 'an unknown tag closes nothing' (-not (Close-BridgeTerminalWindow -Title 'agent-bridge:never-existed'))
-    Check "the user's window survived that too" ((Count-Tabs -Title $yours) -eq $yoursBefore)
+    Check "the user's window survived that too" ((Get-TabCount -Title $yours) -eq $yoursBefore)
 
     Write-Host '--- several tagged windows all go, and only they ---'
     # The case that exposed the positional-reference bug: with one match, closing
@@ -239,14 +245,14 @@ try {
     Open-Tagged -Title $yours
     Open-Tagged -Title $mine
     Open-Tagged -Title $mine
-    $manyMine = Count-Tabs -Title $mine
-    $manyYours = Count-Tabs -Title $yours
+    $manyMine = Get-TabCount -Title $mine
+    $manyYours = Get-TabCount -Title $yours
     Write-Host "  before: bridge=$manyMine  user=$manyYours"
     Check 'three bridge windows are open' ($manyMine -eq 3) "got $manyMine"
     $manyClosed = Close-BridgeTerminalWindow -Title $mine
     Start-Sleep -Seconds 2
-    $manyMineAfter = Count-Tabs -Title $mine
-    $manyYoursAfter = Count-Tabs -Title $yours
+    $manyMineAfter = Get-TabCount -Title $mine
+    $manyYoursAfter = Get-TabCount -Title $yours
     Write-Host "  after : bridge=$manyMineAfter  user=$manyYoursAfter"
     Check 'it reports closing them' $manyClosed
     Check 'every bridge window is gone' ($manyMineAfter -eq 0) "still $manyMineAfter"
@@ -260,13 +266,13 @@ try {
     # stacks another dialog up behind it. Windows stayed open through repeated closes
     # because of this. A busy window must now be declined outright.
     Open-Tagged -Title $mine -Command 'sleep 120'
-    $busyBefore = Count-Tabs -Title $mine
+    $busyBefore = Get-TabCount -Title $mine
     Check 'the busy window opened' ($busyBefore -eq 1) "got $busyBefore"
     $sw = [Diagnostics.Stopwatch]::StartNew()
     $busyClosed = Close-BridgeTerminalWindow -Title $mine -SettleSeconds 2
     $sw.Stop()
     Start-Sleep -Seconds 2
-    $busyAfter = Count-Tabs -Title $mine
+    $busyAfter = Get-TabCount -Title $mine
     Write-Host "  busy window: closed=$busyClosed remaining=$busyAfter in $([int]$sw.Elapsed.TotalSeconds)s"
     Check 'it declines to close it' (-not $busyClosed) "closed=$busyClosed"
     Check 'and leaves it standing' ($busyAfter -eq $busyBefore) "was $busyBefore, now $busyAfter"
@@ -274,8 +280,8 @@ try {
     # that none was raised.
     Check 'without hanging on a dialog' ($sw.Elapsed.TotalSeconds -lt 20) `
         "took $([int]$sw.Elapsed.TotalSeconds)s"
-    Check 'and Terminal is left with nothing to answer' ((Count-Modals) -eq 0) `
-        "$(Count-Modals) dialog(s) on screen"
+    Check 'and Terminal is left with nothing to answer' ((Get-ModalCount) -eq 0) `
+        "$(Get-ModalCount) dialog(s) on screen"
 
     Write-Host '--- once what it was running ends, it goes ---'
     # Which is the bridge's own case: the window runs `tmux attach`, and that returns
@@ -286,12 +292,12 @@ try {
     # straight afterwards reads it as this case's failure - which is exactly what it
     # did, reporting a close that had in fact worked as broken.
     Remove-TaggedWindows -Titles @($mine)
-    $settleStart = Count-Tabs -Title $mine
+    $settleStart = Get-TabCount -Title $mine
     Check 'the busy window is out of the way first' ($settleStart -eq 0) "still $settleStart"
     Open-Tagged -Title $mine -Command 'sleep 4'
     $settleClosed = Close-BridgeTerminalWindow -Title $mine -SettleSeconds 15
     Start-Sleep -Seconds 2
-    $settleAfter = Count-Tabs -Title $mine
+    $settleAfter = Get-TabCount -Title $mine
     Check 'it waits for the command to finish and then closes' ($settleClosed -and $settleAfter -eq 0) `
         "closed=$settleClosed remaining=$settleAfter"
 }
@@ -303,7 +309,7 @@ finally {
     $left = 0
     foreach ($attempt in 1..3) {
         Remove-TaggedWindows -Titles @($mine, $yours)
-        $left = (Count-Tabs -Title $mine) + (Count-Tabs -Title $yours)
+        $left = (Get-TabCount -Title $mine) + (Get-TabCount -Title $yours)
         if ($left -eq 0) { break }
         Start-Sleep -Seconds 2
     }
