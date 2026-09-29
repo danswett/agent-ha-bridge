@@ -46,9 +46,17 @@ function Test-That {
 
 # Stubs above everything that calls them: PowerShell binds a function as it runs.
 $script:ButtonState = $null
+# What the session's own card already says, for the re-adoption case. A daemon that
+# restarts has no launch record left, so the card is the only surviving witness.
+$script:PriorDriver = ''
 function Get-HomeAssistantState {
     param([string]$EntityId, [hashtable]$Headers)
     if ($EntityId -eq $script:DaemonEntity.NewSession) { return $script:ButtonState }
+    if ($EntityId -like 'sensor.*_activity') {
+        $attrs = if ($script:PriorDriver) { [pscustomobject]@{ driver = $script:PriorDriver } }
+        else { [pscustomobject]@{} }
+        return [pscustomobject]@{ state = 'Idle'; attributes = $attrs }
+    }
     # Every session entity already exists, so Add-DaemonSession adopts rather than
     # republishes - the path a launched session actually takes.
     [pscustomobject]@{ state = 'Idle'; attributes = [pscustomobject]@{} }
@@ -167,9 +175,18 @@ try {
             SessionId = $chosenById; Transcript = $transcript; Kind = 'copilot'
             ProcessId = $PID; WorkingDirectory = 'C:\repo'
         }
+        $script:CardDetail = $null
         $entry = Add-DaemonSession -Session $session -Headers $headers
 
         Test-That 'the session is adopted' { $null -ne $entry }
+        # The card is published once at adoption, before there is any transcript to
+        # read. A session that launches and then waits produces no activity at all, so
+        # a driver that only rides on an activity update never arrives - which is
+        # exactly how an agent-launched session sat on the dashboard showing blue.
+        Test-That 'and the card is born knowing an agent launched it' {
+            $null -ne $script:CardDetail -and $script:CardDetail.ContainsKey('driver') -and
+            [string]$script:CardDetail['driver'] -eq 'agent'
+        } ("got: " + $(if ($script:CardDetail -and $script:CardDetail.ContainsKey('driver')) { [string]$script:CardDetail['driver'] } else { 'nothing' }))
         Test-That 'and carries the agent as its driver' {
             $entry.PSObject.Properties['Driver'] -and $entry.Driver -eq 'agent'
         }
@@ -216,14 +233,49 @@ try {
             SessionId = $plainId; Transcript = $transcript; Kind = 'copilot'
             ProcessId = $PID; WorkingDirectory = 'C:\repo'
         }
+        $script:CardDetail = $null
         $plainEntry = Add-DaemonSession -Session $plain -Headers $headers
         Test-That 'it has no driver of its own' {
             -not ($plainEntry.PSObject.Properties['Driver'] -and $plainEntry.Driver)
         }
+        Test-That 'and its card is born reading as yours' {
+            [string]$script:CardDetail['driver'] -eq 'human'
+        } ("got: " + $(if ($script:CardDetail -and $script:CardDetail.ContainsKey('driver')) { [string]$script:CardDetail['driver'] } else { 'nothing' }))
         $script:CardDetail = $null
         Add-Content -LiteralPath $transcript -Encoding UTF8 -Value '{"type":"assistant.message","data":{"content":"hello"}}'
         Update-DaemonSessionActivity -Id $plainId -Entry $plainEntry -Session $plain -Headers $headers -VerboseOn $false
         Test-That 'and the card reads it as yours' { [string]$script:CardDetail['driver'] -eq 'human' }
+
+        Write-Host "`n--- a restart does not hand an agent's session back ---"
+        # The launch record does not survive a daemon restart, and the state entry is
+        # built fresh, so the card itself is the only thing left that knows. Without
+        # reading it back, every restart - and every re-prime after a Home Assistant
+        # restart - quietly turned an agent-driven session blue.
+        $script:DaemonLaunchDrivers = @{}
+        $script:PriorDriver = 'agent'
+        try {
+            $restartId = 'survives-a-restart'
+            $restarted = [pscustomobject]@{
+                SessionId = $restartId; Transcript = $transcript; Kind = 'copilot'
+                ProcessId = $PID; WorkingDirectory = 'C:\repo'
+            }
+            $script:CardDetail = $null
+            $restartEntry = Add-DaemonSession -Session $restarted -Headers $headers
+            Test-That 'the driver is read back off the card' {
+                [string]$script:CardDetail['driver'] -eq 'agent'
+            } ("got: " + $(if ($script:CardDetail -and $script:CardDetail.ContainsKey('driver')) { [string]$script:CardDetail['driver'] } else { 'nothing' }))
+            # Republishing it once would not be enough on its own: the entry is what
+            # the next activity update reads, and a blank one would undo this.
+            Test-That 'and kept on the entry, so the next update does not undo it' {
+                $restartEntry.PSObject.Properties['Driver'] -and $restartEntry.Driver -eq 'agent'
+            }
+            # The launch path owns the first-turn glow; a session being re-adopted is
+            # mid-life and its next turn is ordinary.
+            Test-That 'without claiming a first turn it never had' {
+                -not ($restartEntry.PSObject.Properties['DriverPending'] -and $restartEntry.DriverPending)
+            }
+        }
+        finally { $script:PriorDriver = '' }
     }
     finally { Remove-Item -LiteralPath $transcript -Force -ErrorAction SilentlyContinue }
 }
