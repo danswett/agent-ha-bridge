@@ -122,6 +122,7 @@ jobs:
             'tests/test-daemon-agents.ps1'
             'tests/test-copilot-activity.ps1'
             'tests/test-driver-card.ps1'
+            'tests/test-agent-launched.ps1'
             'tests/test-launchers.ps1'
             'tests/test-hook-functions.ps1'
             'tests/test-hook-spool.ps1'

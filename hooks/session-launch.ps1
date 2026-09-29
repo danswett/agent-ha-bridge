@@ -1751,10 +1751,19 @@ function Stop-BridgeCopilotSession {
     $result
 }
 
-function Test-BridgeSessionRegistered {
+function Get-BridgeRegisteredSessionId {
     <#
-        One look at whether a launched session has registered - no waiting, so the
-        daemon can call it on every pass without stalling.
+        The id a launched session actually registered under, or '' if it has not yet.
+
+        This exists so that "has the launch registered?" and "as what?" are one
+        answer rather than two. Only one agent hands back the id it was given:
+        Copilot and Claude register under the id the bridge invented for them, but
+        Codex picks its own, and its registration is recognised only as the first one
+        written after the launch. Deciding that a launch has registered in one place
+        and then guessing which session it produced somewhere else is how a session
+        would come to wear somebody else's driver, which is worse than wearing none.
+
+        No waiting, so the daemon can call it on every pass without stalling.
 
         The session directory and its `inuse.<pid>.lock` are what the daemon discovers
         Copilot sessions from; Claude and Codex register through their hooks under
@@ -1777,28 +1786,49 @@ function Test-BridgeSessionRegistered {
     $registrations = (Get-BridgeLauncher -Launcher $Launcher).RegistrationFiles
     if ($registrations) {
         $stateDir = Join-Path $env:TEMP "agent-bridge-$Launcher"
-        if (-not [System.IO.Directory]::Exists($stateDir)) { return $false }
+        if (-not [System.IO.Directory]::Exists($stateDir)) { return '' }
         $files = @(& $registrations $stateDir $SessionId $Since)
         foreach ($file in $files) {
             try { $entry = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json } catch { continue }
             $processId = [int]($entry.ProcessId ?? 0)
             if ($processId -le 0) { continue }
             $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
-            if (Test-BridgeAgentProcess -Process $process -Agent $Launcher) { return $true }
+            if (Test-BridgeAgentProcess -Process $process -Agent $Launcher) {
+                # The file is named for the session, which is how an agent that chose
+                # its own id says what it chose.
+                return [System.IO.Path]::GetFileNameWithoutExtension($file.Name)
+            }
         }
-        return $false
+        return ''
     }
 
     $directory = Join-Path $script:DecisionBridgeConfig.SessionStateRoot $SessionId
-    if (-not [System.IO.Directory]::Exists($directory)) { return $false }
+    if (-not [System.IO.Directory]::Exists($directory)) { return '' }
     $livePids = @{}
     foreach ($process in @(Get-BridgeAgentProcesses -Agent 'copilot')) { $livePids[$process.Id] = $true }
     foreach ($lock in [System.IO.Directory]::EnumerateFiles($directory, 'inuse.*.lock')) {
         $name = [System.IO.Path]::GetFileName($lock)
         if ($name -notmatch '^inuse\.(\d+)\.lock$') { continue }
-        if ($livePids.ContainsKey([int]$Matches[1])) { return $true }
+        if ($livePids.ContainsKey([int]$Matches[1])) { return $SessionId }
     }
-    $false
+    ''
+}
+
+function Test-BridgeSessionRegistered {
+    <#
+        One look at whether a launched session has registered - no waiting, so the
+        daemon can call it on every pass without stalling. A thin reading of
+        Get-BridgeRegisteredSessionId, so this and "which session was it" are always
+        the same answer.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$SessionId,
+        [string]$Launcher = 'copilot',
+        [DateTimeOffset]$Since = [DateTimeOffset]::Now.AddMinutes(-1)
+    )
+
+    -not [string]::IsNullOrWhiteSpace(
+        (Get-BridgeRegisteredSessionId -SessionId $SessionId -Launcher $Launcher -Since $Since))
 }
 
 function Wait-BridgeSessionRegistered {

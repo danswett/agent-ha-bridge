@@ -517,24 +517,36 @@ not provide. Fixing this task makes that comment true.
 
 ## Then: a session an agent launches should read as agent-driven
 
-A session the agent starts from the dashboard comes up with the ordinary colours, not
-the purple edge, and stays that way until the agent replies to it. That is backwards -
-you did not open it, and the launch is exactly the moment it is most useful to see that
-something else is driving. Noticed immediately every time a session is handed off.
+Done 2026-09-29. A session the agent starts from the dashboard now comes up with the
+purple edge, instead of the ordinary colours it kept until the agent first replied.
 
-`Get-BridgeDriverFromState` is called from exactly one place: the Submit press in
-`daemon-replies.ps1` (~line 404). So `Driver` is set by an agent *replying* to a
-session, never by one *starting* it. `Test-DaemonNewSessionPressed`
-(hooks/daemon-launch.ps1, ~line 394) already reads the Launch button's state and throws
-its `context` away - the presser's account is sitting on it, exactly as it is on a
-Submit press, and `Get-BridgeDriverFromState` would take it unchanged.
+The press is where the account is - `Test-DaemonNewSessionPressed` already read the
+Launch button's state and threw its `context` away - so that is read there and carried
+on the pending launch. The awkward part was as expected: the press and the session are
+not the same moment, and only one agent registers under the id it was offered. Copilot
+and Claude take the id the bridge invented; **Codex picks its own**, and its
+registration is recognised merely as the first one written after the launch. Deciding
+"has it registered?" in one place and guessing "as what?" in another is exactly how a
+session comes to wear somebody else's driver, so `Get-BridgeRegisteredSessionId` now
+answers both and `Test-BridgeSessionRegistered` is a thin reading of it.
 
-The awkward part, and why this is not a two-line change: the press and the session are
-not the same moment. The launch returns before the CLI has registered itself, so the
-entry to stamp does not exist yet and the driver has to be carried from the press to
-whichever session that launch produces. Get the correlation wrong and a session gets
-somebody else's driver, which is worse than no glow - a glow that lies is the one
-outcome the feature was built to avoid.
+The driver is put aside under the id that registered, and taken - not read - when the
+session is adopted, so a later session cannot inherit it. A launch whose session is
+never adopted ages out after fifteen minutes rather than waiting for an id that never
+comes.
+
+`DriverPending` matters here as much as `Driver`, and for the same reason it does on
+the reply path: `Update-DaemonSessionActivity` reads a starting turn as somebody typing
+in the terminal, and the first turn of a launched session is the launch itself. Setting
+`Driver` alone would have given a glow that lasted until the first activity update -
+seconds - which looks like a flicker rather than a feature.
+
+`tests/test-agent-launched.ps1` follows one launch the whole way: the press, the
+registration, the adoption, and what the card is finally told, across that first turn
+and then across a later one typed in the terminal, which correctly hands the session
+back. Five mutations fail it, and the two worth naming are the ones that would make the
+glow lie: stamping the id the launch offered rather than the one it registered under,
+and stamping every session rather than only the handed-over one.
 
 ## Then: the choices card should answer a whole form
 
