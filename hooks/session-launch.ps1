@@ -2018,24 +2018,148 @@ function Start-BridgeTmuxSession {
     }
     if ($panePid -le 0) { throw (Get-BridgeAgentStartFailure -Executable $Executable) }
 
-    Open-BridgeTerminalWindow -Command "'$tmux' attach -t '$session'"
+    Open-BridgeTerminalWindow -Command "'$tmux' attach -t '$session'" `
+        -Title (Get-BridgeTerminalWindowTitle -ProcessId $panePid)
     $panePid
 }
 
 function Open-BridgeTerminalWindow {
-    <# Opens a macOS terminal window running $Command (already shell-quoted). #>
-    param([Parameter(Mandatory)][string]$Command)
+    <#
+        Opens a macOS terminal window running $Command (already shell-quoted).
+
+        The window is tagged with $Title so it can be found and closed again when the
+        session ends. Nothing else identifies it: the window runs `tmux attach`, whose
+        process is not the agent and is gone by the time anything wants to tidy up, so
+        without a tag the only way to find it would be to guess - and guessing wrong
+        means closing a window of the user's with their own work in it.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Command,
+        [AllowEmptyString()][string]$Title = ''
+    )
 
     $app = [string](Get-BridgeSetting 'platform.terminal' 'Terminal')
     if ($app -eq 'none') { return }
     $quoted = $Command.Replace('\', '\\').Replace('"', '\"')
+    $safeTitle = $Title.Replace('\', '\\').Replace('"', '\"')
     $script = if ($app -match '^iterm') {
-        "tell application `"iTerm`" to create window with default profile command `"$quoted`""
+        # iTerm names the session rather than the tab, and `create window` hands back
+        # the window whose current session it is.
+        @"
+tell application "iTerm"
+  set w to (create window with default profile command "$quoted")
+  try
+    tell current session of w to set name to "$safeTitle"
+  end try
+end tell
+"@
     }
     else {
-        "tell application `"Terminal`"`n  do script `"$quoted`"`n  activate`nend tell"
+        # `do script` returns the tab it started in, which is what carries the title.
+        @"
+tell application "Terminal"
+  set t to do script "$quoted"
+  try
+    set custom title of t to "$safeTitle"
+  end try
+  activate
+end tell
+"@
     }
     & osascript -e $script 2>&1 | Out-Null
+}
+
+function Get-BridgeTerminalWindowTitle {
+    <#
+        The tag put on the terminal window opened for a session.
+
+        Keyed on the process the window was opened for, because that is the one thing
+        both ends have: the launcher knows it the moment tmux reports the pane, and
+        the daemon still has it when the session is stopped. A session id would not
+        do - Codex chooses its own, and does so after the window is already open.
+    #>
+    param([Parameter(Mandatory)][int]$ProcessId)
+    "agent-bridge:$ProcessId"
+}
+
+function Close-BridgeTerminalWindow {
+    <#
+        Closes the terminal window the bridge opened for a session, by its tag.
+
+        macOS needs this and Windows does not. There, the bridge starts the CLI with
+        its own console and closing the window is a matter of ending that process. On
+        a Mac the session runs inside tmux and the window is a separate Terminal
+        window running `tmux attach`: when the agent exits, tmux tears its session
+        down and the attach returns, but the window stays open showing a dead shell.
+        The pid the daemon has is the tmux *pane's* - the agent itself - so there is
+        no process left whose death would take the window with it.
+
+        Only ever called for a window the bridge opened, and only ever closes one
+        carrying this bridge's tag, so a terminal the user opened is never touched.
+
+        Best effort: a window that has already been closed, a terminal that is not
+        running, or an osascript that fails must not stop a session from ending.
+        Returns whether a window was closed.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Title)
+
+    if ([string]::IsNullOrWhiteSpace($Title)) { return $false }
+    $app = [string](Get-BridgeSetting 'platform.terminal' 'Terminal')
+    if ($app -eq 'none') { return $false }
+    if ($script:BridgeIsWindows) { return $false }
+
+    $safeTitle = $Title.Replace('\', '\\').Replace('"', '\"')
+    # The windows are collected before any is closed: closing while walking the same
+    # list is how AppleScript ends up skipping entries or erroring on a stale
+    # reference. `saving no` stops Terminal asking about a window it thinks is busy.
+    $script = if ($app -match '^iterm') {
+        @"
+tell application "iTerm"
+  set doomed to {}
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        try
+          if name of s is "$safeTitle" then set end of doomed to w
+        end try
+      end repeat
+    end repeat
+  end repeat
+  repeat with w in doomed
+    try
+      close w
+    end try
+  end repeat
+  return (count of doomed)
+end tell
+"@
+    }
+    else {
+        @"
+tell application "Terminal"
+  set doomed to {}
+  repeat with w in windows
+    repeat with t in tabs of w
+      try
+        if custom title of t is "$safeTitle" then set end of doomed to w
+      end try
+    end repeat
+  end repeat
+  repeat with w in doomed
+    try
+      close w saving no
+    end try
+  end repeat
+  return (count of doomed)
+end tell
+"@
+    }
+
+    try {
+        $out = (& osascript -e $script 2>&1 | Out-String).Trim()
+        return ($out -match '^[1-9]')
+    }
+    catch { return $false }
 }
 
 function Stop-BridgeCopilotSession {

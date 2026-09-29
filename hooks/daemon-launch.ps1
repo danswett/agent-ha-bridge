@@ -107,7 +107,30 @@ function Invoke-PendingStops {
             if ($script:DaemonLaunchedPids.ContainsKey($sessionId)) {
                 $launcherPid = [int]$script:DaemonLaunchedPids[$sessionId]
             }
-            if ($launcherPid -gt 0 -and $launcherPid -ne $processId) {
+            if (-not $script:BridgeIsWindows -and ($launcherPid -gt 0 -or $processId -gt 0)) {
+                # macOS: the pid here is the tmux *pane's* - the agent itself - so
+                # there is no launcher process to end; killing it is what just
+                # happened. The window is a separate Terminal window running `tmux
+                # attach`, which returns when tmux tears the session down and then
+                # sits there as a dead shell.
+                #
+                # Two candidates, because the launch record is not always there: a
+                # daemon restarted since the launch has lost it, and Codex never had
+                # one (it picks its own id after the window is already open). The
+                # session's own pid covers both, and differs from the launch pid only
+                # when something wraps the CLI. Trying either is safe: the tag is what
+                # decides, so a window the bridge did not open is never matched.
+                Start-Sleep -Milliseconds 1200
+                foreach ($candidate in (@($launcherPid, $processId) | Select-Object -Unique)) {
+                    if ([int]$candidate -le 0) { continue }
+                    $title = Get-BridgeTerminalWindowTitle -ProcessId ([int]$candidate)
+                    if (Close-BridgeTerminalWindow -Title $title) {
+                        Write-DaemonLog -Message "closed the terminal window the bridge opened for $short ($title)"
+                        break
+                    }
+                }
+            }
+            elseif ($launcherPid -gt 0 -and $launcherPid -ne $processId) {
                 Start-Sleep -Milliseconds 1200
                 $launcher = Get-Process -Id $launcherPid -ErrorAction SilentlyContinue
                 if ($null -ne $launcher) {
