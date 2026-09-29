@@ -279,23 +279,46 @@ Test-That 'the update rows are conditional on that machine having an update' {
 
 Write-Host '--- the machines card reports who is around ---'
 
-$machinesCard = @($cards | Where-Object { $_['type'] -eq 'markdown' -and $_['content'] -match '### Machines' })[0]
-Test-That 'there is a machines card' { $null -ne $machinesCard }
+# One row per machine now, each its own card, so that a machine's Detailed activity
+# toggle can sit beside it rather than in a list somewhere else that you have to match
+# up by name.
+$machinesStack = @($cards | Where-Object {
+    $_['type'] -eq 'vertical-stack' -and
+    @($_['cards'] | Where-Object { $_['type'] -eq 'markdown' -and $_['content'] -match '### Machines' }).Count -gt 0
+})[0]
+Test-That 'there is a machines card' { $null -ne $machinesStack }
+
+# Everything the card says, wherever in the stack it says it.
+function Get-StackText {
+    param($Card)
+    $out = @()
+    foreach ($c in @($Card['cards'])) {
+        if ($c['type'] -eq 'markdown') { $out += [string]$c['content'] }
+        elseif ($c['type'] -eq 'horizontal-stack') {
+            foreach ($inner in @($c['cards'])) {
+                if ($inner['type'] -eq 'markdown') { $out += [string]$inner['content'] }
+            }
+        }
+    }
+    $out -join "`n"
+}
+$machinesText = Get-StackText -Card $machinesStack
+
 Test-That 'every registered machine is listed, online or not' {
-    $machinesCard.content -match '\*\*DESKTOP\*\*' -and $machinesCard.content -match '\*\*LAPTOP\*\*'
+    $machinesText -match '\*\*DESKTOP\*\*' -and $machinesText -match '\*\*LAPTOP\*\*'
 }
 Test-That 'status comes from the liveness sensor' {
-    $machinesCard.content -match "is_state\('binary_sensor\.agent_bridge_desktop_online','on'\)" -and
-    $machinesCard.content -match "is_state\('binary_sensor\.agent_bridge_laptop_online','on'\)"
+    $machinesText -match "is_state\('binary_sensor\.agent_bridge_desktop_online','on'\)" -and
+    $machinesText -match "is_state\('binary_sensor\.agent_bridge_laptop_online','on'\)"
 }
 Test-That 'a machine that is not reporting reads as offline' {
     # The sensor is unretained and expires, so anything other than on - including
     # unavailable after the heartbeat stops - has to fall to the offline branch.
-    $machinesCard.content -match 'offline'
+    $machinesText -match 'offline'
 }
 Test-That 'each line carries that machine version and session count' {
-    $machinesCard.content -match "state_attr\('update\.agent_bridge_desktop_update','installed_version'\)" -and
-    $machinesCard.content -match "states\('sensor\.agent_bridge_laptop_sessions'\)"
+    $machinesText -match "state_attr\('update\.agent_bridge_desktop_update','installed_version'\)" -and
+    $machinesText -match "states\('sensor\.agent_bridge_laptop_sessions'\)"
 }
 Test-That 'the summary no longer repeats the versions' {
     $summaryCard = @($cards | Where-Object { $_['type'] -eq 'vertical-stack' } |
@@ -338,8 +361,11 @@ $offCards = @($script:SavedConfig.views[0].cards)
 $offRows = @($offCards | ForEach-Object { Get-RowEntity -Card $_ })
 
 Test-That 'the offline machine still appears in the machines card' {
-    $card = @($offCards | Where-Object { $_['type'] -eq 'markdown' -and $_['content'] -match '### Machines' })[0]
-    $card.content -match '\*\*LAPTOP\*\*'
+    $stack = @($offCards | Where-Object {
+        $_['type'] -eq 'vertical-stack' -and
+        @($_['cards'] | Where-Object { $_['type'] -eq 'markdown' -and $_['content'] -match '### Machines' }).Count -gt 0
+    })[0]
+    (Get-StackText -Card $stack) -match '\*\*LAPTOP\*\*'
 }
 Test-That 'it gets no launch card' {
     # It had one, and with only one machine online there is no picker to tell the two

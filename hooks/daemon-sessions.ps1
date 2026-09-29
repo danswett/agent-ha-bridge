@@ -649,6 +649,11 @@ function Get-DaemonLaunchCapabilities {
         # peer still running a bridge without those entities does not get three
         # "Entity not found" rows drawn for it on the shared dashboard.
         tuning     = [bool]$newSessionEnabled
+        # This bridge publishes a Detailed activity switch for itself. Peers read it
+        # to decide whether to draw a toggle for this machine; one that does not
+        # report it gets no toggle rather than a row pointing at a helper that does
+        # not exist.
+        detailed   = $true
     }
 }
 
@@ -674,7 +679,7 @@ function Publish-DaemonGlobalStatus {
     )
 
     $globalSignature = (($Descriptors | ForEach-Object { "$($_.Node)=$($_.Name)=$($_.Machine)" }) -join '|') +
-        "#$($Capabilities.newSession)$($Capabilities.profile)$($Capabilities.resume)$($Capabilities.agent)"
+        "#$($Capabilities.newSession)$($Capabilities.profile)$($Capabilities.resume)$($Capabilities.agent)$($Capabilities.tuning)$($Capabilities.detailed)"
     $globalStale = ([DateTimeOffset]::Now - $script:DaemonGlobalLastPublish).TotalSeconds -ge $script:DaemonConfig.GlobalReassertSeconds
     if ($globalSignature -ne $script:DaemonGlobalSignature -or $globalStale) {
         try {
@@ -772,6 +777,9 @@ function Get-DaemonMachineCards {
             # ContainsKey rather than a bare read: a capability set built before the
             # tuning rows existed simply has no such key, and StrictMode throws on it.
             IncludeTuning = [bool]($Capabilities.ContainsKey('tuning') -and $Capabilities.tuning)
+            # Same reason - newer than some of the callers that build a capabilities
+            # set by hand.
+            IncludeDetailed = [bool]($Capabilities.ContainsKey('detailed') -and $Capabilities['detailed'])
             # This daemon is the one running the code, so it is online by definition -
             # and saying so here means the launch picker is never empty while its own
             # heartbeat sensor is still being created.
@@ -784,6 +792,11 @@ function Get-DaemonMachineCards {
         $peerResume = $false
         $peerAgent = $false
         $peerTuning = $false
+        # A peer on a bridge older than the Detailed activity switch reports nothing
+        # here, and gets no toggle. Drawing one anyway is an "Entity not found" box on
+        # everyone's dashboard, because the helper only exists on machines that create
+        # it - seen live against a peer still on 1.14.6.
+        $peerDetailed = $false
         if ($null -ne $peerCaps) {
             try { $peerProfile = [bool]$peerCaps.profile } catch { }
             try { $peerResume = [bool]$peerCaps.resume } catch { }
@@ -791,6 +804,7 @@ function Get-DaemonMachineCards {
             # Absent on a peer running a bridge from before the tuning rows existed,
             # which then gets a launch card without them rather than three broken rows.
             try { $peerTuning = [bool]$peerCaps.tuning } catch { }
+            try { $peerDetailed = [bool]$peerCaps.detailed } catch { }
         }
         $machineCards += [pscustomobject]@{
             Slug = $peer.Slug
@@ -799,6 +813,7 @@ function Get-DaemonMachineCards {
             IncludeResume = $peerResume
             IncludeAgent = $peerAgent
             IncludeTuning = $peerTuning
+            IncludeDetailed = $peerDetailed
             Online = [bool]$peer.Online
         }
     }
@@ -875,7 +890,7 @@ function Sync-DaemonDashboard {
 
     $replyCardUrl = Get-BridgeServedReplyCardUrl
     $signature = (@($allDescriptors | Sort-Object -Property Node | ForEach-Object { "$($_.Node)=$($_.Name)" }) -join '|') +
-        '#' + (@($machineCards | ForEach-Object { "$($_.Slug):$($_.IncludeProfile)$($_.IncludeResume)$($_.IncludeAgent):$($_.Online)" }) -join ',') +
+        '#' + (@($machineCards | ForEach-Object { "$($_.Slug):$($_.IncludeProfile)$($_.IncludeResume)$($_.IncludeAgent)$($_.IncludeTuning)$($_.IncludeDetailed):$($_.Online)" }) -join ',') +
         '#' + $replyCardUrl
     if ($signature -ne $script:DaemonDashboardSignature) {
         try {

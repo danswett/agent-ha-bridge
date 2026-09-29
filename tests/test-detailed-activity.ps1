@@ -79,13 +79,25 @@ function Invoke-CopilotHaWebSocket {
     $script:SavedConfig = $Commands[0].config
     @()
 }
-Save-CopilotSessionDashboard -Sessions @(
-    [pscustomobject]@{ Node = 'copilot_abc123def456'; Name = 'Copilot: a task'; Machine = 'BOX'; Kind = 'copilot' }
-)
+$sessions = @([pscustomobject]@{ Node = 'copilot_abc123def456'; Name = 'Copilot: a task'; Machine = 'BOX'; Kind = 'copilot' })
+$mine = [pscustomobject]@{ Slug = $slug; Machine = 'DSWETT-HOME'; Online = $true; IncludeProfile = $false; IncludeResume = $true; IncludeAgent = $true; IncludeDetailed = $true }
+$old  = [pscustomobject]@{ Slug = 'dans_mbp'; Machine = 'Dans-MBP'; Online = $true; IncludeProfile = $false; IncludeResume = $true; IncludeAgent = $false; IncludeDetailed = $false }
+
+Save-CopilotSessionDashboard -Sessions $sessions -Machines @($mine, $old)
 $json = $script:SavedConfig | ConvertTo-Json -Depth 40 -Compress
 
-Test-That 'a Detailed activity card is drawn' { $json -match '"Detailed activity"' }
-Test-That 'and its row is the entity the daemon polls' { $json -match [regex]::Escape($expected) } $expected
+Test-That 'the machines are still listed' { $json -match 'Machines' }
+Test-That 'and the toggle is the entity the daemon polls' { $json -match [regex]::Escape($expected) } $expected
+
+# The bug this replaces: a peer on an older bridge has no such helper, so drawing its
+# row put an "Entity not found" box on everyone's dashboard. Seen live against 1.14.6.
+Test-That 'a machine that cannot have one gets no toggle' {
+    $json -notmatch [regex]::Escape('input_boolean.agent_bridge_dans_mbp_detailed_activity')
+}
+Test-That 'but it is still listed as a machine' { $json -match 'Dans-MBP' }
+Test-That 'the switch sits with the machine, not on a card of its own' {
+    $json -notmatch '"title":"Detailed activity"'
+}
 
 Write-Host "`n--- the switch decides, the setting is only the default ---"
 $script:ProbeState = $null

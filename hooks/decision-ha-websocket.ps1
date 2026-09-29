@@ -1076,26 +1076,51 @@ function Save-CopilotSessionDashboard {
         cards = @($controlMarkdown)
     }
 
-    # Every machine that has ever registered, live or not, with its status and version.
-    # A machine's entities are retained, so one that is switched off stays listed - and
-    # knowing a machine exists but is currently off is exactly what you want when a
-    # session you expected to see is not there.
-    $machinesCard = $null
-    if ($multiMachine) {
-        $machineLines = @($machineList | ForEach-Object {
-            $onlineEntity = Get-BridgeMachineEntityId -Domain 'binary_sensor' -Key 'online' -Slug $_.Slug
-            $updateEntity = Get-BridgeMachineEntityId -Domain 'update' -Key 'update' -Slug $_.Slug
-            $countEntity = Get-BridgeMachineEntityId -Domain 'sensor' -Key 'sessions' -Slug $_.Slug
-            # The liveness sensor is not retained and expires, so "not on" covers both
-            # a machine that reported offline and one that simply stopped reporting.
-            "{% if is_state('$onlineEntity','on') %}🟢 **$($_.Machine)** &bull; " +
+    # Every machine that has ever registered, live or not, with its status and version,
+    # and its Detailed activity switch beside it. A machine's entities are retained, so
+    # one that is switched off stays listed - and knowing a machine exists but is
+    # currently off is exactly what you want when a session you expected to see is not
+    # there.
+    #
+    # One row per machine rather than a block of text and a separate list of switches:
+    # the switch belongs to the machine it is named after, and a list somewhere else
+    # makes you match names up by eye. A machine running a bridge older than the switch
+    # reports no capability for it and gets text alone - drawing the row anyway put an
+    # "Entity not found" box on everyone's dashboard.
+    $machineRows = @($machineList | ForEach-Object {
+        $onlineEntity = Get-BridgeMachineEntityId -Domain 'binary_sensor' -Key 'online' -Slug $_.Slug
+        $updateEntity = Get-BridgeMachineEntityId -Domain 'update' -Key 'update' -Slug $_.Slug
+        $countEntity = Get-BridgeMachineEntityId -Domain 'sensor' -Key 'sessions' -Slug $_.Slug
+        # The liveness sensor is not retained and expires, so "not on" covers both
+        # a machine that reported offline and one that simply stopped reporting.
+        $line = "{% if is_state('$onlineEntity','on') %}🟢 **$($_.Machine)** &bull; " +
             "{{ states('$countEntity')|int(0) }} session(s) &bull; " +
             "{{ state_attr('$updateEntity','installed_version') or '?' }}" +
             "{% else %}⚪ **$($_.Machine)** &bull; offline{% endif %}"
-        })
+        $text = @{ type = 'markdown'; content = $line }
+
+        if ($_.PSObject.Properties['IncludeDetailed'] -and $_.IncludeDetailed) {
+            @{
+                type = 'horizontal-stack'
+                cards = @(
+                    $text
+                    @{
+                        type = 'entities'
+                        entities = @(@{
+                            entity = (Get-BridgeMachineEntityId -Domain 'input_boolean' -Key 'detailed_activity' -Slug $_.Slug)
+                            name = 'Detail'
+                        })
+                    }
+                )
+            }
+        }
+        else { $text }
+    })
+    $machinesCard = $null
+    if ($machineRows.Count -gt 0) {
         $machinesCard = @{
-            type = 'markdown'
-            content = (@('### Machines'; '') + $machineLines) -join "`n`n"
+            type = 'vertical-stack'
+            cards = @(@{ type = 'markdown'; content = '### Machines' }) + $machineRows
         }
     }
 
@@ -1123,28 +1148,6 @@ function Save-CopilotSessionDashboard {
             }
         }
     })
-
-    # How much each card says. Per machine, because one machine may be doing something
-    # you want to watch closely while the others are not, and one card rather than one
-    # per machine because it is a preference, not a control you reach for often.
-    #
-    # It is here rather than on a card of its own - which is what it had before it was
-    # briefly a setting in a file - because this is where you are standing when you
-    # decide the trail is too noisy, or not detailed enough.
-    $detailCard = $null
-    $detailRows = @($onlineList | ForEach-Object {
-        @{
-            entity = (Get-BridgeMachineEntityId -Domain 'input_boolean' -Key 'detailed_activity' -Slug $_.Slug)
-            name = if ($multiMachine) { $_.Machine } else { 'Show thinking and every tool call' }
-        }
-    })
-    if ($detailRows.Count -gt 0) {
-        $detailCard = @{
-            type = 'entities'
-            title = 'Detailed activity'
-            entities = $detailRows
-        }
-    }
 
     # Starting a new session. Placed with the controls rather than among the session
     # cards because it belongs to the bridge, not to any one session, and it stays
@@ -1297,7 +1300,6 @@ function Save-CopilotSessionDashboard {
     # The control panel is a plain card pair at the top of the masonry flow.
     $controlCards = @($agentSessionsCard)
     if ($machinesCard) { $controlCards += $machinesCard }
-    if ($detailCard) { $controlCards += $detailCard }
     $controlCards += $updateCards + $newSessionCards
 
     $sessionSections = foreach ($session in $Sessions) {
