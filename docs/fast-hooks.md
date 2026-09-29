@@ -456,6 +456,25 @@ keeps arming a card for a question nobody is being asked - Codex clears it on th
 hook event for that session. And check what Copilot's prompt actually accepts before
 reusing Codex's `y`/`n`; see the delivery warning below, which applies here too.
 
+**Do not "solve" this by turning on `newSession.allowAllTools`.** It is the obvious
+shortcut - it adds `--allow-all-tools` at launch, the flag equivalent of typing
+`/allow-all`, and a session launched with it never stops for a prompt. The owner was
+offered it on 2026-09-28 and deliberately declined, choosing to make approvals
+answerable rather than hand every phone-launched session blanket tool access. Leave the
+default alone.
+
+Worth knowing if injection is considered instead: typing `/allow-all` into a running
+session only helps if it arrives *before* the session hits its first prompt. Tried live
+on a session already waiting on one - the text goes to the approval dialog rather than
+the prompt, and the session stayed on `Running: powershell` across eight samples. So
+injection can prevent a deadlock and cannot undo one, which makes it a poor substitute
+for routing the prompt properly.
+
+Note also that the comment justifying the safe default in hooks/session-launch.ps1
+(~line 889) says "the bridge already routes permission prompts to Home Assistant". That
+is true for Codex and false for Copilot, so the default is currently resting on a
+guarantee Copilot does not provide. Fixing this task makes that comment true.
+
 ## Then: the choices card should answer a whole form
 
 **First, though:** Dans-MBP went offline on 1.14.4 and never took 1.14.5, so a question
