@@ -99,6 +99,69 @@ Test-That 'the switch sits with the machine, not on a card of its own' {
     $json -notmatch '"title":"Detailed activity"'
 }
 
+Write-Host "`n--- a machine running from source is marked (dev) ---"
+# VERSION only moves when a release is cut, so a machine running a working copy and
+# one running the release report the same number while being days apart in features.
+# That is not hypothetical: it is why a peer looked up to date while missing the
+# Detailed activity switch entirely.
+$devMachine = [pscustomobject]@{ Slug = 'buildbox'; Machine = 'BUILDBOX'; Online = $true; IncludeProfile = $false; IncludeResume = $true; IncludeAgent = $false; IncludeDetailed = $true; IsDev = $true }
+Save-CopilotSessionDashboard -Sessions $sessions -Machines @($devMachine, $old)
+$devJson = $script:SavedConfig | ConvertTo-Json -Depth 40 -Compress
+
+Test-That 'its version carries the marker' {
+    $devJson -match [regex]::Escape("state_attr('update.agent_bridge_buildbox_update','installed_version') or '?' }} (dev)")
+} 'no (dev) beside the version'
+Test-That 'a machine on a release is left unmarked' {
+    $devJson -notmatch [regex]::Escape("agent_bridge_dans_mbp_update','installed_version') or '?' }} (dev)")
+}
+
+# A peer that reports nothing at all is running a release - every machine that has
+# never seen a working copy does.
+$silent = [pscustomobject]@{ Slug = 'quiet'; Machine = 'QUIET'; Online = $true; IncludeProfile = $false; IncludeResume = $false; IncludeAgent = $false }
+Save-CopilotSessionDashboard -Sessions $sessions -Machines @($silent)
+Test-That 'a peer that says nothing is not called dev' {
+    ($script:SavedConfig | ConvertTo-Json -Depth 40 -Compress) -notmatch '\(dev\)'
+}
+
+# One machine is where it matters most: there is no second version to compare with.
+$soloDev = [pscustomobject]@{ Slug = $slug; Machine = 'DSWETT-HOME'; Online = $true; IncludeProfile = $false; IncludeResume = $true; IncludeAgent = $true; IncludeDetailed = $true; IsDev = $true }
+Save-CopilotSessionDashboard -Sessions $sessions -Machines @($soloDev)
+Test-That 'a single-machine install is marked too' {
+    ($script:SavedConfig | ConvertTo-Json -Depth 40 -Compress) -match '\(dev\)'
+}
+
+Write-Host "`n--- and the flag gets there from the machine's own capabilities ---"
+# The dashboard assertions above build machine objects by hand, so on their own they
+# never exercise the step that turns a published capability into one - which a
+# mutation proved by breaking that step without failing anything.
+$cards = Get-DaemonMachineCards -Capabilities @{
+    newSession = $true; profile = $false; resume = $true; agent = $true; detailed = $true; dev = $true
+} -Peers @(
+    [pscustomobject]@{ Slug = 'peerdev'; Machine = 'PEERDEV'; Online = $true
+        Capabilities = [pscustomobject]@{ resume = $true; detailed = $true; dev = $true } }
+    [pscustomobject]@{ Slug = 'peerrel'; Machine = 'PEERREL'; Online = $true
+        Capabilities = [pscustomobject]@{ resume = $true; detailed = $true; dev = $false } }
+    [pscustomobject]@{ Slug = 'peerold'; Machine = 'PEEROLD'; Online = $true; Capabilities = $null }
+)
+Test-That 'this machine reports its own source install' {
+    (@($cards | Where-Object { $_.Slug -eq $script:DaemonMachineSlug })[0]).IsDev
+}
+Test-That 'a peer running from source is marked' {
+    (@($cards | Where-Object { $_.Slug -eq 'peerdev' })[0]).IsDev
+}
+Test-That 'a peer on a release is not' {
+    -not (@($cards | Where-Object { $_.Slug -eq 'peerrel' })[0]).IsDev
+}
+Test-That 'and a peer too old to say anything is not' {
+    -not (@($cards | Where-Object { $_.Slug -eq 'peerold' })[0]).IsDev
+}
+# A capabilities set built before this existed must not throw - StrictMode turns a
+# missing key into a terminating error, and older callers build these by hand.
+Test-That 'a capability set without the key is survivable' {
+    $old = Get-DaemonMachineCards -Capabilities @{ newSession = $true; profile = $false; resume = $true; agent = $true } -Peers @()
+    -not (@($old)[0]).IsDev
+}
+
 Write-Host "`n--- the switch decides, the setting is only the default ---"
 $script:ProbeState = $null
 function Get-DaemonEntityState { param([string]$EntityId, [hashtable]$Headers) $script:ProbeState }

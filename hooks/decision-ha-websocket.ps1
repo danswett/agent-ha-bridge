@@ -1052,7 +1052,10 @@ function Save-CopilotSessionDashboard {
     $versionParts = @()
     if (-not $multiMachine) {
         $soloUpdate = Get-BridgeMachineEntityId -Domain 'update' -Key 'update' -Slug $onlineList[0].Slug
-        $versionParts = @("**Bridge** {{ state_attr('$soloUpdate', 'installed_version') or '?' }}")
+        # Marked here too: a single-machine install is exactly where nobody has another
+        # version to compare against and notice the difference.
+        $soloDev = if ($onlineList[0].PSObject.Properties['IsDev'] -and $onlineList[0].IsDev) { ' (dev)' } else { '' }
+        $versionParts = @("**Bridge** {{ state_attr('$soloUpdate', 'installed_version') or '?' }}$soloDev")
     }
 
     $summaryLine = "**Live sessions:** $liveTemplate &bull; **Pending decisions:** $pendingTemplate"
@@ -1093,9 +1096,15 @@ function Save-CopilotSessionDashboard {
         $countEntity = Get-BridgeMachineEntityId -Domain 'sensor' -Key 'sessions' -Slug $_.Slug
         # The liveness sensor is not retained and expires, so "not on" covers both
         # a machine that reported offline and one that simply stopped reporting.
+        #
+        # "(dev)" marks a machine installed from a working copy. VERSION only moves
+        # when a release is cut, so two machines days apart in features otherwise read
+        # as the same number - which is how one of them came to look up to date while
+        # missing a feature entirely.
+        $devSuffix = if ($_.PSObject.Properties['IsDev'] -and $_.IsDev) { ' (dev)' } else { '' }
         $line = "{% if is_state('$onlineEntity','on') %}🟢 **$($_.Machine)** &bull; " +
             "{{ states('$countEntity')|int(0) }} session(s) &bull; " +
-            "{{ state_attr('$updateEntity','installed_version') or '?' }}" +
+            "{{ state_attr('$updateEntity','installed_version') or '?' }}$devSuffix" +
             "{% else %}⚪ **$($_.Machine)** &bull; offline{% endif %}"
         $text = @{ type = 'markdown'; content = $line }
 

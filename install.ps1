@@ -92,6 +92,17 @@ $installHome = if ($TargetHome) { $TargetHome } else { $HOME }
 # recorded config and the update check can never disagree about what is installed.
 $versionFile = Join-Path $repoRoot 'VERSION'
 $version = if (Test-Path -LiteralPath $versionFile) { (Get-Content -LiteralPath $versionFile -Raw).Trim() } else { '0.0.0' }
+
+# Whether this install came from a working copy rather than a published release.
+# VERSION only moves when a release is cut, so a machine running the source and one
+# running the release report the same number while being days apart - which is exactly
+# how a machine came to look up to date while missing a feature entirely. The
+# dashboard says "(dev)" beside the version when this is set.
+#
+# A release is installed from an extracted archive with no .git in it, so the presence
+# of the repository is the distinction. Checked as a path rather than by running git,
+# which need not be installed on a machine that only ever takes releases.
+$installedFromSource = (Test-Path -LiteralPath (Join-Path $repoRoot '.git'))
 # ~/.copilot belongs to the Copilot CLI: the bridge only ever writes its hook
 # definition there, and reads the transcripts under session-state. Everything the
 # bridge owns lives in its own root, so a Claude-, Codex- or MCP-only install never
@@ -1965,6 +1976,14 @@ if (-not $config.PSObject.Properties.Name.Contains('updates')) {
     })
 }
 $config.updates.installedVersion = $version
+# Written every install, not only when true, so a machine that moves from a working
+# copy to a release stops calling itself dev.
+if ($config.updates.PSObject.Properties.Name -contains 'installedFromSource') {
+    $config.updates.installedFromSource = $installedFromSource
+}
+else {
+    $config.updates | Add-Member -NotePropertyName 'installedFromSource' -NotePropertyValue $installedFromSource
+}
 
 Write-Step "Writing bridge config to $configPath"
 $config | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $configPath -Encoding UTF8

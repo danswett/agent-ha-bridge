@@ -654,6 +654,10 @@ function Get-DaemonLaunchCapabilities {
         # report it gets no toggle rather than a row pointing at a helper that does
         # not exist.
         detailed   = $true
+        # Installed from a working copy rather than a release. VERSION only moves when
+        # a release is cut, so without this a machine running the source and one
+        # running the release show the same number while being days apart.
+        dev        = [bool](Get-BridgeSetting 'updates.installedFromSource' $false)
     }
 }
 
@@ -679,7 +683,7 @@ function Publish-DaemonGlobalStatus {
     )
 
     $globalSignature = (($Descriptors | ForEach-Object { "$($_.Node)=$($_.Name)=$($_.Machine)" }) -join '|') +
-        "#$($Capabilities.newSession)$($Capabilities.profile)$($Capabilities.resume)$($Capabilities.agent)$($Capabilities.tuning)$($Capabilities.detailed)"
+        "#$($Capabilities.newSession)$($Capabilities.profile)$($Capabilities.resume)$($Capabilities.agent)$($Capabilities.tuning)$($Capabilities.detailed)$($Capabilities.dev)"
     $globalStale = ([DateTimeOffset]::Now - $script:DaemonGlobalLastPublish).TotalSeconds -ge $script:DaemonConfig.GlobalReassertSeconds
     if ($globalSignature -ne $script:DaemonGlobalSignature -or $globalStale) {
         try {
@@ -780,6 +784,7 @@ function Get-DaemonMachineCards {
             # Same reason - newer than some of the callers that build a capabilities
             # set by hand.
             IncludeDetailed = [bool]($Capabilities.ContainsKey('detailed') -and $Capabilities['detailed'])
+            IsDev = [bool]($Capabilities.ContainsKey('dev') -and $Capabilities['dev'])
             # This daemon is the one running the code, so it is online by definition -
             # and saying so here means the launch picker is never empty while its own
             # heartbeat sensor is still being created.
@@ -797,6 +802,9 @@ function Get-DaemonMachineCards {
         # everyone's dashboard, because the helper only exists on machines that create
         # it - seen live against a peer still on 1.14.6.
         $peerDetailed = $false
+        # A peer that says nothing is assumed to be running a release, which is what
+        # every machine that has never seen a working copy is.
+        $peerDev = $false
         if ($null -ne $peerCaps) {
             try { $peerProfile = [bool]$peerCaps.profile } catch { }
             try { $peerResume = [bool]$peerCaps.resume } catch { }
@@ -805,6 +813,7 @@ function Get-DaemonMachineCards {
             # which then gets a launch card without them rather than three broken rows.
             try { $peerTuning = [bool]$peerCaps.tuning } catch { }
             try { $peerDetailed = [bool]$peerCaps.detailed } catch { }
+            try { $peerDev = [bool]$peerCaps.dev } catch { }
         }
         $machineCards += [pscustomobject]@{
             Slug = $peer.Slug
@@ -814,6 +823,7 @@ function Get-DaemonMachineCards {
             IncludeAgent = $peerAgent
             IncludeTuning = $peerTuning
             IncludeDetailed = $peerDetailed
+            IsDev = $peerDev
             Online = [bool]$peer.Online
         }
     }
@@ -890,7 +900,7 @@ function Sync-DaemonDashboard {
 
     $replyCardUrl = Get-BridgeServedReplyCardUrl
     $signature = (@($allDescriptors | Sort-Object -Property Node | ForEach-Object { "$($_.Node)=$($_.Name)" }) -join '|') +
-        '#' + (@($machineCards | ForEach-Object { "$($_.Slug):$($_.IncludeProfile)$($_.IncludeResume)$($_.IncludeAgent)$($_.IncludeTuning)$($_.IncludeDetailed):$($_.Online)" }) -join ',') +
+        '#' + (@($machineCards | ForEach-Object { "$($_.Slug):$($_.IncludeProfile)$($_.IncludeResume)$($_.IncludeAgent)$($_.IncludeTuning)$($_.IncludeDetailed)$($_.IsDev):$($_.Online)" }) -join ',') +
         '#' + $replyCardUrl
     if ($signature -ne $script:DaemonDashboardSignature) {
         try {

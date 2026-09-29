@@ -466,6 +466,20 @@ program. So:
   the same form had fired a correction twice earlier the same evening. Anyone answering
   from a phone on 1.15.0 is being contradicted on good answers, which is the reason
   this is a release and not just a commit.
+- **1.16.0** (2026-09-29): how a session thinks, chosen on the launch card and reported
+  back on every session card - **Model**, **Effort** and **Context** dropdowns whose
+  options belong to whichever agent is selected, each opening on *Agent default* so an
+  untouched card launches exactly as before, and a line above **End session** naming
+  what that session is actually running. The model is read from the session's own
+  transcript rather than from the command line the bridge built, so it is right for a
+  session started at a keyboard and follows a `/model` typed into the window. Carried
+  in the same release: the agent's thinking is back in the activity trail behind a
+  per-machine **Detailed activity** switch on the Machines card; a session an agent
+  launches reads as agent-driven from the moment it appears; a login Home Assistant has
+  rejected is not retried into an IP ban; and two measured costs are gone - a
+  transcript is no longer re-parsed when it has not changed (96.7 ms to 1.35 ms on a
+  277 MB file) and `status` reads the daemon's pid from the heartbeat it already writes
+  instead of scanning every process (223 ms to 7.7 ms).
 
 ## Next: let a Copilot permission prompt be approved from Home Assistant
 
@@ -930,6 +944,33 @@ append reduces in 95 ms - which happens after the daemon has been stopped for a 
 That is rare, bounded, and already off the interactive path. If transcript CPU ever
 looks like a problem again, measure the tick-growth rate first: it is the number that
 decides this, and it is the one that was missing.
+
+## Two machines, two versions, one number
+
+Dans-MBP sat on the dashboard reading `1.15.1` beside this machine's `1.15.1`, and was
+missing the Detailed activity switch entirely: this machine was running the working
+copy, thirteen commits past the tag. `VERSION` only moves when a release is cut, so
+every source install reports the last release's number and there was nothing on screen
+to say otherwise. The right read of that dashboard was "both up to date"; it was wrong.
+
+So the installer records which it was. A release is unpacked from an archive with no
+repository in it, so the presence of `.git` beside `install.ps1` is the distinction -
+checked as a path rather than by running `git`, which a machine that only ever takes
+releases need not have. That lands in `updates.installedFromSource`, is republished as
+a `dev` capability, and the Machines card appends `(dev)` to the version. It is written
+on every install, not only when true, so a machine moving from a working copy to a
+release stops calling itself dev.
+
+A peer that reports nothing is taken to be on a release - which is what any machine
+that has never seen a working copy is - so an older bridge is unmarked rather than
+wrong, the same contract `agent`, `tuning` and `detailed` already have.
+
+The test for this is worth keeping in mind, because the first version of it passed
+while the feature was severed. Asserting on the card's markdown proved the template
+appends the suffix, but the assertions built their machine objects by hand, so setting
+`IsDev = $false` in `Get-DaemonMachineCards` - the step that turns a published
+capability into the flag the template reads - broke nothing. The wire is capability →
+machine card → template, and the middle needed its own assertion.
 
 ## Resuming
 
