@@ -18,8 +18,15 @@ import net from 'node:net';
 import { startHttpTransport, isLocalBind, readBearer } from '../src/http.js';
 
 let failures = 0;
+// The details logged below include a raw socket response and a header value built to
+// contain control characters, so they are folded onto one line before being printed:
+// a newline in a log line is how one entry is made to look like two (CodeQL
+// js/log-injection). The `/\n|\r/g` shape is deliberate - a character class covering
+// the same characters is not recognised as a sanitizer.
+const oneLine = (value) => String(value).replace(/\n|\r/g, ' ').replace(/[\u0000-\u001f\u007f]/g, '?');
 const check = (name, ok, detail = '') => {
-  console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? ` - ${detail}` : ''}`);
+  const line = `  ${ok ? 'PASS' : 'FAIL'}  ${oneLine(name)}${detail ? ` - ${oneLine(detail)}` : ''}`;
+  console.log(line);
   if (!ok) failures++;
 };
 

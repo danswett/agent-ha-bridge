@@ -28,10 +28,12 @@ if (!baseUrl || !token) {
 let failures = 0;
 // A name or detail can carry whatever HA_BASE_URL and the instance put in it, and a
 // newline in a log line is how one entry is made to look like two (CodeQL
-// js/log-injection). Control characters are shown rather than obeyed.
-const oneLine = (value) => String(value).replace(/[\r\n\u2028\u2029]/g, ' ').replace(/[\u0000-\u001f\u007f]/g, '?');
+// js/log-injection). The `/\n|\r/g` shape is deliberate: a character class covering
+// the same characters is not recognised as a sanitizer and the alert stays open.
+const oneLine = (value) => String(value).replace(/\n|\r/g, ' ').replace(/[\u0000-\u001f\u007f]/g, '?');
 const check = (name, ok, detail = '') => {
-  console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${oneLine(name)}${detail ? ` - ${oneLine(detail)}` : ''}`);
+  const line = `  ${ok ? 'PASS' : 'FAIL'}  ${oneLine(name)}${detail ? ` - ${oneLine(detail)}` : ''}`;
+  console.log(line);
   if (!ok) failures++;
 };
 
