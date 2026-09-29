@@ -853,6 +853,21 @@ implied**, which was ordered by reasoning rather than by numbers.
   workspace taken out of the config is refused at launch while the cached dropdown
   still lists it.
 
+- The model, effort and context lists join this same function (`1.16.0`). Measured
+  on 2026-09-29, they cost **4.1 ms a pass** for all three axes - but the first
+  version cost **11.0 ms**, of which 9.7 was the model axis alone on a *cache hit*.
+  `Get-BridgeCopilotModelList` resolved `copilot.exe` to build its cache key before
+  checking whether the cache was still fresh, and locating it searches PATH and
+  several install folders: **5.3 ms**, paid three times a reconcile to avoid a call
+  that was already avoided. Checking the clock first is the whole fix. This is the
+  same trap `Get-BridgeAvailableLaunchers` documents, arrived at independently, which
+  is a reasonable argument for looking at the clock before the disk by default.
+
+  The remaining 4 ms is list composition - 28 models deduplicated, three times - and
+  is deliberately not cached, for the reason above: `Resolve-BridgeTuningValue`
+  re-derives the same list to validate what the dropdown sent back, so a cached list
+  would let a model removed from `newSession.models.<agent>` stay launchable.
+
 **Done 2026-09-28.**
 
 - `Get-CopilotAskUserState` re-parsed the tail on every pass. A transcript is

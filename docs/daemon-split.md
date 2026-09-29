@@ -132,9 +132,11 @@ after the Claude and Codex checks, so the table has to name it outright.
   and `SetupNote`; `Sync-DaemonClients` loops the agents that have an adapter.
 
 **Step 3 status: done.** Adding an agent now means one entry in `daemon-agents.ps1`,
-one in `BridgeLaunchers` (`session-launch.ps1`) and its adapter. Still named per agent,
-by design: the adapter loading at the top of `agent-bridge-daemon.ps1` (runs before
-the parts load), Agency's profiles, and comments describing today's agents.
+one in `BridgeLaunchers` (`session-launch.ps1`), one in `BridgeLauncherTuning` beside
+it - the models, efforts and context sizes it accepts, and how each is spelled on its
+command line - and its adapter. Still named per agent, by design: the adapter loading
+at the top of `agent-bridge-daemon.ps1` (runs before the parts load), Agency's
+profiles, and comments describing today's agents.
 
 C to E are optional: A and B are the code that runs constantly. The user approved
 C to E on 2026-09-27; carry on through them without asking.

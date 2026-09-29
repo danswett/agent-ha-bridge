@@ -802,7 +802,7 @@ function Get-BridgeLauncherKind {
 # reconcile. Half an hour is well inside the time it takes to notice a new model
 # exists, and a bridge restart re-reads it anyway.
 $script:BridgeModelCacheMinutes = 30
-$script:BridgeModelCache = @{}
+$script:BridgeModelCache = $null
 
 function Get-BridgeCopilotModelList {
     <#
@@ -819,16 +819,18 @@ function Get-BridgeCopilotModelList {
     #>
     param([string]$Path)
 
-    if (-not $Path) { $Path = Get-BridgeCopilotPath }
-    if ([string]::IsNullOrWhiteSpace($Path)) { return @() }
-
-    $stamp = ''
-    try { $stamp = [string](Get-Item -LiteralPath $Path -ErrorAction Stop).LastWriteTimeUtc.Ticks } catch { }
-    $key = "$Path|$stamp"
-    $cached = $script:BridgeModelCache[$key]
+    # The clock is checked before anything else, deliberately. Locating copilot.exe
+    # searches PATH and several install folders - 5.3 ms measured - so an earlier
+    # version that resolved the path to build its cache key paid the whole discovery
+    # cost on every cache hit, and the three axes ask once each per reconcile. This is
+    # the same trap Get-BridgeAvailableLaunchers documents for the launcher list.
+    $cached = $script:BridgeModelCache
     if ($null -ne $cached -and ([DateTimeOffset]::Now - $cached.At).TotalMinutes -lt $script:BridgeModelCacheMinutes) {
         return @($cached.Models)
     }
+
+    if (-not $Path) { $Path = Get-BridgeCopilotPath }
+    if ([string]::IsNullOrWhiteSpace($Path)) { return @() }
 
     $models = @()
     try {
@@ -846,8 +848,9 @@ function Get-BridgeCopilotModelList {
     catch { }
 
     # Cached either way, including an empty answer: a machine where the call fails
-    # should not retry it on every reconcile.
-    $script:BridgeModelCache[$key] = [pscustomobject]@{ At = [DateTimeOffset]::Now; Models = @($models) }
+    # should not retry it on every reconcile. A Copilot upgraded or installed in the
+    # meantime is picked up when this expires, which is what the half hour is for.
+    $script:BridgeModelCache = [pscustomobject]@{ At = [DateTimeOffset]::Now; Models = @($models) }
     @($models)
 }
 
