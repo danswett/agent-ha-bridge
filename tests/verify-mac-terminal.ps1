@@ -115,9 +115,9 @@ function Remove-TaggedWindows {
     foreach ($pass in 1..2) {
     foreach ($t in $Titles) {
         # Anything still running has to go first: `close saving no` suppresses the
-        # save prompt, not the "terminate running processes?" one, so a busy window
-        # will not close. Killing whatever is on the tab's tty makes it closable.
-        # Only ever applied to windows carrying these test tags.
+        # save prompt, not the "terminate running processes?" one, and that dialog is
+        # modal - so a busy window cannot be closed from a script at all. Only ever
+        # applied to windows carrying these test tags.
         $ttyScript = @"
 tell application "Terminal"
   set out to ""
@@ -136,11 +136,26 @@ end tell
         # ever killed and the busy window survived cleanup with the failure invisible.
         $ttys = @((& osascript -e $ttyScript 2>&1 | Out-String) -split "`r?`n" |
             ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^/dev/tty' })
+        # Killed by pid from `ps -t`, not `pkill -t`. BSD pkill takes the pattern as a
+        # required argument, so `pkill -t ttys011` with nothing else is a usage error
+        # that exits without killing anything - which is why the busy leftover kept
+        # surviving cleanup while the log claimed to have found its tty.
+        $killed = @()
         foreach ($tty in $ttys) {
-            & pkill -t ([System.IO.Path]::GetFileName($tty)) 2>&1 | Out-Null
+            $short = [System.IO.Path]::GetFileName($tty)
+            $pids = @(& ps -t $short -o pid= 2>$null |
+                ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^\d+$' })
+            foreach ($p in $pids) {
+                if ([int]$p -eq $PID) { continue }
+                & kill -9 $p 2>&1 | Out-Null
+                $killed += $p
+            }
         }
-        if ($pass -eq 1) { Write-Host "  cleanup [$t]: ttys $(if ($ttys.Count) { $ttys -join ',' } else { '<none>' })" }
-        Start-Sleep -Milliseconds 600
+        if ($pass -eq 1) {
+            Write-Host "  cleanup [$t]: ttys $(if ($ttys.Count) { $ttys -join ',' } else { '<none>' })" `
+                "killed $(if ($killed.Count) { $killed -join ',' } else { '<none>' })"
+        }
+        Start-Sleep -Milliseconds 800
 
         # Closed by id for the same reason the bridge does: the references
         # `repeat with w in windows` yields are positional, so closing one shifts
