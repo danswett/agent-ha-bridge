@@ -313,7 +313,9 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `newSession.discoverWorkspaces` | Set to `false` to offer only the configured workspaces (default `true`). System folders such as `C:\Windows\System32` are never discovered |
 | `newSession.discoverCount` | How many discovered folders to offer (default `8`) |
 | `newSession.resumeCount` | How many recent sessions the Resume dropdown offers (default `12`) |
-| `newSession.model` | Model for launched sessions (default: whatever the CLI would pick) |
+| `newSession.model` | Model preselected on the card (default: **Agent default** — the CLI's own choice). Applies to Copilot and Agency; `newSession.model.claude` / `.codex` do the same per agent |
+| `newSession.effort.<agent>` / `.context.<agent>` | Reasoning effort and context window preselected on the card, per agent (`copilot`, `claude`, `codex`; Agency reads Copilot's) |
+| `newSession.models.<agent>` | Replace the model list the card offers, e.g. `"models": { "copilot": ["auto", "claude-opus-5"] }`. Copilot's is otherwise read from `copilot help config`; `efforts.<agent>` and `contexts.<agent>` do the same for the other two axes |
 | `newSession.allowAllTools` | Launch without permission prompts (default `false`): `--allow-all` for Copilot, `--dangerously-skip-permissions` for Claude, `--ask-for-approval never` for Codex |
 | `newSession.extraArgs` | Extra CLI arguments for launched sessions, e.g. `["--plan"]` |
 | `newSession.copilotPath` | Full path to `copilot.exe` if it is not on the daemon's PATH |
@@ -465,6 +467,41 @@ offered) and refreshes it on a timer rather than on every reconcile.
 Sessions that are currently live are never offered, because two CLIs writing one
 transcript would corrupt it. A resume reopens in the folder the session originally ran
 in; the Workspace row only applies to a new session.
+
+### Model, effort and context
+
+The card carries three more dropdowns: **Model**, **Effort** and **Context**. Each
+opens on *Agent default*, which passes no flag at all and lets the CLI use whatever it
+has persisted, so a launch that ignores them behaves exactly as it did before.
+
+They belong to the agent selected above them, and the daemon republishes their options
+whenever that selection moves — pick Claude and the model list becomes Claude's. What
+each one drives:
+
+| | Copilot / Agency | Claude | Codex |
+|---|---|---|---|
+| Model | `--model` | `--model` | `--model` |
+| Effort | `--reasoning-effort` | `--effort` | `-c model_reasoning_effort=` |
+| Context | `--context` | `--autocompact` | `-c model_context_window=` |
+
+Claude has no context-window switch; `--autocompact`, which sets the window it compacts
+at, is the nearest equivalent and is what its Context row offers (`auto`, `200k`, `500k`,
+`1m`).
+
+Copilot's model list is read from `copilot help config` and cached for half an hour, so
+it stays current as models come and go. The other two ship with a short built-in list,
+which `newSession.models.<agent>` replaces — worth doing for Copilot too, since
+twenty-six options on a phone is a scroll rather than a choice.
+
+A value arriving from Home Assistant is validated against that agent's list before it
+reaches a command line, exactly as a workspace label is. An unrecognised one quietly
+means "agent default" rather than refusing the launch, because a selector left over
+from a different agent is ordinary rather than suspicious.
+
+Each session's card shows what it was started with, in small type just above **End
+session**. A session started at a keyboard shows nothing there — effort and context
+appear in no transcript and no agent reports them back, so the command line the bridge
+built is the only record, and guessing would be worse than silence.
 
 ### Agency
 

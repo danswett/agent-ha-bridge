@@ -655,6 +655,9 @@ function Set-CopilotMqttNewSessionEntityIds {
         @('select', 'new_workspace'),
         @('select', 'new_profile'),
         @('select', 'new_agent'),
+        @('select', 'new_model'),
+        @('select', 'new_effort'),
+        @('select', 'new_context'),
         @('select', 'new_resume'),
         @('button', 'new_session'),
         @('sensor', 'new_session_result')
@@ -993,6 +996,9 @@ function Save-CopilotSessionDashboard {
         # Whether to show the agent row - worth it only when there is a choice.
         [switch]$IncludeAgent,
 
+        # Whether to show the model, effort and context rows.
+        [switch]$IncludeTuning,
+
         # Resource URL of the reply card, or empty when Home Assistant is not serving
         # it. Empty falls back to the plain text box and Send button: a Lovelace view
         # that references a custom card which does not exist renders an error box
@@ -1015,6 +1021,7 @@ function Save-CopilotSessionDashboard {
             IncludeProfile = [bool]$IncludeProfile
             IncludeResume = [bool]$IncludeResume
             IncludeAgent = [bool]$IncludeAgent
+            IncludeTuning = [bool]$IncludeTuning
         })
     }
     $multiMachine = $machineList.Count -gt 1
@@ -1168,6 +1175,17 @@ function Save-CopilotSessionDashboard {
         if ($_.IncludeProfile) {
             $rows += @{ entity = (Get-BridgeMachineEntityId -Domain 'select' -Key 'new_profile' -Slug $slug); name = 'Profile' }
         }
+        # Model, effort and context. Below the agent because their options belong to
+        # whichever agent is selected: choosing the agent is what decides what these
+        # three can offer, so reading top-to-bottom is also the order to set them in.
+        if ($_.PSObject.Properties['IncludeTuning'] -and $_.IncludeTuning) {
+            foreach ($axis in @(Get-BridgeTuningAxes)) {
+                $rows += @{
+                    entity = (Get-BridgeMachineEntityId -Domain 'select' -Key "new_$axis" -Slug $slug)
+                    name   = Get-BridgeTuningAxisLabel -Axis $axis
+                }
+            }
+        }
         # The optional first message. It had been dropped as an input nobody reached
         # for, but Codex creates no session until it gets one - without it a Codex
         # launch runs in a window the dashboard can never see - and for any agent it
@@ -1241,6 +1259,11 @@ function Save-CopilotSessionDashboard {
     # more than one. The entities card above gave every selector a full-height row,
     # so launching took a screenful. It is still built above for older cards.
     if (Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.12.0') {
+        # The model, effort and context rows arrived with card 1.16.0. An older card
+        # ignores keys it does not know, so handing them over would look like it
+        # worked while the rows never appeared; gating them says plainly that this
+        # dashboard has no tuning rows until the card that draws them is served.
+        $tuningCard = Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.16.0'
         $launchMachines = @($onlineList | ForEach-Object {
             $slug = $_.Slug
             $entry = [ordered]@{
@@ -1255,6 +1278,11 @@ function Save-CopilotSessionDashboard {
                 $entry.agent = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_agent' -Slug $slug
             }
             if ($_.IncludeProfile) { $entry.profile = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_profile' -Slug $slug }
+            if ($tuningCard -and $_.PSObject.Properties['IncludeTuning'] -and $_.IncludeTuning) {
+                foreach ($axis in @(Get-BridgeTuningAxes)) {
+                    $entry[$axis] = Get-BridgeMachineEntityId -Domain 'select' -Key "new_$axis" -Slug $slug
+                }
+            }
             $entry
         })
         $launchCard = [ordered]@{
@@ -1851,7 +1879,27 @@ ha-card {
         # $replyCard is two cards when the custom one is served, so it is concatenated
         # rather than dropped into the list: inside an array literal it would stay a
         # nested array and serialise as one, which Lovelace renders as nothing at all.
-        $footerCards = if ($formCard) { @($sendStatusCard, $stopCard) } else { @($sendStatusCard, $cancelCard, $stopCard) }
+        # What this session was started with, as a footer line: "gpt-5.4 · xhigh ·
+        # long_context". Only the settings that are known are shown, and a session
+        # the bridge did not start knows none, so its card carries no line at all
+        # rather than a row of blanks or a guess at the agent's defaults.
+        #
+        # Rendered from the status sensor's attributes rather than from the dashboard
+        # build, because the dashboard is only rebuilt when the session list changes -
+        # a model swapped mid-session would otherwise keep showing the old one.
+        $settingsTemplate = @"
+{% set bits = [state_attr('$statusEntity','model'), state_attr('$statusEntity','effort'), state_attr('$statusEntity','context')] | select('string') | reject('eq','') | list %}{% if bits %}<span style="font-size:0.8em;color:var(--secondary-text-color)">{{ bits | join(' &bull; ') }}</span>{% endif %}
+"@
+        $settingsCard = @{
+            type = 'markdown'
+            card_mod = @{ style = $bareChild }
+            content = $settingsTemplate
+        }
+
+        # Directly above End session's hairline, so the card reads: what the agent
+        # said, then what it is doing, then quietly what it is doing it with.
+        $footerCards = if ($formCard) { @($sendStatusCard, $settingsCard, $stopCard) }
+            else { @($sendStatusCard, $cancelCard, $settingsCard, $stopCard) }
         $sessionCards = @($header) + @($fieldCards) + @($answerCard) + @($replyCard) + $footerCards
         if (Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.12.0') {
             @{

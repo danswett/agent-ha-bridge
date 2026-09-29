@@ -414,13 +414,19 @@ function Add-DaemonSession {
         # the reply - so a placeholder would be a downgrade.
         [string]$session.Activity
     } elseif ($initialStatus -eq 'working') { 'Working' } else { 'Idle' }
+
+    # What this session was started with, when the bridge started it. A session
+    # opened at a keyboard has none, and its card simply shows no settings line
+    # rather than guessing at the agent's defaults.
+    $tuning = Get-DaemonSessionTuning -SessionId $id -Session $session
     try {
-        Set-CopilotMqttStatus -SessionId $id -Status $initialStatus -Headers $Headers -Attributes @{
-            session = $display.Name
-            machine = $display.Machine
-            process_id = $session.ProcessId
-            updated = [DateTimeOffset]::Now.ToString('o')
-        } | Out-Null
+        Set-CopilotMqttStatus -SessionId $id -Status $initialStatus -Headers $Headers -Attributes (
+            Add-DaemonTuningAttributes -Attributes @{
+                session = $display.Name
+                machine = $display.Machine
+                process_id = $session.ProcessId
+                updated = [DateTimeOffset]::Now.ToString('o')
+            } -Tuning $tuning) | Out-Null
         Set-CopilotMqttActivity -SessionId $id -Summary $initialActivity `
             -Detail @{ session = $display.Name; machine = $display.Machine } -Headers $Headers | Out-Null
         # Prime the reply box to empty so the card shows a blank field rather
@@ -442,6 +448,11 @@ function Add-DaemonSession {
         Machine = $display.Machine
         Status = $initialStatus
         Kind = $kind
+        # Persisted with the rest of the entry, so a card keeps its settings line
+        # across a daemon restart - the launch record it came from does not survive.
+        Model = [string]$tuning.Model
+        Effort = [string]$tuning.Effort
+        Context = [string]$tuning.Context
     }
 
     # A session an agent launched is agent-driven from the moment it appears. The
@@ -459,6 +470,62 @@ function Add-DaemonSession {
         Write-DaemonLog -Message "session $($id.Substring(0,8)) was launched by an agent; showing it as agent-driven"
     }
     $entry
+}
+
+function Get-DaemonSessionTuning {
+    <#
+        The model, effort and context to show for one session: what the bridge
+        launched it with, topped up with the model the agent itself reports.
+
+        Codex names its model in every hook call, and that is better than the launch
+        record for the same reason a transcript beats a command line - it is what the
+        session is actually using, including after a /model typed into its window. The
+        other two axes have no such source, so they can only ever be what the launch
+        asked for.
+
+        Every field is '' for a session the bridge did not start, and the card then
+        shows no settings line at all rather than inventing a default.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        $Session = $null
+    )
+
+    $launched = $null
+    try { $launched = Resolve-DaemonLaunchTuning -SessionId $SessionId } catch { }
+
+    $field = { param($Source, $Name)
+        if ($null -ne $Source -and $Source.PSObject.Properties[$Name]) { [string]$Source.$Name } else { '' } }
+
+    $model = & $field $launched 'Model'
+    $reported = & $field $Session 'Model'
+    if ($reported) { $model = $reported }
+
+    [pscustomobject]@{
+        Model   = $model
+        Effort  = & $field $launched 'Effort'
+        Context = & $field $launched 'Context'
+    }
+}
+
+function Add-DaemonTuningAttributes {
+    <#
+        Adds the three settings to a status attribute set, leaving out any that are
+        empty so the card can tell "not known" from a real value.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Attributes,
+        $Tuning = $null
+    )
+
+    if ($null -eq $Tuning) { return $Attributes }
+    foreach ($pair in @(@('model', 'Model'), @('effort', 'Effort'), @('context', 'Context'))) {
+        if (-not $Tuning.PSObject.Properties[$pair[1]]) { continue }
+        $value = [string]$Tuning.($pair[1])
+        if ([string]::IsNullOrWhiteSpace($value)) { continue }
+        $Attributes[$pair[0]] = $value
+    }
+    $Attributes
 }
 
 function Update-DaemonKnownSession {
@@ -574,6 +641,10 @@ function Get-DaemonLaunchCapabilities {
         profile    = [bool]$includeProfile
         resume     = [bool]$includeResume
         agent      = [bool]$includeAgent
+        # Model, effort and context. Reported separately from the rows above so a
+        # peer still running a bridge without those entities does not get three
+        # "Entity not found" rows drawn for it on the shared dashboard.
+        tuning     = [bool]$newSessionEnabled
     }
 }
 
@@ -694,6 +765,9 @@ function Get-DaemonMachineCards {
             IncludeProfile = [bool]$Capabilities.profile
             IncludeResume = [bool]$Capabilities.resume
             IncludeAgent = [bool]$Capabilities.agent
+            # ContainsKey rather than a bare read: a capability set built before the
+            # tuning rows existed simply has no such key, and StrictMode throws on it.
+            IncludeTuning = [bool]($Capabilities.ContainsKey('tuning') -and $Capabilities.tuning)
             # This daemon is the one running the code, so it is online by definition -
             # and saying so here means the launch picker is never empty while its own
             # heartbeat sensor is still being created.
@@ -705,10 +779,14 @@ function Get-DaemonMachineCards {
         $peerProfile = $false
         $peerResume = $false
         $peerAgent = $false
+        $peerTuning = $false
         if ($null -ne $peerCaps) {
             try { $peerProfile = [bool]$peerCaps.profile } catch { }
             try { $peerResume = [bool]$peerCaps.resume } catch { }
             try { $peerAgent = [bool]$peerCaps.agent } catch { }
+            # Absent on a peer running a bridge from before the tuning rows existed,
+            # which then gets a launch card without them rather than three broken rows.
+            try { $peerTuning = [bool]$peerCaps.tuning } catch { }
         }
         $machineCards += [pscustomobject]@{
             Slug = $peer.Slug
@@ -716,6 +794,7 @@ function Get-DaemonMachineCards {
             IncludeProfile = $peerProfile
             IncludeResume = $peerResume
             IncludeAgent = $peerAgent
+            IncludeTuning = $peerTuning
             Online = [bool]$peer.Online
         }
     }

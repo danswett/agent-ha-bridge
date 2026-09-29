@@ -70,6 +70,9 @@ $script:DaemonEntity = @{
     NewWorkspace  = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_workspace'     -Slug $script:DaemonMachineSlug
     NewProfile    = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_profile'       -Slug $script:DaemonMachineSlug
     NewAgent      = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_agent'         -Slug $script:DaemonMachineSlug
+    NewModel      = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_model'         -Slug $script:DaemonMachineSlug
+    NewEffort     = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_effort'        -Slug $script:DaemonMachineSlug
+    NewContext    = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_context'       -Slug $script:DaemonMachineSlug
     NewResume     = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_resume'        -Slug $script:DaemonMachineSlug
     NewSession    = Get-BridgeMachineEntityId -Domain 'button' -Key 'new_session'       -Slug $script:DaemonMachineSlug
     NewResult     = Get-BridgeMachineEntityId -Domain 'sensor' -Key 'new_session_result' -Slug $script:DaemonMachineSlug
@@ -244,6 +247,19 @@ $script:DaemonTerminalOnlyWarned = @{}
 # terminal is theirs. Not persisted: after a daemon restart the association is gone
 # and the window is simply left alone, which is the safe direction to fail.
 $script:DaemonLaunchedPids = @{}
+
+# Model, reasoning effort and context window per session the bridge launched, keyed
+# by session id - and under DaemonPendingTuningKey for an agent that picks its own
+# id (Codex), until Update-DaemonPendingLaunch learns which session the launch
+# produced and moves the record onto that id.
+#
+# The command line is the only record: effort and context appear in no transcript and
+# no agent reports them back, so what is not kept here cannot be shown anywhere. Once
+# a session is adopted its settings move onto the persisted state entry, which is why
+# this itself is not persisted - a daemon restart mid-launch simply leaves the new
+# card without the line, rather than showing settings from the wrong launch.
+$script:DaemonLaunchedTuning = @{}
+$script:DaemonPendingTuningKey = '(pending)'
 
 # Anything the dashboard reports as happening before this is a leftover from a
 # previous run rather than something the user just did.

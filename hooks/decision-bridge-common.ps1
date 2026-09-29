@@ -22,6 +22,47 @@
 # everything below can rely on them.
 . (Join-Path $PSScriptRoot 'bridge-platform.ps1')
 
+# The three per-launch settings the dashboard can set on a new session, in the order
+# it shows them. Kept here, with the rest of the shared vocabulary, because three
+# separate layers need the same names: session-launch.ps1 turns a value into command
+# line flags, decision-mqtt.ps1 publishes a selector per axis, and
+# decision-ha-websocket.ps1 draws a row per axis.
+#
+# Three axes rather than one combined "quality" knob because the agents treat them as
+# independent: a long context costs nothing in thinking time, and a high effort costs
+# nothing in context.
+#
+#   Label   shown on the launch card
+#   Icon    its selector's icon
+$script:BridgeTuningAxes = [ordered]@{
+    model   = @{ Label = 'Model';   Icon = 'mdi:chip' }
+    effort  = @{ Label = 'Effort';  Icon = 'mdi:speedometer' }
+    context = @{ Label = 'Context'; Icon = 'mdi:arrow-expand-horizontal' }
+}
+
+# The option every axis opens on: launch without passing the flag at all, so the agent
+# uses whatever it has persisted. An MQTT select cannot hold an empty value, so "don't
+# pass anything" has to be an option like any other, and it is deliberately first so an
+# untouched card launches exactly as it did before this existed.
+$script:BridgeTuningDefaultOption = 'Agent default'
+
+function Get-BridgeTuningAxes {
+    <# The axis keys, in display order. #>
+    @($script:BridgeTuningAxes.Keys | ForEach-Object { [string]$_ })
+}
+
+function Get-BridgeTuningAxisLabel {
+    param([Parameter(Mandatory)][string]$Axis)
+    if ($script:BridgeTuningAxes.Contains($Axis)) { return [string]$script:BridgeTuningAxes[$Axis].Label }
+    $Axis
+}
+
+function Get-BridgeTuningAxisIcon {
+    param([Parameter(Mandatory)][string]$Axis)
+    if ($script:BridgeTuningAxes.Contains($Axis)) { return [string]$script:BridgeTuningAxes[$Axis].Icon }
+    'mdi:tune'
+}
+
 function Get-BridgeUserConfig {
     $candidates = @()
     if (-not [string]::IsNullOrWhiteSpace($env:AGENT_HA_BRIDGE_CONFIG)) {

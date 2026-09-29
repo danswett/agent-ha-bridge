@@ -354,6 +354,126 @@ $script:FakeSettings = @{}
 Test-That 'the default profile list is work, home, local' { (Get-BridgeAgencyProfiles) -join ',' -eq 'work,home,local' }
 
 Write-Host ''
+Write-Host '--- model, effort and context ---'
+
+# Three per-launch settings, spelled differently by every agent: Copilot has
+# --reasoning-effort and --context, Claude has --effort and (having no real context
+# switch) --autocompact, Codex has neither and takes both as `-c` overrides. Each was
+# checked against the installed CLI, which rejects a bad value outright, so the option
+# lists here are what those parsers actually accept.
+#
+# Discovery is shadowed throughout: the real one shells out to `copilot help config`,
+# which is neither offline nor stable enough to assert on.
+function Get-BridgeCopilotModelList { @('gpt-5.4', 'claude-opus-5') }
+
+$script:FakeSettings = @{}
+Test-That 'the axes are model, effort and context, in that order' {
+    (Get-BridgeTuningAxes) -join ',' -eq 'model,effort,context'
+}
+Test-That 'every list opens on "Agent default", so an untouched card launches as before' {
+    @('model', 'effort', 'context') | ForEach-Object {
+        (Get-BridgeTuningOptions -Launcher 'copilot' -Axis $_)[0]
+    } | Where-Object { $_ -ne 'Agent default' } | Measure-Object | ForEach-Object { $_.Count -eq 0 }
+}
+Test-That 'discovered Copilot models are offered alongside auto' {
+    $m = @(Get-BridgeTuningOptions -Launcher 'copilot' -Axis 'model')
+    $m -contains 'auto' -and $m -contains 'gpt-5.4' -and $m -contains 'claude-opus-5'
+}
+Test-That 'Agency offers Copilot\''s lists, because it builds a Copilot command line' {
+    (Get-BridgeTuningOptions -Launcher 'agency' -Axis 'model') -join ',' -eq
+        (Get-BridgeTuningOptions -Launcher 'copilot' -Axis 'model') -join ','
+}
+Test-That 'each agent offers its own efforts' {
+    (Get-BridgeTuningOptions -Launcher 'claude' -Axis 'effort') -contains 'max' -and
+    (Get-BridgeTuningOptions -Launcher 'claude' -Axis 'effort') -notcontains 'none' -and
+    (Get-BridgeTuningOptions -Launcher 'codex' -Axis 'effort') -contains 'minimal' -and
+    (Get-BridgeTuningOptions -Launcher 'copilot' -Axis 'effort') -contains 'none'
+}
+Test-That 'Claude\''s context options are autocompact sizes, which is all it has' {
+    (Get-BridgeTuningOptions -Launcher 'claude' -Axis 'context') -join ',' -eq 'Agent default,auto,200k,500k,1m'
+}
+
+Test-That 'a known value resolves to itself' {
+    (Resolve-BridgeTuningValue -Launcher 'copilot' -Axis 'effort' -Value 'xhigh') -eq 'xhigh'
+}
+Test-That 'the sentinel means pass nothing' {
+    (Resolve-BridgeTuningValue -Launcher 'copilot' -Axis 'effort' -Value 'Agent default') -eq ''
+}
+Test-That 'an unset selector means pass nothing' {
+    @('', 'unknown', 'unavailable') |
+        ForEach-Object { Resolve-BridgeTuningValue -Launcher 'copilot' -Axis 'effort' -Value $_ } |
+        Where-Object { $_ -ne '' } | Measure-Object | ForEach-Object { $_.Count -eq 0 }
+}
+# The security boundary, and the reason these are resolved at all: these three land
+# directly in the agent's own argument parser, next to a shell.
+Test-That 'an injected value never reaches the command line' {
+    (Resolve-BridgeTuningValue -Launcher 'copilot' -Axis 'effort' -Value 'high --allow-all') -eq '' -and
+    (Resolve-BridgeTuningValue -Launcher 'copilot' -Axis 'model' -Value 'x; rm -rf /') -eq ''
+}
+Test-That 'a value belonging to another agent is dropped, not refused' {
+    # Claude has no 'xhigh' problem but no 'none' either; a selector left over from
+    # Copilot means "whatever Claude does by default".
+    (Resolve-BridgeTuningValue -Launcher 'claude' -Axis 'effort' -Value 'none') -eq ''
+}
+Test-That 'a dropped value produces no arguments at all' {
+    @(Get-BridgeTuningArguments -Launcher 'copilot' -Axis 'effort' -Value 'evil --yolo').Count -eq 0
+}
+
+$tuned = @(Get-BridgeNewSessionArguments -SessionId $sid -Model 'gpt-5.4' -Effort 'xhigh' -Context 'long_context')
+Test-That 'Copilot gets --reasoning-effort and --context' {
+    $tuned[$tuned.IndexOf('--reasoning-effort') + 1] -eq 'xhigh' -and
+    $tuned[$tuned.IndexOf('--context') + 1] -eq 'long_context'
+}
+$clTuned = @(Get-BridgeNewSessionArguments -SessionId $sid -Launcher 'claude' -Effort 'max' -Context '1m' -Prompt 'go')
+Test-That 'Claude gets --effort and --autocompact' {
+    $clTuned[$clTuned.IndexOf('--effort') + 1] -eq 'max' -and
+    $clTuned[$clTuned.IndexOf('--autocompact') + 1] -eq '1m'
+}
+Test-That 'and they stay in front of the prompt, which is still last' { $clTuned[-2] -eq '--' -and $clTuned[-1] -eq 'go' }
+$cxTuned = @(Get-BridgeNewSessionArguments -SessionId 'sid' -Launcher 'codex' -Effort 'high' -Context '400000' -Resume)
+Test-That 'Codex takes both as -c overrides' {
+    ($cxTuned -join ' ') -match '-c model_reasoning_effort=high' -and
+    ($cxTuned -join ' ') -match '-c model_context_window=400000'
+}
+# `-c` is a global option; Codex reads those before the subcommand, where its own
+# reasoning-summary override already sits.
+Test-That 'and they precede the resume subcommand, like the other -c does' {
+    $cxTuned.IndexOf('model_reasoning_effort=high') -lt $cxTuned.IndexOf('resume') -and
+    $cxTuned.IndexOf('model_context_window=400000') -lt $cxTuned.IndexOf('resume')
+}
+Test-That 'nothing chosen means nothing added' {
+    $plain = @(Get-BridgeNewSessionArguments -SessionId $sid)
+    $plain -notcontains '--reasoning-effort' -and $plain -notcontains '--context' -and $plain -notcontains '--model'
+}
+
+# The config file is the machine owner's own, as trusted as newSession.extraArgs
+# beside it, so a model the installed CLI has not advertised still works - a preview,
+# or a BYOK provider.
+$script:FakeSettings = @{ 'newSession.model' = 'preview-only' }
+Test-That 'the pre-existing newSession.model still names the default model' {
+    (Get-BridgeDefaultTuning -Launcher 'copilot' -Axis 'model') -eq 'preview-only'
+}
+Test-That 'and is offered on the card even though nothing else lists it' {
+    (Get-BridgeTuningOptions -Launcher 'copilot' -Axis 'model') -contains 'preview-only'
+}
+Test-That 'so it survives validation on the way back in' {
+    (Resolve-BridgeTuningValue -Launcher 'copilot' -Axis 'model' -Value 'preview-only') -eq 'preview-only'
+}
+
+$script:FakeSettings = @{ 'newSession.models.claude' = @('opus'); 'newSession.effort.claude' = 'high' }
+Test-That 'a configured list replaces the built-in one outright' {
+    (Get-BridgeTuningOptions -Launcher 'claude' -Axis 'model') -join ',' -eq 'Agent default,opus'
+}
+Test-That 'and a configured default opens the selector there' {
+    (Get-BridgeDefaultTuning -Launcher 'claude' -Axis 'effort') -eq 'high'
+}
+Test-That 'a launcher with nothing configured is unaffected' {
+    (Get-BridgeTuningOptions -Launcher 'codex' -Axis 'model') -contains 'gpt-5.3-codex'
+}
+
+$script:FakeSettings = @{}
+
+Write-Host ''
 Write-Host '--- launcher selection ---'
 
 # Shadow the probes so launcher selection can be tested without any tool present.
@@ -737,7 +857,11 @@ Publish-CopilotMqttNewSession -Workspaces @(
     [pscustomobject]@{ Label = 'Beta project'; Path = $beta }
 ) -Profiles @('work', 'home') -Resumable @(
     [pscustomobject]@{ Label = 'Fix the thing - alpha'; SessionId = 'aaaaaaaa-0000-0000-0000-000000000001'; Folder = 'C:\repos\alpha' }
-) -Headers $headers
+) -Tuning @{
+    model   = @('Agent default', 'auto', 'gpt-5.4')
+    effort  = @('Agent default', 'low', 'xhigh')
+    context = @('Agent default', 'long_context')
+} -Headers $headers
 
 function Get-Config { param([string]$Match) ($script:MqttMsgs | Where-Object { $_.Topic -match $Match } | Select-Object -First 1).Payload }
 
@@ -754,6 +878,18 @@ Test-That 'the select offers both workspaces'  { (Get-Config 'new_workspace/conf
 Test-That 'they all land on the bridge device' { (Get-Config 'new_prompt/config') -match (Dev) }
 Test-That 'the prompt box is optimistic (no state topic)' { (Get-Config 'new_prompt/config') -notmatch '"state_topic"' }
 Test-That 'the result sensor does have a state topic' { (Get-Config 'new_session_result/config') -match '"state_topic"' }
+Test-That 'a select is published for each tuning axis' {
+    @('model', 'effort', 'context') | ForEach-Object { (Get-Config "select/${node}/new_$_/config") -match (Uid "new_$_") } |
+        Where-Object { -not $_ } | Measure-Object | ForEach-Object { $_.Count -eq 0 }
+}
+Test-That 'each offers exactly what it was handed' {
+    (Get-Config 'new_model/config') -match '"options":\["Agent default","auto","gpt-5.4"\]' -and
+    (Get-Config 'new_context/config') -match '"options":\["Agent default","long_context"\]'
+}
+Test-That 'they are optimistic too, like the other selectors' {
+    (Get-Config 'new_effort/config') -notmatch '"state_topic"'
+}
+Test-That 'and land on the same bridge device' { (Get-Config 'new_model/config') -match (Dev) }
 
 $script:MqttMsgs = @()
 Publish-CopilotMqttNewSession -Workspaces @() -Headers $headers
@@ -764,6 +900,13 @@ Test-That 'an empty list still publishes a valid select' {
 Test-That 'no profiles still publishes a valid profile select' {
     $cfg = Get-Config 'new_profile/config'
     $cfg -match '"options":\[' -and $cfg -match 'default'
+}
+# An MQTT select with no options is an invalid discovery payload, which Home Assistant
+# rejects outright - and the generated dashboard names these entities literally, so a
+# rejected one renders an "Entity not found" row where a control should be.
+Test-That 'an agent that offers nothing on an axis still publishes a valid select' {
+    $cfg = Get-Config 'new_model/config'
+    $cfg -match '"options":\["Agent default"\]'
 }
 
 $script:MqttMsgs = @()
@@ -787,21 +930,28 @@ function Get-HomeAssistantState {
     if (-not $script:HaStates.ContainsKey($EntityId)) { throw "no such entity $EntityId" }
     [pscustomobject]@{ state = $script:HaStates[$EntityId] }
 }
-function Publish-CopilotMqttNewSession { param([object[]]$Workspaces, [string[]]$Profiles = @(), [object[]]$Resumable = @(), [string[]]$Agents = @(), [string]$LastResult = '', [hashtable]$Headers) }
+function Publish-CopilotMqttNewSession { param([object[]]$Workspaces, [string[]]$Profiles = @(), [object[]]$Resumable = @(), [string[]]$Agents = @(), [hashtable]$Tuning = @{}, [string]$LastResult = '', [hashtable]$Headers) }
 function Set-CopilotMqttNewSessionEntityIds { $false }
 function Set-CopilotMqttNewSessionResult {
     param([string]$Text = '', [hashtable]$Headers)
     $script:Results += $Text
 }
 function Start-BridgeCopilotSession {
-    param([string]$WorkingDirectory, [string]$Prompt = '', [string]$SessionId = '', [string]$AgencyProfile = '', [string]$Launcher = '', [switch]$Resume)
+    param(
+        [string]$WorkingDirectory, [string]$Prompt = '', [string]$SessionId = '', [string]$AgencyProfile = '',
+        [string]$Launcher = '', [string]$Model = '', [string]$Effort = '', [string]$Context = '', [switch]$Resume
+    )
     $script:Launches += [pscustomobject]@{
         Directory = $WorkingDirectory; Prompt = $Prompt; AgencyProfile = $AgencyProfile
         SessionId = $SessionId; Resumed = $Resume.IsPresent; Launcher = $Launcher
+        Model = $Model; Effort = $Effort; Context = $Context
     }
     $id = if ($SessionId) { $SessionId } else { '11111111-2222-3333-4444-555555555555' }
     # This process stands in for the launched one, so it counts as running.
-    [pscustomobject]@{ Launched = $true; SessionId = $id; ProcessId = $PID; Launcher = 'agency'; Detail = "started pid $PID" }
+    [pscustomobject]@{
+        Launched = $true; SessionId = $id; ProcessId = $PID; Launcher = 'agency'; Detail = "started pid $PID"
+        Model = $Model; Effort = $Effort; Context = $Context
+    }
 }
 # What the launched session is doing: registered yet, and what its screen shows.
 $script:FakeRegistered = $false
@@ -822,11 +972,15 @@ function Reset-NewSessionTest {
         [string]$Prompt = 'do the thing',
         [string]$ProfileState = 'work',
         [string]$ResumeState = 'New session',
-        [string]$AgentState = 'unknown'
+        [string]$AgentState = 'unknown',
+        [string]$ModelState = 'Agent default',
+        [string]$EffortState = 'Agent default',
+        [string]$ContextState = 'Agent default'
     )
     $script:Launches = @()
     $script:Results = @()
     $script:Cleared = @()
+    $script:DaemonLaunchedTuning = @{}
     $script:DaemonNewSessionPublished = $true
     $script:DaemonNewSessionSignature = "alpha=$alpha"
     $script:DaemonNewSessionLastPress = ''
@@ -837,6 +991,9 @@ function Reset-NewSessionTest {
         "select.agent_bridge_${slug}_new_profile"   = $ProfileState
         "select.agent_bridge_${slug}_new_resume"    = $ResumeState
         "select.agent_bridge_${slug}_new_agent"     = $AgentState
+        "select.agent_bridge_${slug}_new_model"     = $ModelState
+        "select.agent_bridge_${slug}_new_effort"    = $EffortState
+        "select.agent_bridge_${slug}_new_context"   = $ContextState
         "text.agent_bridge_${slug}_new_prompt"      = $Prompt
     }
 }
@@ -861,6 +1018,9 @@ Test-That 'a fresh press launches a session' { $script:Launches.Count -eq 1 }
 Test-That 'it launches in the selected workspace' { $script:Launches[0].Directory -eq $alpha }
 Test-That 'it passes the typed prompt' { $script:Launches[0].Prompt -eq 'do the thing' }
 Test-That 'it passes the selected profile' { $script:Launches[0].AgencyProfile -eq 'work' }
+Test-That 'an untouched tuning selector passes nothing, so the agent decides' {
+    $script:Launches[0].Model -eq '' -and $script:Launches[0].Effort -eq '' -and $script:Launches[0].Context -eq ''
+}
 Test-That 'it reports the launch while it runs' { ($script:Results -join ' ') -match 'Starting' }
 # The session's own card is the confirmation; the note is cleared so the card shows
 # it only when there is something to say. Registration is checked on a later pass.
@@ -876,10 +1036,33 @@ Test-That 'it clears the prompt box afterwards' { $script:Cleared -contains 'tex
 Sync-DaemonNewSession -Headers $headers -Live $noLive
 Test-That 'the same press does not launch twice' { $script:Launches.Count -eq 1 }
 
+# The three tuning selectors, at press time. They are read like the workspace and the
+# prompt - only in combination with a press - and validated against the agent actually
+# being launched, so a value left over from a different agent cannot reach its command
+# line.
+Reset-NewSessionTest -Press '2026-06-01T12:01:00+00:00' -ModelState 'gpt-5.4' -EffortState 'xhigh' -ContextState 'long_context'
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+Test-That 'a chosen model, effort and context all reach the launch' {
+    $script:Launches[0].Model -eq 'gpt-5.4' -and $script:Launches[0].Effort -eq 'xhigh' -and
+    $script:Launches[0].Context -eq 'long_context'
+}
+Test-That 'and are remembered for the session that was started, so its card can say so' {
+    $entry = $script:DaemonLaunchedTuning['11111111-2222-3333-4444-555555555555']
+    $null -ne $entry -and $entry.Model -eq 'gpt-5.4' -and $entry.Effort -eq 'xhigh'
+}
+
+Reset-NewSessionTest -Press '2026-06-01T12:02:00+00:00' -EffortState 'not-an-effort --allow-all'
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+Test-That 'a value the agent does not offer is dropped rather than passed on' {
+    $script:Launches.Count -eq 1 -and $script:Launches[0].Effort -eq ''
+}
+Test-That 'and it does not refuse the launch the way an unknown profile does' {
+    ($script:Results -join ' ') -notmatch 'Unknown'
+}
+
 Reset-NewSessionTest -Press '2025-01-01T00:00:00+00:00'
 Sync-DaemonNewSession -Headers $headers -Live $noLive
 Test-That 'a press from before the daemon started is ignored' { $script:Launches.Count -eq 0 }
-
 Reset-NewSessionTest -Press 'unknown'
 Sync-DaemonNewSession -Headers $headers -Live $noLive
 Test-That 'an unknown button state is ignored' { $script:Launches.Count -eq 0 }

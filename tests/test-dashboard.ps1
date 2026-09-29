@@ -220,6 +220,31 @@ Test-That 'it is left-aligned, unlike the right-aligned Send button' {
 Test-That 'it is rendered muted rather than as a primary action' {
     @($stop.styles.name | Where-Object { $_.ContainsKey('color') -and $_['color'] -match 'secondary-text-color' }).Count -gt 0
 }
+
+# What a session was started with, quietly, at the bottom of its card. Rendered from
+# the status sensor's attributes rather than baked in at build time, because the
+# dashboard is only rebuilt when the session list changes - a model swapped
+# mid-session would otherwise keep showing the one it started on.
+$settings = @($sessionCard.cards | Where-Object {
+    $_.type -eq 'markdown' -and "$($_.content)" -match "state_attr\('sensor\.copilot_abc123def456_status','model'\)"
+})[0]
+Test-That 'the card says what the session is running with' { $null -ne $settings }
+Test-That 'all three settings are shown, not just the model' {
+    "$($settings.content)" -match "'effort'" -and "$($settings.content)" -match "'context'"
+}
+# A session started at a keyboard has none of these, and a row of blanks - or a guess
+# at the agent's defaults - would be worse than saying nothing.
+Test-That 'a session with none of them shows no line at all' {
+    "$($settings.content)" -match 'if bits'
+}
+Test-That 'it sits at the bottom, just above End session' {
+    $idx = 0; $settingsIdx = -1
+    foreach ($c in $sessionCard.cards) {
+        if ($c.type -eq 'markdown' -and "$($c.content)" -match "_status','model'") { $settingsIdx = $idx }
+        $idx++
+    }
+    $settingsIdx -eq $sessionCard.cards.Count - 2
+}
 Test-That 'Send and End are not in the same row' {
     $replyRow = @($sessionCard.cards | Where-Object { $_.type -eq 'custom:layout-card' })[0]
     $inRow = @($replyRow.cards | ForEach-Object { if ($_.ContainsKey('entity')) { [string]$_['entity'] } else { '' } })
@@ -336,6 +361,46 @@ Test-That 'with several agents installed the agent row is shown' {
 }
 Test-That 'the agent row sits under the workspace' {
     $agentRows.IndexOf("select.agent_bridge_${slug}_new_agent") -eq $agentRows.IndexOf("select.agent_bridge_${slug}_new_workspace") + 1
+}
+
+# Model, effort and context. Reported as a capability of their own, so a peer still
+# running a bridge without those entities gets a launch card without the rows rather
+# than three "Entity not found" boxes.
+Save-CopilotSessionDashboard -Sessions $sessions -IncludeAgent -IncludeTuning
+$tunedCard = @($script:SavedConfig.views[0].cards | Where-Object { $_['type'] -eq 'vertical-stack' } | ForEach-Object { $_['cards'] } |
+    Where-Object { $_.ContainsKey('title') -and $_['title'] -eq 'Start a new session' })[0]
+$tunedRows = @($tunedCard.entities | ForEach-Object { if ($_.ContainsKey('entity')) { [string]$_['entity'] } else { '' } })
+Test-That 'the tuning rows are shown when the machine has them' {
+    @('model', 'effort', 'context') | ForEach-Object { $tunedRows -contains "select.agent_bridge_${slug}_new_$_" } |
+        Where-Object { -not $_ } | Measure-Object | ForEach-Object { $_.Count -eq 0 }
+}
+# Their options belong to whichever agent is selected, so choosing the agent is what
+# decides what they can offer: reading top-to-bottom is also the order to set them in.
+Test-That 'and sit below the agent that decides what they offer' {
+    $tunedRows.IndexOf("select.agent_bridge_${slug}_new_model") -gt $tunedRows.IndexOf("select.agent_bridge_${slug}_new_agent")
+}
+Test-That 'Launch is still the last thing on the card' {
+    $tunedRows[-1] -eq "button.agent_bridge_${slug}_new_session"
+}
+Test-That 'a machine without them gets no tuning rows at all' {
+    @('model', 'effort', 'context') | ForEach-Object { $agentRows -contains "select.agent_bridge_${slug}_new_$_" } |
+        Where-Object { $_ } | Measure-Object | ForEach-Object { $_.Count -eq 0 }
+}
+
+# The compact card draws them itself, and only from 1.16.0 - an older card silently
+# ignores keys it does not know, which would look like the rows had simply vanished.
+Save-CopilotSessionDashboard -Sessions $sessions -IncludeAgent -IncludeTuning -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.16.0'
+$tunedCompact = @($script:SavedConfig.views[0].cards | Where-Object { $_['type'] -eq 'custom:agent-bridge-launch-card' })[0]
+Test-That 'the compact card is handed all three tuning entities' {
+    $m = @($tunedCompact['machines'])[0]
+    $m['model'] -eq "select.agent_bridge_${slug}_new_model" -and
+    $m['effort'] -eq "select.agent_bridge_${slug}_new_effort" -and
+    $m['context'] -eq "select.agent_bridge_${slug}_new_context"
+}
+Save-CopilotSessionDashboard -Sessions $sessions -IncludeAgent -IncludeTuning -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.15.0'
+$oldCompact = @($script:SavedConfig.views[0].cards | Where-Object { $_['type'] -eq 'custom:agent-bridge-launch-card' })[0]
+Test-That 'a card too old to draw them is not handed them' {
+    -not @($oldCompact['machines'])[0].Contains('model')
 }
 
 Write-Host ''

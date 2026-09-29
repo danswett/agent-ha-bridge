@@ -87,12 +87,13 @@ function Sync-DaemonHookStatus {
     $status = [string]$Session.HookStatus
     if ($status -eq 'working' -and $status -ne [string]$Entry.Status) {
         try {
-            Set-CopilotMqttStatus -SessionId $SessionId -Status 'working' -Headers $Headers -Attributes @{
-                session    = $Entry.Name
-                machine    = $Entry.Machine
-                process_id = $Session.ProcessId
-                updated    = [DateTimeOffset]::Now.ToString('o')
-            }
+            Set-CopilotMqttStatus -SessionId $SessionId -Status 'working' -Headers $Headers -Attributes (
+                Add-DaemonTuningAttributes -Attributes @{
+                    session    = $Entry.Name
+                    machine    = $Entry.Machine
+                    process_id = $Session.ProcessId
+                    updated    = [DateTimeOffset]::Now.ToString('o')
+                } -Tuning $Entry)
         }
         catch {
             # Left unmarked, so the next reconcile tries again.
@@ -469,12 +470,13 @@ function Update-DaemonSessionActivity {
         $newStatus -ne [string]$entry.Status) {
         $entry.Status = $newStatus
         try {
-            Set-CopilotMqttStatus -SessionId $id -Status $newStatus -Headers $Headers -Attributes @{
-                session = $entry.Name
-                machine = $entry.Machine
-                process_id = $session.ProcessId
-                updated = [DateTimeOffset]::Now.ToString('o')
-            }
+            Set-CopilotMqttStatus -SessionId $id -Status $newStatus -Headers $Headers -Attributes (
+                Add-DaemonTuningAttributes -Attributes @{
+                    session = $entry.Name
+                    machine = $entry.Machine
+                    process_id = $session.ProcessId
+                    updated = [DateTimeOffset]::Now.ToString('o')
+                } -Tuning $entry)
         }
         catch {
             Write-DaemonLog -Message "status publish failed for $id : $($_.Exception.Message)"
@@ -637,13 +639,17 @@ function Sync-DaemonCodexHookStatus {
 
     if ($status -in @('working', 'idle', 'waiting') -and $status -ne [string]$Entry.Status) {
         try {
-            Set-CopilotMqttStatus -SessionId $Id -Status $status -Headers $Headers -Attributes @{
-                session    = $Entry.Name
-                machine    = $Entry.Machine
-                updated    = [DateTimeOffset]::Now.ToString('o')
-                model      = [string]$fresh.Model
-                process_id = [int]($fresh.ProcessId ?? 0)
-            }
+            # Codex names its model on every hook call, so the entry follows it rather
+            # than staying on whatever the launch asked for - a /model typed into its
+            # window then shows on the card.
+            if ([string]$fresh.Model) { Set-DaemonSessionProperty -Entry $Entry -Name 'Model' -Value ([string]$fresh.Model) }
+            Set-CopilotMqttStatus -SessionId $Id -Status $status -Headers $Headers -Attributes (
+                Add-DaemonTuningAttributes -Attributes @{
+                    session    = $Entry.Name
+                    machine    = $Entry.Machine
+                    updated    = [DateTimeOffset]::Now.ToString('o')
+                    process_id = [int]($fresh.ProcessId ?? 0)
+                } -Tuning $Entry)
             $Entry.Status = $status
         }
         catch { Write-DaemonLog -Message "codex status publish failed for $Id : $($_.Exception.Message)" }

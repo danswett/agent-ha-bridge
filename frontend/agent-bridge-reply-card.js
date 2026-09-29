@@ -16,7 +16,7 @@
  * daemon downloads them and attaches them to the prompt.
  */
 
-const CARD_VERSION = '1.15.0';
+const CARD_VERSION = '1.16.0';
 
 // The working line, in the style of Claude Code's own spinner: its glyph cycle, and a
 // word picked once per turn. Claude Code does not record which word it chose, so the
@@ -1055,6 +1055,13 @@ class AgentBridgeSessionCard extends HTMLElement {
  */
 const LAUNCH_FRESH = 'New session';
 const LAUNCH_BLANK = ' ';
+// The three per-launch settings, in the order the card shows them. Their options
+// belong to the selected agent and the daemon republishes them when it moves, so the
+// card only ever renders whatever the entity currently offers.
+const LAUNCH_TUNING = ['model', 'effort', 'context'];
+// The option that means "pass nothing and let the agent decide". Worth a row, but
+// not worth a word in the collapsed summary.
+const LAUNCH_TUNING_DEFAULT = 'Agent default';
 
 class AgentBridgeLaunchCard extends HTMLElement {
   constructor() {
@@ -1132,6 +1139,9 @@ class AgentBridgeLaunchCard extends HTMLElement {
           <label class="f-agent"><span>Agent</span><select data-key="agent"></select></label>
           <label class="f-workspace"><span>Workspace</span><select data-key="workspace"></select></label>
           <label class="f-profile"><span>Profile</span><select data-key="profile"></select></label>
+          <label class="f-model"><span>Model</span><select data-key="model"></select></label>
+          <label class="f-effort"><span>Effort</span><select data-key="effort"></select></label>
+          <label class="f-context"><span>Context</span><select data-key="context"></select></label>
           <label class="f-prompt wide"><span>First message (optional)</span><input data-key="prompt" type="text" placeholder="Start with a task, or leave empty"></label>
         </div>
         <div class="note" hidden><span class="spin"></span><span class="text"></span></div>
@@ -1245,6 +1255,9 @@ class AgentBridgeLaunchCard extends HTMLElement {
     this._fill(q('select[data-key="agent"]'), m.agent, q('.f-agent'));
     this._fill(q('select[data-key="workspace"]'), m.workspace, q('.f-workspace'));
     this._fill(q('select[data-key="profile"]'), m.profile, q('.f-profile'));
+    for (const axis of LAUNCH_TUNING) {
+      this._fill(q(`select[data-key="${axis}"]`), m[axis], q(`.f-${axis}`));
+    }
 
     // A resume brings its own agent and folder, so those choices step back.
     const resume = m.resume ? this._state(m.resume) : '';
@@ -1255,6 +1268,14 @@ class AgentBridgeLaunchCard extends HTMLElement {
     // The profile applies only under Agency.
     if (m.agent && agent && agent !== 'Agency') { q('.f-profile').hidden = true; }
 
+    // Model, effort and context still apply to a resume - they are options of this
+    // launch, not properties of the conversation - so unlike agent and workspace they
+    // are not dimmed. An axis left at 'Agent default' is not worth a line in the
+    // summary, but the row itself stays, because it is how you change it.
+    const tuning = LAUNCH_TUNING
+      .map((axis) => (m[axis] ? this._state(m[axis]) : ''))
+      .filter((value) => value && value !== LAUNCH_TUNING_DEFAULT && !['unknown', 'unavailable'].includes(value));
+
     const promptState = this._state(m.prompt);
     if (this.shadowRoot.activeElement !== this._els.prompt && !this._els.prompt.value && promptState.trim() &&
         !['unknown', 'unavailable'].includes(promptState)) {
@@ -1264,7 +1285,7 @@ class AgentBridgeLaunchCard extends HTMLElement {
     const workspace = this._state(m.workspace);
     const bits = resuming ? [`Resume: ${resume}`] : [agent, workspace].filter((b) => b && !['unknown', 'unavailable'].includes(b));
     if (machines.length > 1) { bits.unshift(m.machine); }
-    this._els.summary.textContent = bits.join(' · ');
+    this._els.summary.textContent = bits.concat(tuning).join(' · ');
     this._els.launch.textContent = resuming ? 'Resume' : 'Launch';
 
     // The note: the daemon's word on the last press, or "Launching..." from the

@@ -54,6 +54,99 @@ Test-That 'this machine is online by definition, with its own capabilities' {
 Test-That 'a peer carries what it reported' { $p = $cards | Where-Object Slug -eq 'laptop'; $p.IncludeProfile -and -not $p.IncludeAgent }
 Test-That 'a peer that reported nothing offers nothing' { $p = $cards | Where-Object Slug -eq 'attic'; -not $p.IncludeProfile -and -not $p.Online }
 
+# Model, effort and context are reported as a capability of their own, so a peer still
+# running a bridge from before those entities existed gets a launch card without the
+# rows rather than three "Entity not found" boxes.
+Test-That 'a capability set from before the tuning rows is read, not thrown on' {
+    $me = @(Get-DaemonMachineCards -Capabilities @{ profile = $false; resume = $true; agent = $true } -Peers @()) |
+        Where-Object Slug -eq $script:DaemonMachineSlug
+    $me.IncludeTuning -eq $false
+}
+Test-That 'and a machine that has them says so' {
+    $me = @(Get-DaemonMachineCards -Capabilities @{ profile = $false; resume = $true; agent = $true; tuning = $true } -Peers @()) |
+        Where-Object Slug -eq $script:DaemonMachineSlug
+    $me.IncludeTuning
+}
+Test-That 'a peer without the capability gets no tuning rows' {
+    (@(Get-DaemonMachineCards -Capabilities @{ profile = $false; resume = $true; agent = $true } -Peers $peers) |
+        Where-Object Slug -eq 'laptop').IncludeTuning -eq $false
+}
+
+Write-Host '--- what a session is running with ---'
+# The command line is the only record of effort and context: neither appears in a
+# transcript and no agent reports them back, so the daemon keeps what it launched with
+# and hands it to the card. A session started at a keyboard has none, and its card
+# then shows no settings line rather than guessing at the agent's defaults.
+$script:DaemonLaunchedTuning = @{}
+$launchedId = 'aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee'
+$script:DaemonLaunchedTuning[$launchedId] = [pscustomobject]@{
+    Model = 'gpt-5.4'; Effort = 'xhigh'; Context = 'long_context'; At = [DateTimeOffset]::Now
+}
+$claimed = Get-DaemonSessionTuning -SessionId $launchedId
+Test-That 'a session the bridge launched carries what it was launched with' {
+    $claimed.Model -eq 'gpt-5.4' -and $claimed.Effort -eq 'xhigh' -and $claimed.Context -eq 'long_context'
+}
+Test-That 'and the record is consumed, so nothing else can inherit it' {
+    -not $script:DaemonLaunchedTuning.ContainsKey($launchedId)
+}
+Test-That 'a session the bridge did not launch carries nothing' {
+    $none = Get-DaemonSessionTuning -SessionId 'ffffffff-0000-0000-0000-000000000000'
+    $none.Model -eq '' -and $none.Effort -eq '' -and $none.Context -eq ''
+}
+
+# Codex picks its own id, so its launch is filed under a pending key and claimed by
+# the first session to appear - the same rule its registration matcher already uses.
+# Codex picks its own id, so its launch waits under the pending key until
+# Update-DaemonPendingLaunch learns which session it produced and moves the record
+# across. Nothing claims a pending record by guesswork, so an unrelated session
+# adopted in the meantime gets nothing.
+$script:DaemonLaunchedTuning = @{ $script:DaemonPendingTuningKey = [pscustomobject]@{
+    Model = 'gpt-5.3-codex'; Effort = 'high'; Context = ''; At = [DateTimeOffset]::Now } }
+Test-That 'a session adopted while a launch is still pending claims nothing' {
+    (Get-DaemonSessionTuning -SessionId 'opened-by-hand').Effort -eq '' -and
+    $script:DaemonLaunchedTuning.ContainsKey($script:DaemonPendingTuningKey)
+}
+Test-That 'and once the launch is re-keyed onto the id it registered under, that session gets it' {
+    $real = 'codex-picked-this-id'
+    $script:DaemonLaunchedTuning[$real] = $script:DaemonLaunchedTuning[$script:DaemonPendingTuningKey]
+    [void]$script:DaemonLaunchedTuning.Remove($script:DaemonPendingTuningKey)
+    (Get-DaemonSessionTuning -SessionId $real).Effort -eq 'high'
+}
+# A launch whose session never appears would otherwise sit here for the life of the
+# daemon, and the next launch of that agent would find it waiting.
+$script:DaemonLaunchedTuning = @{ $script:DaemonPendingTuningKey = [pscustomobject]@{
+    Model = 'gpt-5.3-codex'; Effort = 'high'; Context = ''; At = [DateTimeOffset]::Now.AddMinutes(-20) } }
+Clear-DaemonStaleLaunchTuning
+Test-That 'a launch that never registered is eventually dropped' {
+    $script:DaemonLaunchedTuning.Count -eq 0
+}
+$script:DaemonLaunchedTuning = @{ 'fresh-one' = [pscustomobject]@{
+    Model = 'gpt-5.4'; Effort = ''; Context = ''; At = [DateTimeOffset]::Now } }
+Clear-DaemonStaleLaunchTuning
+Test-That 'while one still waiting on its session is left alone' {
+    $script:DaemonLaunchedTuning.ContainsKey('fresh-one')
+}
+
+# Codex names its model on every hook call, which beats the launch record for the same
+# reason a transcript beats a command line: it is what the session is actually using.
+$script:DaemonLaunchedTuning = @{ $launchedId = [pscustomobject]@{
+    Model = 'gpt-5.4'; Effort = 'xhigh'; Context = ''; At = [DateTimeOffset]::Now } }
+Test-That 'a model the agent reports itself wins over the one it was launched with' {
+    $reported = Get-DaemonSessionTuning -SessionId $launchedId -Session ([pscustomobject]@{ Model = 'gpt-5.3-codex' })
+    $reported.Model -eq 'gpt-5.3-codex' -and $reported.Effort -eq 'xhigh'
+}
+
+Test-That 'only settings that are known reach the card' {
+    $attrs = Add-DaemonTuningAttributes -Attributes @{ session = 'x' } `
+        -Tuning ([pscustomobject]@{ Model = 'gpt-5.4'; Effort = ''; Context = $null })
+    $attrs['model'] -eq 'gpt-5.4' -and -not $attrs.ContainsKey('effort') -and -not $attrs.ContainsKey('context')
+}
+Test-That 'a session restored from an older state file simply has none' {
+    $attrs = Add-DaemonTuningAttributes -Attributes @{ session = 'x' } -Tuning ([pscustomobject]@{ Name = 'old' })
+    $attrs.Count -eq 1
+}
+$script:DaemonLaunchedTuning = @{}
+
 Write-Host '--- one reconcile pass ---'
 # Everything that would reach Home Assistant is stood in for.
 $script:Log = @()

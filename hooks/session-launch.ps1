@@ -494,13 +494,15 @@ $script:BridgeLaunchers = [ordered]@{
         Resumable = { param($Limit, $Found) Get-BridgeClaudeSessionEntries -Limit $Limit }
         ResumeOrder = 1
         Arguments = {
-            param($SessionId, $Model, $AllowAllTools, $Extras, $Resuming, $FlatPrompt)
+            param($SessionId, $Model, $AllowAllTools, $Extras, $Resuming, $FlatPrompt, $Effort, $Context)
             $arguments = @()
             # Claude refuses an id already in use, so a resume needs `--resume <id>`.
             if (-not [string]::IsNullOrWhiteSpace($SessionId)) {
                 $arguments += if ($Resuming) { @('--resume', $SessionId) } else { @('--session-id', $SessionId) }
             }
             if (-not [string]::IsNullOrWhiteSpace($Model)) { $arguments += @('--model', $Model) }
+            $arguments += @(Get-BridgeTuningArguments -Launcher 'claude' -Axis 'effort' -Value $Effort)
+            $arguments += @(Get-BridgeTuningArguments -Launcher 'claude' -Axis 'context' -Value $Context)
             # Opt-in only, as for Copilot.
             if ($AllowAllTools) { $arguments += '--dangerously-skip-permissions' }
             $arguments += $Extras
@@ -526,7 +528,7 @@ $script:BridgeLaunchers = [ordered]@{
         Resumable = { param($Limit, $Found) Get-BridgeCodexSessionEntries -Limit $Limit }
         ResumeOrder = 2
         Arguments = {
-            param($SessionId, $Model, $AllowAllTools, $Extras, $Resuming, $FlatPrompt)
+            param($SessionId, $Model, $AllowAllTools, $Extras, $Resuming, $FlatPrompt, $Effort, $Context)
             # Without its shared background daemon, Codex runs hooks from its own
             # window's process. Under the daemon - which has no console - Windows opened
             # a console window for every hook, several a turn, and a reply could not tell
@@ -535,6 +537,11 @@ $script:BridgeLaunchers = [ordered]@{
             # Reasoning summaries, which the card streams; without this Codex writes its
             # reasoning encrypted and there is nothing to show.
             if ([bool](Get-BridgeSetting 'detailedActivity' $true)) { $arguments += @('-c', 'model_reasoning_summary=detailed') }
+            # Effort and context are `-c` overrides rather than flags of their own, so
+            # they join the one above, ahead of the subcommand where Codex reads its
+            # global options.
+            $arguments += @(Get-BridgeTuningArguments -Launcher 'codex' -Axis 'effort' -Value $Effort)
+            $arguments += @(Get-BridgeTuningArguments -Launcher 'codex' -Axis 'context' -Value $Context)
             if ($Resuming) { $arguments += 'resume' }
             if (-not [string]::IsNullOrWhiteSpace($Model)) { $arguments += @('--model', $Model) }
             # Opt-in only. Codex keeps its sandbox; only approvals go.
@@ -790,6 +797,286 @@ function Get-BridgeLauncherKind {
     'copilot'
 }
 
+# How long a discovered model list is kept. Only Copilot can be asked for one, and
+# that costs a process launch (about 0.7 s), which is far too much to spend on every
+# reconcile. Half an hour is well inside the time it takes to notice a new model
+# exists, and a bridge restart re-reads it anyway.
+$script:BridgeModelCacheMinutes = 30
+$script:BridgeModelCache = @{}
+
+function Get-BridgeCopilotModelList {
+    <#
+        The models Copilot will accept, read from `copilot help config`.
+
+        Copilot prints its model list under the `model` setting, which is the only
+        machine-readable list any of the agents offer - Claude and Codex document
+        theirs only in prose, so those stay configured lists. Discovering it matters
+        because the set turns over quickly: a hard-coded list is wrong within weeks,
+        and a wrong list here means a launch that fails at the command line.
+
+        Returns @() when Copilot is not installed or the output does not parse, and
+        the caller then falls back to its configured list.
+    #>
+    param([string]$Path)
+
+    if (-not $Path) { $Path = Get-BridgeCopilotPath }
+    if ([string]::IsNullOrWhiteSpace($Path)) { return @() }
+
+    $stamp = ''
+    try { $stamp = [string](Get-Item -LiteralPath $Path -ErrorAction Stop).LastWriteTimeUtc.Ticks } catch { }
+    $key = "$Path|$stamp"
+    $cached = $script:BridgeModelCache[$key]
+    if ($null -ne $cached -and ([DateTimeOffset]::Now - $cached.At).TotalMinutes -lt $script:BridgeModelCacheMinutes) {
+        return @($cached.Models)
+    }
+
+    $models = @()
+    try {
+        $raw = & $Path help config 2>$null | Out-String
+        # The block of quoted names directly under "`model`:" and nothing else: the
+        # same file lists themes and modes in the same shape, so the match is anchored
+        # to that heading rather than hunting for quoted strings anywhere.
+        $block = [regex]::Match($raw, '(?ms)^\s*`model`:.*?\r?\n((?:[ \t]*-[ \t]*"[^"]+"[ \t]*\r?\n)+)')
+        if ($block.Success) {
+            $models = @([regex]::Matches($block.Groups[1].Value, '"([^"]+)"') |
+                ForEach-Object { [string]$_.Groups[1].Value } |
+                Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        }
+    }
+    catch { }
+
+    # Cached either way, including an empty answer: a machine where the call fails
+    # should not retry it on every reconcile.
+    $script:BridgeModelCache[$key] = [pscustomobject]@{ At = [DateTimeOffset]::Now; Models = @($models) }
+    @($models)
+}
+
+# What each agent accepts on each axis, and how it is spelled on the command line.
+# Keyed by launcher kind, so Agency - which starts Copilot sessions - shares
+# Copilot's entry.
+#
+#   Options     the values offered, beyond 'Agent default'
+#   Discover    an optional extra source of Options, merged ahead of the built-in list
+#   Arguments   the flag form of a chosen value
+#
+# Verified against the installed CLIs rather than guessed: `copilot --reasoning-effort
+# bogus` and `--context bogus` both exit 1 naming the valid set, and `claude
+# --autocompact bogus` prints the accepted range. Claude has no context-window switch
+# at all; --autocompact, which sets the window it compacts at, is the nearest thing
+# and is what the Context row drives for it.
+$script:BridgeLauncherTuning = @{
+    copilot = @{
+        model = @{
+            Options   = @('auto')
+            Discover  = { Get-BridgeCopilotModelList }
+            Arguments = { param($Value) @('--model', $Value) }
+        }
+        effort = @{
+            Options   = @('none', 'minimal', 'low', 'medium', 'high', 'xhigh', 'max')
+            Arguments = { param($Value) @('--reasoning-effort', $Value) }
+        }
+        context = @{
+            Options   = @('default', 'long_context')
+            Arguments = { param($Value) @('--context', $Value) }
+        }
+    }
+    claude = @{
+        model = @{
+            Options   = @('opus', 'sonnet', 'haiku', 'fable')
+            Arguments = { param($Value) @('--model', $Value) }
+        }
+        effort = @{
+            Options   = @('low', 'medium', 'high', 'xhigh', 'max')
+            Arguments = { param($Value) @('--effort', $Value) }
+        }
+        context = @{
+            Options   = @('auto', '200k', '500k', '1m')
+            Arguments = { param($Value) @('--autocompact', $Value) }
+        }
+    }
+    codex = @{
+        model = @{
+            Options   = @('gpt-5.3-codex', 'gpt-5.4', 'gpt-5.4-mini')
+            Arguments = { param($Value) @('--model', $Value) }
+        }
+        effort = @{
+            Options   = @('minimal', 'low', 'medium', 'high')
+            Arguments = { param($Value) @('-c', "model_reasoning_effort=$Value") }
+        }
+        context = @{
+            Options   = @('200000', '400000', '1000000')
+            Arguments = { param($Value) @('-c', "model_context_window=$Value") }
+        }
+    }
+}
+
+function Get-BridgeTuningLauncherKey {
+    <#
+        Which tuning entry a launcher uses. Agency starts Copilot sessions and passes
+        Copilot's own flags straight through, so the two share one entry rather than
+        keeping duplicate lists that could drift apart.
+    #>
+    param([AllowEmptyString()][AllowNull()][string]$Launcher)
+    if ($Launcher -eq 'agency') { return 'copilot' }
+    [string]$Launcher
+}
+
+function Get-BridgeConfiguredTuning {
+    <#
+        The raw `newSession.<axis>.<launcher>` value, with no validation - or
+        `newSession.model` for Copilot, which named the launch model before any of
+        this existed and still does.
+
+        Deliberately unvalidated. This comes from the bridge's own config file, which
+        is exactly as trusted as `newSession.extraArgs` sitting beside it, and a
+        machine configured for a model the installed CLI has not yet advertised
+        (a preview, a BYOK provider) must keep working. What arrives from Home
+        Assistant is a different matter and goes through Resolve-BridgeTuningValue.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Launcher,
+        [Parameter(Mandatory)][string]$Axis
+    )
+
+    $key = Get-BridgeTuningLauncherKey -Launcher $Launcher
+    $configured = [string](Get-BridgeSetting "newSession.$Axis.$key" '')
+    if ([string]::IsNullOrWhiteSpace($configured) -and $Axis -eq 'model') {
+        $configured = [string](Get-BridgeSetting 'newSession.model' '')
+    }
+    $configured.Trim()
+}
+
+function Get-BridgeTuningOptions {
+    <#
+        What an agent's selector offers on one axis: 'Agent default' first, then the
+        values it accepts.
+
+        `newSession.<axis>s.<launcher>` replaces the built-in list outright, for the
+        same reason `newSession.profiles` exists: the set of models worth offering is
+        a matter of taste and of what an account can actually reach, and a list of
+        twenty-six on a phone is not a choice, it is a scroll. A configured list is
+        taken as given - it is the user's own - but is still validated on the way back
+        in, so nothing here lets an arbitrary string reach a command line.
+
+        The keys are `newSession.models.copilot`, `newSession.efforts.claude`,
+        `newSession.contexts.codex` and so on; `agency` reads Copilot's key, since
+        that is the command line it builds.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Launcher,
+        [Parameter(Mandatory)][string]$Axis
+    )
+
+    $key = Get-BridgeTuningLauncherKey -Launcher $Launcher
+    $entry = $script:BridgeLauncherTuning[$key]
+    if ($null -eq $entry -or -not $entry.ContainsKey($Axis)) { return @() }
+
+    $configured = @(Get-BridgeSetting "newSession.${Axis}s.$key" @() |
+        ForEach-Object { [string]$_ } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+
+    $values = if ($configured.Count -gt 0) { $configured } else {
+        $built = @($entry[$Axis].Options)
+        # Discovery adds to the built-in list rather than replacing it, so 'auto' -
+        # which Copilot accepts but does not print among its models - stays offered.
+        if ($entry[$Axis].ContainsKey('Discover')) {
+            $found = @()
+            try { $found = @(& $entry[$Axis].Discover) } catch { }
+            if ($found.Count -gt 0) { $built = @($built) + @($found) }
+        }
+        $built
+    }
+
+    # Distinct, order preserved, and never carrying the sentinel twice.
+    $seen = @{}
+    $ordered = New-Object System.Collections.Generic.List[string]
+    $ordered.Add($script:BridgeTuningDefaultOption)
+    $seen[$script:BridgeTuningDefaultOption] = $true
+    # The configured default joins the list even when it is on no other, so a machine
+    # set to a model its CLI does not advertise - a preview, a BYOK provider - can
+    # still be seen and re-selected on the card rather than silently launching as
+    # something the card never showed.
+    foreach ($value in @(@(Get-BridgeConfiguredTuning -Launcher $Launcher -Axis $Axis)) + @($values)) {
+        $text = [string]$value
+        if ([string]::IsNullOrWhiteSpace($text) -or $seen.ContainsKey($text)) { continue }
+        $seen[$text] = $true
+        $ordered.Add($text)
+    }
+    $ordered.ToArray()
+}
+
+function Get-BridgeDefaultTuning {
+    <#
+        The value an axis opens on: what `newSession.<axis>.<launcher>` asks for, or
+        'Agent default' when it asks for nothing.
+
+        Falls back to 'Agent default' rather than refusing, for the same reason the
+        workspace does: pressing Launch must never require a preceding selection.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Launcher,
+        [Parameter(Mandatory)][string]$Axis
+    )
+
+    $configured = Get-BridgeConfiguredTuning -Launcher $Launcher -Axis $Axis
+    if ([string]::IsNullOrWhiteSpace($configured)) { return $script:BridgeTuningDefaultOption }
+    $configured
+}
+
+function Resolve-BridgeTuningValue {
+    <#
+        Validates a value arriving from Home Assistant against what the chosen agent
+        actually offers, and returns '' for "pass nothing" - the sentinel, an empty or
+        unknown selector, or an option the agent does not have.
+
+        The same contract as Resolve-BridgeWorkspacePath and Resolve-BridgeAgencyProfile:
+        a value from outside is never put on a command line unchecked. It matters more
+        here than for a profile, because these three land next to a shell invocation
+        in the agent's own argument parser.
+
+        Unlike those two, an unrecognised value is not an error worth refusing a launch
+        over - it means the agent selector moved and this selector has not caught up
+        yet - so it quietly means "agent default" instead.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Launcher,
+        [Parameter(Mandatory)][string]$Axis,
+        [AllowEmptyString()][AllowNull()][string]$Value
+    )
+
+    $text = ([string]$Value).Trim()
+    if ([string]::IsNullOrWhiteSpace($text)) { return '' }
+    if ($text -in @($script:BridgeTuningDefaultOption, 'unknown', 'unavailable')) { return '' }
+
+    $match = @(Get-BridgeTuningOptions -Launcher $Launcher -Axis $Axis) |
+        Where-Object { $_ -eq $text } | Select-Object -First 1
+    if ([string]::IsNullOrWhiteSpace($match) -or $match -eq $script:BridgeTuningDefaultOption) { return '' }
+    [string]$match
+}
+
+function Get-BridgeTuningArguments {
+    <#
+        The flag form of one resolved value, or @() for "pass nothing".
+
+        Takes the value through Resolve-BridgeTuningValue first, so this cannot be
+        used to smuggle an unvalidated string onto a command line even if a caller
+        forgets to validate.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Launcher,
+        [Parameter(Mandatory)][string]$Axis,
+        [AllowEmptyString()][AllowNull()][string]$Value
+    )
+
+    $resolved = Resolve-BridgeTuningValue -Launcher $Launcher -Axis $Axis -Value $Value
+    if ([string]::IsNullOrWhiteSpace($resolved)) { return @() }
+
+    $key = Get-BridgeTuningLauncherKey -Launcher $Launcher
+    $entry = $script:BridgeLauncherTuning[$key]
+    if ($null -eq $entry -or -not $entry.ContainsKey($Axis)) { return @() }
+    @(& $entry[$Axis].Arguments $resolved)
+}
+
 function Get-BridgeAgencyProfiles {
     <#
         The Agency profiles offered on the dashboard.
@@ -858,11 +1145,21 @@ function Get-BridgeNewSessionArguments {
         -Resume reopens the session named by -SessionId. Copilot and Agency do that
         with the same --session-id; Claude refuses an id already in use and needs
         `--resume <id>`; Codex needs its `resume <id>` subcommand.
+
+        -Effort and -Context are spelled differently by every agent - Copilot has
+        --reasoning-effort and --context, Claude has --effort and (for want of a real
+        context switch) --autocompact, Codex has neither and takes both as `-c`
+        overrides - so each launcher splices them in itself, from the one table in
+        $script:BridgeLauncherTuning. Both are validated against that table on the way
+        through, so an unknown value means "leave it to the agent" rather than
+        reaching a command line.
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$SessionId,
         [string]$Prompt = '',
         [string]$Model = '',
+        [string]$Effort = '',
+        [string]$Context = '',
         [switch]$AllowAllTools,
         [string[]]$ExtraArguments = @(),
         [ValidateScript({ $script:BridgeLaunchers.Contains($_) })][string]$Launcher = 'copilot',
@@ -878,13 +1175,15 @@ function Get-BridgeNewSessionArguments {
     # Agency share the one below.
     $own = (Get-BridgeLauncher -Launcher $Launcher).Arguments
     if ($own) {
-        return @(& $own $SessionId $Model $AllowAllTools.IsPresent $extras $resuming $flatPrompt)
+        return @(& $own $SessionId $Model $AllowAllTools.IsPresent $extras $resuming $flatPrompt $Effort $Context)
     }
 
     # Copilot-side arguments, identical in both modes.
     $copilotArguments = @('--banner')
 
     if (-not [string]::IsNullOrWhiteSpace($Model)) { $copilotArguments += @('--model', $Model) }
+    $copilotArguments += @(Get-BridgeTuningArguments -Launcher 'copilot' -Axis 'effort' -Value $Effort)
+    $copilotArguments += @(Get-BridgeTuningArguments -Launcher 'copilot' -Axis 'context' -Value $Context)
 
     # Off unless explicitly configured. A session launched from a phone may well run
     # unattended, so blanket approval is not handed out by default.
@@ -1479,6 +1778,15 @@ function Start-BridgeCopilotSession {
         # 'agency', 'copilot', 'claude' or 'codex'; empty means the default.
         [string]$Launcher = '',
 
+        # The three tuning axes, as chosen on the launch card. Each is a label from
+        # that agent's own option list; anything else - including the 'Agent default'
+        # sentinel - means "pass nothing and let the agent decide". Empty falls back
+        # to what the config asks for, which is how a launch from the command line or
+        # from an older daemon still honours `newSession.model`.
+        [AllowEmptyString()][string]$Model = '',
+        [AllowEmptyString()][string]$Effort = '',
+        [AllowEmptyString()][string]$Context = '',
+
         # Resuming an existing session rather than creating one. Copilot and Agency
         # resume whenever --session-id names a session that exists; Claude and Codex
         # need their own resume syntax (Get-BridgeNewSessionArguments).
@@ -1491,6 +1799,9 @@ function Start-BridgeCopilotSession {
         ProcessId = 0
         Launcher  = ''
         Detail    = ''
+        Model     = ''
+        Effort    = ''
+        Context   = ''
     }
 
     if (-not [System.IO.Directory]::Exists($WorkingDirectory)) {
@@ -1517,12 +1828,32 @@ function Start-BridgeCopilotSession {
         $result.SessionId = [guid]::NewGuid().ToString()
     }
 
+    # Each axis: what the card chose, or - when it chose nothing - what the config
+    # asks for. Resolved here rather than in the argument builder so the result can
+    # report what the session was actually started with, which is what the session
+    # card then shows.
+    $chosen = @{}
+    foreach ($axis in @(Get-BridgeTuningAxes)) {
+        $asked = switch ($axis) { 'model' { $Model } 'effort' { $Effort } 'context' { $Context } }
+        $value = Resolve-BridgeTuningValue -Launcher $launcher -Axis $axis -Value $asked
+        if ([string]::IsNullOrWhiteSpace($value)) {
+            $value = Resolve-BridgeTuningValue -Launcher $launcher -Axis $axis `
+                -Value (Get-BridgeDefaultTuning -Launcher $launcher -Axis $axis)
+        }
+        $chosen[$axis] = $value
+    }
+    $result.Model = $chosen['model']
+    $result.Effort = $chosen['effort']
+    $result.Context = $chosen['context']
+
     # Wrapped: an empty list (Codex with no prompt and no options) came back as $null
     # and failed the launch before anything started.
     $arguments = @(Get-BridgeNewSessionArguments `
         -SessionId $result.SessionId `
         -Prompt $Prompt `
-        -Model ([string](Get-BridgeSetting 'newSession.model' '')) `
+        -Model $chosen['model'] `
+        -Effort $chosen['effort'] `
+        -Context $chosen['context'] `
         -AllowAllTools:([bool](Get-BridgeSetting 'newSession.allowAllTools' $false)) `
         -ExtraArguments @(Get-BridgeSetting 'newSession.extraArgs' @()) `
         -Launcher $launcher `
