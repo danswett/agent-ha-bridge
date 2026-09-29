@@ -84,13 +84,26 @@ try {
     Test-That 'and it is matched on the tag' { $close -match 'custom title of t is "agent-bridge:999"' } $close
     # The failure that matters: a script that closes windows it has not matched.
     Test-That 'nothing is closed outside the matched set' {
-        $close -match 'repeat with w in doomed' -and $close -notmatch 'close every window'
+        $close -match 'repeat with wid in doomed' -and $close -notmatch 'close every window'
     } $close
     Test-That 'the matched windows are collected before any is closed' {
-        $close.IndexOf('set end of doomed') -lt $close.IndexOf('repeat with w in doomed')
+        $close.IndexOf('set end of doomed') -lt $close.IndexOf('repeat with wid in doomed')
     }
+    # Three tagged windows on a real Mac produced exactly one close. `repeat with w in
+    # windows` yields positional references - `window 1`, `window 2` - so closing the
+    # first shifts every later one down and the rest of the list points at whatever
+    # moved into the slot, which could be a window of the user's.
+    Test-That 'windows are remembered by id, not by their position in the list' {
+        $close -match 'set wid to id of w' -and $close -match 'first window whose id is wid'
+    } $close
+    Test-That 'and no positional reference is ever closed' {
+        $close -notmatch 'close w saving no' -and $close -notmatch '(?m)^\s*close w\s*$'
+    } $close
+    Test-That 'a window matched by two of its tabs is only closed once' {
+        $close -match 'doomed does not contain wid'
+    } $close
     Test-That 'Terminal is not asked to confirm a window it thinks is busy' {
-        $close -match 'close w saving no'
+        $close -match 'close \(first window whose id is wid\) saving no'
     } $close
     # A real Mac reported "closed one" while the window was still on screen: `close`
     # sits inside a `try`, so a close that fails is swallowed, and returning the
@@ -141,6 +154,7 @@ try {
     $iterm = $script:Sent -join "`n"
     Test-That 'iTerm tags the session it just created' { $iterm -match 'set name to "agent-bridge:77"' } $iterm
     Test-That 'and closes by that name' { $iterm -match 'if name of s is "agent-bridge:77"' } $iterm
+    Test-That 'closing that window by id too' { $iterm -match 'first window whose id is wid' } $iterm
     Test-That 'never falling back to Terminal syntax' { $iterm -notmatch 'custom title' } $iterm
 
     Write-Host "`n--- on Windows this is not the mechanism ---"

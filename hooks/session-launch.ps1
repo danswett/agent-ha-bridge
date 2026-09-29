@@ -2109,9 +2109,19 @@ function Close-BridgeTerminalWindow {
     if ($script:BridgeIsWindows) { return $false }
 
     $safeTitle = $Title.Replace('\', '\\').Replace('"', '\"')
-    # The windows are collected before any is closed: closing while walking the same
-    # list is how AppleScript ends up skipping entries or erroring on a stale
-    # reference. `saving no` stops Terminal asking about a window it thinks is busy.
+    # Windows are collected as ids, not as the references `repeat with w in windows`
+    # hands out. Those are positional - `window 1`, `window 2` - so closing the first
+    # shifts every later one down and the rest of the list then points at whatever
+    # moved into that slot. With one match it happens to work; with more it closes one
+    # window and misses the others, and the window it reaches for on the second pass
+    # could be one of the user's. Ids do not move. Measured on a real Mac, where three
+    # tagged windows produced exactly one close.
+    #
+    # `saving no` stops Terminal asking about a window it thinks is busy. It does not
+    # override the separate "terminate running processes?" confirmation, so a window
+    # with something still running in it stays - which is the wanted answer: the
+    # bridge's window runs `tmux attach`, long returned by the time this is called, so
+    # a busy one means something unexpected is alive in there.
     #
     # What comes back is how many actually went, counted by looking again - not how
     # many matched. `close` is wrapped in `try` because a window that has already gone
@@ -2126,14 +2136,17 @@ tell application "iTerm"
     repeat with t in tabs of w
       repeat with s in sessions of t
         try
-          if name of s is "$safeTitle" then set end of doomed to w
+          if name of s is "$safeTitle" then
+            set wid to id of w
+            if doomed does not contain wid then set end of doomed to wid
+          end if
         end try
       end repeat
     end repeat
   end repeat
-  repeat with w in doomed
+  repeat with wid in doomed
     try
-      close w
+      close (first window whose id is wid)
     end try
   end repeat
   delay 0.3
@@ -2158,13 +2171,16 @@ tell application "Terminal"
   repeat with w in windows
     repeat with t in tabs of w
       try
-        if custom title of t is "$safeTitle" then set end of doomed to w
+        if custom title of t is "$safeTitle" then
+          set wid to id of w
+          if doomed does not contain wid then set end of doomed to wid
+        end if
       end try
     end repeat
   end repeat
-  repeat with w in doomed
+  repeat with wid in doomed
     try
-      close w saving no
+      close (first window whose id is wid) saving no
     end try
   end repeat
   delay 0.3

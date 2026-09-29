@@ -84,25 +84,49 @@ function Remove-TaggedWindows {
     #>
     param([string[]]$Titles)
     foreach ($t in $Titles) {
+        # Anything still running has to go first: `close saving no` suppresses the
+        # save prompt, not the "terminate running processes?" one, so a busy window
+        # will not close. Killing whatever is on the tab's tty makes it closable.
+        # Only ever applied to windows carrying these test tags.
+        $ttyScript = @"
+tell application "Terminal"
+  set found to {}
+  repeat with w in windows
+    repeat with tb in tabs of w
+      try
+        if custom title of tb is "$t" then set end of found to tty of tb
+      end try
+    end repeat
+  end repeat
+  set AppleScript's text item delimiters to " "
+  return found as text
+end tell
+"@
+        $ttys = (& osascript -e $ttyScript 2>&1 | Out-String).Trim()
+        foreach ($tty in ($ttys -split '\s+' | Where-Object { $_ -match '^/dev/tty' })) {
+            & pkill -t ([System.IO.Path]::GetFileName($tty)) 2>&1 | Out-Null
+        }
+        Start-Sleep -Milliseconds 400
+
+        # Closed by id for the same reason the bridge does: the references
+        # `repeat with w in windows` yields are positional, so closing one shifts
+        # every later one onto a different window.
         $script = @"
 tell application "Terminal"
   set doomed to {}
   repeat with w in windows
     repeat with tb in tabs of w
       try
-        if custom title of tb is "$t" then set end of doomed to w
+        if custom title of tb is "$t" then
+          set wid to id of w
+          if doomed does not contain wid then set end of doomed to wid
+        end if
       end try
     end repeat
   end repeat
-  repeat with w in doomed
+  repeat with wid in doomed
     try
-      repeat with tb in tabs of w
-        try
-          do script "exit" in tb
-        end try
-      end repeat
-      delay 0.2
-      close w saving no
+      close (first window whose id is wid) saving no
     end try
   end repeat
 end tell
@@ -146,6 +170,29 @@ try {
     Check 'a second close finds nothing and says so' (-not (Close-BridgeTerminalWindow -Title $mine))
     Check 'an unknown tag closes nothing' (-not (Close-BridgeTerminalWindow -Title 'agent-bridge:never-existed'))
     Check "the user's window survived that too" ((Count-Tabs -Title $yours) -eq $yoursBefore)
+
+    Write-Host '--- several tagged windows all go, and only they ---'
+    # The case that exposed the positional-reference bug: with one match, closing
+    # `window 2` after `window 1` happens to be right, so a single window proves
+    # nothing. Three, with windows of the user's interleaved, is what caught it.
+    Open-Tagged -Title $yours
+    Open-Tagged -Title $mine
+    Open-Tagged -Title $yours
+    Open-Tagged -Title $mine
+    Open-Tagged -Title $mine
+    $manyMine = Count-Tabs -Title $mine
+    $manyYours = Count-Tabs -Title $yours
+    Write-Host "  before: bridge=$manyMine  user=$manyYours"
+    Check 'three bridge windows are open' ($manyMine -eq 3) "got $manyMine"
+    $manyClosed = Close-BridgeTerminalWindow -Title $mine
+    Start-Sleep -Seconds 2
+    $manyMineAfter = Count-Tabs -Title $mine
+    $manyYoursAfter = Count-Tabs -Title $yours
+    Write-Host "  after : bridge=$manyMineAfter  user=$manyYoursAfter"
+    Check 'it reports closing them' $manyClosed
+    Check 'every bridge window is gone' ($manyMineAfter -eq 0) "still $manyMineAfter"
+    Check "and none of the user's went with them" ($manyYoursAfter -eq $manyYours) `
+        "was $manyYours, now $manyYoursAfter"
 
     Write-Host '--- a window still running something ---'
     # Not the state the bridge's window is ever in: it runs `tmux attach`, which has
