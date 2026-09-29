@@ -669,6 +669,36 @@ to retry at full rate - it wants a long back-off and a line in the log naming th
 as the likely cause. Note this is the WebSocket path specifically;
 `Test-DecisionTransientHttpError` already declines to retry an unauthorised REST call.
 
+**Fixed 2026-09-28.** A refusal of the bridge itself now stops the bridge talking to
+Home Assistant at all for a while, rather than being retried. 401 is read as a rejected
+token and 403 as a ban - Home Assistant answers a banned address before it looks at
+credentials - and either opens a hold-off of 60s, then 300s, then 900s, cleared by any
+call that succeeds, because a successful login also resets Home Assistant's own count.
+While it is open `Assert-BridgeAuthAllowed` fails the call locally: the request is never
+made, so it cannot count towards a ban. Both WebSocket paths report their own
+rejections, which is the half that mattered - the watch reconnects every cycle and
+offers the same rejected token each time.
+
+The log now names what happened, once per hold-off rather than once per call. The
+daemon used to repeat `403 (Forbidden)`, which reads like a bad token and is not one,
+and the two have opposite remedies: a token is replaced, a ban is cleared out of
+`/config/ip_bans.yaml` - which the message says, along with the fact that restarting
+Home Assistant will not lift it.
+
+The danger here is the opposite mistake, so `tests/test-auth-backoff.ps1` asserts it
+both ways: a 500 and a refused connection must still be retried, or a Home Assistant
+restart would take the bridge off the air for fifteen minutes. Five mutations fail it -
+not holding calls back, retrying a rejection anyway, not clearing on success, treating
+a 500 as a rejection, and never growing the window. The suite stubs
+`Invoke-RestMethod`, so the one thing it cannot show is that a real PowerShell 401 is
+classified correctly; that was checked separately against a local `HttpListener`
+answering 401, which threw a genuine `HttpResponseException`, opened a 60s hold-off,
+and refused the second call without sending it.
+
+Still open here: the hold-off lives in the process that met the rejection. That is the
+daemon, which is the one that loops, but a hook is a fresh process each time and starts
+with a clear slate - worth a shared marker if hooks are ever seen contributing to this.
+
 Also open: **thinking never enters the history trail.** `History` only ever receives
 `Reading your message`, `Running: <tool>` and, for Copilot, assistant text; reasoning is
 published only as the single newest line (`response` with `response_kind: reasoning`).

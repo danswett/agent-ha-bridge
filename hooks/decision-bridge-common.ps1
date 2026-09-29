@@ -98,6 +98,156 @@ $script:DecisionBridgeConfig = @{
     WaitTransientFailureGraceMinutes = 5
 }
 
+# How long to stay away from Home Assistant after it rejects the bridge's credentials,
+# and how far that grows while it keeps rejecting them.
+#
+# Home Assistant bans an IP after `login_attempts_threshold` failed logins (10 by
+# default), and a successful login resets its count - so what is dangerous is not one
+# rejection but a steady stream of them with no success in between, which is exactly
+# what a daemon reconciling every 15 seconds produces. Six calls a cycle sits four
+# short of the threshold; anything else on the machine failing auth at the same time
+# closes the gap. Backing off is the whole mitigation: while the bridge says nothing,
+# the count cannot rise.
+$script:BridgeAuthBackoffSteps = @(60, 300, 900)
+$script:BridgeAuthBackoffUntil = $null
+$script:BridgeAuthBackoffStep = -1
+
+function Get-BridgeAuthBackoffSeconds {
+    <#
+        Seconds left before the bridge should speak to Home Assistant again, or 0 when
+        it may. Reading it after the window has passed clears it.
+    #>
+    if ($null -eq $script:BridgeAuthBackoffUntil) { return 0 }
+    $left = ($script:BridgeAuthBackoffUntil - [DateTimeOffset]::Now).TotalSeconds
+    if ($left -le 0) {
+        $script:BridgeAuthBackoffUntil = $null
+        return 0
+    }
+    [int][Math]::Ceiling($left)
+}
+
+function Register-BridgeAuthRejected {
+    <#
+        Records that Home Assistant refused the bridge's credentials, and holds every
+        further call off for a growing window.
+
+        Says so in the log, once per window rather than once per call, and names the
+        ban explicitly: the daemon used to report nothing but `403 (Forbidden)` over
+        and over, which reads like a bad token and is not one. The distinction matters
+        because the remedies are opposites - a token is replaced, a ban is cleared -
+        and because an IP ban survives restarting Home Assistant, which is the first
+        thing anyone tries.
+    #>
+    param(
+        [AllowEmptyString()][string]$Detail = '',
+
+        # A refusal at the HTTP layer rather than a refused token: Home Assistant
+        # answers a banned address before it ever looks at credentials.
+        [switch]$Banned
+    )
+
+    # Already holding off; do not let a burst of six calls push the window out six
+    # times, and do not log six times either.
+    if ((Get-BridgeAuthBackoffSeconds) -gt 0) { return }
+
+    if ($script:BridgeAuthBackoffStep -lt ($script:BridgeAuthBackoffSteps.Count - 1)) {
+        $script:BridgeAuthBackoffStep++
+    }
+    $seconds = $script:BridgeAuthBackoffSteps[$script:BridgeAuthBackoffStep]
+    $script:BridgeAuthBackoffUntil = [DateTimeOffset]::Now.AddSeconds($seconds)
+
+    $what = if ($Banned) {
+        'Home Assistant refused this machine outright, which is what it does to a banned address'
+    }
+    else {
+        "Home Assistant rejected the bridge's token"
+    }
+    $tail = if ($Banned) {
+        'A ban is written to /config/ip_bans.yaml and read back at startup, so restarting Home Assistant does not lift it - the file has to be emptied.'
+    }
+    else {
+        'Repeating a rejected login is what gets an IP banned, so nothing more will be sent until then.'
+    }
+    $suffix = if ([string]::IsNullOrWhiteSpace($Detail)) { '' } else { " ($Detail)" }
+    Write-BridgeAuthBackoffLog -Message "$what$suffix. Holding off for ${seconds}s. $tail"
+}
+
+function Register-BridgeAuthAccepted {
+    <#
+        Home Assistant accepted the bridge again, which also resets its own count of
+        failed logins - so the window and its growth start over.
+    #>
+    if ($null -eq $script:BridgeAuthBackoffUntil -and $script:BridgeAuthBackoffStep -lt 0) { return }
+    if ($null -ne $script:BridgeAuthBackoffUntil) {
+        Write-BridgeAuthBackoffLog -Message 'Home Assistant accepted the bridge again.'
+    }
+    $script:BridgeAuthBackoffUntil = $null
+    $script:BridgeAuthBackoffStep = -1
+}
+
+function Write-BridgeAuthBackoffLog {
+    <#
+        The daemon's log when there is one, the bridge log otherwise - so this is seen
+        wherever it happens without the library having to know who loaded it.
+    #>
+    param([Parameter(Mandatory)][string]$Message)
+
+    try {
+        $daemonLog = Get-Command Write-DaemonLog -ErrorAction SilentlyContinue
+        if ($daemonLog) { & $daemonLog -Message $Message; return }
+        Write-DecisionBridgeLog -Message $Message
+    }
+    catch { }
+}
+
+function Assert-BridgeAuthAllowed {
+    <#
+        Refuses a call while the bridge is holding off, without touching the network -
+        the point being that Home Assistant never sees it and its failed-login count
+        stays where it is.
+    #>
+    $left = Get-BridgeAuthBackoffSeconds
+    if ($left -gt 0) {
+        throw [UnauthorizedAccessException]::new(
+            "Home Assistant rejected the bridge's credentials; not retrying for ${left}s.")
+    }
+}
+
+function Test-BridgeAuthRejection {
+    <#
+        Whether a failed request was refused for who the bridge is, rather than for
+        anything retrying could fix. 401 is a rejected token; Home Assistant answers a
+        banned address with 403.
+
+        Returns '' for anything else, 'token' or 'banned' otherwise.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [System.Management.Automation.ErrorRecord]$ErrorRecord
+    )
+
+    $response = $null
+    if ($ErrorRecord.Exception.PSObject.Properties['Response']) {
+        $response = $ErrorRecord.Exception.Response
+    }
+    $status = 0
+    if ($null -ne $response) {
+        try { $status = [int]$response.StatusCode } catch { $status = 0 }
+    }
+    if ($status -eq 0) {
+        # A WebSocket upgrade refused before it is established carries its status in
+        # the message rather than in a Response.
+        $message = [string]$ErrorRecord.Exception.Message
+        if ($message -match "status code '(\d{3})'") { $status = [int]$Matches[1] }
+    }
+
+    switch ($status) {
+        401 { 'token' }
+        403 { 'banned' }
+        default { '' }
+    }
+}
+
 function Test-DecisionTransientHttpError {
     <#
         True for the failures a Home Assistant restart produces - connection refused,
@@ -351,6 +501,7 @@ function Invoke-DecisionHttpRequest {
     )
 
     Assert-BridgeHttpAllowed -Uri ([string]$Parameters['Uri'])
+    Assert-BridgeAuthAllowed
 
     $delayMs = $script:DecisionBridgeConfig.HttpRetryInitialDelayMs
     for ($attempt = 0; $attempt -le $RetryCount; $attempt++) {
@@ -367,9 +518,19 @@ function Invoke-DecisionHttpRequest {
         }
 
         try {
-            return Invoke-RestMethod @call
+            $answer = Invoke-RestMethod @call
+            Register-BridgeAuthAccepted
+            return $answer
         }
         catch {
+            # A refusal of the bridge itself is never retried, and stops the next call
+            # being made at all: repeating a rejected login is precisely what takes a
+            # machine from "one failure" to banned.
+            $rejection = Test-BridgeAuthRejection -ErrorRecord $_
+            if ($rejection) {
+                Register-BridgeAuthRejected -Detail ([string]$Parameters['Uri']) -Banned:($rejection -eq 'banned')
+                throw
+            }
             $isLast = $attempt -ge $RetryCount
             if ($isLast -or -not (Test-DecisionTransientHttpError -ErrorRecord $_)) {
                 throw

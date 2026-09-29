@@ -27,8 +27,19 @@ function Invoke-CopilotHaWebSocket {
     $socket = [Net.WebSockets.ClientWebSocket]::new()
     $cancel = [Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds($TimeoutSeconds))
     $results = @()
+    Assert-BridgeAuthAllowed
     try {
-        [void]$socket.ConnectAsync($wsUri, $cancel.Token).GetAwaiter().GetResult()
+        try {
+            [void]$socket.ConnectAsync($wsUri, $cancel.Token).GetAwaiter().GetResult()
+        }
+        catch {
+            # A banned address is refused here, before the socket exists and before
+            # any token is offered, so it is only ever visible as the upgrade's status
+            # code.
+            $rejection = Test-BridgeAuthRejection -ErrorRecord $_
+            if ($rejection) { Register-BridgeAuthRejected -Detail '/api/websocket' -Banned:($rejection -eq 'banned') }
+            throw
+        }
 
         $receive = {
             $buffer = [ArraySegment[byte]]::new([byte[]]::new(65536))
@@ -58,8 +69,12 @@ function Invoke-CopilotHaWebSocket {
         & $send @{ type = 'auth'; access_token = $token }
         $auth = & $receive
         if ($auth.type -ne 'auth_ok') {
+            # This is the call Home Assistant counts towards a ban. Saying nothing
+            # for a while is the only thing that stops the count rising.
+            Register-BridgeAuthRejected -Detail '/api/websocket'
             throw 'Home Assistant WebSocket authentication failed.'
         }
+        Register-BridgeAuthAccepted
 
         $id = 0
         foreach ($command in $Commands) {
@@ -143,8 +158,17 @@ function Wait-CopilotHaStateChange {
     $cancel = [Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds($TimeoutSeconds + 15))
     $deadline = [DateTimeOffset]::Now.AddSeconds($TimeoutSeconds)
 
+    Assert-BridgeAuthAllowed
     try {
-        [void]$socket.ConnectAsync($wsUri, $cancel.Token).GetAwaiter().GetResult()
+        try {
+            [void]$socket.ConnectAsync($wsUri, $cancel.Token).GetAwaiter().GetResult()
+        }
+        catch {
+            # A banned address is refused at the upgrade, before any token is offered.
+            $rejection = Test-BridgeAuthRejection -ErrorRecord $_
+            if ($rejection) { Register-BridgeAuthRejected -Detail '/api/websocket' -Banned:($rejection -eq 'banned') }
+            throw
+        }
 
         $receive = {
             param([int]$WaitSeconds)
@@ -181,8 +205,13 @@ function Wait-CopilotHaStateChange {
         & $send @{ type = 'auth'; access_token = $token }
         $auth = & $receive 30
         if ($auth.type -ne 'auth_ok') {
+            # The watch reconnects on every failure, so without this it offers the
+            # same rejected token every cycle - six a reconcile while Home Assistant
+            # was starting, against a ban threshold of ten.
+            Register-BridgeAuthRejected -Detail '/api/websocket'
             throw 'Home Assistant WebSocket authentication failed.'
         }
+        Register-BridgeAuthAccepted
 
         & $send @{
             type = 'subscribe_trigger'
