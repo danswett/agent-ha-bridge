@@ -545,6 +545,27 @@ program. So:
   token anyway, which is exactly the failure the check exists to prevent, and the
   scratch install that caught it showed `agentToken` set beside an empty
   `agentUserIds`.
+- **1.17.2** (2026-09-29): the agent account does not need to be an administrator, and
+  the MCP server is no longer given its token - which it briefly was, and which would
+  have forced exactly the privilege a separate account exists to avoid.
+
+  Measured against a real instance rather than reasoned about, and the first pass got
+  it wrong: probing `config/entity_registry/list` and `lovelace/dashboards/list` as a
+  plain user showed both *allowed*, which reads as "admin is unnecessary" until you
+  notice those are reads and Home Assistant gates the writes. The operations the MCP
+  server actually performs - `config/entity_registry/update` for deterministic entity
+  ids, `lovelace/dashboards/create` and `lovelace/config/save` for its dashboard - all
+  return `unauthorized` to a plain user, with `config/auth/list` as the control proving
+  the demotion had bitten. Reading states and calling services stay allowed, and those
+  are the whole of driving a session.
+
+  So the token splits by what each side does rather than by whose door it is. The MCP
+  server provisions, keeps using yours, and presses nothing whose account the bridge
+  ever reads back - it publishes a question and waits - so attributing it buys nothing
+  and costs the privilege. The agent token goes only where that account is read back:
+  the environment of every launched session, all of which a non-administrator can do.
+  The README's advice to make that account a non-administrator is therefore right,
+  which it would not have been an hour earlier.
 
 ## Next: let a Copilot permission prompt be approved from Home Assistant
 

@@ -298,7 +298,7 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `homeAssistant.token` | Long-lived access token |
 | `homeAssistant.tokenEnvVar` | Read the token from this env var instead (default `AGENT_HA_TOKEN`; `COPILOT_HA_TOKEN` still works) |
 | `homeAssistant.agentUserIds` | Home Assistant user ids that count as an agent rather than you. A session an agent starts or replies to gets a purple edge on its card, so a session being driven remotely says so at a glance. Written for you from `agentToken` — see [Telling an agent's turn from yours](#telling-an-agents-turn-from-yours) |
-| `homeAssistant.agentToken` | A long-lived token for a *separate* Home Assistant account standing for the agent. Handed to the MCP server and to every session the bridge launches, so an agent drives the bridge as itself; the daemon and hooks keep using `homeAssistant.token`. Set it with `agent-ha-bridge configure -AgentToken <token>`, which also fills in `agentUserIds` |
+| `homeAssistant.agentToken` | A long-lived token for a *separate* Home Assistant account standing for the agent. Handed to every session the bridge launches, so an agent driving another session does so as itself; the daemon, the hooks and the MCP server keep using `homeAssistant.token`. Set it with `agent-ha-bridge configure -AgentToken <token>`, which also fills in `agentUserIds` |
 | `homeAssistant.agentTokenEnvVar` | Read the agent token from this env var instead (default `AGENT_HA_AGENT_TOKEN`) |
 | `dashboard.urlPath` | Lovelace dashboard slug (default `agent-decisions`) |
 | `notifications.enabled` / `.service` | Optional notify-style service |
@@ -365,9 +365,17 @@ Assistant rejects, and one belonging to *your own* account — which authenticat
 perfectly and can never mark anything.
 
 Your own `homeAssistant.token` is left alone; the daemon, the hooks and the dashboard
-provisioning still run as you. The agent token goes to the MCP server and into the
-environment of every session the bridge launches (`AGENT_HA_AGENT_TOKEN`), so an agent
-that goes on to drive another session does so as itself.
+provisioning still run as you. The agent token goes into the environment of every
+session the bridge launches (`AGENT_HA_AGENT_TOKEN`), so an agent that goes on to
+drive another session does so as itself.
+
+**A non-administrator is genuinely enough**, and the split is deliberate. Driving a
+session is service calls and state reads, both of which a plain user may do. The MCP
+server is not given this token precisely because it *provisions* — it renames entities
+to deterministic ids and creates its own dashboard, and `config/entity_registry/update`,
+`lovelace/dashboards/create` and `lovelace/config/save` all return `unauthorized` to a
+plain user (measured against a real instance, with `config/auth/list` as the control).
+It keeps using yours, and presses nothing whose account the bridge ever reads back.
 
 A session an agent starts or replies to is drawn with a purple edge — steady while
 idle, pulsing while it works — and hands back to the ordinary colours the moment you

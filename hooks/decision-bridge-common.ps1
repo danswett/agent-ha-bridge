@@ -1601,10 +1601,16 @@ function Get-BridgeAgentToken {
         The token an agent drives the bridge with, or '' when none is configured.
 
         Deliberately not the same account as homeAssistant.token. The daemon, the
-        hooks and the dashboard provisioning all act for you and keep using that one;
-        this is the token handed to the agent-facing surfaces - the MCP server's env
-        block, and the environment of every session the bridge launches - so that what
-        an agent does through Home Assistant arrives under the agent's own account.
+        hooks, the dashboard provisioning and the MCP server all act for you and keep
+        using that one; this is the token handed to the environment of every session
+        the bridge launches, so that when an agent goes on to drive another session -
+        a reply, a launch - it arrives under the agent's own account.
+
+        Only where the bridge reads the account back, which is why the MCP server is
+        not on that list: it publishes a question and waits, pressing nothing. It also
+        provisions - entity ids and its dashboard - and those are admin-only, so
+        giving it this token would force the agent account to be an administrator,
+        which is exactly what a separate account exists to avoid.
 
         This is the missing half of Test-BridgeAgentUserId. An id in agentUserIds can
         only ever match if something actually presses with that account's token, and

@@ -98,21 +98,24 @@ if (-not (Test-Path -LiteralPath $configPath)) {
 }
 $config = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $baseUrl = [string]$config.homeAssistant.baseUrl
-# The agent account's token first: this server is the agent's own door into Home
-# Assistant, so what it does should be attributed to the agent rather than to the
-# person who owns the daemon's token. Falls back to that one, which is what every
-# install did before there was an agent token to prefer.
-$token = [string]$config.homeAssistant.agentToken
-if (-not $token -and $config.homeAssistant.agentTokenEnvVar) {
-    $token = [Environment]::GetEnvironmentVariable([string]$config.homeAssistant.agentTokenEnvVar)
-}
-if (-not $token) { $token = [Environment]::GetEnvironmentVariable('AGENT_HA_AGENT_TOKEN') }
-$usingAgentToken = [bool]$token
-if (-not $token) {
-    $token = [string]$config.homeAssistant.token
-    if (-not $token -and $config.homeAssistant.tokenEnvVar) {
-        $token = [Environment]::GetEnvironmentVariable([string]$config.homeAssistant.tokenEnvVar)
-    }
+# Deliberately the bridge's own token, not homeAssistant.agentToken, even though this
+# server is the agent's door into Home Assistant.
+#
+# This server *provisions*: entities.js sends config/entity_registry/update to force
+# deterministic entity ids, and dashboard.js sends lovelace/dashboards/create and
+# lovelace/config/save. All three are admin-only - measured, not assumed: as a plain
+# user every one of them comes back `unauthorized`, while reading states and calling
+# services still work. Handing this server the agent token would therefore either
+# break provisioning or force the agent account to be an administrator, and the whole
+# point of a separate account is that it need not be one.
+#
+# Nothing is lost by it. The account behind a press only matters where the bridge
+# reads it back - a reply, or a launch - and this server presses neither; it publishes
+# a question and waits. The agent token goes where that signal is actually read: the
+# environment of every session the bridge launches.
+$token = [string]$config.homeAssistant.token
+if (-not $token -and $config.homeAssistant.tokenEnvVar) {
+    $token = [Environment]::GetEnvironmentVariable([string]$config.homeAssistant.tokenEnvVar)
 }
 
 Write-Step "Installing the MCP server into $mcpDir"
@@ -159,9 +162,6 @@ $serverBlock = [ordered]@{ command = 'node'; args = @($serverJs); env = $serverE
 Write-Step "Wrote a paste-ready client config to $snippetPath"
 if (-not $token) {
     Write-Warning 'No token was in the bridge config, so the snippet has a placeholder - fill in HA_TOKEN.'
-}
-elseif ($usingAgentToken) {
-    Write-Host '    using homeAssistant.agentToken, so the agent acts as its own account'
 }
 
 # ----------------------------------------------------------- Claude Desktop
