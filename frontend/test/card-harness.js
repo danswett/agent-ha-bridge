@@ -32,6 +32,9 @@ class FakeElement {
     this.classList = new FakeClassList();
     this.style = {};
     this.hidden = false;
+    this.dataset = {};
+    this.attributes = {};
+    this.parentElement = null;
     this._text = '';
     this._listeners = {};
   }
@@ -41,10 +44,37 @@ class FakeElement {
     if (this._text === '') { this.children = []; }
   }
   get textContent() { return this._text; }
-  appendChild(child) { this.children.push(child); return child; }
+  appendChild(child) { child.parentElement = this; this.children.push(child); return child; }
   addEventListener(type, fn) { (this._listeners[type] = this._listeners[type] || []).push(fn); }
+  setAttribute(name, value) { this.attributes[name] = String(value); }
+  getAttribute(name) { return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null; }
   click() { for (const fn of this._listeners.click || []) { fn(); } }
+  dispatch(type, event) { for (const fn of this._listeners[type] || []) { fn(event || {}); } }
   querySelector(sel) { return (this._slots && this._slots[sel]) || null; }
+}
+
+// The launch card's parts, as its innerHTML would create them. Seeded rather than
+// invented on demand, so a selector the card looks for and the harness does not model
+// still comes back null and fails loudly, the way it did before the card grew.
+function seedLaunchParts(slots) {
+  const head = new FakeElement('div');
+  for (const sel of ['.toggle', '.name', '.summary', 'button.launch', '.fields', '.note', '.note .spin', '.note .text']) {
+    slots[sel] = new FakeElement(sel === 'button.launch' ? 'button' : 'div');
+  }
+  slots['.toggle'].parentElement = head;
+  slots['input[data-key="prompt"]'] = new FakeElement('input');
+  slots['input[data-key="prompt"]'].value = '';
+  // One select and one label per field, keyed exactly as the card asks for them.
+  const selects = [];
+  for (const key of ['machine', 'resume', 'agent', 'workspace', 'profile', 'model', 'effort', 'context']) {
+    const select = new FakeElement('select');
+    select.dataset.key = key;
+    select.value = '';
+    slots[`select[data-key="${key}"]`] = select;
+    slots[`.f-${key}`] = new FakeElement('label');
+    selects.push(select);
+  }
+  return selects;
 }
 
 // The choices card builds itself by assigning innerHTML, then looks its parts up.
@@ -52,6 +82,8 @@ class FakeElement {
 function makeShadow() {
   const root = new FakeElement('shadow');
   root._slots = { '.choices': new FakeElement('div'), 'ha-card': new FakeElement('ha-card') };
+  const selects = seedLaunchParts(root._slots);
+  root.querySelectorAll = (sel) => (sel === 'select' ? selects.slice() : []);
   Object.defineProperty(root, 'innerHTML', { set() {}, get() { return ''; } });
   return root;
 }
@@ -80,7 +112,7 @@ function loadCards() {
   const source = fs.readFileSync(sourcePath, 'utf8');
   const context = vm.createContext(sandbox);
   vm.runInContext(
-    `${source}\n;globalThis.__cards = { AgentBridgeChoicesCard, AgentBridgeSessionCard, CARD_VERSION };`,
+    `${source}\n;globalThis.__cards = { AgentBridgeChoicesCard, AgentBridgeSessionCard, AgentBridgeLaunchCard, CARD_VERSION };`,
     context,
     { filename: sourcePath });
   return Object.assign({ sandbox, source }, sandbox.__cards);

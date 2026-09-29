@@ -208,7 +208,7 @@ check('the element is registered under its own name',
   /customElements\.define\('agent-bridge-choices-card'/.test(source));
 check('and offered in the card picker',
   sandbox.window.customCards.some((c) => c.type === 'agent-bridge-choices-card'));
-check('the card version is the one the dashboard gates the card on', CARD_VERSION === '1.15.0', CARD_VERSION);
+check('the card version is the one the dashboard gates the card on', CARD_VERSION === '1.16.0', CARD_VERSION);
 check('"decision" is required', (() => {
   try { new AgentBridgeChoicesCard().setConfig({}); return false; } catch (e) { return /decision/.test(e.message); }
 })());
@@ -263,6 +263,114 @@ check('the purple is a variable, so a theme can change it',
   /--agent-bridge-agent-color/.test(source));
 check('and the glow has its own keyframes rather than reusing the working one',
   /@keyframes cpagent/.test(source));
+
+console.log('');
+console.log('--- the launch card carries model, effort and context ---');
+/*
+ * The three tuning selectors are the launch card's only controls whose options change
+ * with another control: pick Claude and the model list becomes Claude's. The daemon
+ * republishes them when the agent moves, so the card's job is simply to render
+ * whatever the entity offers now, send a tap straight back to that entity, and keep
+ * out of the way while the list is being read.
+ */
+const { AgentBridgeLaunchCard } = require('./card-harness').loadCards();
+
+const L = (key) => `select.agent_bridge_desk_new_${key}`;
+
+function launchEnv(states) {
+  const calls = [];
+  const full = {
+    [L('agent')]: { state: 'Copilot', attributes: { options: ['Copilot', 'Claude'] } },
+    [L('workspace')]: { state: 'bridge', attributes: { options: ['bridge'] } },
+    'text.agent_bridge_desk_new_prompt': { state: ' ', attributes: {} },
+    'sensor.agent_bridge_desk_new_session_result': { state: '', attributes: {} },
+  };
+  Object.assign(full, states);
+  return { calls, hass: { states: full, callService: (d, s, data) => calls.push({ domain: d, service: s, data }) } };
+}
+
+function launchCard(env) {
+  const card = new AgentBridgeLaunchCard();
+  card.setConfig({
+    machines: [{
+      machine: 'desk',
+      agent: L('agent'),
+      workspace: L('workspace'),
+      model: L('model'),
+      effort: L('effort'),
+      context: L('context'),
+      prompt: 'text.agent_bridge_desk_new_prompt',
+      launch: 'button.agent_bridge_desk_new_session',
+      result: 'sensor.agent_bridge_desk_new_session_result',
+    }],
+  });
+  card._open = true;
+  card.hass = env.hass;
+  return card;
+}
+
+const TUNED = {
+  [L('model')]: { state: 'gpt-5.4', attributes: { options: ['Agent default', 'auto', 'gpt-5.4'] } },
+  [L('effort')]: { state: 'xhigh', attributes: { options: ['Agent default', 'low', 'xhigh'] } },
+  [L('context')]: { state: 'Agent default', attributes: { options: ['Agent default', 'long_context'] } },
+};
+
+let lenv = launchEnv(TUNED);
+let lcard = launchCard(lenv);
+const optionsOf = (key) => lcard.shadowRoot.querySelector(`select[data-key="${key}"]`).children.map((o) => o.value);
+
+check('the model selector offers exactly what its entity offers',
+  optionsOf('model').join('|') === 'Agent default|auto|gpt-5.4', optionsOf('model').join('|'));
+check('and opens on the value that entity is holding',
+  lcard.shadowRoot.querySelector('select[data-key="model"]').value === 'gpt-5.4');
+check('effort and context get their own selectors',
+  optionsOf('effort').includes('xhigh') && optionsOf('context').includes('long_context'));
+check('each row is shown, since its entity has options',
+  ['model', 'effort', 'context'].every((k) => lcard.shadowRoot.querySelector(`.f-${k}`).hidden === false));
+
+check('choosing a model sets it on that entity and nothing else', (() => {
+  lenv.calls.length = 0;
+  lcard._choose('model', 'auto');
+  return lenv.calls.length === 1 && lenv.calls[0].domain === 'select' &&
+    lenv.calls[0].service === 'select_option' &&
+    lenv.calls[0].data.entity_id === L('model') && lenv.calls[0].data.option === 'auto';
+})(), JSON.stringify(lenv.calls));
+
+check('what is set shows in the collapsed summary, so a launch says what it will use',
+  lcard.shadowRoot.querySelector('.summary').textContent === 'Copilot · bridge · gpt-5.4 · xhigh',
+  lcard.shadowRoot.querySelector('.summary').textContent);
+
+check('an axis left at the default is not worth a word in that summary',
+  !lcard.shadowRoot.querySelector('.summary').textContent.includes('Agent default'));
+
+check('a machine whose bridge has no tuning entities shows no tuning rows', (() => {
+  const env = launchEnv({});
+  const card = new AgentBridgeLaunchCard();
+  card.setConfig({ machines: [{ machine: 'desk', agent: L('agent'), workspace: L('workspace'), prompt: 'text.agent_bridge_desk_new_prompt', launch: 'button.x', result: 'sensor.y' }] });
+  card._open = true;
+  card.hass = env.hass;
+  return ['model', 'effort', 'context'].every((k) => card.shadowRoot.querySelector(`.f-${k}`).hidden === true);
+})());
+
+check('a resume still carries them, because they are options of this launch not of the conversation', (() => {
+  const env = launchEnv(Object.assign({
+    [L('resume')]: { state: 'Yesterday, bridge', attributes: { options: ['New session', 'Yesterday, bridge'] } },
+  }, TUNED));
+  const card = new AgentBridgeLaunchCard();
+  card.setConfig({
+    machines: [{
+      machine: 'desk', agent: L('agent'), workspace: L('workspace'), resume: L('resume'),
+      model: L('model'), effort: L('effort'), context: L('context'),
+      prompt: 'text.agent_bridge_desk_new_prompt', launch: 'button.x', result: 'sensor.y',
+    }],
+  });
+  card._open = true;
+  card.hass = env.hass;
+  const summary = card.shadowRoot.querySelector('.summary').textContent;
+  return card.shadowRoot.querySelector('.f-model').hidden === false &&
+    !card.shadowRoot.querySelector('.f-model').classList.contains('dim') &&
+    summary === 'Resume: Yesterday, bridge · gpt-5.4 · xhigh';
+})());
 
 console.log('');
 if (failures) {

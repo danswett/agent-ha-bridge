@@ -678,6 +678,13 @@ function Publish-CopilotMqttNewSession {
         [AllowEmptyCollection()]
         [string[]]$Agents = @(),
 
+        # What the chosen agent accepts for model, reasoning effort and context
+        # window, keyed by axis ('model', 'effort', 'context'). Every list already
+        # carries its 'Agent default' entry first, from Get-BridgeTuningOptions. An
+        # axis with no entry gets a single placeholder rather than being left out,
+        # so the entity the generated dashboard references always exists.
+        [hashtable]$Tuning = @{},
+
         [string]$LastResult = '',
 
         [string]$Slug,
@@ -781,6 +788,36 @@ function Publish-CopilotMqttNewSession {
     }
     Publish-CopilotMqttMessage -Topic "$prefix/select/$node/new_resume/config" `
         -Payload ($resumeConfig | ConvertTo-Json -Depth 8 -Compress) -Headers $Headers -Retain
+
+    # Model, reasoning effort and context window. Three selectors rather than one
+    # combined knob because the agents treat them as three independent settings, and
+    # because their option lists change together with the chosen agent: the daemon
+    # republishes these whenever the agent selector moves, so a Claude launch offers
+    # Claude's models and not Copilot's.
+    #
+    # Always published, even for an agent that offers nothing on an axis, for the
+    # same reason the profile selector is: the generated dashboard names these
+    # entities literally, and a missing one renders an "Entity not found" row.
+    foreach ($axis in @(Get-BridgeTuningAxes)) {
+        $axisOptions = @()
+        if ($Tuning.ContainsKey($axis)) {
+            $axisOptions = @(@($Tuning[$axis]) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) } | ForEach-Object { [string]$_ })
+        }
+        if ($axisOptions.Count -eq 0) { $axisOptions = @($script:BridgeTuningDefaultOption) }
+
+        $key = "new_$axis"
+        $axisConfig = @{
+            name          = "New session $(Get-BridgeTuningAxisLabel -Axis $axis)"
+            unique_id     = "agent_bridge_${Slug}_$key"
+            object_id     = "agent_bridge_${Slug}_$key"
+            command_topic = "$root/newsession/$axis/set"
+            options       = $axisOptions
+            icon          = Get-BridgeTuningAxisIcon -Axis $axis
+            device        = $device
+        }
+        Publish-CopilotMqttMessage -Topic "$prefix/select/$node/$key/config" `
+            -Payload ($axisConfig | ConvertTo-Json -Depth 8 -Compress) -Headers $Headers -Retain
+    }
 
     $buttonConfig = @{
         name          = 'Start new session'
@@ -1145,6 +1182,9 @@ function Get-CopilotMqttMachineTopic {
         "$prefix/select/$node/new_workspace/config"
         "$prefix/select/$node/new_profile/config"
         "$prefix/select/$node/new_agent/config"
+        "$prefix/select/$node/new_model/config"
+        "$prefix/select/$node/new_effort/config"
+        "$prefix/select/$node/new_context/config"
         "$prefix/select/$node/new_resume/config"
         "$prefix/button/$node/new_session/config"
         "$prefix/sensor/$node/new_session_result/config"
