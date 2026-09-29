@@ -257,10 +257,9 @@ function Get-BridgeWorkspaceChoices {
     # real sessions, so discovery finds them - and without this the picker fills up
     # with a fresh entry for every session ever started. They are an implementation
     # detail of the workspace they came from, and that is the entry to pick.
-    $worktreeRoot = (Get-BridgeWorktreeRoot).TrimEnd('\', '/').ToLowerInvariant()
     foreach ($path in @(Get-BridgeDiscoveredWorkspaces)) {
         if ($known.ContainsKey($path.ToLowerInvariant())) { continue }
-        if ($worktreeRoot -and $path.ToLowerInvariant().StartsWith("$worktreeRoot$([System.IO.Path]::DirectorySeparatorChar)")) { continue }
+        if (Test-BridgeManagedWorktree -Path $path) { continue }
         $known[$path.ToLowerInvariant()] = $true
         $choices += [pscustomobject]@{ Label = [System.IO.Path]::GetFileName($path); Path = $path; Isolate = $false }
     }
@@ -352,26 +351,72 @@ function Get-BridgeRepositoryBaseRef {
     'HEAD'
 }
 
+function Get-BridgeWorktreeMarkerPath {
+    <#
+        Where a worktree's "made by the bridge" marker lives: inside its git admin
+        directory, which is under the repository rather than in the worktree itself -
+        so it can never show up as an untracked file and make the tree look dirty.
+
+        Returns '' for anything that is not a linked worktree. A worktree's `.git` is
+        a *file* holding `gitdir: <path>`, while a repository's own is a directory,
+        so this also cannot mistake a primary clone for one of these.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    $dotGit = Join-Path $Path '.git'
+    if (-not [System.IO.File]::Exists($dotGit)) { return '' }
+    $text = try { [System.IO.File]::ReadAllText($dotGit) } catch { '' }
+    if ($text -notmatch '(?m)^gitdir:\s*(.+?)\s*$') { return '' }
+    try { Join-Path ([System.IO.Path]::GetFullPath($Matches[1])) 'agent-bridge-created' } catch { '' }
+}
+
+function Test-BridgeManagedWorktree {
+    <#
+        Whether this directory is a worktree the bridge made for a launch.
+
+        Asked by marker rather than by comparing paths against the worktree root.
+        Comparing paths looked simpler and was wrong: on macOS the temporary and home
+        directories are reached through symlinks, so git reports /private/var/... for
+        a worktree created at /var/..., every prefix test failed, and not one worktree
+        was recognised as the bridge's - which meant nothing was ever pruned, silently.
+        A marker is also more precise: a worktree someone made by hand inside the same
+        root is not the bridge's to remove.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    $marker = Get-BridgeWorktreeMarkerPath -Path $Path
+    [bool]($marker -and [System.IO.File]::Exists($marker))
+}
+
+function Get-BridgeWorktreeCreatedAt {
+    <# When the bridge made this worktree, from its marker; its directory otherwise. #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    $marker = Get-BridgeWorktreeMarkerPath -Path $Path
+    if ($marker -and [System.IO.File]::Exists($marker)) {
+        $raw = try { [System.IO.File]::ReadAllText($marker).Trim() } catch { '' }
+        $parsed = [datetime]::MinValue
+        if ($raw -and [datetime]::TryParse($raw, [ref]$parsed)) { return $parsed }
+    }
+    try { (Get-Item -LiteralPath $Path -Force).CreationTime } catch { [datetime]::Now }
+}
+
 function Get-BridgeManagedWorktree {
     <#
-        The worktrees of a repository that the bridge made for itself: everything
-        `git worktree list` reports that sits under the worktree root, never the
-        repository's own working tree and never one made somewhere else.
+        The worktrees of a repository that the bridge made for itself. Never the
+        repository's own working tree, and never one made by hand.
     #>
     param([Parameter(Mandatory)][string]$RepositoryPath)
 
-    $root = Get-BridgeWorktreeRoot
-    if (-not $root) { return @() }
     $listed = Invoke-BridgeGit -Directory $RepositoryPath -Arguments @('worktree', 'list', '--porcelain')
     if (-not $listed.Ok) { return @() }
 
-    $prefix = "$root$([System.IO.Path]::DirectorySeparatorChar)".ToLowerInvariant()
     $found = [System.Collections.Generic.List[string]]::new()
     foreach ($line in ($listed.Output -split "`r?`n")) {
         if ($line -notmatch '^worktree\s+(.+)$') { continue }
         $path = $Matches[1].Trim()
         try { $path = [System.IO.Path]::GetFullPath($path) } catch { continue }
-        if (-not $path.ToLowerInvariant().StartsWith($prefix)) { continue }
+        if (-not (Test-BridgeManagedWorktree -Path $path)) { continue }
         $found.Add($path)
     }
     @($found)
@@ -389,9 +434,9 @@ function Test-BridgeWorktreeFinished {
 
         The fourth is age, because a launch that has only just happened is clean and
         detached too, and pulling the directory out from under it would end the
-        session even though no work would be lost. Creation time is used rather than
-        last write: it is set once and cannot be disturbed by anything reading the
-        tree.
+        session even though no work would be lost. Age comes from the marker the
+        bridge wrote when it made the worktree, so nothing that merely reads the tree
+        can disturb it.
     #>
     param(
         [Parameter(Mandatory)][string]$WorktreePath,
@@ -411,7 +456,7 @@ function Test-BridgeWorktreeFinished {
     $ahead = Invoke-BridgeGit -Directory $WorktreePath -Arguments @('rev-list', '--count', "$BaseRef..HEAD")
     if (-not $ahead.Ok -or $ahead.Output -ne '0') { return $false }
 
-    try { $created = (Get-Item -LiteralPath $WorktreePath -Force).CreationTime } catch { return $false }
+    try { $created = Get-BridgeWorktreeCreatedAt -Path $WorktreePath } catch { return $false }
     ([datetime]::Now - $created).TotalHours -ge $IdleHours
 }
 
@@ -430,12 +475,24 @@ function Remove-BridgeFinishedWorktree {
     )
 
     $baseRef = Get-BridgeRepositoryBaseRef -RepositoryPath $RepositoryPath
+
+    # Keyed on the worktree's git admin directory as well as its path. The admin
+    # directory is written into the worktree's own `.git` file by git, so it reads the
+    # same whichever spelling of the path you arrive through - and on macOS there are
+    # two, because /var and /private/var are the same place. A session reporting the
+    # one and git reporting the other is how a worktree in use could look idle.
     $inUse = @{}
-    foreach ($recent in @(Get-BridgeDiscoveredWorkspaces)) { $inUse[$recent.TrimEnd('\', '/').ToLowerInvariant()] = $true }
+    foreach ($recent in @(Get-BridgeDiscoveredWorkspaces)) {
+        $inUse[$recent.TrimEnd('\', '/').ToLowerInvariant()] = $true
+        $marker = Get-BridgeWorktreeMarkerPath -Path $recent
+        if ($marker) { $inUse[$marker.ToLowerInvariant()] = $true }
+    }
 
     $removed = 0
     foreach ($worktree in @(Get-BridgeManagedWorktree -RepositoryPath $RepositoryPath)) {
         if ($inUse.ContainsKey($worktree.TrimEnd('\', '/').ToLowerInvariant())) { continue }
+        $marker = Get-BridgeWorktreeMarkerPath -Path $worktree
+        if ($marker -and $inUse.ContainsKey($marker.ToLowerInvariant())) { continue }
         if (-not (Test-BridgeWorktreeFinished -WorktreePath $worktree -BaseRef $baseRef -IdleHours $IdleHours)) { continue }
         $gone = Invoke-BridgeGit -Directory $RepositoryPath -Arguments @('worktree', 'remove', '--force', $worktree)
         if ($gone.Ok) { $removed++ }
@@ -510,6 +567,15 @@ function New-BridgeSessionWorktree {
         $fallback.Detail = "could not create a worktree ($($added.Output)), so the session runs in $RepositoryPath"
         return $fallback
     }
+
+    # The marker is what makes this one the bridge's to tidy up later, and carries the
+    # moment it was made. If it cannot be written the worktree simply stays unmanaged
+    # and is never pruned - the safe direction to fail in.
+    try {
+        $marker = Get-BridgeWorktreeMarkerPath -Path $target
+        if ($marker) { [System.IO.File]::WriteAllText($marker, [DateTime]::Now.ToString('o')) }
+    }
+    catch { }
 
     $detail = "$target from $baseRef"
     if ($removed -gt 0) { $detail += " (removed $removed finished)" }

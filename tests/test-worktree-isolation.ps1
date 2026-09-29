@@ -47,6 +47,16 @@ $root = Join-Path $sandbox 'wt'
 
 function Invoke-Git { param([string]$Directory, [string[]]$Arguments) & git -C $Directory @Arguments 2>&1 | Out-Null }
 
+# Membership by directory name, because git reports a worktree by its real path and
+# macOS reaches the temporary directory through a symlink - /var/... going in,
+# /private/var/... coming back. The names here are unique (they carry a timestamp),
+# so this compares what the assertions actually mean.
+function Test-Listed {
+    param([string[]]$List, [string]$Path)
+    @($List | ForEach-Object { [System.IO.Path]::GetFileName($_.TrimEnd('\', '/')) }) -contains
+        [System.IO.Path]::GetFileName($Path.TrimEnd('\', '/'))
+}
+
 & git init --bare --initial-branch=main $origin 2>&1 | Out-Null
 & git clone $origin $repo 2>&1 | Out-Null
 Invoke-Git $repo @('config', 'user.email', 'test@example.com')
@@ -88,7 +98,27 @@ try {
         $first.Path.StartsWith($root)
     } "[$($first.Path)]"
     Test-That 'it is a real worktree of that repository' {
-        @(Get-BridgeManagedWorktree -RepositoryPath $repo) -contains $first.Path
+        Test-Listed -List @(Get-BridgeManagedWorktree -RepositoryPath $repo) -Path $first.Path
+    }
+    # The bug this pins down: identity used to be "is the path under the worktree
+    # root", which is false on macOS the moment a symlinked path is involved - git
+    # reports /private/var/... for a worktree created at /var/..., so no worktree was
+    # ever recognised as the bridge's and nothing was ever pruned, silently. A marker
+    # inside the worktree's git admin directory does not care how the path was spelled.
+    Test-That 'recognised by its marker, not by how its path is spelled' {
+        Test-BridgeManagedWorktree -Path $first.Path
+    }
+    Test-That 'the marker is outside the working tree, so the worktree stays clean' {
+        (& git -C $first.Path --no-optional-locks status --porcelain | Out-String).Trim() -eq ''
+    }
+    Test-That 'the repository itself is never mistaken for one' {
+        -not (Test-BridgeManagedWorktree -Path $repo)
+    }
+    Test-That 'nor is a worktree somebody made by hand' {
+        $manual = Join-Path $sandbox 'by-hand'
+        Invoke-Git $repo @('worktree', 'add', '--detach', $manual, 'origin/main')
+        (Test-Path $manual) -and -not (Test-BridgeManagedWorktree -Path $manual) -and
+            (-not (Test-Listed -List @(Get-BridgeManagedWorktree -RepositoryPath $repo) -Path $manual))
     }
     Test-That 'and it carries the repository content' { Test-Path (Join-Path $first.Path 'README.md') }
 
@@ -111,8 +141,14 @@ try {
     Write-Host ''
     Write-Host '--- pruning cannot reach work ---'
     # Age is the only thing standing between these and removal, so they are aged
-    # deliberately: everything else about them is already "finished".
-    function Set-Aged { param([string]$Path, [double]$Hours) (Get-Item -LiteralPath $Path -Force).CreationTime = [datetime]::Now.AddHours(-$Hours) }
+    # deliberately: everything else about them is already "finished". Written through
+    # the marker the bridge itself reads, rather than by setting a filesystem
+    # timestamp, so this means the same thing on every platform.
+    function Set-Aged {
+        param([string]$Path, [double]$Hours)
+        $marker = Get-BridgeWorktreeMarkerPath -Path $Path
+        [System.IO.File]::WriteAllText($marker, [DateTime]::Now.AddHours(-$Hours).ToString('o'))
+    }
 
     $base = Get-BridgeRepositoryBaseRef -RepositoryPath $repo
 
@@ -166,10 +202,10 @@ try {
     $removed = Remove-BridgeFinishedWorktree -RepositoryPath $repo -IdleHours 12
     $after = @(Get-BridgeManagedWorktree -RepositoryPath $repo)
     Test-That 'exactly the finished one went' { $removed -eq 1 -and $after.Count -eq ($before - 1) } "removed=$removed before=$before after=$($after.Count)"
-    Test-That 'the uncommitted ones are still there' { ($after -contains $dirty) -and ($after -contains $edited) }
-    Test-That 'so is the unmerged branch' { $after -contains $branched }
-    Test-That 'so is the detached commit' { $after -contains $committed }
-    Test-That 'and the repository itself is never a candidate' { $after -notcontains $repo }
+    Test-That 'the uncommitted ones are still there' { (Test-Listed -List $after -Path $dirty) -and (Test-Listed -List $after -Path $edited) }
+    Test-That 'so is the unmerged branch' { Test-Listed -List $after -Path $branched }
+    Test-That 'so is the detached commit' { Test-Listed -List $after -Path $committed }
+    Test-That 'and the repository itself is never a candidate' { -not (Test-Listed -List $after -Path $repo) }
 
     Write-Host ''
     Write-Host '--- a session in a folder is left alone whatever git says about it ---'
@@ -183,7 +219,7 @@ try {
         function Get-BridgeDiscoveredWorkspaces { @($busyWorktree) }
         Test-That 'a recently used worktree survives a prune' {
             (Remove-BridgeFinishedWorktree -RepositoryPath $repo -IdleHours 12) -eq 0 -and
-            (@(Get-BridgeManagedWorktree -RepositoryPath $repo) -contains $busyWorktree)
+            (Test-Listed -List @(Get-BridgeManagedWorktree -RepositoryPath $repo) -Path $busyWorktree)
         }
         function Get-BridgeDiscoveredWorkspaces { @() }
 
