@@ -101,12 +101,19 @@ export class HomeAssistant {
           return;
         }
         if (message.type === 'result') {
-          pending.get(message.id)?.(message);
+          const settle = pending.get(message.id);
           pending.delete(message.id);
+          // The id arrives over the socket, so what it reaches is checked rather than
+          // assumed (CodeQL js/unvalidated-dynamic-method-call). A Map lookup cannot
+          // reach Object.prototype the way a plain object's would, but the guard is
+          // free and it also closes the entry before the callback runs rather than
+          // after, so a callback that sends again cannot see its own stale entry.
+          if (typeof settle === 'function') settle(message);
           return;
         }
         if (message.type === 'event') {
-          triggerHandlers.get(message.id)?.(message.event);
+          const handler = triggerHandlers.get(message.id);
+          if (typeof handler === 'function') handler(message.event);
         }
       });
     });

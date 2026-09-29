@@ -4,6 +4,7 @@
  * The properties that matter are the ones that stop this process's Home Assistant
  * token reaching a stranger, so they are asserted rather than assumed:
  *
+ *   - the Authorization header is parsed in linear time, before any token is checked;
  *   - a non-local bind without a token is refused outright, not warned about;
  *   - requests without the token are rejected;
  *   - requests with a wrong token are rejected;
@@ -13,13 +14,90 @@
  */
 
 import http from 'node:http';
-import { startHttpTransport, isLocalBind } from '../src/http.js';
+import net from 'node:net';
+import { startHttpTransport, isLocalBind, readBearer } from '../src/http.js';
 
 let failures = 0;
 const check = (name, ok, detail = '') => {
   console.log(`  ${ok ? 'PASS' : 'FAIL'}  ${name}${detail ? ` - ${detail}` : ''}`);
   if (!ok) failures++;
 };
+
+console.log('--- reading the Authorization header ---');
+// Parsed before the token is compared, so it is the first thing an anonymous caller
+// can reach. It had no test of its own; it was only ever exercised through a request.
+const bearer = (authorization) => readBearer({ headers: authorization === undefined ? {} : { authorization } });
+for (const [name, header, expected] of [
+  ['a plain bearer token is read', 'Bearer abc123', 'abc123'],
+  ['the scheme is case-insensitive', 'bearer abc123', 'abc123'],
+  ['surrounding and inner whitespace is trimmed', '  Bearer    abc123   ', 'abc123'],
+  ['a tab separates the scheme too', 'Bearer\tabc123', 'abc123'],
+  ['a missing header reads as no token', undefined, ''],
+  ['an empty header reads as no token', '', ''],
+  ['another scheme is not a bearer token', 'Basic abc123', ''],
+  ['a scheme that merely starts with it is not one', 'Bearerish abc123', ''],
+  ['the scheme with nothing after it is no token', 'Bearer', ''],
+  ['nor is the scheme followed only by spaces', 'Bearer     ', ''],
+]) {
+  check(name, bearer(header) === expected, `got '${bearer(header)}'`);
+}
+
+// The regex this replaced was `/^Bearer\s+(.+)$/i`. `\s+` and `(.+)` both match a
+// space, so a failing match made the engine try every way of splitting a run of them.
+// Getting the trigger right took three attempts and each wrong one passed against the
+// old code, so the shape is pinned here: the value needs a CR or LF *after* the
+// spaces, because `.` matches neither and without one the greedy `(.+)` reaches the
+// end first time. Trailing spaces alone do nothing - the old parse trimmed first.
+{
+  const attack = `Bearer${' '.repeat(8000)}a\nb`;
+  const started = process.hrtime.bigint();
+  const got = bearer(attack);
+  const ms = Number(process.hrtime.bigint() - started) / 1e6;
+  check('a value built to make the old parse backtrack is parsed in linear time', ms < 10, `${ms.toFixed(1)} ms`);
+  // A deliberate behaviour change, recorded rather than smoothed over: the old parse
+  // failed to match this and returned '', the new one returns the rest of the value.
+  // Nothing downstream is looser for it. The result is only ever handed to a
+  // constant-time comparison against the configured token, which nothing carrying a
+  // control character can equal, and the request does not reach the handler at all.
+  check('and returns the rest of the value, which no configured token can equal',
+    got === 'a\nb', JSON.stringify(got));
+  check('trailing whitespace alone is trimmed away, not backtracked over',
+    bearer(`Bearer${' '.repeat(8000)}`) === '');
+}
+
+console.log('--- a header value that could backtrack never reaches the handler ---');
+// Which is why the parse above is defence in depth rather than a hole that was being
+// stood in front of. Asserted rather than reasoned about: undici refuses to send such
+// a header at all, so this is written onto a raw socket.
+{
+  const rawPort = 48083;
+  const rawToken = 'raw-probe-token';
+  const rawServer = await startHttpTransport({ host: '127.0.0.1', port: rawPort, token: rawToken });
+  const rawRequest = (authorization) => new Promise((resolve) => {
+    const socket = net.connect(rawPort, '127.0.0.1', () => {
+      socket.write(
+        `POST /mcp HTTP/1.1\r\nHost: 127.0.0.1:${rawPort}\r\n` +
+        `Authorization: ${authorization}\r\nContent-Length: 0\r\n\r\n`);
+    });
+    let seen = '';
+    socket.on('data', (chunk) => { seen += chunk; });
+    const done = () => resolve((seen.split('\r\n')[0] || '').trim());
+    socket.on('close', done);
+    socket.on('error', () => resolve('socket error'));
+    setTimeout(() => { socket.destroy(); done(); }, 2000);
+  });
+  try {
+    const plain = await rawRequest('Bearer wrong-token');
+    check('an ordinary bad token reaches the handler and is a 401', /401/.test(plain), plain);
+    for (const [name, control] of [['LF', '\n'], ['CR', '\r']]) {
+      const status = await rawRequest(`Bearer${' '.repeat(4000)}a${control}b`);
+      check(`a value with an embedded ${name} is a 400 from the parser`, /400/.test(status), status);
+    }
+  }
+  finally {
+    rawServer.httpServer.close();
+  }
+}
 
 console.log('--- local bind detection ---');
 for (const host of ['127.0.0.1', '::1', 'localhost']) {

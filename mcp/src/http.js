@@ -39,10 +39,31 @@ function tokensMatch(presented, expected) {
   return timingSafeEqual(a, b);
 }
 
-function readBearer(request) {
-  const header = request.headers.authorization ?? '';
-  const match = /^Bearer\s+(.+)$/i.exec(header.trim());
-  return match ? match[1].trim() : '';
+/**
+ * The bearer token from the Authorization header, or ''.
+ *
+ * Deliberately not `/^Bearer\s+(.+)$/i`. `\s+` and `(.+)` both match a space, so when
+ * the match has to fail the engine tries every way of splitting a run of them, which
+ * is quadratic: 8,000 spaces cost 36 ms and it grows with the square (CodeQL
+ * js/polynomial-redos).
+ *
+ * Reaching that through this listener turns out not to be possible, and the reason is
+ * worth writing down rather than rediscovering. The match only fails if the value
+ * carries a CR or LF *after* the spaces - `.` matches neither, so without one the
+ * greedy `(.+)` reaches the end on its first attempt - and Node's HTTP parser answers
+ * 400 to any header value containing CR or LF before a handler sees it. Trailing
+ * whitespace alone cannot do it either, because the old parse trimmed first.
+ * test-http.js pins both halves of that down.
+ *
+ * So this is defence in depth, not a hole that was being stood in front of: the
+ * scheme is a fixed six characters, so testing for it and slicing past it is linear
+ * and cannot backtrack at all, and the function is now exported and testable rather
+ * than reachable only through a request.
+ */
+export function readBearer(request) {
+  const header = (request.headers.authorization ?? '').trim();
+  if (!/^Bearer\s/i.test(header)) return '';
+  return header.slice('Bearer'.length).trim();
 }
 
 /**
