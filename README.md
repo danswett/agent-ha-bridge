@@ -613,11 +613,11 @@ are different buttons. Pressing one launches a session on that machine and nowhe
 
 There is still **one dashboard**, and it shows everything:
 
-- a **Machines** card listing every machine that has ever registered, with whether it is
-  online right now, how many sessions it is running and what version it is on,
+- an **Agent sessions** card at the top: live sessions and pending decisions on the line
+  you always see, folding open to a row per machine — whether it is online right now,
+  how many sessions it is running, what version it is on, and its own **Detail** switch,
 - one **Start a new session** card with a **Machine** dropdown at the top — pick where,
   then the workspace, profile and resume rows for *that* machine appear beneath it,
-- **Live sessions** summed across the machines that are actually running,
 - one card per session wherever it is running, labelled with its machine — and because
   the entities are real, you can answer a prompt on the laptop from the same screen.
 
@@ -627,8 +627,8 @@ one press start a session everywhere at once. With only one machine online there
 nothing to pick, so the dropdown does not appear at all.
 
 Liveness is a heartbeat: each machine reports in every 60 seconds and Home Assistant
-marks it offline after three missed beats. An offline machine stays listed in
-**Machines**, because knowing a machine exists but is currently off is exactly what you
+marks it offline after three missed beats. An offline machine stays listed in **Agent
+sessions**, because knowing a machine exists but is currently off is exactly what you
 want when a session you expected is not there — but it gets no launch card, no install
 button, and its sessions are hidden, since none of them can be running.
 
@@ -735,6 +735,7 @@ bridge cannot tell, it asks; a scripted uninstall keeps them. `-ClearShared` and
 .\tests\test-http-guard.ps1      # a suite cannot reach a real Home Assistant
 .\tests\test-bridge-adapter.ps1   # shared adapter orchestration (entities, status, notifications)
 .\tests\test-dashboard.ps1        # generated dashboard: title, view, session summary + version
+.\tests\test-status-card.ps1      # the Agent sessions card, end to end: real config, really published entities
 .\tests\test-security.ps1         # template injection, path and topic safety, token handling
 .\tests\test-copilot-activity.ps1 # Copilot's transcript reader, and the inline thinking on its card
 .\tests\test-reliability.ps1      # request budget, StrictMode safety, stale-state pruning

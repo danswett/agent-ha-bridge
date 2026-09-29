@@ -16,7 +16,7 @@
  * daemon downloads them and attaches them to the prompt.
  */
 
-const CARD_VERSION = '1.18.0';
+const CARD_VERSION = '1.19.0';
 
 // The working line, in the style of Claude Code's own spinner: its glyph cycle, and a
 // word picked once per turn. Claude Code does not record which word it chose, so the
@@ -1351,8 +1351,245 @@ class AgentBridgeLaunchCard extends HTMLElement {
   }
 }
 
+/*
+ * The dashboard's top card: how much is running, what is waiting on you, and the
+ * machines it is all running on.
+ *
+ * It replaces a markdown summary card plus a separate Machines card - two cards that
+ * between them took a third of a phone screen to say "three sessions, nothing
+ * waiting". Folded it is one line of each; opened it is a row per machine, with that
+ * machine's Detailed activity switch beside the name it belongs to.
+ *
+ * The counts are worked out here rather than by a Jinja template, so they follow
+ * state as it arrives. A template is re-rendered by Home Assistant too, but its
+ * *entity list* is fixed when the dashboard is generated, so a machine that came
+ * online since the last rebuild was missing from the sum until the next one.
+ */
+// Decision states that are not a question waiting on an answer.
+const STATUS_QUIET = ['Idle', 'unavailable', 'unknown', ''];
+// How long a flicked switch holds its new position while the service call lands.
+// Without it the next render - which can arrive before Home Assistant has changed
+// the state - snaps the switch back, and it visibly bounces.
+const STATUS_TOGGLE_GRACE = 5000;
+
+class AgentBridgeStatusCard extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: 'open' });
+    this._rows = [];
+    try { this._open = localStorage.getItem('agent-bridge-status-open') === '1'; } catch (e) { this._open = false; }
+  }
+
+  setConfig(config) {
+    if (!config || !Array.isArray(config.machines) || config.machines.length === 0) {
+      throw new Error('agent-bridge-status-card: "machines" is required');
+    }
+    this._config = Object.assign({ title: 'Agent sessions', decisions: [] }, config);
+    this._built = false;
+    if (this._hass) { this._build(); this._render(); }
+  }
+
+  set hass(hass) {
+    this._hass = hass;
+    if (!this._built) { this._build(); }
+    this._render();
+  }
+
+  getCardSize() { return this._open ? 1 + this._config.machines.length : 1; }
+
+  _build() {
+    this._built = true;
+    this.shadowRoot.innerHTML = `
+      <style>
+        ha-card { padding: 12px 16px; }
+        .head { display: flex; align-items: center; gap: 10px; }
+        .toggle { flex: 1; min-width: 0; cursor: pointer; user-select: none; }
+        .title { font-size: 1.1em; font-weight: 500; display: flex; align-items: center; gap: 6px; }
+        /* An icon, not a glyph: phones drew the triangle as a colour emoji. */
+        .chev { transition: transform 0.2s ease; color: var(--secondary-text-color); --mdc-icon-size: 20px; display: inline-flex; margin-left: -4px; }
+        .open .chev { transform: rotate(90deg); }
+        .summary { color: var(--secondary-text-color); font-size: 0.9em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        /* A question waiting on you is the one thing here worth colouring. */
+        .summary.waiting { color: var(--warning-color); }
+        .machines { margin-top: 8px; }
+        .row { display: flex; align-items: center; gap: 10px; padding: 7px 0; border-top: 1px solid var(--divider-color); }
+        /* A dot rather than 🟢/⚪: the same reason as the chevron above, and it takes
+           the theme's colours instead of the platform's idea of green. */
+        .dot { flex: none; width: 10px; height: 10px; border-radius: 50%; background: var(--disabled-text-color, #9e9e9e); }
+        .row.online .dot { background: var(--success-color, #4caf50); }
+        .who { flex: 1; min-width: 0; }
+        .name { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .meta { font-size: 0.85em; color: var(--secondary-text-color); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .detail { display: flex; align-items: center; gap: 6px; flex: none; font-size: 0.85em; color: var(--secondary-text-color); }
+        [hidden] { display: none !important; }
+      </style>
+      <ha-card>
+        <div class="head">
+          <div class="toggle" role="button" tabindex="0" aria-expanded="false">
+            <div class="title"><ha-icon class="chev" icon="mdi:chevron-right"></ha-icon><span class="name"></span></div>
+            <div class="summary"></div>
+          </div>
+        </div>
+        <div class="machines" hidden></div>
+      </ha-card>`;
+    const $ = (s) => this.shadowRoot.querySelector(s);
+    this._els = {
+      card: $('ha-card'), toggle: $('.toggle'), name: $('.name'),
+      summary: $('.summary'), machines: $('.machines'),
+    };
+    this._els.name.textContent = this._config.title;
+
+    const flip = () => {
+      this._open = !this._open;
+      try { localStorage.setItem('agent-bridge-status-open', this._open ? '1' : '0'); } catch (e) { /* per-viewer nicety only */ }
+      this._render();
+    };
+    this._els.toggle.addEventListener('click', flip);
+    this._els.toggle.addEventListener('keydown', (ev) => { if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); flip(); } });
+
+    this._buildRows();
+  }
+
+  // One row per machine, built once. The machine list only changes when the daemon
+  // regenerates the dashboard, and that hands the card a fresh config.
+  _buildRows() {
+    const host = this._els.machines;
+    host.textContent = '';
+    this._rows = this._config.machines.map((machine) => {      const row = document.createElement('div');
+      row.className = 'row';
+      const dot = document.createElement('span');
+      dot.className = 'dot';
+      const who = document.createElement('div');
+      who.className = 'who';
+      const name = document.createElement('div');
+      name.className = 'name';
+      name.textContent = machine.machine || '';
+      const meta = document.createElement('div');
+      meta.className = 'meta';
+      who.appendChild(name);
+      who.appendChild(meta);
+      row.appendChild(dot);
+      row.appendChild(who);
+      const entry = { machine, row, meta, toggle: null, pendingAt: 0, pendingFrom: '' };
+      // A machine running a bridge from before the switch existed reports no entity
+      // for it and gets no switch - drawing one anyway would point at nothing.
+      if (machine.detailed) {
+        const box = document.createElement('div');
+        box.className = 'detail';
+        const label = document.createElement('span');
+        label.textContent = 'Detail';
+        const toggle = document.createElement('ha-switch');
+        toggle.addEventListener('change', () => this._flipDetail(entry));
+        box.appendChild(label);
+        box.appendChild(toggle);
+        row.appendChild(box);
+        entry.toggle = toggle;
+      }
+      host.appendChild(row);
+      return entry;
+    });
+    this._ensureSwitchElement();
+  }
+
+  /*
+   * ha-switch lives in a lazily loaded chunk of the Home Assistant frontend, pulled
+   * in by whichever card first draws a toggle row. This card replaced the entities
+   * card that used to do that, so on a view with no other switch the element could
+   * be undefined and the switches would render as nothing at all. Asking the card
+   * helpers for a row on an input_boolean imports that chunk; the row itself is
+   * thrown away.
+   */
+  _ensureSwitchElement() {
+    const probe = (this._config.machines.find((m) => m.detailed) || {}).detailed;
+    if (!probe || customElements.get('ha-switch') || typeof window.loadCardHelpers !== 'function') { return; }
+    window.loadCardHelpers()
+      .then((helpers) => helpers.createRowElement({ entity: probe }))
+      .catch(() => { /* drawn anyway wherever the chunk is already loaded */ });
+  }
+
+  _state(entityId) {
+    const s = entityId && this._hass ? this._hass.states[entityId] : undefined;
+    return s ? String(s.state) : '';
+  }
+
+  _attr(entityId, name) {
+    const s = entityId && this._hass ? this._hass.states[entityId] : undefined;
+    return s && s.attributes && s.attributes[name] ? String(s.attributes[name]) : '';
+  }
+
+  _count(entityId) {
+    const value = parseInt(this._state(entityId), 10);
+    return Number.isFinite(value) && value > 0 ? value : 0;
+  }
+
+  _flipDetail(entry) {
+    const entityId = entry.machine.detailed;
+    if (!entityId || !this._hass) { return; }
+    entry.pendingAt = Date.now();
+    entry.pendingFrom = this._state(entityId);
+    this._hass.callService(entityId.split('.')[0], 'toggle', { entity_id: entityId });
+  }
+
+  _render() {
+    if (!this._els || !this._hass || !this._config) { return; }
+    this._els.card.classList.toggle('open', this._open);
+    this._els.toggle.setAttribute('aria-expanded', this._open ? 'true' : 'false');
+    this._els.machines.hidden = !this._open;
+
+    let live = 0;
+    let soloVersion = '';
+    for (const entry of this._rows) {
+      const machine = entry.machine;
+      // No liveness entity at all means the caller is not tracking it, so the machine
+      // is taken as running - which is what a bridge from before the sensor did.
+      const online = !machine.online || this._state(machine.online) === 'on';
+      // An offline machine's sessions are hidden, because none of them can be
+      // running; counting its retained sensor would keep a dead machine's sessions
+      // in the total indefinitely.
+      const count = online ? this._count(machine.sessions) : 0;
+      live += count;
+      const version = this._attr(machine.version, 'installed_version') || '?';
+      // "(dev)" marks a machine installed from a working copy. VERSION only moves
+      // when a release is cut, so two machines days apart in features otherwise read
+      // as the same number.
+      const stamp = `${version}${machine.dev ? ' (dev)' : ''}`;
+      if (this._rows.length === 1) { soloVersion = stamp; }
+      entry.row.classList.toggle('online', online);
+      entry.meta.textContent = online
+        ? `${count} session${count === 1 ? '' : 's'} \u00b7 ${stamp}`
+        : 'offline';
+
+      if (entry.toggle) {
+        const value = this._state(machine.detailed);
+        const settled = !entry.pendingAt ||
+          value !== entry.pendingFrom ||
+          Date.now() - entry.pendingAt > STATUS_TOGGLE_GRACE;
+        if (settled) {
+          entry.pendingAt = 0;
+          entry.toggle.checked = value === 'on';
+        }
+        entry.toggle.disabled = value !== 'on' && value !== 'off';
+      }
+    }
+
+    const pending = (this._config.decisions || [])
+      .filter((entityId) => !STATUS_QUIET.includes(this._state(entityId))).length;
+
+    const bits = [`Live sessions: ${live}`, `Pending decisions: ${pending}`];
+    // With one machine there is no second version to compare against, so the version
+    // belongs in the line you can see without opening anything. With several, each
+    // machine's version sits on its own row where it can be compared.
+    if (soloVersion) { bits.push(`Bridge ${soloVersion}`); }
+    this._els.summary.textContent = bits.join(' \u00b7 ');
+    this._els.summary.classList.toggle('waiting', pending > 0);
+  }
+}
+
 if (!customElements.get('agent-bridge-reply-card')) {
   customElements.define('agent-bridge-reply-card', AgentBridgeReplyCard);
+}
+if (!customElements.get('agent-bridge-status-card')) {
+  customElements.define('agent-bridge-status-card', AgentBridgeStatusCard);
 }
 if (!customElements.get('agent-bridge-launch-card')) {
   customElements.define('agent-bridge-launch-card', AgentBridgeLaunchCard);
@@ -1377,6 +1614,11 @@ window.customCards.push({
   type: 'agent-bridge-activity-card',
   name: 'Agent Bridge Activity',
   description: 'Live status, response and reasoning for a bridged session, updated in place.',
+});
+window.customCards.push({
+  type: 'agent-bridge-status-card',
+  name: 'Agent Bridge Status',
+  description: 'Live and pending counts, folding open to a row per machine with its Detail switch.',
 });
 window.customCards.push({
   type: 'agent-bridge-choices-card',

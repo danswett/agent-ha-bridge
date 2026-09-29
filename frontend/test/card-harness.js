@@ -44,6 +44,14 @@ class FakeElement {
     if (this._text === '') { this.children = []; }
   }
   get textContent() { return this._text; }
+  // A card writes `el.className = 'row'` and later reads `el.classList`; in a browser
+  // those are two views of one thing, so they are here too. Without this a class set
+  // at build time was invisible to every classList check.
+  set className(value) {
+    this.classList = new FakeClassList();
+    for (const name of String(value).split(/\s+/).filter(Boolean)) { this.classList.add(name); }
+  }
+  get className() { return Array.from(this.classList._set).join(' '); }
   appendChild(child) { child.parentElement = this; this.children.push(child); return child; }
   addEventListener(type, fn) { (this._listeners[type] = this._listeners[type] || []).push(fn); }
   setAttribute(name, value) { this.attributes[name] = String(value); }
@@ -77,12 +85,20 @@ function seedLaunchParts(slots) {
   return selects;
 }
 
+// The status card's parts, seeded for the same reason as the launch card's.
+function seedStatusParts(slots) {
+  for (const sel of ['.toggle', '.name', '.summary', '.machines']) {
+    if (!slots[sel]) { slots[sel] = new FakeElement('div'); }
+  }
+}
+
 // The choices card builds itself by assigning innerHTML, then looks its parts up.
 // The stand-in hands back the same objects for those two selectors.
 function makeShadow() {
   const root = new FakeElement('shadow');
   root._slots = { '.choices': new FakeElement('div'), 'ha-card': new FakeElement('ha-card') };
   const selects = seedLaunchParts(root._slots);
+  seedStatusParts(root._slots);
   root.querySelectorAll = (sel) => (sel === 'select' ? selects.slice() : []);
   Object.defineProperty(root, 'innerHTML', { set() {}, get() { return ''; } });
   return root;
@@ -118,7 +134,7 @@ function loadCards() {
   const source = fs.readFileSync(sourcePath, 'utf8');
   const context = vm.createContext(sandbox);
   vm.runInContext(
-    `${source}\n;globalThis.__cards = { AgentBridgeChoicesCard, AgentBridgeSessionCard, AgentBridgeLaunchCard, CARD_VERSION };`,
+    `${source}\n;globalThis.__cards = { AgentBridgeChoicesCard, AgentBridgeSessionCard, AgentBridgeLaunchCard, AgentBridgeStatusCard, CARD_VERSION };`,
     context,
     { filename: sourcePath });
   return Object.assign({ sandbox, source }, sandbox.__cards);

@@ -208,7 +208,7 @@ check('the element is registered under its own name',
   /customElements\.define\('agent-bridge-choices-card'/.test(source));
 check('and offered in the card picker',
   sandbox.window.customCards.some((c) => c.type === 'agent-bridge-choices-card'));
-check('the card version is the one the dashboard gates the card on', CARD_VERSION === '1.18.0', CARD_VERSION);
+check('the card version is the one the dashboard gates the card on', CARD_VERSION === '1.19.0', CARD_VERSION);
 check('"decision" is required', (() => {
   try { new AgentBridgeChoicesCard().setConfig({}); return false; } catch (e) { return /decision/.test(e.message); }
 })());
@@ -456,6 +456,163 @@ check('while a bridge without a topic still restores what the entity holds', (()
   card.shadowRoot.querySelector('textarea[data-key="prompt"]').value = '';
   card.hass = env.hass;
   return card.shadowRoot.querySelector('textarea[data-key="prompt"]').value === 'typed on my phone';
+})());
+
+console.log('');
+console.log('--- the status card: counts folded, machines opened ---');
+/*
+ * This replaced a markdown summary plus a separate Machines card. The two rules that
+ * matter are that the counts mean what they say - an offline machine's retained
+ * session sensor is not a live session - and that flicking a Detail switch reaches
+ * the machine it is drawn beside and stays where it was put.
+ */
+const statusLoad = require('./card-harness').loadCards();
+const { AgentBridgeStatusCard } = statusLoad;
+
+const HOME = {
+  machine: 'DSWETT-HOME',
+  online: 'binary_sensor.agent_bridge_home_online',
+  sessions: 'sensor.agent_bridge_home_sessions',
+  version: 'update.agent_bridge_home_update',
+  detailed: 'input_boolean.agent_bridge_home_detailed_activity',
+};
+// No `detailed`: a machine on a bridge from before the switch existed.
+const MBP = {
+  machine: 'Dans-MBP',
+  online: 'binary_sensor.agent_bridge_mbp_online',
+  sessions: 'sensor.agent_bridge_mbp_sessions',
+  version: 'update.agent_bridge_mbp_update',
+};
+const D_IDLE = 'select.agent_bridge_a_decision';
+const D_ASKED = 'select.agent_bridge_b_decision';
+
+function statusStates(overrides) {
+  return Object.assign({
+    [HOME.online]: { state: 'on', attributes: {} },
+    [HOME.sessions]: { state: '3', attributes: {} },
+    [HOME.version]: { state: 'off', attributes: { installed_version: '1.19.0' } },
+    [HOME.detailed]: { state: 'on', attributes: {} },
+    // Offline, but its session sensor is retained and still says 2.
+    [MBP.online]: { state: 'off', attributes: {} },
+    [MBP.sessions]: { state: '2', attributes: {} },
+    [MBP.version]: { state: 'off', attributes: { installed_version: '1.17.1' } },
+    [D_IDLE]: { state: 'Idle', attributes: {} },
+    [D_ASKED]: { state: 'Awaiting answer...', attributes: {} },
+  }, overrides || {});
+}
+
+function statusCard(config, states, open) {
+  const calls = [];
+  const hass = { states, callService: (d, s, data) => calls.push({ domain: d, service: s, data }) };
+  const card = new AgentBridgeStatusCard();
+  card.setConfig(config);
+  card._open = open !== false;
+  card.hass = hass;
+  return { card, calls, hass };
+}
+
+const BOTH = { machines: [HOME, MBP], decisions: [D_IDLE, D_ASKED] };
+let scard = statusCard(BOTH, statusStates()).card;
+const summary = () => scard._els.summary.textContent;
+
+check('the folded line carries both counts', summary() === 'Live sessions: 3 · Pending decisions: 1', summary());
+check('an offline machine\'s retained session sensor is not counted as live',
+  !summary().includes('Live sessions: 5'), summary());
+check('a decision sitting at Idle is not pending', summary().includes('Pending decisions: 1'), summary());
+check('a question waiting on you colours the line', scard._els.summary.classList.contains('waiting'));
+check('and nothing waiting leaves it quiet',
+  statusCard(BOTH, statusStates({ [D_ASKED]: { state: 'Idle', attributes: {} } })).card
+    ._els.summary.classList.contains('waiting') === false);
+
+check('an online machine\'s row says what it is running and what it is on',
+  scard._rows[0].meta.textContent === '3 sessions · 1.19.0', scard._rows[0].meta.textContent);
+check('and is marked online', scard._rows[0].row.classList.contains('online'));
+check('an offline machine says only that', scard._rows[1].meta.textContent === 'offline', scard._rows[1].meta.textContent);
+check('and is not marked online', scard._rows[1].row.classList.contains('online') === false);
+check('one session is not "1 sessions"',
+  statusCard(BOTH, statusStates({ [HOME.sessions]: { state: '1', attributes: {} } })).card
+    ._rows[0].meta.textContent === '1 session · 1.19.0');
+check('a machine yet to report a version does not print "undefined"',
+  statusCard(BOTH, statusStates({ [HOME.version]: { state: 'off', attributes: {} } })).card
+    ._rows[0].meta.textContent === '3 sessions · ?');
+check('a machine running a working copy is marked (dev)',
+  statusCard({ machines: [Object.assign({ dev: true }, HOME), MBP], decisions: [] }, statusStates()).card
+    ._rows[0].meta.textContent === '3 sessions · 1.19.0 (dev)');
+
+check('the machines are hidden while it is folded',
+  statusCard(BOTH, statusStates(), false).card._els.machines.hidden === true);
+check('and shown when it is opened', scard._els.machines.hidden === false);
+check('there is a row per machine, in the order given',
+  scard._rows.length === 2 && scard._rows[0].machine.machine === 'DSWETT-HOME');
+
+check('a machine that cannot have a Detail switch gets none', scard._rows[1].toggle === null);
+check('one that can gets it, set from its entity', scard._rows[0].toggle.checked === true);
+check('with the switch sitting inside that machine\'s own row',
+  scard._rows[0].row.children.some((c) => c.classList.contains('detail')));
+// The switch is an input_boolean in Home Assistant, not a property of the machine
+// process, so an offline machine's Detail setting is still yours to change - it is
+// read when that machine comes back. Only a state nobody can read locks it.
+check('an offline machine\'s switch can still be set, ready for when it comes back',
+  statusCard({ machines: [Object.assign({}, MBP, { detailed: 'input_boolean.agent_bridge_mbp_detailed_activity' })], decisions: [] },
+    statusStates({ 'input_boolean.agent_bridge_mbp_detailed_activity': { state: 'off', attributes: {} } })).card
+    ._rows[0].toggle.disabled === false);
+check('but one whose entity says nothing readable is locked rather than guessed at',
+  statusCard(BOTH, statusStates({ [HOME.detailed]: { state: 'unavailable', attributes: {} } })).card
+    ._rows[0].toggle.disabled === true);
+
+const flick = statusCard(BOTH, statusStates());
+flick.card._rows[0].toggle.checked = false;
+flick.card._rows[0].toggle.dispatch('change');
+check('flicking a Detail switch toggles that machine\'s entity, not another\'s',
+  flick.calls.length === 1 && flick.calls[0].data.entity_id === HOME.detailed, JSON.stringify(flick.calls));
+check('through the entity\'s own domain', flick.calls[0].domain === 'input_boolean' && flick.calls[0].service === 'toggle');
+flick.card.hass = flick.hass;
+check('and it holds its new position while the state catches up, instead of bouncing back',
+  flick.card._rows[0].toggle.checked === false);
+flick.hass.states[HOME.detailed] = { state: 'off', attributes: {} };
+flick.card.hass = flick.hass;
+check('then settles on what the entity ended up at', flick.card._rows[0].toggle.checked === false);
+
+check('one machine puts its version on the line you always see',
+  statusCard({ machines: [HOME], decisions: [] }, statusStates()).card._els.summary.textContent
+    === 'Live sessions: 3 · Pending decisions: 0 · Bridge 1.19.0');
+check('and keeps it there while that machine is off, since the update entity is retained',
+  statusCard({ machines: [Object.assign({}, HOME, { online: MBP.online })], decisions: [] }, statusStates())
+    .card._els.summary.textContent.includes('Bridge 1.19.0'));
+check('several do not, since each has its own row to compare',
+  !summary().includes('Bridge '), summary());
+
+// This card replaced the entities card that used to draw a toggle row, and with it
+// the only thing on the view that pulled ha-switch's chunk into the page.
+check('the frontend is asked for that chunk before a switch is drawn', (() => {
+  const asked = [];
+  statusLoad.sandbox.window.loadCardHelpers = () => {
+    asked.push(true);
+    return Promise.resolve({ createRowElement: () => ({}) });
+  };
+  statusCard(BOTH, statusStates());
+  delete statusLoad.sandbox.window.loadCardHelpers;
+  return asked.length === 1;
+})());
+check('and not at all when no machine has a switch to draw', (() => {
+  const asked = [];
+  statusLoad.sandbox.window.loadCardHelpers = () => { asked.push(true); return Promise.resolve({ createRowElement: () => ({}) }); };
+  statusCard({ machines: [MBP], decisions: [] }, statusStates());
+  delete statusLoad.sandbox.window.loadCardHelpers;
+  return asked.length === 0;
+})());
+
+check('folded it asks for less room than opened', (() => {
+  const folded = statusCard(BOTH, statusStates(), false).card;
+  return folded.getCardSize() < scard.getCardSize();
+})());
+
+check('the element is registered under its own name',
+  /customElements\.define\('agent-bridge-status-card'/.test(source));
+check('and offered in the card picker',
+  sandbox.window.customCards.some((c) => c.type === 'agent-bridge-status-card'));
+check('"machines" is required', (() => {
+  try { new AgentBridgeStatusCard().setConfig({}); return false; } catch (e) { return /machines/.test(e.message); }
 })());
 
 // _launch awaits its service calls, so the checks that read them have to await it too.

@@ -102,6 +102,59 @@ Test-That 'there is no longer a standalone toggle card beside the summary' {
     }).Count -eq 0
 }
 
+Write-Host '--- from card 1.19.0 the summary and the machines are one folding card ---'
+# Two markdown cards took a third of a phone screen to say "three sessions, nothing
+# waiting", and the Detail switches sat in a list you had to match to machine names
+# by eye. One card that folds says the same in a line, and puts each switch on the
+# row of the machine it belongs to.
+$twoMachines = @(
+    [pscustomobject]@{ Slug = 'dswett_home'; Machine = 'DSWETT-HOME'; Online = $true; IncludeProfile = $false; IncludeResume = $true; IncludeAgent = $true; IncludeDetailed = $true }
+    [pscustomobject]@{ Slug = 'dans_mbp'; Machine = 'Dans-MBP'; Online = $false; IncludeProfile = $false; IncludeResume = $true; IncludeAgent = $false; IncludeDetailed = $false }
+)
+Save-CopilotSessionDashboard -Sessions $sessions -Machines $twoMachines -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.19.0'
+$status = @($script:SavedConfig.views[0].cards | Where-Object { $_['type'] -eq 'custom:agent-bridge-status-card' })[0]
+Test-That 'the status card is generated' { $null -ne $status }
+Test-That 'it lists every machine that has registered, offline ones included' {
+    (@($status['machines'] | ForEach-Object { [string]$_['machine'] }) -join ',') -eq 'DSWETT-HOME,Dans-MBP'
+}
+Test-That 'each with the entities it reads liveness, sessions and version from' {
+    $m = @($status['machines'])[0]
+    $m['online'] -eq 'binary_sensor.agent_bridge_dswett_home_online' -and
+    $m['sessions'] -eq 'sensor.agent_bridge_dswett_home_sessions' -and
+    $m['version'] -eq 'update.agent_bridge_dswett_home_update'
+}
+Test-That 'the Detail switch travels with the machine it belongs to' {
+    @($status['machines'])[0]['detailed'] -eq 'input_boolean.agent_bridge_dswett_home_detailed_activity'
+}
+# The bug this guards: a peer on an older bridge has no such helper, so pointing a
+# switch at one put an "Entity not found" box on everyone's dashboard.
+Test-That 'and a machine that cannot have one is handed no entity for it' {
+    -not @($status['machines'])[1].Contains('detailed')
+}
+Test-That 'it is given every session decision to count pending answers from' {
+    @($status['decisions']) -contains 'select.copilot_abc123def456_decision'
+}
+Test-That 'the two markdown cards it replaces are gone, not left beside it' {
+    $json = $script:SavedConfig | ConvertTo-Json -Depth 40 -Compress
+    $json -notmatch '## Agent sessions' -and $json -notmatch '### Machines'
+}
+Test-That 'and it is the first card on the view' {
+    [string]@($script:SavedConfig.views[0].cards)[0]['type'] -eq 'custom:agent-bridge-status-card'
+}
+Test-That 'a machine running a working copy is marked for the card to say so' {
+    $dev = @([pscustomobject]@{ Slug = 'buildbox'; Machine = 'BUILDBOX'; Online = $true; IncludeProfile = $false; IncludeResume = $false; IncludeAgent = $false; IncludeDetailed = $true; IsDev = $true })
+    Save-CopilotSessionDashboard -Sessions $sessions -Machines $dev -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.19.0'
+    $card = @($script:SavedConfig.views[0].cards | Where-Object { $_['type'] -eq 'custom:agent-bridge-status-card' })[0]
+    [bool]@($card['machines'])[0]['dev']
+}
+
+Write-Host '--- an older served card keeps the pair it knows how to draw ---'
+Save-CopilotSessionDashboard -Sessions $sessions -Machines $twoMachines -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.18.0'
+$oldStatusJson = $script:SavedConfig | ConvertTo-Json -Depth 40 -Compress
+Test-That 'no status card is drawn for it' { $oldStatusJson -notmatch 'agent-bridge-status-card' }
+Test-That 'so the summary is still there' { $oldStatusJson -match '## Agent sessions' }
+Test-That 'and so is the Machines card' { $oldStatusJson -match '### Machines' }
+
 Write-Host '--- a live session produces a card ---'
 Test-That 'the control cards plus a session card are present' { @($cfg.views[0].cards).Count -ge 3 }
 
