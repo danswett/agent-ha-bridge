@@ -164,6 +164,12 @@ $script:DaemonRegistrationStamps = @{}
 $script:DaemonPendingLaunch = $null
 $script:DaemonReconcileNow = $false
 
+# Who pressed Launch, and the driver waiting for the session that press produced. The
+# press carries the account behind it and the session does not exist yet, so the
+# answer is held here between the two (Test-DaemonNewSessionPressed, Add-DaemonSession).
+$script:DaemonNewSessionPressDriver = ''
+$script:DaemonLaunchDrivers = @{}
+
 # Adapter installs started for agents installed after the bridge (Sync-DaemonClients),
 # and why the daemon should restart once the pass is done - to load a new adapter.
 $script:DaemonClientSetup = @{}

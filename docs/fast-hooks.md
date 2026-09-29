@@ -517,24 +517,36 @@ not provide. Fixing this task makes that comment true.
 
 ## Then: a session an agent launches should read as agent-driven
 
-A session the agent starts from the dashboard comes up with the ordinary colours, not
-the purple edge, and stays that way until the agent replies to it. That is backwards -
-you did not open it, and the launch is exactly the moment it is most useful to see that
-something else is driving. Noticed immediately every time a session is handed off.
+Done 2026-09-29. A session the agent starts from the dashboard now comes up with the
+purple edge, instead of the ordinary colours it kept until the agent first replied.
 
-`Get-BridgeDriverFromState` is called from exactly one place: the Submit press in
-`daemon-replies.ps1` (~line 404). So `Driver` is set by an agent *replying* to a
-session, never by one *starting* it. `Test-DaemonNewSessionPressed`
-(hooks/daemon-launch.ps1, ~line 394) already reads the Launch button's state and throws
-its `context` away - the presser's account is sitting on it, exactly as it is on a
-Submit press, and `Get-BridgeDriverFromState` would take it unchanged.
+The press is where the account is - `Test-DaemonNewSessionPressed` already read the
+Launch button's state and threw its `context` away - so that is read there and carried
+on the pending launch. The awkward part was as expected: the press and the session are
+not the same moment, and only one agent registers under the id it was offered. Copilot
+and Claude take the id the bridge invented; **Codex picks its own**, and its
+registration is recognised merely as the first one written after the launch. Deciding
+"has it registered?" in one place and guessing "as what?" in another is exactly how a
+session comes to wear somebody else's driver, so `Get-BridgeRegisteredSessionId` now
+answers both and `Test-BridgeSessionRegistered` is a thin reading of it.
 
-The awkward part, and why this is not a two-line change: the press and the session are
-not the same moment. The launch returns before the CLI has registered itself, so the
-entry to stamp does not exist yet and the driver has to be carried from the press to
-whichever session that launch produces. Get the correlation wrong and a session gets
-somebody else's driver, which is worse than no glow - a glow that lies is the one
-outcome the feature was built to avoid.
+The driver is put aside under the id that registered, and taken - not read - when the
+session is adopted, so a later session cannot inherit it. A launch whose session is
+never adopted ages out after fifteen minutes rather than waiting for an id that never
+comes.
+
+`DriverPending` matters here as much as `Driver`, and for the same reason it does on
+the reply path: `Update-DaemonSessionActivity` reads a starting turn as somebody typing
+in the terminal, and the first turn of a launched session is the launch itself. Setting
+`Driver` alone would have given a glow that lasted until the first activity update -
+seconds - which looks like a flicker rather than a feature.
+
+`tests/test-agent-launched.ps1` follows one launch the whole way: the press, the
+registration, the adoption, and what the card is finally told, across that first turn
+and then across a later one typed in the terminal, which correctly hands the session
+back. Five mutations fail it, and the two worth naming are the ones that would make the
+glow lie: stamping the id the launch offered rather than the one it registered under,
+and stamping every session rather than only the handed-over one.
 
 ## Then: the choices card should answer a whole form
 
@@ -825,14 +837,42 @@ implied**, which was ordered by reasoning rather than by numbers.
   constants matched, and did, until it was noticed.
 
 **On moving more to Go.** The hook is already there and is 28x faster; the work was
-getting it used. Beyond it the only rewrite the measurements justify is a resident
-**transcript worker** - bounded append reads and the reducers behind a small JSON
-contract, with the PowerShell readers kept as the fallback - because transcript
-parsing is what the reconcile actually spends its CPU on. A full daemon rewrite is not
+getting it used. Beyond it, a resident **transcript worker** was the one rewrite the
+measurements seemed to justify - bounded append reads and the reducers behind a small
+JSON contract, with the PowerShell readers kept as the fallback - because transcript
+parsing looked like what the reconcile spent its CPU on. A full daemon rewrite is not
 justified: the loop is orchestration rather than compute, and the I/O it orchestrates
 is already 5-15 ms. Dashboard generation (20 ms, gated), MQTT and WebSocket transport,
 and the installer are not worth moving. Console injection is already compiled C# in a
 cached DLL, so it is a strategic move rather than a performance one.
+
+**Re-measured 2026-09-28, and the transcript worker is not justified either.** The
+number that made the case was taken before the same evening's caching work, and it was
+measuring something else. `Get-CopilotAskUserState` re-parsed a four megabyte tail
+**unconditionally, every pass, per armed question**, at 93 ms. *That* was the
+transcript CPU. It is now 1.35 ms, and what remains is gated on the transcript actually
+having grown - which is the part nobody had measured.
+
+- The reducer costs about **0.09 ms per line**, with a fixed cost of roughly 0.5 ms.
+- Transcripts are not written continuously. Sampled at the fast lane's own 100 ms rate
+  across live sessions, **2 ticks in 600 had any new bytes at all** - 0.3%, over thirty
+  seconds, while this machine was working hard. Writes arrive in bursts at event
+  boundaries, with a median burst of 18.8 KB.
+- One such burst - 17 lines - costs **7.8 ms** to read and reduce.
+
+So the whole of transcript handling is about **0.5 ms per second, or 0.05% of one
+core**. A worker cannot save more than that, and would not save all of it: a round trip
+to a resident process over pipes measures **0.14 ms** before it does any work at all
+(measured with a Node echo process; the cost is pipe I/O and a scheduler wake-up, not
+the language, so Go would be no better). Against that, a new resident process, a wire
+contract, four more cross-platform builds and a fallback path buy five hundredths of
+one percent of a CPU.
+
+The one case that would still favour a worker is a very large catch-up batch - a 4 MB
+append reduces in 95 ms - which happens after the daemon has been stopped for a while.
+That is rare, bounded, and already off the interactive path. If transcript CPU ever
+looks like a problem again, measure the tick-growth rate first: it is the number that
+decides this, and it is the one that was missing.
 
 ## Resuming
 

@@ -507,7 +507,14 @@ function Test-DaemonNewSessionPressed {
 
     $pressedAt = [DateTimeOffset]::MinValue
     if (-not [DateTimeOffset]::TryParse($press, [ref]$pressedAt)) { return $false }
-    $pressedAt -gt $script:DaemonStartedAt
+    if ($pressedAt -le $script:DaemonStartedAt) { return $false }
+
+    # Who pressed Launch, kept for the session this press is about to produce. The
+    # press is the only thing that carries the account behind it - by the time the
+    # session registers, seconds later, there is nothing left to ask. Read here for
+    # the same reason a Submit press is read in daemon-replies.ps1.
+    $script:DaemonNewSessionPressDriver = Get-BridgeDriverFromState -State $button
+    $true
 }
 
 function Confirm-DaemonPendingTrust {
@@ -867,6 +874,10 @@ function Start-DaemonLaunch {
         TrustAskedAt   = $null
         TrustConfirmed = $false
         TrustAnswers   = 0
+        # Who pressed Launch, carried from the press to whichever session it produces:
+        # a session an agent started should show as agent-driven from the moment it
+        # appears, not only once the agent first replies to it.
+        Driver         = [string]$script:DaemonNewSessionPressDriver
         # Codex registers only on its first message, so one opened without a prompt
         # waits for it rather than timing out (Update-DaemonPendingLaunch).
         AwaitingFirstMessage = ((Get-BridgeLauncher -Launcher $chosenLauncher).NeedsFirstMessage -and -not $prompt)
@@ -1021,6 +1032,24 @@ function Update-DaemonPendingLaunch {
     }
 
     if (Test-BridgeSessionRegistered -SessionId $p.SessionId -Launcher $p.Launcher -Since $p.Since) {
+        # Stamp the launcher's driver on the session this launch produced, by the id it
+        # actually registered under rather than the one it was offered - Codex picks
+        # its own. Read from the same check that just said it had registered, so the
+        # two can never name different sessions.
+        if ($p.Driver -eq 'agent') {
+            $registeredId = Get-BridgeRegisteredSessionId -SessionId $p.SessionId -Launcher $p.Launcher -Since $p.Since
+            if (-not [string]::IsNullOrWhiteSpace($registeredId)) {
+                # A launch whose session is never adopted - a publish that keeps
+                # failing - would otherwise leave its driver here for the life of the
+                # daemon, waiting for an id that never comes.
+                foreach ($stale in @($script:DaemonLaunchDrivers.Keys)) {
+                    if (([DateTimeOffset]::Now - $script:DaemonLaunchDrivers[$stale].At).TotalMinutes -gt 15) {
+                        $script:DaemonLaunchDrivers.Remove($stale)
+                    }
+                }
+                $script:DaemonLaunchDrivers[$registeredId] = @{ Driver = $p.Driver; At = [DateTimeOffset]::Now }
+            }
+        }
         # The session's own card is the confirmation, so the note is cleared, and a
         # reconcile is asked for now so the card appears without waiting the interval.
         $script:DaemonReconcileNow = $true

@@ -438,7 +438,7 @@ function Add-DaemonSession {
         Write-DaemonLog -Message "initial status publish failed for $id : $($_.Exception.Message)"
     }
 
-    [pscustomobject]@{
+    $entry = [pscustomobject]@{
         # A session with no transcript yet starts at offset 0, so the first
         # bytes it writes are picked up rather than skipped.
         Offset = if ([IO.File]::Exists($session.Transcript)) {
@@ -454,6 +454,22 @@ function Add-DaemonSession {
         Effort = [string]$tuning.Effort
         Context = [string]$tuning.Context
     }
+
+    # A session an agent launched is agent-driven from the moment it appears. The
+    # press that started it is long gone by now, so the driver was put aside when the
+    # launch registered, under the id it registered with. Taken rather than read, so
+    # a later session that happens to reuse the id cannot inherit it.
+    if ($script:DaemonLaunchDrivers.ContainsKey($id)) {
+        Set-DaemonSessionProperty -Entry $entry -Name 'Driver' -Value ([string]$script:DaemonLaunchDrivers[$id].Driver)
+        # Pending for the same reason a Submit press is: the first turn of a launched
+        # session is the launch itself, and Update-DaemonSessionActivity reads a
+        # starting turn as somebody typing unless it is told one is expected. Without
+        # this the glow would last until the session's first activity update - seconds.
+        Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $true
+        $script:DaemonLaunchDrivers.Remove($id)
+        Write-DaemonLog -Message "session $($id.Substring(0,8)) was launched by an agent; showing it as agent-driven"
+    }
+    $entry
 }
 
 function Get-DaemonSessionTuning {
