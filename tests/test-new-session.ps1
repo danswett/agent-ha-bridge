@@ -866,6 +866,13 @@ Publish-CopilotMqttNewSession -Workspaces @(
 function Get-Config { param([string]$Match) ($script:MqttMsgs | Where-Object { $_.Topic -match $Match } | Select-Object -First 1).Payload }
 
 Test-That 'a prompt text entity is published'  { (Get-Config "text/${node}/new_prompt/config") -match (Uid 'new_prompt') }
+Test-That 'a prompt payload sensor is published beside it' {
+    (Get-Config "sensor/${node}/new_prompt_payload/config") -match (Uid 'new_prompt_payload')
+}
+Test-That 'its text rides in an attribute, not the capped state' {
+    $c = Get-Config "sensor/${node}/new_prompt_payload/config"
+    $c -match '"json_attributes_topic"' -and $c -match '"value_template":"\{\{ value_json.at \}\}"'
+} (Get-Config "sensor/${node}/new_prompt_payload/config")
 Test-That 'a workspace select is published'    { (Get-Config "select/${node}/new_workspace/config") -match (Uid 'new_workspace') }
 Test-That 'a profile select is published'      { (Get-Config "select/${node}/new_profile/config") -match (Uid 'new_profile') }
 Test-That 'the profile select offers the profiles' { (Get-Config 'new_profile/config') -match 'work' -and (Get-Config 'new_profile/config') -match 'home' }
@@ -928,7 +935,13 @@ $script:Cleared = @()
 function Get-HomeAssistantState {
     param([string]$EntityId, [hashtable]$Headers)
     if (-not $script:HaStates.ContainsKey($EntityId)) { throw "no such entity $EntityId" }
-    [pscustomobject]@{ state = $script:HaStates[$EntityId] }
+    $value = $script:HaStates[$EntityId]
+    # A hashtable stands for an entity whose attributes matter - the prompt payload
+    # sensor, whose text is in an attribute because a state is capped at 255 chars.
+    if ($value -is [hashtable]) {
+        return [pscustomobject]@{ state = [string]$value.state; attributes = [pscustomobject]$value.attributes }
+    }
+    [pscustomobject]@{ state = $value }
 }
 function Publish-CopilotMqttNewSession { param([object[]]$Workspaces, [string[]]$Profiles = @(), [object[]]$Resumable = @(), [string[]]$Agents = @(), [hashtable]$Tuning = @{}, [string]$LastResult = '', [hashtable]$Headers) }
 function Set-CopilotMqttNewSessionEntityIds { $false }
@@ -963,6 +976,11 @@ function Send-BridgeTrustAnswer { param([int]$ProcessId, [string]$Selection) $sc
 function Invoke-HomeAssistantService {
     param([string]$Domain, [string]$Service, [hashtable]$Data, [hashtable]$Headers)
     $script:Cleared += "$Domain.$Service"
+}
+$script:PromptPayloadCleared = 0
+function Clear-CopilotMqttNewSessionPrompt {
+    param([string]$Slug, [hashtable]$Headers)
+    $script:PromptPayloadCleared++
 }
 
 function Reset-NewSessionTest {
@@ -1415,6 +1433,63 @@ Test-That 'a press for another agent launches it instead' {
 }
 $script:DaemonPendingLaunch = $null
 $script:CodexPresent = $false
+
+Write-Host ''
+Write-Host '--- a first message longer than a text entity can hold ---'
+# Home Assistant caps a text entity at 255 characters, which is far too short to hand
+# a new session the context of what it is taking over. The launch card publishes the
+# whole prompt to a sensor whose attribute has no cap; the text box stays for a
+# dashboard whose card is too old to know about it.
+$payloadEntity = "sensor.agent_bridge_${slug}_new_prompt_payload"
+$longPrompt = ('Take over the migration. ' * 40).Trim()
+
+Test-That 'the test prompt is longer than a text entity allows' { $longPrompt.Length -gt 255 } "$($longPrompt.Length)"
+
+Reset-NewSessionTest -Press '2026-06-01T13:00:00+00:00' -Prompt 'the short one'
+$script:HaStates[$payloadEntity] = @{
+    state = '2026-06-01T13:00:00+00:00'
+    attributes = @{ at = '2026-06-01T13:00:00+00:00'; text = $longPrompt; card_version = '1.18.0' }
+}
+Test-That 'the payload is what the launch reads' {
+    (Get-DaemonLaunchPrompt -Headers $headers) -eq $longPrompt
+} "$((Get-DaemonLaunchPrompt -Headers $headers).Length) chars"
+Test-That 'and it is not truncated on the way through' {
+    (Get-DaemonLaunchPrompt -Headers $headers).Length -gt 255
+}
+
+$script:Launches = @()
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+Test-That 'so the session is started with the whole prompt' {
+    $script:Launches.Count -eq 1 -and $script:Launches[0].Prompt -eq $longPrompt
+} "$($script:Launches.Count) launch(es), $($script:Launches[0].Prompt.Length) chars"
+
+# An empty payload must not mask a prompt typed into the box by an older card.
+Reset-NewSessionTest -Press '2026-06-01T13:05:00+00:00' -Prompt 'typed in the old box'
+$script:HaStates[$payloadEntity] = @{ state = 'unknown'; attributes = @{} }
+Test-That 'an empty payload falls back to the text box' {
+    (Get-DaemonLaunchPrompt -Headers $headers) -eq 'typed in the old box'
+} (Get-DaemonLaunchPrompt -Headers $headers)
+
+# A bridge that never published the sensor at all - the stub throws for it, exactly as
+# Home Assistant 404s - must not lose the typed prompt either.
+Reset-NewSessionTest -Press '2026-06-01T13:06:00+00:00' -Prompt 'no payload sensor here'
+Test-That 'a missing payload sensor falls back rather than throwing' {
+    (Get-DaemonLaunchPrompt -Headers $headers) -eq 'no payload sensor here'
+} (Get-DaemonLaunchPrompt -Headers $headers)
+
+# Both boxes are emptied after a launch, or the retained payload would start the next
+# session with the same prompt.
+Reset-NewSessionTest -Press '2026-06-01T13:10:00+00:00' -Prompt ''
+$script:HaStates[$payloadEntity] = @{
+    state = '2026-06-01T13:10:00+00:00'
+    attributes = @{ at = '2026-06-01T13:10:00+00:00'; text = $longPrompt }
+}
+$script:Cleared = @()
+$script:PromptPayloadCleared = 0
+$script:Launches = @()
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+Test-That 'the retained payload is cleared once it has been used' { $script:PromptPayloadCleared -ge 1 } "$script:PromptPayloadCleared"
+Test-That 'and the text box is blanked alongside it' { $script:Cleared -contains 'text.set_value' } ($script:Cleared -join ',')
 
 Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $testLogFile -Force -ErrorAction SilentlyContinue

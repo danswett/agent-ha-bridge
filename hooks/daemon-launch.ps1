@@ -555,6 +555,53 @@ function Confirm-DaemonPendingTrust {
     $true
 }
 
+function Get-DaemonLaunchPrompt {
+    <#
+        The first message the launch card is offering, from whichever of its two
+        boxes carries it.
+
+        The card publishes the whole prompt to the payload sensor, whose attribute has
+        no length limit; the text entity beside it is what a dashboard running an
+        older card still writes, and Home Assistant caps that at 255 characters. The
+        payload wins when it has anything in it, so a long handover prompt arrives
+        whole instead of cut off mid-sentence.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Headers)
+
+    try {
+        $payload = Get-BridgeReplyPayload -State (Get-HomeAssistantState `
+            -EntityId $script:DaemonEntity.NewPromptPayload -Headers $Headers)
+        if ($null -ne $payload -and -not [string]::IsNullOrWhiteSpace([string]$payload.Text)) {
+            return ([string]$payload.Text).Trim()
+        }
+    }
+    catch {
+        # No payload sensor yet (a machine published before this existed), or it is
+        # unreadable. The text box still works, within its 255 characters.
+    }
+
+    $typed = ''
+    try { $typed = [string](Get-HomeAssistantState -EntityId $script:DaemonEntity.NewPrompt -Headers $Headers).state } catch { }
+    if ($typed -in @('unknown', 'unavailable')) { $typed = '' }
+    $typed.Trim()
+}
+
+function Clear-DaemonLaunchPrompt {
+    <#
+        Empties both prompt boxes once their text has been used, so the next press
+        does not silently repeat the last prompt.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Headers)
+
+    try {
+        Invoke-HomeAssistantService -Domain 'text' -Service 'set_value' -Headers $Headers -Data @{
+            entity_id = $script:DaemonEntity.NewPrompt; value = $script:DaemonConfig.ReplyBlankValue
+        } | Out-Null
+    }
+    catch { }
+    try { Clear-CopilotMqttNewSessionPrompt -Headers $Headers | Out-Null } catch { }
+}
+
 function Send-DaemonPendingFirstMessage {
     <#
         Sends the First message box into a Codex launched without a first message:
@@ -570,7 +617,7 @@ function Send-DaemonPendingFirstMessage {
 
     $first = ''
     $firstAgent = ''
-    try { $first = [string](Get-HomeAssistantState -EntityId $script:DaemonEntity.NewPrompt -Headers $Headers).state } catch { }
+    try { $first = Get-DaemonLaunchPrompt -Headers $Headers } catch { }
     try { $firstAgent = [string](Get-HomeAssistantState -EntityId $script:DaemonEntity.NewAgent -Headers $Headers).state } catch { }
     if ($first -in @('unknown', 'unavailable')) { $first = '' }
     $first = $first.Trim()
@@ -591,12 +638,7 @@ function Send-DaemonPendingFirstMessage {
     $pending.Since = [DateTimeOffset]::Now
     $pending.LastCheck = [DateTimeOffset]::MinValue
     Set-CopilotMqttNewSessionResult -Headers $Headers -Text "Sending your first message to $agent in $($pending.Label)..." | Out-Null
-    try {
-        Invoke-HomeAssistantService -Domain 'text' -Service 'set_value' -Headers $Headers -Data @{
-            entity_id = $script:DaemonEntity.NewPrompt; value = $script:DaemonConfig.ReplyBlankValue
-        } | Out-Null
-    }
-    catch { }
+    Clear-DaemonLaunchPrompt -Headers $Headers
     $true
 }
 
@@ -697,11 +739,7 @@ function Resolve-DaemonLaunchRequest {
     }
 
     $prompt = ''
-    try {
-        $promptState = Get-HomeAssistantState -EntityId $script:DaemonEntity.NewPrompt -Headers $Headers
-        $prompt = [string]$promptState.state
-    }
-    catch { }
+    try { $prompt = Get-DaemonLaunchPrompt -Headers $Headers } catch { }
     if ($prompt -in @('unknown', 'unavailable')) { $prompt = '' }
     $prompt = $prompt.Trim()
 
@@ -936,18 +974,9 @@ function Start-DaemonLaunch {
     $script:DaemonNewSessionSignature = ''
 
     # Clear the prompt box so the next launch starts from a blank field instead of
-    # silently reusing the previous prompt.
-    if ($prompt) {
-        try {
-            Invoke-HomeAssistantService -Domain 'text' -Service 'set_value' -Headers $Headers -Data @{
-                entity_id = $script:DaemonEntity.NewPrompt
-                value     = $script:DaemonConfig.ReplyBlankValue
-            } | Out-Null
-        }
-        catch {
-            Write-DaemonLog -Message "could not clear the new-session prompt: $($_.Exception.Message)"
-        }
-    }
+    # silently reusing the previous prompt. Both boxes: the payload topic is retained,
+    # so a long prompt left there would start the next session too.
+    if ($prompt) { Clear-DaemonLaunchPrompt -Headers $Headers }
 }
 
 function Resolve-DaemonLaunchTuning {

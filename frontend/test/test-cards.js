@@ -208,7 +208,7 @@ check('the element is registered under its own name',
   /customElements\.define\('agent-bridge-choices-card'/.test(source));
 check('and offered in the card picker',
   sandbox.window.customCards.some((c) => c.type === 'agent-bridge-choices-card'));
-check('the card version is the one the dashboard gates the card on', CARD_VERSION === '1.17.0', CARD_VERSION);
+check('the card version is the one the dashboard gates the card on', CARD_VERSION === '1.18.0', CARD_VERSION);
 check('"decision" is required', (() => {
   try { new AgentBridgeChoicesCard().setConfig({}); return false; } catch (e) { return /decision/.test(e.message); }
 })());
@@ -413,8 +413,91 @@ check('a resume still carries them, because they are options of this launch not 
 })());
 
 console.log('');
-if (failures) {
-  console.log(`${failures} check(s) failed`);
-  process.exit(1);
+console.log('--- a first message long enough to hand over a whole task ---');
+/*
+ * A Home Assistant text entity is capped at 255 characters, which is far too short
+ * for the box's best use: giving a new session the full context of what it is taking
+ * over. The card publishes the prompt to an MQTT topic instead, exactly as the reply
+ * box already does, and only falls back to the text entity when the bridge is too old
+ * to offer a topic.
+ */
+const PROMPT_TOPIC = 'copilot/cli/machine/desk/newsession/promptpayload';
+
+function promptCard(env, extra) {
+  const card = new AgentBridgeLaunchCard();
+  card.setConfig({
+    machines: [Object.assign({
+      machine: 'desk', agent: L('agent'), workspace: L('workspace'),
+      prompt: 'text.agent_bridge_desk_new_prompt',
+      launch: 'button.agent_bridge_desk_new_session',
+      result: 'sensor.agent_bridge_desk_new_session_result',
+    }, extra || {})],
+  });
+  card._open = true;
+  card.hass = env.hass;
+  return card;
 }
-console.log('All card checks passed');
+
+const LONG_PROMPT = 'Take over the migration. '.repeat(40);
+
+check('a prompt longer than a text entity allows is worth testing with', LONG_PROMPT.length > 255, `${LONG_PROMPT.length}`);
+
+check('a prompt typed here is not overwritten by the blank text entity', (() => {
+  const env = launchEnv({ 'text.agent_bridge_desk_new_prompt': { state: 'stale leftover', attributes: {} } });
+  const card = promptCard(env, { promptTopic: PROMPT_TOPIC });
+  card.shadowRoot.querySelector('textarea[data-key="prompt"]').value = 'what I am typing';
+  card.hass = env.hass;
+  return card.shadowRoot.querySelector('textarea[data-key="prompt"]').value === 'what I am typing';
+})());
+
+check('while a bridge without a topic still restores what the entity holds', (() => {
+  const env = launchEnv({ 'text.agent_bridge_desk_new_prompt': { state: 'typed on my phone', attributes: {} } });
+  const card = promptCard(env, {});
+  card.shadowRoot.querySelector('textarea[data-key="prompt"]').value = '';
+  card.hass = env.hass;
+  return card.shadowRoot.querySelector('textarea[data-key="prompt"]').value === 'typed on my phone';
+})());
+
+// _launch awaits its service calls, so the checks that read them have to await it too.
+(async () => {
+  const pubEnv = launchEnv({});
+  const pubCard = promptCard(pubEnv, { promptTopic: PROMPT_TOPIC });
+  pubCard.shadowRoot.querySelector('textarea[data-key="prompt"]').value = LONG_PROMPT;
+  pubEnv.calls.length = 0;
+  await pubCard._launch();
+
+  const published = pubEnv.calls.find((c) => c.domain === 'mqtt' && c.service === 'publish');
+  check('Launch publishes the prompt over MQTT', !!published,
+    JSON.stringify(pubEnv.calls.map((c) => `${c.domain}.${c.service}`)));
+  check('to the topic the bridge named', !!published && published.data.topic === PROMPT_TOPIC);
+  check('carrying the prompt whole, not cut to 255 characters', (() => {
+    if (!published) { return false; }
+    const body = JSON.parse(published.data.payload);
+    return body.text === LONG_PROMPT.trim() && body.text.length > 255;
+  })(), published ? `${JSON.parse(published.data.payload).text.length} chars` : 'nothing published');
+  check('retained, so the daemon still finds it when it reads the press',
+    !!published && published.data.retain === true);
+  check('and the capped text entity is not written at all',
+    !pubEnv.calls.some((c) => c.domain === 'text'));
+  check('the button is still pressed',
+    pubEnv.calls.some((c) => c.domain === 'button' && c.service === 'press'));
+  check('the box is emptied once it has been sent',
+    pubCard.shadowRoot.querySelector('textarea[data-key="prompt"]').value === '');
+
+  const oldEnv = launchEnv({});
+  const oldCard = promptCard(oldEnv, {});
+  oldCard.shadowRoot.querySelector('textarea[data-key="prompt"]').value = 'short one';
+  oldEnv.calls.length = 0;
+  await oldCard._launch();
+  check('a bridge with no topic still gets the text entity, so nothing regresses',
+    oldEnv.calls.some((c) => c.domain === 'text' && c.service === 'set_value' && c.data.value === 'short one'),
+    JSON.stringify(oldEnv.calls));
+  check('and no MQTT publish is attempted', !oldEnv.calls.some((c) => c.domain === 'mqtt'));
+
+  console.log('');
+  if (failures) {
+    console.log(`${failures} check(s) failed`);
+    process.exit(1);
+  }
+  console.log('All card checks passed');
+})();

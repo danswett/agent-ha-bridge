@@ -559,8 +559,11 @@ A few deliberate choices:
 - **Launch is a button, not the text box.** Home Assistant commits a text entity as soon
   as it loses focus, so acting on the typed value alone would spawn a session the moment
   you clicked away.
-- **The opening prompt is capped at 255 characters**, the Home Assistant limit for an
-  MQTT `text` entity. Launch with a short prompt and continue in the reply box.
+- **The opening prompt is as long as you need it to be.** The launch card publishes it
+  over MQTT, the same way the reply box sends a long reply, so a whole handover — the
+  context, the constraints, what has already been tried — can start the session. A
+  dashboard still on an older card falls back to a plain `text` entity, which Home
+  Assistant caps at 255 characters.
 
 The **Last launch** row reports what happened. It confirms success only once the new
 session has actually registered itself, not merely when a process started.

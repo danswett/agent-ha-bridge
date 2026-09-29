@@ -451,6 +451,23 @@ Test-That 'and a card too old to draw it is not, so it is never silently dropped
     -not @($preCompact['machines'])[0].Contains('permissions')
 }
 
+# The long first message arrived with 1.18.0. A card that knows the topic publishes
+# the whole prompt there; an older one writes the text entity, which Home Assistant
+# caps at 255 characters.
+Save-CopilotSessionDashboard -Sessions $sessions -IncludeAgent -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.18.0'
+$promptCompact = @($script:SavedConfig.views[0].cards | Where-Object { $_['type'] -eq 'custom:agent-bridge-launch-card' })[0]
+Test-That 'a 1.18.0 card is told where to publish a long first message' {
+    @($promptCompact['machines'])[0]['promptTopic'] -match 'newsession/promptpayload$'
+} ([string](@($promptCompact['machines'])[0]['promptTopic']))
+Test-That 'and still gets the text entity, so it has something to fall back on' {
+    @($promptCompact['machines'])[0]['prompt'] -eq "text.agent_bridge_${slug}_new_prompt"
+}
+Save-CopilotSessionDashboard -Sessions $sessions -IncludeAgent -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.17.0'
+$oldPromptCompact = @($script:SavedConfig.views[0].cards | Where-Object { $_['type'] -eq 'custom:agent-bridge-launch-card' })[0]
+Test-That 'a 1.17.0 card is not handed a key it would drop' {
+    -not @($oldPromptCompact['machines'])[0].Contains('promptTopic')
+}
+
 Write-Host ''
 Write-Host '--- the session header updates in place when the card supports it ---'
 # The markdown header re-renders wholesale on every attribute change, collapsing the

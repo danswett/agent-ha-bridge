@@ -718,6 +718,29 @@ function Publish-CopilotMqttNewSession {
     Publish-CopilotMqttMessage -Topic "$prefix/text/$node/new_prompt/config" `
         -Payload ($promptConfig | ConvertTo-Json -Depth 8 -Compress) -Headers $Headers -Retain
 
+    # The prompt box above is a text entity, and Home Assistant caps one at 255
+    # characters. That is far too short for the thing the box is most useful for -
+    # handing a new session the full context of what it is taking over - and the text
+    # was silently truncated rather than refused.
+    #
+    # So the launch card publishes the whole prompt here instead, exactly as the reply
+    # card already does for a long reply: the state carries only the card's timestamp
+    # (value_template), and the prompt itself rides in an attribute, which has no cap.
+    # The text entity stays, and still works, for a dashboard whose card is too old to
+    # know about this one.
+    $promptPayloadConfig = @{
+        name                  = 'New session prompt payload'
+        unique_id             = "agent_bridge_${Slug}_new_prompt_payload"
+        object_id             = "agent_bridge_${Slug}_new_prompt_payload"
+        state_topic           = "$root/newsession/promptpayload"
+        value_template        = '{{ value_json.at }}'
+        json_attributes_topic = "$root/newsession/promptpayload"
+        icon                  = 'mdi:message-plus-outline'
+        device                = $device
+    }
+    Publish-CopilotMqttMessage -Topic "$prefix/sensor/$node/new_prompt_payload/config" `
+        -Payload ($promptPayloadConfig | ConvertTo-Json -Depth 8 -Compress) -Headers $Headers -Retain
+
     $workspaceConfig = @{
         name          = 'New session workspace'
         unique_id     = "agent_bridge_${Slug}_new_workspace"
@@ -864,6 +887,24 @@ function Publish-CopilotMqttNewSession {
     if ($PSBoundParameters.ContainsKey('LastResult')) {
         Set-CopilotMqttNewSessionResult -Text $LastResult -Slug $Slug -Headers $Headers
     }
+}
+
+function Clear-CopilotMqttNewSessionPrompt {
+    <#
+        Empties the launch card's prompt payload once it has been used.
+
+        The topic is retained, so without this the prompt that started one session
+        would still be sitting there for the next press - the same reason the text
+        box is blanked after a launch. An empty object leaves value_json.at undefined,
+        which is what Get-BridgeReplyPayload reads as "nothing to send".
+    #>
+    param(
+        [string]$Slug,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    Publish-CopilotMqttMessage -Topic "$(Get-CopilotMqttMachineTopicRoot -Slug $Slug)/newsession/promptpayload" `
+        -Payload '{}' -Headers $Headers -Retain
 }
 
 function Set-CopilotMqttNewSessionResult {
@@ -1198,6 +1239,7 @@ function Get-CopilotMqttMachineTopic {
         "$prefix/update/$node/update/config"
         "$prefix/button/$node/install_update/config"
         "$prefix/text/$node/new_prompt/config"
+        "$prefix/sensor/$node/new_prompt_payload/config"
         "$prefix/select/$node/new_workspace/config"
         "$prefix/select/$node/new_profile/config"
         "$prefix/select/$node/new_agent/config"
@@ -1211,6 +1253,7 @@ function Get-CopilotMqttMachineTopic {
         "$prefix/binary_sensor/$node/online/config"
         "$root/update/state"
         "$root/newsession/result"
+        "$root/newsession/promptpayload"
         "$root/online/state"
         "$root/global/state"
         "$root/global/attr"

@@ -652,6 +652,7 @@ function Set-CopilotMqttNewSessionEntityIds {
     $wanted = @{}
     foreach ($pair in @(
         @('text',   'new_prompt'),
+        @('sensor', 'new_prompt_payload'),
         @('select', 'new_workspace'),
         @('select', 'new_profile'),
         @('select', 'new_agent'),
@@ -1293,6 +1294,11 @@ function Save-CopilotSessionDashboard {
         # reason: an older card would silently drop the key, leaving a dashboard that
         # looks like it offers the choice and does not.
         $permissionsCard = Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.17.0'
+        # The long prompt arrived with card 1.18.0. An older card writes the text
+        # entity, which Home Assistant caps at 255 characters; a card that knows this
+        # topic publishes the whole thing instead. Gated the same way, so an old card
+        # is never handed a key it would drop.
+        $promptPayloadCard = Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.18.0'
         $launchMachines = @($onlineList | ForEach-Object {
             $slug = $_.Slug
             $entry = [ordered]@{
@@ -1314,6 +1320,9 @@ function Save-CopilotSessionDashboard {
             }
             if ($permissionsCard -and $_.PSObject.Properties['IncludePermissions'] -and $_.IncludePermissions) {
                 $entry.permissions = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_permissions' -Slug $slug
+            }
+            if ($promptPayloadCard) {
+                $entry.promptTopic = "$(Get-CopilotMqttMachineTopicRoot -Slug $slug)/newsession/promptpayload"
             }
             $entry
         })

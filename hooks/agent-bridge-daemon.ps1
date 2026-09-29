@@ -67,6 +67,7 @@ $script:DaemonEntity = @{
     Update        = Get-BridgeMachineEntityId -Domain 'update' -Key 'update'            -Slug $script:DaemonMachineSlug
     InstallUpdate = Get-BridgeMachineEntityId -Domain 'button' -Key 'install_update'    -Slug $script:DaemonMachineSlug
     NewPrompt     = Get-BridgeMachineEntityId -Domain 'text'   -Key 'new_prompt'        -Slug $script:DaemonMachineSlug
+    NewPromptPayload = Get-BridgeMachineEntityId -Domain 'sensor' -Key 'new_prompt_payload' -Slug $script:DaemonMachineSlug
     NewWorkspace  = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_workspace'     -Slug $script:DaemonMachineSlug
     NewProfile    = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_profile'       -Slug $script:DaemonMachineSlug
     NewAgent      = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_agent'         -Slug $script:DaemonMachineSlug
