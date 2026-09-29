@@ -467,6 +467,21 @@ indistinguishable from the values alone. Moving a form onto the rows does not fi
 by itself: the rows set entities, and something still has to type the result into an
 arrow-key prompt.
 
+Related, and still open: **a session an agent launches does not read as agent-driven.**
+`Get-BridgeDriverFromState` is called from exactly one place, the Submit press in
+`daemon-replies.ps1`, so `Driver` is only ever set by an agent *replying* to a session.
+A session an agent *started* is blue until it replies to it, which is backwards - you
+did not open it. `Test-DaemonNewSessionPressed` (hooks/daemon-launch.ps1, ~line 394)
+already reads the Launch button's state and discards its `context`; the presser's
+account is sitting on it, exactly as it is on a Submit press.
+
+The awkward part, and why this is not a two-line change: the press and the session are
+not the same moment. The launch returns before the CLI has registered itself, so the
+entry to stamp does not exist yet and the driver has to be carried from the press to
+whichever session that launch produces. Get that correlation wrong and a session gets
+somebody else's driver, which is worse than no glow - see the note above about a glow
+that lies.
+
 Also open: **thinking never enters the history trail.** `History` only ever receives
 `Reading your message`, `Running: <tool>` and, for Copilot, assistant text; reasoning is
 published only as the single newest line (`response` with `response_kind: reasoning`).
