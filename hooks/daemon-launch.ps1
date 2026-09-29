@@ -902,12 +902,29 @@ function Start-DaemonLaunch {
     }
     else {
         $agentName = Get-BridgeLauncherLabel -Launcher $chosenLauncher
-        Write-DaemonLog -Message "new $agentName session requested in '$label' ($directory)$(if ($agencyProfile) { " profile '$agencyProfile'" })$(if ($tuningNote) { " [$tuningNote]" })$(if ($prompt) { " with prompt: $prompt" })"
+
+        # A workspace marked `isolate` launches in a git worktree of its own, so two
+        # sessions in the same repository cannot move each other's HEAD - the failure
+        # this whole feature exists to remove. Only a fresh launch: a resume belongs
+        # in the directory it was already running in, above.
+        $launchDirectory = $directory
+        $choice = Get-BridgeWorkspaceChoice -Label $label
+        if ($null -ne $choice -and $choice.PSObject.Properties['Isolate'] -and $choice.Isolate) {
+            $worktree = [pscustomobject]@{ Path = $directory; Isolated = $false; Detail = '' }
+            try { $worktree = New-BridgeSessionWorktree -RepositoryPath $directory }
+            catch { $worktree.Detail = "worktree creation threw: $($_.Exception.Message)" }
+            if ($worktree.Isolated) { $launchDirectory = $worktree.Path }
+            if ($worktree.Detail) {
+                Write-DaemonLog -Message "$(if ($worktree.Isolated) { 'worktree' } else { 'no worktree' }): $($worktree.Detail)"
+            }
+        }
+
+        Write-DaemonLog -Message "new $agentName session requested in '$label' ($launchDirectory)$(if ($agencyProfile) { " profile '$agencyProfile'" })$(if ($tuningNote) { " [$tuningNote]" })$(if ($prompt) { " with prompt: $prompt" })"
         Set-CopilotMqttNewSessionResult -Headers $Headers `
             -Text "Starting $agentName in $label$(if ($agencyProfile) { " ($agencyProfile)" })..." | Out-Null
 
         $launchedAt = [DateTimeOffset]::Now
-        $launch = Start-BridgeCopilotSession -WorkingDirectory $directory -Prompt $prompt `
+        $launch = Start-BridgeCopilotSession -WorkingDirectory $launchDirectory -Prompt $prompt `
             -AgencyProfile $agencyProfile -Launcher $chosenLauncher `
             -Model $model -Effort $effort -Context $context -AllowAllTools:$allowAllTools
     }

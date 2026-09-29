@@ -9,35 +9,57 @@ often working in this repository at once, so the first section is not optional.
 read, and what releases are cut from. A `git checkout` there changes the files under
 every session sharing the clone.
 
-Three worktree slots exist for the actual work. Each has its own `HEAD` and index and
-shares one object store, so two sessions physically cannot disturb each other:
+You should not normally have to do anything about this. **Bridge** is configured with
+`"isolate": true`, so every session the bridge launches into it gets a git worktree of
+its own under `~/repos/wt`, created at launch and named for the moment it was made.
+Your session is already somewhere private; `git status` will tell you where.
 
-| Slot | Path | Workspace in the launch card |
-|---|---|---|
-| 1 | `~/repos/wt/bridge-1` | **Bridge wt1** |
-| 2 | `~/repos/wt/bridge-2` | **Bridge wt2** |
-| 3 | `~/repos/wt/bridge-3` | **Bridge wt3** |
-
-A slot is free when `git -C <slot> status --porcelain` is empty **and** its `HEAD` is
-detached. Anything else means a session has it; take another.
+If you find yourself in the primary clone - launched by hand, or the isolation fell
+back because git was unavailable - make your own before doing anything else:
 
 ```powershell
-$wt = "$HOME\repos\wt\bridge-1"
-git -C $wt fetch origin --quiet
-git -C $wt switch -c feat/<topic> origin/main    # always from fresh origin/main
-# ... work, test, PR ...
-git -C $wt switch --detach origin/main           # hand the slot back
-git -C $wt branch -D feat/<topic>
+$wt = "$HOME\repos\wt\agent-ha-bridge-manual"
+git -C "$HOME\repos\agent-ha-bridge" fetch origin --quiet
+git -C "$HOME\repos\agent-ha-bridge" worktree add --detach $wt origin/main
+Set-Location $wt
 ```
 
-Hand the slot back in that order, *after* the merge. `gh pr merge --delete-branch`
-cannot delete a branch that is checked out in a worktree: it prints a warning and
-suggests `git worktree remove`. Do not do that - the slot is meant to be reused.
-Detach it and delete the branch yourself instead.
+Either way, branch from freshly fetched `origin/main` once you are in one:
 
-A slot is a complete working copy: the full suite runs there, and the installer still
-marks an install from one as `(dev)` (a worktree's `.git` is a file, and `Test-Path`
-returns true for it).
+```powershell
+git fetch origin --quiet
+git switch -c feat/<topic> origin/main
+```
+
+A worktree is a complete working copy: the full suite runs there, and the installer
+still marks an install from one as `(dev)` (a worktree's `.git` is a file, and
+`Test-Path` returns true for it).
+
+### What happens to it afterwards
+
+Nothing you need to do. The bridge removes worktrees that hold nothing worth keeping
+before each launch, and the bar for that is deliberately high - all of: no uncommitted
+or untracked files, no branch checked out, no commit of its own on a detached HEAD,
+not a directory a session has worked in recently, and more than
+`newSession.worktreeIdleHours` (12) old. Anything unmerged or uncommitted stays until
+a person deals with it, however old it is.
+
+So leaving a branch behind is safe, and is the right thing to do if the work is not
+finished. If it *is* finished, leave the worktree clean and detached and it will be
+tidied up on its own:
+
+```powershell
+git switch --detach origin/main
+git branch -D feat/<topic>
+```
+
+Do that *after* the merge. `gh pr merge --delete-branch` cannot delete a branch that is
+checked out in a worktree: it warns and suggests `git worktree remove`. Following that
+is fine here - the worktree is disposable - but detaching is enough.
+
+`newSession.worktreeLimit` (10) caps how many can exist at once. At the cap a launch
+runs in the primary clone rather than failing, and says so in the daemon log and on the
+launch card.
 
 The general rules - never touch a branch you did not create, never `git stash`, stage
 only files you changed, never `git add -A` - are in
@@ -53,7 +75,7 @@ Including one-line and documentation changes.
 4. Wait for CI to be green. If it fails on something you did not touch, check whether
    `main` is already failing the same way and say so rather than merging into red.
 5. `gh pr merge <n> --squash --delete-branch`.
-6. Hand the slot back: detach it, then delete the local branch.
+6. Leave the worktree clean and detached; the bridge tidies it up later.
 
 ## Tests
 
