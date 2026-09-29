@@ -887,9 +887,18 @@ function Get-BridgeNewSessionArguments {
     if (-not [string]::IsNullOrWhiteSpace($Model)) { $copilotArguments += @('--model', $Model) }
 
     # Off unless explicitly configured. A session launched from a phone may well run
-    # unattended, and the bridge already routes permission prompts to Home Assistant,
-    # so there is no reason to hand it blanket approval by default.
-    if ($AllowAllTools.IsPresent) { $copilotArguments += '--allow-all-tools' }
+    # unattended, so blanket approval is not handed out by default.
+    #
+    # --allow-all, not --allow-all-tools. Copilot splits permission into three axes -
+    # tools, file paths and URLs - and the narrow flag grants only the first, so a
+    # session launched with it still stopped dead on "allow access to this folder?"
+    # with nobody watching. `--allow-all` is documented as exactly
+    # `--allow-all-tools --allow-all-paths --allow-all-urls`, and is the flag form of
+    # the `/allow-all` a user would type. It also makes Copilot match the other two,
+    # which have always had the whole thing: Claude's --dangerously-skip-permissions
+    # and Codex's --ask-for-approval never both cover everything, so Copilot was the
+    # only launcher whose "launch without permission prompts" setting did not.
+    if ($AllowAllTools.IsPresent) { $copilotArguments += '--allow-all' }
 
     foreach ($extra in @($ExtraArguments)) {
         if (-not [string]::IsNullOrWhiteSpace($extra)) { $copilotArguments += [string]$extra }

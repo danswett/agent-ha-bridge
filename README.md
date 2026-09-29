@@ -314,7 +314,7 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `newSession.discoverCount` | How many discovered folders to offer (default `8`) |
 | `newSession.resumeCount` | How many recent sessions the Resume dropdown offers (default `12`) |
 | `newSession.model` | Model for launched sessions (default: whatever the CLI would pick) |
-| `newSession.allowAllTools` | Launch without permission prompts (default `false`): `--allow-all-tools` for Copilot, `--dangerously-skip-permissions` for Claude, `--ask-for-approval never` for Codex |
+| `newSession.allowAllTools` | Launch without permission prompts (default `false`): `--allow-all` for Copilot, `--dangerously-skip-permissions` for Claude, `--ask-for-approval never` for Codex |
 | `newSession.extraArgs` | Extra CLI arguments for launched sessions, e.g. `["--plan"]` |
 | `newSession.copilotPath` | Full path to `copilot.exe` if it is not on the daemon's PATH |
 | `newSession.agencyPath` | Full path to `agency.exe` if it is not on the daemon's PATH |
@@ -501,7 +501,7 @@ A few deliberate choices:
   daemon resolves that label against this list. A path typed or injected anywhere else
   is never executed, so the config file — not Home Assistant — decides where a session
   may start.
-- **Tools are not auto-approved.** Launched sessions get no `--allow-all-tools` unless
+- **Tools are not auto-approved.** Launched sessions get no `--allow-all` unless
   you set `newSession.allowAllTools`. Permission prompts already route to Home
   Assistant, so an unattended session still asks before it acts.
 - **Launch is a button, not the text box.** Home Assistant commits a text entity as soon

@@ -235,7 +235,7 @@ $sid = '0cb916db-26aa-40f2-86b5-1ba81b225fd2'
 $args1 = @(Get-BridgeNewSessionArguments -SessionId $sid)
 Test-That 'the session id is set explicitly' { $args1 -contains '--session-id' -and $args1 -contains $sid }
 Test-That 'no prompt means no -i' { $args1 -notcontains '-i' }
-Test-That 'tools are not auto-approved by default' { $args1 -notcontains '--allow-all-tools' }
+Test-That 'nothing is auto-approved by default' { $args1 -notcontains '--allow-all' -and $args1 -notcontains '--allow-all-tools' }
 
 $args2 = @(Get-BridgeNewSessionArguments -SessionId $sid -Prompt 'do the thing')
 Test-That 'a prompt is passed with -i so the session stays interactive' {
@@ -252,7 +252,12 @@ Test-That 'a whitespace-only prompt is treated as no prompt' { $args4 -notcontai
 
 $args5 = @(Get-BridgeNewSessionArguments -SessionId $sid -Model 'gpt-5.4' -AllowAllTools)
 Test-That 'a configured model is passed through' { $args5[$args5.IndexOf('--model') + 1] -eq 'gpt-5.4' }
-Test-That 'tools are auto-approved only when asked for' { $args5 -contains '--allow-all-tools' }
+Test-That 'permissions are waived only when asked for' { $args5 -contains '--allow-all' }
+# Not the narrow one. Copilot splits permission into tools, paths and URLs, and
+# --allow-all-tools grants only the first, so a session launched with it still stopped
+# on "allow access to this folder?" - unattended, with nobody there to answer. The
+# other launchers have always waived the lot.
+Test-That 'and with the whole thing, not just tools' { $args5 -notcontains '--allow-all-tools' }
 
 $args6 = @(Get-BridgeNewSessionArguments -SessionId $sid -Prompt 'p' -ExtraArguments @('--plan'))
 Test-That 'extra arguments are included' { $args6 -contains '--plan' }
