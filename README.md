@@ -761,6 +761,10 @@ dashboard cards have one of their own in `frontend/test/test-cards.js`, run with
 `.github/workflows/ci.yml`, along with `tests/test-bootstrap.sh` — what the macOS
 installer hands to `installer` — on the macOS runner, because it needs BSD `mktemp`.
 
+`AGENTS.md` has the rest of what a contributor needs: the worktree slots that keep
+concurrent sessions out of each other's way, the branch and pull request rules, the
+lint CI also enforces, how dashboard cards are version-gated, and the release steps.
+
 The native hook is Go (`hook/`): `go test ./...` there, and `go build -o
 agent-bridge-hook.exe .` (no `.exe` on macOS) for a local build - which the installer
 then uses instead of downloading one, and which `tests/test-native-hook.ps1` runs end
