@@ -438,6 +438,22 @@ program. So:
   and still reads `allowAllTools`; it is the flag it sends that was too narrow. Claude
   (`--dangerously-skip-permissions`) and Codex (`--ask-for-approval never`) waive
   everything already, so Copilot was the only one with a half-open door.
+- **1.15.0** (2026-09-28): a multi-field question is answered by tapping rows, not by
+  filling in Home Assistant's native dropdowns - one labelled group per field, the
+  picked option staying marked until Send. The dropdowns were bad in the two ways the
+  rows were built to fix: a native select commits on blur, so an answer needed a tap
+  away and then Send, and it sizes its menu to the longest option without wrapping, so
+  sentence-length answers were cut off on a phone. The headings come from the decision
+  entity's `field_<n>_label` attributes rather than the entity's own `friendly_name`,
+  which Home Assistant builds from the device name plus the entity name and would have
+  put the session's whole title in front of every field. Verified live: a form answered
+  from the dashboard delivered `idx=3 of 4` intact, and an optional free-text field
+  committed empty and was accepted. Two things came out of testing it rather than out
+  of the feature. A test suite fired ten reads at the live instance with a placeholder
+  token in seventy milliseconds and got the machine IP-banned, which is now impossible
+  (`tests/test-http-guard.ps1`). And the answer-mismatch warning turns out to be a
+  false alarm on any question built from value/label pairs - see below; the correction
+  it injects tells the agent to disregard an answer that was right.
 
 ## Next: let a Copilot permission prompt be approved from Home Assistant
 
