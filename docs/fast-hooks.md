@@ -549,13 +549,35 @@ runs the card check and opens real WebSocket connections, and stubbed
 `Invoke-CopilotHaWebSocket` only halfway down the file. Every door is closed before
 anything runs now.
 
-Related, and still open: **the arrow-key delivery is unreliable.** The submission path
-is fixed, but `Get-DaemonAnswerCorrection` fired twice in a row on 2026-09-28 - the
-answer reaching the CLI was not the one sent. Both times the intended answer happened
-to be the first option, which is also where a mis-delivery lands, so the two are
-indistinguishable from the values alone. Moving a form onto the rows does not fix this
-by itself: the rows set entities, and something still has to type the result into an
-arrow-key prompt.
+Related, and now understood: **the mismatch warning is a false alarm, and the
+arrow-key delivery was never the problem.** `Get-DaemonAnswerCorrection` had fired
+three times on 2026-09-28, each reported as the answer reaching the CLI not being the
+one sent, and each time the intended answer happened to be the first option - which is
+also where a mis-delivery lands, so the two were indistinguishable from the values
+alone. The live drive of the form card settled it. A form was answered from the
+dashboard with `Next task` at **index 3 of 4**, a mis-delivery could not produce it,
+the CLI recorded exactly that option - and the correction fired anyway.
+
+`Test-CopilotAnswerMatchesSelections` asserts that the recorded result contains each
+injected option label verbatim; its docstring says labels are "reproduced verbatim".
+They are not. Copilot records a form's answer as its *schema values*, not its labels:
+the transcript for that question reads `User responded: release=cut_now,
+next_task=stop_here`, while the labels sent were `(Recommended) Cut 1.15.0 now` and
+`Nothing - stop for tonight`. So any question whose options are value/label pairs -
+`oneOf: [{const, title}]`, which is what a readable prompt needs - can never match, and
+neither can a boolean field, recorded as `true` rather than the `Yes` that was typed.
+A plain `enum`, where label and value are the same string, matches and is why this was
+not constant.
+
+The cost is not cosmetic: the card says "Answer may be wrong - check the terminal" and
+a correction is injected into the session telling the agent to disregard an answer that
+was in fact correct. It trains you to ignore the one warning that exists for a genuinely
+confident wrong answer. The fix is to compare against the value as well as the label,
+which means the marker has to carry both - the hook parses the schema and has them.
+
+**Still open, and not the same thing:** nothing yet proves delivery is always right.
+This is one correct delivery at a non-first index; it removes the evidence that
+delivery was broken, not the possibility.
 
 Also open: **a rejected auth is retried hard enough to get the bridge IP-banned.** Seen
 live on 2026-09-28. Two `wyoming` config entries hung Home Assistant's bootstrap - it
