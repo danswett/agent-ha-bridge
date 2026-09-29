@@ -476,12 +476,28 @@ Note also that the comment justifying the old default in hooks/session-launch.ps
 is true for Codex and false for Copilot, so it was resting on a guarantee Copilot does
 not provide. Fixing this task makes that comment true.
 
-## Then: the choices card should answer a whole form
+## Then: a session an agent launches should read as agent-driven
 
-**First, though:** Dans-MBP went offline on 1.14.4 and never took 1.14.5, so a question
-on that machine still cannot be answered from the dashboard. Press its **Install Bridge
-Update** button (`button.agent_bridge_dans_mbp_install_update`) once it is back - the
-owner has already agreed to this. DSWETT-HOME is on 1.14.5.
+A session the agent starts from the dashboard comes up with the ordinary colours, not
+the purple edge, and stays that way until the agent replies to it. That is backwards -
+you did not open it, and the launch is exactly the moment it is most useful to see that
+something else is driving. Noticed immediately every time a session is handed off.
+
+`Get-BridgeDriverFromState` is called from exactly one place: the Submit press in
+`daemon-replies.ps1` (~line 404). So `Driver` is set by an agent *replying* to a
+session, never by one *starting* it. `Test-DaemonNewSessionPressed`
+(hooks/daemon-launch.ps1, ~line 394) already reads the Launch button's state and throws
+its `context` away - the presser's account is sitting on it, exactly as it is on a
+Submit press, and `Get-BridgeDriverFromState` would take it unchanged.
+
+The awkward part, and why this is not a two-line change: the press and the session are
+not the same moment. The launch returns before the CLI has registered itself, so the
+entry to stamp does not exist yet and the driver has to be carried from the press to
+whichever session that launch produces. Get the correlation wrong and a session gets
+somebody else's driver, which is worse than no glow - a glow that lies is the one
+outcome the feature was built to avoid.
+
+## Then: the choices card should answer a whole form
 
 Not started. Multi-field questions still render as Home Assistant's native `select`
 dropdowns, and they are bad in two specific ways the row buttons already solve: a
@@ -513,21 +529,6 @@ to be the first option, which is also where a mis-delivery lands, so the two are
 indistinguishable from the values alone. Moving a form onto the rows does not fix this
 by itself: the rows set entities, and something still has to type the result into an
 arrow-key prompt.
-
-Related, and still open: **a session an agent launches does not read as agent-driven.**
-`Get-BridgeDriverFromState` is called from exactly one place, the Submit press in
-`daemon-replies.ps1`, so `Driver` is only ever set by an agent *replying* to a session.
-A session an agent *started* is blue until it replies to it, which is backwards - you
-did not open it. `Test-DaemonNewSessionPressed` (hooks/daemon-launch.ps1, ~line 394)
-already reads the Launch button's state and discards its `context`; the presser's
-account is sitting on it, exactly as it is on a Submit press.
-
-The awkward part, and why this is not a two-line change: the press and the session are
-not the same moment. The launch returns before the CLI has registered itself, so the
-entry to stamp does not exist yet and the driver has to be carried from the press to
-whichever session that launch produces. Get that correlation wrong and a session gets
-somebody else's driver, which is worse than no glow - see the note above about a glow
-that lies.
 
 Also open: **thinking never enters the history trail.** `History` only ever receives
 `Reading your message`, `Running: <tool>` and, for Copilot, assistant text; reasoning is
