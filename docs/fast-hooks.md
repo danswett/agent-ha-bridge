@@ -738,10 +738,36 @@ anything.
 
 **Still open, in rough order of measured value.**
 
+Both of these were measured on 2026-09-28 and are **smaller than the list above
+implied**, which was ordered by reasoning rather than by numbers.
+
 - `Invoke-DaemonFastActivity` runs **four times per reconcile**
-  (`agent-bridge-daemon.ps1`), each a full scan of every session.
+  (`agent-bridge-daemon.ps1`). Worth about **2.8 ms**, not the top item: the fast
+  lane already self-gates on a file-size check per live session, and the 10 Hz tick
+  that runs it was measured at 0.7 ms. Three of those four calls could go, and would
+  buy roughly 2 ms of a reconcile that costs 100-170 ms. The reason they are there -
+  publishing activity partway through a long pass - is worth more than 2 ms.
 - Launcher, workspace and adapter discovery are machine-level but recomputed every
-  15 seconds; the dashboard is already signature-gated and these could be.
+  15 seconds. Two thirds of this turns out to be **already done**:
+  `Get-BridgeAvailableLaunchers` has cached for 60 seconds since the comment at
+  `session-launch.ps1` about a reconcile asking four times, and
+  `Get-DaemonResumableSessions` is on its own timer because `agency hub
+  list-local-sessions` takes over a second. What is left is
+  `Get-BridgeWorkspaceChoices` at **8.6 ms** - of which `Get-BridgeDiscoveredWorkspaces`
+  is 6.8 - and `Get-BridgeAgencyProfiles` at 4.6 ms, both recomputed every pass by
+  `Get-DaemonNewSessionControls` even though `Publish-DaemonNewSessionControls`
+  already refuses to publish an unchanged result. About **13 ms a pass**.
+
+  It is not simply a cache, which is why it is still here. `Get-BridgeWorkspaceChoices`
+  is documented as the security boundary for launching: the daemon never launches a
+  path from Home Assistant, it launches one from this list, chosen by label, and
+  `Resolve-BridgeWorkspacePath` re-derives the list to check the label. Caching it
+  wholesale would let a directory removed from the config stay launchable for up to a
+  minute. The shape that keeps the boundary exact is to cache only what the
+  **publisher** reads, and to leave the resolver deriving the list fresh - it runs
+  once, when the button is actually pressed. Any change here needs a test that a
+  workspace taken out of the config is refused at launch while the cached dropdown
+  still lists it.
 
 **Done 2026-09-28.**
 
