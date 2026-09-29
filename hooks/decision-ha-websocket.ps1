@@ -839,7 +839,8 @@ function Test-BridgeActivityCardServed {
         with -MinimumVersion, whatever element shipped in that version), read from
         the `?v=` cache-buster on its resource URL. The activity card first shipped in
         card version 1.10.0; agent-bridge-session-card in 1.12.0;
-        agent-bridge-choices-card in 1.13.0.
+        agent-bridge-choices-card in 1.13.0, and its whole-form shape - a labelled
+        group of rows per field, replacing the per-field dropdowns - in 1.15.0.
     #>
     param(
         [AllowEmptyString()][AllowNull()][string]$ReplyCardUrl,
@@ -1397,6 +1398,14 @@ ha-select, mwc-select { width: 100%; }
         # has it; the dropdown stays as the fallback. Home Assistant's own select
         # sizes its menu to the longest option and will not wrap, so on a phone a
         # question whose answers are sentences ran off the right edge unreadable.
+        #
+        # From card 1.15.0 the same card answers the whole form: it is handed the
+        # field selectors as well, renders a labelled group of rows per armed field,
+        # and the split above goes away - so does the separate cancel button, which
+        # the card draws as its own quiet row. The fields are handed over in slot
+        # order, which is what lines each group up with the field_<n>_label attribute
+        # carrying its heading and with the slot Read-DaemonFormAnswer reads.
+        $formCard = Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.15.0'
         $answerInner = @{
             type = 'entities'
             show_header_toggle = $false
@@ -1409,15 +1418,23 @@ ha-select, mwc-select { width: 100%; }
                 card_mod = @{ style = $bareChild }
                 decision = $decisionEntity
             }
+            if ($formCard) {
+                $answerInner.fields = @(
+                    1..$script:CopilotMqttMaxFields | ForEach-Object { Get-CopilotMqttFieldEntityId -Node $node -Index $_ }
+                )
+            }
+        }
+        $answerConditions = @(
+            @{ condition = 'state'; entity = $decisionEntity; state_not = 'Idle' }
+            @{ condition = 'state'; entity = $decisionEntity; state_not = 'unknown' }
+            @{ condition = 'state'; entity = $decisionEntity; state_not = 'unavailable' }
+        )
+        if (-not $formCard) {
+            $answerConditions += @{ condition = 'state'; entity = "select.${node}_f1"; state = 'Idle' }
         }
         $answerCard = @{
             type = 'conditional'
-            conditions = @(
-                @{ condition = 'state'; entity = $decisionEntity; state_not = 'Idle' }
-                @{ condition = 'state'; entity = $decisionEntity; state_not = 'unknown' }
-                @{ condition = 'state'; entity = $decisionEntity; state_not = 'unavailable' }
-                @{ condition = 'state'; entity = "select.${node}_f1"; state = 'Idle' }
-            )
+            conditions = $answerConditions
             card = $answerInner
         }
 
@@ -1427,6 +1444,9 @@ ha-select, mwc-select { width: 100%; }
         # be. Relabelling it was not enough: it was still a select you could open, and
         # it still read as a question. It is a button here instead, sitting with End
         # session as the secondary action it actually is.
+        #
+        # With the form card served this is left out entirely: the card already draws
+        # 'Cancel request' as its own quiet row, and both together is two cancels.
         $cancelCard = @{
             type = 'conditional'
             conditions = @(
@@ -1489,20 +1509,28 @@ ha-select, mwc-select { width: 100%; }
         # The name is deliberately omitted: an entities card's `name` is not templated,
         # so a Jinja expression there renders as literal text. The bridge instead sets
         # each dropdown's MQTT name to the field's own label, and the card inherits it.
-        $fieldCards = foreach ($fi in 1..4) {
-            $fe = "select.${node}_f$fi"
-            @{
-                type = 'conditional'
-                conditions = @(
-                    @{ condition = 'state'; entity = $fe; state_not = 'Idle' }
-                    @{ condition = 'state'; entity = $fe; state_not = 'unknown' }
-                    @{ condition = 'state'; entity = $fe; state_not = 'unavailable' }
-                )
-                card = @{
-                    type = 'entities'
-                    show_header_toggle = $false
-                    card_mod = @{ style = $selectRowCard }
-                    entities = @(@{ entity = $fe; card_mod = @{ style = $selectRow } })
+        #
+        # These are the dropdowns the form card replaces, so with it served there are
+        # none: a native select commits on blur, so answering one meant tapping the
+        # option, tapping away and only then pressing Send, and it sizes its menu to
+        # the longest option without wrapping, so sentence-length answers were cut off
+        # on a phone. The card's rows do neither.
+        $fieldCards = if ($formCard) { @() } else {
+            foreach ($fi in 1..$script:CopilotMqttMaxFields) {
+                $fe = Get-CopilotMqttFieldEntityId -Node $node -Index $fi
+                @{
+                    type = 'conditional'
+                    conditions = @(
+                        @{ condition = 'state'; entity = $fe; state_not = 'Idle' }
+                        @{ condition = 'state'; entity = $fe; state_not = 'unknown' }
+                        @{ condition = 'state'; entity = $fe; state_not = 'unavailable' }
+                    )
+                    card = @{
+                        type = 'entities'
+                        show_header_toggle = $false
+                        card_mod = @{ style = $selectRowCard }
+                        entities = @(@{ entity = $fe; card_mod = @{ style = $selectRow } })
+                    }
                 }
             }
         }
@@ -1771,7 +1799,8 @@ ha-card {
         # $replyCard is two cards when the custom one is served, so it is concatenated
         # rather than dropped into the list: inside an array literal it would stay a
         # nested array and serialise as one, which Lovelace renders as nothing at all.
-        $sessionCards = @($header) + @($fieldCards) + @($answerCard) + @($replyCard) + @($sendStatusCard, $cancelCard, $stopCard)
+        $footerCards = if ($formCard) { @($sendStatusCard, $stopCard) } else { @($sendStatusCard, $cancelCard, $stopCard) }
+        $sessionCards = @($header) + @($fieldCards) + @($answerCard) + @($replyCard) + $footerCards
         if (Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.12.0') {
             @{
                 type     = 'custom:agent-bridge-session-card'

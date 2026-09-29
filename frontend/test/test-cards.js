@@ -10,10 +10,6 @@
  */
 'use strict';
 
-const fs = require('fs');
-const path = require('path');
-const vm = require('vm');
-
 let failures = 0;
 function check(name, condition, detail) {
   if (condition) { console.log(`  PASS  ${name}`); return; }
@@ -21,79 +17,18 @@ function check(name, condition, detail) {
   console.log(`  FAIL  ${name}${detail ? ` - ${detail}` : ''}`);
 }
 
-// --- a DOM small enough to run a card, and no smaller -----------------------------
+// --- the card itself, in a DOM small enough to run it (card-harness.js) --------
 
-class FakeClassList {
-  constructor() { this._set = new Set(); }
-  add(c) { this._set.add(c); }
-  remove(c) { this._set.delete(c); }
-  contains(c) { return this._set.has(c); }
-  toggle(c, force) {
-    const on = force === undefined ? !this._set.has(c) : !!force;
-    if (on) { this.add(c); } else { this.remove(c); }
-  }
-}
-
-class FakeElement {
-  constructor(tag) {
-    this.tagName = String(tag).toUpperCase();
-    this.children = [];
-    this.classList = new FakeClassList();
-    this.style = {};
-    this.hidden = false;
-    this._text = '';
-    this._listeners = {};
-  }
-  set textContent(value) {
-    this._text = String(value);
-    // Assigning '' is how a card empties a container before refilling it.
-    if (this._text === '') { this.children = []; }
-  }
-  get textContent() { return this._text; }
-  appendChild(child) { this.children.push(child); return child; }
-  addEventListener(type, fn) { (this._listeners[type] = this._listeners[type] || []).push(fn); }
-  click() { for (const fn of this._listeners.click || []) { fn(); } }
-  querySelector(sel) { return (this._slots && this._slots[sel]) || null; }
-}
-
-// The choices card builds itself by assigning innerHTML, then looks its parts up.
-// The stand-in hands back the same objects for those two selectors.
-function makeShadow() {
-  const root = new FakeElement('shadow');
-  root._slots = { '.choices': new FakeElement('div'), 'ha-card': new FakeElement('ha-card') };
-  Object.defineProperty(root, 'innerHTML', { set() {}, get() { return ''; } });
-  return root;
-}
-
-const sandbox = {
-  console: { info() {}, log() {} },
-  window: { customCards: [] },
-  document: { createElement: (tag) => new FakeElement(tag) },
-  customElements: { get: () => undefined, define: () => {}, whenDefined: () => new Promise(() => {}) },
-  HTMLElement: class {
-    constructor() { this.hidden = false; }
-    attachShadow() { this.shadowRoot = makeShadow(); return this.shadowRoot; }
-    dispatchEvent() { return true; }
-  },
-  CustomEvent: class { constructor(type, init) { this.type = type; Object.assign(this, init); } },
-  localStorage: { getItem: () => null, setItem: () => {} },
-};
-sandbox.globalThis = sandbox;
-
-const sourcePath = path.join(__dirname, '..', 'agent-bridge-reply-card.js');
-const source = fs.readFileSync(sourcePath, 'utf8');
-const context = vm.createContext(sandbox);
-// A classic script, so a trailing expression is what exposes its classes for testing.
-vm.runInContext(`${source}\n;globalThis.__cards = { AgentBridgeChoicesCard, AgentBridgeSessionCard, CARD_VERSION };`, context, { filename: sourcePath });
-const { AgentBridgeChoicesCard, AgentBridgeSessionCard, CARD_VERSION } = sandbox.__cards;
+const { FakeElement, loadCards } = require('./card-harness');
+const { AgentBridgeChoicesCard, AgentBridgeSessionCard, CARD_VERSION, sandbox, source } = loadCards();
 
 // --- the harness ------------------------------------------------------------------
 
 const DECISION = 'select.agent_bridge_abc_decision';
 
-function newCard() {
+function newCard(fields) {
   const card = new AgentBridgeChoicesCard();
-  card.setConfig({ decision: DECISION });
+  card.setConfig(fields ? { decision: DECISION, fields } : { decision: DECISION });
   return card;
 }
 
@@ -110,6 +45,7 @@ function hassWith(state, options) {
 
 const rows = (card) => card.shadowRoot.querySelector('.choices').children;
 const labels = (card) => rows(card).map((b) => b.textContent);
+const buttons = (card) => rows(card).filter((r) => r.tagName === 'BUTTON');
 
 // --- what it offers ---------------------------------------------------------------
 
@@ -160,12 +96,119 @@ rows(card)[0].click();
 check('the next question can be answered again',
   env.calls.length === 1 && env.calls[0].data.option === 'Another question', JSON.stringify(env.calls));
 
+console.log('--- a whole form, not just one choice ---');
+// A multi-field question publishes one select per field and leaves the main selector
+// carrying only 'Cancel request'. Those fields used to render as Home Assistant's own
+// dropdowns, which commit on blur - so answering meant tapping the option, tapping
+// away, and only then pressing Send - and which size their menu to the longest option
+// without wrapping, so sentence-length answers were cut off on a phone.
+
+const F = (n) => `select.agent_bridge_abc_f${n}`;
+const FIELDS = [F(1), F(2), F(3), F(4)];
+
+/*
+ * A form as the bridge actually publishes one: `armed` gives each named slot its
+ * options and current state, unnamed slots stay parked on 'Idle', and the headings
+ * ride on the decision entity's attributes because a field's own friendly_name is the
+ * device name followed by the entity name.
+ */
+function formEnv(armed, decisionOptions) {
+  const calls = [];
+  const attributes = { options: decisionOptions || ['Awaiting answer...', 'Cancel request'] };
+  const states = { [DECISION]: { state: 'Awaiting answer...', attributes } };
+  for (let i = 1; i <= 4; i++) {
+    const field = armed[i];
+    if (field) {
+      attributes[`field_${i}_label`] = field.label;
+      states[F(i)] = {
+        state: field.state || 'Choose...',
+        attributes: {
+          options: ['Choose...'].concat(field.options),
+          friendly_name: `Copilot: a task ${field.label}`,
+        },
+      };
+    }
+    else { states[F(i)] = { state: 'Idle', attributes: { options: ['Idle'] } }; }
+  }
+  return { calls, hass: { states, callService: (d, s, data) => calls.push({ domain: d, service: s, data }) } };
+}
+
+const twoFields = {
+  1: { label: 'Approach', options: ['Rewrite it', 'Patch it in place (Recommended)'] },
+  2: { label: 'When', options: ['Now', 'After the release'] },
+};
+
+card = newCard(FIELDS);
+env = formEnv(twoFields);
+card.hass = env.hass;
+check('each armed field gets a heading of its own',
+  rows(card).filter((r) => r.classList.contains('label')).map((r) => r.textContent).join('|') === 'Approach|When',
+  labels(card).join('|'));
+check('the headings come from the decision attributes, not the device-prefixed name',
+  labels(card).every((t) => !t.includes('Copilot: a task')), labels(card).join('|'));
+check('every option of every field is a row, in field order',
+  labels(card).join('|') === 'Approach|Rewrite it|Patch it in place (Recommended)|When|Now|After the release|Cancel request',
+  labels(card).join('|'));
+check('an unarmed field slot contributes nothing', !labels(card).includes('Idle'));
+check('and a field placeholder is never offered as an answer', !labels(card).includes('Choose...'));
+check('cancelling stays the quiet row at the bottom',
+  buttons(card)[buttons(card).length - 1].classList.contains('cancel'));
+check('the form is shown', card.hidden === false);
+
+// The wire that matters: a row has to set the entity the daemon reads when Send is
+// pressed, which is that field's own select and not the main one.
+buttons(card)[1].click();
+check('a tap on a field row selects that option on that field entity',
+  env.calls.length === 1 && env.calls[0].domain === 'select' && env.calls[0].service === 'select_option' &&
+  env.calls[0].data.entity_id === F(1) && env.calls[0].data.option === 'Patch it in place (Recommended)',
+  JSON.stringify(env.calls));
+check('answering one field does not lock the rest of the form',
+  card.shadowRoot.querySelector('.choices').classList.contains('sending') === false);
+buttons(card)[3].click();
+check('so the next field can be answered straight away',
+  env.calls.length === 2 && env.calls[1].data.entity_id === F(2) && env.calls[1].data.option === 'After the release',
+  JSON.stringify(env.calls));
+
+// A form is only sent when Send is pressed, so what has already been picked has to
+// stay visible while the rest is filled in.
+card = newCard(FIELDS);
+card.hass = formEnv({
+  1: { label: 'Approach', options: ['Rewrite it', 'Patch it in place'], state: 'Patch it in place' },
+  2: { label: 'When', options: ['Now', 'After the release'] },
+}).hass;
+check('a field already answered shows which option was picked',
+  buttons(card).filter((b) => b.classList.contains('chosen')).map((b) => b.textContent).join('|') === 'Patch it in place',
+  buttons(card).map((b) => `${b.textContent}:${b.classList.contains('chosen')}`).join('|'));
+
+// The card short-circuits on an unchanged signature, and a selection changes only a
+// field's state - leaving it out of the signature made a tap look like it did nothing.
+card = newCard(FIELDS);
+card.hass = formEnv(twoFields).hass;
+card.hass = formEnv({
+  1: { label: 'Approach', options: ['Rewrite it', 'Patch it in place (Recommended)'], state: 'Rewrite it' },
+  2: { label: 'When', options: ['Now', 'After the release'] },
+}).hass;
+check('and the mark follows the state once the selection lands',
+  buttons(card).filter((b) => b.classList.contains('chosen')).map((b) => b.textContent).join('|') === 'Rewrite it',
+  buttons(card).map((b) => `${b.textContent}:${b.classList.contains('chosen')}`).join('|'));
+
+card = newCard(FIELDS);
+card.hass = formEnv({}).hass;
+check('a decision offering only Cancel, with no field armed, is just that one row',
+  labels(card).join('|') === 'Cancel request', labels(card).join('|'));
+card = newCard(FIELDS);
+card.hass = hassWith('Idle', ['Idle']).hass;
+check('and a cleared question with field slots configured shows nothing at all',
+  card.hidden === true);
+check('"fields" is optional, so a single-choice question needs no change',
+  (() => { const c = new AgentBridgeChoicesCard(); c.setConfig({ decision: DECISION }); return c._fields.length === 0; })());
+
 console.log('--- it is wired up ---');
 check('the element is registered under its own name',
   /customElements\.define\('agent-bridge-choices-card'/.test(source));
 check('and offered in the card picker',
   sandbox.window.customCards.some((c) => c.type === 'agent-bridge-choices-card'));
-check('the card version is the one the dashboard gates the card on', CARD_VERSION === '1.14.0', CARD_VERSION);
+check('the card version is the one the dashboard gates the card on', CARD_VERSION === '1.15.0', CARD_VERSION);
 check('"decision" is required', (() => {
   try { new AgentBridgeChoicesCard().setConfig({}); return false; } catch (e) { return /decision/.test(e.message); }
 })());

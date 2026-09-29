@@ -434,6 +434,69 @@ Test-That 'an older served card keeps the dropdown, not an error box' {
     (Get-SavedJson) -notmatch 'agent-bridge-choices-card'
 }
 
+Write-Host ''
+Write-Host '--- and from 1.15.0 the same card answers the whole form ---'
+# A form used to render as one native dropdown per field. A native select commits on
+# blur, so an answer needed a tap away and then Send, and it sizes its menu to the
+# longest option without wrapping, so sentence-length answers were cut off on a phone.
+# The card draws a labelled group of rows per field instead - but only if the view
+# actually hands it the field entities, which is the link this pins down.
+Save-CopilotSessionDashboard -Sessions $sessions -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.15.0'
+$formDash = $script:SavedConfig | ConvertTo-Json -Depth 40 | ConvertFrom-Json -Depth 40
+$formSession = @($formDash.views[0].cards | Where-Object { $_.type -eq 'custom:agent-bridge-session-card' }) | Select-Object -First 1
+$formAnswer = @($formSession.cards | Where-Object {
+    $_.type -eq 'conditional' -and "$($_.card.type)" -eq 'custom:agent-bridge-choices-card'
+})[0]
+$node = $sessions[0].Node
+Test-That 'the choices card is handed the field entities' {
+    $null -ne $formAnswer -and $formAnswer.card.PSObject.Properties['fields']
+} "fields=[$(if ($null -ne $formAnswer -and $formAnswer.card.PSObject.Properties['fields']) { @($formAnswer.card.fields) -join ',' } else { '<missing>' })]"
+# The ids themselves, not just their presence: the card sets these entities and
+# Read-DaemonFormAnswer reads them, so a rename on either side is a form that takes
+# every tap and delivers nothing. Both sides are asked the same helper.
+Test-That 'and they are exactly the slots the daemon reads, in slot order' {
+    $expected = @(1..4 | ForEach-Object { Get-CopilotMqttFieldEntityId -Node $node -Index $_ })
+    (@($formAnswer.card.fields) -join ',') -eq ($expected -join ',')
+} "fields=[$(@($formAnswer.card.fields) -join ',')]"
+Test-That 'the answer card no longer hides itself when a field is in play' {
+    @($formAnswer.conditions | Where-Object { "$($_.entity)" -match '_f\d$' }).Count -eq 0
+}
+Test-That 'the per-field dropdowns it replaces are gone' {
+    @($formSession.cards | Where-Object {
+        $_.type -eq 'conditional' -and "$($_.card.type)" -eq 'entities' -and
+        "$($_.card.entities[0].entity)" -match '_f\d$'
+    }).Count -eq 0
+}
+Test-That 'and so is the separate cancel button, which the card draws as a row' {
+    @($formSession.cards | Where-Object {
+        $_.type -eq 'conditional' -and "$($_.card.type)" -eq 'custom:button-card' -and
+        "$($_.card.name)" -eq 'Cancel this request'
+    }).Count -eq 0
+}
+Test-That 'the entity pair still takes over the reply box while a question is armed' {
+    @($formSession.cards | Where-Object {
+        $_.type -eq 'conditional' -and "$($_.card.type)" -eq 'custom:layout-card'
+    }).Count -eq 1
+}
+Test-That 'End session is still the last thing on the card' {
+    "$($formSession.cards[-1].entity)" -match '_stop$'
+}
+Save-CopilotSessionDashboard -Sessions $sessions -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.14.5'
+$oldDash = $script:SavedConfig | ConvertTo-Json -Depth 40 | ConvertFrom-Json -Depth 40
+$oldSession = @($oldDash.views[0].cards | Where-Object { $_.type -eq 'custom:agent-bridge-session-card' }) | Select-Object -First 1
+Test-That 'a card served before 1.15.0 keeps its dropdowns rather than an empty form' {
+    @($oldSession.cards | Where-Object {
+        $_.type -eq 'conditional' -and "$($_.card.type)" -eq 'entities' -and
+        "$($_.card.entities[0].entity)" -match '_f\d$'
+    }).Count -eq 4
+}
+Test-That 'and is handed no fields it would not know what to do with' {
+    $old = @($oldSession.cards | Where-Object {
+        $_.type -eq 'conditional' -and "$($_.card.type)" -eq 'custom:agent-bridge-choices-card'
+    })[0]
+    $null -ne $old -and -not $old.card.PSObject.Properties['fields']
+}
+
 Write-Host '--- the dashboard is provisioned before it is written to ---'
 # Invoke-CopilotHaWebSocket hands back each command's `result` already unwrapped, so
 # a caller that reaches for `.result` again finds nothing and silently creates no

@@ -16,7 +16,7 @@
  * daemon downloads them and attaches them to the prompt.
  */
 
-const CARD_VERSION = '1.14.0';
+const CARD_VERSION = '1.15.0';
 
 // The working line, in the style of Claude Code's own spinner: its glyph cycle, and a
 // word picked once per turn. Claude Code does not record which word it chose, so the
@@ -642,21 +642,33 @@ class AgentBridgeActivityCard extends HTMLElement {
 }
 
 /*
- * The answer to a single-choice question, as tappable rows rather than a dropdown.
+ * The answer to a question - one choice or a whole form - as tappable rows rather
+ * than dropdowns.
  *
- * Home Assistant's own select control sizes its menu to the longest option and will
- * not wrap, so on a phone a question with real sentences for answers ran off the
- * right edge and the choices could not be read at all. Rows in the card wrap onto as
- * many lines as they need and are the same on every screen.
+ * Home Assistant's own select control is bad here in two specific ways. It sizes its
+ * menu to the longest option and will not wrap, so on a phone a question with real
+ * sentences for answers ran off the right edge and could not be read at all. And it
+ * commits on blur, so answering meant tapping the option, tapping away, and only then
+ * pressing Send. Rows wrap onto as many lines as they need, are the same on every
+ * screen, and commit on the tap itself.
  *
- * The options come from the select entity the bridge arms, so nothing about the
- * answer path changes: a tap is the same `select_option` call the dropdown made.
- * 'Awaiting answer...' is the parked state the bridge drives the selector to, not a
- * choice, so it is never offered; 'Cancel request' is, but as a quieter row at the
- * bottom, because it withdraws the question rather than answering it.
+ * A multi-field question publishes one select per field (`fields`), and the main
+ * selector (`decision`) then carries only 'Cancel request'. Both are rendered here:
+ * a labelled group of rows per armed field, then whatever the main selector offers.
+ * Nothing about the answer path changes - a tap is the same `select_option` call the
+ * dropdown made, on the same entity the daemon reads when Send is pressed.
+ *
+ * 'Awaiting answer...' is the parked state the bridge drives the main selector to and
+ * 'Choose...' is a field's, so neither is ever offered as an answer. 'Cancel request'
+ * is, but as a quieter row at the bottom, because it withdraws the question rather
+ * than answering it.
  */
 const CHOICE_PLACEHOLDER = 'Awaiting answer...';
+const CHOICE_FIELD_PLACEHOLDER = 'Choose...';
 const CHOICE_CANCEL = 'Cancel request';
+// The states an entity sits in when it is carrying nothing: an unarmed field slot is
+// parked on 'Idle', and a session that has gone leaves its entity behind.
+const CHOICE_UNARMED = ['', 'Idle', 'unknown', 'unavailable'];
 
 class AgentBridgeChoicesCard extends HTMLElement {
   constructor() {
@@ -664,6 +676,7 @@ class AgentBridgeChoicesCard extends HTMLElement {
     this.attachShadow({ mode: 'open' });
     this._last = '';
     this._sent = '';
+    this._fields = [];
   }
 
   setConfig(config) {
@@ -671,6 +684,9 @@ class AgentBridgeChoicesCard extends HTMLElement {
       throw new Error('agent-bridge-choices-card: "decision" is required');
     }
     this._config = Object.assign({}, config);
+    // A single-choice question has no fields; a form has up to four, and the unused
+    // slots stay parked on Idle rather than being deleted, so the list is fixed.
+    this._fields = Array.isArray(config.fields) ? config.fields.map(String).filter(Boolean) : [];
     this._last = '';
     if (this._hass) { this._render(); }
   }
@@ -688,6 +704,13 @@ class AgentBridgeChoicesCard extends HTMLElement {
       <style>
         ha-card { padding: 0; background: none; box-shadow: none; border: none; }
         .choices { display: flex; flex-direction: column; gap: 6px; }
+        /* A field's own heading, so a form of three-option groups reads as three
+           questions rather than one long list of unrelated answers. */
+        .label {
+          font-size: 0.85em; font-weight: 500; color: var(--secondary-text-color);
+          margin: 4px 0 -2px 2px; overflow-wrap: anywhere;
+        }
+        .label:first-child { margin-top: 0; }
         button {
           /* Wrapping is the whole point: the text decides the height, not the row. */
           white-space: normal; overflow-wrap: anywhere; text-align: left;
@@ -699,6 +722,12 @@ class AgentBridgeChoicesCard extends HTMLElement {
         button:hover { border-color: var(--primary-color); }
         button:active { background: var(--divider-color); }
         button:focus-visible { outline: 2px solid var(--primary-color); outline-offset: 1px; }
+        /* A form is answered field by field and only sent with Send, so what has
+           already been picked has to stay visible while the rest is filled in. */
+        button.chosen {
+          border-color: var(--primary-color); border-width: 2px; padding: 9px 11px;
+          background: var(--primary-color); color: var(--text-primary-color, #fff);
+        }
         button.cancel {
           color: var(--secondary-text-color); background: none;
           min-height: 36px; font-size: 0.92em;
@@ -711,47 +740,111 @@ class AgentBridgeChoicesCard extends HTMLElement {
     this._els = { list: this.shadowRoot.querySelector('.choices') };
   }
 
+  /*
+   * What one select entity is offering, or null when it is carrying nothing.
+   *
+   * The two placeholders are dropped here rather than at the call site: they are
+   * parked states the bridge drives the entity to so that "waiting" is a state and
+   * not merely an absence, and offering either as an answer would send the prompt
+   * the word 'Choose...'.
+   */
+  _armed(entityId) {
+    const entity = this._hass ? this._hass.states[entityId] : undefined;
+    if (!entity) { return null; }
+    const state = String(entity.state);
+    if (CHOICE_UNARMED.indexOf(state) !== -1) { return null; }
+    const attributes = entity.attributes || {};
+    const options = Array.isArray(attributes.options)
+      ? attributes.options.map(String).filter((o) => o && o !== CHOICE_PLACEHOLDER && o !== CHOICE_FIELD_PLACEHOLDER)
+      : [];
+    if (options.length === 0) { return null; }
+    return {
+      entityId,
+      state,
+      options,
+      label: '',
+      // A field still on its placeholder has not been answered yet.
+      chosen: (state === CHOICE_PLACEHOLDER || state === CHOICE_FIELD_PLACEHOLDER) ? '' : state,
+    };
+  }
+
   _render() {
     if (!this._built) { this._build(); }
-    const entityId = this._config.decision;
-    const entity = this._hass ? this._hass.states[entityId] : undefined;
-    const state = entity ? String(entity.state) : '';
-    const options = entity && entity.attributes && Array.isArray(entity.attributes.options)
-      ? entity.attributes.options.map(String).filter((o) => o && o !== CHOICE_PLACEHOLDER)
-      : [];
 
-    // Nothing is waiting: an unarmed selector sits on Idle, and a session that has
-    // gone leaves its entity unknown.
-    const waiting = state !== '' && state !== 'Idle' && state !== 'unknown' && state !== 'unavailable';
-    const show = waiting && options.length > 0;
+    const decisionEntity = this._hass ? this._hass.states[this._config.decision] : undefined;
+    const decisionAttrs = (decisionEntity && decisionEntity.attributes) || {};
+
+    // Fields first, then whatever the main selector offers - which on a form is only
+    // 'Cancel request'. A field group is shown only while it is carrying options, so
+    // a two-field question renders exactly two groups and the spare slots stay away.
+    //
+    // The heading comes from the decision entity's field_<n>_label attribute, which
+    // is where the bridge has published the labels since the per-field dropdowns
+    // existed. The field entity's own friendly_name cannot be used: Home Assistant
+    // builds it from the device name plus the entity name, so every heading would
+    // start with the session's whole title.
+    const fields = [];
+    this._fields.forEach((entityId, i) => {
+      const armed = this._armed(entityId);
+      if (!armed) { return; }
+      armed.label = String(decisionAttrs[`field_${i + 1}_label`] || '');
+      fields.push(armed);
+    });
+
+    const decision = this._armed(this._config.decision);
+    const groups = fields.slice();
+    if (decision) { groups.push(Object.assign({}, decision, { isDecision: true })); }
+
+    const show = groups.length > 0;
     this.hidden = !show;
     if (!show) { this._sent = ''; return; }
 
     // The answer has landed once the selector is no longer parked on the placeholder.
-    if (this._sent && state !== CHOICE_PLACEHOLDER) { this._sent = ''; }
+    if (this._sent && (!decision || decision.state !== CHOICE_PLACEHOLDER)) { this._sent = ''; }
     this._els.list.classList.toggle('sending', !!this._sent);
 
-    const signature = `${entityId}\u0001${options.join('\u0001')}`;
+    // Every field's current value is in the signature, so picking one redraws the
+    // form and the tick moves. Without it the card short-circuits on an unchanged
+    // option list and a tap appears to do nothing at all.
+    const signature = groups
+      .map((g) => `${g.entityId}\u0002${g.chosen}\u0002${g.label}\u0002${g.options.join('\u0001')}`)
+      .join('\u0003');
     if (signature === this._last) { return; }
     this._last = signature;
 
     this._els.list.textContent = '';
-    for (const option of options) {
-      const button = document.createElement('button');
-      button.type = 'button';
-      button.textContent = option;
-      if (option === CHOICE_CANCEL) { button.classList.add('cancel'); }
-      button.addEventListener('click', () => this._choose(option));
-      this._els.list.appendChild(button);
+    for (const group of groups) {
+      if (group.label) {
+        const label = document.createElement('div');
+        label.classList.add('label');
+        label.textContent = group.label;
+        this._els.list.appendChild(label);
+      }
+      for (const option of group.options) {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.textContent = option;
+        if (option === CHOICE_CANCEL) { button.classList.add('cancel'); }
+        else if (option === group.chosen) { button.classList.add('chosen'); }
+        button.addEventListener('click', () => this._choose(group, option));
+        this._els.list.appendChild(button);
+      }
     }
   }
 
-  _choose(option) {
+  /*
+   * A tap on the main selector answers the question outright, so the rows are locked
+   * until the daemon clears it. A tap on a field does not: a form is sent by Send,
+   * and every field must stay changeable until then.
+   */
+  _choose(group, option) {
     if (this._sent || !this._hass) { return; }
-    this._sent = option;
-    this._els.list.classList.add('sending');
+    if (group.isDecision) {
+      this._sent = option;
+      this._els.list.classList.add('sending');
+    }
     this._hass.callService('select', 'select_option', {
-      entity_id: this._config.decision,
+      entity_id: group.entityId,
       option,
     });
   }
@@ -1224,7 +1317,7 @@ window.customCards.push({
 window.customCards.push({
   type: 'agent-bridge-choices-card',
   name: 'Agent Bridge Choices',
-  description: 'The answers to a waiting question, as rows that wrap instead of a dropdown.',
+  description: 'A waiting question or form, as rows that wrap instead of dropdowns.',
 });
 
 console.info(`%c AGENT-BRIDGE-REPLY-CARD %c ${CARD_VERSION} `,
