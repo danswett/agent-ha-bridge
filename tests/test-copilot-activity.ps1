@@ -65,7 +65,39 @@ $activity = Get-ActivityFromEvents -Lines $batch -VerboseMode $true
 Test-That 'the last thought wins over the earlier reply' { $activity.Latest -eq 'a last thought' -and $activity.LatestIsThinking }
 Test-That 'the reply is still remembered as the response' { $activity.Response -eq 'the answer' }
 Test-That 'the summary is the last tool call, which is what the status line shows' { $activity.Summary -eq 'Running: edit' }
-Test-That 'and the trail holds both tools and the reply' { (@($activity.History) -join '|') -eq 'the answer|Running: grep|Running: edit' -or @($activity.History).Count -eq 3 }
+
+# With detail on, a thought is a step in the trail like any other, in the order it
+# happened. Before this the trail held tools and text only: every message carries a
+# thought and most carry nothing else, so the reasoning between the steps - which is
+# most of what the agent did - was never shown and could not be recovered.
+Test-That 'the trail interleaves thinking with what was done' {
+    (@($activity.History) -join '|') -eq
+        'Thinking: first thought|Running: grep|Thinking: second thought|the answer|Running: edit|Thinking: a last thought'
+} (@($activity.History) -join '|')
+
+# And is unchanged without it, which is what the switch is for.
+$plain = Get-ActivityFromEvents -Lines $batch -VerboseMode $false
+Test-That 'without detail the trail holds only what was done' {
+    (@($plain.History) -join '|') -eq 'Running: grep|the answer|Running: edit'
+} (@($plain.History) -join '|')
+Test-That 'though the thinking is still captured either way' { $plain.Reasoning -eq 'a last thought' }
+
+Write-Host '--- a thought is reduced to one line for the trail ---'
+# The trail is a list on a phone; reasoning is paragraphs.
+Test-That 'only the first line is taken' {
+    (Get-BridgeThoughtLine -Text "Checking the config`n`nThen the rest of it") -eq 'Thinking: Checking the config'
+}
+Test-That 'a markdown heading loses its markup' {
+    (Get-BridgeThoughtLine -Text '**Weighing the options**') -eq 'Thinking: Weighing the options'
+}
+Test-That 'and a hash heading too' {
+    (Get-BridgeThoughtLine -Text '## Weighing the options') -eq 'Thinking: Weighing the options'
+}
+Test-That 'a long line is cut rather than filling the card' {
+    $long = Get-BridgeThoughtLine -Text ('x' * 400)
+    $long.Length -lt 140 -and $long.EndsWith([char]0x2026)
+} (Get-BridgeThoughtLine -Text ('x' * 400))
+Test-That 'nothing worth showing gives nothing' { (Get-BridgeThoughtLine -Text "   `n  ") -eq '' }
 
 $activity = Get-ActivityFromEvents -Lines @((New-Thought 'thinking'), (New-Reply 'and then speaking')) -VerboseMode $true
 Test-That 'a reply after a thought wins' { $activity.Latest -eq 'and then speaking' -and -not $activity.LatestIsThinking }

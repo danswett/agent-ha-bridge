@@ -134,6 +134,7 @@ jobs:
             'tests/test-state-snapshot.ps1'
             'tests/test-stop-session.ps1'
             'tests/test-verbose-toggle.ps1'
+            'tests/test-detailed-activity.ps1'
             'codex/tests/test-codex.ps1'
             'claude/tests/test-claude-ask-parser.ps1'
             'claude/tests/test-claude-transcript.ps1'

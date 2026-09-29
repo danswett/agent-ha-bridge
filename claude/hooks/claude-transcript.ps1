@@ -131,6 +131,13 @@ function Get-ClaudeActivityFromTranscript {
                         $reasoning = $text.Trim()
                         $latest = $reasoning
                         $latestIsThinking = $true
+                        # Into the trail too when detail is asked for, the same as
+                        # Copilot's reasoningText: otherwise a thought is only ever
+                        # the newest line and the next one erases it.
+                        if ($VerboseMode) {
+                            $thought = Get-BridgeThoughtLine -Text $reasoning
+                            if ($thought) { $history.Add($thought) }
+                        }
                     }
                 }
                 'text' {

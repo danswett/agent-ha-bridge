@@ -205,6 +205,12 @@ $mid = Get-CodexActivityFromTranscript -Lines $turn[0..4]
 Test-That 'mid-turn, the progress note is what the card shows' { $mid.Latest -eq "I'll check the network settings first." }
 $summary = Get-CodexActivityFromTranscript -Lines @('{"type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"Weighing DNS against the proxy"}]}}')
 Test-That 'a reasoning summary is shown as thinking' { $summary.Latest -eq 'Weighing DNS against the proxy' -and $summary.LatestIsThinking -and $summary.Reasoning }
+# Detail on puts it in the trail as well, so History is no longer tool calls only.
+Test-That 'without detail, the trail is what it ran' { @($summary.History).Count -eq 0 } (@($summary.History) -join '|')
+$summaryDetailed = Get-CodexActivityFromTranscript -VerboseMode $true -Lines @('{"type":"response_item","payload":{"type":"reasoning","summary":[{"type":"summary_text","text":"Weighing DNS against the proxy"}]}}')
+Test-That 'with detail, the thought is a step in the trail' {
+    (@($summaryDetailed.History) -join '|') -eq 'Thinking: Weighing DNS against the proxy'
+} (@($summaryDetailed.History) -join '|')
 Test-That 'a batch with nothing to show adds nothing' {
     $none = Get-CodexActivityFromTranscript -Lines @('{"type":"event_msg","payload":{"type":"token_count"}}', 'not json')
     -not $none.TurnStarted -and -not $none.Latest -and @($none.History).Count -eq 0

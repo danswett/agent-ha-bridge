@@ -112,8 +112,15 @@ function Get-CodexActivityFromTranscript {
 
         The hooks alone gave the card nothing but a status line until the turn ended,
         and the reply only then.
+
+        VerboseMode decides only whether a reasoning summary also joins History; it is
+        always captured as Reasoning either way, so the Detailed activity switch can
+        show what is already known without waiting for Codex to think again.
     #>
-    param([Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines)
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Lines,
+        [bool]$VerboseMode = $false
+    )
 
     $result = [pscustomobject]@{ TurnStarted = $false; Latest = ''; LatestIsThinking = $false; Reasoning = ''; History = @() }
     foreach ($line in $Lines) {
@@ -150,6 +157,13 @@ function Get-CodexActivityFromTranscript {
                 }) -join "`n"
                 if (-not [string]::IsNullOrWhiteSpace($text)) {
                     $result.Reasoning = $text.Trim(); $result.Latest = $text.Trim(); $result.LatestIsThinking = $true
+                    # Into the trail too when detail is asked for, as Copilot and
+                    # Claude do - otherwise History is tool calls only and everything
+                    # Codex considered between them is lost.
+                    if ($VerboseMode) {
+                        $thought = Get-BridgeThoughtLine -Text $result.Reasoning
+                        if ($thought) { $result.History = @($result.History) + $thought }
+                    }
                 }
             }
             default {

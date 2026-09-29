@@ -238,7 +238,11 @@ function Get-ActivityFromEvents {
 
         Returns the last meaningful event plus a short rolling history, so the Home
         Assistant card shows what the session is doing now and what it just did.
-        Reasoning text is only collected when verbose streaming is on.
+
+        Reasoning text is always collected; VerboseMode decides only whether it also
+        joins the trail. Capture and display are deliberately decoupled so the
+        Detailed activity switch can show or hide what is already known without
+        waiting for the session to think again.
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Lines,
@@ -309,6 +313,16 @@ function Get-ActivityFromEvents {
                     $reasoning = $text.Trim()
                     $latest = $reasoning
                     $latestIsThinking = $true
+                    # Into the trail as well as the newest line, when detail is asked
+                    # for. Without this a thought was only ever the single newest
+                    # thing on the card: every message carries one, most carry
+                    # nothing else, and each was overwritten by the next before
+                    # anyone saw it - so the trail showed tools and text with all the
+                    # reasoning between them missing.
+                    if ($VerboseMode) {
+                        $thought = Get-BridgeThoughtLine -Text $reasoning
+                        if ($thought) { $history.Add($thought) }
+                    }
                 }
                 $content = Get-BridgeEventField -Data $parsed.data -Name 'content'
                 if (-not [string]::IsNullOrWhiteSpace($content)) {
@@ -545,8 +559,17 @@ function Update-DaemonSessionActivity {
     if (-not $turnStarted -and $entry.PSObject.Properties['LastHistory'] -and $entry.LastHistory) {
         $carried = @($entry.LastHistory | ForEach-Object { [string]$_ })
     }
+    # A deeper trail while Detailed activity is on. Almost every message an agent
+    # writes carries a thought, so including them fills the trail about twice as fast;
+    # at the ordinary depth the actions would scroll off in half the time they do now,
+    # which would make turning detail on lose you information as well as add it.
+    $depth = if ($verbose -and $script:DaemonConfig.ContainsKey('ActivityHistoryDetailed')) {
+        [int]$script:DaemonConfig.ActivityHistoryDetailed
+    } else {
+        [int]$script:DaemonConfig.ActivityHistory
+    }
     $detail['history'] = @(@($carried) + @($activity.History | ForEach-Object { [string]$_ }) |
-        Select-Object -Last $script:DaemonConfig.ActivityHistory)
+        Select-Object -Last $depth)
     # Persist the history alongside the summary and reasoning, so a daemon restart
     # can restore the whole card rather than blanking it.
     if ($entry.PSObject.Properties['LastHistory']) { $entry.LastHistory = $detail.history }
@@ -660,7 +683,7 @@ function Update-DaemonCodexActivity {
     $Entry.Offset = $append.Offset
     if ($append.Lines.Count -eq 0 -and -not $Republish) { return }
 
-    $activity = Get-CodexActivityFromTranscript -Lines $append.Lines
+    $activity = Get-CodexActivityFromTranscript -Lines $append.Lines -VerboseMode $VerboseOn
     if ($activity.TurnStarted) {
         foreach ($name in @('LastMessage', 'LastReasoning')) { Set-DaemonSessionProperty -Entry $Entry -Name $name -Value '' }
         Set-DaemonSessionProperty -Entry $Entry -Name 'LastMessageIsThinking' -Value $false
