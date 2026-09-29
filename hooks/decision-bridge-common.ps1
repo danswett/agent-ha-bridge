@@ -656,9 +656,24 @@ function ConvertFrom-DecisionSchemaText {
     $null
 }
 
-function Get-DecisionSchemaFieldOptions {
+function Get-DecisionSchemaFieldChoices {
     <#
-        Option list for a single JSON-Schema field, or an empty array for free text.
+        The choices of a single JSON-Schema field as Label/Value pairs, or an empty
+        array for free text.
+
+        Both halves matter, and they are read here together so they cannot drift
+        apart. The label is what the card shows and what the injector counts arrow
+        presses towards; the value is what the schema actually carries - the `const`
+        of a `oneOf` entry, the `enum` entry behind an `enumNames` label, `true` or
+        `false` for a checkbox.
+
+        The two are usually the same string, which is why the difference went unseen
+        for so long. It only shows when a form is written the richer way, and then it
+        matters: the CLI records an answer by value ("release=cut_now"), never by
+        label ("Cut the release now"). A checker that knows only labels calls every
+        such answer a mismatch.
+
+        Returns an array of @{ Label; Value }.
     #>
     param(
         [AllowNull()]
@@ -666,59 +681,102 @@ function Get-DecisionSchemaFieldOptions {
     )
 
     if ($null -eq $Field) { return @() }
-    $options = @()
+    $choices = [System.Collections.Generic.List[object]]::new()
 
-    if ($null -ne $Field.enum) {
+    # Every probe below goes through PSObject.Properties rather than reading the
+    # property directly. A schema is a ConvertFrom-Json object, and asking one for a
+    # property it does not have is a terminating error under Set-StrictMode. The
+    # Copilot ask_user handler is spooled non-strict for exactly that reason
+    # (daemon-hookspool.ps1), but this is the one piece of the parser reached from
+    # elsewhere - the tests run it strict - so it does not rely on that.
+    $has = {
+        param($Object, [string]$Name)
+        ($null -ne $Object) -and
+        $Object.PSObject.Properties[$Name] -and
+        ($null -ne $Object.$Name)
+    }
+
+    # A `oneOf`/`anyOf` entry carries its display text in `title` and its schema value
+    # in `const`; either may be absent, and each stands in for the other.
+    $addEntry = {
+        param($Entry)
+        $title = ''
+        $const = ''
+        if ($null -ne $Entry) {
+            if ($Entry.PSObject.Properties['title']) { $title = [string]$Entry.title }
+            if ($Entry.PSObject.Properties['const']) { $const = [string]$Entry.const }
+        }
+        $label = if ([string]::IsNullOrWhiteSpace($title)) { $const } else { $title }
+        $value = if ([string]::IsNullOrWhiteSpace($const)) { $label } else { $const }
+        if (-not [string]::IsNullOrWhiteSpace($label)) {
+            $choices.Add([pscustomobject]@{ Label = $label; Value = $value })
+        }
+    }
+
+    if (& $has $Field 'enum') {
         $values = @($Field.enum | ForEach-Object { [string]$_ })
         $labels = @()
-        if ($null -ne $Field.enumNames) {
+        if (& $has $Field 'enumNames') {
             $labels = @($Field.enumNames | ForEach-Object { [string]$_ })
         }
         for ($index = 0; $index -lt $values.Count; $index++) {
+            $label = $values[$index]
             if (
                 $index -lt $labels.Count -and
                 -not [string]::IsNullOrWhiteSpace($labels[$index])
             ) {
-                $options += $labels[$index]
+                $label = $labels[$index]
             }
-            else {
-                $options += $values[$index]
+            if (-not [string]::IsNullOrWhiteSpace($label)) {
+                $choices.Add([pscustomobject]@{ Label = $label; Value = $values[$index] })
             }
         }
-        return @($options | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+        return @($choices.ToArray())
     }
 
-    if ($null -ne $Field.oneOf) {
-        foreach ($option in @($Field.oneOf)) {
-            $label = [string]$option.title
-            if ([string]::IsNullOrWhiteSpace($label)) { $label = [string]$option.const }
-            if (-not [string]::IsNullOrWhiteSpace($label)) { $options += $label }
-        }
-        return @($options)
+    if (& $has $Field 'oneOf') {
+        foreach ($option in @($Field.oneOf)) { & $addEntry $option }
+        return @($choices.ToArray())
     }
 
-    if ($null -ne $Field.items) {
-        if ($null -ne $Field.items.enum) {
-            return @(
-                $Field.items.enum |
-                    ForEach-Object { [string]$_ } |
-                    Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
-            )
-        }
-        if ($null -ne $Field.items.anyOf) {
-            foreach ($option in @($Field.items.anyOf)) {
-                $label = [string]$option.title
-                if ([string]::IsNullOrWhiteSpace($label)) { $label = [string]$option.const }
-                if (-not [string]::IsNullOrWhiteSpace($label)) { $options += $label }
+    if (& $has $Field 'items') {
+        if (& $has $Field.items 'enum') {
+            foreach ($entry in @($Field.items.enum)) {
+                $value = [string]$entry
+                if (-not [string]::IsNullOrWhiteSpace($value)) {
+                    $choices.Add([pscustomobject]@{ Label = $value; Value = $value })
+                }
             }
-            return @($options)
+            return @($choices.ToArray())
+        }
+        if (& $has $Field.items 'anyOf') {
+            foreach ($option in @($Field.items.anyOf)) { & $addEntry $option }
+            return @($choices.ToArray())
         }
         return @()
     }
 
-    if ([string]$Field.type -eq 'boolean') { return @('Yes', 'No') }
+    # A checkbox is shown as Yes/No but recorded as the JSON literal.
+    if ((& $has $Field 'type') -and [string]$Field.type -eq 'boolean') {
+        return @(
+            [pscustomobject]@{ Label = 'Yes'; Value = 'true' }
+            [pscustomobject]@{ Label = 'No';  Value = 'false' }
+        )
+    }
 
     @()
+}
+
+function Get-DecisionSchemaFieldOptions {
+    <#
+        Option labels for a single JSON-Schema field, or an empty array for free text.
+    #>
+    param(
+        [AllowNull()]
+        [psobject]$Field
+    )
+
+    @(Get-DecisionSchemaFieldChoices -Field $Field | ForEach-Object { [string]$_.Label })
 }
 
 function Format-DecisionSchemaOutline {
@@ -822,7 +880,9 @@ function Get-DecisionSchemaFields {
         left the card with no options at all, and the resulting free-text answer was
         swallowed by the live prompt.
 
-        Returns an array of @{ Label; Options; IsText }.
+        Returns an array of @{ Label; Options; Values; IsText }, where Options are the
+        labels shown on the card and Values the schema values the CLI records, in the
+        same order.
     #>
     param(
         [AllowNull()][psobject]$Schema
@@ -837,11 +897,12 @@ function Get-DecisionSchemaFields {
         $field = $Schema.properties.$name
         $label = [string]$field.title
         if ([string]::IsNullOrWhiteSpace($label)) { $label = $name }
-        $options = @(Get-DecisionSchemaFieldOptions -Field $field)
+        $choices = @(Get-DecisionSchemaFieldChoices -Field $field)
         $fields += [pscustomobject]@{
             Label   = $label
-            Options = @($options)
-            IsText  = ($options.Count -eq 0)
+            Options = @($choices | ForEach-Object { [string]$_.Label })
+            Values  = @($choices | ForEach-Object { [string]$_.Value })
+            IsText  = ($choices.Count -eq 0)
         }
     }
     @($fields)
@@ -1567,7 +1628,14 @@ function Test-CopilotAnswerMatchesSelections {
 
         Comparing the recorded result against what was sent turns that into something
         visible. Text fields are skipped - the CLI may reformat what was typed - so
-        this only asserts on the option labels, which are reproduced verbatim.
+        this only asserts on the choice fields.
+
+        A choice is accepted by either of its two names. The card and the injector
+        work in labels; the CLI records the schema value - "release=cut_now", not
+        "Cut the release now" - so a label-only comparison called every richly
+        written form a mismatch, and then told the session to disregard an answer
+        that was right. Seen live on 2026-09-28. Matching either name keeps the
+        neighbour check intact, because a neighbouring option differs under both.
     #>
     param(
         [AllowEmptyString()][string]$ResultContent,
@@ -1581,12 +1649,41 @@ function Test-CopilotAnswerMatchesSelections {
     if ($fieldList.Count -eq 0 -or $selectionList.Count -ne $fieldList.Count) { return $true }
 
     for ($i = 0; $i -lt $fieldList.Count; $i++) {
-        if (Test-DecisionFieldIsText -Field $fieldList[$i]) { continue }
+        $field = $fieldList[$i]
+        if (Test-DecisionFieldIsText -Field $field) { continue }
         $wanted = [string]$selectionList[$i]
         if ([string]::IsNullOrWhiteSpace($wanted)) { continue }
-        if ($ResultContent -notlike "*$wanted*") { return $false }
+        if ($ResultContent -like "*$wanted*") { continue }
+
+        # Fall back to the schema value sitting behind the label that was picked.
+        # A marker written before this was carried has no Values, and then there is
+        # nothing better to compare than the label.
+        $value = Get-DecisionFieldOptionValue -Field $field -Option $wanted
+        if (-not [string]::IsNullOrWhiteSpace($value) -and $ResultContent -like "*$value*") { continue }
+        return $false
     }
     $true
+}
+
+function Get-DecisionFieldOptionValue {
+    <#
+        The schema value behind one of a field's option labels, or '' when the field
+        does not carry values - a marker written by an older build, say.
+    #>
+    param(
+        [AllowNull()][object]$Field,
+        [AllowEmptyString()][string]$Option
+    )
+
+    if ($null -eq $Field -or -not $Field.PSObject.Properties['Values']) { return '' }
+    $options = @($Field.Options)
+    $values = @($Field.Values)
+    for ($i = 0; $i -lt $options.Count; $i++) {
+        if ([string]$options[$i] -eq $Option -and $i -lt $values.Count) {
+            return [string]$values[$i]
+        }
+    }
+    ''
 }
 
 function Get-CopilotTranscriptTailLines {

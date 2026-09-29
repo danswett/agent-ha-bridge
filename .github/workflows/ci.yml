@@ -93,6 +93,7 @@ jobs:
         run: |
           $suites = @(
             'tests/test-decision-args.ps1'
+            'tests/test-answer-match.ps1'
             'tests/test-decision-retry.ps1'
             'tests/test-http-guard.ps1'
             'tests/test-decision-select-race.ps1'

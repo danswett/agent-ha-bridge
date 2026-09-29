@@ -588,8 +588,35 @@ not constant.
 The cost is not cosmetic: the card says "Answer may be wrong - check the terminal" and
 a correction is injected into the session telling the agent to disregard an answer that
 was in fact correct. It trains you to ignore the one warning that exists for a genuinely
-confident wrong answer. The fix is to compare against the value as well as the label,
-which means the marker has to carry both - the hook parses the schema and has them.
+confident wrong answer.
+
+**Fixed 2026-09-28.** A field now carries `Values` alongside `Options`, and
+`Test-CopilotAnswerMatchesSelections` accepts a choice under either name. Both halves
+are read by one function, `Get-DecisionSchemaFieldChoices`, which returns Label/Value
+pairs; `Get-DecisionSchemaFieldOptions` is now a thin wrapper over it that takes the
+labels. That is deliberate - read by two copies of the branching logic the lists would
+eventually disagree about which value sits behind which label, and the check would
+then blame the wrong option. The neighbour check keeps its teeth, because a
+neighbouring option differs under both names.
+
+The work was all in the middle. Reading values where the schema is parsed and
+comparing them where the answer is checked are two ends that would each pass their own
+test while the value was dropped in between - the two are separated by a marker file
+that is JSON on disk, written by the hook and read by the daemon minutes later.
+`tests/test-answer-match.ps1` therefore follows one answer the whole way: real tool
+arguments, the real parse, `Write-CopilotDecisionMarker` to a real file,
+`Get-CopilotDecisionMarker` back off it, and only then the check, against the verbatim
+string Copilot recorded. It picks the **second** option of each list, because a first
+option passes a broken check by accident. Three mutations were confirmed to fail it:
+ignoring the value in the check, dropping `Values` at capture, and letting labels and
+values drift out of step - the last of which flips `the neighbouring option is still
+caught`, which is the assertion that proves the check still does its job.
+
+One thing found on the way: `Get-DecisionSchemaFieldOptions` read `$Field.enum` and
+`$Field.oneOf` bare. Under `Set-StrictMode` that is a terminating error on any field
+lacking them. It has never fired, because `daemon-hookspool.ps1` spools the Copilot
+handlers with `Strict = $false` for exactly this reason, but the new pair function is
+reachable from elsewhere and now probes through `PSObject.Properties` instead.
 
 **Still open, and not the same thing:** nothing yet proves delivery is always right.
 This is one correct delivery at a non-first index; it removes the evidence that
