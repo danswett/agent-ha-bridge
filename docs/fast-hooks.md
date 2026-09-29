@@ -387,6 +387,89 @@ program. So:
   *agent's* account. A person and an id in `agentUserIds` are only two of the three
   steps, and with the agent still pressing on your own token every press is correctly
   read as yours - the feature works and nothing ever lights up.
+- **1.14.3** (2026-09-28): picking Approve or Deny on a Codex approval did nothing; the
+  prompt had to be answered in the terminal every time. `Test-DaemonReplyBoxFree` looks
+  for the `ask_user` marker to decide whether a question still owns the card, and a
+  Codex approval arms the same selector through its `PermissionRequest` hook instead.
+  So a live approval fell through to the staleness check below, which asks the
+  transcript whether an `ask_user` is pending - for an approval there is none and never
+  was, so it always answered no, read the card as a leftover and cleared it.
+  `Invoke-PendingReplies` runs that for every live session on every reconcile, so this
+  was not a race: armed at 15:51:45 with Approve/Deny/Cancel, back to a single `Idle`
+  option by 15:51:48 while the card still read "Needs approval". A choice made in that
+  window is sent against an option list that has just been emptied and Home Assistant
+  rejects it, so the dropdown appeared to do nothing rather than failing visibly.
+- **1.14.4** (2026-09-28): the purple edge had never appeared on any dashboard and could
+  not have. `AgentBridgeSessionCard` draws the frame and reads the driver from the
+  activity sensor's attributes; the view that builds it handed over `status` and
+  `decision` and never `activity`. With no entity to look at, the card falls back to
+  'human' - the deliberate safe default - so every session read as yours whatever the
+  daemon published.
+- **1.14.5** (2026-09-28): a question could not be answered from the dashboard at all.
+  Every field chosen, Send pressed, nothing delivered and nothing logged. A question is
+  answered through the entities - the daemon reads the free-text field from
+  `text.<node>_reply` and waits for a press on `button.<node>_submit` newer than the
+  moment the question was armed - and the custom reply card writes neither: its Send
+  publishes an MQTT payload, which `Invoke-PendingReplies` deliberately ignores while a
+  question owns the box. Its Send also returns early on an empty textarea, so a form
+  whose only free-text field was optional could not be submitted at all. Nothing
+  failed, so nothing was reported: the daemon log for 17:08:58 to 17:13:30 holds one
+  line, the terminal answer being adopted. Latent for as long as the card has existed,
+  and reachable only once the card was upgraded to a version the dashboard gates its
+  own layout on, which swapped the entity pair for the card. The card stays for
+  ordinary replies; while a question is armed the pair is shown, because that is what
+  can answer one.
+
+  **The shape all five share.** Every one sat in the wiring between two tested ends.
+  `Test-BridgeAgentProcess` has stripped `.exe` since it was written and a test
+  asserted it did - passing on a candidate the gatherer never handed it. The card's
+  suite sets `status`, `activity` and `decision` by hand and passed all eight glow
+  checks on a config the dashboard never produced. The driver had a test for mapping a
+  user id and one for recording the press, and none for the value reaching the card.
+  Adding cases at either end would not have caught any of them; each now has a test
+  that follows the value the whole way and fails without its fix.
+
+## Next: the choices card should answer a whole form
+
+Not started. Multi-field questions still render as Home Assistant's native `select`
+dropdowns, and they are bad in two specific ways the row buttons already solve: a
+native select commits on blur, so an answer needs a tap away and then Send, and it
+sizes its menu to the longest option and will not wrap, so sentence-length answers are
+cut off on a phone. Both were why `agent-bridge-choices-card` was written for 1.13.0.
+
+It was only ever wired up for the single-choice case. The card is gated on
+`select.<node>_f1` being `Idle` - that is, shown only when there are no field
+dropdowns, which is exactly backwards from what a form needs.
+
+The work: `AgentBridgeChoicesCard` (frontend/agent-bridge-reply-card.js, ~line 661)
+takes a `fields` list of the field entities and renders a labelled group of rows per
+armed field, each tap calling `select.select_option` on that field's entity. The text
+box and Send stay beneath it for the free-text field, since that Send already presses
+the button the daemon waits for, so no daemon change is needed - it reads those same
+entities today. Then bump `CARD_VERSION`, gate the dashboard on it beside the existing
+`Test-BridgeActivityCardServed` checks, and replace the per-field dropdown cards built
+in hooks/decision-ha-websocket.ps1.
+
+Test the wiring, not just the ends - that is what this file's last five entries are
+about. Assert the generated dashboard hands the card the field entities, not only that
+the card renders rows when it is given them.
+
+Related, and still open: **the arrow-key delivery is unreliable.** The submission path
+is fixed, but `Get-DaemonAnswerCorrection` fired twice in a row on 2026-09-28 - the
+answer reaching the CLI was not the one sent. Both times the intended answer happened
+to be the first option, which is also where a mis-delivery lands, so the two are
+indistinguishable from the values alone. Moving a form onto the rows does not fix this
+by itself: the rows set entities, and something still has to type the result into an
+arrow-key prompt.
+
+Also open: **thinking never enters the history trail.** `History` only ever receives
+`Reading your message`, `Running: <tool>` and, for Copilot, assistant text; reasoning is
+published only as the single newest line (`response` with `response_kind: reasoning`).
+The daemon publishes every few seconds, so a thought superseded within that window is
+never seen and cannot be recovered from the trail, which is capped at
+`ActivityHistory = 12`. Raised twice by the owner. It affects every inline agent's
+trail, so it wants a decision - put thinking in the trail (capped in length, probably
+only with Detailed activity on), or publish per line rather than per reconcile.
 
 ## Resuming
 
