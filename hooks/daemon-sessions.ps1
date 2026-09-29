@@ -415,6 +415,25 @@ function Add-DaemonSession {
         [string]$session.Activity
     } elseif ($initialStatus -eq 'working') { 'Working' } else { 'Idle' }
 
+    # Whether the bridge started this session from nothing, asked before the launch
+    # record is taken by Get-DaemonSessionTuning below.
+    #
+    # It decides where in the transcript to start reading. A session the daemon merely
+    # found is picked up at the end - everything before that was said without the
+    # bridge watching and is not news. But a session the bridge just launched can
+    # answer before it is adopted: registering and publishing takes several seconds,
+    # and a short prompt is done well inside that. Starting at the end then skips the
+    # answer permanently, and the card sits at Idle with nothing in it while the
+    # session has already replied - which is what happened to every quick launch, and
+    # was hidden until now by test prompts that ran for minutes.
+    #
+    # A resume is deliberately excluded: its transcript is a conversation that already
+    # happened, and reading from the start would replay all of it onto the card.
+    $launchRecord = $null
+    if ($script:DaemonLaunchedTuning.ContainsKey($id)) { $launchRecord = $script:DaemonLaunchedTuning[$id] }
+    $startedFresh = ($null -ne $launchRecord) -and
+        -not ($launchRecord.PSObject.Properties['Resumed'] -and $launchRecord.Resumed)
+
     # What this session was started with, when the bridge started it. A session
     # opened at a keyboard has none, and its card simply shows no settings line
     # rather than guessing at the agent's defaults.
@@ -471,9 +490,12 @@ function Add-DaemonSession {
     }
 
     $entry = [pscustomobject]@{
-        # A session with no transcript yet starts at offset 0, so the first
-        # bytes it writes are picked up rather than skipped.
-        Offset = if ([IO.File]::Exists($session.Transcript)) {
+        # Where to start reading. A session the bridge started from nothing is read
+        # from the beginning, so an answer it gave before it was adopted is still
+        # picked up; anything else starts at the transcript's end, since what was
+        # said before the daemon saw it is not news and a resumed conversation must
+        # not be replayed.
+        Offset = if (-not $startedFresh -and [IO.File]::Exists($session.Transcript)) {
             (Get-Item -LiteralPath $session.Transcript).Length
         } else { 0 }
         Name = $display.Name

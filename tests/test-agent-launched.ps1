@@ -276,6 +276,76 @@ try {
             }
         }
         finally { $script:PriorDriver = '' }
+
+        Write-Host "`n--- a quick answer given before adoption is still seen ---"
+        # Registering and publishing a session takes several seconds, and a short
+        # prompt is answered well inside that, so a launched session's first answer is
+        # often already on disk before the daemon ever looks. Starting at the end of
+        # the transcript skipped it for good: the card sat at Idle with nothing in it
+        # while the session had in fact replied. Confirmed on a real Mac, where a
+        # session showing no answer was asked and said it had already given one.
+        $script:DaemonLaunchDrivers = @{}
+        $quickId = 'answered-before-anyone-looked'
+        $quickTranscript = Join-Path ([IO.Path]::GetTempPath()) "first-answer-$([guid]::NewGuid().ToString('N').Substring(0, 8)).jsonl"
+        Set-Content -LiteralPath $quickTranscript -Encoding UTF8 -Value @(
+            '{"type":"user.message"}'
+            '{"type":"assistant.message","data":{"content":"COLOUR OK"}}'
+        )
+        try {
+            $script:DaemonLaunchedTuning = @{ $quickId = [pscustomobject]@{
+                    Model = ''; Effort = ''; Context = ''; At = [DateTimeOffset]::Now; Resumed = $false
+                }
+            }
+            $quick = [pscustomobject]@{
+                SessionId = $quickId; Transcript = $quickTranscript; Kind = 'copilot'
+                ProcessId = $PID; WorkingDirectory = 'C:\repo'
+            }
+            $quickEntry = Add-DaemonSession -Session $quick -Headers $headers
+            Test-That 'a session the bridge started is read from the beginning' {
+                $quickEntry.Offset -eq 0
+            } ("offset: " + [string]$quickEntry.Offset)
+
+            # The proof that matters: the answer reaches the card without the session
+            # being prodded into saying anything else.
+            $script:CardDetail = $null
+            Update-DaemonSessionActivity -Id $quickId -Entry $quickEntry -Session $quick -Headers $headers -VerboseOn $false
+            Test-That 'and the answer it already gave reaches the card' {
+                $null -ne $script:CardDetail -and ($script:CardDetail | Out-String) -match 'COLOUR OK'
+            } ("card: " + $(if ($script:CardDetail) { ($script:CardDetail | Out-String).Trim() } else { 'nothing' }))
+
+            Write-Host "`n--- but a resumed session is not replayed ---"
+            # Its transcript is a conversation that already happened. Reading it from
+            # the start would push the whole of it onto the card as though it were new.
+            $resumedId = 'reopened-from-the-list'
+            $script:DaemonLaunchedTuning = @{ $resumedId = [pscustomobject]@{
+                    Model = ''; Effort = ''; Context = ''; At = [DateTimeOffset]::Now; Resumed = $true
+                }
+            }
+            $resumed = [pscustomobject]@{
+                SessionId = $resumedId; Transcript = $quickTranscript; Kind = 'copilot'
+                ProcessId = $PID; WorkingDirectory = 'C:\repo'
+            }
+            $resumedEntry = Add-DaemonSession -Session $resumed -Headers $headers
+            Test-That 'it starts at the end of what it already said' {
+                $resumedEntry.Offset -eq (Get-Item -LiteralPath $quickTranscript).Length
+            } ("offset: " + [string]$resumedEntry.Offset)
+
+            Write-Host "`n--- and a session the bridge never launched is untouched ---"
+            # Including one being re-adopted after a daemon restart: the launch record
+            # does not survive, so nothing claims this is a fresh start, and rewinding
+            # would replay a live session's whole history onto its card.
+            $script:DaemonLaunchedTuning = @{}
+            $foundId = 'was-already-running'
+            $found = [pscustomobject]@{
+                SessionId = $foundId; Transcript = $quickTranscript; Kind = 'copilot'
+                ProcessId = $PID; WorkingDirectory = 'C:\repo'
+            }
+            $foundEntry = Add-DaemonSession -Session $found -Headers $headers
+            Test-That 'it starts at the transcript''s end' {
+                $foundEntry.Offset -eq (Get-Item -LiteralPath $quickTranscript).Length
+            } ("offset: " + [string]$foundEntry.Offset)
+        }
+        finally { Remove-Item -LiteralPath $quickTranscript -Force -ErrorAction SilentlyContinue }
     }
     finally { Remove-Item -LiteralPath $transcript -Force -ErrorAction SilentlyContinue }
 }
