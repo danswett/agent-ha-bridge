@@ -1994,6 +1994,41 @@ Write-Host "    baseUrl      : $($config.homeAssistant.baseUrl)"
 Write-Host "    token        : $(if ($config.homeAssistant.token) { 'set in config' } else { "from `$env:$($config.homeAssistant.tokenEnvVar)" })"
 Write-Host "    notifications: $(if ($config.notifications.enabled) { $config.notifications.service } else { 'disabled' })"
 
+function Get-BridgeInstallAgentIdentityWarning {
+    <#
+        Why an agent-driven session could never be marked as one, or '' when it can.
+
+        An agent identity is two settings that are inert apart, and having only one of
+        them fails silently - the dashboard simply never marks anything. Said here
+        because nothing later will.
+
+        The rule lives with the code that reads the config rather than being copied,
+        and the library is dot-sourced inside this function: at script scope it would
+        define the whole thing in the installer, and a dot-sourced script rebinds any
+        parameter it declares over a same-named local here. AGENT_HA_BRIDGE_CONFIG is
+        pointed at the file just written, since -TargetHome need not be $HOME.
+    #>
+    param([Parameter(Mandatory)][string]$HooksDir, [Parameter(Mandatory)][string]$ConfigFile)
+
+    $lib = Join-Path $HooksDir 'decision-bridge-common.ps1'
+    if (-not (Test-Path -LiteralPath $lib)) { return '' }
+    $previous = $env:AGENT_HA_BRIDGE_CONFIG
+    $env:AGENT_HA_BRIDGE_CONFIG = $ConfigFile
+    try {
+        . $lib
+        if (-not (Get-Command Get-BridgeAgentIdentityWarning -ErrorAction SilentlyContinue)) { return '' }
+        [string](Get-BridgeAgentIdentityWarning)
+    }
+    catch { '' }
+    finally {
+        if ($null -eq $previous) { Remove-Item Env:\AGENT_HA_BRIDGE_CONFIG -ErrorAction SilentlyContinue }
+        else { $env:AGENT_HA_BRIDGE_CONFIG = $previous }
+    }
+}
+
+$agentIdentityWarning = Get-BridgeInstallAgentIdentityWarning -HooksDir $hooksDir -ConfigFile $configPath
+if ($agentIdentityWarning) { Write-Warning $agentIdentityWarning }
+
 # The dashboard is drawn with three custom Lovelace cards. Without them it renders as
 # a column of "Custom element doesn't exist" boxes - an install that reports success
 # and then visibly does not work. The file itself can only come from HACS, but a card

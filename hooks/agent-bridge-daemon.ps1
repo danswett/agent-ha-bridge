@@ -74,6 +74,7 @@ $script:DaemonEntity = @{
     NewEffort     = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_effort'        -Slug $script:DaemonMachineSlug
     NewContext    = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_context'       -Slug $script:DaemonMachineSlug
     NewResume     = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_resume'        -Slug $script:DaemonMachineSlug
+    NewPermissions = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_permissions'  -Slug $script:DaemonMachineSlug
     NewSession    = Get-BridgeMachineEntityId -Domain 'button' -Key 'new_session'       -Slug $script:DaemonMachineSlug
     NewResult     = Get-BridgeMachineEntityId -Domain 'sensor' -Key 'new_session_result' -Slug $script:DaemonMachineSlug
     Online        = Get-BridgeMachineEntityId -Domain 'binary_sensor' -Key 'online'      -Slug $script:DaemonMachineSlug

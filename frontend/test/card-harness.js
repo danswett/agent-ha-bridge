@@ -66,7 +66,7 @@ function seedLaunchParts(slots) {
   slots['input[data-key="prompt"]'].value = '';
   // One select and one label per field, keyed exactly as the card asks for them.
   const selects = [];
-  for (const key of ['machine', 'resume', 'agent', 'workspace', 'profile', 'model', 'effort', 'context']) {
+  for (const key of ['machine', 'resume', 'agent', 'workspace', 'profile', 'model', 'effort', 'context', 'permissions']) {
     const select = new FakeElement('select');
     select.dataset.key = key;
     select.value = '';

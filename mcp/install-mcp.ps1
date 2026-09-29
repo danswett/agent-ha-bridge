@@ -98,9 +98,21 @@ if (-not (Test-Path -LiteralPath $configPath)) {
 }
 $config = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $baseUrl = [string]$config.homeAssistant.baseUrl
-$token = [string]$config.homeAssistant.token
-if (-not $token -and $config.homeAssistant.tokenEnvVar) {
-    $token = [Environment]::GetEnvironmentVariable([string]$config.homeAssistant.tokenEnvVar)
+# The agent account's token first: this server is the agent's own door into Home
+# Assistant, so what it does should be attributed to the agent rather than to the
+# person who owns the daemon's token. Falls back to that one, which is what every
+# install did before there was an agent token to prefer.
+$token = [string]$config.homeAssistant.agentToken
+if (-not $token -and $config.homeAssistant.agentTokenEnvVar) {
+    $token = [Environment]::GetEnvironmentVariable([string]$config.homeAssistant.agentTokenEnvVar)
+}
+if (-not $token) { $token = [Environment]::GetEnvironmentVariable('AGENT_HA_AGENT_TOKEN') }
+$usingAgentToken = [bool]$token
+if (-not $token) {
+    $token = [string]$config.homeAssistant.token
+    if (-not $token -and $config.homeAssistant.tokenEnvVar) {
+        $token = [Environment]::GetEnvironmentVariable([string]$config.homeAssistant.tokenEnvVar)
+    }
 }
 
 Write-Step "Installing the MCP server into $mcpDir"
@@ -147,6 +159,9 @@ $serverBlock = [ordered]@{ command = 'node'; args = @($serverJs); env = $serverE
 Write-Step "Wrote a paste-ready client config to $snippetPath"
 if (-not $token) {
     Write-Warning 'No token was in the bridge config, so the snippet has a placeholder - fill in HA_TOKEN.'
+}
+elseif ($usingAgentToken) {
+    Write-Host '    using homeAssistant.agentToken, so the agent acts as its own account'
 }
 
 # ----------------------------------------------------------- Claude Desktop

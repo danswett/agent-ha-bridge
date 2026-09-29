@@ -16,7 +16,7 @@
  * daemon downloads them and attaches them to the prompt.
  */
 
-const CARD_VERSION = '1.16.0';
+const CARD_VERSION = '1.17.0';
 
 // The working line, in the style of Claude Code's own spinner: its glyph cycle, and a
 // word picked once per turn. Claude Code does not record which word it chose, so the
@@ -1062,6 +1062,10 @@ const LAUNCH_TUNING = ['model', 'effort', 'context'];
 // The option that means "pass nothing and let the agent decide". Worth a row, but
 // not worth a word in the collapsed summary.
 const LAUNCH_TUNING_DEFAULT = 'Agent default';
+// Permissions. The cautious option is the selector's first, and is not worth a word
+// in the collapsed summary - "Allow all" is, because it is the one worth noticing
+// before pressing Launch.
+const LAUNCH_ALLOW_ALL = 'Allow all';
 
 class AgentBridgeLaunchCard extends HTMLElement {
   constructor() {
@@ -1142,6 +1146,7 @@ class AgentBridgeLaunchCard extends HTMLElement {
           <label class="f-model"><span>Model</span><select data-key="model"></select></label>
           <label class="f-effort"><span>Effort</span><select data-key="effort"></select></label>
           <label class="f-context"><span>Context</span><select data-key="context"></select></label>
+          <label class="f-permissions"><span>Permissions</span><select data-key="permissions"></select></label>
           <label class="f-prompt wide"><span>First message (optional)</span><input data-key="prompt" type="text" placeholder="Start with a task, or leave empty"></label>
         </div>
         <div class="note" hidden><span class="spin"></span><span class="text"></span></div>
@@ -1258,6 +1263,7 @@ class AgentBridgeLaunchCard extends HTMLElement {
     for (const axis of LAUNCH_TUNING) {
       this._fill(q(`select[data-key="${axis}"]`), m[axis], q(`.f-${axis}`));
     }
+    this._fill(q('select[data-key="permissions"]'), m.permissions, q('.f-permissions'));
 
     // A resume brings its own agent and folder, so those choices step back.
     const resume = m.resume ? this._state(m.resume) : '';
@@ -1285,7 +1291,12 @@ class AgentBridgeLaunchCard extends HTMLElement {
     const workspace = this._state(m.workspace);
     const bits = resuming ? [`Resume: ${resume}`] : [agent, workspace].filter((b) => b && !['unknown', 'unavailable'].includes(b));
     if (machines.length > 1) { bits.unshift(m.machine); }
-    this._els.summary.textContent = bits.concat(tuning).join(' · ');
+    // Allow all earns a place in the collapsed summary; asking is the quiet default
+    // and would only be noise. It applies to a resume too, so it sits outside that
+    // branch.
+    const permissions = m.permissions ? this._state(m.permissions) : '';
+    const extras = permissions === LAUNCH_ALLOW_ALL ? tuning.concat(LAUNCH_ALLOW_ALL) : tuning;
+    this._els.summary.textContent = bits.concat(extras).join(' · ');
     this._els.launch.textContent = resuming ? 'Resume' : 'Launch';
 
     // The note: the daemon's word on the last press, or "Launching..." from the

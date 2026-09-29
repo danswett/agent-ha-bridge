@@ -297,7 +297,9 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `homeAssistant.baseUrl` | e.g. `http://homeassistant.local:8123` |
 | `homeAssistant.token` | Long-lived access token |
 | `homeAssistant.tokenEnvVar` | Read the token from this env var instead (default `AGENT_HA_TOKEN`; `COPILOT_HA_TOKEN` still works) |
-| `homeAssistant.agentUserIds` | Home Assistant user ids that count as an agent rather than you. A session whose last reply came from one of them gets a purple edge on its card, so a session being driven remotely says so at a glance. Empty by default, which means nothing is ever marked — see [Telling an agent's turn from yours](#telling-an-agents-turn-from-yours) |
+| `homeAssistant.agentUserIds` | Home Assistant user ids that count as an agent rather than you. A session an agent starts or replies to gets a purple edge on its card, so a session being driven remotely says so at a glance. Empty by default, which means nothing is ever marked — see [Telling an agent's turn from yours](#telling-an-agents-turn-from-yours) |
+| `homeAssistant.agentToken` | The long-lived token belonging to that agent account. Handed to the MCP server and to every session the bridge launches, so an agent drives the bridge as itself; the daemon and the hooks keep using `homeAssistant.token`. Without it an agent presses with your token and nothing is ever marked — the two settings are useless apart, and `agent-ha-bridge status` says so when only one is set |
+| `homeAssistant.agentTokenEnvVar` | Read the agent token from this env var instead (default `AGENT_HA_AGENT_TOKEN`) |
 | `dashboard.urlPath` | Lovelace dashboard slug (default `agent-decisions`) |
 | `notifications.enabled` / `.service` | Optional notify-style service |
 | `copilot.sessionStateRoot` | Override the Copilot CLI's session-state location if not `~/.copilot/session-state` |
@@ -316,7 +318,7 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `newSession.model` | Model preselected on the card (default: **Agent default** — the CLI's own choice). Applies to Copilot and Agency; `newSession.model.claude` / `.codex` do the same per agent |
 | `newSession.effort.<agent>` / `.context.<agent>` | Reasoning effort and context window preselected on the card, per agent (`copilot`, `claude`, `codex`; Agency reads Copilot's) |
 | `newSession.models.<agent>` | Replace the model list the card offers, e.g. `"models": { "copilot": ["auto", "claude-opus-5"] }`. Copilot's is otherwise read from `copilot help config`; `efforts.<agent>` and `contexts.<agent>` do the same for the other two axes |
-| `newSession.allowAllTools` | Launch without permission prompts (default `false`): `--allow-all` for Copilot, `--dangerously-skip-permissions` for Claude, `--ask-for-approval never` for Codex |
+| `newSession.allowAllTools` | What the card's **Permissions** row opens on (default `false`). **Allow all** launches without permission prompts: `--allow-all` for Copilot, `--dangerously-skip-permissions` for Claude, `--ask-for-approval never` for Codex, and it answers Claude's folder-trust dialog rather than waiting for a second press. The card decides each launch, so a session started on another machine no longer silently takes that machine's setting |
 | `newSession.extraArgs` | Extra CLI arguments for launched sessions, e.g. `["--plan"]` |
 | `newSession.copilotPath` | Full path to `copilot.exe` if it is not on the daemon's PATH |
 | `newSession.agencyPath` | Full path to `agency.exe` if it is not on the daemon's PATH |
@@ -342,8 +344,11 @@ Giving the agent its own account is what makes the difference real:
 1. *Settings → People → Add person*, with **Allow login** on. Call it whatever you
    like — `Copilot`, say — and make it a non-administrator.
 2. Log in as that user once and create a long-lived token for it (*Profile →
-   Security → Long-lived access tokens*). Hand that token to the agent; leave your own
-   `homeAssistant.token` alone, since the daemon still runs as you.
+   Security → Long-lived access tokens*). Put it in `homeAssistant.agentToken`, and
+   leave your own `homeAssistant.token` alone: the daemon, the hooks and the dashboard
+   provisioning still run as you. The bridge hands the agent token to the MCP server
+   and into the environment of every session it launches (`AGENT_HA_AGENT_TOKEN`), so
+   an agent that goes on to drive another session does so as itself.
 3. Find the user's id under *Settings → People → <the user>*; it is the long hex string
    in the URL. Put it in `homeAssistant.agentUserIds`.
 
@@ -353,10 +358,14 @@ Giving the agent its own account is what makes the difference real:
    the agent change something with its own token and read `context.user_id` back off
    the resulting state — that is the same id the bridge compares against.
 
-A session whose last reply came from one of those ids is drawn with a purple edge —
-steady while idle, pulsing while it works — and hands back to the ordinary colours the
-moment you reply yourself or type in the session's own window. With no ids configured
-nothing is ever marked, which is deliberate: a glow that lies is worse than no glow.
+Steps 2 and 3 are useless apart, and having only one of them fails silently: the
+dashboard simply never marks anything. `agent-ha-bridge status` and the installer both
+say so when only one is set.
+
+A session an agent starts or replies to is drawn with a purple edge — steady while
+idle, pulsing while it works — and hands back to the ordinary colours the moment you
+reply yourself or type in the session's own window. With nothing configured nothing is
+ever marked, which is deliberate: a glow that lies is worse than no glow.
 
 The same change makes Home Assistant's own logbook honest, since those actions are
 then attributed to the agent rather than to you.

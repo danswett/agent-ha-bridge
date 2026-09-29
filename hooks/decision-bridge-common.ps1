@@ -46,6 +46,48 @@ $script:BridgeTuningAxes = [ordered]@{
 # untouched card launches exactly as it did before this existed.
 $script:BridgeTuningDefaultOption = 'Agent default'
 
+# Whether a launched session may act without stopping to ask. Published as a selector
+# beside the tuning axes rather than read only from the launching machine's config,
+# because the machine that runs the session is not always the one choosing: a session
+# started on a Mac from a Windows dashboard silently took the Mac's
+# newSession.allowAllTools, which the person pressing Launch could neither see nor
+# change.
+#
+# Two named options rather than a switch entity: every other launch control is a
+# select, so the launch card fills and reads this one with the code it already has.
+# 'Ask permission' is first, so an untouched card is the cautious one.
+$script:BridgePermissionAskOption = 'Ask permission'
+$script:BridgePermissionAllowOption = 'Allow all'
+
+function Get-BridgePermissionOptions {
+    <# Both options, cautious one first - which is also the selector's default. #>
+    @($script:BridgePermissionAskOption, $script:BridgePermissionAllowOption)
+}
+
+function Get-BridgePermissionLabel {
+    <# The option that stands for a given allow-all setting. #>
+    param([bool]$AllowAllTools)
+    if ($AllowAllTools) { return $script:BridgePermissionAllowOption }
+    $script:BridgePermissionAskOption
+}
+
+function Test-BridgePermissionAllowsAll {
+    <#
+        Whether a selector value means "launch without permission prompts".
+
+        Only the exact 'Allow all' option does, case included. Anything else - unknown,
+        unavailable, a value from an older bridge, an empty entity on a machine that
+        has not published the selector yet - reads as asking, so the failure mode of
+        every unclear case is a session that stops to ask rather than one handed
+        blanket approval nobody chose. -ceq rather than -eq for the same reason: the
+        options are published by Get-BridgePermissionOptions and come back exactly as
+        sent, so a differently-cased value did not come from this control, and erring
+        towards asking costs a prompt while erring the other way costs the safeguard.
+    #>
+    param([AllowEmptyString()][AllowNull()][string]$Value)
+    ([string]$Value).Trim() -ceq $script:BridgePermissionAllowOption
+}
+
 function Get-BridgeTuningAxes {
     <# The axis keys, in display order. #>
     @($script:BridgeTuningAxes.Keys | ForEach-Object { [string]$_ })
@@ -117,6 +159,10 @@ $script:DecisionBridgeConfig = @{
     HomeAssistantBaseUrl = (Get-BridgeSetting 'homeAssistant.baseUrl' 'http://homeassistant.local:8123')
     HomeAssistantToken = (Get-BridgeSetting 'homeAssistant.token' '')
     HomeAssistantTokenEnvVar = (Get-BridgeSetting 'homeAssistant.tokenEnvVar' 'AGENT_HA_TOKEN')
+    # The token an *agent* drives the bridge with, which is a different account from
+    # the one above - see Get-BridgeAgentToken.
+    HomeAssistantAgentToken = (Get-BridgeSetting 'homeAssistant.agentToken' '')
+    HomeAssistantAgentTokenEnvVar = (Get-BridgeSetting 'homeAssistant.agentTokenEnvVar' 'AGENT_HA_AGENT_TOKEN')
     SessionStateRoot = (Get-BridgeSetting 'copilot.sessionStateRoot' (Join-Path $HOME '.copilot\session-state'))
     DashboardUrlPath = (Get-BridgeSetting 'dashboard.urlPath' 'agent-decisions')
     DashboardPath = ('/' + (Get-BridgeSetting 'dashboard.urlPath' 'agent-decisions') + '/decision')
@@ -1548,6 +1594,81 @@ function Test-BridgeAgentUserId {
         ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
     if ($configured.Count -eq 0) { return $false }
     $configured -contains $UserId.Trim()
+}
+
+function Get-BridgeAgentToken {
+    <#
+        The token an agent drives the bridge with, or '' when none is configured.
+
+        Deliberately not the same account as homeAssistant.token. The daemon, the
+        hooks and the dashboard provisioning all act for you and keep using that one;
+        this is the token handed to the agent-facing surfaces - the MCP server's env
+        block, and the environment of every session the bridge launches - so that what
+        an agent does through Home Assistant arrives under the agent's own account.
+
+        This is the missing half of Test-BridgeAgentUserId. An id in agentUserIds can
+        only ever match if something actually presses with that account's token, and
+        until this existed there was nowhere for such a token to live: the bridge held
+        exactly one, yours, and handed it to everything. So every press an agent made
+        was read as yours - correctly - and the purple edge could not appear at all.
+
+        Configured as homeAssistant.agentToken, or the environment variable named by
+        homeAssistant.agentTokenEnvVar (default AGENT_HA_AGENT_TOKEN), so it need not
+        be written to a file.
+    #>
+    $token = [string]$script:DecisionBridgeConfig.HomeAssistantAgentToken
+    if (-not [string]::IsNullOrWhiteSpace($token)) { return $token.Trim() }
+
+    $envVar = [string]$script:DecisionBridgeConfig.HomeAssistantAgentTokenEnvVar
+    if ([string]::IsNullOrWhiteSpace($envVar)) { return '' }
+    $fromEnv = [string][Environment]::GetEnvironmentVariable($envVar)
+    if ([string]::IsNullOrWhiteSpace($fromEnv)) { return '' }
+    $fromEnv.Trim()
+}
+
+function Get-BridgeAgentTokenEnvironment {
+    <#
+        The environment variable a launched session carries so the agent inside it
+        drives the bridge as itself, or $null when no agent token is configured.
+
+        A launched session is where this matters most: it is the one most likely to go
+        on and drive another session, and it has no other way to learn that the agent
+        account exists. Windows children inherit the launcher's environment; tmux keeps
+        its own, so the macOS path has to pass it explicitly - the same reason PATH is
+        passed there.
+    #>
+    $token = Get-BridgeAgentToken
+    if (-not $token) { return $null }
+    $name = [string]$script:DecisionBridgeConfig.HomeAssistantAgentTokenEnvVar
+    if ([string]::IsNullOrWhiteSpace($name)) { return $null }
+    [pscustomobject]@{ Name = $name.Trim(); Value = $token }
+}
+
+function Get-BridgeAgentIdentityWarning {
+    <#
+        Why a session an agent drives can never be marked as such, or '' when it can.
+
+        The two halves are configured separately and are inert apart, which is exactly
+        the failure this reports. agentUserIds says which account counts as an agent;
+        agentToken is what lets an agent actually act as that account. With an id and
+        no token, every press an agent makes still carries your account and is read as
+        yours; with a token and no id, the agent's own account is not recognised. Both
+        leave the purple edge permanently off.
+
+        Nothing fails in either case - no error, no log line, a dashboard that simply
+        never lights up - so this has to be said out loud rather than discovered. Both
+        empty is the documented default of marking nothing, and is not a warning.
+    #>
+    $ids = @(@(Get-BridgeSetting 'homeAssistant.agentUserIds' @()) |
+        ForEach-Object { ([string]$_).Trim() } | Where-Object { $_ })
+    $hasToken = -not [string]::IsNullOrWhiteSpace((Get-BridgeAgentToken))
+
+    if ($ids.Count -eq 0 -and -not $hasToken) { return '' }
+    if ($ids.Count -gt 0 -and $hasToken) { return '' }
+    if ($ids.Count -gt 0) {
+        return 'homeAssistant.agentUserIds is set but homeAssistant.agentToken is not, so an agent still drives the bridge as you and no session is ever marked agent-driven.'
+    }
+    'homeAssistant.agentToken is set but homeAssistant.agentUserIds is empty, so the agent account is never recognised and no session is ever marked agent-driven.'
 }
 
 function Get-BridgeThoughtLine {

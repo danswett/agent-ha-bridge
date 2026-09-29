@@ -827,6 +827,25 @@ function Publish-CopilotMqttNewSession {
         icon          = 'mdi:rocket-launch-outline'
         device        = $device
     }
+
+    # Permissions: whether the launched session may act without stopping to ask. A
+    # fixed two-option list, unlike the axes above, because it belongs to the bridge
+    # rather than to the chosen agent - each of them spells it differently, and
+    # Get-BridgeNewSessionArguments is where that is translated. The daemon opens it
+    # on the local newSession.allowAllTools and leaves a picked value alone, so the
+    # control states what that machine would have done rather than changing it.
+    $permissionsConfig = @{
+        name          = 'New session permissions'
+        unique_id     = "agent_bridge_${Slug}_new_permissions"
+        object_id     = "agent_bridge_${Slug}_new_permissions"
+        command_topic = "$root/newsession/permissions/set"
+        options       = @(Get-BridgePermissionOptions)
+        icon          = 'mdi:shield-key-outline'
+        device        = $device
+    }
+    Publish-CopilotMqttMessage -Topic "$prefix/select/$node/new_permissions/config" `
+        -Payload ($permissionsConfig | ConvertTo-Json -Depth 8 -Compress) -Headers $Headers -Retain
+
     Publish-CopilotMqttMessage -Topic "$prefix/button/$node/new_session/config" `
         -Payload ($buttonConfig | ConvertTo-Json -Depth 8 -Compress) -Headers $Headers -Retain
 

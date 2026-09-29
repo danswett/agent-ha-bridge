@@ -480,6 +480,47 @@ program. So:
   transcript is no longer re-parsed when it has not changed (96.7 ms to 1.35 ms on a
   277 MB file) and `status` reads the daemon's pid from the heartbeat it already writes
   instead of scanning every process (223 ms to 7.7 ms).
+- **1.17.0** (2026-09-29): two settings that were each configured, documented and
+  inert, because in both cases the middle was missing.
+
+  The purple "an agent is driving this" edge had never appeared and could not. It is
+  decided by the Home Assistant account behind the press, and `agentUserIds` names that
+  account - but the bridge held exactly **one** token, yours, and handed it to
+  everything: the config file, the MCP server's env block, every session it launched.
+  An agent had nothing else to press with, so every press it made was read as yours,
+  correctly, and the edge stayed off however the feature was configured. Checked
+  against the live instance: the press that started a session on the Mac carried the
+  owner's user id, not the agent's. There is now a `homeAssistant.agentToken` for the
+  agent account's own token, handed to the MCP server and into each launched session as
+  `AGENT_HA_AGENT_TOKEN`, while the daemon and hooks keep using `homeAssistant.token` -
+  they act for you and should. The two halves are useless apart and fail *silently*
+  when only one is set, so `agent-ha-bridge status` and the installer now say so
+  instead of leaving a dashboard that never lights up.
+
+  `newSession.allowAllTools` was read from the config of the machine that *runs* the
+  session, not the one choosing. A launch onto another machine therefore took that
+  machine's setting, invisible and unchangeable from where Launch was pressed - so a
+  session started from a phone could stop dead on a permission prompt with nobody at
+  the keyboard. It is now a **Permissions** row on the launch card, opening on the
+  local `allowAllTools` so the control states the existing behaviour rather than
+  changing it, and left alone once picked. Unclear values - unknown, unavailable, a
+  peer that has not published the selector - all read as *Ask permission*: the failure
+  direction has to be a prompt, not unearned blanket approval, which is also why the
+  comparison is case-sensitive.
+
+  **Allow all** now also answers Claude's folder-trust dialog instead of waiting for a
+  second Launch press. That dialog is the one prompt `--dangerously-skip-permissions`
+  cannot waive - Claude skips it only in non-interactive mode (`-p`, or a non-TTY) and
+  a bridge window is deliberately interactive - so an unattended launch stopped there,
+  which is exactly the deadlock the setting exists to avoid. Ordinary launches still
+  ask for their second press.
+
+  The lesson is the same one 1.14.2 recorded, in a new place. Both features had tests
+  at each end - a user id mapped, a flag translated per agent - and nothing following a
+  value from the config through to the thing that consumed it. `tests/test-launch-permissions.ps1`
+  follows both the whole way, and `tests/verify-permissions-live.ps1` proves the
+  discovery payload against a real Home Assistant, because 1.14.1 and 1.14.4 were both
+  features that passed their tests and could not appear in a browser.
 
 ## Next: let a Copilot permission prompt be approved from Home Assistant
 

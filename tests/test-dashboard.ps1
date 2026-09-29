@@ -422,6 +422,35 @@ Test-That 'a card too old to draw them is not handed them' {
     -not @($oldCompact['machines'])[0].Contains('model')
 }
 
+# Permissions. The machine that runs the session is not always the one choosing, so
+# the row has to reach the dashboard the peer draws - the row and the card entry were
+# both added at once, and each fails invisibly on its own.
+Save-CopilotSessionDashboard -Sessions $sessions -IncludeAgent -IncludeTuning -IncludePermissions
+$permCard = @($script:SavedConfig.views[0].cards | Where-Object { $_['type'] -eq 'vertical-stack' } | ForEach-Object { $_['cards'] } |
+    Where-Object { $_.ContainsKey('title') -and $_['title'] -eq 'Start a new session' })[0]
+$permRows = @($permCard.entities | ForEach-Object { if ($_.ContainsKey('entity')) { [string]$_['entity'] } else { '' } })
+Test-That 'the permissions row is shown when the machine offers it' {
+    $permRows -contains "select.agent_bridge_${slug}_new_permissions"
+}
+Test-That 'it sits below the settings it applies to, and above Launch' {
+    $permRows.IndexOf("select.agent_bridge_${slug}_new_permissions") -gt $permRows.IndexOf("select.agent_bridge_${slug}_new_model") -and
+    $permRows.IndexOf("select.agent_bridge_${slug}_new_permissions") -lt $permRows.IndexOf("button.agent_bridge_${slug}_new_session")
+}
+Test-That 'a machine that does not offer it gets no such row' {
+    $tunedRows -notcontains "select.agent_bridge_${slug}_new_permissions"
+}
+
+Save-CopilotSessionDashboard -Sessions $sessions -IncludeAgent -IncludeTuning -IncludePermissions -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.17.0'
+$permCompact = @($script:SavedConfig.views[0].cards | Where-Object { $_['type'] -eq 'custom:agent-bridge-launch-card' })[0]
+Test-That 'the compact card is handed the permissions entity' {
+    @($permCompact['machines'])[0]['permissions'] -eq "select.agent_bridge_${slug}_new_permissions"
+} ([string](@($permCompact['machines'])[0]['permissions']))
+Save-CopilotSessionDashboard -Sessions $sessions -IncludeAgent -IncludeTuning -IncludePermissions -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.16.0'
+$preCompact = @($script:SavedConfig.views[0].cards | Where-Object { $_['type'] -eq 'custom:agent-bridge-launch-card' })[0]
+Test-That 'and a card too old to draw it is not, so it is never silently dropped' {
+    -not @($preCompact['machines'])[0].Contains('permissions')
+}
+
 Write-Host ''
 Write-Host '--- the session header updates in place when the card supports it ---'
 # The markdown header re-renders wholesale on every attribute change, collapsing the

@@ -208,7 +208,7 @@ check('the element is registered under its own name',
   /customElements\.define\('agent-bridge-choices-card'/.test(source));
 check('and offered in the card picker',
   sandbox.window.customCards.some((c) => c.type === 'agent-bridge-choices-card'));
-check('the card version is the one the dashboard gates the card on', CARD_VERSION === '1.16.0', CARD_VERSION);
+check('the card version is the one the dashboard gates the card on', CARD_VERSION === '1.17.0', CARD_VERSION);
 check('"decision" is required', (() => {
   try { new AgentBridgeChoicesCard().setConfig({}); return false; } catch (e) { return /decision/.test(e.message); }
 })());
@@ -299,6 +299,7 @@ function launchCard(env) {
       model: L('model'),
       effort: L('effort'),
       context: L('context'),
+      permissions: L('permissions'),
       prompt: 'text.agent_bridge_desk_new_prompt',
       launch: 'button.agent_bridge_desk_new_session',
       result: 'sensor.agent_bridge_desk_new_session_result',
@@ -313,6 +314,7 @@ const TUNED = {
   [L('model')]: { state: 'gpt-5.4', attributes: { options: ['Agent default', 'auto', 'gpt-5.4'] } },
   [L('effort')]: { state: 'xhigh', attributes: { options: ['Agent default', 'low', 'xhigh'] } },
   [L('context')]: { state: 'Agent default', attributes: { options: ['Agent default', 'long_context'] } },
+  [L('permissions')]: { state: 'Ask permission', attributes: { options: ['Ask permission', 'Allow all'] } },
 };
 
 let lenv = launchEnv(TUNED);
@@ -342,6 +344,44 @@ check('what is set shows in the collapsed summary, so a launch says what it will
 
 check('an axis left at the default is not worth a word in that summary',
   !lcard.shadowRoot.querySelector('.summary').textContent.includes('Agent default'));
+
+// --- the permissions row -------------------------------------------------------
+// The launch card is where this is decided now, because the machine that runs the
+// session is not always the one choosing: a launch onto another machine used to take
+// that machine's newSession.allowAllTools, unseen from where Launch was pressed.
+check('permissions offers both options and opens on the one its entity holds',
+  optionsOf('permissions').join('|') === 'Ask permission|Allow all' &&
+  lcard.shadowRoot.querySelector('select[data-key="permissions"]').value === 'Ask permission',
+  optionsOf('permissions').join('|'));
+
+check('asking is the quiet default, so it says nothing in the summary',
+  !lcard.shadowRoot.querySelector('.summary').textContent.includes('Ask permission'),
+  lcard.shadowRoot.querySelector('.summary').textContent);
+
+check('choosing it sets it on that entity and nothing else', (() => {
+  lenv.calls.length = 0;
+  lcard._choose('permissions', 'Allow all');
+  return lenv.calls.length === 1 && lenv.calls[0].domain === 'select' &&
+    lenv.calls[0].service === 'select_option' &&
+    lenv.calls[0].data.entity_id === L('permissions') && lenv.calls[0].data.option === 'Allow all';
+})(), JSON.stringify(lenv.calls));
+
+check('but allowing everything is worth saying before Launch is pressed', (() => {
+  const env = launchEnv(Object.assign({}, TUNED, {
+    [L('permissions')]: { state: 'Allow all', attributes: { options: ['Ask permission', 'Allow all'] } },
+  }));
+  const card = launchCard(env);
+  return card.shadowRoot.querySelector('.summary').textContent === 'Copilot · bridge · gpt-5.4 · xhigh · Allow all';
+})());
+
+check('a machine whose bridge has no permissions entity shows no permissions row', (() => {
+  const env = launchEnv({});
+  const card = new AgentBridgeLaunchCard();
+  card.setConfig({ machines: [{ machine: 'desk', agent: L('agent'), workspace: L('workspace'), prompt: 'text.agent_bridge_desk_new_prompt', launch: 'button.x', result: 'sensor.y' }] });
+  card._open = true;
+  card.hass = env.hass;
+  return card.shadowRoot.querySelector('.f-permissions').hidden === true;
+})());
 
 check('a machine whose bridge has no tuning entities shows no tuning rows', (() => {
   const env = launchEnv({});

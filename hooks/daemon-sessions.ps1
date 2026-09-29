@@ -649,6 +649,9 @@ function Get-DaemonLaunchCapabilities {
         # peer still running a bridge without those entities does not get three
         # "Entity not found" rows drawn for it on the shared dashboard.
         tuning     = [bool]$newSessionEnabled
+        # The allow-all selector, for the same reason: a peer that has not published
+        # it yet gets no permissions row rather than one pointing at nothing.
+        permissions = [bool]$newSessionEnabled
         # This bridge publishes a Detailed activity switch for itself. Peers read it
         # to decide whether to draw a toggle for this machine; one that does not
         # report it gets no toggle rather than a row pointing at a helper that does
@@ -781,6 +784,9 @@ function Get-DaemonMachineCards {
             # ContainsKey rather than a bare read: a capability set built before the
             # tuning rows existed simply has no such key, and StrictMode throws on it.
             IncludeTuning = [bool]($Capabilities.ContainsKey('tuning') -and $Capabilities.tuning)
+            # Same reason again: newer than the tuning rows, so a hand-built set or a
+            # peer from before it has no such key.
+            IncludePermissions = [bool]($Capabilities.ContainsKey('permissions') -and $Capabilities['permissions'])
             # Same reason - newer than some of the callers that build a capabilities
             # set by hand.
             IncludeDetailed = [bool]($Capabilities.ContainsKey('detailed') -and $Capabilities['detailed'])
@@ -797,6 +803,7 @@ function Get-DaemonMachineCards {
         $peerResume = $false
         $peerAgent = $false
         $peerTuning = $false
+        $peerPermissions = $false
         # A peer on a bridge older than the Detailed activity switch reports nothing
         # here, and gets no toggle. Drawing one anyway is an "Entity not found" box on
         # everyone's dashboard, because the helper only exists on machines that create
@@ -812,6 +819,10 @@ function Get-DaemonMachineCards {
             # Absent on a peer running a bridge from before the tuning rows existed,
             # which then gets a launch card without them rather than three broken rows.
             try { $peerTuning = [bool]$peerCaps.tuning } catch { }
+            # Absent on a peer from before the permissions selector, which then keeps
+            # using its own newSession.allowAllTools - the old behaviour - rather than
+            # showing a row that points at an entity it never published.
+            try { $peerPermissions = [bool]$peerCaps.permissions } catch { }
             try { $peerDetailed = [bool]$peerCaps.detailed } catch { }
             try { $peerDev = [bool]$peerCaps.dev } catch { }
         }
@@ -822,6 +833,7 @@ function Get-DaemonMachineCards {
             IncludeResume = $peerResume
             IncludeAgent = $peerAgent
             IncludeTuning = $peerTuning
+            IncludePermissions = $peerPermissions
             IncludeDetailed = $peerDetailed
             IsDev = $peerDev
             Online = [bool]$peer.Online
@@ -900,7 +912,7 @@ function Sync-DaemonDashboard {
 
     $replyCardUrl = Get-BridgeServedReplyCardUrl
     $signature = (@($allDescriptors | Sort-Object -Property Node | ForEach-Object { "$($_.Node)=$($_.Name)" }) -join '|') +
-        '#' + (@($machineCards | ForEach-Object { "$($_.Slug):$($_.IncludeProfile)$($_.IncludeResume)$($_.IncludeAgent)$($_.IncludeTuning)$($_.IncludeDetailed)$($_.IsDev):$($_.Online)" }) -join ',') +
+        '#' + (@($machineCards | ForEach-Object { "$($_.Slug):$($_.IncludeProfile)$($_.IncludeResume)$($_.IncludeAgent)$($_.IncludeTuning)$($_.IncludePermissions)$($_.IncludeDetailed)$($_.IsDev):$($_.Online)" }) -join ',') +
         '#' + $replyCardUrl
     if ($signature -ne $script:DaemonDashboardSignature) {
         try {
