@@ -557,24 +557,40 @@ indistinguishable from the values alone. Moving a form onto the rows does not fi
 by itself: the rows set entities, and something still has to type the result into an
 arrow-key prompt.
 
-Also open: **a slow Home Assistant start can get the bridge IP-banned.** Seen live on
-2026-09-28. Two `wyoming` config entries hung Home Assistant's bootstrap - it logged
-`Waiting for integrations to complete setup: {('wyoming', ...): 66.03, ...}` with the
-same frozen elapsed value minute after minute - and while core was starting every
-bridge request was logged as `Login attempt or request with invalid authentication ...
-Requested URL: '/api/websocket'`, six per reconcile. Their `login_attempts_threshold`
-is 10, so two cycles was enough: Home Assistant IP-banned the machine and every
-request from it, daemon and dashboard alike, answered 403.
+Also open: **a rejected auth is retried hard enough to get the bridge IP-banned.** Seen
+live on 2026-09-28. Two `wyoming` config entries hung Home Assistant's bootstrap - it
+logged `Waiting for integrations to complete setup: {('wyoming', ...): 66.03, ...}`
+with the same frozen elapsed value minute after minute - and while core was starting
+every bridge request was logged as `Login attempt or request with invalid
+authentication ... Requested URL: '/api/websocket'`, six per reconcile.
+
+That noise was not on its own what banned the machine, and the arithmetic is worth
+keeping straight. `login_attempts_threshold` is 10 and a *successful* login resets the
+count, so a burst of six never reaches it: four of those bursts came and went between
+17:23 and 18:17 with no ban at all. What tripped it was a test suite firing ten reads
+of one entity in seventy milliseconds with a placeholder token, too fast for any
+success to land in between - `tests/test-choices-form.ps1` had defined its
+`Get-HomeAssistantState` stub *below* the call that needed it, so the real one was
+still in scope. Home Assistant logged the ban in the same millisecond as the tenth.
+Had the count merely accumulated, the ban would have landed at 17:24 rather than 18:22.
+That hole is now closed by a guard on `Invoke-DecisionHttpRequest`, covered by
+`tests/test-http-guard.ps1`: a suite cannot reach a real Home Assistant at all.
+
+So the slow start is the standing hazard rather than this ban's cause: six per cycle
+sits four short of the threshold, and anything else failing auth at the same time
+closes that gap. Once banned, every request from the machine - daemon and dashboard
+alike - answered 403.
 
 Three things are worth knowing. The ban is written to `/config/ip_bans.yaml` and read
 back at startup, so restarting Home Assistant does *not* lift it - the file has to be
 emptied first, which is not obvious when the symptom is "I restarted and it is still
 banned". Nothing in the bridge said what had happened; the daemon log only repeated
 `403 (Forbidden)`, which reads like a token problem and is not one. And the bridge's
-own behaviour is what earns the ban: it keeps issuing the same six calls on every
+own behaviour is what leaves it exposed: it keeps issuing the same six calls on every
 cycle while the answer is an auth rejection. A rejected auth is not a transient error
 to retry at full rate - it wants a long back-off and a line in the log naming the ban
-as the likely cause.
+as the likely cause. Note this is the WebSocket path specifically;
+`Test-DecisionTransientHttpError` already declines to retry an unauthorised REST call.
 
 Also open: **thinking never enters the history trail.** `History` only ever receives
 `Reading your message`, `Running: <tool>` and, for Copilot, assistant text; reasoning is
