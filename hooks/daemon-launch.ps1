@@ -934,6 +934,12 @@ function Start-DaemonLaunch {
         Effort  = & $launched 'Effort'
         Context = & $launched 'Context'
         At      = $launchedAt
+        # Whether this reopened an existing session rather than starting a new one.
+        # Adoption reads it to decide where in the transcript to start: a session
+        # starting from nothing has its whole transcript read, so a first answer that
+        # arrives before the daemon adopts it is still seen, while a resumed one is
+        # picked up at the end so its old conversation is not replayed onto the card.
+        Resumed = ($null -ne $resumeSession)
     }
     # Copilot, Agency and Claude register under the id the bridge invented, so the
     # record is filed under it straight away. Codex picks its own, so its launch waits
