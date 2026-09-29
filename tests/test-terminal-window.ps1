@@ -92,6 +92,12 @@ try {
     Test-That 'Terminal is not asked to confirm a window it thinks is busy' {
         $close -match 'close w saving no'
     } $close
+    # A real Mac reported "closed one" while the window was still on screen: `close`
+    # sits inside a `try`, so a close that fails is swallowed, and returning the
+    # matched count called that success.
+    Test-That 'what comes back is what actually went, counted by looking again' {
+        $close -match 'set remaining to 0' -and $close -match '\(count of doomed\) - remaining'
+    } $close
 
     Write-Host "`n--- and it stays out of the way when it should ---"
     $script:OsascriptResult = '0'

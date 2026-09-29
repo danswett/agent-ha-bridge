@@ -53,10 +53,19 @@ end tell
 }
 
 function Open-Tagged {
-    param([string]$Title)
+    <#
+        A window in the state the bridge's really ends up in.
+
+        The bridge's window runs `tmux attach`, which *returns* when the session is
+        torn down, leaving a shell at a prompt - not a running command. The first
+        version of this opened `sleep 120` instead, which leaves Terminal considering
+        the window busy: a different case entirely, and one that made the close look
+        broken when it was the test that was wrong. Both are covered below.
+    #>
+    param([string]$Title, [string]$Command = 'echo bridge-window-ready')
     $script = @"
 tell application "Terminal"
-  set t to do script "sleep 120"
+  set t to do script "$Command"
   set custom title of t to "$Title"
 end tell
 "@
@@ -90,6 +99,18 @@ try {
     Check 'a second close finds nothing and says so' (-not (Close-BridgeTerminalWindow -Title $mine))
     Check 'an unknown tag closes nothing' (-not (Close-BridgeTerminalWindow -Title 'agent-bridge:never-existed'))
     Check "the user's window survived that too" ((Count-Tabs -Title $yours) -eq $yoursBefore)
+
+    Write-Host '--- a window still running something closes too ---'
+    # Not the usual case, but a session whose tmux did not tear down cleanly would
+    # leave one, and Terminal treats a busy window differently: `saving no` is what
+    # stops it stopping to ask.
+    Open-Tagged -Title $mine -Command 'sleep 120'
+    $busyBefore = Count-Tabs -Title $mine
+    Check 'the busy window opened' ($busyBefore -ge 1)
+    $busyClosed = Close-BridgeTerminalWindow -Title $mine
+    Start-Sleep -Seconds 2
+    $busyAfter = Count-Tabs -Title $mine
+    Check 'it is closed without stopping to ask' ($busyClosed -and $busyAfter -eq 0) "closed=$busyClosed remaining=$busyAfter"
 }
 finally {
     # Take the stand-in away again whatever happened, so a failed run does not leave

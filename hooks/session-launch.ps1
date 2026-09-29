@@ -2112,6 +2112,12 @@ function Close-BridgeTerminalWindow {
     # The windows are collected before any is closed: closing while walking the same
     # list is how AppleScript ends up skipping entries or erroring on a stale
     # reference. `saving no` stops Terminal asking about a window it thinks is busy.
+    #
+    # What comes back is how many actually went, counted by looking again - not how
+    # many matched. `close` is wrapped in `try` because a window that has already gone
+    # must not throw, and that same `try` will swallow a close that genuinely failed;
+    # returning the matched count would then report success for a window still sitting
+    # on screen. Measured on a real Mac, where exactly that happened.
     $script = if ($app -match '^iterm') {
         @"
 tell application "iTerm"
@@ -2130,7 +2136,18 @@ tell application "iTerm"
       close w
     end try
   end repeat
-  return (count of doomed)
+  delay 0.3
+  set remaining to 0
+  repeat with w in windows
+    repeat with t in tabs of w
+      repeat with s in sessions of t
+        try
+          if name of s is "$safeTitle" then set remaining to remaining + 1
+        end try
+      end repeat
+    end repeat
+  end repeat
+  return ((count of doomed) - remaining)
 end tell
 "@
     }
@@ -2150,7 +2167,16 @@ tell application "Terminal"
       close w saving no
     end try
   end repeat
-  return (count of doomed)
+  delay 0.3
+  set remaining to 0
+  repeat with w in windows
+    repeat with t in tabs of w
+      try
+        if custom title of t is "$safeTitle" then set remaining to remaining + 1
+      end try
+    end repeat
+  end repeat
+  return ((count of doomed) - remaining)
 end tell
 "@
     }
