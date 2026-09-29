@@ -384,6 +384,26 @@ Test-That 'and the activity entity, without which the agent glow can never fire'
     $sessionCard.activity -eq "sensor.$($sessions[0].Node)_activity"
 } "activity=[$(if ($sessionCard.PSObject.Properties['activity']) { $sessionCard.activity } else { '<missing>' })]"
 Test-That 'and holds the session sections' { @($sessionCard.cards | Where-Object { $_.type -eq 'custom:agent-bridge-activity-card' }).Count -eq 1 }
+
+# A question is answered through the entities: the daemon reads the free-text field
+# from text.<node>_reply and waits for a press on button.<node>_submit. The reply card
+# writes neither - its Send publishes an MQTT payload, which the reply path ignores
+# while a question owns the box, and it returns early on an empty textarea. So a form
+# under the card took every dropdown and did nothing at all on Send, silently and with
+# nothing in the daemon log. The pair has to come back while a question is armed.
+$decEntity = "select.$($sessions[0].Node)_decision"
+$cardWhenFree = @($sessionCard.cards | Where-Object {
+    $_.type -eq 'conditional' -and "$($_.card.type)" -eq 'custom:agent-bridge-reply-card' })
+$pairWhenAsked = @($sessionCard.cards | Where-Object {
+    $_.type -eq 'conditional' -and "$($_.card.type)" -eq 'custom:layout-card' })
+Test-That 'the reply card is shown only while no question is waiting' {
+    $cardWhenFree.Count -eq 1 -and
+        @($cardWhenFree[0].conditions | Where-Object { $_.entity -eq $decEntity -and @($_.state) -contains 'Idle' }).Count -eq 1
+} "found $($cardWhenFree.Count)"
+Test-That 'and the entity pair, which can actually answer one, takes over when it is' {
+    $pairWhenAsked.Count -eq 1 -and
+        @($pairWhenAsked[0].conditions | Where-Object { $_.entity -eq $decEntity -and "$($_.state_not)" -eq 'Idle' }).Count -eq 1
+} "found $($pairWhenAsked.Count)"
 Save-CopilotSessionDashboard -Sessions $sessions -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.11.3'
 Test-That 'an older served card keeps the styled stack' { (Get-SavedJson) -notmatch 'agent-bridge-session-card' }
 

@@ -1549,19 +1549,26 @@ ha-card {
         # can carry pasted images. The text box below is kept as a fallback because a
         # view referencing a custom card that is not installed renders an error box
         # instead of a reply box, which would leave no way to reply at all.
-        $replyCard = if (-not [string]::IsNullOrWhiteSpace($ReplyCardUrl)) {
-            @{
-                type = 'custom:agent-bridge-reply-card'
-                card_mod = @{ style = $bareChild }
-                # Empty so the card draws no header of its own; the session card
-                # already has one.
-                name = ''
-                topic = (Get-CopilotMqttReplyPayloadTopic -Node $node)
-                placeholder = 'Reply or continue...'
-            }
-        }
-        else {
-        @{
+        # The reply box, in two shapes.
+        #
+        # The card is much the better of the two for an ordinary reply: it reads the
+        # textarea at the moment Send is pressed, so one press is always enough, it
+        # publishes over MQTT so a reply is not limited to the 255 characters an entity
+        # state allows, and it can carry pasted images.
+        #
+        # It cannot answer a question, though, and that is not a styling detail. A
+        # question is answered through the entities - the daemon reads the free-text
+        # field from text.<node>_reply and waits for a press on button.<node>_submit -
+        # and the card writes neither: its Send publishes an MQTT payload, which the
+        # reply path deliberately ignores while a question owns the box. Its Send also
+        # returns early on an empty textarea, so a form whose only text field is
+        # optional could not be sent at all. The result was a form that looked ready,
+        # took every dropdown, and did nothing whatsoever on Send - silently, with not
+        # one line in the daemon log, because nothing ever arrived to log.
+        #
+        # So the entity pair is not only a fallback for a Home Assistant that is not
+        # serving the card; it is what is shown whenever a question is armed.
+        $fallbackReplyCard = @{
             type = 'custom:layout-card'
             # The layout card draws its own surface. That went unnoticed while every
             # sibling had one too, but against a single shared background it is the
@@ -1628,7 +1635,39 @@ ha-card {
                 }
             )
         }
+
+        # With the card served, the two swap on whether a question is waiting: the card
+        # for ordinary replies, the entity pair for anything that has to be answered.
+        # Without it, the pair is all there is and is always shown.
+        $replyCard = if (-not [string]::IsNullOrWhiteSpace($ReplyCardUrl)) {
+            @(
+                @{
+                    type = 'conditional'
+                    conditions = @(
+                        @{ condition = 'state'; entity = $decisionEntity; state = @('Idle', 'unknown', 'unavailable') }
+                    )
+                    card = @{
+                        type = 'custom:agent-bridge-reply-card'
+                        card_mod = @{ style = $bareChild }
+                        # Empty so the card draws no header of its own; the session card
+                        # already has one.
+                        name = ''
+                        topic = (Get-CopilotMqttReplyPayloadTopic -Node $node)
+                        placeholder = 'Reply or continue...'
+                    }
+                }
+                @{
+                    type = 'conditional'
+                    conditions = @(
+                        @{ condition = 'state'; entity = $decisionEntity; state_not = 'Idle' }
+                        @{ condition = 'state'; entity = $decisionEntity; state_not = 'unknown' }
+                        @{ condition = 'state'; entity = $decisionEntity; state_not = 'unavailable' }
+                    )
+                    card = $fallbackReplyCard
+                }
+            )
         }
+        else { $fallbackReplyCard }
 
         # Send feedback belongs next to Send, not in the header. The header is the
         # first thing to scroll out of view on a card carrying a long response, which
@@ -1729,7 +1768,10 @@ ha-card {
         # file has it. The card-mod-styled vertical-stack it replaces lost them on a
         # hard refresh whenever the stack was built before card-mod loaded; it remains
         # only for a Home Assistant still serving an older card.
-        $sessionCards = @($header) + @($fieldCards) + @($answerCard, $replyCard, $sendStatusCard, $cancelCard, $stopCard)
+        # $replyCard is two cards when the custom one is served, so it is concatenated
+        # rather than dropped into the list: inside an array literal it would stay a
+        # nested array and serialise as one, which Lovelace renders as nothing at all.
+        $sessionCards = @($header) + @($fieldCards) + @($answerCard) + @($replyCard) + @($sendStatusCard, $cancelCard, $stopCard)
         if (Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.12.0') {
             @{
                 type     = 'custom:agent-bridge-session-card'
