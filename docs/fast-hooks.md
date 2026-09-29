@@ -428,6 +428,16 @@ program. So:
   user id and one for recording the press, and none for the value reaching the card.
   Adding cases at either end would not have caught any of them; each now has a test
   that follows the value the whole way and fails without its fix.
+- **1.14.6** (2026-09-28): `newSession.allowAllTools` did not actually stop a launched
+  Copilot session stopping for a prompt. Copilot's permissions are three independent
+  axes - tools, paths and URLs - and `--allow-all-tools` grants only the first, so a
+  session still halted the moment it wanted to read a file. That is the one prompt
+  Copilot does not route to Home Assistant, so the session went dark on the dashboard
+  with no way to answer it: exactly the deadlock the flag was turned on to avoid. Now
+  `--allow-all`, which is the three together. The name of the config key is unchanged
+  and still reads `allowAllTools`; it is the flag it sends that was too narrow. Claude
+  (`--dangerously-skip-permissions`) and Codex (`--ask-for-approval never`) waive
+  everything already, so Copilot was the only one with a half-open door.
 
 ## Next: let a Copilot permission prompt be approved from Home Assistant
 
@@ -458,11 +468,12 @@ reusing Codex's `y`/`n`; see the delivery warning below, which applies here too.
 
 **`newSession.allowAllTools` is now on, and that does not make this task redundant.**
 It was turned on for both machines on 2026-09-28, so Copilot and Agency sessions
-launched from the dashboard get `--allow-all-tools` and do not stop for a prompt. That
-covers sessions the *bridge* starts. It does nothing for a session started by hand in a
-terminal, or for one whose permission mode is changed mid-session, and those still go
-dark on the dashboard exactly as before. Routing the prompt is still the fix; the flag
-just stops it being hit constantly in the meantime.
+launched from the dashboard get `--allow-all` (all three permission axes - see 1.14.6,
+where `--allow-all-tools` alone turned out to still stop for a file prompt) and do not
+stop for a prompt. That covers sessions the *bridge* starts. It does nothing for a
+session started by hand in a terminal, or for one whose permission mode is changed
+mid-session, and those still go dark on the dashboard exactly as before. Routing the
+prompt is still the fix; the flag just stops it being hit constantly in the meantime.
 
 Worth knowing if injection is considered instead: typing `/allow-all` into a running
 session only helps if it arrives *before* the session hits its first prompt. Tried live
