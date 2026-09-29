@@ -104,10 +104,15 @@ function Remove-TaggedWindows {
 
         Without this the counts start above zero and every assertion below reads
         wrong - which is exactly what happened on the first attempt, where a failed
-        run's leftovers made a working close look broken. Force-closes, because a
-        leftover may well be busy.
+        run's leftovers made a working close look broken.
+
+        Unlike the bridge, this does kill what is running in the window first, by
+        tty. It has to: a busy window cannot be closed without raising the modal
+        confirmation, and these are the check's own stand-in windows with nothing in
+        them but a sleep. The bridge never does this to a real session's window.
     #>
     param([string[]]$Titles)
+    foreach ($pass in 1..2) {
     foreach ($t in $Titles) {
         # Anything still running has to go first: `close saving no` suppresses the
         # save prompt, not the "terminate running processes?" one, so a busy window
@@ -159,14 +164,16 @@ end tell
         & osascript -e $script 2>&1 | Out-Null
     }
     Start-Sleep -Seconds 2
+    }
 }
 
 try {
     Write-Host '--- clearing anything left from an earlier run ---'
+    Write-Host "  dialogs waiting on screen before cleanup: $(Count-Modals)"
     Remove-TaggedWindows -Titles @($mine, $yours)
     $startMine = Count-Tabs -Title $mine
     $startYours = Count-Tabs -Title $yours
-    Write-Host "  start: bridge=$startMine  user=$startYours"
+    Write-Host "  start: bridge=$startMine  user=$startYours  dialogs=$(Count-Modals)"
     Check 'the slate is clean before anything is measured' (($startMine + $startYours) -eq 0) `
         "bridge=$startMine user=$startYours"
 
