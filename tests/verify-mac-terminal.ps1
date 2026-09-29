@@ -31,8 +31,12 @@ function Check {
     else { Write-Host "  FAIL  $Name$(if ($Detail) { " - $Detail" })" -ForegroundColor Red; $script:failures++ }
 }
 
-$mine = 'agent-bridge:verify-9911'
-$yours = 'a window of my own'
+$mine = "agent-bridge:verify-$PID"
+$yours = "a window of my own $PID"
+# Tagged per run rather than with a fixed name. An earlier version reused one tag, so
+# anything a failed run left behind was counted as this run's and every assertion read
+# wrong - and one leftover could not be cleared at all, having had its shell killed.
+# Unique tags mean a run can only ever see its own windows.
 
 function Count-Tabs {
     param([string]$Title)
