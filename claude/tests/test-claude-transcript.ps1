@@ -70,6 +70,27 @@ Test-That 'a tool result is not treated as a user message' {
     @($activity.History | Where-Object { $_ -eq 'Reading your message' }).Count -eq 1
 }
 
+Write-Host '--- which model is writing ---'
+# Claude records the model on every assistant entry. Reading it is what lets a
+# session's card say what it is running without the bridge having launched it: the
+# launch record, the only source for effort and context, covers nothing started at a
+# keyboard.
+Test-That 'the model on an assistant entry is picked up' { $activity.Model -eq 'claude-opus-4' } $activity.Model
+Test-That 'the newest one wins, so a /model mid-session is followed' {
+    $later = '{"type":"assistant","message":{"role":"assistant","model":"claude-sonnet-5","content":[{"type":"text","text":"ok"}]}}'
+    (Get-ClaudeActivityFromTranscript -Lines (@($lines) + @($later))).Model -eq 'claude-sonnet-5'
+}
+# Absence is not a change. A batch of user entries says nothing about the model, and
+# treating that as "no model" would blank the card's settings line every few seconds.
+Test-That 'a batch with no assistant entry reports no model' {
+    $user = '{"type":"user","message":{"role":"user","content":"hello"}}'
+    [string]::IsNullOrEmpty([string](Get-ClaudeActivityFromTranscript -Lines @($user)).Model)
+}
+Test-That 'an entry naming no model does not blank it either' {
+    $none = '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"ok"}]}}'
+    [string]::IsNullOrEmpty([string](Get-ClaudeActivityFromTranscript -Lines @($none)).Model)
+}
+
 Write-Host '--- content shapes ---'
 Test-That 'a string content body is handled' {
     $line = '{"type":"assistant","message":{"role":"assistant","content":"plain string"}}'

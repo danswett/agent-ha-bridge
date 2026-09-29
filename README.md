@@ -498,10 +498,16 @@ reaches a command line, exactly as a workspace label is. An unrecognised one qui
 means "agent default" rather than refusing the launch, because a selector left over
 from a different agent is ordinary rather than suspicious.
 
-Each session's card shows what it was started with, in small type just above **End
-session**. A session started at a keyboard shows nothing there — effort and context
-appear in no transcript and no agent reports them back, so the command line the bridge
-built is the only record, and guessing would be worse than silence.
+Each session's card shows what it is running with, in small type just above **End
+session**.
+
+The **Model** comes from the session itself: all three agents stamp it on every
+message they write, so a session shows its model whether the bridge launched it or
+you started it at a keyboard, and a `/model` typed into the window is picked up within
+a turn. **Effort** and **Context** can only be what the launch asked for — they appear
+in no transcript and no agent reports them back, so the command line the bridge built
+is the only record. A session started at a keyboard therefore shows a model and
+nothing else, which is better than guessing at the rest.
 
 ### Agency
 

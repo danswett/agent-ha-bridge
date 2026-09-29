@@ -38,6 +38,28 @@ function Test-That {
 function New-Thought { param([string]$Text) (@{ type = 'assistant.message'; data = @{ reasoningText = $Text } } | ConvertTo-Json -Depth 5 -Compress) }
 function New-Reply { param([string]$Text, [string]$Thought = '') (@{ type = 'assistant.message'; data = @{ content = $Text; reasoningText = $Thought } } | ConvertTo-Json -Depth 5 -Compress) }
 function New-Tool { param([string]$Name) (@{ type = 'tool.execution_start'; data = @{ toolName = $Name } } | ConvertTo-Json -Depth 5 -Compress) }
+function New-ReplyFrom { param([string]$Text, [string]$Model) (@{ type = 'assistant.message'; data = @{ content = $Text; model = $Model } } | ConvertTo-Json -Depth 5 -Compress) }
+
+Write-Host '--- which model is writing ---'
+# Copilot stamps the model on every assistant message. Reading it here is what lets a
+# session's card say what it is running without the bridge having launched it - the
+# launch record, which is the only source for effort and context, covers nothing that
+# was started at a keyboard.
+$activity = Get-ActivityFromEvents -Lines @((New-ReplyFrom 'done' 'claude-opus-5')) -VerboseMode $true
+Test-That 'the model on an assistant message is picked up' { $activity.Model -eq 'claude-opus-5' }
+$activity = Get-ActivityFromEvents -Lines @(
+    (New-ReplyFrom 'first' 'gpt-5.4'), (New-Tool 'shell'), (New-ReplyFrom 'second' 'claude-opus-5')) -VerboseMode $true
+Test-That 'the newest one in the batch wins, so a /model mid-turn is followed' { $activity.Model -eq 'claude-opus-5' }
+# Absence is not a change. A batch of tool calls says nothing about the model, and
+# treating that as "no model" would blank the card's settings line every few seconds.
+$activity = Get-ActivityFromEvents -Lines @((New-Tool 'shell'), (New-Thought 'hmm')) -VerboseMode $true
+Test-That 'a batch with no assistant message reports no model, not an empty one' {
+    [string]::IsNullOrEmpty([string]$activity.Model)
+}
+$activity = Get-ActivityFromEvents -Lines @((New-Reply 'no model field here')) -VerboseMode $true
+Test-That 'a message from an older CLI that names none is handled' {
+    [string]::IsNullOrEmpty([string]$activity.Model)
+}
 
 Write-Host '--- the newest line of either kind ---'
 $activity = Get-ActivityFromEvents -Lines @((New-Thought 'I should look at the config first')) -VerboseMode $true
@@ -139,8 +161,9 @@ Test-That 'a malformed line does not throw' { [string]::IsNullOrEmpty([string]$a
 Write-Host '--- what reaches the card ---'
 # Everything that would reach Home Assistant is stood in for.
 $script:Published = $null
+$script:StatusPublishes = @()
 function Set-CopilotMqttActivity { param($SessionId, $Summary, $Detail, $Headers) $script:Published = $Detail }
-function Set-CopilotMqttStatus { param($SessionId, $Status, $Headers, $Attributes) }
+function Set-CopilotMqttStatus { param($SessionId, $Status, $Headers, $Attributes) $script:StatusPublishes += [pscustomobject]@{ Status = $Status; Attributes = $Attributes } }
 function Write-DaemonLog { param([string]$Message) }
 
 $transcript = Join-Path ([IO.Path]::GetTempPath()) "copilot-activity-$([guid]::NewGuid().ToString('N')).jsonl"
@@ -174,6 +197,36 @@ try {
     Add-DaemonCardText -Entry $entry -Detail $toggled -VerboseOn $true
     Test-That 'and turning it back on shows it without waiting for more thinking' {
         $toggled['response'] -eq 'a private thought' -and $toggled['response_kind'] -eq 'reasoning'
+    }
+
+    # The model reaches the card's settings line through the status attributes, which
+    # are republished wholesale. The status only changes at the edges of a turn, so a
+    # model learned mid-turn needs a publish of its own - without it the line stayed
+    # blank for a session that was already working when the daemon first saw it.
+    $script:StatusPublishes = @()
+    Step -Lines @((New-ReplyFrom 'from a named model' 'claude-opus-5'))
+    Test-That 'a model learned from the transcript is recorded on the session' { $entry.Model -eq 'claude-opus-5' }
+    Test-That 'and published even though the status did not change' {
+        @($script:StatusPublishes).Count -eq 1 -and $script:StatusPublishes[-1].Attributes['model'] -eq 'claude-opus-5'
+    } "publishes=$(@($script:StatusPublishes).Count)"
+    Test-That 'at the status it already had, not a made-up one' { $script:StatusPublishes[-1].Status -eq 'working' }
+
+    $script:StatusPublishes = @()
+    Step -Lines @((New-ReplyFrom 'same model again' 'claude-opus-5'))
+    Test-That 'the same model again publishes nothing, so an idle session stays quiet' {
+        @($script:StatusPublishes).Count -eq 0
+    } "publishes=$(@($script:StatusPublishes).Count)"
+
+    $script:StatusPublishes = @()
+    Step -Lines @((New-Tool 'grep'))
+    Test-That 'and a batch naming no model does not blank the one already shown' {
+        $entry.Model -eq 'claude-opus-5' -and @($script:StatusPublishes).Count -eq 0
+    }
+
+    $script:StatusPublishes = @()
+    Step -Lines @((New-ReplyFrom 'switched' 'gpt-5.4'))
+    Test-That 'a /model typed into the window is followed' {
+        $entry.Model -eq 'gpt-5.4' -and $script:StatusPublishes[-1].Attributes['model'] -eq 'gpt-5.4'
     }
 }
 finally {
