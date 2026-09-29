@@ -510,28 +510,44 @@ outcome the feature was built to avoid.
 
 ## Then: the choices card should answer a whole form
 
-Not started. Multi-field questions still render as Home Assistant's native `select`
-dropdowns, and they are bad in two specific ways the row buttons already solve: a
-native select commits on blur, so an answer needs a tap away and then Send, and it
-sizes its menu to the longest option and will not wrap, so sentence-length answers are
-cut off on a phone. Both were why `agent-bridge-choices-card` was written for 1.13.0.
+Done, card 1.15.0. Multi-field questions rendered as Home Assistant's native `select`
+dropdowns, and they are bad in two specific ways the row buttons already solved: a
+native select commits on blur, so an answer needed a tap away and then Send, and it
+sizes its menu to the longest option and will not wrap, so sentence-length answers were
+cut off on a phone. Both were why `agent-bridge-choices-card` was written for 1.13.0,
+and it was only ever wired up for the single-choice case - gated on `select.<node>_f1`
+being `Idle`, that is, shown only when there were no field dropdowns, which is exactly
+backwards from what a form needs.
 
-It was only ever wired up for the single-choice case. The card is gated on
-`select.<node>_f1` being `Idle` - that is, shown only when there are no field
-dropdowns, which is exactly backwards from what a form needs.
+`AgentBridgeChoicesCard` now takes a `fields` list of the field entities and draws a
+labelled group of rows per armed field, each tap calling `select.select_option` on that
+field's entity, with the picked option kept marked because a form is only sent when
+Send is pressed. The headings come from the decision entity's `field_<n>_label`
+attributes, where the bridge has published them since the dropdowns existed: an MQTT
+entity's own `friendly_name` is the device name plus the entity name, so reading it
+there would have put the session's whole title in front of every field. The text box
+and Send stay beneath for the free-text field, and no daemon change was needed - it
+reads those same entities today. With the card served the dashboard stops building the
+per-field dropdowns and the separate cancel button, which the card draws as its own
+quiet row.
 
-The work: `AgentBridgeChoicesCard` (frontend/agent-bridge-reply-card.js, ~line 661)
-takes a `fields` list of the field entities and renders a labelled group of rows per
-armed field, each tap calling `select.select_option` on that field's entity. The text
-box and Send stay beneath it for the free-text field, since that Send already presses
-the button the daemon waits for, so no daemon change is needed - it reads those same
-entities today. Then bump `CARD_VERSION`, gate the dashboard on it beside the existing
-`Test-BridgeActivityCardServed` checks, and replace the per-field dropdown cards built
-in hooks/decision-ha-websocket.ps1.
+**The test follows the value the whole way** (`tests/test-choices-form.ps1`). It arms a
+real two-field question through `Set-CopilotMqttDecision` and keeps the entity ids,
+options and labels that publishes; builds the real dashboard and takes the card's config
+out of it; runs the *real card* on that config and those states through node
+(`frontend/test/drive-choices-card.js`, sharing `frontend/test/card-harness.js` with the
+card's own suite); then applies the `select_option` calls the card made and asks the
+real `Read-DaemonFormAnswer` what the form says. Nothing in the middle is written out by
+hand. Both halves of the break were checked by mutation: renaming the `fields` slot in
+the view fails it, and pointing the card's rows at the decision entity instead of the
+field fails it at the daemon end - neither of which any test at either end would have
+caught.
 
-Test the wiring, not just the ends - that is what this file's last five entries are
-about. Assert the generated dashboard hands the card the field entities, not only that
-the card renders rows when it is given them.
+Worth keeping: a test suite must not be able to reach the live instance. An early draft
+dot-sourced `bridge-frontend-cards.ps1` without its `BRIDGE_FRONTEND_NORUN` guard, which
+runs the card check and opens real WebSocket connections, and stubbed
+`Invoke-CopilotHaWebSocket` only halfway down the file. Every door is closed before
+anything runs now.
 
 Related, and still open: **the arrow-key delivery is unreliable.** The submission path
 is fixed, but `Get-DaemonAnswerCorrection` fired twice in a row on 2026-09-28 - the
