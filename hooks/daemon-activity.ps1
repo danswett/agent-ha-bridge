@@ -257,6 +257,7 @@ function Get-ActivityFromEvents {
     $latest = $null
     $latestIsThinking = $false
     $turnStarted = $false
+    $model = $null
     $history = New-Object System.Collections.Generic.List[string]
 
     foreach ($line in $Lines) {
@@ -299,6 +300,12 @@ function Get-ActivityFromEvents {
         if ($type -eq 'assistant.message') {
             try {
                 $parsed = $line | ConvertFrom-Json
+                # Which model produced this message. Copilot stamps it on every
+                # assistant message, so the card can say what a session is running
+                # even when the bridge did not start it - and follows a /model typed
+                # into the window, which the launch record never could.
+                $named = Get-BridgeEventField -Data $parsed.data -Name 'model'
+                if (-not [string]::IsNullOrWhiteSpace($named)) { $model = $named.Trim() }
                 # Within one message the thinking comes first and whatever it produced
                 # second, so both are recorded in that order and the later one is what
                 # the card shows as the newest line.
@@ -356,6 +363,10 @@ function Get-ActivityFromEvents {
         # writes, so a card can show them in the order they happened.
         Latest = $latest
         LatestIsThinking = $latestIsThinking
+        # The model that produced the newest message in this batch, or $null when the
+        # batch carried none. Only ever moves forward: a batch of tool calls alone
+        # says nothing about the model, which is not the same as saying it changed.
+        Model = $model
         # True when this batch contains the start of a new turn, so the caller drops
         # the reasoning and history it has been carrying from the last one, and hands
         # the session back to the person who typed it.
@@ -466,6 +477,17 @@ function Update-DaemonSessionActivity {
         }
     }
 
+    # The model the transcript just named. Recorded before the status publish below,
+    # so a batch that changes both spends one publish on the pair.
+    $modelChanged = $false
+    if ($activity.PSObject.Properties['Model'] -and -not [string]::IsNullOrWhiteSpace($activity.Model)) {
+        $seenModel = if ($entry.PSObject.Properties['Model']) { [string]$entry.Model } else { '' }
+        if ($seenModel -ne [string]$activity.Model) {
+            Set-DaemonSessionProperty -Entry $entry -Name 'Model' -Value ([string]$activity.Model)
+            $modelChanged = $true
+        }
+    }
+
     if (-not $staleTail -and -not [string]::IsNullOrWhiteSpace($newStatus) -and
         $newStatus -ne [string]$entry.Status) {
         $entry.Status = $newStatus
@@ -477,9 +499,34 @@ function Update-DaemonSessionActivity {
                     process_id = $session.ProcessId
                     updated = [DateTimeOffset]::Now.ToString('o')
                 } -Tuning $entry)
+            $modelChanged = $false
         }
         catch {
             Write-DaemonLog -Message "status publish failed for $id : $($_.Exception.Message)"
+        }
+    }
+    elseif ($modelChanged) {
+        # A model can change without the status doing so - a session already working
+        # when the daemon first sees it, or a /model typed mid-turn - and the status
+        # attributes are republished wholesale, so the card would otherwise carry the
+        # old model until the next time the session happened to go idle.
+        #
+        # Only from a status Set-CopilotMqttStatus accepts: an entry parked on
+        # something else ('ending') is mid-retirement and its card is about to go.
+        $current = [string]$entry.Status
+        if ($current -in @('working', 'idle', 'waiting', 'offline')) {
+            try {
+                Set-CopilotMqttStatus -SessionId $id -Status $current -Headers $Headers -Attributes (
+                    Add-DaemonTuningAttributes -Attributes @{
+                        session = $entry.Name
+                        machine = $entry.Machine
+                        process_id = $session.ProcessId
+                        updated = [DateTimeOffset]::Now.ToString('o')
+                    } -Tuning $entry)
+            }
+            catch {
+                Write-DaemonLog -Message "model publish failed for $id : $($_.Exception.Message)"
+            }
         }
     }
 

@@ -474,17 +474,21 @@ function Add-DaemonSession {
 
 function Get-DaemonSessionTuning {
     <#
-        The model, effort and context to show for one session: what the bridge
-        launched it with, topped up with the model the agent itself reports.
+        The model, effort and context to show for one session at the moment it is
+        adopted: what the bridge launched it with, topped up with a model the agent
+        has already reported.
 
-        Codex names its model in every hook call, and that is better than the launch
-        record for the same reason a transcript beats a command line - it is what the
-        session is actually using, including after a /model typed into its window. The
-        other two axes have no such source, so they can only ever be what the launch
-        asked for.
+        A reported model wins over the launch record for the same reason a transcript
+        beats a command line - it is what the session is actually using, including
+        after a /model typed into its window. All three agents supply one: Codex names
+        it in every hook call, and Copilot and Claude stamp it on every assistant
+        message, which Update-DaemonSessionActivity picks up from then on. So a
+        session the bridge never launched still ends up showing its model, within a
+        turn of the daemon seeing it.
 
-        Every field is '' for a session the bridge did not start, and the card then
-        shows no settings line at all rather than inventing a default.
+        Effort and context have no such source - they appear in no transcript and no
+        agent reports them back - so they can only ever be what the launch asked for,
+        and are blank for a session started at a keyboard.
     #>
     param(
         [Parameter(Mandatory)][string]$SessionId,

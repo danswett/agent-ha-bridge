@@ -64,6 +64,7 @@ function Get-ClaudeActivityFromTranscript {
     $lastUserAt = $null
     $latest = $null
     $latestIsThinking = $false
+    $model = $null
     $history = New-Object System.Collections.Generic.List[string]
 
     foreach ($line in $Lines) {
@@ -116,6 +117,13 @@ function Get-ClaudeActivityFromTranscript {
         if ($type -ne 'assistant') { continue }
 
         $status = 'working'
+        # Which model wrote this message. Claude records it on every assistant entry,
+        # so the card can say what a session is running even when the bridge did not
+        # start it, and follows a /model typed into the window.
+        if ($entry.message.PSObject.Properties['model']) {
+            $named = [string]$entry.message.model
+            if (-not [string]::IsNullOrWhiteSpace($named)) { $model = $named.Trim() }
+        }
         foreach ($block in (Get-ClaudeContentBlocks -Message $entry.message)) {
             switch ([string]$block.type) {
                 'tool_use' {
@@ -177,6 +185,10 @@ function Get-ClaudeActivityFromTranscript {
         # what matches the terminal's order; Response alone runs behind it.
         Latest = $latest
         LatestIsThinking = $latestIsThinking
+        # The model that wrote the newest message in this batch, or $null when the
+        # batch carried none - a batch of user entries alone says nothing about the
+        # model, which is not the same as saying it changed.
+        Model = $model
     }
 }
 
