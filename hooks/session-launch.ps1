@@ -2096,32 +2096,48 @@ function Close-BridgeTerminalWindow {
 
         Only ever called for a window the bridge opened, and only ever closes one
         carrying this bridge's tag, so a terminal the user opened is never touched.
+        A window with something still running in it is left alone rather than closed,
+        because the confirmation macOS raises for that is modal and there is nobody
+        at the keyboard to answer it.
 
         Best effort: a window that has already been closed, a terminal that is not
         running, or an osascript that fails must not stop a session from ending.
         Returns whether a window was closed.
     #>
-    param([Parameter(Mandatory)][AllowEmptyString()][string]$Title)
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Title,
+
+        # How long to give tmux to finish tearing down before the window is judged
+        # busy. The attach returns on its own once the session is gone; closing in
+        # that gap would find the window still running something and leave it.
+        [double]$SettleSeconds = 6
+    )
 
     if ([string]::IsNullOrWhiteSpace($Title)) { return $false }
     $app = [string](Get-BridgeSetting 'platform.terminal' 'Terminal')
     if ($app -eq 'none') { return $false }
     if ($script:BridgeIsWindows) { return $false }
+    $waitTicks = [Math]::Max(1, [int][Math]::Round($SettleSeconds / 0.5))
 
     $safeTitle = $Title.Replace('\', '\\').Replace('"', '\"')
+    # Two things had to be got right here, both learned from a real Mac.
+    #
     # Windows are collected as ids, not as the references `repeat with w in windows`
     # hands out. Those are positional - `window 1`, `window 2` - so closing the first
     # shifts every later one down and the rest of the list then points at whatever
     # moved into that slot. With one match it happens to work; with more it closes one
     # window and misses the others, and the window it reaches for on the second pass
-    # could be one of the user's. Ids do not move. Measured on a real Mac, where three
-    # tagged windows produced exactly one close.
+    # could be one of the user's. Ids do not move.
     #
-    # `saving no` stops Terminal asking about a window it thinks is busy. It does not
-    # override the separate "terminate running processes?" confirmation, so a window
-    # with something still running in it stays - which is the wanted answer: the
-    # bridge's window runs `tmux attach`, long returned by the time this is called, so
-    # a busy one means something unexpected is alive in there.
+    # And `close` is never called on a busy window. `saving no` suppresses the *save*
+    # prompt; the "terminate running processes?" confirmation is a different dialog
+    # and it is modal. Closing a busy window therefore does not fail - it puts a
+    # dialog on the user's screen and waits, and every later attempt queues another
+    # behind it. That is what left windows stuck open and unclosable through repeated
+    # attempts. So the window is given a few seconds to go idle first, which is all
+    # tmux needs to finish tearing down and let the attach return, and if something
+    # is still running after that the window is left alone - much the better outcome
+    # than a modal dialog nobody is at the keyboard to answer.
     #
     # What comes back is how many actually went, counted by looking again - not how
     # many matched. `close` is wrapped in `try` because a window that has already gone
@@ -2180,7 +2196,12 @@ tell application "Terminal"
   end repeat
   repeat with wid in doomed
     try
-      close (first window whose id is wid) saving no
+      set target to (first window whose id is wid)
+      repeat $waitTicks times
+        if (busy of target) is false then exit repeat
+        delay 0.5
+      end repeat
+      if (busy of target) is false then close target saving no
     end try
   end repeat
   delay 0.3

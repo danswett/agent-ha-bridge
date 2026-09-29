@@ -52,6 +52,31 @@ end tell
     [int]((& osascript -e $script 2>&1 | Out-String).Trim())
 }
 
+function Count-Modals {
+    <#
+        How many sheets or dialogs Terminal currently has up.
+
+        The failure this guards is silent from the script's side: `close` on a busy
+        window does not return an error, it raises a modal confirmation and waits.
+        Counting them is the only way the check can tell "declined to close" from
+        "asked a question nobody answered".
+    #>
+    $script = @'
+tell application "Terminal"
+  set n to 0
+  repeat with w in windows
+    try
+      set n to n + (count of sheets of w)
+    end try
+  end repeat
+  return n
+end tell
+'@
+    $raw = (& osascript -e $script 2>&1 | Out-String).Trim()
+    if ($raw -match '^\d+$') { return [int]$raw }
+    0
+}
+
 function Open-Tagged {
     <#
         A window in the state the bridge's really ends up in.
@@ -194,20 +219,39 @@ try {
     Check "and none of the user's went with them" ($manyYoursAfter -eq $manyYours) `
         "was $manyYours, now $manyYoursAfter"
 
-    Write-Host '--- a window still running something ---'
-    # Not the state the bridge's window is ever in: it runs `tmux attach`, which has
-    # returned by the time anything tries to close it. Reported rather than asserted,
-    # because Terminal will not close a busy window and *that is the right answer* -
-    # if something is still running in there, leaving it alone beats killing it.
+    Write-Host '--- a window still running something is left alone, not argued with ---'
+    # The case that produced the real damage. macOS answers `close` on a busy window
+    # with a modal "terminate running processes?" dialog rather than an error, so the
+    # call sits there waiting for a click nobody is there to give, and every retry
+    # stacks another dialog up behind it. Windows stayed open through repeated closes
+    # because of this. A busy window must now be declined outright.
     Open-Tagged -Title $mine -Command 'sleep 120'
     $busyBefore = Count-Tabs -Title $mine
-    $busyClosed = Close-BridgeTerminalWindow -Title $mine
+    Check 'the busy window opened' ($busyBefore -eq 1) "got $busyBefore"
+    $sw = [Diagnostics.Stopwatch]::StartNew()
+    $busyClosed = Close-BridgeTerminalWindow -Title $mine -SettleSeconds 2
+    $sw.Stop()
     Start-Sleep -Seconds 2
     $busyAfter = Count-Tabs -Title $mine
-    Write-Host "  INFO  busy window: opened=$busyBefore closed=$busyClosed remaining=$busyAfter"
-    Check 'a busy window is either closed or honestly reported as not closed' `
-        (($busyClosed -and $busyAfter -eq 0) -or ((-not $busyClosed) -and $busyAfter -eq $busyBefore)) `
-        "closed=$busyClosed before=$busyBefore after=$busyAfter"
+    Write-Host "  busy window: closed=$busyClosed remaining=$busyAfter in $([int]$sw.Elapsed.TotalSeconds)s"
+    Check 'it declines to close it' (-not $busyClosed) "closed=$busyClosed"
+    Check 'and leaves it standing' ($busyAfter -eq $busyBefore) "was $busyBefore, now $busyAfter"
+    # A dialog would hold the call open indefinitely; returning promptly is the proof
+    # that none was raised.
+    Check 'without hanging on a dialog' ($sw.Elapsed.TotalSeconds -lt 20) `
+        "took $([int]$sw.Elapsed.TotalSeconds)s"
+    Check 'and Terminal is left with nothing to answer' ((Count-Modals) -eq 0) `
+        "$(Count-Modals) dialog(s) on screen"
+
+    Write-Host '--- once what it was running ends, it goes ---'
+    # Which is the bridge's own case: the window runs `tmux attach`, and that returns
+    # when the session is torn down.
+    Open-Tagged -Title $mine -Command 'sleep 4'
+    $settleClosed = Close-BridgeTerminalWindow -Title $mine -SettleSeconds 15
+    Start-Sleep -Seconds 2
+    $settleAfter = Count-Tabs -Title $mine
+    Check 'it waits for the command to finish and then closes' ($settleClosed -and $settleAfter -eq 0) `
+        "closed=$settleClosed remaining=$settleAfter"
 }
 finally {
     # Take the stand-ins away whatever happened, so a failed run does not leave

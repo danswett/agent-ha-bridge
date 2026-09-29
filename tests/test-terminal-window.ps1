@@ -96,14 +96,33 @@ try {
     Test-That 'windows are remembered by id, not by their position in the list' {
         $close -match 'set wid to id of w' -and $close -match 'first window whose id is wid'
     } $close
-    Test-That 'and no positional reference is ever closed' {
+    # A busy window is never handed to `close`. 'saving no' suppresses the save
+    # prompt, not the "terminate running processes?" confirmation, and that one is
+    # modal: closing a busy window hangs a dialog on the user's screen instead of
+    # failing, and every later attempt queues another behind it. Seen on a real Mac,
+    # where windows then stayed open through repeated closes.
+    Test-That 'a busy window is waited for, not closed out from under whatever is running' {
+        $close -match 'if \(busy of target\) is false then close target saving no'
+    } $close
+    Test-That 'and it is given time to go idle first, since tmux takes a moment to go' {
+        $close -match '(?m)repeat \d+ times' -and $close -match 'if \(busy of target\) is false then exit repeat'
+    } $close
+    Test-That 'the settle time is the caller''s to set' {
+        $script:Sent = @()
+        [void](Close-BridgeTerminalWindow -Title 'agent-bridge:999' -SettleSeconds 1)
+        ($script:Sent -join "`n") -match '(?m)repeat 2 times'
+    } ($script:Sent -join "`n")
+    $script:Sent = @()
+    [void](Close-BridgeTerminalWindow -Title 'agent-bridge:999')
+    $close = $script:Sent -join "`n"
+    Test-That 'no positional reference is ever closed' {
         $close -notmatch 'close w saving no' -and $close -notmatch '(?m)^\s*close w\s*$'
     } $close
     Test-That 'a window matched by two of its tabs is only closed once' {
         $close -match 'doomed does not contain wid'
     } $close
     Test-That 'Terminal is not asked to confirm a window it thinks is busy' {
-        $close -match 'close \(first window whose id is wid\) saving no'
+        $close -match 'close target saving no'
     } $close
     # A real Mac reported "closed one" while the window was still on screen: `close`
     # sits inside a `try`, so a close that fails is swallowed, and returning the
