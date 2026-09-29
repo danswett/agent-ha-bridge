@@ -94,13 +94,18 @@ try {
     # first shifts every later one down and the rest of the list points at whatever
     # moved into the slot, which could be a window of the user's.
     Test-That 'windows are remembered by id, not by their position in the list' {
-        $close -match 'set wid to id of w' -and $close -match 'first window whose id is wid'
+        $close -match 'set wid to id of w' -and $close -match 'window id wid'
     } $close
     # A busy window is never handed to `close`. 'saving no' suppresses the save
     # prompt, not the "terminate running processes?" confirmation, and that one is
     # modal: closing a busy window hangs a dialog on the user's screen instead of
     # failing, and every later attempt queues another behind it. Seen on a real Mac,
     # where windows then stayed open through repeated closes.
+    # `first window whose id is N` is not equivalent: Terminal resolved one of those
+    # to the wrong window on a real Mac, closing a different session's terminal.
+    Test-That 'and never through a whose filter, which Terminal resolves wrongly' {
+        $close -notmatch 'whose id is'
+    } $close
     Test-That 'a busy window is waited for, not closed out from under whatever is running' {
         $close -match 'if \(busy of target\) is false then close target saving no'
     } $close
@@ -173,7 +178,7 @@ try {
     $iterm = $script:Sent -join "`n"
     Test-That 'iTerm tags the session it just created' { $iterm -match 'set name to "agent-bridge:77"' } $iterm
     Test-That 'and closes by that name' { $iterm -match 'if name of s is "agent-bridge:77"' } $iterm
-    Test-That 'closing that window by id too' { $iterm -match 'first window whose id is wid' } $iterm
+    Test-That 'closing that window by id too' { $iterm -match 'window id wid' } $iterm
     Test-That 'never falling back to Terminal syntax' { $iterm -notmatch 'custom title' } $iterm
 
     Write-Host "`n--- on Windows this is not the mechanism ---"

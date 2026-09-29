@@ -2122,12 +2122,14 @@ function Close-BridgeTerminalWindow {
     $safeTitle = $Title.Replace('\', '\\').Replace('"', '\"')
     # Two things had to be got right here, both learned from a real Mac.
     #
-    # Windows are collected as ids, not as the references `repeat with w in windows`
-    # hands out. Those are positional - `window 1`, `window 2` - so closing the first
-    # shifts every later one down and the rest of the list then points at whatever
-    # moved into that slot. With one match it happens to work; with more it closes one
-    # window and misses the others, and the window it reaches for on the second pass
-    # could be one of the user's. Ids do not move.
+    # Windows are addressed by id through `window id N`, Terminal's own by-id
+    # specifier - not as the references `repeat with w in windows` hands out, and not
+    # through `first window whose id is N`. The plain references are positional
+    # (`window 1`, `window 2`), so closing the first shifts every later one down and
+    # the rest of the list then points at whatever moved into that slot; on a real Mac
+    # that closed a window belonging to a *different* session, leaving its tmux
+    # detached with no window and its card still on the dashboard. A `whose` filter
+    # fares no better here - Terminal resolved one to the wrong window too.
     #
     # And `close` is never called on a busy window. `saving no` suppresses the *save*
     # prompt; the "terminate running processes?" confirmation is a different dialog
@@ -2162,7 +2164,7 @@ tell application "iTerm"
   end repeat
   repeat with wid in doomed
     try
-      close (first window whose id is wid)
+      close (window id wid)
     end try
   end repeat
   delay 0.3
@@ -2196,7 +2198,7 @@ tell application "Terminal"
   end repeat
   repeat with wid in doomed
     try
-      set target to (first window whose id is wid)
+      set target to (window id wid)
       repeat $waitTicks times
         if (busy of target) is false then exit repeat
         delay 0.5

@@ -78,14 +78,39 @@ foreach ($wid in $ids) {
     # Deliberately no try: the point is to surface the error AppleScript would hide.
     $byId = @"
 tell application "Terminal"
-  set target to (first window whose id is $wid)
-  close target saving no
-  return "closed by id $wid"
+  close (window id $wid) saving no
+  return "close window id $wid returned"
 end tell
 "@
     Write-Host "  close id=$wid -> $((& osascript -e $byId 2>&1 | Out-String).Trim())"
-    Start-Sleep -Seconds 1
+    Start-Sleep -Seconds 3
 }
 
 Write-Host '=== inventory after ==='
+Start-Sleep -Seconds 2
 (& osascript -e $inventory 2>&1 | Out-String).Trim() | Write-Host
+
+# A window whose shell has been killed has no session behind it; if Terminal will not
+# close one from AppleScript, clicking its close button is the remaining option - and
+# needs Accessibility permission, which this reports on rather than assumes.
+$stillThere = @((& osascript -e $idScript 2>&1 | Out-String) -split "`r?`n" |
+    ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^\d+$' })
+if ($stillThere.Count) {
+    Write-Host "=== $($stillThere.Count) still there; trying the close button ==="
+    $click = @"
+tell application "System Events"
+  tell process "Terminal"
+    repeat with w in windows
+      try
+        if name of w contains "$tag" then click button 1 of w
+      end try
+    end repeat
+  end tell
+end tell
+"@
+    Write-Host "  click -> $((& osascript -e $click 2>&1 | Out-String).Trim())"
+    Start-Sleep -Seconds 2
+    $after = @((& osascript -e $idScript 2>&1 | Out-String) -split "`r?`n" |
+        ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^\d+$' })
+    Write-Host "  remaining after click: $($after.Count)"
+}

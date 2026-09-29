@@ -136,19 +136,23 @@ end tell
         # ever killed and the busy window survived cleanup with the failure invisible.
         $ttys = @((& osascript -e $ttyScript 2>&1 | Out-String) -split "`r?`n" |
             ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^/dev/tty' })
-        # Killed by pid from `ps -t`, not `pkill -t`. BSD pkill takes the pattern as a
-        # required argument, so `pkill -t ttys011` with nothing else is a usage error
-        # that exits without killing anything - which is why the busy leftover kept
-        # surviving cleanup while the log claimed to have found its tty.
+        # Only what is running *in* the shell is killed, never the shell itself. A
+        # window whose login shell has been killed is left showing "[Process
+        # completed]" with no session behind it, and Terminal will not close one of
+        # those from AppleScript at all - it reports success and the window stays.
+        # That husk is what kept the slate dirty for run after run.
+        $shells = @('login', 'bash', '-bash', 'zsh', '-zsh', 'sh', '-sh', 'tcsh', 'csh')
         $killed = @()
         foreach ($tty in $ttys) {
             $short = [System.IO.Path]::GetFileName($tty)
-            $pids = @(& ps -t $short -o pid= 2>$null |
-                ForEach-Object { $_.Trim() } | Where-Object { $_ -match '^\d+$' })
-            foreach ($p in $pids) {
-                if ([int]$p -eq $PID) { continue }
-                & kill -9 $p 2>&1 | Out-Null
-                $killed += $p
+            foreach ($line in @(& ps -t $short -o pid=,comm= 2>$null)) {
+                $parts = $line.Trim() -split '\s+', 2
+                if ($parts.Count -lt 2 -or $parts[0] -notmatch '^\d+$') { continue }
+                if ([int]$parts[0] -eq $PID) { continue }
+                $name = [System.IO.Path]::GetFileName($parts[1])
+                if ($shells -contains $name) { continue }
+                & kill -9 $parts[0] 2>&1 | Out-Null
+                $killed += "$($parts[0]):$name"
             }
         }
         if ($pass -eq 1) {
@@ -175,7 +179,7 @@ tell application "Terminal"
   end repeat
   repeat with wid in doomed
     try
-      close (first window whose id is wid) saving no
+      close (window id wid) saving no
     end try
   end repeat
 end tell
