@@ -429,7 +429,34 @@ program. So:
   Adding cases at either end would not have caught any of them; each now has a test
   that follows the value the whole way and fails without its fix.
 
-## Next: the choices card should answer a whole form
+## Next: let a Copilot permission prompt be approved from Home Assistant
+
+Do this before the choices card. A Copilot session that hits a permission prompt stalls
+with no sign of it on the dashboard - the card reads `working / Running: powershell`
+indefinitely, its decision selector sits on `Idle`, and the only way through is the
+terminal. Three sessions were stuck like that at once on 2026-09-28 and the owner could
+not see why from the dashboard, which defeats the point of having it on a phone.
+
+Copilot has half the path already. `Invoke-CopilotPermissionHook`
+(hooks/copilot-hooks.ps1, ~line 189) receives the `permission_prompt` notification and,
+by its own docstring, is *purely informational*: it sends a notification and returns.
+It writes no approval marker, so nothing arms a card.
+
+Codex has the whole path and is the template. Its hook records a marker
+(`Get-CodexApprovalMarker`), its agent definition exposes it as `ApprovalMarker`
+(hooks/daemon-agents.ps1, ~line 161), and `Invoke-PendingCodexApprovals`
+(hooks/daemon-decisions.ps1, ~line 520) arms Approve/Deny and types the answer into the
+prompt. That last function is already generic - it looks the marker up by session kind
+and does nothing for a kind that has none - so the daemon side needs no change beyond
+Copilot gaining a marker. The default in `Get-DaemonAgent` is `ApprovalMarker = $null`,
+which is exactly why Copilot is silently skipped today.
+
+Two things to get right. The marker must be cleared when the prompt goes, or a stale one
+keeps arming a card for a question nobody is being asked - Codex clears it on the next
+hook event for that session. And check what Copilot's prompt actually accepts before
+reusing Codex's `y`/`n`; see the delivery warning below, which applies here too.
+
+## Then: the choices card should answer a whole form
 
 **First, though:** Dans-MBP went offline on 1.14.4 and never took 1.14.5, so a question
 on that machine still cannot be answered from the dashboard. Press its **Install Bridge
