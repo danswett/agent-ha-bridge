@@ -159,13 +159,29 @@ function Invoke-ClaudeAskHook {
     $markerFields = @($parsed.MarkerFields)
     $terminalOnly = [bool]$parsed.MultiSelect -or ($mode -eq 'multiple_choice' -and $markerFields.Count -eq 0)
     $toolUseId = if ($HookEvent.PSObject.Properties['tool_use_id']) { [string]$HookEvent.tool_use_id } else { '' }
+
+    # A prompt the daemon refuses to drive must offer no control that pretends to
+    # drive it. This published the full set of dropdowns regardless, so a multi-select
+    # question armed a card that looked completely answerable: both fields were
+    # chosen, Send was pressed six times over half an hour, and the daemon dropped
+    # every press at its terminal-only check without a word on the card. The options
+    # move into the question text - as Copilot's side already does - so the card still
+    # shows what is being asked, and nothing on it claims to be able to answer.
+    $asked = "choices=$($choices.Count) fields=$($fields.Count)"
+    if ($terminalOnly) {
+        $question = Add-ClaudeTerminalOnlyNotice -Question $question -Fields $markerFields
+        $choices = @()
+        $fields = @()
+        $markerFields = @()
+    }
+
     Write-CopilotDecisionMarker -SessionId $sessionId -DecisionId $decisionId `
         -Question $question -Choices $choices -Combos @() -Fields $markerFields -Mode $mode `
         -TerminalOnly:$terminalOnly -ToolCallId $toolUseId | Out-Null
 
     Write-DecisionBridgeLog -Message (
         "claude AskUserQuestion: session=$($sessionId.Substring(0,[Math]::Min(8,$sessionId.Length))) " +
-        "pid=$owningPid choices=$($choices.Count) fields=$($fields.Count) mode=$mode " +
+        "pid=$owningPid $asked mode=$mode " +
         "toolUseId=$(if ($toolUseId) { 'yes' } else { 'no' }) terminalOnly=$terminalOnly"
     )
 
@@ -197,7 +213,7 @@ function Invoke-ClaudeAskHook {
         $question
         ''
         $numbered
-        'Answer in the terminal or on the dashboard.'
+        $(if ($terminalOnly) { 'Answer this one in the terminal.' } else { 'Answer in the terminal or on the dashboard.' })
     ) -join "`n"
     if ($body.Length -gt 950) { $body = $body.Substring(0, 947) + '...' }
 

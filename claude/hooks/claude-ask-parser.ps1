@@ -156,6 +156,47 @@ function Limit-ClaudeText {
     $Text.Substring(0, $script:ClaudeMaxQuestionLength - 20) + "`n[truncated]"
 }
 
+function Add-ClaudeTerminalOnlyNotice {
+    <#
+        Rewrites a question the dashboard cannot drive so the card says so, and lists
+        the options the card will no longer be showing.
+
+        The options have to be repeated here because they reach the card only through
+        the dropdowns, which a terminal-only question does not get: without this, an
+        option Claude gave no description for disappears from the card entirely.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Question,
+        [AllowNull()][AllowEmptyCollection()][object[]]$Fields = @()
+    )
+
+    $fieldList = @($Fields)
+    $parts = [System.Collections.Generic.List[string]]::new()
+    if (-not [string]::IsNullOrWhiteSpace($Question)) { $parts.Add($Question) }
+
+    $anyMultiSelect = $false
+    if ($fieldList.Count -gt 0) {
+        $outline = for ($i = 0; $i -lt $fieldList.Count; $i++) {
+            $field = $fieldList[$i]
+            $multi = [bool]($field.PSObject.Properties.Name -contains 'MultiSelect' -and $field.MultiSelect)
+            if ($multi) { $anyMultiSelect = $true }
+            $options = if (@($field.Options).Count) { ': ' + (@($field.Options) -join ' | ') } else { '' }
+            "$($i + 1). $([string]$field.Title)$(if ($multi) { ' (pick any)' })$options"
+        }
+        $parts.Add(($outline -join "`n"))
+    }
+
+    $why = if ($anyMultiSelect) {
+        'it lets you pick more than one option, which the dashboard cannot drive'
+    }
+    else {
+        'it has more fields than the dashboard can drive'
+    }
+    $parts.Add("**Answer this one in the terminal** - $why, so an answer chosen here would not reach the prompt.")
+
+    Limit-ClaudeText -Text ($parts -join "`n`n")
+}
+
 function Get-ClaudeHookEvent {
     <#
         Reads and parses the hook event from stdin. Returns $null when nothing usable

@@ -57,6 +57,37 @@ Test-That 'the field carries its options for the dropdown' { $parsedMulti.Fields
 Test-That 'multiSelect is preserved' { $parsedMulti.Fields[1].MultiSelect -eq $true }
 Test-That 'the prompt mentions both questions' { $parsedMulti.Question -match 'database' -and $parsedMulti.Question -match 'features' }
 Test-That 'no flattened choice list is produced' { $parsedMulti.Choices.Count -eq 0 }
+Test-That 'one multi-select question makes the whole set terminal-only' { $parsedMulti.MultiSelect }
+
+Write-Host '--- a prompt the dashboard cannot drive ---'
+# The dropdowns are dropped for these, so the options have to survive in the text or
+# they are not on the card at all: only the ones Claude described would show.
+$notice = Add-ClaudeTerminalOnlyNotice -Question $parsedMulti.Question -Fields $parsedMulti.MarkerFields
+Test-That 'the question still leads' { $notice.StartsWith($parsedMulti.Question) }
+Test-That 'it says to answer in the terminal' { $notice -match '\*\*Answer this one in the terminal\*\*' } $notice
+Test-That 'and says why, in multi-select terms' { $notice -match 'pick more than one option' } $notice
+Test-That 'every option is still readable' {
+    $notice -match 'PostgreSQL \(Recommended\)' -and $notice -match 'SQLite' -and
+    $notice -match 'Auth' -and $notice -match 'Billing'
+} $notice
+Test-That 'the multi-select question is marked as one' { $notice -match 'Features.*\(pick any\)|\(pick any\)' } $notice
+Test-That 'a form with no fields still gets the notice, with the other reason' {
+    $bare = Add-ClaudeTerminalOnlyNotice -Question 'Too many' -Fields @()
+    $bare -match 'Answer this one in the terminal' -and $bare -match 'more fields than the dashboard can drive'
+}
+Test-That 'it stays within the question length cap' {
+    $longQ = 'q' * 4000
+    $longR = 'r' * 4000
+    $optX = 'x' * 500
+    $optY = 'y' * 500
+    $optZ = 'z' * 500
+    $huge = [pscustomobject]@{ questions = @(
+        [pscustomobject]@{ question = $longQ; header = 'A'; multiSelect = $true; options = @($optX, $optY) }
+        [pscustomobject]@{ question = $longR; header = 'B'; options = @($optZ) }
+    ) }
+    $p = ConvertFrom-ClaudeAskUserQuestion -ToolInput $huge
+    (Add-ClaudeTerminalOnlyNotice -Question $p.Question -Fields $p.MarkerFields).Length -le 6000
+}
 
 Write-Host '--- more questions than dropdowns ---'
 $many = (Get-Fixture 'pretooluse-too-many.json')

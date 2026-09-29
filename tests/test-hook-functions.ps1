@@ -87,6 +87,53 @@ $ask.tool_name = 'Bash'
 $null = Invoke-ClaudeAskHook -HookEvent $ask
 Test-That 'any other tool is ignored' { $script:Markers.Count -eq 0 }
 
+# A multi-select question is answered in the terminal: the daemon refuses to inject
+# one. The card used to be armed with working dropdowns all the same, so it looked
+# answerable and silently was not - every Send was dropped at the daemon's
+# terminal-only check with nothing said on the card.
+function Write-CopilotDecisionMarker { param($SessionId, $DecisionId, $Question, $Choices, $Combos, $Fields, $Mode, [switch]$TerminalOnly, $ToolCallId) $script:Markers += [pscustomobject]@{ Question = $Question; Choices = @($Choices); Fields = @($Fields); TerminalOnly = [bool]$TerminalOnly } }
+$script:Published = @()
+function Get-ClaudeSessionDisplay { param($SessionId, $WorkingDirectory) [pscustomobject]@{ Name = 'Claude: t'; Machine = 'M' } }
+function Confirm-BridgeSessionEntities { param($SessionId, $SessionName, $Machine, $Headers, $ProbeEntity) $true }
+function Set-CopilotMqttDecision { param($SessionId, $SessionName, $Machine, $Question, $Choices, $Fields, $DecisionId, $Headers) $script:Published += [pscustomobject]@{ Question = $Question; Choices = @($Choices); Fields = @($Fields) } }
+function Send-BridgeNotification { param($Title, $Message, $Headers) $script:Notified += $Message }
+function Format-BridgeNotificationTitle { param($Name) $Name }
+$script:Reachable = $true
+
+$script:Markers = @(); $script:Published = @(); $script:Notified = @()
+$multiAsk = [pscustomobject]@{
+    session_id = 'c1'; transcript_path = 't'; cwd = 'w'; tool_name = 'AskUserQuestion'; tool_use_id = 'tu2'
+    tool_input = [pscustomobject]@{ questions = @(
+        [pscustomobject]@{ question = 'Which database?'; header = 'Database'; multiSelect = $false; options = @([pscustomobject]@{ label = 'PostgreSQL' }, [pscustomobject]@{ label = 'SQLite' }) }
+        [pscustomobject]@{ question = 'Which features?'; header = 'Features'; multiSelect = $true; options = @([pscustomobject]@{ label = 'Auth' }, [pscustomobject]@{ label = 'Billing' }) }
+    ) }
+}
+$null = Invoke-ClaudeAskHook -HookEvent $multiAsk -Ancestors @(30)
+Test-That 'a multi-select question is marked terminal-only' { $script:Markers[-1].TerminalOnly }
+Test-That 'and publishes no dropdown that cannot deliver' { $script:Published[-1].Fields.Count -eq 0 -and $script:Published[-1].Choices.Count -eq 0 } "fields=$($script:Published[-1].Fields.Count) choices=$($script:Published[-1].Choices.Count)"
+Test-That 'the card says to answer in the terminal' { $script:Published[-1].Question -match 'Answer this one in the terminal' } $script:Published[-1].Question
+Test-That 'the options are still readable on it' {
+    $script:Published[-1].Question -match 'PostgreSQL' -and $script:Published[-1].Question -match 'Billing'
+} $script:Published[-1].Question
+Test-That 'the marker matches, so a daemon re-arm cannot bring the dropdowns back' {
+    $script:Markers[-1].Fields.Count -eq 0 -and $script:Markers[-1].Question -eq $script:Published[-1].Question
+}
+Test-That 'the push says so too' { $script:Notified[-1] -match 'Answer this one in the terminal\.' } $script:Notified[-1]
+
+$script:Markers = @(); $script:Published = @(); $script:Notified = @()
+$driveable = [pscustomobject]@{
+    session_id = 'c1'; transcript_path = 't'; cwd = 'w'; tool_name = 'AskUserQuestion'; tool_use_id = 'tu3'
+    tool_input = [pscustomobject]@{ questions = @(
+        [pscustomobject]@{ question = 'Which database?'; header = 'Database'; multiSelect = $false; options = @([pscustomobject]@{ label = 'PostgreSQL' }, [pscustomobject]@{ label = 'SQLite' }) }
+        [pscustomobject]@{ question = 'Deploy now?'; header = 'Deploy'; multiSelect = $false; options = @([pscustomobject]@{ label = 'Yes' }, [pscustomobject]@{ label = 'No' }) }
+    ) }
+}
+$null = Invoke-ClaudeAskHook -HookEvent $driveable -Ancestors @(30)
+Test-That 'a single-select form still gets its dropdowns' { -not $script:Markers[-1].TerminalOnly -and $script:Published[-1].Fields.Count -eq 2 } "fields=$($script:Published[-1].Fields.Count)"
+Test-That 'and is not told to go to the terminal' { $script:Published[-1].Question -notmatch 'Answer this one in the terminal' }
+Test-That 'its push still offers both inputs' { $script:Notified[-1] -match 'Answer in the terminal or on the dashboard\.' }
+$script:Reachable = $false
+
 $script:Registered = @()
 $null = Invoke-ClaudeNotificationHook -HookEvent ([pscustomobject]@{ session_id = 'c1'; transcript_path = 't'; cwd = 'w'; notification_type = 'permission_prompt'; message = 'Claude needs your permission to use Bash' }) -Ancestors @(30)
 Test-That 'a permission notification marks it waiting' { $script:Registered[-1].Status -eq 'waiting' -and $script:Registered[-1].Pid -eq 30 }
