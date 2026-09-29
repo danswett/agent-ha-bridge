@@ -183,22 +183,34 @@ function Show-Status {
     Write-Host "    clients    : $(if ($clients) { $clients -join ', ' } else { 'none recorded' })"
 
     $task = if ($script:BridgeIsWindows) { Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue } else { $null }
+
+    # The daemon writes its own pid to the heartbeat every pass, so the usual answer
+    # costs a file read. Scanning command lines for it costs 272 ms on Windows, and
+    # is kept only for when the heartbeat cannot answer - it is the difference
+    # between "no heartbeat" and "not running", which are not the same thing.
+    $daemonPid = Get-BridgeStatusDaemonPid -HooksDir (Join-Path $bridgeHome 'hooks')
     if (-not $script:BridgeIsWindows -and -not (Get-Command Get-BridgeProcessesNamed -ErrorAction SilentlyContinue)) {
         Write-Host '    daemon     : unknown - the install''s hooks are missing; run agent-ha-bridge configure' -ForegroundColor Yellow
     }
     elseif (-not $script:BridgeIsWindows) {
         $loaded = [bool](& launchctl print "gui/$(& id -u)/$launchAgentLabel" 2>$null)
-        $daemon = @(Get-BridgeProcessesNamed -Name 'pwsh' -WithCommandLine | Where-Object { $_.CommandLine -match 'agent-bridge-daemon\.ps1' })
-        if ($daemon) { Write-Host "    daemon     : running (pid $($daemon[0].ProcessId))" -ForegroundColor Green }
+        if ($daemonPid -le 0) {
+            $daemon = @(Get-BridgeProcessesNamed -Name 'pwsh' -WithCommandLine | Where-Object { $_.CommandLine -match 'agent-bridge-daemon\.ps1' })
+            if ($daemon) { $daemonPid = [int]$daemon[0].ProcessId }
+        }
+        if ($daemonPid -gt 0) { Write-Host "    daemon     : running (pid $daemonPid)" -ForegroundColor Green }
         elseif ($loaded) { Write-Host '    daemon     : not running - launchd will start it again shortly' -ForegroundColor Yellow }
         else { Write-Host "    daemon     : the '$launchAgentLabel' LaunchAgent is not loaded - run agent-ha-bridge configure" -ForegroundColor Yellow }
         if (-not (Get-BridgeTmuxPath)) { Write-Host '    tmux       : not installed - replies from the dashboard need it (brew install tmux)' -ForegroundColor Yellow }
     }
     elseif ($task) {
-        $daemon = @(Get-CimInstance Win32_Process -Filter "Name='pwsh.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { $_.CommandLine -match 'agent-bridge-daemon\.ps1' })
-        if ($daemon) {
-            Write-Host "    daemon     : running (pid $($daemon[0].ProcessId))" -ForegroundColor Green
+        if ($daemonPid -le 0) {
+            $daemon = @(Get-CimInstance Win32_Process -Filter "Name='pwsh.exe'" -ErrorAction SilentlyContinue |
+                Where-Object { $_.CommandLine -match 'agent-bridge-daemon\.ps1' })
+            if ($daemon) { $daemonPid = [int]$daemon[0].ProcessId }
+        }
+        if ($daemonPid -gt 0) {
+            Write-Host "    daemon     : running (pid $daemonPid)" -ForegroundColor Green
         }
         else {
             Write-Host "    daemon     : not running - task state $($task.State)" -ForegroundColor Yellow
@@ -268,6 +280,30 @@ function Show-Status {
     }
 
     Show-BridgeMachines -HooksDir (Join-Path $bridgeHome 'hooks') -ConfigPath $configPath
+}
+
+function Get-BridgeStatusDaemonPid {
+    <#
+        The daemon's pid, from the heartbeat it writes each pass.
+
+        Read through the hooks library so there is one implementation of it rather
+        than a copy here that can drift from the one the hooks use. Dot-sourced inside
+        this function deliberately: at script scope it would leave the whole library
+        defined in this command, which this file avoids on purpose, and a dot-sourced
+        script rebinds any parameter it declares over a same-named local here.
+
+        Returns 0 when the library is missing or the heartbeat cannot answer, and the
+        caller falls back to scanning process command lines.
+    #>
+    param([Parameter(Mandatory)][string]$HooksDir)
+
+    $lib = Join-Path $HooksDir 'decision-bridge-common.ps1'
+    if (-not (Test-Path -LiteralPath $lib)) { return 0 }
+    try {
+        . $lib
+        [int](Get-BridgeDaemonPid)
+    }
+    catch { 0 }
 }
 
 function Show-BridgeMachines {

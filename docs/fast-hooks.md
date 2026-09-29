@@ -742,10 +742,31 @@ anything.
   (`agent-bridge-daemon.ps1`), each a full scan of every session.
 - Launcher, workspace and adapter discovery are machine-level but recomputed every
   15 seconds; the dashboard is already signature-gated and these could be.
-- `Get-CopilotAskUserState` re-parses the tail every pass at 93 ms. It cannot have
-  changed if the transcript has not grown, and the length is already known.
-- `bin/agent-ha-bridge.ps1` finds the daemon with a 272 ms WMI query, for a pid the
-  heartbeat file already holds.
+
+**Done 2026-09-28.**
+
+- `Get-CopilotAskUserState` re-parsed the tail on every pass. A transcript is
+  append-only, so an unchanged length is proof the answer cannot have changed, and
+  the answer is now kept against the file's length and write time: **96.7 ms to
+  1.35 ms** on a real 277 MB transcript. Both halves of that are dangerous rather
+  than merely slow, which is what `tests/test-transcript-cache.ps1` is about - a
+  stale answer does not slow anything down, it tears a live question off the phone
+  or re-injects an answer into a session that has moved on. It counts reads instead
+  of timing them, so it says whether the file was opened rather than how busy the
+  machine was, and it covers a transcript replaced by one of exactly the same length
+  (the case the write time is carried for). Four mutations fail it: dropping either
+  half of the stamp, handing out the stored object instead of a copy - a caller
+  editing its answer would otherwise rewrite what the next caller is told - and
+  removing the bound that stops the cache growing an entry per session forever.
+- `agent-ha-bridge status` found the daemon with a 272 ms WMI query. `CommandLine`
+  lives only on `Win32_Process`, and filtering it walks every process on the
+  machine. The daemon already writes its own pid to the heartbeat each pass, so this
+  is now a file read - **223 ms to 7.7 ms**, same pid - with the scan kept for when
+  the heartbeat cannot answer, because "no heartbeat" and "not running" are not the
+  same thing. A fresh heartbeat naming a recycled pid is refused. The test starts a
+  genuine second process through .NET rather than `Start-Process`, which that suite
+  stubs with a fixed pid 777: going through the stub would have proved only that two
+  constants matched, and did, until it was noticed.
 
 **On moving more to Go.** The hook is already there and is 28x faster; the work was
 getting it used. Beyond it the only rewrite the measurements justify is a resident

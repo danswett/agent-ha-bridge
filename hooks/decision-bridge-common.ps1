@@ -203,6 +203,36 @@ function Set-BridgeDaemonAlive {
     try { [IO.File]::WriteAllText((Get-BridgeDaemonHeartbeat), [string]$PID) } catch { }
 }
 
+function Get-BridgeDaemonPid {
+    <#
+        The running daemon's process id, taken from the heartbeat it writes each pass.
+
+        Finding it by command line instead costs 272 ms on Windows: CommandLine lives
+        only on Win32_Process, and filtering that walks every process on the machine.
+        The daemon already records its own pid, so the scan is only needed when that
+        record is missing, stale, or points at something that is no longer it.
+
+        Returns 0 when the heartbeat cannot answer, and the caller falls back to the
+        scan rather than reporting the daemon as stopped.
+    #>
+    try {
+        $path = Get-BridgeDaemonHeartbeat
+        if (([DateTime]::UtcNow - [IO.File]::GetLastWriteTimeUtc($path)).TotalSeconds -ge 60) { return 0 }
+        $id = 0
+        if (-not [int]::TryParse(([IO.File]::ReadAllText($path)).Trim(), [ref]$id)) { return 0 }
+        if ($id -le 0) { return 0 }
+        $proc = Get-Process -Id $id -ErrorAction SilentlyContinue
+        if ($null -eq $proc) { return 0 }
+
+        # A fresh heartbeat naming a pid that has since been recycled would otherwise
+        # report some unrelated process as the daemon. The name is the cheap half of
+        # the identity the command-line scan used to establish.
+        if ($proc.ProcessName -notin @('pwsh', 'powershell')) { return 0 }
+        $id
+    }
+    catch { 0 }
+}
+
 function Test-BridgeDaemonAlive {
     <#
         Whether the daemon has completed a pass in the last minute - so a hook can leave
@@ -1542,6 +1572,10 @@ function Remove-CopilotDecisionMarker {
     }
 }
 
+# Answers already read out of a transcript, keyed by its path, each with the length
+# and write time they were read at (see Get-CopilotAskUserState).
+$script:CopilotAskUserStateCache = @{}
+
 function Get-CopilotAskUserState {
     <#
         Inspects the transcript for the most recent ask_user tool call and reports
@@ -1561,6 +1595,46 @@ function Get-CopilotAskUserState {
     )
 
     $result = [pscustomobject]@{ Started = $false; Pending = $false; ToolCallId = ''; StartedAt = $null; ResultContent = '' }
+
+    # A transcript is append-only, so the same length means the same events, and the
+    # answer to "is this question still waiting?" cannot have changed. Parsing it
+    # again costs 93 ms of the daemon's reconcile, paid per armed question per pass -
+    # and a question sits armed for as long as it takes someone to look at their
+    # phone.
+    #
+    # The stamp carries the write time as well as the length. The length alone would
+    # miss a transcript replaced by another of exactly the same size, which is
+    # unlikely rather than impossible, and the pair costs the same single stat call.
+    $stamp = ''
+    try {
+        $info = [IO.FileInfo]::new($TranscriptPath)
+        if ($info.Exists) { $stamp = "$($info.Length):$($info.LastWriteTimeUtc.Ticks)" }
+    }
+    catch { }
+
+    if ($stamp) {
+        $hit = $script:CopilotAskUserStateCache[$TranscriptPath]
+        if ($null -ne $hit -and [string]$hit.Stamp -eq $stamp) {
+            # A copy, never the stored object: handing the same instance to every
+            # caller would let one of them edit what the next one reads.
+            return $hit.Result.PSObject.Copy()
+        }
+    }
+
+    # Records what was read, so the next pass over an unchanged transcript is a stat
+    # call. Used for every outcome, including "no question here" - that answer costs
+    # the same full parse to reach as any other.
+    $remember = {
+        param($Answer)
+        if ($stamp) {
+            # The daemon outlives every session it watches, so this would otherwise
+            # grow an entry per transcript forever. Emptying it costs one parse per
+            # session still being watched, which is rare enough not to matter.
+            if ($script:CopilotAskUserStateCache.Count -ge 64) { $script:CopilotAskUserStateCache.Clear() }
+            $script:CopilotAskUserStateCache[$TranscriptPath] = @{ Stamp = $stamp; Result = $Answer.PSObject.Copy() }
+        }
+        $Answer
+    }
 
     $lines = @(Get-CopilotTranscriptTailLines -Path $TranscriptPath)
     if ($lines.Count -eq 0) { return $result }
@@ -1608,13 +1682,13 @@ function Get-CopilotAskUserState {
         }
     }
 
-    if ([string]::IsNullOrWhiteSpace($latestStartId)) { return $result }
+    if ([string]::IsNullOrWhiteSpace($latestStartId)) { return (& $remember $result) }
     $result.Started = $true
     $result.ToolCallId = $latestStartId
     $result.StartedAt = $latestStartAt
     $result.Pending = -not $completed.ContainsKey($latestStartId)
     if ($results.ContainsKey($latestStartId)) { $result.ResultContent = [string]$results[$latestStartId] }
-    $result
+    & $remember $result
 }
 
 function Test-CopilotAnswerMatchesSelections {

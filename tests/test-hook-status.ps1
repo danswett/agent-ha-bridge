@@ -301,6 +301,57 @@ try {
         $env:AGENT_BRIDGE_HOOKS_PUBLISH = '1'
         Test-That 'unless told to publish anyway' { -not (Test-BridgeDaemonAlive) }
         Remove-Item Env:\AGENT_BRIDGE_HOOKS_PUBLISH
+
+        # The heartbeat is also how `agent-ha-bridge status` finds the daemon, in
+        # place of a 272 ms command-line scan. The two ends are a process writing its
+        # own pid and another process reading it, so the pid written here belongs to a
+        # real second process - reading the file and reporting $PID would otherwise
+        # look identical and be wrong.
+        #
+        # Started through .NET because this suite stubs Start-Process to record launch
+        # arguments; the stub hands back a fixed pid 777 and never starts anything, so
+        # going through it would prove only that two constants match.
+        $psi = [Diagnostics.ProcessStartInfo]::new((Get-Process -Id $PID).Path)
+        '-NoProfile', '-Command', 'Start-Sleep -Seconds 30' | ForEach-Object { $psi.ArgumentList.Add($_) }
+        $psi.UseShellExecute = $false
+        $psi.CreateNoWindow = $true
+        $other = [Diagnostics.Process]::Start($psi)
+        try {
+            [IO.File]::WriteAllText((Get-BridgeDaemonHeartbeat), [string]$other.Id)
+            Test-That 'status finds the daemon at the pid the daemon wrote' {
+                (Get-BridgeDaemonPid) -eq $other.Id
+            } "got $(Get-BridgeDaemonPid), wanted $($other.Id), this process is $PID"
+            Test-That 'and not at its own' { (Get-BridgeDaemonPid) -ne $PID }
+        }
+        finally { try { $other.Kill() } catch { } }
+        $other.WaitForExit(5000) | Out-Null
+
+        # Everything below must fall through to the scan rather than be reported as a
+        # running daemon: a wrong pid here is printed to the user as fact.
+        Test-That 'a pid that has gone falls back to the scan' {
+            [IO.File]::WriteAllText((Get-BridgeDaemonHeartbeat), [string]$other.Id)
+            (Get-BridgeDaemonPid) -eq 0
+        }
+        Test-That 'a recycled pid running something else falls back' {
+            # This test process is not pwsh under some hosts; explorer never is.
+            $notPwsh = @(Get-Process -Name 'explorer' -ErrorAction SilentlyContinue)
+            if ($notPwsh.Count -eq 0) { return $true }
+            [IO.File]::WriteAllText((Get-BridgeDaemonHeartbeat), [string]$notPwsh[0].Id)
+            (Get-BridgeDaemonPid) -eq 0
+        }
+        Test-That 'a heartbeat that is not a number falls back' {
+            [IO.File]::WriteAllText((Get-BridgeDaemonHeartbeat), 'not a pid')
+            (Get-BridgeDaemonPid) -eq 0
+        }
+        Test-That 'a stale heartbeat falls back even with a live pid' {
+            [IO.File]::WriteAllText((Get-BridgeDaemonHeartbeat), [string]$PID)
+            (Get-Item (Get-BridgeDaemonHeartbeat)).LastWriteTime = (Get-Date).AddMinutes(-5)
+            (Get-BridgeDaemonPid) -eq 0
+        }
+        Test-That 'no heartbeat at all falls back' {
+            Remove-Item (Get-BridgeDaemonHeartbeat) -Force -ErrorAction SilentlyContinue
+            (Get-BridgeDaemonPid) -eq 0
+        }
     }
     finally { $env:TEMP = $realTemp }
 }
