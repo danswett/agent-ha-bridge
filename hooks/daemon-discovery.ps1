@@ -112,9 +112,18 @@ function Get-LiveCodexSessions {
 
 # Only the bridge's own entities (agent_bridge_*) and the MCP server's (mcp_*), rendered
 # by Home Assistant itself as a JSON list of { entity_id, state, attributes }.
+#
+# `selectattr` before the loop is the whole performance of this template. Written as
+# `for s in states if s.object_id.startswith(...)` the filter runs in Jinja, once per
+# entity, over every state in the instance - 5,354 of them on DASDESK to find 44 - and
+# measured 221 ms of Home Assistant's CPU. `selectattr` does the same filtering inside
+# Python and hands back only the matches, so the Jinja loop runs 44 times instead:
+# 50 ms for byte-identical output. The accumulator is not the cost and the attributes
+# are not the cost; iterating the whole instance in Jinja is.
 $script:DaemonBridgeStatesTemplate = @'
+{%- set sel = states | selectattr('object_id','match','agent_bridge_|mcp_') | list -%}
 {%- set ns = namespace(out=[]) -%}
-{%- for s in states if s.object_id.startswith('agent_bridge_') or s.object_id.startswith('mcp_') -%}
+{%- for s in sel -%}
 {%- set ns.out = ns.out + [{'entity_id': s.entity_id, 'state': s.state, 'attributes': dict(s.attributes)}] -%}
 {%- endfor -%}
 {{ ns.out | to_json }}
@@ -127,7 +136,8 @@ function Get-DaemonHomeAssistantStates {
         server's - cached for a short while.
 
         Three things read them - MCP clients, peer machines and the orphan sweep - and
-        all change slowly, so they share one read per reconcile interval.
+        all change slowly, so they share one read per reconcile interval. -Fresh skips
+        the cache and refills it, which is what the reconcile's own snapshot uses.
 
         Home Assistant filters them (DaemonBridgeStatesTemplate, through /api/template):
         the full /api/states list was 5,354 entities and 2.4 MB of JSON on DASDESK, of
@@ -136,9 +146,9 @@ function Get-DaemonHomeAssistantStates {
         that refuses templates gets the full list, as before. Failure throws; each
         caller decides whether to fall back to its own last known good set.
     #>
-    param([Parameter(Mandatory)][hashtable]$Headers)
+    param([Parameter(Mandatory)][hashtable]$Headers, [switch]$Fresh)
 
-    if ($null -ne $script:DaemonStatesCache -and
+    if (-not $Fresh -and $null -ne $script:DaemonStatesCache -and
         ([DateTimeOffset]::Now - $script:DaemonStatesCacheAt).TotalSeconds -lt $script:DaemonConfig.McpScanCacheSeconds) {
         return ,$script:DaemonStatesCache
     }
@@ -187,6 +197,83 @@ function Get-DaemonHomeAssistantStates {
     # @($result) then yields a one-element array holding $null, which every consumer
     # here would dereference.
     ,$script:DaemonStatesCache
+}
+
+$script:DaemonReconcileStates = $null
+
+function Set-DaemonReconcileSnapshot {
+    <#
+        Takes one read of every bridge entity and holds it for this reconcile, so the
+        per-session checks below can be answered without a request each.
+
+        A reconcile used to make about 5 Home Assistant reads per live session and 3
+        besides - the repair pass read the reply box and the decision selector, the
+        reply pass read the decision selector again and the payload sensor, and the
+        stop pass read the stop button - every pass, for every session, whether or not
+        anything had happened. Thirteen round trips for two sessions, forty-three for
+        eight. One filtered template read answers all of them at once and costs the
+        same whatever the session count, which is the point: the old shape charged for
+        idleness and grew with every session opened.
+
+        This is a backstop, not the fast path. A press is noticed within a tick by the
+        WebSocket watch, which subscribes to these same entities and acts on the change
+        directly (Invoke-DaemonHit); the reconcile exists to catch whatever landed
+        between watch windows. So a snapshot taken at the top of a pass is no staler
+        than the reads it replaces - and it is more consistent, because every check in
+        the pass now sees the same instant rather than thirteen slightly different ones.
+
+        A failure leaves no snapshot, and Get-DaemonEntityState falls back to reading
+        each entity directly, exactly as before.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Headers)
+
+    $script:DaemonReconcileStates = $null
+    try {
+        $map = @{}
+        # Assigned first, then wrapped. Get-DaemonHomeAssistantStates returns its list
+        # comma-wrapped so that an empty one survives the caller's @(), which means
+        # @(Get-DaemonHomeAssistantStates ...) is a one-element array holding the whole
+        # list - and the loop below then ran once with every entity at once. It built a
+        # single key 179 characters long, [string] having joined the ids with spaces,
+        # and every lookup missed and fell back to a direct read: the batching silently
+        # did nothing at all while looking like it worked.
+        $states = Get-DaemonHomeAssistantStates -Headers $Headers -Fresh
+        foreach ($entry in @($states)) {
+            if ($null -eq $entry) { continue }
+            $id = [string]$entry.entity_id
+            if (-not [string]::IsNullOrWhiteSpace($id)) { $map[$id] = $entry }
+        }
+        $script:DaemonReconcileStates = $map
+    }
+    catch {
+        Write-DaemonLog -Message "state snapshot failed, reading entities one at a time: $($_.Exception.Message)"
+    }
+}
+
+function Clear-DaemonReconcileSnapshot {
+    <# Ends the pass the snapshot belongs to, so nothing outside it reads stale values. #>
+    $script:DaemonReconcileStates = $null
+}
+
+function Get-DaemonEntityState {
+    <#
+        One entity's state: from this reconcile's snapshot when it holds it, otherwise
+        read directly.
+
+        An entity the snapshot does not hold is read rather than reported missing.
+        Several callers use a read that throws as an existence probe, and the template
+        only renders entities Home Assistant already knows about, so answering "absent"
+        from the snapshot would quietly change what those callers decide.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$EntityId,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    if ($null -ne $script:DaemonReconcileStates -and $script:DaemonReconcileStates.ContainsKey($EntityId)) {
+        return $script:DaemonReconcileStates[$EntityId]
+    }
+    Get-HomeAssistantState -EntityId $EntityId -Headers $Headers
 }
 
 function Get-DaemonPeerMachines {

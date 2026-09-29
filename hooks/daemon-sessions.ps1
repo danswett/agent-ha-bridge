@@ -76,10 +76,10 @@ function Repair-CopilotSessionEntities {
             # Check both optimistic entities: a session whose reply box happens to hold
             # a value can still have an unknown decision selector, so keying off the
             # reply box alone would leave that session unrepaired.
-            $reply = Get-HomeAssistantState -EntityId "text.${node}_reply" -Headers $Headers
+            $reply = Get-DaemonEntityState -EntityId "text.${node}_reply" -Headers $Headers
             if ([string]$reply.state -in @('unknown', 'unavailable')) { $needsRepair = $true }
             if (-not $needsRepair) {
-                $dec = Get-HomeAssistantState -EntityId "select.${node}_decision" -Headers $Headers
+                $dec = Get-DaemonEntityState -EntityId "select.${node}_decision" -Headers $Headers
                 if ([string]$dec.state -in @('unknown', 'unavailable')) { $needsRepair = $true }
             }
         }

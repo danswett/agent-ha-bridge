@@ -216,6 +216,17 @@ function Show-Status {
         if ($nativePath) {
             $nativeVersion = (& $nativePath --version 2>$null | Out-String).Trim()
             Write-Host "    hooks      : native ($nativeVersion) - $(Format-BridgeHookStats -Stats (Get-BridgeHookStats -Hours 24) -Hours 24)"
+            # Installed is not the same as used. Copilot only runs the native hook from
+            # a version that can launch one directly, and below it the installer writes
+            # PowerShell hooks instead - which cost 587 ms a hook against 21 ms, on the
+            # path a person is actually waiting on. That was reported once, in grey,
+            # during an install nobody re-reads; "no runs in 24 h" beside a version
+            # number reads like the hook is idle rather than bypassed.
+            $copilotVersion = Get-BridgeCopilotVersion
+            if ($null -ne $copilotVersion -and -not (Test-BridgeCopilotRunsExec -Version $copilotVersion)) {
+                Write-Host "                 Copilot CLI $copilotVersion is below $($script:BridgeCopilotExecMinVersion), so its hooks are NOT using it" -ForegroundColor Yellow
+                Write-Host '                 and cost about 570 ms each. Run: copilot update, then agent-ha-bridge configure' -ForegroundColor Yellow
+            }
         }
         else {
             Write-Host '    hooks      : PowerShell - the native hook is not installed (agent-ha-bridge update fetches it)' -ForegroundColor Yellow

@@ -2066,7 +2066,7 @@ if ($selectedClients -contains 'copilot') {
         Write-Host "    through the native hook (Copilot $copilotVersion)"
     }
     elseif ($nativeHook.Path) {
-        Write-Host "    PowerShell hooks: Copilot $(if ($copilotVersion) { $copilotVersion } else { 'not found' }) is older than $($script:BridgeCopilotExecMinVersion), the first seen to run the native hook" -ForegroundColor DarkGray
+        Write-Warning "Copilot CLI $(if ($copilotVersion) { $copilotVersion } else { 'not found' }) is below $($script:BridgeCopilotExecMinVersion), so its hooks stay PowerShell and cost about 570 ms each instead of 21 ms - on the path you wait on. Run 'copilot update', then re-run this installer."
     }
     # Off Windows the CLI runs a hook's `bash` command, so each gets one that starts
     # the same script under pwsh, by full path - a hook's PATH may not include it.

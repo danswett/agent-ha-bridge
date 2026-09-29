@@ -669,6 +669,12 @@ function Invoke-DaemonReconcile {
         # transcript write that lands during it would otherwise wait for all of
         # them. The fast lane between steps costs a file-size check per session
         # when nothing changed.
+        #
+        # One read of every bridge entity up front, which the per-session checks
+        # below answer from instead of asking for each one (Set-DaemonReconcileSnapshot).
+        # It is cleared at the end of the pass rather than left to age, so nothing
+        # outside a reconcile can read a value from one.
+        Set-DaemonReconcileSnapshot -Headers $headers
         $live = Get-LiveBridgeSessions
         Sync-DaemonSessions -Headers $headers -State $state -Live $live
         Repair-CopilotSessionEntities -Headers $headers -State $state -Live $live
@@ -693,6 +699,11 @@ function Invoke-DaemonReconcile {
     }
     catch {
         Write-DaemonLog -Message "reconcile failed: $($_.Exception.Message)"
+    }
+    finally {
+        # In finally so a pass that threw halfway does not leave its snapshot behind
+        # for the tick path to read.
+        Clear-DaemonReconcileSnapshot
     }
 }
 

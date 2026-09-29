@@ -53,7 +53,13 @@ Write-Host '--- the filtered read ---'
 Reset-Cache
 $states = Get-DaemonHomeAssistantStates -Headers $headers
 Test-That 'only the filtered read is made' { ($script:Calls -join ',') -eq 'Post /api/template' } ($script:Calls -join ',')
-Test-That 'asking for the bridge''s entities and the MCP server''s' { $script:LastTemplate -match "startswith\('agent_bridge_'\)" -and $script:LastTemplate -match "startswith\('mcp_'\)" }
+Test-That 'asking for the bridge''s entities and the MCP server''s' { $script:LastTemplate -match 'agent_bridge_' -and $script:LastTemplate -match 'mcp_' } $script:LastTemplate
+# Named rather than assumed: the filtering has to happen inside Home Assistant, not in
+# the Jinja loop. Written as `for s in states if s.object_id.startswith(...)` the test
+# still passed and the render cost 221 ms, because Jinja evaluated the condition once
+# per entity over all 5,354 of them; `selectattr` does it in Python and the same render
+# takes 50 ms. So the check is that the prefixes are asked for through selectattr.
+Test-That 'and filtering where it is cheap, not in the Jinja loop' { $script:LastTemplate -match 'selectattr' } $script:LastTemplate
 Test-That 'its text reply is parsed into states' { @($states).Count -eq 1 -and $states[0].entity_id -eq 'sensor.agent_bridge_desk_sessions' -and $states[0].attributes.machine -eq 'DESK' }
 Test-That 'which the peer scan reads as before' { @(Get-BridgePeerMachine -States $states).Count -eq 1 }
 $script:Calls = @()

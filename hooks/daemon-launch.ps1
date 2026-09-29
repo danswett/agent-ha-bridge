@@ -37,7 +37,7 @@ function Invoke-PendingStops {
         $node = Get-CopilotMqttNodeId -SessionId $sessionId
         $press = ''
         try {
-            $button = Get-HomeAssistantState -EntityId "button.${node}_stop" -Headers $Headers
+            $button = Get-DaemonEntityState -EntityId "button.${node}_stop" -Headers $Headers
             $press = [string]$button.state
         }
         catch {

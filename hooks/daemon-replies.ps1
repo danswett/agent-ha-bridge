@@ -248,7 +248,7 @@ function Test-DaemonReplyBoxFree {
 
     $armedQuestion = ''
     try {
-        $decisionState = Get-HomeAssistantState -EntityId "select.${node}_decision" -Headers $Headers
+        $decisionState = Get-DaemonEntityState -EntityId "select.${node}_decision" -Headers $Headers
         $armedQuestion = [string]$decisionState.attributes.question
     }
     catch {
@@ -326,7 +326,7 @@ function Send-DaemonCardPayload {
     $node = Get-CopilotMqttNodeId -SessionId $sessionId
     $payload = $null
     try {
-        $payloadState = Get-HomeAssistantState -EntityId "sensor.${node}_reply_payload" -Headers $Headers
+        $payloadState = Get-DaemonEntityState -EntityId "sensor.${node}_reply_payload" -Headers $Headers
         $payload = Get-BridgeReplyPayload -State $payloadState
     }
     catch {

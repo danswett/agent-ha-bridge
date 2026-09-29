@@ -639,6 +639,85 @@ never seen and cannot be recovered from the trail, which is capped at
 trail, so it wants a decision - put thinking in the trail (capped in length, probably
 only with Detailed activity on), or publish per line rather than per reconcile.
 
+## A performance pass, measured (2026-09-28)
+
+Numbers taken on DSWETT-HOME against the live instance, not estimated.
+
+| | |
+|---|---|
+| daemon, steady | 2-5% of one core continuously, 147-159 MB private |
+| where its CPU goes | ~68% in reconcile spikes of 100-170 ms; ~30% in the 10 Hz tick at ~0.7 ms |
+| a PowerShell hook, end to end | 587-634 ms |
+| the same event through the native hook | 21 ms |
+| `pwsh -NoProfile -Command exit` | 341 ms |
+| REST: one entity / template / WebSocket command | 5.5 / 14.6 / 12 ms |
+| REST: `/api/states`, everything | 421 ms |
+| build the whole Lovelace config, and serialise it | 18-23 ms, then 0.3 ms |
+| `Get-CopilotAskUserState` over a 4 MB tail | 93 ms |
+| tail-read a **276 MB** transcript | 32 ms |
+| `Get-CimInstance Win32_Process` | 272 ms |
+
+**The two largest findings were not Go work.**
+
+**The native hook was installed and not being used.** `agent-ha-bridge status` read
+`native (1.14.6) - no runs in the last 24 h`, which sounds idle and meant bypassed:
+Copilot only runs it from 1.0.88 and this machine had 1.0.87, so every `ask_user`,
+permission prompt and turn end paid 587 ms of PowerShell startup instead of 21 ms, on
+the one path a person waits for. The installer did say so - once, in dark grey, in a
+page of output nobody re-reads. It is a warning now, and `status` says it beside the
+version rather than leaving "no runs" to be read as quiet.
+
+**A reconcile made about 5 Home Assistant reads per session and 3 besides, every pass,
+whether or not anything had happened** - the repair pass read the reply box and the
+decision selector, the reply pass read the decision selector *again* and the payload
+sensor, and the stop pass read the stop button. Thirteen round trips for two sessions,
+forty-three for eight. The machinery to avoid this already existed and was used for
+three slow-moving things only: `Get-DaemonHomeAssistantStates` renders the bridge's
+entities through `/api/template` in one read. There were 3 calls to it against 47
+direct `Get-HomeAssistantState` calls. The reconcile now takes one snapshot up front
+(`Set-DaemonReconcileSnapshot`) and the repeated checks read from it - 17 ms of CPU
+against 37 ms for five direct reads, and flat in the session count rather than linear.
+
+**That template was also four times slower than it needed to be.** Written as
+`for s in states if s.object_id.startswith(...)` the filter ran in Jinja, once per
+entity, across all 5,354 states to find 44: 221 ms of Home Assistant's CPU. Moving the
+filter into `selectattr` - the same output, byte for byte - made it 50 ms. The
+accumulator was not the cost and the attributes were not the cost; iterating the whole
+instance in Jinja was.
+
+**Two things this pass got wrong, both caught by testing rather than reasoning.**
+The snapshot was built with `foreach ($x in @(Get-DaemonHomeAssistantStates ...))`,
+and that function returns its list comma-wrapped so an empty one survives a caller's
+`@()`. The wrap therefore produced a one-element array holding the whole list, the
+loop ran once with every entity at once, and `[string]` joined the ids into a single
+key 179 characters long. Every lookup missed and fell through to a direct read: the
+batching did nothing whatsoever while passing every end-to-end check. And the daemon's
+CPU read 4.8% after the change against 2.2% before, which looked like a regression and
+was not attributable at all - the two windows differed by how hard the session on the
+machine happened to be working. The isolated measurement is the one that means
+anything.
+
+**Still open, in rough order of measured value.**
+
+- `Invoke-DaemonFastActivity` runs **four times per reconcile**
+  (`agent-bridge-daemon.ps1`), each a full scan of every session.
+- Launcher, workspace and adapter discovery are machine-level but recomputed every
+  15 seconds; the dashboard is already signature-gated and these could be.
+- `Get-CopilotAskUserState` re-parses the tail every pass at 93 ms. It cannot have
+  changed if the transcript has not grown, and the length is already known.
+- `bin/agent-ha-bridge.ps1` finds the daemon with a 272 ms WMI query, for a pid the
+  heartbeat file already holds.
+
+**On moving more to Go.** The hook is already there and is 28x faster; the work was
+getting it used. Beyond it the only rewrite the measurements justify is a resident
+**transcript worker** - bounded append reads and the reducers behind a small JSON
+contract, with the PowerShell readers kept as the fallback - because transcript
+parsing is what the reconcile actually spends its CPU on. A full daemon rewrite is not
+justified: the loop is orchestration rather than compute, and the I/O it orchestrates
+is already 5-15 ms. Dashboard generation (20 ms, gated), MQTT and WebSocket transport,
+and the installer are not worth moving. Console injection is already compiled C# in a
+cached DLL, so it is a strategic move rather than a performance one.
+
 ## Resuming
 
 Read this file, then `git log --oneline -10`. The first unticked phase is next. A
