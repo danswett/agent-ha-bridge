@@ -861,7 +861,7 @@ function Get-BridgeHomeAssistantUser {
         $result
     }
     catch {
-        $result.Error = $_.Exception.InnerException ? $_.Exception.InnerException.Message : $_.Exception.Message
+        $result.Error = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
         $result
     }
     finally { if ($ws) { $ws.Dispose() } }
