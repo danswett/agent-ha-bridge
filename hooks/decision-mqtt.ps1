@@ -1341,8 +1341,14 @@ function Publish-CopilotMqttDecisionFields {
         if ($null -ne $field -and -not (Test-DecisionFieldIsText -Field $field)) {
             $label = [string]$field.Label
             if ([string]::IsNullOrWhiteSpace($label)) { $label = "Field $i" }
+            # A multi-select field offers its combinations, because a select holds one
+            # value; the marker keeps the real options for the keystrokes.
+            $listed = if (Test-DecisionFieldIsMultiSelect -Field $field) {
+                @(Get-DecisionMultiSelectChoices -Field $field)
+            }
+            else { @($field.Options) }
             $options = @('Choose...') + @(
-                $field.Options | ForEach-Object {
+                $listed | ForEach-Object {
                     $t = [string]$_
                     if ($t.Length -gt 250) { $t = $t.Substring(0, 247) + '...' }
                     $t

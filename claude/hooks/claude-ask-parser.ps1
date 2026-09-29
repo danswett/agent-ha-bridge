@@ -167,7 +167,13 @@ function Add-ClaudeTerminalOnlyNotice {
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$Question,
-        [AllowNull()][AllowEmptyCollection()][object[]]$Fields = @()
+        [AllowNull()][AllowEmptyCollection()][object[]]$Fields = @(),
+
+        # Why it cannot be driven, when the caller knows better than the shape of the
+        # fields does. Whether a multi-select question is answerable depends on how
+        # many combinations its options make, which is the core's to decide, not this
+        # parser's.
+        [AllowEmptyString()][string]$Reason = ''
     )
 
     $fieldList = @($Fields)
@@ -186,8 +192,11 @@ function Add-ClaudeTerminalOnlyNotice {
         $parts.Add(($outline -join "`n"))
     }
 
-    $why = if ($anyMultiSelect) {
-        'it lets you pick more than one option, which the dashboard cannot drive'
+    $why = if (-not [string]::IsNullOrWhiteSpace($Reason)) {
+        $Reason
+    }
+    elseif ($anyMultiSelect) {
+        'it offers more combinations than the dashboard can list'
     }
     else {
         'it has more fields than the dashboard can drive'

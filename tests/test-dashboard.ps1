@@ -297,6 +297,25 @@ Test-That 'the choice slots still carry their real options' {
     @($script:FieldOptions['f1']) -contains 'Amber' -and @($script:FieldOptions['f3']) -contains 'Two'
 }
 
+# A multi-select field cannot be offered as its bare options: a Home Assistant select
+# holds one value, so picking one would quietly answer "choose any" with exactly one.
+# Its dropdown carries the combinations instead.
+$script:FieldOptions = @{}; $script:FieldStarts = @{}
+$msFields = @(
+    [pscustomobject]@{ Label = 'Envs';  Options = @('Staging', 'Production'); IsText = $false; MultiSelect = $true }
+    [pscustomobject]@{ Label = 'Pick';  Options = @('One', 'Two');            IsText = $false }
+)
+Publish-CopilotMqttDecisionFields -SessionId 'abc123de-f456-7890-abcd-ef1234567890' `
+    -SessionName 'S' -Machine 'BOX' -Fields $msFields -Headers @{ Authorization = '******' }
+
+Test-That 'a multi-select slot lists every combination' {
+    (@($script:FieldOptions['f1']) -join ' / ') -eq 'Choose... / Staging / Production / Staging + Production'
+} (@($script:FieldOptions['f1']) -join ' / ')
+Test-That 'a single-select slot beside it is unchanged' {
+    (@($script:FieldOptions['f2']) -join ' / ') -eq 'Choose... / One / Two'
+} (@($script:FieldOptions['f2']) -join ' / ')
+Test-That 'and it still starts on Choose...' { $script:FieldStarts['f1'] -eq 'Choose...' }
+
 Write-Host ''
 Write-Host '--- the new-session card is only what a launch needs ---'
 # The card exists to be one press: every selector carries a default. The first

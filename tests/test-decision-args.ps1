@@ -378,6 +378,69 @@ Test-Case 'an option that is not in the list is refused' {
     $threw
 }
 
+Write-Host "`n--- a multi-select field is typed by number, then walked to Submit ---"
+# Verified live against Claude Code 2.1.273: the prompt numbers its options and typing
+# a number toggles that one wherever the cursor is, so no Down press can land on the
+# wrong option. Down once per row - the options plus the "Type something" row - then
+# highlights Submit, which the caller's Enter presses.
+$msField = [pscustomobject]@{
+    Label = 'Features'; Options = @('Auth', 'Billing', 'Search'); IsText = $false; MultiSelect = $true
+}
+Test-Case 'every combination is offered, single picks first' {
+    (@(Get-DecisionMultiSelectChoices -Field $msField) -join ' / ') -eq
+        'Auth / Billing / Search / Auth + Billing / Auth + Search / Billing + Search / Auth + Billing + Search'
+} ((@(Get-DecisionMultiSelectChoices -Field $msField)) -join ' / ')
+Test-Case 'a combination resolves back to its own options, in field order' {
+    (@(Resolve-DecisionMultiSelectChoice -Field $msField -Choice 'Auth + Search') -join ',') -eq 'Auth,Search'
+}
+Test-Case 'a combination that was never offered resolves to nothing' {
+    @(Resolve-DecisionMultiSelectChoice -Field $msField -Choice 'Auth + Nope').Count -eq 0
+}
+Test-Case 'two options are typed as their numbers, then four Downs reach Submit' {
+    $s = @(Get-BridgeFormPayloads -Fields @($msField) -Selections @('Billing + Search'))[0]
+    $s.Payload -eq ('23' + ($esc + '[B') * 4) -and -not $s.IsText
+} (@(Get-BridgeFormPayloads -Fields @($msField) -Selections @('Billing + Search'))[0].Payload -replace [regex]::Escape($esc), '<esc>')
+Test-Case 'each toggle is its own write, with the walk to Submit last' {
+    # One write for the lot had its toggles silently dropped against a live prompt.
+    $keys = @(@(Get-BridgeFormPayloads -Fields @($msField) -Selections @('Billing + Search'))[0].Keys)
+    $keys.Count -eq 3 -and $keys[0] -eq '2' -and $keys[1] -eq '3' -and $keys[2] -eq (($esc + '[B') * 4)
+}
+Test-Case 'an ordinary choice field is still one write' {
+    $keys = @(@(Get-BridgeFormPayloads -Fields @($formFields[0]) -Selections @('Blue'))[0].Keys)
+    $keys.Count -eq 1 -and $keys[0] -eq ($esc + '[B')
+}
+Test-Case 'so is a text field' {
+    $keys = @(@(Get-BridgeFormPayloads -Fields @($formFields[1]) -Selections @('hello'))[0].Keys)
+    $keys.Count -eq 1 -and $keys[0] -eq 'hello'
+}
+Test-Case 'a single pick on a multi-select field still walks to Submit' {
+    @(Get-BridgeFormPayloads -Fields @($msField) -Selections @('Auth'))[0].Payload -eq ('1' + ($esc + '[B') * 4)
+}
+Test-Case 'a two-option field walks three rows, not four' {
+    $small = [pscustomobject]@{ Label = 'Envs'; Options = @('Staging', 'Production'); IsText = $false; MultiSelect = $true }
+    @(Get-BridgeFormPayloads -Fields @($small) -Selections @('Production'))[0].Payload -eq ('2' + ($esc + '[B') * 3)
+}
+Test-Case 'a combination the card never offered is refused, not guessed at' {
+    $threw = $false
+    try { [void](Get-BridgeFormPayloads -Fields @($msField) -Selections @('Auth + Nope')) }
+    catch { $threw = $true }
+    $threw
+}
+Test-Case 'too many options to list every combination is refused' {
+    $wide = [pscustomobject]@{ Label = 'W'; Options = @('A','B','C','D','E'); IsText = $false; MultiSelect = $true }
+    @(Get-DecisionMultiSelectChoices -Field $wide).Count -eq 0
+}
+Test-Case 'a single-select field is not treated as one' {
+    -not (Test-DecisionFieldIsMultiSelect -Field $formFields[0])
+}
+Test-Case 'the recorded answer is matched option by option' {
+    # Claude records "Billing, Search", never the card's combination label.
+    (Test-CopilotAnswerMatchesSelections -ResultContent '"Which features?"="Billing, Search"' `
+        -Fields @($msField) -Selections @('Billing + Search')) -and
+    -not (Test-CopilotAnswerMatchesSelections -ResultContent '"Which features?"="Billing"' `
+        -Fields @($msField) -Selections @('Billing + Search'))
+}
+
 Write-Host "`n--- legacy shape must still work ---"
 
 Assert-Case -Name 'legacy question + choices array' -ExpectedQuestion 'Legacy question?' `

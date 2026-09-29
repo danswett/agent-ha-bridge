@@ -109,16 +109,47 @@ $multiAsk = [pscustomobject]@{
     ) }
 }
 $null = Invoke-ClaudeAskHook -HookEvent $multiAsk -Ancestors @(30)
-Test-That 'a multi-select question is marked terminal-only' { $script:Markers[-1].TerminalOnly }
-Test-That 'and publishes no dropdown that cannot deliver' { $script:Published[-1].Fields.Count -eq 0 -and $script:Published[-1].Choices.Count -eq 0 } "fields=$($script:Published[-1].Fields.Count) choices=$($script:Published[-1].Choices.Count)"
-Test-That 'the card says to answer in the terminal' { $script:Published[-1].Question -match 'Answer this one in the terminal' } $script:Published[-1].Question
-Test-That 'the options are still readable on it' {
-    $script:Published[-1].Question -match 'PostgreSQL' -and $script:Published[-1].Question -match 'Billing'
-} $script:Published[-1].Question
-Test-That 'the marker matches, so a daemon re-arm cannot bring the dropdowns back' {
-    $script:Markers[-1].Fields.Count -eq 0 -and $script:Markers[-1].Question -eq $script:Published[-1].Question
+Test-That 'a multi-select question is now answerable from the card' { -not $script:Markers[-1].TerminalOnly }
+Test-That 'its field is passed through as multi-select' {
+    Test-DecisionFieldIsMultiSelect -Field (@($script:Published[-1].Fields)[1])
 }
-Test-That 'the push says so too' { $script:Notified[-1] -match 'Answer this one in the terminal\.' } $script:Notified[-1]
+Test-That 'the single-select field is untouched' {
+    (@($script:Published[-1].Fields)[0].Options -join ',') -eq 'PostgreSQL,SQLite'
+}
+Test-That 'the marker keeps the real options for the keystrokes' {
+    (@($script:Markers[-1].Fields)[1].Options -join ',') -eq 'Auth,Billing'
+}
+Test-That 'and nothing is sent to the terminal' { $script:Published[-1].Question -notmatch 'Answer this one in the terminal' }
+
+# Too many options to list every combination: back to the terminal, and said so.
+$script:Markers = @(); $script:Published = @(); $script:Notified = @()
+$wideAsk = [pscustomobject]@{
+    session_id = 'c1'; transcript_path = 't'; cwd = 'w'; tool_name = 'AskUserQuestion'; tool_use_id = 'tu9'
+    tool_input = [pscustomobject]@{ questions = @(
+        [pscustomobject]@{ question = 'Which?'; header = 'Many'; multiSelect = $true; options = @(
+            [pscustomobject]@{ label = 'A' }, [pscustomobject]@{ label = 'B' }, [pscustomobject]@{ label = 'C' },
+            [pscustomobject]@{ label = 'D' }, [pscustomobject]@{ label = 'E' }) }
+    ) }
+}
+$null = Invoke-ClaudeAskHook -HookEvent $wideAsk -Ancestors @(30)
+Test-That 'too many combinations falls back to the terminal' { $script:Markers[-1].TerminalOnly }
+Test-That 'and the card says which limit it hit' { $script:Published[-1].Question -match 'more combinations than the dashboard can list' } $script:Published[-1].Question
+Test-That 'with no dropdown published' { $script:Published[-1].Fields.Count -eq 0 -and $script:Published[-1].Choices.Count -eq 0 }
+
+# One multi-select question shows a single dropdown, so the combinations go there.
+$script:Markers = @(); $script:Published = @(); $script:Notified = @()
+$soloAsk = [pscustomobject]@{
+    session_id = 'c1'; transcript_path = 't'; cwd = 'w'; tool_name = 'AskUserQuestion'; tool_use_id = 'tu8'
+    tool_input = [pscustomobject]@{ questions = @(
+        [pscustomobject]@{ question = 'Which features?'; header = 'Features'; multiSelect = $true; options = @(
+            [pscustomobject]@{ label = 'Auth' }, [pscustomobject]@{ label = 'Billing' }) }
+    ) }
+}
+$null = Invoke-ClaudeAskHook -HookEvent $soloAsk -Ancestors @(30)
+Test-That 'a lone multi-select question offers combinations on the main selector' {
+    ($script:Published[-1].Choices -join ' / ') -eq 'Auth / Billing / Auth + Billing'
+} ($script:Published[-1].Choices -join ' / ')
+Test-That 'and is not sent to the terminal' { -not $script:Markers[-1].TerminalOnly }
 
 $script:Markers = @(); $script:Published = @(); $script:Notified = @()
 $driveable = [pscustomobject]@{

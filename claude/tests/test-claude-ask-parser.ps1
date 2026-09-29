@@ -65,7 +65,7 @@ Write-Host '--- a prompt the dashboard cannot drive ---'
 $notice = Add-ClaudeTerminalOnlyNotice -Question $parsedMulti.Question -Fields $parsedMulti.MarkerFields
 Test-That 'the question still leads' { $notice.StartsWith($parsedMulti.Question) }
 Test-That 'it says to answer in the terminal' { $notice -match '\*\*Answer this one in the terminal\*\*' } $notice
-Test-That 'and says why, in multi-select terms' { $notice -match 'pick more than one option' } $notice
+Test-That 'and says why, in multi-select terms' { $notice -match 'more combinations than the dashboard can list' } $notice
 Test-That 'every option is still readable' {
     $notice -match 'PostgreSQL \(Recommended\)' -and $notice -match 'SQLite' -and
     $notice -match 'Auth' -and $notice -match 'Billing'
@@ -74,6 +74,9 @@ Test-That 'the multi-select question is marked as one' { $notice -match 'Feature
 Test-That 'a form with no fields still gets the notice, with the other reason' {
     $bare = Add-ClaudeTerminalOnlyNotice -Question 'Too many' -Fields @()
     $bare -match 'Answer this one in the terminal' -and $bare -match 'more fields than the dashboard can drive'
+}
+Test-That 'a caller can say why itself' {
+    (Add-ClaudeTerminalOnlyNotice -Question 'q' -Fields @() -Reason 'the moon is wrong') -match 'the moon is wrong'
 }
 Test-That 'it stays within the question length cap' {
     $longQ = 'q' * 4000

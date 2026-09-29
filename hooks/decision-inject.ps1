@@ -496,6 +496,11 @@ function Send-CopilotSessionPrompt {
     $result
 }
 
+# How long to leave between the separate writes one field is delivered in - each
+# toggle of a multi-select list. Measured against a live prompt: the toggles land
+# reliably at this spacing, and were dropped entirely when sent as one write.
+$script:BridgeFormKeyGapMs = 350
+
 function Get-BridgeFormPayloads {
     <#
         Turns a form's fields and chosen values into the exact sequence typed into the
@@ -511,6 +516,11 @@ function Get-BridgeFormPayloads {
 
         Returns objects with Payload and IsText, in field order. Throws if a selection
         is not one of its field's options.
+
+        Keys is the payload split into the separate writes it has to be delivered in:
+        one entry for most fields, one per toggle plus the walk to Submit for a
+        multi-select one, which cannot be delivered in a single write (see
+        Send-CopilotSessionForm).
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Fields,
@@ -522,8 +532,10 @@ function Get-BridgeFormPayloads {
         if (Test-DecisionFieldIsText -Field $Fields[$i]) {
             # Normalised the same way a reply is: a newline mid-form would commit the
             # field early and leave the rest of the prompt unanswered.
+            $text = [string](Get-CopilotInjectableText -Text ([string]$Selections[$i]))
             [pscustomobject]@{
-                Payload = [string](Get-CopilotInjectableText -Text ([string]$Selections[$i]))
+                Payload = $text
+                Keys    = @($text)
                 IsText  = $true
                 Index   = 0
             }
@@ -531,11 +543,46 @@ function Get-BridgeFormPayloads {
         }
 
         $options = @($Fields[$i].Options | ForEach-Object { [string]$_ })
+
+        # A multi-select field is a checkbox list, not a cursor. Its options are
+        # numbered on screen and typing a number toggles that one, wherever the cursor
+        # happens to be - which is both simpler and safer than counting Down presses.
+        # Then Down once per row (the options plus the "Type something" row) lands on
+        # Submit, and the caller's Enter presses it.
+        #
+        # Verified live against Claude Code 2.1.273 on two- and three-option questions:
+        # "2" then "3" checked exactly Billing and Search, four Downs highlighted
+        # Submit, and Claude recorded "Billing, Search". Tab was tried as a way to
+        # reach Submit without counting - the decompiled handler ignores it once Submit
+        # has focus - but overshooting with Tab tore the prompt down, so the count is
+        # exact and deliberate.
+        if (Test-DecisionFieldIsMultiSelect -Field $Fields[$i]) {
+            $picked = @(Resolve-DecisionMultiSelectChoice -Field $Fields[$i] -Choice ([string]$Selections[$i]))
+            if ($picked.Count -eq 0) { throw "combination '$($Selections[$i])' not found in field $i" }
+            $keys = New-Object System.Collections.Generic.List[string]
+            foreach ($option in $picked) {
+                $at = [Array]::IndexOf($options, [string]$option)
+                # Only the first nine rows have a number to type.
+                if ($at -lt 0 -or $at -ge 9) { throw "option '$option' is not typeable in field $i" }
+                $keys.Add([string]($at + 1))
+            }
+            $keys.Add((($esc + '[B') * ($options.Count + 1)))
+            [pscustomobject]@{
+                Payload = ($keys -join '')
+                Keys    = $keys.ToArray()
+                IsText  = $false
+                Index   = -1
+            }
+            continue
+        }
+
         $idx = [Array]::IndexOf($options, [string]$Selections[$i])
         if ($idx -lt 0) { throw "option '$($Selections[$i])' not found in field $i" }
 
+        $arrows = ($esc + '[B') * $idx
         [pscustomobject]@{
-            Payload = ($esc + '[B') * $idx
+            Payload = $arrows
+            Keys    = @($arrows)
             IsText  = $false
             Index   = $idx
         }
@@ -633,8 +680,21 @@ function Send-CopilotSessionForm {
         # reply, which is the delivery path with a long record of working.
         $outcome = 'ok:form'
         for ($i = 0; $i -lt $steps.Count; $i++) {
-            $r = Invoke-BridgeConsoleSend -ProcessId $processId -Text $steps[$i].Payload -Submit $true -DelayMs $StepDelayMs
-            if (-not $r.StartsWith('ok')) { $outcome = "field${i}:$r"; break }
+            # A multi-select field needs each toggle in its own attach-write-detach.
+            # Delivered as one write - the digits and the walk to Submit together -
+            # the toggles were silently dropped and the prompt reached its review
+            # screen saying "You have not answered all questions", which is the same
+            # way the arrows behaved when a whole form was delivered in one attach.
+            # Only the last write carries the committing Enter.
+            $keys = @($steps[$i].Keys)
+            $failed = $false
+            for ($k = 0; $k -lt $keys.Count; $k++) {
+                $isLast = ($k -eq ($keys.Count - 1))
+                $r = Invoke-BridgeConsoleSend -ProcessId $processId -Text $keys[$k] -Submit $isLast -DelayMs $StepDelayMs
+                if (-not $r.StartsWith('ok')) { $outcome = "field${i}:$r"; $failed = $true; break }
+                if (-not $isLast) { Start-Sleep -Milliseconds $script:BridgeFormKeyGapMs }
+            }
+            if ($failed) { break }
             Start-Sleep -Milliseconds ($StepDelayMs * 2)
         }
 

@@ -157,7 +157,19 @@ function Invoke-ClaudeAskHook {
     # by index. A multi-select question, or one with more questions than the card has
     # dropdowns for, cannot be driven by keystroke and is left to the terminal.
     $markerFields = @($parsed.MarkerFields)
-    $terminalOnly = [bool]$parsed.MultiSelect -or ($mode -eq 'multiple_choice' -and $markerFields.Count -eq 0)
+    # A multi-select question is answerable from the card as the list of combinations
+    # its options make (Get-DecisionMultiSelectChoices), and delivered by typing each
+    # chosen option's number at the prompt. Only one that makes more combinations than
+    # a dropdown can list is left to the terminal.
+    $terminalOnly = ($mode -eq 'multiple_choice' -and $markerFields.Count -eq 0)
+    $tooManyCombinations = $false
+    foreach ($markerField in $markerFields) {
+        if ((Test-DecisionFieldIsMultiSelect -Field $markerField) -and
+            @(Get-DecisionMultiSelectChoices -Field $markerField).Count -eq 0) {
+            $tooManyCombinations = $true
+        }
+    }
+    if ($tooManyCombinations) { $terminalOnly = $true }
     $toolUseId = if ($HookEvent.PSObject.Properties['tool_use_id']) { [string]$HookEvent.tool_use_id } else { '' }
 
     # A prompt the daemon refuses to drive must offer no control that pretends to
@@ -169,10 +181,18 @@ function Invoke-ClaudeAskHook {
     # shows what is being asked, and nothing on it claims to be able to answer.
     $asked = "choices=$($choices.Count) fields=$($fields.Count)"
     if ($terminalOnly) {
-        $question = Add-ClaudeTerminalOnlyNotice -Question $question -Fields $markerFields
+        $reason = if ($tooManyCombinations) { 'it offers more combinations than the dashboard can list' } else { '' }
+        $question = Add-ClaudeTerminalOnlyNotice -Question $question -Fields $markerFields -Reason $reason
         $choices = @()
         $fields = @()
         $markerFields = @()
+    }
+    elseif ($choices.Count -gt 0 -and $markerFields.Count -eq 1 -and
+            (Test-DecisionFieldIsMultiSelect -Field $markerFields[0])) {
+        # One multi-select question shows a single dropdown, so its combinations go on
+        # that dropdown rather than the bare options - picking one option there would
+        # quietly answer a "choose any" question with exactly one.
+        $choices = @(Get-DecisionMultiSelectChoices -Field $markerFields[0])
     }
 
     Write-CopilotDecisionMarker -SessionId $sessionId -DecisionId $decisionId `
