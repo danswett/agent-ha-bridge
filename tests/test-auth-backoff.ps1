@@ -47,6 +47,8 @@ function Invoke-RestMethod {
     'ok'
 }
 function Start-Sleep { param($Milliseconds, $Seconds) }
+$script:AuthNow = [DateTimeOffset]'2026-01-01T00:00:00-08:00'
+function Get-BridgeAuthTime { $script:AuthNow }
 
 $script:Failures = 0
 function Test-That {
@@ -72,6 +74,7 @@ function Reset-Backoff {
     $script:BridgeAuthBackoffStep = -1
     $script:Attempts = 0
     $script:ThrowThis = $null
+    $script:AuthNow = [DateTimeOffset]'2026-01-01T00:00:00-08:00'
 }
 
 function Invoke-Call {
@@ -108,12 +111,31 @@ try {
     for ($i = 0; $i -lt 4; $i++) {
         $seen += (Get-BridgeAuthBackoffSeconds)
         # Let the window lapse, as it would with time passing, and be rejected again.
-        $script:BridgeAuthBackoffUntil = [DateTimeOffset]::Now.AddSeconds(-1)
+        $script:AuthNow = $script:BridgeAuthBackoffUntil.AddSeconds(1)
         $null = Invoke-Call
     }
     Test-That 'it grows 60 -> 300 -> 900' { ($seen[0] -eq 60) -and ($seen[1] -eq 300) -and ($seen[2] -eq 900) } `
         ($seen -join ', ')
     Test-That 'and then stops growing' { $seen[3] -eq 900 } ($seen -join ', ')
+
+    Write-Host "`n--- the hold-off expires at its deadline, rounding up before it ---"
+    Reset-Backoff
+    $script:ThrowThis = New-HttpError -Status 401
+    $null = Invoke-Call
+    $script:AuthNow = $script:AuthNow.AddSeconds(59)
+    Test-That 'after 59 seconds there is one second left' { (Get-BridgeAuthBackoffSeconds) -eq 1 }
+    $script:AuthNow = $script:AuthNow.AddMilliseconds(999)
+    Test-That 'a fractional second still prevents a request' {
+        (Get-BridgeAuthBackoffSeconds) -eq 1 -and (Invoke-Call).Threw -and $script:Attempts -eq 1
+    }
+    $script:AuthNow = $script:AuthNow.AddMilliseconds(1)
+    Test-That 'at exactly 60 seconds the window is cleared' {
+        (Get-BridgeAuthBackoffSeconds) -eq 0 -and $null -eq $script:BridgeAuthBackoffUntil
+    }
+    $null = Invoke-Call
+    Test-That 'the next rejection is sent once and starts the five-minute window' {
+        $script:Attempts -eq 2 -and (Get-BridgeAuthBackoffSeconds) -eq 300
+    }
 
     Write-Host "`n--- a burst does not multiply the hold-off ---"
     # Six calls a cycle used to arrive together. Each one pushing the window out again,
@@ -122,7 +144,7 @@ try {
     $script:ThrowThis = New-HttpError -Status 401
     $null = Invoke-Call
     1..6 | ForEach-Object { $null = Invoke-Call }
-    Test-That 'the window is still the first step' { (Get-BridgeAuthBackoffSeconds) -le 60 } `
+    Test-That 'the window is still the first step' { (Get-BridgeAuthBackoffSeconds) -eq 60 } `
         "$(Get-BridgeAuthBackoffSeconds)s"
     Test-That 'and only the first was written down' {
         @(Get-Content -LiteralPath $script:LogFile | Where-Object { $_ -match 'Holding off' }).Count -ge 1
@@ -133,7 +155,7 @@ try {
     $script:ThrowThis = New-HttpError -Status 401
     $null = Invoke-Call
     Test-That 'holding off after a rejection' { (Get-BridgeAuthBackoffSeconds) -gt 0 }
-    $script:BridgeAuthBackoffUntil = [DateTimeOffset]::Now.AddSeconds(-1)
+    $script:AuthNow = $script:BridgeAuthBackoffUntil.AddSeconds(1)
     $script:ThrowThis = $null
     $ok = Invoke-Call
     Test-That 'a call that works goes through' { -not $ok.Threw }
@@ -141,7 +163,7 @@ try {
     Test-That 'and starts again from a minute, not from where it left off' {
         $script:ThrowThis = New-HttpError -Status 401
         $null = Invoke-Call
-        (Get-BridgeAuthBackoffSeconds) -le 60
+        (Get-BridgeAuthBackoffSeconds) -eq 60
     }
 
     Write-Host "`n--- a ban is named as a ban ---"

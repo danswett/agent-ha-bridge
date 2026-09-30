@@ -122,8 +122,15 @@ Test-That 'the labels cover nothing that is not a known client' {
 }
 
 Write-Host '--- Test-BridgeClientInstalled returns a bool for each client ---'
-foreach ($c in @('copilot', 'claude', 'codex', 'mcp')) {
-    Test-That "$c detection does not throw" { (Test-BridgeClientInstalled $c) -is [bool] }
+$realCommandProbe = (Get-Command Test-BridgeCommandRuns).ScriptBlock
+function Test-BridgeCommandRuns { param($Executable, $Arguments) $false }
+try {
+    foreach ($c in @('copilot', 'claude', 'codex', 'mcp')) {
+        Test-That "$c detection does not throw" { (Test-BridgeClientInstalled $c) -is [bool] }
+    }
+}
+finally {
+    Set-Item -LiteralPath function:Test-BridgeCommandRuns -Value $realCommandProbe
 }
 
 Write-Host '--- Protect-BridgeSecretFile locks a token file to the current user ---'

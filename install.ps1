@@ -57,6 +57,10 @@
 .PARAMETER SkipPath
     Do not put the `agent-ha-bridge` command on your PATH.
 
+.PARAMETER TestRegistryId
+    Unique registry namespace for disposable installer tests. Requires -TargetHome;
+    it does not isolate other machine-wide effects.
+
 .PARAMETER NonInteractive
     Never prompt. Without this, the installer discovers Home Assistant on the network
     and asks for anything it still needs.
@@ -85,10 +89,13 @@ param(
     [switch]$SkipDependencies,
     [switch]$SkipPath,
     [switch]$NonInteractive,
-    [switch]$SkipTask
+    [switch]$SkipTask,
+    [ValidatePattern('^[a-f0-9]{32}$')][string]$TestRegistryId
 )
 
 $ErrorActionPreference = 'Stop'
+if ($TestRegistryId -and -not $TargetHome) { throw '-TestRegistryId requires -TargetHome.' }
+$testRegistrySuffix = if ($TestRegistryId) { "_$TestRegistryId" } else { '' }
 
 $repoRoot = $PSScriptRoot
 # Windows/macOS differences, before any path is built: on macOS it also makes
@@ -136,7 +143,7 @@ $launchAgentLabel = 'com.agent-ha-bridge.daemon'
 $launchAgentPath = Join-Path $installHome "Library/LaunchAgents/$launchAgentLabel.plist"
 # A sandbox install must not collide with the real Add/Remove Programs entry.
 $arpKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\AgentHaBridge' +
-          $(if ($TargetHome) { '_Sandbox' } else { '' })
+          $(if ($TargetHome) { "_Sandbox$testRegistrySuffix" } else { '' })
 
 # Pre-rename locations, still cleaned up on upgrade.
 $legacySkillDir = Join-Path $copilotHome 'skills\decision-notifier'
@@ -145,7 +152,7 @@ $legacyConfigPath = Join-Path $copilotHome 'copilot-ha-bridge.config.json'
 $legacyBridgeHome = Join-Path $copilotHome 'copilot-ha-bridge'
 $legacyTaskName = 'CopilotBridgeDaemon'
 $legacyArpKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CopilotHaBridge' +
-                $(if ($TargetHome) { '_Sandbox' } else { '' })
+                $(if ($TargetHome) { "_Sandbox$testRegistrySuffix" } else { '' })
 
 function Write-Step { param([string]$Message) Write-Host "==> $Message" -ForegroundColor Cyan }
 
@@ -2668,6 +2675,7 @@ Write-Step 'Registering in Apps & features'
 # keeps the machine-wide cleanup (scheduled task, daemon processes) enabled.
 $uninstallArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$uninstallScript`" -ClearEntities"
 if ($TargetHome) { $uninstallArgs += " -TargetHome `"$installHome`"" }
+if ($TestRegistryId) { $uninstallArgs += " -TestRegistryId $TestRegistryId" }
 
 New-Item -Path $arpKey -Force | Out-Null
 $arpValues = @{

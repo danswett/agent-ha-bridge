@@ -25,6 +25,13 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '..\hooks\decision-bridge-common.ps1')
 . (Join-Path $PSScriptRoot '..\claude\hooks\claude-session.ps1')
 
+$script:Requests = [Collections.Generic.List[object]]::new()
+function Invoke-RestMethod {
+    param($Uri, $Method, $Headers, $TimeoutSec)
+    $script:Requests.Add([pscustomobject]@{ Uri = $Uri; TimeoutSec = $TimeoutSec })
+    throw [Net.WebException]::new('Unable to connect to the remote server')
+}
+
 $script:Failures = 0
 function Test-That {
     param([string]$Name, [scriptblock]$Condition, [string]$Detail = '')
@@ -80,8 +87,7 @@ Set-DecisionBridgeDeadline -Seconds 1
 Start-Sleep -Milliseconds 1200
 $elapsed = Measure-Command {
     try {
-        # An address that black-holes traffic: without the budget this would retry
-        # for tens of seconds.
+        # The transport is a stub; the budget, not an HTTP guard refusal, must stop it.
         Invoke-DecisionHttpRequest -Parameters @{
             Method = 'Get'; Uri = 'http://192.0.2.99:8123/api/'; TimeoutSec = 30
         }
@@ -89,6 +95,7 @@ $elapsed = Measure-Command {
     catch { }
 }
 Test-That 'a spent budget fails immediately' { $elapsed.TotalSeconds -lt 2 } "$([math]::Round($elapsed.TotalSeconds,2))s"
+Test-That 'a spent budget never reaches the sender' { $script:Requests.Count -eq 0 }
 
 Write-Host '--- a live budget is not exceeded ---'
 Set-DecisionBridgeDeadline -Seconds 3
@@ -103,14 +110,16 @@ $elapsed = Measure-Command {
 Test-That 'a 3s budget is respected despite a 30s request timeout' {
     $elapsed.TotalSeconds -lt 6
 } "$([math]::Round($elapsed.TotalSeconds,2))s"
+Test-That 'the sender actually ran with a timeout clamped to the budget' {
+    $script:Requests.Count -gt 0 -and @($script:Requests | Where-Object { $_.TimeoutSec -gt 3 }).Count -eq 0
+}
 Set-DecisionBridgeDeadline -Seconds 0
 
 Write-Host '--- reachability probe ---'
+$script:Requests.Clear()
 Test-That 'an unreachable host is detected quickly' {
-    $sw = [Diagnostics.Stopwatch]::StartNew()
     $result = Test-HomeAssistantReachable -TimeoutSec 2
-    $sw.Stop()
-    (-not $result) -or $sw.Elapsed.TotalSeconds -lt 4
+    -not $result -and $script:Requests.Count -eq 1 -and $script:Requests[0].TimeoutSec -eq 2
 }
 
 # A recent contact vouches for Home Assistant, so a hook skips the probe - about
@@ -120,16 +129,18 @@ $savedBase = $script:DecisionBridgeConfig.HomeAssistantBaseUrl
 $env:TEMP = Join-Path ([IO.Path]::GetTempPath()) "bridge-reach-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
 New-Item -ItemType Directory -Path $env:TEMP -Force | Out-Null
 try {
-    # Nothing listens here, so a real probe fails.
+    # Only the stub sees this synthetic address.
     $script:DecisionBridgeConfig.HomeAssistantBaseUrl = 'http://127.0.0.1:9'
+    $script:Requests.Clear()
     Test-That 'with no recent contact, the probe runs (and fails here)' { -not (Test-HomeAssistantReachable -TimeoutSec 1) }
     Set-BridgeHomeAssistantReachable
     Test-That 'a contact just now answers without probing' {
-        $sw = [Diagnostics.Stopwatch]::StartNew(); $ok = Test-HomeAssistantReachable -TimeoutSec 1
-        $ok -and $sw.ElapsedMilliseconds -lt 200
+        (Test-HomeAssistantReachable -TimeoutSec 1) -and $script:Requests.Count -eq 1
     }
     [IO.File]::SetLastWriteTimeUtc((Get-BridgeReachableMarker), [DateTime]::UtcNow.AddSeconds(-60))
-    Test-That 'a stale one probes again' { -not (Test-HomeAssistantReachable -TimeoutSec 1) }
+    Test-That 'a stale one probes again' {
+        -not (Test-HomeAssistantReachable -TimeoutSec 1) -and $script:Requests.Count -eq 2
+    }
 }
 finally {
     Remove-Item -LiteralPath $env:TEMP -Recurse -Force -ErrorAction SilentlyContinue
@@ -150,8 +161,7 @@ try {
         } | ConvertTo-Json | Set-Content (Join-Path $root "$id.json") -Encoding UTF8
     }
     $before = @(Get-ChildItem -LiteralPath $root -Filter '*.json' -File).Count
-    # Only the entries seeded here: the registry is the real one, and a Claude session
-    # running on this machine - including the one running these tests - is live in it.
+    # The runner gives this suite its own registration directory.
     $live = @(Get-ClaudeSessionRegistrations | Where-Object { $seeded -contains $_.SessionId })
     $after = @(Get-ChildItem -LiteralPath $root -Filter '*.json' -File).Count
 

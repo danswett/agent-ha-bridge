@@ -24,6 +24,7 @@ function Invoke-CopilotHaWebSocket {
         '/api/websocket'
     )
 
+    Assert-BridgeHttpAllowed -Uri $wsUri -WebSocket
     $socket = [Net.WebSockets.ClientWebSocket]::new()
     $cancel = [Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds($TimeoutSeconds))
     $results = @()
@@ -154,6 +155,7 @@ function Wait-CopilotHaStateChange {
         '/api/websocket'
     )
 
+    Assert-BridgeHttpAllowed -Uri $wsUri -WebSocket
     $socket = [Net.WebSockets.ClientWebSocket]::new()
     $cancel = [Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds($TimeoutSeconds + 15))
     $deadline = [DateTimeOffset]::Now.AddSeconds($TimeoutSeconds)
@@ -2093,5 +2095,4 @@ function Set-CopilotMqttEntityIds {
 
     $targets
 }
-
 

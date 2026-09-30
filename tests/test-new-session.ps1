@@ -197,10 +197,14 @@ if ($script:BridgeIsWindows) {
 else {
     Test-That '/System is a system folder' { Test-BridgeSystemDirectory -Path '/System/Library' }
     Test-That '/usr is a system folder' { Test-BridgeSystemDirectory -Path '/usr/local/bin' }
+    Test-That 'an isolated home under /var is still a system folder' { Test-BridgeSystemDirectory -Path '/var/folders/bridge-test/home/repos/project' }
+    Test-That 'an isolated home under /private is still a system folder' { Test-BridgeSystemDirectory -Path '/private/var/folders/bridge-test/home/repos/project' }
     Test-That 'the root is a system folder' { Test-BridgeSystemDirectory -Path '/' }
     Test-That 'a sibling that only shares a prefix is not' { -not (Test-BridgeSystemDirectory -Path '/Users/someone/usrstuff') }
 }
-Test-That 'a project under the home folder is not' { -not (Test-BridgeSystemDirectory -Path (Join-Path $HOME 'repos\project')) }
+# The runner's macOS HOME lives under excluded /var, not a normal user-home root.
+$userHomeFixture = if ($script:BridgeIsWindows) { 'C:\Users\bridge-test' } else { '/Users/bridge-test' }
+Test-That 'a project under a user home folder is not' { -not (Test-BridgeSystemDirectory -Path (Join-Path $userHomeFixture 'repos\project')) }
 
 Write-Host ''
 Write-Host '--- defaults, so a launch needs no input ---'

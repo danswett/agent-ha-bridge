@@ -95,11 +95,17 @@ Knowing a session has stopped, and why, works regardless.
 ## Tests
 
 ```powershell
-.\tests\test-claude-ask-parser.ps1     # AskUserQuestion parsing; no Claude or HA needed
-.\tests\test-claude-transcript.ps1     # transcript reducer and tailing reader
-.\tests\test-claude-integration.ps1    # drives the hooks against a real Home Assistant
-.\tests\verify-askuserquestion.ps1     # live AskUserQuestion check, when the tool exists
+pwsh -NoProfile -File ..\tests\run-tests.ps1 -Suite test-claude-ask-parser.ps1
+pwsh -NoProfile -File ..\tests\run-tests.ps1 -Suite test-claude-transcript.ps1
+pwsh -NoProfile -File ..\tests\run-tests.ps1 -Suite test-claude-install.ps1
 ```
+
+Run these from `claude/`, through the shared runner so their home/config/client roots
+and temporary state are private. See the root README for prerequisites and groups.
+`test-claude-integration.ps1` is not an offline suite: it requires an explicitly
+configured disposable Home Assistant and `BRIDGE_ALLOW_TEST_HTTP=1` outside the
+runner. `verify-askuserquestion.ps1` drives a real client and is a separately arranged
+manual check, never part of the offline selection.
 
 The fixtures in `fixtures/` mirror shapes taken from the shipping tool, including
 `transcript-real-shape.jsonl`, whose envelope and noise entry types
