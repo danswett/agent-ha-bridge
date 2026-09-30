@@ -99,6 +99,14 @@ question cannot inherit an earlier question's answer. The hook alone is not evid
 that the native prompt is ready; delivery waits for the matching transcript entry.
 Older events without enough request identity are explicitly terminal-only.
 
+**Current Copilot compatibility gate:** the documented
+[PreToolUse input](https://github.com/github/copilot-sdk/blob/4dc774c91aff609c338563aadc699d5c2dc596f7/docs/hooks/pre-tool-use.md#input)
+does not expose a native `toolCallId`. This implementation therefore makes that
+current payload terminal-only, not just older clients. Synthetic fixtures that add a
+native ID test internal correlation but do not establish current dashboard-answer
+compatibility. A verified compatible input contract or explicit approval of this
+functional reduction is required before integration or release.
+
 Field identities and full option labels are retained. Labels that collide, exceed a
 selector's limit or conflict with its control labels are not clipped into actionable
 choices; the card instead directs the user to the terminal. The shared Copilot schema

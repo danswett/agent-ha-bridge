@@ -128,7 +128,9 @@ try {
         $null -eq (Get-CodexApprovalMarker -SessionId $sid)
     }
 
-    Test-That 'Copilot persists the exact request before an outage can return' {
+    # Native-ID-bearing Copilot events below are synthetic contract tests, not proof
+    # that the current documented PreToolUse input exposes such an ID.
+    Test-That 'a synthetic identified Copilot request is persisted before an outage' {
         & {
             Set-StrictMode -Off
             Invoke-CopilotAskUserHook -HookEvent ([pscustomobject]@{
@@ -144,13 +146,13 @@ try {
         function Enter-BridgeAdapterSession { throw 'Synthetic outage.' }
         try {
             Invoke-CopilotAskUserHook -HookEvent ([pscustomobject]@{
-                sessionId = $sid; cwd = $root; tool_use_id = 'legacy-envelope-id'
-                tool_input = '{"question":"Legacy shape","choices":["No","Not now"]}'
+                sessionId = $sid; cwd = $root; tool_use_id = 'synthetic-alias-id'
+                tool_input = '{"question":"Alias shape","choices":["No","Not now"]}'
             })
         }
         catch { }
         $marker = Get-CopilotDecisionMarker -SessionId $sid
-        $marker.toolCallId -ceq 'legacy-envelope-id' -and -not $marker.terminalOnly
+        $marker.toolCallId -ceq 'synthetic-alias-id' -and -not $marker.terminalOnly
     }
     Test-That 'same-timestamp requests get different generations' {
         $event = [pscustomobject]@{ sessionId = $sid; cwd = $root; timestamp = 1; toolCallId = 'one'; toolArgs = '{"question":"Pick","choices":["A","B"]}' }
@@ -186,10 +188,25 @@ try {
         $saved = Get-CodexApprovalMarker -SessionId $sid
         $saved.DecisionId -ceq 'codex-replay' -and $saved.DeliveryAttempted
     }
-    Test-That 'an older envelope without identity is informative but cannot authorize input' {
-        Invoke-CopilotAskUserHook -HookEvent ([pscustomobject]@{ sessionId = $sid; cwd = $root; toolArgs = '{"question":"Pick","choices":["A","B"]}' })
+    Test-That 'the documented current Copilot payload is terminal-only without native identity' {
+        # github/copilot-sdk 4dc774c91aff609c338563aadc699d5c2dc596f7:
+        # docs/hooks/pre-tool-use.md lists no native toolCallId.
+        Invoke-CopilotAskUserHook -HookEvent ([pscustomobject]@{
+            sessionId = $sid; timestamp = [DateTimeOffset]::Now.ToUnixTimeMilliseconds()
+            cwd = $root; toolName = 'ask_user'
+            toolArgs = [pscustomobject]@{
+                message = 'Pick'
+                requestedSchema = [pscustomobject]@{
+                    type = 'object'
+                    properties = [pscustomobject]@{ answer = [pscustomobject]@{ type = 'string'; enum = @('A','B') } }
+                }
+            }
+        })
         $marker = Get-CopilotDecisionMarker -SessionId $sid
-        $marker.terminalOnly -and $marker.question -match 'did not identify'
+        $script:NativeCalls = 0
+        Invoke-PendingDecisions -Headers $headers -State $state -Live $script:DaemonLive
+        $marker.terminalOnly -and $marker.toolCallId -ceq '' -and
+        $marker.question -match 'did not identify' -and $script:NativeCalls -eq 0
     }
 
     $transcript = Join-Path $root 'events.jsonl'
