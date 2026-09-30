@@ -206,19 +206,38 @@ Test-That 'Claude alone confirms input from its transcript' {
 }
 
 $script:Approved = @()
-function Get-CodexApprovalMarker { param($SessionId) [pscustomobject]@{ id = $SessionId } }
-function Get-HomeAssistantState { param($EntityId, $Headers) [pscustomobject]@{ state = 'Approve' } }
+. (Join-Path $PSScriptRoot '..\codex\hooks\codex-session.ps1')
+function Get-HomeAssistantState { param($EntityId, $Headers) $script:ApprovalCard }
 function Send-CopilotSessionPrompt { param($SessionId, $Text, $ProcessId) $script:Approved += "${SessionId}:$Text"; [pscustomobject]@{ Delivered = $true; ProcessId = $ProcessId; Detail = '' } }
 function Clear-CopilotMqttDecision { param($SessionId, $SessionName, $Machine, $Headers) }
+function Set-DaemonTransientActivity { param($SessionId, $Summary, $Extra, $Headers) }
 $cx = '44444444-0000-4000-8000-000000000004'; $cl = '55555555-0000-4000-8000-000000000005'
-$approvalLive = @{ $cx = [pscustomobject]@{ Kind = 'codex'; ProcessId = 9 }; $cl = [pscustomobject]@{ Kind = 'claude'; ProcessId = 8 } }
+$approvalLive = @{ $cx = [pscustomobject]@{ Kind = 'codex'; ProcessId = 9; Status = 'waiting' }; $cl = [pscustomobject]@{ Kind = 'claude'; ProcessId = 8 } }
 $approvalState = @{ $cx = [pscustomobject]@{ Name = 'Codex: x'; Machine = 'M' }; $cl = [pscustomobject]@{ Name = 'Claude: y'; Machine = 'M' } }
+Write-CodexApprovalMarker -SessionId $cx -DecisionId 'approval-generation' -ToolCallId 'native-approval' -ToolName 'shell' -Question 'Synthetic approval'
+$approvalMarker = Get-CodexApprovalMarker -SessionId $cx
+$script:ApprovalCard = [pscustomobject]@{
+    state = 'Approve'
+    last_changed = (ConvertTo-DecisionInstant -Value $approvalMarker.Created).AddMilliseconds(1).ToString('o')
+    attributes = [pscustomobject]@{ decision_id = $approvalMarker.DecisionId; question = $approvalMarker.Question }
+}
 $script:CodexAdapterLoaded = $true
 Invoke-PendingCodexApprovals -Headers @{} -State $approvalState -Live $approvalLive
 Test-That 'a Codex approval is answered, and nothing is typed into Claude' { ($script:Approved -join ',') -eq "${cx}:y" }
+Test-That 'the identified generation records its one-shot delivery attempt' { (Get-CodexApprovalMarker -SessionId $cx).DeliveryAttempted }
+$script:Approved = @()
+Write-CodexApprovalMarker -SessionId $cx -DecisionId 'unidentified-generation' -Question 'Unidentified synthetic approval'
+$approvalMarker = Get-CodexApprovalMarker -SessionId $cx
+$script:ApprovalCard.attributes.decision_id = $approvalMarker.DecisionId
+$script:ApprovalCard.last_changed = (ConvertTo-DecisionInstant -Value $approvalMarker.Created).AddMilliseconds(1).ToString('o')
+Invoke-PendingCodexApprovals -Headers @{} -State $approvalState -Live $approvalLive
+Test-That 'a current card without native approval identity cannot authorize input' {
+    $script:Approved.Count -eq 0 -and -not (Get-CodexApprovalMarker -SessionId $cx).DeliveryAttempted
+}
 $script:Approved = @(); $script:CodexAdapterLoaded = $false
 Invoke-PendingCodexApprovals -Headers @{} -State $approvalState -Live $approvalLive
 Test-That 'without the Codex adapter, no approval is read' { $script:Approved.Count -eq 0 }
+[void](Remove-CodexApprovalMarker -SessionId $cx)
 
 Write-Host '--- a reply finds its process ---'
 $script:Sent = $null

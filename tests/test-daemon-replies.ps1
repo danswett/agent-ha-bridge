@@ -35,17 +35,40 @@ $session = [pscustomobject]@{ SessionId = $sid }
 $state = @{ $sid = [pscustomobject]@{ Name = 'Claude: x'; Machine = 'M' } }
 
 $script:Ha = @{}
+$script:HaReads = 0
+$script:MarkerOnRead = $null
+$script:ApprovalOnRead = $null
+$script:ApprovalReadError = $false
+$script:MarkerReadError = $false
+$script:MarkerOnTranscriptRead = $null
+$script:MarkerOnClear = $null
 function Get-HomeAssistantState {
     param([string]$EntityId, [hashtable]$Headers)
+    $script:HaReads++
+    if ($null -ne $script:MarkerOnRead) { $script:Marker = $script:MarkerOnRead }
+    if ($null -ne $script:ApprovalOnRead) { $script:ApprovalMarker = $script:ApprovalOnRead }
     if (-not $script:Ha.ContainsKey($EntityId)) { throw "404 $EntityId" }
     $script:Ha[$EntityId]
 }
 $script:Marker = $null
 $script:Pending = $true
 $script:Cleared = 0
-function Get-CopilotDecisionMarker { param($SessionId) $script:Marker }
-function Get-DaemonAskUserState { param($Session, $Marker) [pscustomobject]@{ Pending = $script:Pending } }
-function Clear-CopilotMqttDecision { param($SessionId, $SessionName, $Machine, $Headers) $script:Cleared++; 'emitted' }
+function Get-CopilotDecisionMarker {
+    param($SessionId)
+    if ($script:MarkerReadError) { throw 'Synthetic local marker read failure.' }
+    $script:Marker
+}
+function Get-DaemonAskUserState {
+    param($Session, $Marker)
+    if ($null -ne $script:MarkerOnTranscriptRead) { $script:Marker = $script:MarkerOnTranscriptRead }
+    [pscustomobject]@{ Pending = $script:Pending }
+}
+function Clear-CopilotMqttDecision {
+    param($SessionId, $SessionName, $Machine, $Headers)
+    $script:Cleared++
+    if ($null -ne $script:MarkerOnClear) { $script:Marker = $script:MarkerOnClear }
+    'emitted'
+}
 function Write-DaemonLog { param([string]$Message) }
 function Set-DaemonTransientActivity { param($SessionId, $Summary, $Extra, $Headers) 'emitted' }
 
@@ -75,7 +98,16 @@ Write-Host '--- a Codex approval owns the card too ---'
 # rejected against an emptied option list: the prompt could only be answered in the
 # terminal.
 $script:ApprovalMarker = $null
-function Get-DaemonAgent { param($Kind) [pscustomobject]@{ ApprovalMarker = { param($id) $script:ApprovalMarker } } }
+function Get-DaemonAgent {
+    param($Kind)
+    [pscustomobject]@{
+        ApprovalMarker = {
+            param($id)
+            if ($script:ApprovalReadError) { throw 'Synthetic approval marker read failure.' }
+            $script:ApprovalMarker
+        }
+    }
+}
 $codexSession = [pscustomobject]@{ SessionId = $sid; Kind = 'codex' }
 $script:Ha = @{ "select.${node}_decision" =
     [pscustomobject]@{ state = 'Awaiting answer...'; attributes = [pscustomobject]@{ question = 'Approve agent-ha-bridge restart?' } } }
@@ -91,6 +123,88 @@ $script:ApprovalMarker = $null
 Test-That 'once the approval is gone the card is cleared as before' {
     ((Test-DaemonReplyBoxFree -SessionId $sid -Session $codexSession -State $state -Headers $headers) -eq $true) -and
         $script:Cleared -eq ($clearedBefore + 1)
+}
+
+Write-Host '--- local ownership cannot be bypassed by the remote card ---'
+foreach ($owner in @('decision', 'approval')) {
+    foreach ($cardShape in @('missing', 'empty', 'unavailable', 'stale')) {
+        $script:Marker = if ($owner -eq 'decision') { [pscustomobject]@{ decisionId = 'local-decision' } } else { $null }
+        $script:ApprovalMarker = if ($owner -eq 'approval') { [pscustomobject]@{ DecisionId = 'local-approval' } } else { $null }
+        $script:Ha = @{}
+        if ($cardShape -ne 'missing') {
+            $question = if ($cardShape -eq 'stale') { 'Previous question' } else { '' }
+            $remoteState = if ($cardShape -eq 'unavailable') { 'unavailable' } else { 'Idle' }
+            $script:Ha["select.${node}_decision"] = [pscustomobject]@{
+                state = $remoteState
+                attributes = [pscustomobject]@{ question = $question; decision_id = 'previous-generation' }
+            }
+        }
+        Test-That "a local $owner blocks continuation before reading a $cardShape card" {
+            $reads = $script:HaReads
+            $clears = $script:Cleared
+            $script:ContinuationCalls = 0
+            function Send-DaemonCardPayload { param($SessionId, $Entry, $Headers) $script:ContinuationCalls++; $true }
+            function Send-DaemonReplyBoxText { param($SessionId, $Entry, $Headers) $script:ContinuationCalls++ }
+            Invoke-PendingReplies -Headers $headers -State $state -Live @{ $sid = $codexSession }
+            $script:ContinuationCalls -eq 0 -and $script:HaReads -eq $reads -and $script:Cleared -eq $clears
+        }
+    }
+}
+$script:Marker = $null
+$script:ApprovalMarker = $null
+$script:Ha = @{ "select.${node}_decision" = [pscustomobject]@{ state = 'Idle'; attributes = [pscustomobject]@{ question = '' } } }
+$script:MarkerReadError = $true
+Test-That 'an unreadable local owner does not turn uncertainty into continuation' {
+    -not (Test-DaemonReplyBoxFree -SessionId $sid -Session $codexSession -State $state -Headers $headers)
+}
+$script:MarkerReadError = $false
+$script:ApprovalReadError = $true
+Test-That 'an unreadable local approval owner also refuses continuation' {
+    -not (Test-DaemonReplyBoxFree -SessionId $sid -Session $codexSession -State $state -Headers $headers)
+}
+$script:ApprovalReadError = $false
+$script:MarkerOnRead = [pscustomobject]@{ decisionId = 'arrived-during-card-read' }
+Test-That 'a decision created while the empty card is read still owns input' {
+    -not (Test-DaemonReplyBoxFree -SessionId $sid -Session $codexSession -State $state -Headers $headers)
+}
+$script:MarkerOnRead = $null
+$script:Marker = $null
+$script:ApprovalOnRead = [pscustomobject]@{ DecisionId = 'approval-during-card-read' }
+Test-That 'an approval created during a card read also owns input' {
+    -not (Test-DaemonReplyBoxFree -SessionId $sid -Session $codexSession -State $state -Headers $headers)
+}
+$script:ApprovalOnRead = $null
+$script:ApprovalMarker = $null
+$script:Ha["select.${node}_decision"].attributes.question = 'Old question'
+$script:MarkerOnTranscriptRead = [pscustomobject]@{ decisionId = 'arrived-during-transcript-read' }
+Test-That 'a newly pending decision is not cleared by stale-card cleanup' {
+    $clears = $script:Cleared
+    -not (Test-DaemonReplyBoxFree -SessionId $sid -Session $codexSession -State $state -Headers $headers) -and
+        $script:Cleared -eq $clears
+}
+$script:MarkerOnTranscriptRead = $null
+$script:Marker = $null
+$script:MarkerOnClear = [pscustomobject]@{ decisionId = 'arrived-during-clear' }
+Test-That 'a local decision created during cleanup still blocks continuation' {
+    -not (Test-DaemonReplyBoxFree -SessionId $sid -Session $codexSession -State $state -Headers $headers)
+}
+$script:MarkerOnClear = $null
+$script:Marker = $null
+Test-That 'revoked local owners leave ordinary continuations available' {
+    $script:Ha = @{}
+    Test-DaemonReplyBoxFree -SessionId $sid -Session $codexSession -State $state -Headers $headers
+}
+Test-That 'ownership checks do not turn a safe-runner boundary violation into a free reply box' {
+    function Get-DaemonEntityState {
+        param($EntityId, $Headers)
+        $error = [InvalidOperationException]::new('Synthetic offline boundary.')
+        $error.Data['BridgeTestNetworkBlocked'] = $true
+        throw $error
+    }
+    $blocked = $false
+    try { $null = Test-DaemonReplyBoxFree -SessionId $sid -Session $codexSession -State $state -Headers $headers }
+    catch { $blocked = $_.Exception.Data['BridgeTestNetworkBlocked'] -eq $true }
+    $blocked
 }
 Remove-Item function:Get-DaemonAgent
 $script:Ha = @{}
