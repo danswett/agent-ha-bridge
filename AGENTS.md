@@ -156,6 +156,34 @@ Peers can be updated from Home Assistant without a shell on them: press that mac
 `button.agent_bridge_<slug>_install_update`. The press forces a fresh release check, so
 it works even when the machine's own cached check still reads as up to date.
 
+## Driving the bridge as an agent
+
+An agent can drive a session the same way the dashboard does - press **Launch**, answer
+a question, reply to a session on another machine - by calling Home Assistant directly.
+Do that with the *agent's* token, never yours:
+
+```powershell
+$headers = @{ Authorization = "Bearer $env:AGENT_HA_AGENT_TOKEN" }
+```
+
+Every session the bridge launches already carries that variable;
+`Get-BridgeAgentTokenEnvironment` puts it there for exactly this, so an agent that goes
+on to drive another session arrives as itself. `homeAssistant.token` is *yours*, and
+stays what the daemon, the hooks, the dashboard provisioning and the MCP server use.
+
+Getting it wrong fails silently, which is the whole problem. Both tokens authenticate
+and both are authorised, so nothing errors and no log line appears. The only difference
+is the `context.user_id` Home Assistant records against the press, which
+`Test-BridgeAgentUserId` matches against `homeAssistant.agentUserIds` to decide whether
+the session card gets its purple edge.
+
+On 2026-09-29 an agent took the first token it found in `config.json`, launched a
+session on another machine with it, and the card came back blue: a launch attributed to
+the user, with nothing anywhere saying otherwise. The token it should have used was
+already sitting in its own environment. Reading state is different - for a read
+`homeAssistant.token` is correct and simpler. The rule is about writes: a press, a
+reply, a launch.
+
 ## Style
 
 - Comments explain *why*, and especially what went wrong before. Most of the comments
