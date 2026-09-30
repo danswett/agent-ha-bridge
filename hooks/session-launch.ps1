@@ -1432,6 +1432,38 @@ function Get-BridgeAgencyProfileNames {
 $script:BridgeAgencyProfileCacheMinutes = 10
 $script:BridgeAgencyProfileCache = $null
 
+function Test-BridgeAgencyHasNoProfiles {
+    <#
+        Whether Agency answered, definitely, that this machine has none.
+
+        `config profiles` is recent. An Agency from before it - 2026.7.18.2, say -
+        answers with "unrecognized subcommand 'profiles'" and exit 2, which is
+        indistinguishable from being unable to ask at all. Falling back to the
+        configured list then offers profiles the machine does not have, and that is
+        precisely the failure discovery exists to prevent: `--profile-only work` exits
+        1 before Copilot starts, the window closes too fast to read, and all the
+        dashboard ever says is "closed before it started".
+
+        `config get` has been there throughout, and on a machine with no Agency config
+        at all it fails with "Key 'profiles' not found in config". That is an answer -
+        none - rather than a failure to ask. Offering no profile launches Agency's base
+        config, which always works.
+
+        Measured on DSWETT-DEV-VM1 on 2026-09-29: agency 2026.7.18.2, no config file
+        found anywhere, `config profiles` exit 2, `config get profiles` exit 1 with
+        that message, and every launch from the card dead on arrival.
+    #>
+    param($Probe)
+
+    if ($null -eq $Probe -or -not $Probe.Ran -or $Probe.TimedOut) { return $false }
+    if ($Probe.ExitCode -eq 0) { return $false }
+    $text = ''
+    # Output is stdout and stderr together; which stream carries it is Agency's
+    # business and has moved between versions.
+    if ($Probe.PSObject.Properties['Output']) { $text = [string]$Probe.Output }
+    [bool]($text -match "Key\s+.{0,2}profiles.{0,2}\s+not found")
+}
+
 function Get-BridgeAgencyProfileList {
     <#
         Which profiles Agency actually has here, as @{ Ok; Profiles }.
@@ -1483,6 +1515,22 @@ function Get-BridgeAgencyProfileList {
             $probe.PSObject.Properties['StandardOutput']) {
             $ok = $true
             $found = @(Get-BridgeAgencyProfileNames -Text ([string]$probe.StandardOutput))
+        }
+
+        # An Agency too old for `config profiles` is not the same as one that cannot be
+        # asked, and treating it as the latter is what left this machine offering three
+        # profiles it did not have. `config get` answers on every version.
+        if (-not $ok) {
+            $older = @{ Executable = $Path; Arguments = @('config', 'get', 'profiles'); TimeoutMs = 10000 }
+            if ($probeCommand -and $probeCommand.Parameters.ContainsKey('WorkingDirectory')) {
+                $older.WorkingDirectory = $HOME
+            }
+            $fallback = $null
+            try { $fallback = Invoke-BridgeCommandProbe @older } catch { }
+            if (Test-BridgeAgencyHasNoProfiles -Probe $fallback) {
+                $ok = $true
+                $found = @()
+            }
         }
     }
 
