@@ -419,6 +419,49 @@ Test-That 'nor is one too old to know the subcommand' {
     -not (& $script:RealAgencyProfileList -Path 'C:\agency.exe').Ok
 }
 
+# ...unless it can be asked a question it does understand. On DSWETT-DEV-VM1 - agency
+# 2026.7.18.2, no config file anywhere on the machine - `config profiles` failed with
+# "unrecognized subcommand", the card went on offering the three configured profiles,
+# and every launch died with "closed before it started" because none of them existed.
+# `config get` has been there throughout, and "Key 'profiles' not found" is an answer.
+$script:BridgeAgencyProfileCache = $null
+$script:SavedPerArgsProbe = ${function:Invoke-BridgeCommandProbe}
+function Invoke-BridgeCommandProbe {
+    param([string]$Executable, [string[]]$Arguments = @(), [int]$TimeoutMs = 5000, [string]$WorkingDirectory = '')
+    $script:ProbeCalls++
+    $script:ProbeArguments = @($Arguments)
+    if (($Arguments -join ' ') -eq 'config profiles') {
+        return [pscustomobject]@{
+            Ran = $true; TimedOut = $false; ExitCode = 2
+            Output = "error: unrecognized subcommand 'profiles'"; StandardOutput = ''
+        }
+    }
+    [pscustomobject]@{
+        Ran = $true; TimedOut = $false; ExitCode = 1
+        Output = "CLI command 'config' failed: Key 'profiles' not found in config"; StandardOutput = ''
+    }
+}
+$script:ProbeCalls = 0
+$script:OldAgencyAnswer = & $script:RealAgencyProfileList -Path 'C:\agency.exe'
+Test-That 'an older Agency is then asked something it does understand' {
+    $script:ProbeCalls -eq 2 -and ($script:ProbeArguments -join ' ') -eq 'config get profiles'
+}
+Test-That 'and "no profiles here" is an answer, not a failure to ask' {
+    $script:OldAgencyAnswer.Ok -and @($script:OldAgencyAnswer.Profiles).Count -eq 0
+}
+
+$script:BridgeAgencyProfileCache = $null
+function Invoke-BridgeCommandProbe {
+    param([string]$Executable, [string[]]$Arguments = @(), [int]$TimeoutMs = 5000, [string]$WorkingDirectory = '')
+    [pscustomobject]@{ Ran = $true; TimedOut = $false; ExitCode = 1; Output = 'connection refused'; StandardOutput = '' }
+}
+Test-That 'but a failure that says nothing about profiles still is not' {
+    -not (& $script:RealAgencyProfileList -Path 'C:\agency.exe').Ok
+}
+${function:Invoke-BridgeCommandProbe} = $script:SavedPerArgsProbe
+$script:BridgeAgencyProfileCache = $null
+$script:ProbeResult = [pscustomobject]@{ Ran = $true; TimedOut = $false; ExitCode = 2; Output = 'unrecognized subcommand'; StandardOutput = '' }
+
 # Each adapter ships its own copy of bridge-platform.ps1 and the daemon loads whichever
 # is installed, so a bridge running from a checkout against an older install can be
 # holding a probe from before this asked for stdout on its own. Losing the profiles
