@@ -667,6 +667,11 @@ would be, so the CLI shuts down the way it does at the keyboard: transcript writ
 MCP servers closed, lock released. Only a session still running after the grace period
 is terminated outright, because a killed CLI leaves a stale lock and half-written state.
 
+The status is `ending` while the stop runs, then `ended` when it succeeds or `error`
+when it fails. A failed stop keeps the failure detail on the card rather than looking
+like an idle session. If status publication fails, the daemon retains the local
+outcome and logs the publication failure.
+
 It is safe to press. The transcript survives either way, so an ended session stays in
 the **Resume** list and can be reopened — a mistaken press costs a window, not the work.
 

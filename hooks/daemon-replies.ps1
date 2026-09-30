@@ -334,9 +334,8 @@ function Invoke-PendingReplies {
 function Test-DaemonReplyBoxFree {
     <#
         Whether a session's reply box is free for a reply, rather than owned by a
-        question on its card. Reads the decision card once and decides who owns the
-        box; a question card left over from a question already answered is cleared,
-        which frees it.
+        local question or approval. Remote card state cannot override local ownership;
+        a card left over from an answered question is cleared only while unowned.
     #>
     param(
         [Parameter(Mandatory)][string]$SessionId,
@@ -346,42 +345,35 @@ function Test-DaemonReplyBoxFree {
     )
 
     $sessionId = $SessionId
-    $node = Get-CopilotMqttNodeId -SessionId $sessionId
-    $marker = Get-CopilotDecisionMarker -SessionId $sessionId
+    $ownsInput = {
+        try {
+            if ($null -ne (Get-CopilotDecisionMarker -SessionId $sessionId -RequireReadable)) { return $true }
+            $readApproval = (Get-DaemonAgent -Kind (Get-DaemonEntryKind -Entry $Session)).ApprovalMarker
+            if ($readApproval) { return $null -ne (& $readApproval $sessionId $true) }
+            $false
+        }
+        catch {
+            if ($_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+            Write-DaemonLog -Message "could not establish local input ownership for $sessionId : $($_.Exception.Message)"
+            $true
+        }
+    }
+    # An existing local owner takes precedence even when the card is empty or absent.
+    # Recheck around I/O because a hook can write a marker while the read is in flight.
+    if (& $ownsInput) { return $false }
 
+    $node = Get-CopilotMqttNodeId -SessionId $sessionId
     $armedQuestion = ''
     try {
         $decisionState = Get-DaemonEntityState -EntityId "select.${node}_decision" -Headers $Headers
         $armedQuestion = [string]$decisionState.attributes.question
     }
     catch {
-        # Unreadable decision state: treat the reply as a continuation, the common case.
+        if ($_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        Write-DaemonLog -Message "reply ownership card unavailable for $sessionId; rechecking local owners"
     }
+    if (& $ownsInput) { return $false }
     if ([string]::IsNullOrWhiteSpace($armedQuestion)) { return $true }
-
-    if ($null -ne $marker) {
-        # A live question owns the reply box - Invoke-PendingDecisions reads it as the
-        # free-text field of the form, and reports there if the form is incomplete.
-        # Nothing to do here.
-        return $false
-    }
-
-    # A Codex approval arms the same card through a different marker: its
-    # PermissionRequest hook, not ask_user. Only the ask_user marker was looked for
-    # here, so a live approval always fell through to the staleness check below, which
-    # asks the transcript about an ask_user that was never there, concluded the card
-    # was a leftover and tore it down. This runs for every live session on every
-    # reconcile, so an approval card was reset to Idle within seconds of appearing,
-    # every time: a choice made on the dashboard landed on a selector whose options had
-    # just been emptied and was rejected, and the prompt could only be answered in the
-    # terminal.
-    $approvalMarker = $null
-    try {
-        $readApproval = (Get-DaemonAgent -Kind ([string]$Session.Kind)).ApprovalMarker
-        if ($readApproval) { $approvalMarker = & $readApproval $sessionId }
-    }
-    catch { }
-    if ($null -ne $approvalMarker) { return $false }
 
     # Armed card with no marker behind it. Either the old blocking router is genuinely
     # waiting on it, or the question was already answered and the card was never torn
@@ -392,9 +384,12 @@ function Test-DaemonReplyBoxFree {
         $askState = Get-DaemonAskUserState -Session $Session
         $stale = (-not $askState.Pending)
     }
-    catch { }
+    catch {
+        if ($_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        Write-DaemonLog -Message "reply ownership transcript check failed for $sessionId : $($_.Exception.Message)"
+    }
 
-    if (-not $stale) { return $false }
+    if (-not $stale -or (& $ownsInput)) { return $false }
 
     try {
         Clear-CopilotMqttDecision -SessionId $sessionId `
@@ -403,10 +398,11 @@ function Test-DaemonReplyBoxFree {
         Write-DaemonLog -Message "cleared a stale decision card for $($sessionId.Substring(0,8)) so replies work again"
     }
     catch {
+        if ($_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
         Write-DaemonLog -Message "could not clear the stale decision card for $sessionId : $($_.Exception.Message)"
         return $false
     }
-    $true
+    -not (& $ownsInput)
 }
 
 function Send-DaemonCardPayload {

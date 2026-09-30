@@ -28,6 +28,12 @@ function Invoke-CodexHook {
     $sessionId = [string]$HookEvent.session_id
     if ([string]::IsNullOrWhiteSpace($sessionId)) { return }
     $eventName = [string]$HookEvent.hook_event_name
+    # A later lifecycle event retires the prompt, whichever input answered it.
+    # Do this before the daemon/network fast paths, not as part of card publication.
+    $approvalCleared = $false
+    if ($eventName -in @('PreToolUse', 'UserPromptSubmit', 'Stop', 'SessionEnd')) {
+        $approvalCleared = Remove-CodexApprovalMarker -SessionId $sessionId
+    }
     $workingDirectory = [string]$HookEvent.cwd
 
     $field = {
@@ -164,16 +170,12 @@ function Invoke-CodexHook {
         Send-BridgeNotification -Title (Format-BridgeNotificationTitle "Approval needed: $($display.Name)") `
             -Message $question -Headers $headers | Out-Null
     }
-    elseif ($eventName -in @('PreToolUse', 'Stop')) {
-        # Whatever was awaiting approval has been answered - in the terminal or on the
-        # dashboard - because the tool is now running or the turn has finished.
-        if (Remove-CodexApprovalMarker -SessionId $sessionId) {
-            try {
-                Clear-CopilotMqttDecision -SessionId $sessionId -SessionName $display.Name `
-                    -Machine $display.Machine -Headers $headers | Out-Null
-            }
-            catch { }
+    elseif ($approvalCleared) {
+        try {
+            Clear-CopilotMqttDecision -SessionId $sessionId -SessionName $display.Name `
+                -Machine $display.Machine -Headers $headers | Out-Null
         }
+        catch { }
     }
 
     if ($eventName -eq 'Stop') {

@@ -352,10 +352,8 @@ function Write-CodexApprovalMarker {
 }
 
 function Get-CodexApprovalMarker {
-    param([Parameter(Mandatory)][string]$SessionId)
-    $path = Get-CodexApprovalMarkerPath -SessionId $SessionId
-    if (-not (Test-Path -LiteralPath $path)) { return $null }
-    try { Get-Content -LiteralPath $path -Raw | ConvertFrom-Json } catch { $null }
+    param([Parameter(Mandatory)][string]$SessionId, [switch]$RequireReadable)
+    Read-DecisionMarkerFile -Path (Get-CodexApprovalMarkerPath -SessionId $SessionId) -RequireReadable:$RequireReadable
 }
 
 function Remove-CodexApprovalMarker {

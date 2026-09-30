@@ -1346,7 +1346,7 @@ function Set-CopilotMqttStatus {
         [string]$SessionId,
 
         [Parameter(Mandatory)]
-        [ValidateSet('working', 'idle', 'waiting', 'offline')]
+        [ValidateSet('working', 'idle', 'waiting', 'ending', 'ended', 'error', 'offline')]
         [string]$Status,
 
         [hashtable]$Attributes = @{},

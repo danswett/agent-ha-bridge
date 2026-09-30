@@ -74,6 +74,12 @@ rather than the script contents — so you can update the adapter without re-app
   `.json`, so the registration reader skips them explicitly. Without that they were
   parsed as registrations and the missing fields threw under StrictMode, which took
   down the daemon's entire reconcile rather than just this adapter.
+- **Later lifecycle events retire approval locally first.** `PreToolUse`,
+  `UserPromptSubmit`, `Stop` and `SessionEnd` remove an existing approval marker before
+  daemon fast paths or Home Assistant work. This does not change `PermissionRequest`
+  marker creation or the approval input path. A pending local marker owns the reply
+  box even if its card is empty or unavailable; an unreadable marker blocks
+  continuation with a diagnostic rather than being mistaken for an absent owner.
 
 ## What works, and what does not yet
 
