@@ -1247,6 +1247,10 @@ function Get-CopilotMqttMachineTopic {
         "$prefix/select/$node/new_effort/config"
         "$prefix/select/$node/new_context/config"
         "$prefix/select/$node/new_resume/config"
+        # Added after the rest, and missed here at the time: a removed machine left a
+        # dead permissions selector behind in Home Assistant, found the first time a
+        # machine was actually removed from the dashboard.
+        "$prefix/select/$node/new_permissions/config"
         "$prefix/button/$node/new_session/config"
         "$prefix/sensor/$node/new_session_result/config"
         "$prefix/sensor/$node/sessions/config"

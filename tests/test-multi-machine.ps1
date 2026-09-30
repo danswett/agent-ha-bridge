@@ -594,6 +594,30 @@ Test-That 'a machine with no liveness sensor at all reads as offline' {
 
 Write-Host '--- withdrawing one machine leaves the others alone ---'
 
+# Everything a machine publishes once, published for real, so the list that withdraws
+# them can be checked against it rather than against itself. This is how a dead
+# permissions selector came to be left behind in Home Assistant: the selector was
+# added to the launch card and nobody added it here, and nothing noticed until a
+# machine was actually removed from a live dashboard.
+$script:Published = @()
+Publish-CopilotMqttMachineOnlineConfig -Slug 'laptop' -MachineName 'LAPTOP' -Headers @{}
+Publish-CopilotMqttGlobalStatus -Slug 'laptop' -MachineName 'LAPTOP' -Headers @{} `
+    -Capabilities @{ newSession = $true } -Sessions @()
+Publish-CopilotMqttUpdate -InstalledVersion '1.19.0' -LatestVersion '1.20.0' -Slug 'laptop' -Headers @{}
+Publish-CopilotMqttNewSession -Slug 'laptop' -Headers @{} `
+    -Workspaces @([pscustomobject]@{ Label = 'repo'; Path = 'C:\repo' }) `
+    -Profiles @('default') -Resumable @([pscustomobject]@{ Label = 'a session' }) `
+    -Agents @('Copilot') -Tuning @{ model = @('Agent default'); effort = @('Agent default'); context = @('Agent default') }
+
+$publishedConfigs = @($script:Published | Where-Object { $_.Topic -match '/config$' } |
+    ForEach-Object { $_.Topic } | Sort-Object -Unique)
+$machineTopics = @(Get-CopilotMqttMachineTopic -Slug 'laptop')
+
+Test-That 'every entity a machine publishes is on the list that withdraws it' {
+    $publishedConfigs.Count -gt 10 -and
+    @($publishedConfigs | Where-Object { $machineTopics -notcontains $_ }).Count -eq 0
+} "missing=[$(@($publishedConfigs | Where-Object { $machineTopics -notcontains $_ }) -join ',')]"
+
 $script:Published = @()
 [void](Remove-CopilotMqttMachineEntities -Slug 'laptop' -Headers @{})
 $cleared = @($script:Published | Where-Object { $_.Payload -eq '' } | ForEach-Object { $_.Topic })
