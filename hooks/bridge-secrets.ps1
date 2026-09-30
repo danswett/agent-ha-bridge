@@ -13,10 +13,43 @@ function ConvertTo-BridgeHomeAssistantUrl {
 }
 
 function Read-BridgeSecret {
-    param([Parameter(Mandatory)][string]$Prompt)
+    param([Parameter(Mandatory)][string]$Prompt, [bool]$InputRedirected = [Console]::IsInputRedirected)
+    if ($InputRedirected) {
+        # Read-Host's secure reader requires a terminal on some platforms. Console
+        # stdin does not echo or transcribe the piped value, and preserves automation.
+        Write-Host "${Prompt}: " -NoNewline
+        return [Console]::ReadLine()
+    }
     $secret = Read-Host -Prompt $Prompt -AsSecureString
     try { [Net.NetworkCredential]::new('', $secret).Password }
     finally { if ($secret) { $secret.Dispose() } }
+}
+
+function Test-BridgeUnixModeApi {
+    $null -ne [IO.File].GetMethod('GetUnixFileMode', [type[]]@([string]))
+}
+
+function Get-BridgeSecretUnixMode {
+    param([Parameter(Mandatory)][string]$Path)
+    if (Test-BridgeUnixModeApi) { return [int][IO.File]::GetUnixFileMode($Path) }
+
+    $fullPath = [IO.Path]::GetFullPath($Path)
+    $mode = if ($IsMacOS) { & /usr/bin/stat -f '%Lp' $fullPath 2>$null }
+            else { & /usr/bin/stat -c '%a' $fullPath 2>$null }
+    if ($LASTEXITCODE -ne 0 -or [string]$mode -notmatch '^[0-7]{3,4}$') {
+        throw 'Could not read Unix credential-file permissions with stat.'
+    }
+    [Convert]::ToInt32([string]$mode, 8)
+}
+
+function Set-BridgeSecretUnixMode {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][ValidateSet('600', '700')][string]$Mode)
+    if (Test-BridgeUnixModeApi) {
+        [IO.File]::SetUnixFileMode($Path, [IO.UnixFileMode][Convert]::ToInt32($Mode, 8))
+        return
+    }
+    & /bin/chmod $Mode ([IO.Path]::GetFullPath($Path)) 2>$null
+    if ($LASTEXITCODE -ne 0) { throw 'Could not restrict Unix credential-file permissions with chmod.' }
 }
 
 function Test-BridgeSecretFileProtected {
@@ -27,9 +60,8 @@ function Test-BridgeSecretFileProtected {
         $item = Get-Item -LiteralPath $Path -Force
         if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) { return $false }
         if (-not $script:BridgeIsWindows) {
-            $mode = [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite
-            if ($item.PSIsContainer) { $mode = $mode -bor [IO.UnixFileMode]::UserExecute }
-            return [IO.File]::GetUnixFileMode($Path) -eq $mode
+            $mode = if ($item.PSIsContainer) { '700' } else { '600' }
+            return (Get-BridgeSecretUnixMode -Path $Path) -eq [Convert]::ToInt32($mode, 8)
         }
         $acl = Get-Acl -LiteralPath $Path
         $me = [Security.Principal.WindowsIdentity]::GetCurrent().User
@@ -64,9 +96,7 @@ function Protect-BridgeSecretFile {
             return $false
         }
         if (-not $script:BridgeIsWindows) {
-            $mode = [IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite
-            if ($item.PSIsContainer) { $mode = $mode -bor [IO.UnixFileMode]::UserExecute }
-            [IO.File]::SetUnixFileMode($Path, $mode)
+            Set-BridgeSecretUnixMode -Path $Path -Mode $(if ($item.PSIsContainer) { '700' } else { '600' })
         }
         else {
             $me = [Security.Principal.WindowsIdentity]::GetCurrent().User

@@ -152,6 +152,34 @@ if (-not $script:BridgeIsWindows) {
         Test-That 'a missing file is handled without throwing' {
             (Protect-BridgeSecretFile -Path (Join-Path $env:TEMP ([guid]::NewGuid().ToString('N')))) -eq $false
         }
+        $nativeModeProbe = (Get-Command Test-BridgeUnixModeApi).ScriptBlock
+        function Test-BridgeUnixModeApi { $false }
+        $legacyModeDirectory = Join-Path $env:TEMP ("bridge-unix-mode-" + [guid]::NewGuid().ToString('N'))
+        try {
+            Test-That 'older Unix runtimes detect and repair weak modes through stat and chmod' {
+                & /bin/chmod '644' $secretFile
+                if ($LASTEXITCODE) { throw 'Could not prepare the permission fixture.' }
+                -not (Test-BridgeSecretFileProtected -Path $secretFile) -and
+                    (Protect-BridgeSecretFile -Path $secretFile) -and
+                    [IO.File]::GetUnixFileMode($secretFile) -eq [IO.UnixFileMode]'UserRead, UserWrite'
+            }
+            Test-That 'the older-runtime path also creates a private credential directory' {
+                [void][IO.Directory]::CreateDirectory($legacyModeDirectory)
+                (Protect-BridgeSecretFile -Path $legacyModeDirectory) -and
+                    [IO.File]::GetUnixFileMode($legacyModeDirectory) -eq [IO.UnixFileMode]'UserRead, UserWrite, UserExecute'
+            }
+            Test-That 'a native permission-command failure is explicit, not success-shaped' {
+                try {
+                    Set-BridgeSecretUnixMode -Path (Join-Path $legacyModeDirectory 'missing.json') -Mode '600'
+                    $false
+                }
+                catch { $true }
+            }
+        }
+        finally {
+            Set-Item -LiteralPath function:Test-BridgeUnixModeApi -Value $nativeModeProbe
+            if (Test-Path -LiteralPath $legacyModeDirectory) { Remove-Item -LiteralPath $legacyModeDirectory -Force }
+        }
     }
     finally { Remove-Item -LiteralPath $secretFile -Force -ErrorAction SilentlyContinue }
 }
@@ -393,10 +421,59 @@ function Read-Host {
 }
 try {
     Test-That 'the secret prompt reads a SecureString without echoing it' {
-        (Read-BridgeSecret -Prompt 'Synthetic token') -eq 'synthetic-entered-secret'
+        (Read-BridgeSecret -Prompt 'Synthetic token' -InputRedirected $false) -eq 'synthetic-entered-secret'
     }
 }
 finally { Remove-Item Function:\Read-Host }
+
+Write-Host '--- redirected token input is consumed without a terminal or an echo ---'
+$inputRoot = Join-Path $env:TEMP ('bridge-secret-input-' + [guid]::NewGuid().ToString('N'))
+[void][IO.Directory]::CreateDirectory($inputRoot)
+$inputProbe = Join-Path $inputRoot 'read-secret.ps1'
+$probeText = @'
+$ErrorActionPreference = 'Stop'
+. '__SECRETS__'
+$choice = Read-Host 'Choice'
+$token = Read-BridgeSecret -Prompt 'Token'
+if ($choice -ne '1' -or $token -cne 'synthetic-piped-token') { throw 'Redirected input was not consumed correctly.' }
+Write-Output 'piped secret verified'
+'@
+$helperPath = (Join-Path $PSScriptRoot '..\hooks\bridge-secrets.ps1').Replace("'", "''")
+$probeText.Replace('__SECRETS__', $helperPath) | Set-Content -LiteralPath $inputProbe -Encoding utf8
+$inputProcess = [Diagnostics.Process]::new()
+$started = $false
+try {
+    # Only a prompt helper is run, not an installer. This process inherits the
+    # canonical runner's already-scrubbed environment and receives synthetic input.
+    $start = [Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME $(if ($IsWindows) { 'pwsh.exe' } else { 'pwsh' })))
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardInput = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    foreach ($argument in @('-NoLogo', '-NoProfile', '-File', $inputProbe)) { $start.ArgumentList.Add($argument) }
+    $inputProcess.StartInfo = $start
+    $started = $inputProcess.Start()
+    $stdout = $inputProcess.StandardOutput.ReadToEndAsync()
+    $stderr = $inputProcess.StandardError.ReadToEndAsync()
+    $inputProcess.StandardInput.WriteLine('1')
+    $inputProcess.StandardInput.WriteLine('synthetic-piped-token')
+    $inputProcess.StandardInput.Close()
+    $finished = $inputProcess.WaitForExit(5000)
+    if (-not $finished) { $inputProcess.Kill($true); $inputProcess.WaitForExit() }
+    $inputOutput = $stdout.GetAwaiter().GetResult() + $stderr.GetAwaiter().GetResult()
+    Test-That 'a token after a normal prompt is read from redirected stdin without hanging' {
+        $finished -and $inputProcess.ExitCode -eq 0 -and $inputOutput -match 'piped secret verified'
+    }
+    Test-That 'redirected token input is not echoed into either output stream' {
+        $finished -and $inputOutput -notmatch 'synthetic-piped-token'
+    }
+}
+finally {
+    if ($started -and -not $inputProcess.HasExited) { $inputProcess.Kill($true); $inputProcess.WaitForExit() }
+    $inputProcess.Dispose()
+    Remove-Item -LiteralPath $inputRoot -Recurse -Force
+}
 
 Write-Host '--- a scripted run is never offered things only a human can use ---'
 Test-That 'console interactivity is reported as a bool' {

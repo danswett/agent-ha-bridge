@@ -245,6 +245,7 @@ For unattended setup, supply `AGENT_HA_TOKEN` through your process's secret/envi
 configuration. `-Token` and `-AgentToken` remain supported, but their values can appear
 in shell history, process listings, and automation logs; do not put literal secrets
 in a command line. Omitting `-NonInteractive` lets the installer mask token entry.
+Redirected stdin remains supported and is read without echoing the token.
 
 Then `/restart` any running Copilot sessions so they pick up the hooks, and open the
 **Agent Sessions** dashboard in Home Assistant.
@@ -351,7 +352,9 @@ starts; a terminal's temporary environment does not automatically reach a deskto
 
 The installer protects main configs, MCP snippets, Claude Desktop configs, and their
 owned backups before writing: owner-only ACLs on Windows, `0600` files and `0700` new
-credential directories on Unix. Protection failures stop the write instead of
+credential directories on Unix. When the .NET Unix mode APIs are unavailable, the
+credential helper uses the OS's `stat` and `chmod` and verifies the resulting mode.
+Protection failures stop the write instead of
 reporting success. Generated MCP entries reference the protected bridge config via
 `HA_BRIDGE_CONFIG`, so neither saved nor environment-only tokens are copied into
 the snippet. Existing saved credentials are still plaintext in the protected main
