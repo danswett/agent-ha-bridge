@@ -380,6 +380,12 @@ Test-That 'and says plainly which token is not the one to use' {
 Test-That 'and names what silently goes wrong, so the reason survives an edit' {
     $script:AgentsDoc -match 'agentUserIds' -and $script:AgentsDoc -match 'purple'
 }
+Test-That 'and says how a remote session reports back, which is not a notification' {
+    # Persistent notifications are invisible to GET /api/states, so an agent told to
+    # answer with one polls forever and reads the silence as a dead session. That cost
+    # two polling rounds on 2026-09-29 before the activity sensor was used instead.
+    $script:AgentsDoc -match 'persistent_notification' -and $script:AgentsDoc -match '_activity'
+}
 
 if ($script:Failures -gt 0) {
     Write-Host "`n$($script:Failures) failed" -ForegroundColor Red
