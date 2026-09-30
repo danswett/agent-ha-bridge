@@ -115,6 +115,8 @@ Installer helpers share that configuration-free guard. Stub the actual transport
 `Invoke-RestMethod` does not replace `Invoke-WebRequest`, WebSockets, DNS discovery,
 or a checker subprocess. A guard violation must propagate, not become an ordinary
 connection failure or a successful cosmetic fallback.
+Manual suite detection uses the `test-*.ps1` entry filename, not an ancestor folder
+named `tests`; ordinary installer/runtime scripts in such a checkout remain normal.
 
 The runner retains logs and `summary.json` in the printed results directory, reports
 skips explicitly, and fails on a nonzero suite exit or timeout (180 seconds per suite).

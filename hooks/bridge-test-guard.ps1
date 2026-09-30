@@ -7,7 +7,7 @@ if (-not (Get-Variable -Name BridgeBlockedHttpCalls -Scope Script -ErrorAction S
     $script:BridgeBlockedHttpCalls = 0
 }
 foreach ($bridgeTestFrame in Get-PSCallStack) {
-    if ([string]$bridgeTestFrame.ScriptName -match '[\\/]tests[\\/].+\.ps1$') {
+    if ([string]$bridgeTestFrame.ScriptName -match '[\\/]test-[^\\/]+\.ps1$') {
         $script:BridgeUnderTestSuite = $true
         break
     }

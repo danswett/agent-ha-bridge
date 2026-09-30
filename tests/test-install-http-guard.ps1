@@ -225,6 +225,43 @@ Write-Output 'installer descendant transports blocked without runtime configurat
         $result.ExitCode -eq 0 -and -not $result.TimedOut -and
         $result.Output -match 'installer descendant transports blocked without runtime configuration'
     } $result.Output
+
+    Write-Host '--- suite detection follows the entry filename, not a checkout ancestor ---'
+    # These scripts invoke only the guard, never an installer or transport. Removing
+    # the inherited flag here tests call-stack detection independently and safely.
+    $pathProbe = @'
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+$env:AGENT_HA_BRIDGE_OFFLINE_TEST = $null
+. '__GUARD__'
+$expected = __EXPECTED__
+if ($script:BridgeUnderTestSuite -ne $expected) { throw 'Incorrect suite classification for this script path.' }
+$blocked = $false
+try { Assert-BridgeHttpAllowed -Uri 'offline-test://fixture' -Transport WebSocket }
+catch {
+    if (-not $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+    $blocked = $true
+}
+if ($blocked -ne $expected) { throw 'The guard did not honor the script classification.' }
+Write-Output 'call-stack classification verified without invoking a transport'
+'@
+    foreach ($pathCase in @(
+        @{ Relative = 'tests\checkout\install.ps1'; IsSuite = $false },
+        @{ Relative = 'tests\checkout\hooks\runtime.ps1'; IsSuite = $false },
+        @{ Relative = 'component\tests\nested\test-nested.ps1'; IsSuite = $true },
+        @{ Relative = 'mcp\checks\test-component.ps1'; IsSuite = $true }
+    )) {
+        $pathProbeFile = Join-Path $scratch ($pathCase.Relative.Replace('\', [IO.Path]::DirectorySeparatorChar))
+        [void][IO.Directory]::CreateDirectory((Split-Path -Parent $pathProbeFile))
+        $expectedLiteral = if ($pathCase.IsSuite) { '$true' } else { '$false' }
+        $pathProbe.Replace('__GUARD__', (Join-Path $script:BridgeTestRepository 'hooks\bridge-test-guard.ps1').Replace("'", "''")).
+            Replace('__EXPECTED__', $expectedLiteral) | Set-Content -LiteralPath $pathProbeFile -Encoding utf8
+        $pathResult = Invoke-BridgeTestProcess -StartInfo (New-BridgeTestProcessStartInfo -ScriptPath $pathProbeFile -Sandbox $box)
+        Test-That "$($pathCase.Relative) is classified as suite=$($pathCase.IsSuite) without network access" {
+            $pathResult.ExitCode -eq 0 -and -not $pathResult.TimedOut -and
+            $pathResult.Output -match 'call-stack classification verified without invoking a transport'
+        } $pathResult.Output
+    }
 }
 finally { Remove-Item -LiteralPath $scratch -Recurse -Force }
 
