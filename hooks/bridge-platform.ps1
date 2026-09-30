@@ -325,12 +325,21 @@ function Invoke-BridgeCommandProbe {
     param(
         [Parameter(Mandatory)][string]$Executable,
         [string[]]$Arguments = @('--version'),
-        [int]$TimeoutMs = 5000
+        [int]$TimeoutMs = 5000,
+
+        # Where to run it. Some commands answer differently depending on where they
+        # are run - `agency config profiles` merges any agency.yaml found from the
+        # current directory upwards - and the daemon's own directory is not something
+        # a caller should have to reason about. Ignored when it does not exist.
+        [AllowEmptyString()][AllowNull()][string]$WorkingDirectory = ''
     )
 
     $out = [IO.Path]::GetTempFileName()
     $err = [IO.Path]::GetTempFileName()
-    $result = [pscustomobject]@{ ExitCode = -1; Output = ''; TimedOut = $false; Ran = $false }
+    # Output is both streams, flattened, which is what a one-line "why did this fail"
+    # message wants. StandardOutput keeps stdout with its lines intact, for the
+    # callers that have to parse a listing.
+    $result = [pscustomobject]@{ ExitCode = -1; Output = ''; StandardOutput = ''; TimedOut = $false; Ran = $false }
     try {
         $start = @{
             FilePath               = $Executable
@@ -341,6 +350,9 @@ function Invoke-BridgeCommandProbe {
             NoNewWindow            = $true
             ErrorAction            = 'Stop'
         }
+        if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory) -and (Test-Path -LiteralPath $WorkingDirectory)) {
+            $start.WorkingDirectory = $WorkingDirectory
+        }
         $process = Start-Process @start
         $result.Ran = $true
         if ($process.WaitForExit($TimeoutMs)) {
@@ -350,8 +362,10 @@ function Invoke-BridgeCommandProbe {
             $result.TimedOut = $true
             try { $process.Kill($true) } catch { }
         }
+        $stdout = [string](Get-Content -LiteralPath $out -Raw -ErrorAction SilentlyContinue)
+        $result.StandardOutput = $stdout
         $text = @(
-            (Get-Content -LiteralPath $out -Raw -ErrorAction SilentlyContinue)
+            $stdout
             (Get-Content -LiteralPath $err -Raw -ErrorAction SilentlyContinue)
         ) -join ' '
         $result.Output = ($text -replace '\s+', ' ').Trim()

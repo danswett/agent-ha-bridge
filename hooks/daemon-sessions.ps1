@@ -696,7 +696,12 @@ function Get-DaemonLaunchCapabilities {
     #>
     $newSessionEnabled = [bool](Get-BridgeSetting 'newSession.enabled' $true)
     $installedLaunchers = @(Get-BridgeAvailableLaunchers)
-    $includeProfile = $newSessionEnabled -and $installedLaunchers -contains 'agency'
+    # Agency, and at least one profile to choose between. A machine whose Agency has
+    # no profiles - a new one, before whatever syncs the config has run there - gets
+    # no row rather than one whose only option is a placeholder, and its launches pass
+    # no profile, which is what Agency's own base config is for.
+    $includeProfile = $newSessionEnabled -and $installedLaunchers -contains 'agency' -and
+        @(Get-BridgeAgencyProfiles).Count -gt 0
     # Every agent's sessions can be resumed now, not only Agency's.
     $includeResume = $newSessionEnabled -and $installedLaunchers.Count -gt 0
     $includeAgent = $newSessionEnabled -and $installedLaunchers.Count -gt 1
