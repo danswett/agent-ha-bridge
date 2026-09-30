@@ -263,6 +263,28 @@ $script:Again = Install-BridgeReplyCard -SourcePath $script:CardSource -Version 
 Test-That 're-running with nothing to change sends no resource command' { $script:Sent.Count -eq 0 }
 Test-That 'it reports the card as already current' { $script:Again.Ok -and $script:Again.Action -eq 'current' }
 
+# The same CARD_VERSION does not mean the same card. Two sessions can each build one
+# at 1.9.0 - one of them from a branch installed from source before it merged - and
+# whichever registered first used to win permanently, because the version matched and
+# nothing looked any further. Every machine then held the newer card and none could
+# replace the older one that Home Assistant was actually serving.
+$script:Sent = @()
+$script:Impostor = @([pscustomobject]@{
+    id  = 'res-1'
+    url = ('data:text/javascript;base64,' +
+        [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("// a different card that also calls itself 1.9.0`nconst CARD_VERSION = '1.9.0';")) +
+        '#agent-bridge-reply-card.js?v=1.9.0')
+})
+$script:Collision = Install-BridgeReplyCard -SourcePath $script:CardSource -Version '1.9.0' `
+    -Invoker $script:Invoker -Resources { $script:Impostor } -FileProbe { throw 'an inline card has no file to probe' }
+Test-That 'a different card wearing the same version is replaced, not left serving' {
+    $script:Collision.Action -eq 'updated' -and $script:Sent.Count -eq 1 -and
+    $script:Sent[0].type -eq 'lovelace/resources/update' -and $script:Sent[0].resource_id -eq 'res-1'
+}
+Test-That 'and what replaces it is the card this bridge actually ships' {
+    $script:Sent[0].url -eq $script:InlineUrl
+}
+
 # An upgrade must not leave two resources pointing at the same card.
 $script:Sent = @()
 $script:Older = @([pscustomobject]@{ id = 'res-1'; url = (Get-BridgeInlineReplyCardUrl -SourcePath $script:CardSource -Version '1.8.0') })

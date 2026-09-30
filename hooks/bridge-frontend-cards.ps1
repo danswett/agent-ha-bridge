@@ -375,14 +375,6 @@ function Install-BridgeReplyCard {
 
     $present = ($state.Registered -and $state.Served)
     $inlineNow = $state.Registered -and $state.Url.StartsWith('data:')
-    if ($present -and $inlineNow -and ([string]::IsNullOrWhiteSpace($Version) -or $state.Version -eq $Version)) {
-        # Already installed inline at the right version: touch nothing.
-        $result.Registered = $true
-        $result.Url = $state.Url
-        $result.Ok = $true
-        $result.Action = 'current'
-        return $result
-    }
 
     try { $result.Url = Get-BridgeInlineReplyCardUrl -SourcePath $SourcePath -Version $Version }
     catch {
@@ -391,6 +383,20 @@ function Install-BridgeReplyCard {
         return $result
     }
 
+    # Compared by what is registered, not by the version inside its URL. Two machines
+    # can hold different cards carrying the same CARD_VERSION - one of them built from
+    # a branch that was installed from source before it merged - and comparing the
+    # versions alone called that 'current' and left the older body serving for good.
+    # It happened: every machine held a card with a fix in it, Home Assistant served
+    # one without, and no install could ever replace it because the two numbers
+    # matched. An inline card carries its whole body in the URL, so comparing the
+    # thing itself costs nothing and cannot be fooled.
+    if ($present -and $inlineNow -and $state.Url -eq $result.Url) {
+        $result.Registered = $true
+        $result.Ok = $true
+        $result.Action = 'current'
+        return $result
+    }
     # An existing registration is updated in place rather than joined by a second
     # one, which would load the card twice and leave a stale entry behind.
     try {
