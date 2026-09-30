@@ -786,10 +786,18 @@ pwsh -NoProfile -File .\tests\run-tests.ps1 -Suite test-status-card.ps1
 Use PowerShell 7, Node.js and Git (including Git Bash on Windows). The runner uses
 `tests/suites.psd1` for the same Windows/macOS selection, including the Claude and
 Codex offline suites. Every suite must appear exactly once in the manifest.
+Discovery covers every component and nested `test-*.ps1`, not just existing test
+directories. Dependency, Git, fixture and generated-output exclusions are documented
+in `AGENTS.md` and regression-tested; symbolic links and junctions are not traversed.
+The runner marks its output with `.bridge-test-results` so a custom results directory
+inside the checkout cannot become a source of executable suites.
 Each runs in a fresh process with a private home, temporary directory, synthetic
 configuration and client roots. Credentials and HTTP opt-ins are not inherited;
 redirected input, output and pipelines are UTF-8. Do not invoke suite files directly:
 these protections belong to the runner, not to every individual script.
+Installer REST, WebRequest, WebSocket, discovery and checker-child paths honor the
+same inherited boundary without loading runtime configuration. Stub each transport
+actually used: a REST stub does not authorize a WebSocket or discovery request.
 
 Logs and a machine-readable `summary.json` are kept in the printed results directory
 (or a new `-ResultsDirectory` you supply). Failures and per-suite timeouts fail the
@@ -802,6 +810,8 @@ GitHub-hosted Windows/macOS CI machines with `-AllowHostTests`, unique test regi
 names and loopback fixtures. **Never run them on a developer or self-hosted machine**:
 `-TargetHome` does not redirect every external side effect. The **Platform** group
 keeps tmux/terminal delivery separate and has the same hosted-runner gate.
+Only the Host group permits its fixed `http://127.0.0.1:1` connection-refused fixture
+and matching WebSocket endpoint; LAN discovery remains blocked.
 **Integration** suites are inventoried but never executed by this runner or CI.
 They require an explicitly configured disposable Home Assistant, installed test
 hooks, and `BRIDGE_ALLOW_TEST_HTTP=1` outside the runner.

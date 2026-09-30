@@ -444,7 +444,8 @@ try {
     } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $legacyBridge 'config.json') -Encoding UTF8
 
     $null = & pwsh -NoProfile -File (Join-Path $repoRoot 'install.ps1') `
-        -TargetHome $legacy -TestRegistryId $suiteRegistryId -SkipTask -SkipPath -SkipDependencies -SkipVerify -NonInteractive 2>&1
+        -TargetHome $legacy -TestRegistryId $suiteRegistryId -SkipTask -SkipPath -SkipDependencies -SkipVerify -NonInteractive `
+        -HomeAssistantUrl 'http://127.0.0.1:1' 2>&1
     $after = Get-Content -LiteralPath (Join-Path $legacyBridge 'config.json') -Raw | ConvertFrom-Json
 
     Test-That 'the update repository is corrected' {
@@ -472,7 +473,8 @@ Test-That 'a fork is not rewritten' {
             updates       = @{ repository = 'someone/their-fork'; installedVersion = '1.0.0'; checkForUpdates = $true }
         } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $forkBridge 'config.json') -Encoding UTF8
         $null = & pwsh -NoProfile -File (Join-Path $repoRoot 'install.ps1') `
-            -TargetHome $fork -TestRegistryId $suiteRegistryId -SkipTask -SkipPath -SkipDependencies -SkipVerify -NonInteractive 2>&1
+            -TargetHome $fork -TestRegistryId $suiteRegistryId -SkipTask -SkipPath -SkipDependencies -SkipVerify -NonInteractive `
+            -HomeAssistantUrl 'http://127.0.0.1:1' 2>&1
         (Get-Content -LiteralPath (Join-Path $forkBridge 'config.json') -Raw | ConvertFrom-Json).updates.repository -eq 'someone/their-fork'
     }
     finally {

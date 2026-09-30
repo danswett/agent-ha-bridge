@@ -27,6 +27,7 @@
         'tests\test-install-clients.ps1'
         'tests\test-install-connection.ps1'
         'tests\test-install-deps.ps1'
+        'tests\test-install-http-guard.ps1'
         'tests\test-launch-permissions.ps1'
         'tests\test-launchers.ps1'
         'tests\test-layout-migration.ps1'
