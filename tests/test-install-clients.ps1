@@ -359,7 +359,7 @@ try {
         $repaired -and (Get-Content -LiteralPath $script:InstrPath -Raw) -match 'AGENT_HA_AGENT_TOKEN'
     }
 
-    $script:InstrText = Get-BridgeAgentInstructions
+    $script:InstrText = Get-BridgeAgentInstructions -HasAgentToken
     Test-That 'it names the token an agent writes with' {
         $script:InstrText -match 'AGENT_HA_AGENT_TOKEN'
     }
@@ -369,11 +369,26 @@ try {
         $common = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\hooks\decision-bridge-common.ps1') -Raw
         $common -match "agentTokenEnvVar'\s+'AGENT_HA_AGENT_TOKEN'"
     }
-    Test-That 'and says where the answer from a session is read from' {
+    Test-That 'a renamed variable is what the instructions name' {
+        # Get-BridgeAgentTokenEnvironment exports whatever agentTokenEnvVar says, so a
+        # fixed name here would point an override at a variable nothing sets.
+        $renamed = Get-BridgeAgentInstructions -EnvVarName 'HOUSE_AGENT_TOKEN' -HasAgentToken
+        ($renamed -match 'HOUSE_AGENT_TOKEN') -and ($renamed -notmatch 'AGENT_HA_AGENT_TOKEN')
+    }
+    Test-That 'with no agent token configured it does not promise one is there' {
+        # The variable is only exported when a token exists; claiming otherwise sends
+        # an agent off to build an empty bearer header.
+        $none = Get-BridgeAgentInstructions
+        $none -match 'No agent account is configured' -and $none -match 'configure -AgentToken'
+    }
+    Test-That 'and says where the answer is read from' {
         $script:InstrText -match '_activity' -and $script:InstrText -match 'response'
     }
     Test-That 'and warns off the notification that cannot be read back' {
         $script:InstrText -match 'persistent_notification'
+    }
+    Test-That 'and warns that a stale response is kept while the next turn starts' {
+        $script:InstrText -match 'previous'
     }
     Test-That 'and says the bridge owns the file, so nobody hand-edits it' {
         $script:InstrText -match 'uninstall' -and $script:InstrText -match 'overwritten'

@@ -1428,8 +1428,42 @@ function Get-BridgeAgentInstructions {
         driving the bridge is almost never working *in* the bridge's repository - it is
         in some unrelated project on a machine that happens to have the bridge
         installed, and it never sees that file.
+
+        The variable name is rendered rather than fixed: Get-BridgeAgentTokenEnvironment
+        exports whatever homeAssistant.agentTokenEnvVar names, so an install that has
+        overridden it would otherwise be handed instructions pointing at a variable
+        nothing sets. For the same reason the promise that it is *there* is only made
+        when an agent token is actually configured - without one the variable is never
+        exported at all, and an agent following that would send an empty bearer token.
     #>
-    @'
+    param(
+        [string]$EnvVarName = 'AGENT_HA_AGENT_TOKEN',
+        [switch]$HasAgentToken
+    )
+
+    if (-not $EnvVarName) { $EnvVarName = 'AGENT_HA_AGENT_TOKEN' }
+    # Literal here-strings with a placeholder, rather than an expandable one: the text
+    # is markdown full of backticks and `$env:` references, and escaping those for the
+    # parser makes it unreadable and easy to break.
+    $tokenRule = if ($HasAgentToken) {
+        @'
+A press, a reply or a launch must use `$env:__ENVVAR__`. When the bridge launched this
+session that variable is already in its environment. The token in
+`~/.agent-ha-bridge/config.json` under `homeAssistant.token` is the *user's*, and is
+the right one for reads.
+'@
+    }
+    else {
+        @'
+No agent account is configured on this machine, so there is no separate token to write
+with and every action is recorded as the user. If `$env:__ENVVAR__` is set in your
+environment, use it for a press, a reply or a launch; otherwise the token in
+`~/.agent-ha-bridge/config.json` under `homeAssistant.token` is all there is, and it is
+the user's. `agent-ha-bridge configure -AgentToken <token>` sets one up.
+'@
+    }
+
+    $body = @'
 # agent-ha-bridge
 
 Installed and maintained by agent-ha-bridge. Removed when the bridge is uninstalled;
@@ -1441,10 +1475,7 @@ things about that fail silently, so they are worth knowing before you try.
 
 ## Authenticate writes as the agent
 
-A press, a reply or a launch must use `$env:AGENT_HA_AGENT_TOKEN`. When the bridge
-launched this session that variable is already in its environment. The token in
-`~/.agent-ha-bridge/config.json` under `homeAssistant.token` is the *user's*, and is
-the right one for reads.
+__TOKENRULE__
 
 Both tokens authenticate and both are authorised, so using the wrong one raises no
 error and writes no log line. The only symptom is that Home Assistant records the
@@ -1455,14 +1486,17 @@ user's own.
 
 `sensor.agent_bridge_<session>_activity` carries what the session said, in its
 `response` attribute. `sensor.agent_bridge_<session>_status` reads `idle` when a turn
-ends - but also briefly before the session starts working, so wait for a `response`
-rather than for the status alone.
+ends - but also briefly before the session starts working, and a session keeps the
+*previous* turn's response while the next one starts, so an answer only counts once
+that `response` has actually changed from what it was when you wrote.
 
 Do not ask a session to answer with a persistent notification. Home Assistant does not
 expose those through `GET /api/states`, so polling for a `persistent_notification.*`
 entity finds nothing however long you wait, and that silence looks exactly like the
 session having died.
 '@
+
+    $body.Replace('__TOKENRULE__', $tokenRule.Trim()).Replace('__ENVVAR__', $EnvVarName)
 }
 
 function Install-BridgeAgentInstructions {
@@ -1472,9 +1506,13 @@ function Install-BridgeAgentInstructions {
         Rewritten only when the content differs, so a re-install does not churn a file
         the CLI may be reading, and so the common case prints nothing.
     #>
-    param([Parameter(Mandatory)][string]$Path)
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$EnvVarName = 'AGENT_HA_AGENT_TOKEN',
+        [switch]$HasAgentToken
+    )
 
-    $wanted = Get-BridgeAgentInstructions
+    $wanted = Get-BridgeAgentInstructions -EnvVarName $EnvVarName -HasAgentToken:$HasAgentToken
     if (Test-Path -LiteralPath $Path) {
         $current = Get-Content -LiteralPath $Path -Raw -ErrorAction SilentlyContinue
         # Both sides normalised: Set-Content writes the platform's line ending, so a
@@ -2435,7 +2473,9 @@ if ($selectedClients -contains 'copilot') {
     @{ version = 1; hooks = $hookDefs } | ConvertTo-Json -Depth 8 |
         Set-Content -LiteralPath $hookConfigPath -Encoding UTF8
     Write-Host "    $hookConfigPath"
-    if (Install-BridgeAgentInstructions -Path $agentInstructionsPath) {
+    if (Install-BridgeAgentInstructions -Path $agentInstructionsPath `
+            -EnvVarName ([string]$config.homeAssistant.agentTokenEnvVar) `
+            -HasAgentToken:([bool][string]$config.homeAssistant.agentToken)) {
         Write-Host "    $agentInstructionsPath"
     }
 }

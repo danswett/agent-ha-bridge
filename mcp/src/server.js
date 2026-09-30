@@ -212,13 +212,21 @@ async function main() {
         name: 'read_agent_session',
         description:
           'Read what a session last said. Its answer is in the response field; done is true ' +
-          'once the turn has actually finished. Use this rather than asking a session to ' +
-          'reply with a Home Assistant notification - notifications are not readable through ' +
-          'the states API, so waiting on one never returns.',
+          'once the turn has actually finished. Pass the since value that ' +
+          'reply_to_agent_session returned, otherwise a poll straight after replying can ' +
+          "hand back the previous turn's answer, which is kept on the card. Use this rather " +
+          'than asking a session to reply with a Home Assistant notification - notifications ' +
+          'are not readable through the states API, so waiting on one never returns.',
         inputSchema: {
           type: 'object',
           properties: {
             session_id: { type: 'string', description: 'From list_agent_sessions.' },
+            since: {
+              type: 'string',
+              description:
+                'The since value from reply_to_agent_session, so an answer only counts once ' +
+                'the activity has moved on from the turn you started.',
+            },
           },
           required: ['session_id'],
         },
@@ -226,9 +234,10 @@ async function main() {
       {
         name: 'reply_to_agent_session',
         description:
-          'Send a message to a session - yours or one on another machine - as the agent, so ' +
-          'it is attributed correctly. Any length: long text is not truncated. Then poll ' +
-          'read_agent_session for the answer.',
+          'Send a message to a session - yours or one on another machine. Any length. ' +
+          'Returns since, to pass to read_agent_session, and attributed: a reply of 255 ' +
+          'characters or fewer is recorded as the agent, while a longer one is sent whole ' +
+          'over a path that carries no account and so is not marked.',
         inputSchema: {
           type: 'object',
           properties: {
@@ -267,7 +276,8 @@ async function main() {
   // Reads use the user's token, writes the agent's - see loadConfig.
   const sessionTools = {
     list_agent_sessions: () => listSessions(ha),
-    read_agent_session: (args) => readSession(ha, String(args?.session_id ?? '')),
+    read_agent_session: (args) =>
+      readSession(ha, String(args?.session_id ?? ''), { since: String(args?.since ?? '') }),
     reply_to_agent_session: (args) =>
       replyToSession(agentHa, String(args?.session_id ?? ''), args?.text),
     launch_agent_session: (args) =>

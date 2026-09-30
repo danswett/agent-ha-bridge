@@ -168,8 +168,13 @@ $headers = @{ Authorization = "Bearer $env:AGENT_HA_AGENT_TOKEN" }
 
 Every session the bridge launches already carries that variable;
 `Get-BridgeAgentTokenEnvironment` puts it there for exactly this, so an agent that goes
-on to drive another session arrives as itself. `homeAssistant.token` is *yours*, and
-stays what the daemon, the hooks, the dashboard provisioning and the MCP server use.
+on to drive another session arrives as itself. Two caveats it is worth knowing before
+you hard-code the name: it is exported only when an agent token is configured, and the
+name itself is `homeAssistant.agentTokenEnvVar` - `AGENT_HA_AGENT_TOKEN` is only its
+default, so an install that has renamed it exports the renamed one.
+`homeAssistant.token` is *yours*, and stays what the daemon, the hooks and the
+dashboard provisioning use. The MCP server holds both: yours for provisioning, which is
+administrator-only, and the agent's for the session tools that press things.
 
 Getting it wrong fails silently, which is the whole problem. Both tokens authenticate
 and both are authorised, so nothing errors and no log line appears. The only difference
@@ -189,8 +194,11 @@ reply, a launch.
 A session on another machine reports through its own entities, and the one that
 carries what it actually said is `sensor.agent_bridge_<session>_activity` - the text is
 in the `response` attribute, with `sensor.agent_bridge_<session>_status` going `idle`
-when the turn is done. Note that a session is briefly `idle` before it starts working
-too, so wait for a `response` rather than for the status alone.
+when the turn is done. Two things make waiting on that alone unreliable: a session is
+briefly `idle` before it starts working, and it *keeps the previous turn's* `response`
+while the next one starts. So snapshot `response` (or the activity's `updated`) before
+you write, and treat the turn as finished only once it has changed - otherwise the
+first poll hands back the last answer and you stop waiting.
 
 Do not ask a remote session to answer with a persistent notification. Home Assistant
 does not expose those through `GET /api/states`, so polling for a

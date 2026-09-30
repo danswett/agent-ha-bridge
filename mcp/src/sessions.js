@@ -113,17 +113,23 @@ export async function listSessions(ha) {
 /**
  * What a session last said, and whether it is still working.
  *
- * A session reads `idle` briefly *before* it starts working as well as when a turn
- * ends, so `done` requires a response to actually be there - waiting on the status
- * alone returns an empty answer from a session that has not begun.
+ * `since` is what makes `done` trustworthy. A session's `response` is deliberately
+ * kept across turns - Update-DaemonSessionActivity retains it and the card republishes
+ * it - and its status reads `idle` briefly before work starts as well as after a turn
+ * ends. So an immediate poll after sending a message would otherwise return the
+ * *previous* answer marked done, and the caller would stop waiting before the new turn
+ * had produced anything. Pass the `since` that reply_to_agent_session returned and the
+ * answer only counts once the activity has actually moved on.
  */
-export async function readSession(ha, sessionId) {
+export async function readSession(ha, sessionId, { since = '' } = {}) {
   const ids = sessionEntities(sessionId);
   const [activity, status] = await Promise.all([ha.getState(ids.activity), ha.getState(ids.status)]);
   if (!activity) throw new Error(`No session ${sessionId} in Home Assistant.`);
 
   const response = String(attr(activity, 'response') ?? '');
   const state = String(status?.state ?? 'unknown');
+  const updated = String(attr(activity, 'updated') ?? '');
+  const moved = !since || updated !== since;
   return {
     sessionId,
     machine: attr(activity, 'machine') ?? '',
@@ -132,42 +138,53 @@ export async function readSession(ha, sessionId) {
     status: state,
     activity: activity.state ?? '',
     response,
-    done: state === 'idle' && response.trim().length > 0,
+    updated,
+    done: state === 'idle' && response.trim().length > 0 && moved,
   };
 }
 
 /**
- * Sends text to a session as the agent.
+ * Sends text to a session, by whichever of the two paths fits - never both.
  *
- * The payload topic carries the whole message; the text entity beside it is capped at
- * 255 characters by Home Assistant, so a long handover sent that way arrives cut off
- * mid-sentence. Both are written - the payload for the daemon, the text box so a
- * dashboard running an older card still shows what was sent - and then Submit is
- * pressed, which is what the daemon watches.
+ * Sending both is what the obvious implementation does, and it delivers the message
+ * twice: Invoke-PendingReplies takes the payload, `continue`s without consuming the
+ * Submit press, and the next pass then finds a fresh press beside a populated text box
+ * and injects the same text again.
+ *
+ * Which path is not a free choice, because they differ in what they can carry:
+ *
+ *   - The text box commits through a service call, so Home Assistant records the
+ *     account on the Submit press and Send-DaemonReplyBoxText reads the driver off it.
+ *     That is what marks the turn as the agent's. It is capped at 255 characters.
+ *   - The payload topic has no cap, but arrives over MQTT, and an MQTT-published state
+ *     carries no context at all - measured: context.user_id comes back empty. Nothing
+ *     downstream can tell who sent it, so the turn is not marked.
+ *
+ * So a reply that fits is sent the attributed way, and a longer one is sent whole and
+ * unmarked rather than silently truncated. The returned `attributed` says which.
  */
 export async function replyToSession(ha, sessionId, text) {
   const body = String(text ?? '');
   if (!body.trim()) throw new Error('A reply needs some text.');
 
   const ids = sessionEntities(sessionId);
-  if (!(await ha.getState(ids.activity))) {
-    throw new Error(`No session ${sessionId} in Home Assistant.`);
+  const activity = await ha.getState(ids.activity);
+  if (!activity) throw new Error(`No session ${sessionId} in Home Assistant.`);
+  // Captured before sending, so read_agent_session can tell the next answer from this
+  // turn's leftover one.
+  const since = String(attr(activity, 'updated') ?? '');
+
+  if (body.length <= STATE_MAX_CHARS) {
+    await ha.callService('text', 'set_value', { entity_id: ids.reply, value: body });
+    await ha.callService('button', 'press', { entity_id: ids.submit });
+    return { sessionId, sent: body.length, attributed: true, since };
   }
 
-  await ha.publishMqtt(replyPayloadTopic(sessionId), {
-    at: new Date().toISOString(),
-    text: body,
-  });
-  await ha
-    .callService('text', 'set_value', {
-      entity_id: ids.reply,
-      value: body.length > STATE_MAX_CHARS ? body.slice(0, STATE_MAX_CHARS) : body,
-    })
-    .catch(() => {
-      // The payload is what the daemon reads; an older session may have no text box.
-    });
-  await ha.callService('button', 'press', { entity_id: ids.submit });
-  return { sessionId, sent: body.length };
+  // Not retained, matching the reply card: the daemon's guard against re-delivering a
+  // payload is in memory, so a retained one restored by the broker after a restart
+  // would be read as a new submission and injected again.
+  await ha.publishMqtt(replyPayloadTopic(sessionId), { at: new Date().toISOString(), text: body }, false);
+  return { sessionId, sent: body.length, attributed: false, since };
 }
 
 /**
