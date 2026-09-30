@@ -59,13 +59,22 @@ Publish-CopilotMqttGlobalStatus -Sessions @(
 Publish-CopilotMqttUpdate -InstalledVersion '1.19.0' -LatestVersion '1.19.0' -Slug $live.Slug -Headers $headers
 
 # The dark machine registered once and was then switched off. Its retained sensors
-# survive - and its session count is one of them, still reading 3.
+# survive - and so do its session entities, which is why removing it has to take them
+# with it.
+$darkSessionIds = @(
+    'e5f6a7b8-1111-2222-3333-444444444444'
+    'a1b2c3d4-5555-6666-7777-888888888888'
+    'c0ffee00-9999-aaaa-bbbb-cccccccccccc'
+)
+$darkNodes = @($darkSessionIds | ForEach-Object { Get-CopilotMqttNodeId -SessionId $_ })
+foreach ($darkSessionId in $darkSessionIds) {
+    Publish-CopilotMqttSession -SessionId $darkSessionId -SessionName 'Claude: old' `
+        -Machine $dark.Machine -Headers $headers | Out-Null
+}
 Publish-CopilotMqttMachineOnlineConfig -Slug $dark.Slug -MachineName $dark.Machine -Headers $headers
-Publish-CopilotMqttGlobalStatus -Sessions @(
-    [pscustomobject]@{ node = 'claude_eee555fff666'; name = 'Claude: old' }
-    [pscustomobject]@{ node = 'claude_ggg777hhh888'; name = 'Claude: older' }
-    [pscustomobject]@{ node = 'claude_iii999jjj000'; name = 'Claude: oldest' }
-) -Capabilities @{} -Slug $dark.Slug -MachineName $dark.Machine -Headers $headers
+Publish-CopilotMqttGlobalStatus -Sessions @($darkNodes | ForEach-Object {
+    [pscustomobject]@{ node = $_; name = 'Claude: old' }
+}) -Capabilities @{} -Slug $dark.Slug -MachineName $dark.Machine -Headers $headers
 Publish-CopilotMqttUpdate -InstalledVersion '1.17.1' -LatestVersion '1.17.1' -Slug $dark.Slug -Headers $headers
 
 function Get-LastPublishedPayload {
@@ -82,16 +91,28 @@ function Get-PublishedHaStates {
         The entity states Home Assistant would hold, built from the discovery configs
         and state payloads just captured - the same rules it applies: the entity id
         comes from domain plus object_id, payload_on/payload_off map a binary sensor,
-        an update entity's JSON state becomes its attributes, and a machine that has
-        published no heartbeat is unavailable because the sensor expires.
+        an update entity's JSON state becomes its attributes, a machine that has
+        published no heartbeat is unavailable because the sensor expires, and an empty
+        retained config withdraws the entity it declared.
     #>
     $states = @{}
+    # Which entity each config topic declared, so clearing that topic can take the
+    # right one away: the empty payload that withdraws it names nothing itself.
+    $declared = @{}
     foreach ($message in $script:Published) {
         if ($message.Topic -notmatch '^homeassistant/([a-z_]+)/[^/]+/[^/]+/config$') { continue }
         $domain = $Matches[1]
+        if ([string]::IsNullOrEmpty($message.Payload)) {
+            if ($declared.ContainsKey($message.Topic)) {
+                $states.Remove($declared[$message.Topic])
+                $declared.Remove($message.Topic)
+            }
+            continue
+        }
         $config = $message.Payload | ConvertFrom-Json
         if (-not $config.PSObject.Properties['object_id']) { continue }
         $entityId = "$domain.$($config.object_id)"
+        $declared[$message.Topic] = $entityId
 
         $raw = $null
         if ($config.PSObject.Properties['state_topic']) {
@@ -100,7 +121,7 @@ function Get-PublishedHaStates {
         $state = if ($null -eq $raw) { 'unavailable' } else { [string]$raw }
         $attributes = @{}
 
-        if ($domain -eq 'update' -and $null -ne $raw) {
+        if ($domain -eq 'update' -and -not [string]::IsNullOrWhiteSpace($raw)) {
             $body = $raw | ConvertFrom-Json
             foreach ($property in $body.PSObject.Properties) { $attributes[$property.Name] = $property.Value }
             $state = if ([string]$body.installed_version -ne [string]$body.latest_version) { 'on' } else { 'off' }
@@ -161,8 +182,10 @@ $sessions = @(
     [pscustomobject]@{ Node = 'copilot_ccc333ddd444'; Name = 'Copilot: another'; Machine = $live.Machine; Kind = 'copilot' }
 )
 $machines = @(
-    [pscustomobject]@{ Slug = $live.Slug; Machine = $live.Machine; Online = $true; IncludeProfile = $false; IncludeResume = $true; IncludeAgent = $true; IncludeDetailed = $true }
-    [pscustomobject]@{ Slug = $dark.Slug; Machine = $dark.Machine; Online = $false; IncludeProfile = $false; IncludeResume = $true; IncludeAgent = $false; IncludeDetailed = $false }
+    [pscustomobject]@{ Slug = $live.Slug; Machine = $live.Machine; Online = $true; IncludeProfile = $false; IncludeResume = $true; IncludeAgent = $true; IncludeDetailed = $true
+        SessionNodes = @($sessions | ForEach-Object { $_.Node }) }
+    [pscustomobject]@{ Slug = $dark.Slug; Machine = $dark.Machine; Online = $false; IncludeProfile = $false; IncludeResume = $true; IncludeAgent = $false; IncludeDetailed = $false
+        SessionNodes = @($darkNodes) }
 )
 Save-CopilotSessionDashboard -Sessions $sessions -Machines $machines `
     -MachineSelector 'input_select.agent_bridge_launch_machine' `
@@ -201,13 +224,14 @@ if (-not $nodeExe) {
 }
 
 function Invoke-StatusCard {
-    <# What the real card draws, and the service calls the given flips produce. #>
-    param([string[]]$Flips = @(), [bool]$Open = $true)
+    <# What the real card draws, and the service calls the given actions produce. #>
+    param([string[]]$Flips = @(), [string[]]$Forgets = @(), [bool]$Open = $true)
     $job = @{
-        config = $cardConfig
-        states = $haStates
-        open   = $Open
-        flips  = @($Flips)
+        config  = $cardConfig
+        states  = $haStates
+        open    = $Open
+        flips   = @($Flips)
+        forgets = @($Forgets)
     } | ConvertTo-Json -Depth 20 -Compress
     $out = $job | & $nodeExe.Source $driver
     if ($LASTEXITCODE -ne 0) { throw "the card driver exited with $LASTEXITCODE" }
@@ -256,6 +280,64 @@ Test-That 'through that helper''s own domain' {
 }
 Test-That 'and the switch ends up where the helper did' {
     @($flipped.rows | Where-Object { $_.machine -eq $live.Machine })[0].toggle.checked -eq $true
+}
+
+Write-Host ''
+Write-Host '--- and the X on a machine that is gone really removes it ---'
+# The machine here was renamed. Nothing on it will ever publish under the old name
+# again, so its row would read "offline" for good and its session entities would sit
+# in Home Assistant with nothing left to withdraw them.
+$darkForget = @(@($cardConfig.machines | Where-Object { $_.machine -eq $dark.Machine })[0].forget)
+
+Test-That 'the dashboard hands that row the topics to clear' { $darkForget.Count -gt 0 }
+Test-That 'they cover every discovery config the bridge published for it' {
+    # The list the card is given and the list the publishers use are two different
+    # files; this is what stops one of them growing an entity the other never clears.
+    $published = @($script:Published |
+        Where-Object { $_.Topic -match "^homeassistant/[a-z_]+/(agent_bridge_$($dark.Slug)|$($darkNodes -join '|'))/[^/]+/config$" } |
+        ForEach-Object { $_.Topic } | Sort-Object -Unique)
+    $published.Count -gt 0 -and @($published | Where-Object { $darkForget -notcontains $_ }).Count -eq 0
+} "missing=[$(@($script:Published | Where-Object { $_.Topic -match "^homeassistant/[a-z_]+/(agent_bridge_$($dark.Slug)|$($darkNodes -join '|'))/[^/]+/config$" } | ForEach-Object { $_.Topic } | Sort-Object -Unique | Where-Object { $darkForget -notcontains $_ }) -join ',')]"
+Test-That 'and nothing belonging to the machine that is still running' {
+    @($darkForget | Where-Object { $_ -match "$($live.Slug)|$(@($sessions | ForEach-Object { $_.Node }) -join '|')" }).Count -eq 0
+}
+
+$removed = Invoke-StatusCard -Forgets @($dark.Machine)
+Test-That 'the X was there to press' { @($removed.missing).Count -eq 0 } "missing=[$(@($removed.missing) -join ',')]"
+Test-That 'it is offered only on the machine that is not running' {
+    # Every row is given the topics - the card decides - but the control only appears
+    # on a machine that is not running, where the Detail switch has nothing to do.
+    $darkRow = @($removed.rows | Where-Object { $_.machine -eq $dark.Machine })[0]
+    $liveRow = @($removed.rows | Where-Object { $_.machine -eq $live.Machine })[0]
+    -not $darkRow.forget.hidden -and $liveRow.forget.hidden -and -not $liveRow.detail.hidden
+}
+Test-That 'the row goes without waiting for the daemon to rebuild the dashboard' {
+    @($removed.rows | Where-Object { $_.machine -eq $dark.Machine })[0].gone
+}
+Test-That 'every call it makes is an emptied, retained publish' {
+    @($removed.calls).Count -eq $darkForget.Count -and
+    @($removed.calls | Where-Object {
+        $_.domain -ne 'mqtt' -or $_.service -ne 'publish' -or $_.data.payload -ne '' -or -not $_.data.retain
+    }).Count -eq 0
+} "calls=$(@($removed.calls).Count) topics=$($darkForget.Count)"
+
+# Replayed through the same rules Home Assistant applies, which is the real question:
+# does pressing it actually make the machine go away?
+foreach ($call in @($removed.calls)) {
+    $script:Published.Add([pscustomobject]@{ Topic = [string]$call.data.topic; Payload = '' })
+}
+$afterStates = Get-PublishedHaStates
+
+Test-That 'Home Assistant is left with none of that machine entities' {
+    @($afterStates.Keys | Where-Object { $_ -match "agent_bridge_$($dark.Slug)_" }).Count -eq 0
+} "left=[$(@($afterStates.Keys | Where-Object { $_ -match "agent_bridge_$($dark.Slug)_" }) -join ',')]"
+Test-That 'nor any of the session cards it left behind' {
+    @($afterStates.Keys | Where-Object { $_ -match ($darkNodes -join '|') }).Count -eq 0
+} "left=[$(@($afterStates.Keys | Where-Object { $_ -match ($darkNodes -join '|') }) -join ',')]"
+Test-That 'and the machine that is still running is untouched' {
+    $afterStates.ContainsKey("sensor.agent_bridge_$($live.Slug)_sessions") -and
+    $afterStates.ContainsKey("binary_sensor.agent_bridge_$($live.Slug)_online") -and
+    $afterStates["binary_sensor.agent_bridge_$($live.Slug)_online"].state -eq 'on'
 }
 
 Write-Host ''

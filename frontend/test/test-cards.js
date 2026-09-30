@@ -220,13 +220,14 @@ check('the element is registered under its own name',
   /customElements\.define\('agent-bridge-choices-card'/.test(source));
 check('and offered in the card picker',
   sandbox.window.customCards.some((c) => c.type === 'agent-bridge-choices-card'));
-// The generator gates its newest card shape on 1.19.0. The card may run ahead of that
-// - a fix needing no new config key still has to change the version, because that is
-// what the resource URL is keyed on and an unchanged one is never re-served - but it
-// must never fall behind it, and a fix takes the patch place so that the next minor
-// is still free for the shape the generator will gate on.
+// The generator gates its newest card shape on 1.20.0 - the X on an offline machine's
+// row, and the topics that go with it. The card may run ahead of that - a fix needing
+// no new config key still has to change the version, because that is what the resource
+// URL is keyed on and an unchanged one is never re-served - but it must never fall
+// behind it, and a fix takes the patch place so that the next minor is still free for
+// the shape the generator will gate on.
 check('the card is at least the version the dashboard gates the card on',
-  cmpVersion(CARD_VERSION, '1.19.0') >= 0, CARD_VERSION);
+  cmpVersion(CARD_VERSION, '1.20.0') >= 0, CARD_VERSION);
 check('"decision" is required', (() => {
   try { new AgentBridgeChoicesCard().setConfig({}); return false; } catch (e) { return /decision/.test(e.message); }
 })());
@@ -625,6 +626,84 @@ check('folded it asks for less room than opened', (() => {
   return folded.getCardSize() < scard.getCardSize();
 })());
 
+console.log('--- removing a machine that is never coming back ---');
+/*
+ * A machine that was renamed, reimaged or thrown away never withdraws its own
+ * entities, so its row sat on the dashboard reading "offline" for good. The X clears
+ * the retained topics the dashboard handed the card, which is exactly what an
+ * uninstall on that machine would have published.
+ */
+const GONE = {
+  machine: 'CPC-OLD-NAME',
+  online: 'binary_sensor.agent_bridge_gone_online',
+  sessions: 'sensor.agent_bridge_gone_sessions',
+  version: 'update.agent_bridge_gone_update',
+  detailed: 'input_boolean.agent_bridge_gone_detailed_activity',
+  forget: [
+    'homeassistant/sensor/agent_bridge_gone/sessions/config',
+    'homeassistant/binary_sensor/agent_bridge_gone/online/config',
+    'copilot/cli/machine/gone/global/state',
+  ],
+};
+const goneStates = () => statusStates({
+  [GONE.online]: { state: 'off', attributes: {} },
+  [GONE.sessions]: { state: '2', attributes: {} },
+  [GONE.version]: { state: 'off', attributes: { installed_version: '1.19.0' } },
+  [GONE.detailed]: { state: 'on', attributes: {} },
+});
+
+const goneEnv = statusCard({ machines: [HOME, GONE], decisions: [] }, goneStates());
+const goneRow = goneEnv.card._rows[1];
+check('an offline machine is given an X', goneRow.forget !== null && goneRow.forget.hidden === false);
+check('and its Detail switch steps aside for it', goneRow.detail.hidden === true);
+check('a machine that is running keeps its switch and is shown no X',
+  goneEnv.card._rows[0].detail.hidden === false && goneEnv.card._rows[0].forget === null);
+check('an offline machine the dashboard gave no topics for keeps its switch',
+  statusCard({ machines: [Object.assign({}, MBP, { detailed: 'input_boolean.agent_bridge_mbp_detailed_activity' })], decisions: [] },
+    statusStates({ 'input_boolean.agent_bridge_mbp_detailed_activity': { state: 'off', attributes: {} } })).card
+    ._rows[0].detail.hidden === false);
+
+goneRow.forgetButton.click();
+check('one tap only asks', goneEnv.calls.length === 0 && goneRow.forgetButton.textContent === 'Remove?',
+  `${goneEnv.calls.length} call(s), label [${goneRow.forgetButton.textContent}]`);
+check('and marks the button as asking', goneRow.forgetButton.classList.contains('confirm'));
+
+// An online machine has nothing to remove, and a render that finds one running puts
+// the question away rather than leaving it armed behind the row.
+const armedThenBack = statusCard({ machines: [GONE], decisions: [] }, goneStates());
+armedThenBack.card._rows[0].forgetButton.click();
+armedThenBack.hass.states[GONE.online] = { state: 'on', attributes: {} };
+armedThenBack.card.hass = armedThenBack.hass;
+check('a machine that comes back disarms its own X',
+  armedThenBack.card._rows[0].forget.hidden === true &&
+  armedThenBack.card._rows[0].forgetButton.textContent === '');
+
+// Awaited by the block at the end of this file, so its checks cannot race the
+// summary that decides the exit code.
+async function checkForgetRemoval() {
+  await goneEnv.card._forget(goneRow);
+  check('the second tap clears every topic the dashboard listed',
+    goneEnv.calls.length === GONE.forget.length &&
+    goneEnv.calls.every((c) => c.domain === 'mqtt' && c.service === 'publish'),
+    JSON.stringify(goneEnv.calls.map((c) => `${c.domain}.${c.service}`)));
+  check('each one emptied and retained, which is how a retained topic is withdrawn',
+    goneEnv.calls.every((c) => c.data.payload === '' && c.data.retain === true),
+    JSON.stringify(goneEnv.calls.map((c) => c.data)));
+  check('and in the order the dashboard gave them',
+    goneEnv.calls.map((c) => c.data.topic).join('|') === GONE.forget.join('|'));
+  check('the row goes at once rather than waiting for the rebuild', goneRow.row.hidden === true);
+
+  // Home Assistant can refuse - no MQTT integration, a token that may not publish -
+  // and a row that vanished on a failed removal would be a lie.
+  const failEnv = statusCard({ machines: [GONE], decisions: [] }, goneStates());
+  failEnv.hass.callService = () => { throw new Error('no mqtt here'); };
+  const failRow = failEnv.card._rows[0];
+  failRow.forgetButton.click();
+  await failEnv.card._forget(failRow);
+  check('a removal that fails says so and leaves the row alone',
+    failRow.row.hidden === false && failRow.forgetButton.textContent === 'Failed');
+}
+
 check('the element is registered under its own name',
   /customElements\.define\('agent-bridge-status-card'/.test(source));
 check('and offered in the card picker',
@@ -635,6 +714,8 @@ check('"machines" is required', (() => {
 
 // _launch awaits its service calls, so the checks that read them have to await it too.
 (async () => {
+  await checkForgetRemoval();
+
   const pubEnv = launchEnv({});
   const pubCard = promptCard(pubEnv, { promptTopic: PROMPT_TOPIC });
   pubCard.shadowRoot.querySelector('textarea[data-key="prompt"]').value = LONG_PROMPT;

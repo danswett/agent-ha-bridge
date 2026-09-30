@@ -198,6 +198,77 @@ function Clear-CopilotMqttOrphans {
     }
 }
 
+$script:DaemonStaleHelperSeen = @{}
+
+function Clear-DaemonStaleMachineHelper {
+    <#
+        Deletes a Detailed activity switch whose machine is no longer registered.
+
+        The switch is a Home Assistant helper, not an MQTT entity, so clearing a
+        machine's retained topics - which is what the X on its row does, straight from
+        the browser - cannot take it with them. Left behind it is a switch named after
+        a machine that appears nowhere else, and nothing would ever come back for it.
+
+        A helper has to look stale twice before it goes, and only when the snapshot
+        shows machines at all. A machine creates its switch at startup and publishes
+        its sensors moments later, and a Home Assistant that has restarted takes a
+        while to restore every retained discovery message - so a single snapshot
+        showing a helper with no machine proves nothing. Deleting a live machine's
+        switch is far worse than leaving a dead one for another reconcile: only its own
+        daemon creates it, so it would stay gone until that machine restarted.
+
+        Returns how many were removed.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Machines,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $known = @($Machines | ForEach-Object { [string]$_.Slug } | Where-Object { $_ })
+    if ($known.Count -eq 0) { return 0 }
+
+    try { $states = Get-DaemonHomeAssistantStates -Headers $Headers }
+    catch { return 0 }
+
+    # The same fail-safe the orphan sweep uses: no machine sensor in the whole list
+    # means the picture is incomplete - MQTT not restored yet, most likely - and not
+    # that every machine has gone.
+    if (-not @($states | Where-Object {
+        $null -ne $_ -and [string]$_.entity_id -match '^sensor\.agent_bridge_[a-z0-9_]+_sessions$'
+    }).Count) {
+        return 0
+    }
+
+    $stale = @{}
+    $removed = 0
+    foreach ($state in @($states)) {
+        if ($null -eq $state) { continue }
+        # The unscoped helper from before the switch was per-machine is
+        # `input_boolean.agent_bridge_detailed_activity`, with no slug between the two
+        # halves, so it can never match this and is left where it is.
+        if ([string]$state.entity_id -notmatch '^input_boolean\.agent_bridge_(.+)_detailed_activity$') { continue }
+        $slug = $Matches[1]
+        if ($known -contains $slug) { continue }
+
+        $stale[$slug] = $true
+        if (-not $script:DaemonStaleHelperSeen.ContainsKey($slug)) { continue }
+
+        try {
+            if (Remove-CopilotVerboseToggle -HelperId "agent_bridge_${slug}_detailed_activity") {
+                $removed++
+                Write-DaemonLog -Message "removed the Detailed activity switch for $slug, which is no longer registered"
+            }
+        }
+        catch {
+            Write-DaemonLog -Message "could not remove the Detailed activity switch for $slug : $($_.Exception.Message)"
+        }
+    }
+    # Only what still looks stale is carried forward, so a machine that came back
+    # starts from scratch rather than being one pass from losing its switch.
+    $script:DaemonStaleHelperSeen = $stale
+    $removed
+}
+
 function Invoke-DaemonLegacyCleanup {
     <#
         Sweeps the entities published under the pre-rename ids, once.
@@ -833,10 +904,15 @@ function Get-DaemonMachineCards {
     <#
         Every registered machine with the launch rows its card should show: this one
         from its own capabilities, the others from what their global status reports.
+
+        Each carries the session nodes it is running, too. They are not drawn anywhere;
+        they are what the X on an offline machine's row has to clear along with the
+        machine's own controls, and only the machine's retained sensor knows them.
     #>
     param(
         [Parameter(Mandatory)][hashtable]$Capabilities,
-        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Peers
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Peers,
+        [AllowEmptyCollection()][string[]]$LocalSessionNodes = @()
     )
 
     $machineCards = @(
@@ -860,6 +936,7 @@ function Get-DaemonMachineCards {
             # and saying so here means the launch picker is never empty while its own
             # heartbeat sensor is still being created.
             Online = $true
+            SessionNodes = @($LocalSessionNodes)
         }
     )
     foreach ($peer in $Peers) {
@@ -902,6 +979,18 @@ function Get-DaemonMachineCards {
             IncludeDetailed = $peerDetailed
             IsDev = $peerDev
             Online = [bool]$peer.Online
+            # Whatever it was running when it last reported. For a machine that is gone
+            # these are precisely the entities nothing else will ever withdraw.
+            #
+            # Read through PSObject rather than directly: a peer built by hand - which
+            # every older caller and several suites do - has no such property at all,
+            # and StrictMode makes reading one a terminating error.
+            SessionNodes = @(
+                if ($peer.PSObject.Properties['Sessions']) {
+                    @($peer.Sessions) | ForEach-Object { [string]$_.node } |
+                        Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+                }
+            )
         }
     }
     # Stable order, so two machines rebuilding independently generate byte-identical
@@ -967,7 +1056,14 @@ function Sync-DaemonDashboard {
 
     $peers = @(Get-DaemonPeerMachines -Headers $Headers)
     $allDescriptors = @(Get-DaemonAllDescriptors -Descriptors $Descriptors -Peers $peers)
-    $machineCards = @(Get-DaemonMachineCards -Capabilities $Capabilities -Peers $peers)
+    $machineCards = @(Get-DaemonMachineCards -Capabilities $Capabilities -Peers $peers `
+        -LocalSessionNodes @($Descriptors | ForEach-Object { [string]$_.Node }))
+
+    # A machine removed from the dashboard leaves its Detailed activity switch behind,
+    # because that one is a helper rather than a retained topic. Cheap unless something
+    # is actually stale, and self-healing however the machine went.
+    try { [void](Clear-DaemonStaleMachineHelper -Machines $machineCards -Headers $Headers) }
+    catch { Write-DaemonLog -Message "stale switch sweep failed: $($_.Exception.Message)" }
 
     # Only machines that are actually running can start a session, so the picker lists
     # those. Every registered machine still appears in the machines card, online or

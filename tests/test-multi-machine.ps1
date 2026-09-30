@@ -594,6 +594,30 @@ Test-That 'a machine with no liveness sensor at all reads as offline' {
 
 Write-Host '--- withdrawing one machine leaves the others alone ---'
 
+# Everything a machine publishes once, published for real, so the list that withdraws
+# them can be checked against it rather than against itself. This is how a dead
+# permissions selector came to be left behind in Home Assistant: the selector was
+# added to the launch card and nobody added it here, and nothing noticed until a
+# machine was actually removed from a live dashboard.
+$script:Published = @()
+Publish-CopilotMqttMachineOnlineConfig -Slug 'laptop' -MachineName 'LAPTOP' -Headers @{}
+Publish-CopilotMqttGlobalStatus -Slug 'laptop' -MachineName 'LAPTOP' -Headers @{} `
+    -Capabilities @{ newSession = $true } -Sessions @()
+Publish-CopilotMqttUpdate -InstalledVersion '1.19.0' -LatestVersion '1.20.0' -Slug 'laptop' -Headers @{}
+Publish-CopilotMqttNewSession -Slug 'laptop' -Headers @{} `
+    -Workspaces @([pscustomobject]@{ Label = 'repo'; Path = 'C:\repo' }) `
+    -Profiles @('default') -Resumable @([pscustomobject]@{ Label = 'a session' }) `
+    -Agents @('Copilot') -Tuning @{ model = @('Agent default'); effort = @('Agent default'); context = @('Agent default') }
+
+$publishedConfigs = @($script:Published | Where-Object { $_.Topic -match '/config$' } |
+    ForEach-Object { $_.Topic } | Sort-Object -Unique)
+$machineTopics = @(Get-CopilotMqttMachineTopic -Slug 'laptop')
+
+Test-That 'every entity a machine publishes is on the list that withdraws it' {
+    $publishedConfigs.Count -gt 10 -and
+    @($publishedConfigs | Where-Object { $machineTopics -notcontains $_ }).Count -eq 0
+} "missing=[$(@($publishedConfigs | Where-Object { $machineTopics -notcontains $_ }) -join ',')]"
+
 $script:Published = @()
 [void](Remove-CopilotMqttMachineEntities -Slug 'laptop' -Headers @{})
 $cleared = @($script:Published | Where-Object { $_.Payload -eq '' } | ForEach-Object { $_.Topic })
@@ -712,6 +736,136 @@ Test-That 'an incomplete picture skips the sweep rather than guessing' {
     # Deleting a running machine's entities is far worse than leaving a dead session
     # a little longer; the sweep runs again on the next start.
     @($script:Swept).Count -eq 0 -and @($script:SweepLog | Where-Object { $_ -match 'skipped' }).Count -eq 1
+}
+
+Write-Host '--- taking a machine that is never coming back off the dashboard ---'
+
+# A machine that was renamed, reimaged or thrown away never publishes under its old
+# name again, so nothing it left behind is ever withdrawn: its row reads "offline"
+# for good and its session entities stay in Home Assistant. The X on the row clears
+# the topics the dashboard handed the card, and the two pieces below are what make
+# that list complete - the sessions it was running, and the switch that is not a
+# topic at all.
+
+$forgetPeers = @(Get-BridgePeerMachine -ExcludeSelf -States @(
+    (New-MachineState -Slug 'oldbox' -Machine 'OLD-BOX' -Capabilities @{ detailed = $true } -Sessions @(
+        [pscustomobject]@{ name = 'Claude: gone'; machine = 'OLD-BOX'; node = 'agent_bridge_2222222222222222'; kind = 'claude' }
+    ))
+))
+$forgetCards = @(Get-DaemonMachineCards -Capabilities @{ profile = $false; resume = $true; agent = $false } `
+    -Peers $forgetPeers -LocalSessionNodes @('agent_bridge_1111111111111111'))
+
+Test-That 'a peer card carries the sessions its retained sensor still lists' {
+    $peerCard = @($forgetCards | Where-Object { $_.Slug -eq 'oldbox' })[0]
+    (@($peerCard.SessionNodes) -join ',') -eq 'agent_bridge_2222222222222222'
+}
+Test-That 'and this machine card carries its own' {
+    $selfCard = @($forgetCards | Where-Object { $_.Slug -eq $selfSlug })[0]
+    (@($selfCard.SessionNodes) -join ',') -eq 'agent_bridge_1111111111111111'
+}
+Test-That 'a peer running nothing carries an empty list rather than nothing at all' {
+    $bare = @(Get-DaemonMachineCards -Capabilities @{ profile = $false; resume = $false; agent = $false } `
+        -Peers @(Get-BridgePeerMachine -ExcludeSelf -States @((New-MachineState -Slug 'quiet' -Machine 'QUIET'))))
+    @(@($bare | Where-Object { $_.Slug -eq 'quiet' })[0].SessionNodes).Count -eq 0
+}
+Test-That 'and a peer built without a session list at all does not throw' {
+    # Several suites, and every caller older than this, build peer objects by hand;
+    # StrictMode turns reading a property they never set into a terminating error.
+    $handmade = @(Get-DaemonMachineCards -Capabilities @{ profile = $false; resume = $false; agent = $false } `
+        -Peers @([pscustomobject]@{ Slug = 'handmade'; Machine = 'HANDMADE'; Online = $true; Capabilities = $null }))
+    @(@($handmade | Where-Object { $_.Slug -eq 'handmade' })[0].SessionNodes).Count -eq 0
+}
+Test-That 'the topics to clear are the machine own, plus its sessions' {
+    $peerCard = @($forgetCards | Where-Object { $_.Slug -eq 'oldbox' })[0]
+    $topics = @(Get-BridgeMachineForgetTopic -Slug $peerCard.Slug -SessionNodes $peerCard.SessionNodes)
+    ($topics -contains 'homeassistant/sensor/agent_bridge_oldbox/sessions/config') -and
+    ($topics -contains 'homeassistant/binary_sensor/agent_bridge_oldbox/online/config') -and
+    ($topics -contains 'homeassistant/button/agent_bridge_2222222222222222/stop/config') -and
+    ($topics -contains 'copilot/cli/agent_bridge_2222222222222222/available')
+}
+Test-That 'and nothing belonging to any other machine' {
+    $peerCard = @($forgetCards | Where-Object { $_.Slug -eq 'oldbox' })[0]
+    @(@(Get-BridgeMachineForgetTopic -Slug $peerCard.Slug -SessionNodes $peerCard.SessionNodes) |
+        Where-Object { $_ -match "$selfSlug|1111111111111111" }).Count -eq 0
+}
+Test-That 'a machine with no sessions still has its own controls cleared' {
+    @(Get-BridgeMachineForgetTopic -Slug 'oldbox').Count -eq @(Get-CopilotMqttMachineTopic -Slug 'oldbox').Count
+}
+
+# The Detailed activity switch is a Home Assistant helper, not a retained topic, so
+# clearing the topics cannot take it with them. It is swept by whichever daemon
+# notices that its machine is no longer registered.
+$script:DeletedHelpers = @()
+function Remove-CopilotVerboseToggle {
+    param([string]$HelperId = 'agent_bridge_detailed_activity')
+    $script:DeletedHelpers += $HelperId
+    $true
+}
+$script:DaemonStatesCache = @(
+    (New-MachineState -Slug 'stillhere' -Machine 'STILL-HERE'),
+    [pscustomobject]@{ entity_id = 'input_boolean.agent_bridge_stillhere_detailed_activity'; state = 'on'; attributes = [pscustomobject]@{} },
+    [pscustomobject]@{ entity_id = 'input_boolean.agent_bridge_oldbox_detailed_activity'; state = 'on'; attributes = [pscustomobject]@{} },
+    # The unscoped helper from before the switch was per-machine.
+    [pscustomobject]@{ entity_id = 'input_boolean.agent_bridge_detailed_activity'; state = 'off'; attributes = [pscustomobject]@{} }
+)
+$script:DaemonStatesCacheAt = [DateTimeOffset]::Now
+$script:DaemonStaleHelperSeen = @{}
+$known = @([pscustomobject]@{ Slug = 'stillhere' })
+
+$firstPass = Clear-DaemonStaleMachineHelper -Machines $known -Headers @{}
+Test-That 'a switch with no machine is not deleted the first time it is seen' {
+    # A machine creates its switch at startup and publishes its sensors moments
+    # later, so a snapshot taken in between shows a helper with no machine.
+    $firstPass -eq 0 -and @($script:DeletedHelpers).Count -eq 0
+}
+$secondPass = Clear-DaemonStaleMachineHelper -Machines $known -Headers @{}
+Test-That 'and is deleted once it still looks stale a pass later' {
+    $secondPass -eq 1 -and (@($script:DeletedHelpers) -join ',') -eq 'agent_bridge_oldbox_detailed_activity'
+}
+Test-That 'a registered machine switch is never touched' {
+    @($script:DeletedHelpers | Where-Object { $_ -match 'stillhere' }).Count -eq 0
+}
+Test-That 'nor the unscoped one from before the switch was per-machine' {
+    @($script:DeletedHelpers | Where-Object { $_ -eq 'agent_bridge_detailed_activity' }).Count -eq 0
+}
+
+$script:DeletedHelpers = @()
+$script:DaemonStaleHelperSeen = @{}
+[void](Clear-DaemonStaleMachineHelper -Machines @() -Headers @{})
+[void](Clear-DaemonStaleMachineHelper -Machines @() -Headers @{})
+Test-That 'knowing of no machine at all sweeps nothing rather than everything' {
+    # A failed read must never be mistaken for "nobody is here" - that would take the
+    # Detail switch away from every machine at once.
+    @($script:DeletedHelpers).Count -eq 0
+}
+
+$script:DeletedHelpers = @()
+$script:DaemonStaleHelperSeen = @{}
+$script:DaemonStatesCache = @(
+    [pscustomobject]@{ entity_id = 'input_boolean.agent_bridge_oldbox_detailed_activity'; state = 'on'; attributes = [pscustomobject]@{} }
+)
+$script:DaemonStatesCacheAt = [DateTimeOffset]::Now
+[void](Clear-DaemonStaleMachineHelper -Machines $known -Headers @{})
+[void](Clear-DaemonStaleMachineHelper -Machines $known -Headers @{})
+Test-That 'a snapshot with no machine sensors in it is treated as incomplete' {
+    # Home Assistant takes a while to restore every retained discovery message after a
+    # restart. Only the machine's own daemon creates its switch, so one deleted while
+    # MQTT was still coming back would stay gone until that machine restarted.
+    @($script:DeletedHelpers).Count -eq 0
+}
+
+$script:DeletedHelpers = @()
+$script:DaemonStaleHelperSeen = @{}
+$script:DaemonStatesCache = @(
+    (New-MachineState -Slug 'stillhere' -Machine 'STILL-HERE'),
+    [pscustomobject]@{ entity_id = 'input_boolean.agent_bridge_oldbox_detailed_activity'; state = 'on'; attributes = [pscustomobject]@{} }
+)
+$script:DaemonStatesCacheAt = [DateTimeOffset]::Now
+[void](Clear-DaemonStaleMachineHelper -Machines $known -Headers @{})
+[void](Clear-DaemonStaleMachineHelper -Machines @($known + [pscustomobject]@{ Slug = 'oldbox' }) -Headers @{})
+[void](Clear-DaemonStaleMachineHelper -Machines $known -Headers @{})
+Test-That 'a machine that comes back starts again from the first pass' {
+    @($script:DeletedHelpers).Count -eq 0
 }
 
 Write-Host '--- holding the window open when Windows owns the console ---'
