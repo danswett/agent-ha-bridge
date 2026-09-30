@@ -35,6 +35,7 @@ if (-not $ResultsDirectory) {
 $ResultsDirectory = [IO.Path]::GetFullPath($ResultsDirectory)
 if (Test-Path -LiteralPath $ResultsDirectory) { throw "Use a new results directory; refusing to overwrite $ResultsDirectory" }
 [void][IO.Directory]::CreateDirectory($ResultsDirectory)
+[IO.File]::WriteAllText((Join-Path $ResultsDirectory '.bridge-test-results'), '')
 
 Write-Host "$Group suites: $($suites.Count). Logs: $ResultsDirectory"
 if ($Group -eq 'Offline') { Write-Host 'Excluded by design: Host (installer), Platform (terminal delivery), Integration (live Home Assistant).' }

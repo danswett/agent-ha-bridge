@@ -102,6 +102,7 @@ $repoRoot = $PSScriptRoot
 # Join-Path accept the Windows separators used throughout.
 . (Join-Path $repoRoot 'hooks/bridge-platform.ps1')
 . (Join-Path $repoRoot 'hooks/bridge-native-hook.ps1')
+. (Join-Path $repoRoot 'hooks/bridge-test-guard.ps1')
 $installHome = if ($TargetHome) { $TargetHome } else { $HOME }
 
 # The VERSION file is the single source of truth, so the Apps & features entry, the
@@ -746,8 +747,8 @@ function Test-BridgeHomeAssistantConnection {
         Confirms that a URL and token really do talk to Home Assistant, and reports
         enough to show the user what they just connected to.
 
-        Always returns an object rather than throwing, so the caller can offer another
-        go at the token instead of ending the install on a typo.
+        Connection failures return an object, so the caller can offer another go at
+        the token. A violated offline-test boundary throws instead.
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$BaseUrl,
@@ -769,6 +770,7 @@ function Test-BridgeHomeAssistantConnection {
     if ([string]::IsNullOrWhiteSpace($Token)) { $result.Error = 'no Home Assistant token'; return $result }
 
     $headers = @{ Authorization = "Bearer $Token"; 'Content-Type' = 'application/json' }
+    Assert-BridgeHttpAllowed -Uri "$base/api/"
     try {
         $api = Invoke-RestMethod -Uri "$base/api/" -Headers $headers -TimeoutSec $TimeoutSec
         $result.Message = [string]$api.message
@@ -781,6 +783,7 @@ function Test-BridgeHomeAssistantConnection {
 
     # Cosmetic, but it is what turns "it worked" into "it worked, and this is the
     # Home Assistant you are now attached to".
+    Assert-BridgeHttpAllowed -Uri "$base/api/config"
     try {
         $haConfig = Invoke-RestMethod -Uri "$base/api/config" -Headers $headers -TimeoutSec $TimeoutSec
         $result.Version = [string]$haConfig.version
@@ -790,6 +793,7 @@ function Test-BridgeHomeAssistantConnection {
 
     # The MQTT integration is the one prerequisite the bridge cannot provision itself:
     # every per-session entity is published through the mqtt.publish service.
+    Assert-BridgeHttpAllowed -Uri "$base/api/services"
     try {
         $services = Invoke-RestMethod -Uri "$base/api/services" -Headers $headers -TimeoutSec ($TimeoutSec + 5)
         $mqtt = @($services) | Where-Object { $_.domain -eq 'mqtt' }
@@ -813,9 +817,9 @@ function Get-BridgeHomeAssistantUser {
         authenticates as.
 
         WebSocket rather than REST because Home Assistant offers this nowhere else.
-        Always returns an object rather than throwing: a rejected token is an ordinary
+        Connection failures return an object: a rejected token is an ordinary
         outcome here - it is exactly what a revoked or half-pasted one looks like -
-        and the caller offers another go.
+        and the caller offers another go. Test-boundary violations still throw.
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$BaseUrl,
@@ -828,6 +832,7 @@ function Get-BridgeHomeAssistantUser {
     if ([string]::IsNullOrWhiteSpace($Token)) { $result.Error = 'no token'; return $result }
 
     $wsUrl = (([string]$BaseUrl).TrimEnd('/') -replace '^http', 'ws') + '/api/websocket'
+    Assert-BridgeHttpAllowed -Uri $wsUrl -Transport WebSocket
     $ws = $null
     try {
         $cancel = [Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds($TimeoutSec))
@@ -1216,6 +1221,7 @@ function Test-IsHomeAssistant {
     #>
     param([Parameter(Mandatory)][string]$BaseUrl, [int]$TimeoutSec = 4)
 
+    Assert-BridgeHttpAllowed -Uri "$($BaseUrl.TrimEnd('/'))/manifest.json" -Transport WebRequest
     try {
         $response = Invoke-WebRequest -Uri "$($BaseUrl.TrimEnd('/'))/manifest.json" `
             -TimeoutSec $TimeoutSec -SkipHttpErrorCheck -ErrorAction Stop
@@ -1240,6 +1246,7 @@ function Get-BridgeHomeAssistantCandidate {
     param([scriptblock]$Resolver)
 
     if (-not $Resolver) {
+        Assert-BridgeHttpAllowed -Uri 'homeassistant.local' -Transport Discovery
         $Resolver = {
             # [System.Net.Dns] rather than Resolve-DnsName: that cmdlet ships only with
             # Windows, so on a Mac the lookup threw and every address candidate was
@@ -1668,8 +1675,8 @@ function Invoke-BridgeFrontendCardCheck {
         install just wrote, so a -TargetHome sandbox checks its own settings rather
         than the real install's.
 
-        Never throws: a dashboard prerequisite is worth reporting, not worth failing
-        an otherwise good install over.
+        Ordinary checker failures are reported without failing an otherwise good
+        install. Test-boundary violations fail before launching the child.
     #>
     param(
         [Parameter(Mandatory)][string]$HooksDir,
@@ -1679,6 +1686,7 @@ function Invoke-BridgeFrontendCardCheck {
 
     $checker = Join-Path $HooksDir 'bridge-frontend-cards.ps1'
     if (-not (Test-Path -LiteralPath $checker)) { return $false }
+    Assert-BridgeHttpAllowed -Transport ChildProcess
 
     $pwsh = Join-Path $PSHOME 'pwsh.exe'
     if (-not (Test-Path -LiteralPath $pwsh)) { $pwsh = 'pwsh' }

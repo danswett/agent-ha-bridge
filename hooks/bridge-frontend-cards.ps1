@@ -46,6 +46,7 @@ param(
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'bridge-test-guard.ps1')
 
 # HACS serves everything it downloads from /hacsfiles/<repository name>/. The file
 # name is what the resource URL has to end with, and is what identifies the card
@@ -117,6 +118,7 @@ function Get-BridgeFrontendCardStatus {
         $FileProbe = {
             param($relativeUrl)
             $base = ([string]$script:DecisionBridgeConfig.HomeAssistantBaseUrl).TrimEnd('/')
+            Assert-BridgeHttpAllowed -Uri "$base$relativeUrl" -Transport WebRequest
             try {
                 $response = Invoke-WebRequest -Uri "$base$relativeUrl" -TimeoutSec 8 `
                     -SkipHttpErrorCheck -ErrorAction Stop
@@ -129,7 +131,10 @@ function Get-BridgeFrontendCardStatus {
     $resourceList = @()
     $resourcesRead = $true
     try { $resourceList = @(& $Resources) }
-    catch { $resourcesRead = $false }
+    catch {
+        if ($_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        $resourcesRead = $false
+    }
 
     $records = @()
     foreach ($name in $script:BridgeFrontendCards.Keys) {
@@ -147,7 +152,10 @@ function Get-BridgeFrontendCardStatus {
         $served = $false
         if (-not $registered) {
             try { $served = [bool](& $FileProbe $card.HacsPath) }
-            catch { $served = $false }
+            catch {
+                if ($_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+                $served = $false
+            }
         }
 
         $records += [pscustomobject]@{
@@ -189,7 +197,10 @@ function Register-BridgeFrontendCard {
         [void](& $Invoker @(@{ type = 'lovelace/resources/create'; res_type = 'module'; url = $Url }))
         return $true
     }
-    catch { return $false }
+    catch {
+        if ($_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        return $false
+    }
 }
 
 function Get-BridgeReplyCardState {
@@ -216,6 +227,7 @@ function Get-BridgeReplyCardState {
         $FileProbe = {
             param($relativeUrl)
             $base = ([string]$script:DecisionBridgeConfig.HomeAssistantBaseUrl).TrimEnd('/')
+            Assert-BridgeHttpAllowed -Uri "$base$relativeUrl" -Transport WebRequest
             try {
                 $response = Invoke-WebRequest -Uri "$base$relativeUrl" -TimeoutSec 8 `
                     -SkipHttpErrorCheck -ErrorAction Stop
@@ -248,6 +260,7 @@ function Get-BridgeReplyCardState {
         }
     }
     catch {
+        if ($_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
         # Unreadable: say so rather than reporting the card as missing, which would
         # send an install off to rewrite a file that is probably already correct.
         $state.Readable = $false
@@ -258,7 +271,11 @@ function Get-BridgeReplyCardState {
         # An inline card is its own content; there is no file behind it to go missing.
         if ($state.Url.StartsWith('data:')) { $state.Served = $true }
         else {
-            try { $state.Served = [bool](& $FileProbe ($state.Url)) } catch { $state.Served = $false }
+            try { $state.Served = [bool](& $FileProbe ($state.Url)) }
+            catch {
+                if ($_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+                $state.Served = $false
+            }
         }
     }
 
@@ -417,6 +434,7 @@ function Install-BridgeReplyCard {
         $result.Ok = $true
     }
     catch {
+        if ($_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
         $result.Detail = "could not register the resource: $($_.Exception.Message)"
         if ($present) { $result.Ok = $true; $result.Action = 'kept' }
     }
@@ -426,6 +444,7 @@ function Install-BridgeReplyCard {
 
 # Dot-sourced for the functions alone; a real run never sets this.
 if ($env:BRIDGE_FRONTEND_NORUN) { return }
+Assert-BridgeHttpAllowed -Transport ChildProcess
 
 . (Join-Path $PSScriptRoot 'decision-bridge-common.ps1')
 . (Join-Path $PSScriptRoot 'decision-mqtt.ps1')

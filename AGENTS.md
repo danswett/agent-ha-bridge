@@ -97,12 +97,26 @@ same command; new suites must be classified there or the runner fails:
 pwsh -NoProfile -File tests\run-tests.ps1
 ```
 
+Inventory discovers `test-*.ps1` throughout the checkout, including new components
+and nested directories. It prunes `.git`, `node_modules`, `vendor`, `.venv`, `venv`,
+`fixtures`, `__fixtures__`, `test-results`, `TestResults`, `coverage`, and `dist` at
+any depth, plus runner output marked by `.bridge-test-results`. It never follows
+symbolic links or junctions, including linked suite files. Excluded trees cannot be
+made executable by adding them to the manifest. Use either path separator in the
+manifest or selectors; duplicate canonical paths are rejected.
+
 Each suite gets a fresh process, HOME, TEMP, config, AppData and client roots. Only a
 small OS/tool environment allowlist is inherited, not credentials or HTTP opt-ins.
 Console input/output and pipelines use UTF-8. The offline guard also applies in child
 processes; mock transports before calling code that uses them. Do not defeat that
 guard, read installed helpers, or add real client/installer execution to Offline.
 This is isolation for reviewed tests, not an OS sandbox for arbitrary scripts.
+Installer helpers share that configuration-free guard. Stub the actual transport:
+`Invoke-RestMethod` does not replace `Invoke-WebRequest`, WebSockets, DNS discovery,
+or a checker subprocess. A guard violation must propagate, not become an ordinary
+connection failure or a successful cosmetic fallback.
+Manual suite detection uses the `test-*.ps1` entry filename, not an ancestor folder
+named `tests`; ordinary installer/runtime scripts in such a checkout remain normal.
 
 The runner retains logs and `summary.json` in the printed results directory, reports
 skips explicitly, and fails on a nonzero suite exit or timeout (180 seconds per suite).
@@ -115,6 +129,9 @@ They require `-Group Host` or `-Group Platform`, `-AllowHostTests`, and a dispos
 GitHub-hosted runner; developer and self-hosted machines are refused. Host tests use
 unique `-TestRegistryId` namespaces and loopback fixtures, but `-TargetHome` still
 does not isolate every installer side effect. Never run that suite locally.
+The Host runner alone permits its fixed connection-refused endpoint,
+`http://127.0.0.1:1` (and the matching WebSocket endpoint); it never permits LAN
+discovery. Supply the fixture URL explicitly to avoid discovery during reconfigure.
 `Integration` is inventory-only here: those suites require a separately provisioned,
 disposable Home Assistant and an explicit `BRIDGE_ALLOW_TEST_HTTP=1` outside this
 runner. They are not part of CI or the safe offline command.

@@ -21,6 +21,7 @@
 # Windows/macOS differences (the temporary folder, process lookups, tmux), first so
 # everything below can rely on them.
 . (Join-Path $PSScriptRoot 'bridge-platform.ps1')
+. (Join-Path $PSScriptRoot 'bridge-test-guard.ps1')
 
 # The three per-launch settings the dashboard can set on a new session, in the order
 # it shows them. Kept here, with the rest of the shared vocabulary, because three
@@ -512,71 +513,6 @@ function Set-DecisionBridgeDeadline {
 function Get-DecisionBridgeRemainingSeconds {
     if ($null -eq $script:DecisionBridgeDeadline) { return [double]::PositiveInfinity }
     [Math]::Max(0, ($script:DecisionBridgeDeadline - [DateTimeOffset]::Now).TotalSeconds)
-}
-
-# Armed at load. When a test suite dot-sources this file the suite's own script is on
-# the call stack; the daemon, the hooks and the installer are not. Detected that way
-# rather than from an environment variable so it covers a suite run by hand, which is
-# how the run that caused the ban below was started.
-$script:BridgeUnderTestSuite = $false
-$script:BridgeBlockedHttpCalls = 0
-foreach ($frame in Get-PSCallStack) {
-    $frameScript = [string]$frame.ScriptName
-    if ($frameScript -and $frameScript -match '[\\/]tests[\\/][^\\/]+\.ps1$') {
-        $script:BridgeUnderTestSuite = $true
-        break
-    }
-}
-
-function Assert-BridgeHttpAllowed {
-    <#
-        Refuses a real Home Assistant call made from a test suite.
-
-        The CI step that runs the suites is called "PowerShell test suites (Home
-        Assistant free)" and that is meant literally, but nothing enforced it. On
-        2026-09-28 a suite stubbed Get-HomeAssistantState *below* the call that needed
-        it, so the real one was still in scope and every request went to the live
-        house with a placeholder token. Set-CopilotSelectOption retries twelve times,
-        and the suite had stubbed Start-Sleep, so twelve invalid-auth reads arrived in
-        seventy milliseconds. Home Assistant read that as a brute-force attempt and IP
-        banned the developer's machine, which took the bridge daemon offline with it.
-
-        The failure was silent in both directions: the suite passed, and the ban only
-        surfaced later as 403s in the daemon log. So this fails loudly instead, and
-        names the mistake - a stub in the wrong place is much harder to see than a
-        missing one.
-
-        An integration test that deliberately wants a real Home Assistant sets
-        BRIDGE_ALLOW_TEST_HTTP=1; those suites are excluded from CI for that reason.
-
-        Callers like Set-CopilotMqttSelectOption swallow a failed read on purpose, so
-        throwing is not on its own enough to make a mistake visible - that is how the
-        original went unnoticed. Every refusal is counted as well, so a suite can
-        assert that nothing was attempted rather than that something threw.
-    #>
-    param([string]$Uri, [switch]$WebSocket)
-
-    # The runner's boundary survives subprocesses, whose call stacks no longer
-    # contain the suite. An integration opt-in cannot disable an offline run.
-    $offline = $env:AGENT_HA_BRIDGE_OFFLINE_TEST -eq '1'
-    if (-not $script:BridgeUnderTestSuite -and -not $offline) { return }
-    if (-not $offline -and $env:BRIDGE_ALLOW_TEST_HTTP -eq '1') { return }
-
-    # A suite that has replaced Invoke-RestMethod cannot put anything on the wire, and
-    # test-decision-retry.ps1 legitimately does exactly that to exercise this retry
-    # layer. The guard is about real traffic, so that is what it asks about rather than
-    # refusing every call made from a tests directory.
-    if (-not $WebSocket) {
-        $sender = Get-Command -Name 'Invoke-RestMethod' -ErrorAction SilentlyContinue
-        if ($sender -and $sender.CommandType -ne [Management.Automation.CommandTypes]::Cmdlet) { return }
-    }
-
-    $script:BridgeBlockedHttpCalls++
-    throw ("A test suite tried to reach a real Home Assistant$(if ($Uri) { " at $Uri" }). " +
-        'Stub the function that makes the call, and define the stub above the code ' +
-        'under test - PowerShell binds a function as it executes, so a stub written ' +
-        'below the call it is meant to intercept does nothing. An integration test ' +
-        'that means to use a real Home Assistant sets BRIDGE_ALLOW_TEST_HTTP=1 outside the offline runner.')
 }
 
 $script:BridgeHttpSession = $null
@@ -2449,7 +2385,6 @@ function Send-BridgeNotification {
         Write-DecisionBridgeLog -Message "notification via $service failed: $($_.Exception.Message)"
     }
 }
-
 
 
 

@@ -14,6 +14,9 @@ function Test-That {
 }
 
 Write-Host '--- one classified inventory for every platform ---'
+Test-That 'the runner marks its results directory so inventory can prune generated suites' {
+    Test-Path -LiteralPath (Join-Path (Split-Path -Parent $env:AGENT_HA_BRIDGE_TEST_ROOT) '.bridge-test-results') -PathType Leaf
+}
 $offline = @(Get-BridgeTestSuite)
 foreach ($expected in @(
     'test-http-session.ps1', 'test-launch-permissions.ps1', 'test-reply-card.ps1',
@@ -53,18 +56,153 @@ Test-That 'an opt-in alone never permits a developer or self-hosted machine' {
 $scratch = Join-Path $env:TEMP ("runner-fixtures-" + [guid]::NewGuid().ToString('N'))
 [void][IO.Directory]::CreateDirectory($scratch)
 $sandboxes = @()
+$inventoryLinks = @()
 $saved = @{}
 $poison = @{
     AGENT_HA_TOKEN = 'synthetic-parent-token'
     AGENT_HA_AGENT_TOKEN = 'synthetic-parent-agent-token'
     CUSTOM_HOUSE_CREDENTIAL = 'synthetic-custom-token'
     BRIDGE_ALLOW_TEST_HTTP = '1'
+    AGENT_HA_BRIDGE_TEST_LOOPBACK_ORIGIN = 'http://127.0.0.1:1'
     COPILOT_HA_BRIDGE_CONFIG = (Join-Path $scratch 'not-a-config.json')
     HTTPS_PROXY = 'http://proxy.invalid:1'
     NODE_OPTIONS = '--require=not-a-module'
     GIT_CONFIG_COUNT = '1'
 }
 try {
+    Write-Host '--- repository-wide inventory, including new components and nested suites ---'
+    $inventoryRoot = Join-Path $scratch 'inventory'
+    $inventoryManifest = @{
+        Offline = @('tests\test-base.ps1')
+        Host = @('tests\test-host.ps1')
+        Platform = @('tests\test-platform.ps1')
+        Integration = @('tests\test-integration.ps1')
+    }
+    function New-InventoryFile {
+        param([string]$Relative)
+        $fixturePath = Join-Path $inventoryRoot ($Relative.Replace('\', [IO.Path]::DirectorySeparatorChar))
+        [void][IO.Directory]::CreateDirectory((Split-Path -Parent $fixturePath))
+        Set-Content -LiteralPath $fixturePath -Value "throw 'Inventory must not execute a suite.'"
+        $fixturePath
+    }
+    function Save-InventoryManifest {
+        $lines = @('@{')
+        foreach ($category in 'Offline', 'Host', 'Platform', 'Integration') {
+            $entries = @($inventoryManifest[$category] | ForEach-Object { "'$_'" }) -join ', '
+            $lines += "    $category = @($entries)"
+        }
+        $lines += '}'
+        $lines | Set-Content -LiteralPath (Join-Path (Join-Path $inventoryRoot 'tests') 'suites.psd1') -Encoding utf8
+    }
+    foreach ($category in $inventoryManifest.Keys) {
+        foreach ($relative in $inventoryManifest[$category]) { [void](New-InventoryFile $relative) }
+    }
+    Save-InventoryManifest
+    Test-That 'a synthetic inventory retains all four group distinctions without executing files' {
+        $found = @(foreach ($category in 'Offline', 'Host', 'Platform', 'Integration') {
+            Get-BridgeTestSuite -Repository $inventoryRoot -Group $category
+        })
+        $found.Count -eq 4 -and @($found.Group | Select-Object -Unique).Count -eq 4
+    }
+    foreach ($relative in @(
+        'mcp\tests\test-foo.ps1', 'new-component\tests\nested\test-deep.ps1',
+        'tests\nested\test-nested.ps1', 'test-root.ps1', '.component\test-hidden.ps1'
+    )) {
+        $fixturePath = New-InventoryFile $relative
+        try {
+            Test-That "$relative cannot disappear from classification" {
+                try { Get-BridgeTestSuite -Repository $inventoryRoot; $false }
+                catch {
+                    $_.Exception.Message -match 'suite inventory differs' -and
+                    $_.Exception.Message.Contains($relative)
+                }
+            }
+        }
+        finally { Remove-Item -LiteralPath $fixturePath -Force }
+    }
+
+    [void](New-InventoryFile 'mcp\tests\nested\test-component.ps1')
+    $inventoryManifest.Offline += 'mcp/tests/nested/test-component.ps1'
+    Save-InventoryManifest
+    Test-That 'manifest and selectors normalize either separator to the same nested suite' {
+        $forward = Get-BridgeTestSuite -Repository $inventoryRoot -Suite 'mcp/tests/nested/test-component.ps1'
+        $backward = Get-BridgeTestSuite -Repository $inventoryRoot -Suite 'mcp\tests\nested\test-component.ps1'
+        $forward.Suite -eq 'mcp\tests\nested\test-component.ps1' -and
+        $forward.Path -eq $backward.Path -and (Test-Path -LiteralPath $forward.Path)
+    }
+    Test-That 'nested basenames select the same classified suite' {
+        (Get-BridgeTestSuite -Repository $inventoryRoot -Suite 'test-component.ps1').Suite -eq
+            'mcp\tests\nested\test-component.ps1'
+    }
+    $inventoryManifest.Host += 'mcp\tests\nested\test-component.ps1'
+    Save-InventoryManifest
+    Test-That 'different separator spellings cannot classify a suite twice' {
+        try { Get-BridgeTestSuite -Repository $inventoryRoot; $false }
+        catch { $_.Exception.Message -match 'Suite declared twice' }
+    }
+    $inventoryManifest.Offline = @('tests\test-base.ps1')
+    Save-InventoryManifest
+    Test-That 'a newly classified Host suite is still excluded from Offline' {
+        @(Get-BridgeTestSuite -Repository $inventoryRoot).Count -eq 1 -and
+        @(Get-BridgeTestSuite -Repository $inventoryRoot -Group Host).Count -eq 2
+    }
+
+    Write-Host '--- exclusions are pruned before traversal and cannot be declared executable ---'
+    foreach ($excluded in @(
+        '.git', 'node_modules', 'vendor', '.venv', 'venv',
+        'fixtures', '__fixtures__', 'test-results', 'TestResults', 'coverage', 'dist'
+    )) {
+        [void](New-InventoryFile "$excluded\deep\test-excluded.ps1")
+        [void](New-InventoryFile "component\$excluded\deep\test-excluded.ps1")
+        Test-That "$excluded is excluded at the root and inside a component" {
+            @(Get-BridgeTestSuite -Repository $inventoryRoot).Count -eq 1
+        }
+    }
+    [void](New-InventoryFile 'custom-output\sandbox\test-generated.ps1')
+    Set-Content -LiteralPath (Join-Path (Join-Path $inventoryRoot 'custom-output') '.bridge-test-results') -Value ''
+    Test-That 'runner-marked results are excluded regardless of the chosen directory name' {
+        @(Get-BridgeTestSuite -Repository $inventoryRoot).Count -eq 1
+    }
+    $inventoryManifest.Offline += 'component\fixtures\deep\test-excluded.ps1'
+    Save-InventoryManifest
+    Test-That 'declaring an excluded fixture does not make it executable' {
+        try { Get-BridgeTestSuite -Repository $inventoryRoot; $false }
+        catch { $_.Exception.Message -match 'suite inventory differs' }
+    }
+    $inventoryManifest.Offline = @('tests\test-base.ps1', '..\test-escape.ps1')
+    Save-InventoryManifest
+    Test-That 'manifest paths cannot escape the repository' {
+        try { Get-BridgeTestSuite -Repository $inventoryRoot; $false }
+        catch { $_.Exception.Message -match 'canonical repository-relative' }
+    }
+    $inventoryManifest.Offline = @('tests\test-base.ps1')
+    Save-InventoryManifest
+
+    $externalRoot = Join-Path $scratch 'external-suites'
+    [void][IO.Directory]::CreateDirectory($externalRoot)
+    Set-Content -LiteralPath (Join-Path $externalRoot 'test-external.ps1') -Value "throw 'External suite must not run.'"
+    $linkType = if ($IsWindows) { 'Junction' } else { 'SymbolicLink' }
+    foreach ($link in @(
+        @{ Path = (Join-Path $inventoryRoot 'linked-component'); Target = $externalRoot },
+        @{ Path = (Join-Path (Join-Path $inventoryRoot 'component') 'cycle'); Target = $inventoryRoot }
+    )) {
+        [void](New-Item -ItemType $linkType -Path $link.Path -Value $link.Target)
+        $inventoryLinks += $link.Path
+    }
+    Test-That 'external directory links and cycles are not traversed' {
+        @(Get-BridgeTestSuite -Repository $inventoryRoot).Count -eq 1
+    }
+    Test-That 'a linked directory cannot itself be a suite repository' {
+        try { Get-BridgeTestSuite -Repository $inventoryLinks[0]; $false }
+        catch { $_.Exception.Message -match 'not a symbolic link or junction' }
+    }
+    $inventoryManifest.Offline += 'linked-component\test-external.ps1'
+    Save-InventoryManifest
+    Test-That 'a manifest cannot opt an external linked suite into execution' {
+        try { Get-BridgeTestSuite -Repository $inventoryRoot; $false }
+        catch { $_.Exception.Message -match 'suite inventory differs' }
+    }
+
     Write-Host '--- private roots and no inherited credentials, including descendants ---'
     foreach ($key in $poison.Keys) {
         $saved[$key] = [Environment]::GetEnvironmentVariable($key)
@@ -98,7 +236,8 @@ if ($LASTEXITCODE) { throw 'Descendant probe failed.' }
     GitConfig = $env:GIT_CONFIG_GLOBAL
     Leaked = @(Get-ChildItem Env: | Where-Object Name -in @(
         'AGENT_HA_TOKEN', 'AGENT_HA_AGENT_TOKEN', 'CUSTOM_HOUSE_CREDENTIAL', 'BRIDGE_ALLOW_TEST_HTTP',
-        'COPILOT_HA_BRIDGE_CONFIG', 'HTTPS_PROXY', 'NODE_OPTIONS', 'GIT_CONFIG_COUNT'
+        'COPILOT_HA_BRIDGE_CONFIG', 'HTTPS_PROXY', 'NODE_OPTIONS', 'GIT_CONFIG_COUNT',
+        'AGENT_HA_BRIDGE_TEST_LOOPBACK_ORIGIN'
     ) | ForEach-Object Name)
     ConsoleInput = [Console]::InputEncoding.CodePage
     ConsoleOutput = [Console]::OutputEncoding.CodePage
@@ -270,6 +409,7 @@ Start-Sleep -Seconds 60
 }
 finally {
     foreach ($key in $saved.Keys) { [Environment]::SetEnvironmentVariable($key, $saved[$key], 'Process') }
+    foreach ($linkPath in $inventoryLinks) { Remove-Item -LiteralPath $linkPath -Force }
     foreach ($box in $sandboxes) {
         $pidFile = Join-Path $box 'child.json'
         if (Test-Path -LiteralPath $pidFile) {

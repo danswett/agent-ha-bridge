@@ -2,40 +2,71 @@
 
 $script:BridgeTestRepository = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
 
+function Get-BridgeTestSuitePath {
+    param([Parameter(Mandatory)][string]$Repository)
+
+    $root = Get-Item -LiteralPath $Repository -Force -ErrorAction Stop
+    if (-not $root.PSIsContainer -or ($root.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+        throw 'The suite repository must be a directory, not a symbolic link or junction.'
+    }
+    $excluded = @(
+        '.git', 'node_modules', 'vendor', '.venv', 'venv',
+        'fixtures', '__fixtures__', 'test-results', 'TestResults', 'coverage', 'dist'
+    )
+    $pending = [Collections.Generic.Stack[string]]::new()
+    $pending.Push($root.FullName)
+    while ($pending.Count) {
+        foreach ($entry in Get-ChildItem -LiteralPath $pending.Pop() -Force -ErrorAction Stop) {
+            # Do not recurse and filter afterwards: even enumerating a linked or
+            # dependency tree can leave the checkout or loop back into it.
+            if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) { continue }
+            if ($entry.PSIsContainer) {
+                if ($entry.Name -in $excluded -or
+                    (Test-Path -LiteralPath (Join-Path $entry.FullName '.bridge-test-results') -PathType Leaf)) { continue }
+                $pending.Push($entry.FullName)
+            }
+            elseif ($entry.Name -like 'test-*.ps1') {
+                [IO.Path]::GetRelativePath($root.FullName, $entry.FullName).Replace('/', '\')
+            }
+        }
+    }
+}
+
 function Get-BridgeTestSuite {
     param(
         [ValidateSet('Offline', 'Host', 'Platform', 'Integration')][string]$Group = 'Offline',
-        [string[]]$Suite = @()
+        [string[]]$Suite = @(),
+        [string]$Repository = $script:BridgeTestRepository
     )
 
-    $manifest = Import-PowerShellDataFile -LiteralPath (Join-Path $PSScriptRoot 'suites.psd1')
+    $Repository = [IO.Path]::GetFullPath($Repository)
+    $discovered = @(Get-BridgeTestSuitePath -Repository $Repository)
+    $manifest = Import-PowerShellDataFile -LiteralPath (Join-Path (Join-Path $Repository 'tests') 'suites.psd1')
     $groups = @('Offline', 'Host', 'Platform', 'Integration')
     if (@(Compare-Object $groups @($manifest.Keys)).Count) { throw 'The suite manifest must declare exactly Offline, Host, Platform and Integration.' }
     $declared = @{}
     foreach ($category in $manifest.Keys) {
         foreach ($relative in $manifest[$category]) {
-            if ($declared.ContainsKey($relative)) { throw "Suite declared twice: $relative" }
-            $declared[$relative] = $category
+            $key = ([string]$relative).Replace('/', '\')
+            if ($key -match '(^\\|:|(^|\\)\.\.?($|\\)|\\\\)' -or $key -notmatch '(^|\\)test-[^\\]+\.ps1$') {
+                throw "Suite paths must be canonical repository-relative test-*.ps1 paths: $relative"
+            }
+            if ($declared.ContainsKey($key)) { throw "Suite declared twice: $key" }
+            $declared[$key] = $category
         }
     }
-    $discovered = @(
-        foreach ($directory in 'tests', 'claude\tests', 'codex\tests') {
-            $path = Join-Path $script:BridgeTestRepository ($directory.Replace('\', [IO.Path]::DirectorySeparatorChar))
-            Get-ChildItem -LiteralPath $path -Filter 'test-*.ps1' -File |
-                ForEach-Object { [IO.Path]::GetRelativePath($script:BridgeTestRepository, $_.FullName).Replace('/', '\') }
-        }
-    )
-    $difference = @(Compare-Object @($declared.Keys) $discovered)
+    $difference = @($declared.Keys | Where-Object { $_ -notin $discovered }) +
+        @($discovered | Where-Object { -not $declared.ContainsKey($_) })
     if ($difference.Count) {
-        throw "Update tests\suites.psd1; suite inventory differs: $($difference.InputObject -join ', ')"
+        throw "Update tests\suites.psd1; suite inventory differs: $(($difference | Sort-Object) -join ', ')"
     }
 
-    $selected = @($manifest[$Group])
+    $selected = @($declared.Keys | Where-Object { $declared[$_] -eq $Group })
     if ($Suite.Count) {
         $selected = @(
             foreach ($requested in $Suite) {
                 $key = $requested.Replace('/', '\')
-                $matches = @($manifest[$Group] | Where-Object { $_ -eq $key -or ($_ -split '\\')[-1] -eq $key })
+                $matches = @($selected | Where-Object { $_ -eq $key -or ($_ -split '\\')[-1] -eq $key })
                 if ($matches.Count -ne 1) { throw "Expected one $Group suite named '$requested'; use -List to see the selection." }
                 $matches[0]
             }
@@ -46,7 +77,7 @@ function Get-BridgeTestSuite {
         [pscustomobject]@{
             Suite = $relative
             Group = $Group
-            Path = Join-Path $script:BridgeTestRepository ($relative.Replace('\', [IO.Path]::DirectorySeparatorChar))
+            Path = Join-Path $Repository ($relative.Replace('\', [IO.Path]::DirectorySeparatorChar))
         }
     }
 }
@@ -156,6 +187,9 @@ function New-BridgeTestProcessStartInfo {
     if ($Group -ne 'Offline') {
         $start.Environment['GITHUB_ACTIONS'] = 'true'
         $start.Environment['RUNNER_ENVIRONMENT'] = 'github-hosted'
+    }
+    if ($Group -eq 'Host') {
+        $start.Environment['AGENT_HA_BRIDGE_TEST_LOOPBACK_ORIGIN'] = 'http://127.0.0.1:1'
     }
 
     $command = @'
