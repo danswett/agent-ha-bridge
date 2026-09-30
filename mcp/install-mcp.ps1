@@ -98,24 +98,32 @@ if (-not (Test-Path -LiteralPath $configPath)) {
 }
 $config = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
 $baseUrl = [string]$config.homeAssistant.baseUrl
-# Deliberately the bridge's own token, not homeAssistant.agentToken, even though this
-# server is the agent's door into Home Assistant.
+# Two tokens, because this server does two different kinds of thing.
 #
-# This server *provisions*: entities.js sends config/entity_registry/update to force
-# deterministic entity ids, and dashboard.js sends lovelace/dashboards/create and
-# lovelace/config/save. All three are admin-only - measured, not assumed: as a plain
-# user every one of them comes back `unauthorized`, while reading states and calling
-# services still work. Handing this server the agent token would therefore either
-# break provisioning or force the agent account to be an administrator, and the whole
-# point of a separate account is that it need not be one.
+# HA_TOKEN is the bridge's own - the user's - because this server *provisions*:
+# entities.js sends config/entity_registry/update to force deterministic entity ids,
+# and dashboard.js sends lovelace/dashboards/create and lovelace/config/save. All
+# three are admin-only - measured, not assumed: as a plain user every one comes back
+# `unauthorized`, while reading states and calling services still work. Handing this
+# server only the agent token would either break provisioning or force the agent
+# account to be an administrator, and the whole point of a separate account is that it
+# need not be one.
 #
-# Nothing is lost by it. The account behind a press only matters where the bridge
-# reads it back - a reply, or a launch - and this server presses neither; it publishes
-# a question and waits. The agent token goes where that signal is actually read: the
-# environment of every session the bridge launches.
+# HA_AGENT_TOKEN is the agent's, and the session tools use it for the writes whose
+# account Home Assistant records - a reply, a launch. That used to be nothing: this
+# server published a question and waited, pressing nothing. It now drives sessions
+# too, and a press made with the user's token is indistinguishable from the user
+# pressing it, so it is the one thing here that must not use HA_TOKEN.
+#
+# Optional. Without it the tools still work; the actions are simply recorded as the
+# user, which is what happened before either existed, and the server says so on stderr.
 $token = [string]$config.homeAssistant.token
 if (-not $token -and $config.homeAssistant.tokenEnvVar) {
     $token = [Environment]::GetEnvironmentVariable([string]$config.homeAssistant.tokenEnvVar)
+}
+$agentToken = [string]$config.homeAssistant.agentToken
+if (-not $agentToken -and $config.homeAssistant.agentTokenEnvVar) {
+    $agentToken = [Environment]::GetEnvironmentVariable([string]$config.homeAssistant.agentTokenEnvVar)
 }
 
 Write-Step "Installing the MCP server into $mcpDir"
@@ -155,6 +163,9 @@ else {
 $serverJs = Join-Path $mcpDir 'src\server.js'
 $serverEnv = [ordered]@{ HA_BASE_URL = $baseUrl }
 $serverEnv['HA_TOKEN'] = if ($token) { $token } else { '<your Home Assistant long-lived token>' }
+# Only when there is one: an empty value would read as configured and silently record
+# every session an agent drove as the user.
+if ($agentToken) { $serverEnv['HA_AGENT_TOKEN'] = $agentToken }
 $serverBlock = [ordered]@{ command = 'node'; args = @($serverJs); env = $serverEnv }
 
 ([ordered]@{ mcpServers = [ordered]@{ $serverName = $serverBlock } }) |

@@ -80,9 +80,39 @@ Claude Desktop — add to `claude_desktop_config.json`:
 |---|---|
 | `HA_BASE_URL` | Home Assistant base URL (required) |
 | `HA_TOKEN` | Long-lived access token (required) |
+| `HA_AGENT_TOKEN` | The *agent's* token, used only for writes whose account Home Assistant records — a reply, a launch. Optional; without it those actions are recorded as you. See [Driving sessions](#driving-sessions) |
 | `HA_CARD_TITLE` | Device name for the card (default `Agent MCP`) |
 | `HA_TIMEOUT_MS` | How long to wait for an answer (default 30 min) |
 | `HA_DASHBOARD` | Fallback dashboard when the daemon is absent (default `agent-mcp`; set to empty to manage cards yourself) |
+
+## Driving sessions
+
+Besides `ask_via_home_assistant`, the server exposes four tools for the bridge's own
+sessions — the ones on your dashboard, on this machine and every other one:
+
+| Tool | What it does |
+|---|---|
+| `list_agent_sessions` | Every session and machine the bridge knows about. Start here; the rest need an id or a machine slug |
+| `read_agent_session` | What a session last said, from its activity sensor's `response` |
+| `reply_to_agent_session` | Sends a message to a session, any length |
+| `launch_agent_session` | Starts a session on a machine, optionally with an opening prompt |
+
+They exist because doing this by hand has two failure modes that are completely
+silent:
+
+- **The wrong token.** Both yours and the agent's authenticate and both are
+  authorised, so a reply sent with yours raises no error and writes no log line —
+  Home Assistant simply records it against you, and the session card is drawn as
+  yours. The writing tools use `HA_AGENT_TOKEN` for exactly this reason, while
+  `HA_TOKEN` keeps doing the provisioning, which is administrator-only. Without an
+  agent token everything still works and the server says on stderr that actions will
+  be recorded as you.
+- **Waiting on a notification.** Home Assistant does not expose persistent
+  notifications through `GET /api/states`, so asking a session to answer with one and
+  then polling finds nothing however long you wait — which looks exactly like the
+  session having died. `read_agent_session` reads the activity sensor instead, and
+  reports `done` only once a response is actually there (a session reads `idle`
+  briefly *before* it starts working, as well as when a turn ends).
 
 ## Remote clients (HTTP transport)
 

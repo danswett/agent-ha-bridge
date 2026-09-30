@@ -8,6 +8,7 @@
   "scripts": {
     "start": "node src/server.js",
     "test": "node test/harness.js",
+    "test:sessions": "node test/test-sessions.js",
     "test:http": "node test/test-http.js && node test/test-http-e2e.js"
   },
   "engines": {

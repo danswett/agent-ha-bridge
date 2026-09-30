@@ -37,6 +37,7 @@ import {
 } from './entities.js';
 import { describeSchema, outlineFor, valueForLabel } from './schema.js';
 import { DEFAULT_URL_PATH, ensureDashboard, removeFromDashboard } from './dashboard.js';
+import { launchSession, listSessions, readSession, replyToSession } from './sessions.js';
 import { startHttpTransport } from './http.js';
 import { readFileSync } from 'node:fs';
 
@@ -74,6 +75,13 @@ function loadConfig() {
   return {
     baseUrl,
     token,
+    // The account an agent *drives* sessions as, which is deliberately not the one
+    // above. HA_TOKEN is the user's: it provisions, and renaming entities and writing
+    // dashboards is administrator-only, which is exactly what a separate agent account
+    // exists to avoid needing. Writes that Home Assistant records against an account -
+    // a reply, a launch - use this one instead, so a session an agent drove is marked
+    // as the agent's rather than silently as the user's.
+    agentToken: process.env.HA_AGENT_TOKEN || '',
     title: process.env.HA_CARD_TITLE || 'Agent MCP',
     timeoutMs: Number(process.env.HA_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS,
     // Set HA_DASHBOARD='' to manage cards yourself.
@@ -127,6 +135,18 @@ function waitForHomeAssistant(socket, ids, signal) {
 async function main() {
   const config = loadConfig();
   const ha = new HomeAssistant(config);
+  // Writes that Home Assistant attributes to an account go through this one. Without
+  // an agent token it is the same client, which still works - the actions are just
+  // recorded as the user, exactly as they were before this existed.
+  const agentHa = config.agentToken
+    ? new HomeAssistant({ baseUrl: config.baseUrl, token: config.agentToken })
+    : ha;
+  if (!config.agentToken) {
+    process.stderr.write(
+      '[bridge] HA_AGENT_TOKEN is not set, so sessions driven from here are recorded as you. ' +
+        'Run: agent-ha-bridge configure -AgentToken <token>\n',
+    );
+  }
 
   const server = new Server(
     { name: 'agent-ha-bridge', version: serverVersion() },
@@ -180,10 +200,94 @@ async function main() {
           required: ['message'],
         },
       },
+      {
+        name: 'list_agent_sessions',
+        description:
+          'List the agent sessions the bridge knows about, on this machine and every other ' +
+          'one, with what each is doing. Start here: the other session tools need a session ' +
+          'id, and launching needs a machine slug.',
+        inputSchema: { type: 'object', properties: {} },
+      },
+      {
+        name: 'read_agent_session',
+        description:
+          'Read what a session last said. Its answer is in the response field; done is true ' +
+          'once the turn has actually finished. Use this rather than asking a session to ' +
+          'reply with a Home Assistant notification - notifications are not readable through ' +
+          'the states API, so waiting on one never returns.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            session_id: { type: 'string', description: 'From list_agent_sessions.' },
+          },
+          required: ['session_id'],
+        },
+      },
+      {
+        name: 'reply_to_agent_session',
+        description:
+          'Send a message to a session - yours or one on another machine - as the agent, so ' +
+          'it is attributed correctly. Any length: long text is not truncated. Then poll ' +
+          'read_agent_session for the answer.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            session_id: { type: 'string', description: 'From list_agent_sessions.' },
+            text: { type: 'string', description: 'The message to send.' },
+          },
+          required: ['session_id', 'text'],
+        },
+      },
+      {
+        name: 'launch_agent_session',
+        description:
+          'Start a new session on a machine, optionally with an opening prompt of any ' +
+          'length, as the agent. The machine must be online. Other launch settings come ' +
+          "from that machine's card; this does not change them.",
+        inputSchema: {
+          type: 'object',
+          properties: {
+            machine: {
+              type: 'string',
+              description: 'The machine slug from list_agent_sessions.',
+            },
+            prompt: { type: 'string', description: 'Optional first instruction.' },
+          },
+          required: ['machine'],
+        },
+      },
     ],
   }));
 
+  const asJson = (value) => ({
+    content: [{ type: 'text', text: JSON.stringify(value, null, 2) }],
+    structuredContent: value,
+  });
+
+  // Reads use the user's token, writes the agent's - see loadConfig.
+  const sessionTools = {
+    list_agent_sessions: () => listSessions(ha),
+    read_agent_session: (args) => readSession(ha, String(args?.session_id ?? '')),
+    reply_to_agent_session: (args) =>
+      replyToSession(agentHa, String(args?.session_id ?? ''), args?.text),
+    launch_agent_session: (args) =>
+      launchSession(agentHa, String(args?.machine ?? ''), { prompt: args?.prompt }),
+  };
+
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
+    const tool = Object.prototype.hasOwnProperty.call(sessionTools, request.params.name)
+      ? sessionTools[request.params.name]
+      : null;
+    if (tool) {
+      try {
+        return asJson(await tool(request.params.arguments ?? {}));
+      } catch (error) {
+        return {
+          content: [{ type: 'text', text: error.message }],
+          isError: true,
+        };
+      }
+    }
     if (request.params.name !== 'ask_via_home_assistant') {
       throw new Error(`Unknown tool: ${request.params.name}`);
     }
