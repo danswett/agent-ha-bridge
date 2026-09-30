@@ -88,71 +88,9 @@ jobs:
           go build -trimpath -ldflags '-s -w' -o agent-bridge-hook.exe .
           if ($LASTEXITCODE) { throw 'build failed' }
 
-      - name: PowerShell test suites (Home Assistant free)
+      - name: Canonical offline PowerShell suites
         shell: pwsh
-        run: |
-          $suites = @(
-            'tests/test-decision-args.ps1'
-            'tests/test-answer-match.ps1'
-            'tests/test-transcript-cache.ps1'
-            'tests/test-decision-retry.ps1'
-            'tests/test-auth-backoff.ps1'
-            'tests/test-http-guard.ps1'
-            'tests/test-decision-select-race.ps1'
-            'tests/test-bridge-adapter.ps1'
-            'tests/test-dashboard.ps1'
-            'tests/test-choices-form.ps1'
-            'tests/test-install-clients.ps1'
-            'tests/test-install-deps.ps1'
-            'tests/test-install-connection.ps1'
-            'tests/test-install-command.ps1'
-            'tests/test-install-cards.ps1'
-            'tests/test-multi-machine.ps1'
-            'tests/test-layout-migration.ps1'
-            'tests/test-reliability.ps1'
-            'tests/test-restart-restore.ps1'
-            'tests/test-security.ps1'
-            'tests/test-update.ps1'
-            'tests/test-update-outcome.ps1'
-            'tests/test-new-session.ps1'
-            'tests/test-daemon-sessions.ps1'
-            'tests/test-daemon-decisions.ps1'
-            'tests/test-daemon-replies.ps1'
-            'tests/test-daemon-loop.ps1'
-            'tests/test-daemon-agents.ps1'
-            'tests/test-copilot-activity.ps1'
-            'tests/test-driver-card.ps1'
-            'tests/test-agent-launched.ps1'
-            'tests/test-launchers.ps1'
-            'tests/test-hook-functions.ps1'
-            'tests/test-hook-spool.ps1'
-            'tests/test-native-hook.ps1'
-            'tests/test-native-hook-install.ps1'
-            'tests/test-hook-stats.ps1'
-            'tests/test-hook-status.ps1'
-            'tests/test-turn-end.ps1'
-            'tests/test-state-read.ps1'
-            'tests/test-state-snapshot.ps1'
-            'tests/test-stop-session.ps1'
-            'tests/test-verbose-toggle.ps1'
-            'tests/test-detailed-activity.ps1'
-            'codex/tests/test-codex.ps1'
-            'claude/tests/test-claude-ask-parser.ps1'
-            'claude/tests/test-claude-transcript.ps1'
-            'claude/tests/test-claude-install.ps1'
-          )
-          $failed = @()
-          foreach ($suite in $suites) {
-            Write-Host "::group::$suite"
-            pwsh -NoProfile -File $suite
-            $code = $LASTEXITCODE
-            Write-Host "::endgroup::"
-            if ($code -ne 0) {
-              $failed += $suite
-              Write-Host "::error::$suite exited with $code"
-            }
-          }
-          if ($failed.Count) { throw "Failed suites: $($failed -join ', ')" }
+        run: pwsh -NoProfile -File tests/run-tests.ps1
 
   macos:
     name: macOS (platform layer, tmux delivery, suites)
@@ -176,7 +114,7 @@ jobs:
 
       - name: Platform layer and tmux delivery
         shell: pwsh
-        run: pwsh -NoProfile -File tests/test-platform.ps1
+        run: pwsh -NoProfile -File tests/run-tests.ps1 -Group Platform -AllowHostTests
 
       - name: Shell scripts
         run: |
@@ -201,26 +139,37 @@ jobs:
           go test ./...
           go build -trimpath -ldflags '-s -w' -o agent-bridge-hook .
 
-      - name: Test suites on macOS
+      - name: Canonical offline PowerShell suites
         shell: pwsh
+        run: pwsh -NoProfile -File tests/run-tests.ps1
+
+  installer-host:
+    name: Installer host tests (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, macos-latest]
+    # Never move this job to self-hosted: -TargetHome is not an OS sandbox.
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions/setup-go@v7
+        with:
+          go-version-file: hook/go.mod
+          cache-dependency-path: hook/go.sum
+
+      - name: Build the local installer payload (no runtime download)
+        shell: pwsh
+        working-directory: hook
         run: |
-          $failed = @()
-          foreach ($suite in @(Get-ChildItem tests/test-*.ps1, claude/tests/test-*.ps1, codex/tests/test-*.ps1 | Where-Object { $_.Name -notmatch 'integration|platform' })) {
-            Write-Host "::group::$($suite.Name)"
-            pwsh -NoProfile -File $suite.FullName
-            $code = $LASTEXITCODE
-            Write-Host "::endgroup::"
-            if ($code -ne 0) {
-              $failed += $suite.Name
-              Write-Host "::warning::$($suite.Name) exited with $code"
-              # Why: run it again traced, and show where it stopped.
-              $trace = @(pwsh -NoProfile -Command "Set-PSDebug -Trace 1; & '$($suite.FullName)'" 2>&1 | ForEach-Object { [string]$_ })
-              Write-Host "--- last traced lines of $($suite.Name) ---"
-              $trace | Select-Object -Last 40 | ForEach-Object { Write-Host $_ }
-            }
-          }
-          Write-Host "Failed on macOS: $($failed -join ', ')"
-          if ($failed.Count) { exit 1 }
+          $binary = if ($IsWindows) { 'agent-bridge-hook.exe' } else { 'agent-bridge-hook' }
+          go build -trimpath -ldflags '-s -w' -o $binary .
+          if ($LASTEXITCODE) { throw 'build failed' }
+
+      - name: Installer assertions on a disposable host
+        shell: pwsh
+        run: pwsh -NoProfile -File tests/run-tests.ps1 -Group Host -AllowHostTests -TimeoutSeconds 300
 
   release-build:
     name: Release build of the native hook (no upload)
@@ -273,4 +222,3 @@ jobs:
           node test/test-sessions.js
           node test/test-http.js
           node test/test-http-e2e.js
-

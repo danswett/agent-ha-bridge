@@ -10,8 +10,10 @@
     copy of itself in ~/.agent-ha-bridge/installer and an `agent-ha-bridge` command on
     PATH that dispatches to it.
 
-    The dangerous part of testing this is that the machine running the tests usually
-    has a real install. So:
+    This suite is HOST-ONLY: it runs only through run-tests.ps1 -Group Host
+    -AllowHostTests on a disposable GitHub-hosted runner, never a developer or
+    self-hosted machine. -TargetHome does not isolate every installer side effect.
+    In that controlled environment:
 
       * the end-to-end install runs with -TargetHome, -SkipTask, -SkipPath,
         -SkipDependencies and -NonInteractive, which keeps it out of $HOME, the
@@ -21,7 +23,8 @@
         which honours -TargetHome;
       * the command's own dispatch is checked against a fake payload whose install.ps1
         records its arguments instead of installing anything;
-      * the user PATH and the real bridge root are compared before and after.
+      * every subprocess gets a unique -TestRegistryId, not a shared sandbox key;
+      * the user PATH and the isolated bridge root are compared before and after.
 
     install.ps1 is dot-sourced with BRIDGE_INSTALL_NORUN set so its functions load
     without running the install.
@@ -29,8 +32,16 @@
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'runner-support.ps1')
+Assert-BridgeHostedTest -AllowHostTests:($env:AGENT_HA_BRIDGE_TEST_GROUP -eq 'Host')
 
 $repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$nativeName = if ($IsWindows) { 'agent-bridge-hook.exe' } else { 'agent-bridge-hook' }
+if (-not (Test-Path -LiteralPath (Join-Path (Join-Path $repoRoot 'hook') $nativeName))) {
+    throw 'Build the native hook before host tests; the installer must not download its payload.'
+}
+$suiteRegistryId = [guid]::NewGuid().ToString('N')
+$configOverrideBefore = $env:AGENT_HA_BRIDGE_CONFIG
 $env:BRIDGE_INSTALL_NORUN = '1'
 . (Join-Path $repoRoot 'install.ps1')
 Remove-Item Env:\BRIDGE_INSTALL_NORUN -ErrorAction SilentlyContinue
@@ -252,8 +263,8 @@ Write-Host "CARD-CHECK-RAN register=$Register config=$env:AGENT_HA_BRIDGE_CONFIG
     Test-That 'a missing checker is not an error' {
         (Invoke-BridgeFrontendCardCheck -HooksDir (New-ScratchDir) -ConfigPath $marker) -eq $false
     }
-    Test-That 'AGENT_HA_BRIDGE_CONFIG is not left set afterwards' {
-        [string]::IsNullOrEmpty($env:AGENT_HA_BRIDGE_CONFIG)
+    Test-That 'AGENT_HA_BRIDGE_CONFIG is restored afterwards' {
+        $env:AGENT_HA_BRIDGE_CONFIG -eq $configOverrideBefore
     }
 }
 finally { Remove-Item -LiteralPath $cardHooks -Recurse -Force -ErrorAction SilentlyContinue }
@@ -316,12 +327,12 @@ $realConfig = Join-Path $realBridgeHome 'config.json'
 $realConfigBefore = if (Test-Path -LiteralPath $realConfig) {
     (Get-FileHash -LiteralPath $realConfig -Algorithm SHA256).Hash
 } else { 'absent' }
-$sandboxArpKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\AgentHaBridge_Sandbox'
+$sandboxArpKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\AgentHaBridge_Sandbox_$suiteRegistryId"
 
 try {
     $log = & pwsh -NoProfile -File (Join-Path $repoRoot 'install.ps1') `
-        -TargetHome $sandbox -SkipTask -SkipPath -SkipDependencies -SkipVerify -NonInteractive `
-        -Clients copilot -HomeAssistantUrl 'http://ha.invalid:8123' -Token 'sandbox-token' 2>&1
+        -TargetHome $sandbox -TestRegistryId $suiteRegistryId -SkipTask -SkipPath -SkipDependencies -SkipVerify -NonInteractive `
+        -Clients copilot -HomeAssistantUrl 'http://127.0.0.1:1' -Token 'sandbox-token' 2>&1
     $logText = $log -join "`n"
     $sandboxHome = Join-Path $sandbox '.agent-ha-bridge'
 
@@ -387,7 +398,9 @@ try {
     Test-That 'both still uninstall the sandbox rather than the real install' {
         $arp = Get-ItemProperty -LiteralPath $sandboxArpKey
         ([string]$arp.UninstallString -match '-TargetHome') -and
-        ([string]$arp.QuietUninstallString -match '-TargetHome')
+        ([string]$arp.QuietUninstallString -match '-TargetHome') -and
+        ([string]$arp.UninstallString -match "-TestRegistryId $suiteRegistryId") -and
+        ([string]$arp.QuietUninstallString -match "-TestRegistryId $suiteRegistryId")
     }
     }
 
@@ -397,7 +410,8 @@ try {
     Test-That 'version matches the VERSION file' { ($status -join '') -match [regex]::Escape($expected) }
 
     Write-Host '--- uninstalling the sandbox ---'
-    $uninstallLog = & pwsh -NoProfile -File (Join-Path $repoRoot 'uninstall.ps1') -TargetHome $sandbox 2>&1
+    $uninstallLog = & pwsh -NoProfile -File (Join-Path $repoRoot 'uninstall.ps1') `
+        -TargetHome $sandbox -TestRegistryId $suiteRegistryId 2>&1
     Test-That 'the sandbox uninstall succeeds' { $LASTEXITCODE -eq 0 }
     Test-That 'it leaves PATH alone for a sandbox' { ($uninstallLog -join "`n") -match 'Leaving PATH alone' }
     Test-That 'the sandbox bridge root is gone' { -not (Test-Path -LiteralPath $sandboxHome) }
@@ -423,14 +437,14 @@ try {
     $legacyBridge = Join-Path $legacy '.agent-ha-bridge'
     New-Item -ItemType Directory -Path $legacyBridge -Force | Out-Null
     @{
-        homeAssistant = @{ baseUrl = 'http://ha.invalid:8123'; token = 'kept'; tokenEnvVar = 'AGENT_HA_TOKEN' }
+        homeAssistant = @{ baseUrl = 'http://127.0.0.1:1'; token = 'kept'; tokenEnvVar = 'AGENT_HA_TOKEN' }
         dashboard     = @{ urlPath = 'copilot-decisions' }
         clients       = @('copilot')
         updates       = @{ repository = 'danswett/copilot-ha-bridge'; installedVersion = '1.2.0'; checkForUpdates = $true }
     } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $legacyBridge 'config.json') -Encoding UTF8
 
     $null = & pwsh -NoProfile -File (Join-Path $repoRoot 'install.ps1') `
-        -TargetHome $legacy -SkipTask -SkipPath -SkipDependencies -SkipVerify -NonInteractive 2>&1
+        -TargetHome $legacy -TestRegistryId $suiteRegistryId -SkipTask -SkipPath -SkipDependencies -SkipVerify -NonInteractive 2>&1
     $after = Get-Content -LiteralPath (Join-Path $legacyBridge 'config.json') -Raw | ConvertFrom-Json
 
     Test-That 'the update repository is corrected' {
@@ -454,11 +468,11 @@ Test-That 'a fork is not rewritten' {
         $forkBridge = Join-Path $fork '.agent-ha-bridge'
         New-Item -ItemType Directory -Path $forkBridge -Force | Out-Null
         @{
-            homeAssistant = @{ baseUrl = 'http://ha.invalid:8123'; token = 't'; tokenEnvVar = 'AGENT_HA_TOKEN' }
+            homeAssistant = @{ baseUrl = 'http://127.0.0.1:1'; token = 't'; tokenEnvVar = 'AGENT_HA_TOKEN' }
             updates       = @{ repository = 'someone/their-fork'; installedVersion = '1.0.0'; checkForUpdates = $true }
         } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $forkBridge 'config.json') -Encoding UTF8
         $null = & pwsh -NoProfile -File (Join-Path $repoRoot 'install.ps1') `
-            -TargetHome $fork -SkipTask -SkipPath -SkipDependencies -SkipVerify -NonInteractive 2>&1
+            -TargetHome $fork -TestRegistryId $suiteRegistryId -SkipTask -SkipPath -SkipDependencies -SkipVerify -NonInteractive 2>&1
         (Get-Content -LiteralPath (Join-Path $forkBridge 'config.json') -Raw | ConvertFrom-Json).updates.repository -eq 'someone/their-fork'
     }
     finally {
@@ -475,7 +489,7 @@ function Invoke-SandboxInstall {
     $box = New-ScratchDir
     $installArgs = @(
         '-NoProfile', '-File', (Join-Path $repoRoot 'install.ps1'),
-        '-TargetHome', $box, '-SkipTask', '-SkipPath', '-SkipDependencies'
+        '-TargetHome', $box, '-TestRegistryId', $suiteRegistryId, '-SkipTask', '-SkipPath', '-SkipDependencies'
     ) + $ExtraArgs
     $output = $Answers | & pwsh @installArgs 2>&1
     [pscustomobject]@{
@@ -486,7 +500,7 @@ function Invoke-SandboxInstall {
     }
 }
 
-$run = Invoke-SandboxInstall -Answers "1`n" -ExtraArgs @('-SkipVerify', '-HomeAssistantUrl', 'http://ha.example:8123')
+$run = Invoke-SandboxInstall -Answers "1`n" -ExtraArgs @('-SkipVerify', '-HomeAssistantUrl', 'http://127.0.0.1:1')
 try {
     # The bug: config.example.json shipped a clients list, the persisted branch fired
     # on a first install, and this question was never asked.

@@ -199,13 +199,18 @@ $script:BridgeAuthBackoffSteps = @(60, 300, 900)
 $script:BridgeAuthBackoffUntil = $null
 $script:BridgeAuthBackoffStep = -1
 
+function Get-BridgeAuthTime {
+    # A single clock for the hold-off, replaceable by deterministic regression tests.
+    [DateTimeOffset]::Now
+}
+
 function Get-BridgeAuthBackoffSeconds {
     <#
         Seconds left before the bridge should speak to Home Assistant again, or 0 when
         it may. Reading it after the window has passed clears it.
     #>
     if ($null -eq $script:BridgeAuthBackoffUntil) { return 0 }
-    $left = ($script:BridgeAuthBackoffUntil - [DateTimeOffset]::Now).TotalSeconds
+    $left = ($script:BridgeAuthBackoffUntil - (Get-BridgeAuthTime)).TotalSeconds
     if ($left -le 0) {
         $script:BridgeAuthBackoffUntil = $null
         return 0
@@ -241,7 +246,7 @@ function Register-BridgeAuthRejected {
         $script:BridgeAuthBackoffStep++
     }
     $seconds = $script:BridgeAuthBackoffSteps[$script:BridgeAuthBackoffStep]
-    $script:BridgeAuthBackoffUntil = [DateTimeOffset]::Now.AddSeconds($seconds)
+    $script:BridgeAuthBackoffUntil = (Get-BridgeAuthTime).AddSeconds($seconds)
 
     $what = if ($Banned) {
         'Home Assistant refused this machine outright, which is what it does to a banned address'
@@ -410,8 +415,10 @@ function Test-HomeAssistantReachable {    <#
     }
     catch { }
 
+    $uri = "$($script:DecisionBridgeConfig.HomeAssistantBaseUrl)/api/"
+    Assert-BridgeHttpAllowed -Uri $uri
     try {
-        $null = Invoke-RestMethod -Uri "$($script:DecisionBridgeConfig.HomeAssistantBaseUrl)/api/" `
+        $null = Invoke-RestMethod -Uri $uri `
             -Headers (Get-HomeAssistantHeaders) -TimeoutSec $TimeoutSec
         Set-BridgeHomeAssistantReachable
         return $true
@@ -547,24 +554,29 @@ function Assert-BridgeHttpAllowed {
         original went unnoticed. Every refusal is counted as well, so a suite can
         assert that nothing was attempted rather than that something threw.
     #>
-    param([string]$Uri)
+    param([string]$Uri, [switch]$WebSocket)
 
-    if (-not $script:BridgeUnderTestSuite) { return }
-    if ($env:BRIDGE_ALLOW_TEST_HTTP -eq '1') { return }
+    # The runner's boundary survives subprocesses, whose call stacks no longer
+    # contain the suite. An integration opt-in cannot disable an offline run.
+    $offline = $env:AGENT_HA_BRIDGE_OFFLINE_TEST -eq '1'
+    if (-not $script:BridgeUnderTestSuite -and -not $offline) { return }
+    if (-not $offline -and $env:BRIDGE_ALLOW_TEST_HTTP -eq '1') { return }
 
     # A suite that has replaced Invoke-RestMethod cannot put anything on the wire, and
     # test-decision-retry.ps1 legitimately does exactly that to exercise this retry
     # layer. The guard is about real traffic, so that is what it asks about rather than
     # refusing every call made from a tests directory.
-    $sender = Get-Command -Name 'Invoke-RestMethod' -ErrorAction SilentlyContinue
-    if ($sender -and $sender.CommandType -ne [Management.Automation.CommandTypes]::Cmdlet) { return }
+    if (-not $WebSocket) {
+        $sender = Get-Command -Name 'Invoke-RestMethod' -ErrorAction SilentlyContinue
+        if ($sender -and $sender.CommandType -ne [Management.Automation.CommandTypes]::Cmdlet) { return }
+    }
 
     $script:BridgeBlockedHttpCalls++
     throw ("A test suite tried to reach a real Home Assistant$(if ($Uri) { " at $Uri" }). " +
         'Stub the function that makes the call, and define the stub above the code ' +
         'under test - PowerShell binds a function as it executes, so a stub written ' +
         'below the call it is meant to intercept does nothing. An integration test ' +
-        'that means to use a real Home Assistant sets BRIDGE_ALLOW_TEST_HTTP=1.')
+        'that means to use a real Home Assistant sets BRIDGE_ALLOW_TEST_HTTP=1 outside the offline runner.')
 }
 
 $script:BridgeHttpSession = $null
@@ -2437,7 +2449,6 @@ function Send-BridgeNotification {
         Write-DecisionBridgeLog -Message "notification via $service failed: $($_.Exception.Message)"
     }
 }
-
 
 
 

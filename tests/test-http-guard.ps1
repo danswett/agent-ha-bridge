@@ -20,8 +20,8 @@
     to fail loudly, and it has to catch the stub-in-the-wrong-place shape specifically -
     a missing stub is easy to see, one written thirty lines too late is not.
 
-    Nothing here reaches the network. The one check that deliberately gets past the
-    guard is pointed at a closed port on this machine.
+    Nothing here reaches the network. Integration opt-in is checked by calling the
+    guard itself, never by sending an actual request.
 #>
 
 Set-StrictMode -Version Latest
@@ -29,6 +29,7 @@ $ErrorActionPreference = 'Stop'
 
 . (Join-Path $PSScriptRoot '..\hooks\decision-bridge-common.ps1')
 . (Join-Path $PSScriptRoot '..\hooks\decision-mqtt.ps1')
+. (Join-Path $PSScriptRoot '..\hooks\decision-ha-websocket.ps1')
 $script:DecisionBridgeConfig.LogFile = Join-Path ([IO.Path]::GetTempPath()) "test-http-guard-$([guid]::NewGuid().ToString('N').Substring(0, 8)).log"
 
 $script:Failures = 0
@@ -103,26 +104,28 @@ function Get-HomeAssistantState {
 Write-Host ''
 Write-Host '--- an integration test can still opt in ---'
 
-# Past the guard deliberately, and pointed at a closed port on this machine so the
-# check proves the guard let it through without any traffic leaving the box.
-$script:DecisionBridgeConfig.HomeAssistantBaseUrl = 'http://127.0.0.1:1'
-$env:BRIDGE_ALLOW_TEST_HTTP = '1'
-$script:OptedIn = $null
+$offlineBefore = $env:AGENT_HA_BRIDGE_OFFLINE_TEST
 try {
-    Invoke-DecisionHttpRequest -Parameters @{ Method = 'Get'; Uri = 'http://127.0.0.1:1/api/'; TimeoutSec = 2 } -RetryCount 0
+    $env:BRIDGE_ALLOW_TEST_HTTP = '1'
+    $env:AGENT_HA_BRIDGE_OFFLINE_TEST = $null
+    Test-That 'an explicit integration opt-in gets past the guard outside the runner' {
+        Assert-BridgeHttpAllowed -Uri 'http://127.0.0.1:1/api/'
+        $true
+    }
+    $env:AGENT_HA_BRIDGE_OFFLINE_TEST = '1'
+    Test-That 'the same opt-in cannot bypass the offline runner' {
+        try { Assert-BridgeHttpAllowed -Uri 'http://127.0.0.1:1/api/'; $false }
+        catch { $_.Exception.Message -match 'tried to reach a real Home Assistant' }
+    }
 }
-catch { $script:OptedIn = $_.Exception.Message }
-$env:BRIDGE_ALLOW_TEST_HTTP = $null
+finally {
+    $env:BRIDGE_ALLOW_TEST_HTTP = $null
+    $env:AGENT_HA_BRIDGE_OFFLINE_TEST = $offlineBefore
+}
 
-Test-That 'BRIDGE_ALLOW_TEST_HTTP=1 gets past the guard' {
-    $script:OptedIn -and $script:OptedIn -notmatch 'tried to reach a real Home Assistant'
-} "[$script:OptedIn]"
-
-Test-That 'and the guard is back on once it is unset' {
-    $t = $null
-    try { Invoke-DecisionHttpRequest -Parameters @{ Method = 'Get'; Uri = 'http://127.0.0.1:1/api/'; TimeoutSec = 2 } -RetryCount 0 }
-    catch { $t = $_.Exception.Message }
-    $t -match 'tried to reach a real Home Assistant'
+Test-That 'the reachability probe uses the same guard, outside its catch' {
+    try { Test-HomeAssistantReachable -TimeoutSec 1; $false }
+    catch { $_.Exception.Message -match 'tried to reach a real Home Assistant' }
 }
 
 Write-Host ''
@@ -141,6 +144,16 @@ catch { $script:Stubbed = "threw: $($_.Exception.Message)" }
 
 Test-That 'a stubbed sender is allowed through' { $script:Stubbed -eq 'stubbed' } "[$script:Stubbed]"
 Test-That 'and is not counted as a refusal' { $script:BridgeBlockedHttpCalls -eq 0 } "blocked=$script:BridgeBlockedHttpCalls"
+
+Test-That 'a REST stub does not authorize a real WebSocket command' {
+    try { Invoke-CopilotHaWebSocket -Commands @(@{ type = 'get_states' }); $false }
+    catch { $_.Exception.Message -match 'tried to reach a real Home Assistant' }
+}
+Test-That 'nor a real WebSocket subscription' {
+    try { Wait-CopilotHaStateChange -EntityIds @('sensor.test') -TimeoutSeconds 1; $false }
+    catch { $_.Exception.Message -match 'tried to reach a real Home Assistant' }
+}
+Test-That 'both WebSocket refusals are counted' { $script:BridgeBlockedHttpCalls -eq 2 }
 
 Remove-Item -LiteralPath $script:DecisionBridgeConfig.LogFile -Force -ErrorAction SilentlyContinue
 if ($script:Failures) { Write-Host "`n$script:Failures check(s) failed" -ForegroundColor Red; exit 1 }

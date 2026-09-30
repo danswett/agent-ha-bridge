@@ -777,54 +777,53 @@ bridge cannot tell, it asks; a scripted uninstall keeps them. `-ClearShared` and
 ## Tests
 
 ```powershell
-.\tests\test-decision-args.ps1    # ask_user argument parsing and recovery
-.\tests\test-decision-retry.ps1   # HTTP retry / transient-failure classification
-.\tests\test-http-guard.ps1      # a suite cannot reach a real Home Assistant
-.\tests\test-bridge-adapter.ps1   # shared adapter orchestration (entities, status, notifications)
-.\tests\test-dashboard.ps1        # generated dashboard: title, view, session summary + version
-.\tests\test-status-card.ps1      # the Agent sessions card, end to end: real config, really published entities
-.\tests\test-worktree-isolation.ps1 # a worktree per launch, and that pruning cannot reach unmerged work
-.\tests\test-security.ps1         # template injection, path and topic safety, token handling
-.\tests\test-copilot-activity.ps1 # Copilot's transcript reader, and the inline thinking on its card
-.\tests\test-reliability.ps1      # request budget, StrictMode safety, stale-state pruning
-.\tests\test-update.ps1           # version comparison, release cache, failure safety
-.\tests\test-update-outcome.ps1   # install spinner + updated/failed notification
-.\tests\test-restart-restore.ps1  # a daemon restart restores cards instead of blanking them
-.\tests\test-driver-card.ps1      # the agent/human driver reaching the card, on every path that publishes one
-.\tests\test-new-session.ps1      # launching a session: argument quoting, the workspace allowlist, press handling
-.\tests\test-stop-session.ps1     # ending a session: graceful /exit, terminate fallback, press handling
-.\tests\test-install-clients.ps1  # installer client selection (‑Clients, persisted, defaults, first-install picker)
-.\tests\test-install-deps.ps1     # dependency offers (PowerShell 7, Node, the agent CLIs) and PATH handling
-.\tests\test-install-connection.ps1 # Home Assistant discovery without a pointless prompt, and the connection check
-.\tests\test-install-command.ps1  # the agent-ha-bridge command, its payload, and a sandboxed end-to-end install
-.\tests\test-install-cards.ps1    # the dashboard's frontend cards: detection, and repairing an unregistered one
-.\tests\test-layout-migration.ps1 # upgrading a pre-rename ~/.copilot install in place
-.\tests\test-verbose-toggle.ps1   # Detailed activity helper is provisioned without ever resetting it
+pwsh -NoProfile -File .\tests\run-tests.ps1                         # all offline suites
+pwsh -NoProfile -File .\tests\run-tests.ps1 -List                   # inspect the selection
+pwsh -NoProfile -File .\tests\run-tests.ps1 -Suite test-runner.ps1  # runner safety checks
+pwsh -NoProfile -File .\tests\run-tests.ps1 -Suite test-status-card.ps1
 ```
 
-These are plain PowerShell, need no Home Assistant, and run in a couple of seconds.
-The Claude adapter and the MCP server have their own suites — see their READMEs. The
-dashboard cards have one of their own in `frontend/test/test-cards.js`, run with plain
-`node` against a small DOM stand-in. CI runs the full list in
-`.github/workflows/ci.yml`, along with `tests/test-bootstrap.sh` — what the macOS
-installer hands to `installer` — on the macOS runner, because it needs BSD `mktemp`.
+Use PowerShell 7, Node.js and Git (including Git Bash on Windows). The runner uses
+`tests/suites.psd1` for the same Windows/macOS selection, including the Claude and
+Codex offline suites. Every suite must appear exactly once in the manifest.
+Each runs in a fresh process with a private home, temporary directory, synthetic
+configuration and client roots. Credentials and HTTP opt-ins are not inherited;
+redirected input, output and pipelines are UTF-8. Do not invoke suite files directly:
+these protections belong to the runner, not to every individual script.
+
+Logs and a machine-readable `summary.json` are kept in the printed results directory
+(or a new `-ResultsDirectory` you supply). Failures and per-suite timeouts fail the
+run; missing prerequisites are reported as explicit skips, not hidden passes.
+The default timeout is 180 seconds per suite. This is a test harness for reviewed
+fixtures, not a general OS sandbox.
+
+Installer-command tests are in the separate **Host** group. They run on disposable
+GitHub-hosted Windows/macOS CI machines with `-AllowHostTests`, unique test registry
+names and loopback fixtures. **Never run them on a developer or self-hosted machine**:
+`-TargetHome` does not redirect every external side effect. The **Platform** group
+keeps tmux/terminal delivery separate and has the same hosted-runner gate.
+**Integration** suites are inventoried but never executed by this runner or CI.
+They require an explicitly configured disposable Home Assistant, installed test
+hooks, and `BRIDGE_ALLOW_TEST_HTTP=1` outside the runner.
+
+The MCP server has its own Node suites; see its README. Dashboard cards also have
+`frontend/test/test-cards.js`, run with plain `node` against a small DOM stand-in.
+CI additionally runs `tests/test-bootstrap.sh` on macOS because it needs BSD `mktemp`.
 
 `AGENTS.md` has the rest of what a contributor needs: the worktree slots that keep
 concurrent sessions out of each other's way, the branch and pull request rules, the
 lint CI also enforces, how dashboard cards are version-gated, and the release steps.
 
-The native hook is Go (`hook/`): `go test ./...` there, and `go build -o
-agent-bridge-hook.exe .` (no `.exe` on macOS) for a local build - which the installer
+Build the native hook before a full offline run. It is Go (`hook/`): `go test ./...`
+there, and `go build -o agent-bridge-hook.exe .` (no `.exe` on macOS) for a local build -
+which the installer
 then uses instead of downloading one, and which `tests/test-native-hook.ps1` runs end
 to end with the daemon's spool.
 
-Nothing in the suite may disturb a real install on the machine running it. The
-installer tests run against `-TargetHome` with `-SkipTask`, `-SkipPath` and
-`-SkipDependencies`, configure only Copilot (the Codex adapter registers a plugin with
-the real `codex` binary, and the MCP one can write to Claude Desktop — neither honours
-`-TargetHome`), inject their own package-manager runners, drive PATH through injected
-getters and setters, and assert afterwards that the user PATH and the real config are
-byte-for-byte unchanged.
+Offline installer-helper tests inject package-manager and PATH operations; they do
+not run the main installer. The host-only suite still uses `-SkipTask`, `-SkipPath`,
+`-SkipDependencies` and Copilot-only fixtures. These switches are defense in depth
+inside a disposable machine, not permission to exercise installation on a real one.
 
 ---
 
@@ -1010,5 +1009,3 @@ start a turn, so there is no activity streaming and no reply-after-the-turn. See
 ## License
 
 MIT — see [LICENSE](LICENSE).
-
-

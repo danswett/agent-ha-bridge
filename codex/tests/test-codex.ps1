@@ -29,11 +29,8 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-# Loaded exactly as the hook loads it: template sanitisation lives in the shared
-# module, and codex-session defers to it when present.
-$core = Join-Path $HOME '.agent-ha-bridge\hooks\decision-bridge-common.ps1'
-if (Test-Path -LiteralPath $core) { . $core }
-else { . (Join-Path $PSScriptRoot '..\..\hooks\decision-bridge-common.ps1') }
+# Template sanitisation must come from this checkout, never an installed version.
+. (Join-Path $PSScriptRoot '..\..\hooks\decision-bridge-common.ps1')
 
 . (Join-Path $PSScriptRoot '..\hooks\codex-session.ps1')
 . (Join-Path $PSScriptRoot '..\hooks\codex-transcript.ps1')

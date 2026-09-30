@@ -117,15 +117,17 @@ Home Assistant card with the summary joined and the ciphertext withheld.
 ## Tests
 
 ```powershell
-.\tests\test-codex.ps1              # hook parsing, naming, path safety, reducer; no HA needed
-.\tests\test-codex-integration.ps1  # drives the hook against a real Home Assistant
+pwsh -NoProfile -File ..\tests\run-tests.ps1 -Suite test-codex.ps1
 ```
 
 `test-codex.ps1` covers hook parsing against the real captured payloads, session
 naming, path safety, approval markers, and the rollout reducer — no Home Assistant and
 no Codex session. `test-codex-integration.ps1` drives the hook with the fixtures on a
-real Home Assistant, checking the card publishes, tracks status and activity, and
-retires; it needs the bridge installed and is not part of CI.
+disposable Home Assistant, checking the card publishes, tracks status and activity,
+and retires; it needs test hooks installed and an explicit `BRIDGE_ALLOW_TEST_HTTP=1`
+outside the runner, and is not part of CI. Run the offline command from `codex/`.
+It always tests checkout code in private roots, never an installed shared helper.
+See the root README for the shared runner's prerequisites and suite groups.
 
 ## Uninstall
 
@@ -135,4 +137,3 @@ retires; it needs the bridge installed and is not part of CI.
 
 Removes the plugin, the marketplace registration and the adapter. Trust entries under
 `[hooks.state]` are left alone; they are harmless and Codex prunes them itself.
-

@@ -38,6 +38,10 @@
 .PARAMETER TargetHome
     Uninstall from this directory's .agent-ha-bridge instead of $HOME's. Intended for
     testing; it also skips the machine-wide steps (scheduled task, process termination).
+
+.PARAMETER TestRegistryId
+    The unique registry namespace passed to a disposable test install. Requires
+    -TargetHome and does not make this safe to run on a shared host.
 #>
 
 [CmdletBinding()]
@@ -47,10 +51,13 @@ param(
     [switch]$ClearShared,
     [switch]$KeepShared,
     [switch]$Pause,
-    [string]$TargetHome
+    [string]$TargetHome,
+    [ValidatePattern('^[a-f0-9]{32}$')][string]$TestRegistryId
 )
 
 $ErrorActionPreference = 'Stop'
+if ($TestRegistryId -and -not $TargetHome) { throw '-TestRegistryId requires -TargetHome.' }
+$testRegistrySuffix = if ($TestRegistryId) { "_$TestRegistryId" } else { '' }
 
 # Held at script scope because the trap below cannot see the parameter directly.
 $script:PauseOnExit = [bool]$Pause
@@ -96,7 +103,7 @@ if (Test-Path -LiteralPath $platform) { . $platform } else { $script:BridgeIsWin
 $installHome = if ($TargetHome) { $TargetHome } else { $HOME }
 $copilotHome = Join-Path $installHome '.copilot'
 $arpKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\AgentHaBridge' +
-          $(if ($TargetHome) { '_Sandbox' } else { '' })
+          $(if ($TargetHome) { "_Sandbox$testRegistrySuffix" } else { '' })
 $bridgeHome = Join-Path $installHome '.agent-ha-bridge'
 $hooksDir = Join-Path $bridgeHome 'hooks'
 $hookConfigPath = Join-Path $copilotHome 'hooks\decision-notifier.json'
@@ -110,7 +117,7 @@ $legacyHooksDir = Join-Path $copilotHome 'hooks'
 $legacyConfigPath = Join-Path $copilotHome 'copilot-ha-bridge.config.json'
 $legacyBridgeHome = Join-Path $copilotHome 'copilot-ha-bridge'
 $legacyArpKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\CopilotHaBridge' +
-                $(if ($TargetHome) { '_Sandbox' } else { '' })
+                $(if ($TargetHome) { "_Sandbox$testRegistrySuffix" } else { '' })
 
 function Write-Step { param([string]$Message) Write-Host "==> $Message" -ForegroundColor Cyan }
 

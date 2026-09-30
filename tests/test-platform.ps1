@@ -18,6 +18,8 @@
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'runner-support.ps1')
+Assert-BridgeHostedTest -AllowHostTests:($env:AGENT_HA_BRIDGE_TEST_GROUP -eq 'Platform')
 
 $script:Failures = 0
 function Test-That {

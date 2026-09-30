@@ -255,9 +255,22 @@ Test-That 'the default address lookup is not the Windows-only cmdlet' {
     $calls = $ast.FindAll({ param($n) $n -is [System.Management.Automation.Language.CommandAst] }, $true)
     @($calls | Where-Object { "$($_.GetCommandName())" -eq 'Resolve-DnsName' }).Count -eq 0
 }
-Test-That 'and it runs on this platform, whichever it is' {
-    $list = @(Get-BridgeHomeAssistantCandidate)
-    ($list -contains 'http://homeassistant.local:8123') -and ($list -contains 'http://localhost:8123')
+Test-That 'the default lookup uses the portable DNS API' {
+    $ast = (Get-Command Get-BridgeHomeAssistantCandidate).ScriptBlock.Ast
+    $lookups = @($ast.FindAll({
+        param($n)
+        $n -is [System.Management.Automation.Language.InvokeMemberExpressionAst] -and
+        $n.Expression -is [System.Management.Automation.Language.TypeExpressionAst] -and
+        $n.Expression.TypeName.FullName -eq 'System.Net.Dns' -and $n.Member.Value -eq 'GetHostAddresses'
+    }, $true))
+    $lookups.Count -eq 1
+}
+Test-That 'that API runs on this platform without looking up a real house' {
+    # A literal is parsed locally by the same API; no mDNS query leaves the machine.
+    $list = @(Get-BridgeHomeAssistantCandidate -Resolver {
+        [System.Net.Dns]::GetHostAddresses('127.0.0.1') | ForEach-Object { $_.IPAddressToString }
+    })
+    ($list -contains 'http://127.0.0.1:8123') -and ($list -contains 'http://homeassistant.local:8123')
 }
 
 Write-Host '--- an old or damaged config does not end the install ---'

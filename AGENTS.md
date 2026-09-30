@@ -79,22 +79,45 @@ Including one-line and documentation changes.
 
 ## Tests
 
-No Home Assistant is needed; everything is stubbed. From a slot:
+Use the runner, not individual suite scripts or a `Get-ChildItem` execution loop.
+From a slot, with PowerShell 7, Node.js and Git available:
 
 ```powershell
 node --check frontend/agent-bridge-reply-card.js
 node frontend/test/test-cards.js                 # the dashboard cards
-pwsh -NoProfile -File tests/test-<area>.ps1       # one suite
+pwsh -NoProfile -File tests\run-tests.ps1 -Suite test-runner.ps1
+pwsh -NoProfile -File tests\run-tests.ps1 -Suite test-auth-backoff.ps1
+pwsh -NoProfile -File tests\run-tests.ps1 -List   # no execution
 ```
 
-The whole suite, which is what CI runs:
+The canonical offline selection is `tests/suites.psd1`. Windows and macOS CI run the
+same command; new suites must be classified there or the runner fails:
 
 ```powershell
-foreach ($s in Get-ChildItem tests\test-*.ps1, claude\tests\test-*.ps1, codex\tests\test-*.ps1 |
-    Where-Object { $_.Name -notmatch 'integration|platform' }) {
-  pwsh -NoProfile -File $s.FullName
-}
+pwsh -NoProfile -File tests\run-tests.ps1
 ```
+
+Each suite gets a fresh process, HOME, TEMP, config, AppData and client roots. Only a
+small OS/tool environment allowlist is inherited, not credentials or HTTP opt-ins.
+Console input/output and pipelines use UTF-8. The offline guard also applies in child
+processes; mock transports before calling code that uses them. Do not defeat that
+guard, read installed helpers, or add real client/installer execution to Offline.
+This is isolation for reviewed tests, not an OS sandbox for arbitrary scripts.
+
+The runner retains logs and `summary.json` in the printed results directory, reports
+skips explicitly, and fails on a nonzero suite exit or timeout (180 seconds per suite).
+Use `-ResultsDirectory <new-directory>` to choose where diagnostics go. Build the
+native hook in `hook/` before a full run (`go build -o agent-bridge-hook.exe .` on
+Windows, without `.exe` on macOS); missing native binaries are reported as skips.
+
+`Host` (installer-command) and `Platform` (tmux delivery) are deliberately separate.
+They require `-Group Host` or `-Group Platform`, `-AllowHostTests`, and a disposable
+GitHub-hosted runner; developer and self-hosted machines are refused. Host tests use
+unique `-TestRegistryId` namespaces and loopback fixtures, but `-TargetHome` still
+does not isolate every installer side effect. Never run that suite locally.
+`Integration` is inventory-only here: those suites require a separately provisioned,
+disposable Home Assistant and an explicit `BRIDGE_ALLOW_TEST_HTTP=1` outside this
+runner. They are not part of CI or the safe offline command.
 
 CI also runs PSScriptAnalyzer over every `.ps1` under `PSScriptAnalyzerSettings.psd1`
 and fails on any finding. Run it before pushing - it has caught unapproved verbs and
@@ -107,7 +130,8 @@ Get-ChildItem -Recurse -Include *.ps1, *.psm1 |
 ```
 
 `tests/verify-*.ps1` are manual checks against real hardware (a Mac's Terminal, for
-one). CI does not run them, and neither should you without reading them first.
+one). The manifest and CI do not run them, and neither should you without reading
+them first and explicitly arranging a suitable test system.
 
 ## Dashboard cards are version-gated
 
