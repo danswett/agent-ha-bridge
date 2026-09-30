@@ -567,6 +567,45 @@ function Assert-BridgeHttpAllowed {
         'that means to use a real Home Assistant sets BRIDGE_ALLOW_TEST_HTTP=1.')
 }
 
+$script:BridgeHttpSession = $null
+
+function Get-BridgeHttpSession {
+    <#
+        One WebRequestSession shared by every call this process makes.
+
+        Invoke-RestMethod builds a fresh session for each call it is not given one,
+        and with it a fresh connection pool, so every request paid a new TCP connect
+        and a full TLS handshake. On the LAN that is a few milliseconds and invisible,
+        which is why it went unnoticed; over a Cloudflare tunnel it was measured at
+        60-75 ms a call against 23-26 ms once the connection is reused, on a daemon
+        that makes roughly eight calls every fifteen seconds.
+
+        Holding the session is what keeps the connection alive between calls. A
+        connection dropped in the meantime - Home Assistant restarting, a tunnel
+        reconnecting - surfaces as a transient error, which is precisely what the
+        retry loop below already exists to absorb.
+    #>
+    if ($null -eq $script:BridgeHttpSession) {
+        $script:BridgeHttpSession = [Microsoft.PowerShell.Commands.WebRequestSession]::new()
+    }
+    $script:BridgeHttpSession
+}
+
+function Test-BridgeHttpSessionSupported {
+    <#
+        Whether the Invoke-RestMethod in scope can be handed a WebSession.
+
+        Suites replace it with stubs, and those stubs declare their own parameters -
+        test-decision-retry.ps1 uses a bare param(), test-http-guard.ps1 names six.
+        Splatting WebSession at either is a binding error, so a change meant to save
+        a TLS handshake would instead have failed every suite that drives this retry
+        layer. Only the real cmdlet is given one; a stub is called exactly as before.
+    #>
+    if (-not $script:BridgeUnderTestSuite) { return $true }
+    $sender = Get-Command -Name 'Invoke-RestMethod' -ErrorAction SilentlyContinue
+    [bool]($sender -and $sender.CommandType -eq [Management.Automation.CommandTypes]::Cmdlet)
+}
+
 function Invoke-DecisionHttpRequest {
     <#
         Wraps Invoke-RestMethod with bounded exponential backoff.
@@ -597,11 +636,16 @@ function Invoke-DecisionHttpRequest {
             throw [TimeoutException]::new('Home Assistant budget for this hook is spent.')
         }
 
-        $call = $Parameters
+        # Copied rather than mutated: callers hold one parameter hashtable and reuse it
+        # across calls, so both the clamped timeout and the shared session below would
+        # otherwise leak back into theirs.
+        $call = @{} + $Parameters
         if ([double]::IsFinite($remaining)) {
-            $call = @{} + $Parameters
             $requested = if ($call.ContainsKey('TimeoutSec')) { [int]$call['TimeoutSec'] } else { 15 }
             $call['TimeoutSec'] = [Math]::Max(1, [Math]::Min($requested, [int][Math]::Floor($remaining)))
+        }
+        if (-not $call.ContainsKey('WebSession') -and (Test-BridgeHttpSessionSupported)) {
+            $call['WebSession'] = Get-BridgeHttpSession
         }
 
         try {
