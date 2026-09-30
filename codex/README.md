@@ -82,15 +82,31 @@ prompt and each tool call through the turn, shows the final reply, and is retire
 when the session ends — confirmed in the daemon log as `dashboard rebuilt for 3
 session(s)` followed by `retired session`.
 
-**Approving commands from Home Assistant works.** Codex runs `PermissionRequest`
+**Approval input uses Codex's native permission prompt.** Codex runs `PermissionRequest`
 before showing its own approval UI, and a hook that writes nothing to stdout reads as
 "no decision", so the terminal prompt still appears. The dashboard is therefore a
-second way to answer rather than a replacement, and whichever is used first wins —
-the same arrangement Copilot's `ask_user` uses.
+second input device rather than a replacement. It never changes Codex's permission
+policy or returns an automatic approval from a hook.
 
-Verified end to end: Codex asked to run a command outside its sandbox, the card armed
-showing that exact command, approving on the dashboard delivered the answer into the
-session, and the command ran.
+An earlier adapter validation exercised an approval end to end. That is not a
+guarantee about every current native UI: writing keys is reported as an **attempt**,
+not proof of approval or denial. If the result is not clear, check the terminal;
+the bridge does not retry input or infer consent from silence.
+
+Approval markers are now persisted before network work and carry the tool request
+ID plus a unique dashboard generation. A subsequent tool, new turn, stop or session
+end invalidates the old marker locally, including the live-daemon fast path and
+outages. A dashboard selection must belong to the current card and be newer than its
+marker. One delivery attempt is recorded before writing any keys, so restarting the
+daemon or failing to clear the card does not replay it. Requests without a native
+tool ID remain terminal-only.
+
+**Remaining compatibility limit:** the existing optimistic selector does not send a
+request ID with each command. A delayed command applied to a newer card with the same
+labels cannot be distinguished just by its resulting state. Fully request-bound input
+needs a separately versioned command/card contract and disposable real-client
+validation of the native UI and result shapes. Offline tests cover the local marker,
+generation, replay and status contracts, not that live guarantee.
 
 Note that `PermissionRequest` only fires in an interactive session. `codex exec`
 reports `approval: never` regardless of `approval_policy`, because it has no way to

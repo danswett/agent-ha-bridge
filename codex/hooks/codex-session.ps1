@@ -215,7 +215,7 @@ function Write-CodexSessionRegistration {
 
     $path = Join-Path (Get-CodexStateRoot) ((Get-CodexSafeSessionKey -SessionId $SessionId) + '.json')
     $existing = if (Test-Path -LiteralPath $path) {
-        try { Get-Content -LiteralPath $path -Raw | ConvertFrom-Json } catch { $null }
+        try { ConvertFrom-DecisionJson -Json (Get-Content -LiteralPath $path -Raw) } catch { $null }
     }
 
     # Later events carry less than SessionStart did, so anything already known is kept
@@ -340,15 +340,26 @@ function Write-CodexApprovalMarker {
     param(
         [Parameter(Mandatory)][string]$SessionId,
         [Parameter(Mandatory)][string]$DecisionId,
-        [Parameter(Mandatory)][AllowEmptyString()][string]$Question
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Question,
+        [string]$ToolCallId = '',
+        [string]$ToolName = '',
+        [string]$TurnId = ''
     )
 
-    [pscustomobject]@{
+    $marker = [pscustomobject]@{
         SessionId  = $SessionId
         DecisionId = $DecisionId
+        ToolCallId = $ToolCallId
+        ToolName   = $ToolName
+        TurnId     = $TurnId
         Question   = $Question
         Created    = [DateTimeOffset]::Now.ToString('o')
-    } | ConvertTo-Json -Depth 3 | Set-Content -LiteralPath (Get-CodexApprovalMarkerPath -SessionId $SessionId) -Encoding UTF8
+        DeliveryAttempted = $false
+    }
+    $path = Get-CodexApprovalMarkerPath -SessionId $SessionId
+    Invoke-DecisionMarkerLock -Path $path -Action {
+        Write-DecisionMarkerFile -Path $path -Marker $marker
+    }
 }
 
 function Get-CodexApprovalMarker {
@@ -361,11 +372,37 @@ function Get-CodexApprovalMarker {
 function Remove-CodexApprovalMarker {
     <# Returns $true when a marker was actually removed, so callers can tell whether
        there was anything pending. #>
-    param([Parameter(Mandatory)][string]$SessionId)
+    param([Parameter(Mandatory)][string]$SessionId, [string]$DecisionId = '')
     $path = Get-CodexApprovalMarkerPath -SessionId $SessionId
-    if (-not (Test-Path -LiteralPath $path)) { return $false }
-    Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
-    return $true
+    Invoke-DecisionMarkerLock -Path $path -Action {
+        if (-not (Test-Path -LiteralPath $path)) { return $false }
+        if ($DecisionId) {
+            $current = Get-CodexApprovalMarker -SessionId $SessionId
+            if ($null -eq $current -or [string]$current.DecisionId -cne $DecisionId) { return $false }
+        }
+        Remove-Item -LiteralPath $path -Force
+        $true
+    }
+}
+
+function Set-CodexApprovalMarkerAttempted {
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][string]$DecisionId,
+        [Parameter(Mandatory)][ValidateSet('Approve', 'Deny')][string]$Answer
+    )
+
+    $path = Get-CodexApprovalMarkerPath -SessionId $SessionId
+    Invoke-DecisionMarkerLock -Path $path -Action {
+        $marker = Get-CodexApprovalMarker -SessionId $SessionId
+        if ($null -eq $marker -or [string]$marker.DecisionId -cne $DecisionId -or
+            -not $marker.PSObject.Properties['ToolCallId'] -or -not $marker.ToolCallId -or
+            ($marker.PSObject.Properties['DeliveryAttempted'] -and $marker.DeliveryAttempted)) { return $false }
+        $marker | Add-Member -NotePropertyName DeliveryAttempted -NotePropertyValue $true -Force
+        $marker | Add-Member -NotePropertyName Answer -NotePropertyValue $Answer -Force
+        Write-DecisionMarkerFile -Path $path -Marker $marker
+        $true
+    }
 }
 
 function Get-CodexHookEvent {

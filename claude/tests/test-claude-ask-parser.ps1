@@ -111,13 +111,14 @@ Test-That 'options given as plain strings still work' {
     (ConvertFrom-ClaudeAskUserQuestion -ToolInput $input).Choices -join ',' -eq 'A,B'
 }
 
-Write-Host '--- truncation ---'
-Test-That 'an overlong option label is truncated' {
+Write-Host '--- lossless option identity ---'
+Test-That 'an overlong option label stays intact for safe terminal-only handling' {
     $long = 'x' * 900
     $input = [pscustomobject]@{ questions = @([pscustomobject]@{ question = 'Pick'; options = @([pscustomobject]@{ label = $long }) }) }
     $result = ConvertFrom-ClaudeAskUserQuestion -ToolInput $input
-    $result.Choices[0].Length -le 600 -and $result.Choices[0].EndsWith('...')
+    $result.Choices[0] -ceq $long -and $result.MarkerFields[0].Options[0] -ceq $long
 }
+Test-That 'too many questions retain their marker identities and options' { $parsedMany.MarkerFields.Count -eq 5 }
 
 Write-Host '--- hook event reading ---'
 Test-That 'a full hook event parses' {

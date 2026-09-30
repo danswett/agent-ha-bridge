@@ -82,6 +82,7 @@ function Publish-CopilotMqttMessage {
         $entityId = if ($slot -eq 'decision') { "select.${node}_decision" } else { "select.${node}_$slot" }
         $script:HaStates[$entityId] = [ordered]@{
             state = 'unknown'
+            last_changed = [DateTimeOffset]::Now.ToString('o')
             attributes = [ordered]@{
                 options = @($config.options)
                 # Home Assistant builds an MQTT entity's friendly_name from the device
@@ -103,7 +104,10 @@ function Publish-CopilotMqttMessage {
 function Invoke-HomeAssistantService {
     param([string]$Domain, [string]$Service, [hashtable]$Headers, [hashtable]$Data)
     $entityId = [string]$Data.entity_id
-    if ($script:HaStates.Contains($entityId)) { $script:HaStates[$entityId].state = [string]$Data.option }
+    if ($script:HaStates.Contains($entityId)) {
+        $script:HaStates[$entityId].state = [string]$Data.option
+        $script:HaStates[$entityId].last_changed = [DateTimeOffset]::Now.ToString('o')
+    }
 }
 function Set-CopilotMqttEntityIds { param([string]$SessionId) }
 function Start-Sleep { param([int]$Milliseconds, [int]$Seconds) }
@@ -219,15 +223,16 @@ foreach ($call in @($rendered.calls)) {
     $entityId = [string]$call.data.entity_id
     if (-not $script:HaStates.Contains($entityId)) { $script:HaStates[$entityId] = [ordered]@{ state = ''; attributes = @{} } }
     $script:HaStates[$entityId].state = [string]$call.data.option
+    $script:HaStates[$entityId].last_changed = [DateTimeOffset]::Now.ToString('o')
 }
-$script:HaStates["text.${node}_reply"] = [ordered]@{ state = 'nothing to add'; attributes = @{} }
+$script:HaStates["text.${node}_reply"] = [ordered]@{ state = 'nothing to add'; last_changed = [DateTimeOffset]::Now.ToString('o'); attributes = @{} }
 $script:HaStates["button.${node}_submit"] = [ordered]@{ state = [DateTimeOffset]::Now.ToString('o'); attributes = @{} }
 
 function Get-HomeAssistantState {
     param([string]$EntityId, [hashtable]$Headers)
     if (-not $script:HaStates.Contains($EntityId)) { throw "no such entity: $EntityId" }
     $entry = $script:HaStates[$EntityId]
-    [pscustomobject]@{ entity_id = $EntityId; state = [string]$entry.state; attributes = $entry.attributes }
+    [pscustomobject]@{ entity_id = $EntityId; state = [string]$entry.state; last_changed = $entry['last_changed']; attributes = $entry.attributes }
 }
 
 $marker = [pscustomobject]@{
@@ -258,6 +263,7 @@ $script:HaStates["select.${node}_f2"].state = 'After the release'
 $cancelled = Invoke-ChoicesCard -Taps @('Cancel request')
 foreach ($call in @($cancelled.calls)) {
     $script:HaStates[[string]$call.data.entity_id].state = [string]$call.data.option
+    $script:HaStates[[string]$call.data.entity_id].last_changed = [DateTimeOffset]::Now.ToString('o')
 }
 Test-That 'the cancel row sets the decision selector, not a field' {
     @($cancelled.calls).Count -eq 1 -and [string]@($cancelled.calls)[0].data.entity_id -eq "select.${node}_decision"

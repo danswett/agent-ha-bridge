@@ -87,6 +87,36 @@ It asks Claude which tools it advertises and stops with an explanation if
 session, captures the `PreToolUse` payload Claude actually emits, checks every field
 against the assumed contract, and runs it through the parser — so a drift in field
 names is caught rather than guessed at. Re-run it after any Claude Code upgrade.
+The existing [question-path verification issue](https://github.com/danswett/agent-ha-bridge/issues/5)
+remains the tracking point. Passing synthetic parser or decision tests does not close
+that real-session gate.
+
+### Decision correlation and answer verification
+
+A pending decision is saved locally before Home Assistant work. Its unique dashboard
+generation and native `tool_use_id` are kept separately: a newer or overlapping
+question cannot inherit an earlier question's answer. The hook alone is not evidence
+that the native prompt is ready; delivery waits for the matching transcript entry.
+Older events without enough request identity are explicitly terminal-only.
+
+Field identities and full option labels are retained. Labels that collide, exceed a
+selector's limit or conflict with its control labels are not clipped into actionable
+choices; the card instead directs the user to the terminal. The shared Copilot schema
+path also retains typed values, array semantics and defaults, but leaves arrays and
+default-dependent forms to the terminal until their native UI contract is established.
+It does not borrow Claude's checkbox keystrokes for a different client.
+
+Dashboard input is attempted at most once per generation, including partial delivery
+and daemon restarts. The bridge compares complete, field-addressed results exactly,
+distinguishing **matched**, **different** and **unconfirmed** rather than searching
+for a label inside arbitrary result text. It never sends an extra Enter merely
+because a result is missing, and does not send an automatic correction that might
+overrule a legitimate terminal answer.
+
+Both input paths remain available for identified, supported requests. This is not an
+atomic native-UI input protocol: terminal focus, simultaneous input and a delayed
+optimistic selector command still need real-client validation and a request-bearing,
+version-gated command contract. None of these checks replace native permissions.
 
 **Best-effort:** answering a permission prompt from the reply box. The text is injected
 into Claude's own prompt; whether that prompt accepts typed input depends on the prompt.

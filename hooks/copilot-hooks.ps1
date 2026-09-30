@@ -13,10 +13,10 @@
 function Invoke-CopilotAskUserHook {
     <#
         preToolUse for ask_user - dual-input, non-blocking:
-          1. Ensures this session's Home Assistant entities exist.
-          2. Arms this session's MQTT decision card with the question and choices.
-          3. Sends an optional push notification.
-          4. Writes a pending-decision marker for the daemon.
+          1. Writes a pending-decision marker for the daemon.
+          2. Ensures this session's Home Assistant entities exist.
+          3. Arms this session's MQTT decision card with the question and choices.
+          4. Sends an optional push notification.
         The caller then returns `allow` at once, so the native terminal prompt appears.
 
         Why non-blocking: the previous router blocked until Home Assistant returned an
@@ -37,13 +37,27 @@ function Invoke-CopilotAskUserHook {
     # Fields read only when present, so an event missing one reads the same under
     # strict mode (the daemon's tests) as without it (the hook).
     $field = { param($Object, [string]$Name) if ($null -ne $Object -and $Object.PSObject.Properties[$Name]) { $Object.$Name } }
+    $sessionId = [string](& $field $HookEvent 'sessionId')
+    if ([string]::IsNullOrWhiteSpace($sessionId)) { $sessionId = "unknown-$PID" }
+    $toolCallId = ''
+    foreach ($key in @('toolCallId', 'tool_call_id', 'tool_use_id')) {
+        $value = [string](& $field $HookEvent $key)
+        if ($value) { $toolCallId = $value; break }
+    }
+    $current = Get-CopilotDecisionMarker -SessionId $sessionId
+    if ($toolCallId -and $null -ne $current -and $current.PSObject.Properties['toolCallId'] -and
+        [string]$current.toolCallId -ceq $toolCallId) {
+        Write-DecisionBridgeLog -Message "ignored repeated ask_user hook for $sessionId"
+        return
+    }
+    [void](Remove-CopilotDecisionMarker -SessionId $sessionId)
 
     $toolArgs = & $field $HookEvent 'toolArgs'
     if ($null -eq $toolArgs) { $toolArgs = & $field $HookEvent 'tool_input' }
-    if ($toolArgs -is [string]) { $toolArgs = $toolArgs | ConvertFrom-Json }
+    if ($toolArgs -is [string]) { $toolArgs = ConvertFrom-DecisionJson -Json $toolArgs }
     if ($null -ne (& $field $toolArgs 'arguments')) {
         $toolArgs = $toolArgs.arguments
-        if ($toolArgs -is [string]) { $toolArgs = $toolArgs | ConvertFrom-Json }
+        if ($toolArgs -is [string]) { $toolArgs = ConvertFrom-DecisionJson -Json $toolArgs }
     }
 
     $parsed = Repair-DecisionToolArguments -ToolArgs $toolArgs
@@ -51,14 +65,21 @@ function Invoke-CopilotAskUserHook {
     $choices = @($parsed.Choices)
     $combos = @($parsed.Combos)
     $fields = @($parsed.Fields)
-    $terminalOnly = [bool]$parsed.TerminalOnly
-    $mode = if ($choices.Count -gt 0 -or $fields.Count -gt 0) { 'multiple_choice' } else { 'freeform' }
+    $terminalOnly = [bool]$parsed.TerminalOnly -or [bool]$parsed.Recovered
+    $mode = if ($choices.Count -gt 0 -or $fields.Count -gt 1) { 'multiple_choice' } else { 'freeform' }
+    if (-not $toolCallId) { $terminalOnly = $true }
 
     # Say so on the card rather than offering a box that cannot work. The native
     # prompt here is an arrow-key form the dashboard cannot drive, and anything typed
     # at it is discarded, so the honest thing is to send the user to the terminal.
     if ($terminalOnly) {
-        $question = "$question`n`n**This one has to be answered in the terminal** - it has more fields than the dashboard can drive, so a reply typed here would not reach the prompt."
+        if ($choices.Count -gt 0 -and $fields.Count -eq 0) {
+            $question += "`n`n" + (($choices | ForEach-Object { "- $_" }) -join "`n")
+        }
+        $reason = if (-not $toolCallId) { 'this client did not identify the current request' }
+            elseif ($parsed.Recovered) { 'recovered arguments do not establish the native form contract' }
+            else { 'its fields, defaults or option labels cannot be driven safely by this dashboard' }
+        $question = "$question`n`n**Answer this one in the terminal** - $reason."
     }
     else {
         # A mixed form answers its dropdowns from the field selectors and its one
@@ -78,10 +99,14 @@ function Invoke-CopilotAskUserHook {
         "ask_user parsed (v3): argKeys=[$argKeys] choices=$($choices.Count) fields=$($fields.Count) mode=$mode terminalOnly=$terminalOnly questionChars=$($question.Length)"
     )
 
-    $sessionId = [string](& $field $HookEvent 'sessionId')
-    if ([string]::IsNullOrWhiteSpace($sessionId)) { $sessionId = "unknown-$PID" }
     $workingDirectory = [string](& $field $HookEvent 'cwd')
     if ([string]::IsNullOrWhiteSpace($workingDirectory)) { $workingDirectory = 'Unknown folder' }
+
+    $node = Get-CopilotMqttNodeId -SessionId $sessionId
+    $decisionId = "$node-$([guid]::NewGuid().ToString('N'))"
+    Write-CopilotDecisionMarker -SessionId $sessionId -DecisionId $decisionId `
+        -Question $question -Choices $choices -Combos $combos -Fields $fields `
+        -TerminalOnly:$terminalOnly -Mode $mode -ToolCallId $toolCallId | Out-Null
 
     # This hook runs before the native prompt appears; it must never wait on the
     # network. Enter-BridgeAdapterSession probes, sets the deadline and returns headers
@@ -89,8 +114,6 @@ function Invoke-CopilotAskUserHook {
     $headers = Enter-BridgeAdapterSession
     if (-not $headers) { return }
     $display = Get-CopilotSessionDisplay -SessionId $sessionId -WorkingDirectory $workingDirectory
-    $node = Get-CopilotMqttNodeId -SessionId $sessionId
-    $decisionId = "$($node)-$(& $field $HookEvent 'timestamp')"
 
     # Ensure this session's entities exist. The daemon publishes them within a
     # reconcile interval of session start, but an ask_user in the first seconds of a
@@ -100,15 +123,7 @@ function Invoke-CopilotAskUserHook {
 
     Set-CopilotMqttDecision -SessionId $sessionId -SessionName $display.Name `
         -Machine $display.Machine -Question $question -Choices $choices `
-        -Fields $fields -DecisionId $decisionId -Headers $headers | Out-Null
-
-    # The marker is the daemon's gate: while it exists and the transcript shows the
-    # ask_user still pending, the daemon injects a Home Assistant answer and clears the
-    # card on completion. It also carries the combo mapping so a multi-field choice can
-    # be reported field by field.
-    Write-CopilotDecisionMarker -SessionId $sessionId -DecisionId $decisionId `
-        -Question $question -Choices $choices -Combos $combos -Fields $fields `
-        -TerminalOnly:$terminalOnly -Mode $mode | Out-Null
+        -Fields $fields -DecisionId $decisionId -Headers $headers -TerminalOnly:$terminalOnly | Out-Null
 
     # Notify. Both paths (terminal and Home Assistant) are now open.
     if ($choices.Count -gt 0) {
@@ -121,7 +136,7 @@ function Invoke-CopilotAskUserHook {
             ''
             ($numbered -join "`n")
             ''
-            'Answer in the terminal or on the Agent Sessions dashboard.'
+            $(if ($terminalOnly) { 'Answer in the terminal.' } else { 'Answer in the terminal or on the Agent Sessions dashboard.' })
         ) -join "`n"
     }
     else {
@@ -131,7 +146,7 @@ function Invoke-CopilotAskUserHook {
             ''
             $question
             ''
-            'Answer in the terminal or in the Reply box on the Agent Sessions dashboard.'
+            $(if ($terminalOnly) { 'Answer in the terminal.' } else { 'Answer in the terminal or in the Reply box on the Agent Sessions dashboard.' })
         ) -join "`n"
     }
     if ($body.Length -gt 950) { $body = $body.Substring(0, 947) + '...' }
@@ -156,6 +171,7 @@ function Invoke-CopilotAgentStopHook {
     param([Parameter(Mandatory)]$HookEvent)
 
     $sessionId = [string]$HookEvent.sessionId
+    [void](Remove-CopilotDecisionMarker -SessionId $sessionId)
     $transcriptPath = [string]$HookEvent.transcriptPath
     if (
         [string]::IsNullOrWhiteSpace($transcriptPath) -or

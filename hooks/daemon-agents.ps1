@@ -49,7 +49,15 @@ $script:DaemonAgents = [ordered]@{
         ReadAppend = { param($Path, $Offset) Read-TranscriptAppend -Path $Path -Offset $Offset }
         Activity = { param($Lines, $VerboseMode) Get-ActivityFromEvents -Lines $Lines -VerboseMode $VerboseMode }
         IsWorking = { param($SessionId, $Transcript, $Status) Test-CopilotSessionWorking -SessionId $SessionId }
-        AskUserState = { param($Session, $Marker) Get-CopilotAskUserState -TranscriptPath ([string]$Session.Transcript) }
+        AskUserState = {
+            param($Session, $Marker)
+            if ($null -eq $Marker) { return Get-CopilotAskUserState -TranscriptPath ([string]$Session.Transcript) }
+            if (-not $Marker.PSObject.Properties['toolCallId'] -or -not $Marker.toolCallId -or
+                ($Marker.PSObject.Properties['toolName'] -and $Marker.toolName -cne 'ask_user')) {
+                return [pscustomobject]@{ Started = $false; Pending = $false; CanAnswer = $false; ResultContent = '' }
+            }
+            Get-CopilotAskUserState -TranscriptPath ([string]$Session.Transcript) -ToolCallId ([string]$Marker.toolCallId)
+        }
         AdapterInstalled = { Test-Path -LiteralPath (Join-Path $HOME '.copilot\hooks\decision-notifier.json') }
         # Copilot's hooks are written by the main installer, which also removes them
         # whenever Copilot is not among the configured clients - so it is run with
@@ -131,12 +139,17 @@ $script:DaemonAgents = [ordered]@{
         # Judged by the marker's own question, not whichever one the transcript shows last.
         AskUserState = {
             param($Session, $Marker)
-            if (-not $script:ClaudeAdapterLoaded) { return Get-CopilotAskUserState -TranscriptPath ([string]$Session.Transcript) }
+            if (-not $script:ClaudeAdapterLoaded) {
+                return & $script:DaemonAgents['copilot'].AskUserState $Session $Marker
+            }
             $toolCallId = ''
             $since = $null
             if ($null -ne $Marker) {
                 if ($Marker.PSObject.Properties['toolCallId']) { $toolCallId = [string]$Marker.toolCallId }
                 if ($Marker.PSObject.Properties['armedAt']) { $since = [string]$Marker.armedAt }
+                if (-not $toolCallId -or ($Marker.PSObject.Properties['toolName'] -and $Marker.toolName -cne 'AskUserQuestion')) {
+                    return [pscustomobject]@{ Started = $false; Pending = $false; CanAnswer = $false; ResultContent = '' }
+                }
             }
             Get-ClaudeAskUserState -TranscriptPath ([string]$Session.Transcript) -ToolCallId $toolCallId -Since $since
         }

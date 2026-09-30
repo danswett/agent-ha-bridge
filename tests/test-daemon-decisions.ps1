@@ -32,12 +32,17 @@ $node = Get-CopilotMqttNodeId -SessionId $sid
 
 # Home Assistant, as a table of entity states; a missing entity throws, as a 404 does.
 $script:Ha = @{}
+$script:CardId = 'd1'
+$script:SelectionAt = [DateTimeOffset]::Now.ToString('o')
 function Get-HomeAssistantState {
     param([string]$EntityId, [hashtable]$Headers)
     if (-not $script:Ha.ContainsKey($EntityId)) { throw "404 $EntityId" }
     $v = $script:Ha[$EntityId]
     if ($v -is [pscustomobject]) { return $v }
-    [pscustomobject]@{ state = [string]$v; attributes = [pscustomobject]@{ question = 'Pick' } }
+    [pscustomobject]@{
+        state = [string]$v; last_changed = $script:SelectionAt
+        attributes = [pscustomobject]@{ question = 'Pick'; decision_id = $script:CardId }
+    }
 }
 $script:Transient = @()
 function Set-DaemonTransientActivity { param($SessionId, $Summary, $Extra, $Headers) $script:Transient += $Summary; 'emitted' }
@@ -54,6 +59,8 @@ $form = [pscustomobject]@{
 }
 $state = @{ $sid = [pscustomobject]@{ Name = 'Claude: x'; Machine = 'M'; LastReply = '' } }
 function Set-Form { param($Colour, $Size, $Notes, $Submit, $Decision = 'Awaiting answer...')
+    $script:CardId = 'd1'
+    $state[$sid] | Add-Member -NotePropertyName LastSubmitAt -NotePropertyValue '' -Force
     $script:Ha = @{
         "select.${node}_decision" = $Decision
         "select.${node}_f1" = $Colour
@@ -70,6 +77,9 @@ Test-That 'every field chosen and Submit pressed after arming sends it' { $r.Ans
 Test-That 'an empty free-text field is a valid answer' { @($r.Selections).Count -eq 3 }
 Test-That 'the press is consumed, so it is not also read as a Send' { $state[$sid].LastSubmitAt -eq $script:Ha["button.${node}_submit"] }
 Test-That 'what a call emits never joins the result' { $r -is [pscustomobject] }
+Test-That 'the same submit press cannot send the form twice' {
+    (Read-DaemonFormAnswer -SessionId $sid -Marker $form -State $state -Headers $headers).Answer -eq ''
+}
 
 Set-Form -Colour 'Blue' -Size 'L' -Notes '' -Submit $armedAt.AddMinutes(-1).ToString('o')
 Test-That 'a press from before the question was armed does not count' { (Read-DaemonFormAnswer -SessionId $sid -Marker $form -State $state -Headers $headers).Answer -eq '' }
@@ -84,15 +94,17 @@ Test-That 'Cancel on the main selector cancels the form' { (Read-DaemonFormAnswe
 
 Write-Host '--- a single choice, and a free-text answer ---'
 # Markers as Write-CopilotDecisionMarker writes them: injectedAnswer is always there.
-$choice = [pscustomobject]@{ mode = 'multiple_choice'; decisionId = 'd2'; question = 'Pick'; fields = @(); choices = @('Yes', 'No'); injectedAnswer = '' }
+$choice = [pscustomobject]@{ mode = 'multiple_choice'; decisionId = 'd2'; toolCallId = 'native'; armedAt = $armedAt.ToString('o'); question = 'Pick'; fields = @(); choices = @('Yes', 'No'); injectedAnswer = '' }
+$script:CardId = 'd2'
 $script:Ha = @{ "select.${node}_decision" = 'Yes' }
 Test-That 'a choice is read from the selector' { $x = Read-DaemonDecisionAnswer -SessionId $sid -Marker $choice -State $state -Headers $headers; $x.Answer -eq 'Yes' -and $x.IsChoice }
 $script:Ha = @{ "select.${node}_decision" = 'Awaiting answer...' }
 Test-That 'the placeholder is not an answer' { (Read-DaemonDecisionAnswer -SessionId $sid -Marker $choice -State $state -Headers $headers).Answer -eq '' }
-$free = [pscustomobject]@{ mode = 'freeform'; decisionId = 'd3'; question = 'Why?'; fields = @(); choices = @(); injectedAnswer = '' }
-$script:Ha = @{ "text.${node}_reply" = 'Because.' }
+$free = [pscustomobject]@{ mode = 'freeform'; decisionId = 'd3'; armedAt = $armedAt.ToString('o'); question = 'Why?'; fields = @(); choices = @(); injectedAnswer = '' }
+$script:CardId = 'd3'
+$script:Ha = @{ "select.${node}_decision" = 'Awaiting answer...'; "text.${node}_reply" = 'Because.' }
 Test-That 'a freeform answer is read from the reply box' { (Read-DaemonDecisionAnswer -SessionId $sid -Marker $free -State $state -Headers $headers).Answer -eq 'Because.' }
-$script:Ha = @{ "text.${node}_reply" = ' ' }
+$script:Ha = @{ "select.${node}_decision" = 'Awaiting answer...'; "text.${node}_reply" = ' ' }
 Test-That 'the blank the box is parked on is not an answer' { (Read-DaemonDecisionAnswer -SessionId $sid -Marker $free -State $state -Headers $headers).Answer -eq '' }
 $script:Ha = @{}
 Test-That 'an unreadable card gives nothing, rather than a guess' { $null -eq (Read-DaemonDecisionAnswer -SessionId $sid -Marker $free -State $state -Headers $headers) }
@@ -102,15 +114,21 @@ $script:Injected = @(); $script:Cleared = @(); $script:Removed = @()
 $script:Marker = $null
 $script:Ask = @{ Started = $true; Pending = $true }
 function Get-CopilotDecisionMarker { param($SessionId) $script:Marker }
-function Get-DaemonAskUserState { param($Session, $Marker) [pscustomobject]@{ Started = $script:Ask.Started; Pending = $script:Ask.Pending; ResultContent = '' } }
+function Get-DaemonAskUserState { param($Session, $Marker) [pscustomobject]@{ Started = $script:Ask.Started; Pending = $script:Ask.Pending; CanAnswer = ($script:Ask.Started -and $script:Ask.Pending); ToolCallId = 'native'; ResultContent = '' } }
 function Invoke-DaemonDecisionAnswer { param($SessionId, $Marker, $Answer, $IsChoice, $Selections, $Headers) $script:Injected += $Answer; $true }
 function Clear-CopilotMqttDecision { param($SessionId, $SessionName, $Machine, $Headers) $script:Cleared += $SessionId; 'emitted' }
 function Invoke-HomeAssistantService { param($Domain, $Service, $Headers, $Data) }
-function Remove-CopilotDecisionMarker { param($SessionId) $script:Removed += $SessionId }
+function Remove-CopilotDecisionMarker {
+    param($SessionId, $DecisionId, [switch]$PassThru)
+    $removed = $null -ne $script:Marker -and $script:Marker.decisionId -ceq $DecisionId
+    if ($removed) { $script:Removed += $SessionId; $script:Marker = $null }
+    if ($PassThru) { $removed }
+}
 function Set-CopilotMqttDecision { param($SessionId, $SessionName, $Machine, $Question, $Choices, $Fields, $DecisionId, $Headers) $script:Rearmed = $true }
 $live = @{ $sid = [pscustomobject]@{ SessionId = $sid } }
 
 $script:Marker = $choice
+$script:CardId = 'd2'
 $script:Ha = @{ "select.${node}_decision" = 'No' }
 Invoke-PendingDecisions -Headers $headers -State $state -Live $live
 Test-That 'a pending question with an answer on its card is answered' { ($script:Injected -join ',') -eq 'No' }
@@ -137,6 +155,7 @@ Invoke-PendingDecisions -Headers $headers -State $state -Live $live
 Test-That 'a card the hook could not arm is armed from the marker' { $script:Rearmed }
 
 $script:Ask = @{ Started = $true; Pending = $false }
+$script:Ha = @{ "select.${node}_decision" = 'No' }
 Invoke-PendingDecisions -Headers $headers -State $state -Live $live
 Test-That 'an answered question has its card cleared and its marker removed' { $script:Cleared -contains $sid -and $script:Removed -contains $sid }
 

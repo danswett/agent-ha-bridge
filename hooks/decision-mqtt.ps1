@@ -1346,7 +1346,7 @@ function Set-CopilotMqttStatus {
         [string]$SessionId,
 
         [Parameter(Mandatory)]
-        [ValidateSet('working', 'idle', 'waiting', 'offline')]
+        [ValidateSet('working', 'idle', 'waiting', 'ending', 'ended', 'error', 'offline')]
         [string]$Status,
 
         [hashtable]$Attributes = @{},
@@ -1418,6 +1418,9 @@ function Publish-CopilotMqttDecisionFields {
         [Parameter(Mandatory)][hashtable]$Headers
     )
 
+    if ($Fields.Count -gt 0 -and -not (Test-DecisionFieldsAnswerable -Fields $Fields)) {
+        throw 'Decision fields cannot be represented losslessly; answer in the terminal.'
+    }
     $topics = Get-CopilotMqttTopics -SessionId $SessionId
     $node = $topics.Node
     $device = New-CopilotMqttDeviceBlock -Node $node -SessionName $SessionName -Machine $Machine
@@ -1440,13 +1443,7 @@ function Publish-CopilotMqttDecisionFields {
                 @(Get-DecisionMultiSelectChoices -Field $field)
             }
             else { @($field.Options) }
-            $options = @('Choose...') + @(
-                $listed | ForEach-Object {
-                    $t = [string]$_
-                    if ($t.Length -gt 250) { $t = $t.Substring(0, 247) + '...' }
-                    $t
-                }
-            )
+            $options = @('Choose...') + @($listed)
         }
 
         $config = @{
@@ -1709,6 +1706,8 @@ function Set-CopilotMqttDecision {
         # published as one dropdown per field instead of a single flattened list.
         [AllowNull()][object[]]$Fields = @(),
 
+        [switch]$TerminalOnly,
+
         [Parameter(Mandatory)]
         [string]$DecisionId,
 
@@ -1722,6 +1721,12 @@ function Set-CopilotMqttDecision {
     $availability = @(@{ topic = $topics.Availability; payload_available = 'online'; payload_not_available = 'offline' })
 
     $fieldList = @($Fields)
+    if (-not (Test-DecisionOptionLabels -Options $Choices) -or
+        ($fieldList.Count -gt 0 -and -not (Test-DecisionFieldsAnswerable -Fields $fieldList))) {
+        $TerminalOnly = $true
+        $Question += "`n`nAnswer in the terminal: the dashboard cannot represent this request safely."
+    }
+    if ($TerminalOnly) { $fieldList = @(); $Choices = @() }
     $isMultiField = $fieldList.Count -gt 1 -and $fieldList.Count -le $script:CopilotMqttMaxFields
 
     # A multi-field question answers through its per-field dropdowns, so the main
@@ -1731,13 +1736,7 @@ function Set-CopilotMqttDecision {
         $options = @('Awaiting answer...', 'Cancel request')
     }
     elseif ($Choices.Count -gt 0) {
-        $options = @('Awaiting answer...') +
-            @($Choices | ForEach-Object {
-                $text = [string]$_
-                if ($text.Length -gt 250) { $text = $text.Substring(0, 247) + '...' }
-                $text
-            }) +
-            @('Cancel request')
+        $options = @('Awaiting answer...') + @($Choices) + @('Cancel request')
     }
 
     $decision = @{
@@ -1866,4 +1865,3 @@ function Clear-CopilotMqttDecision {
         # Non-fatal.
     }
 }
-

@@ -767,6 +767,39 @@ function Repair-DecisionTextEncoding {
     }
 }
 
+function ConvertFrom-DecisionJson {
+    <# JSON strings must stay strings, including date-looking enum values. #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Json)
+
+    $document = [System.Text.Json.JsonDocument]::Parse($Json)
+    $read = {
+        param($Element)
+        switch ([string]$Element.ValueKind) {
+            'Object' {
+                $properties = [ordered]@{}
+                foreach ($property in $Element.EnumerateObject()) {
+                    if ($properties.Contains($property.Name)) { throw 'Ambiguous decision JSON property names.' }
+                    $properties[$property.Name] = & $read $property.Value
+                }
+                return [pscustomobject]$properties
+            }
+            'Array' {
+                $items = [Collections.Generic.List[object]]::new()
+                foreach ($item in $Element.EnumerateArray()) { $items.Add((& $read $item)) }
+                return ,$items.ToArray()
+            }
+            'String' { return $Element.GetString() }
+            'Number' { return (ConvertFrom-Json -InputObject $Element.GetRawText()) }
+            'True' { return $true }
+            'False' { return $false }
+            'Null' { return $null }
+            default { throw 'Unsupported decision JSON value.' }
+        }
+    }
+    try { return ,(& $read $document.RootElement) }
+    finally { $document.Dispose() }
+}
+
 function ConvertFrom-DecisionChoiceList {
     <#
         Parses a leaked `choices` payload, which arrives as the JSON array literal the
@@ -794,7 +827,7 @@ function ConvertFrom-DecisionChoiceList {
         try {
             # Windows PowerShell 5.1 emits a parsed JSON array as a single nested
             # object rather than unrolling it, so flatten one level explicitly.
-            $parsed = $payload.Substring(0, $end + 1) | ConvertFrom-Json
+            $parsed = ConvertFrom-DecisionJson -Json $payload.Substring(0, $end + 1)
             $items = New-Object System.Collections.Generic.List[string]
             foreach ($entry in @($parsed)) {
                 if ($entry -is [System.Collections.IEnumerable] -and $entry -isnot [string]) {
@@ -915,7 +948,7 @@ function ConvertFrom-DecisionSchemaText {
 
     foreach ($candidate in $candidates) {
         try {
-            $parsed = $candidate | ConvertFrom-Json
+            $parsed = ConvertFrom-DecisionJson -Json $candidate
             if ($null -ne $parsed) { return $parsed }
         }
         catch {
@@ -966,40 +999,45 @@ function Get-DecisionSchemaFieldChoices {
         ($null -ne $Object.$Name)
     }
 
-    # A `oneOf`/`anyOf` entry carries its display text in `title` and its schema value
-    # in `const`; either may be absent, and each stands in for the other.
+    $labelFor = {
+        param($Value)
+        if ($Value -is [string]) { return $Value }
+        ConvertTo-Json -InputObject $Value -Depth 64 -Compress
+    }
     $addEntry = {
         param($Entry)
         $title = ''
-        $const = ''
+        $const = $null
+        $known = $false
         if ($null -ne $Entry) {
             if ($Entry.PSObject.Properties['title']) { $title = [string]$Entry.title }
-            if ($Entry.PSObject.Properties['const']) { $const = [string]$Entry.const }
+            if ($Entry.PSObject.Properties['const']) {
+                $const = $Entry.const
+                $known = $const -isnot [DateTime] -and $const -isnot [DateTimeOffset]
+            }
         }
-        $label = if ([string]::IsNullOrWhiteSpace($title)) { $const } else { $title }
-        $value = if ([string]::IsNullOrWhiteSpace($const)) { $label } else { $const }
-        if (-not [string]::IsNullOrWhiteSpace($label)) {
-            $choices.Add([pscustomobject]@{ Label = $label; Value = $value })
-        }
+        $label = if ([string]::IsNullOrWhiteSpace($title)) { & $labelFor $const } else { $title }
+        $choices.Add([pscustomobject]@{ Label = $label; Value = $const; ValueKnown = $known })
     }
 
     if (& $has $Field 'enum') {
-        $values = @($Field.enum | ForEach-Object { [string]$_ })
+        $values = @($Field.enum)
         $labels = @()
         if (& $has $Field 'enumNames') {
             $labels = @($Field.enumNames | ForEach-Object { [string]$_ })
         }
         for ($index = 0; $index -lt $values.Count; $index++) {
-            $label = $values[$index]
+            $label = & $labelFor $values[$index]
             if (
                 $index -lt $labels.Count -and
                 -not [string]::IsNullOrWhiteSpace($labels[$index])
             ) {
                 $label = $labels[$index]
             }
-            if (-not [string]::IsNullOrWhiteSpace($label)) {
-                $choices.Add([pscustomobject]@{ Label = $label; Value = $values[$index] })
-            }
+            $choices.Add([pscustomobject]@{
+                Label = $label; Value = $values[$index]
+                ValueKnown = $values[$index] -isnot [DateTime] -and $values[$index] -isnot [DateTimeOffset]
+            })
         }
         return @($choices.ToArray())
     }
@@ -1009,28 +1047,20 @@ function Get-DecisionSchemaFieldChoices {
         return @($choices.ToArray())
     }
 
+    if (& $has $Field 'anyOf') {
+        foreach ($option in @($Field.anyOf)) { & $addEntry $option }
+        return @($choices.ToArray())
+    }
+
     if (& $has $Field 'items') {
-        if (& $has $Field.items 'enum') {
-            foreach ($entry in @($Field.items.enum)) {
-                $value = [string]$entry
-                if (-not [string]::IsNullOrWhiteSpace($value)) {
-                    $choices.Add([pscustomobject]@{ Label = $value; Value = $value })
-                }
-            }
-            return @($choices.ToArray())
-        }
-        if (& $has $Field.items 'anyOf') {
-            foreach ($option in @($Field.items.anyOf)) { & $addEntry $option }
-            return @($choices.ToArray())
-        }
-        return @()
+        return @(Get-DecisionSchemaFieldChoices -Field $Field.items)
     }
 
     # A checkbox is shown as Yes/No but recorded as the JSON literal.
     if ((& $has $Field 'type') -and [string]$Field.type -eq 'boolean') {
         return @(
-            [pscustomobject]@{ Label = 'Yes'; Value = 'true' }
-            [pscustomobject]@{ Label = 'No';  Value = 'false' }
+            [pscustomobject]@{ Label = 'Yes'; Value = $true; ValueKnown = $true }
+            [pscustomobject]@{ Label = 'No';  Value = $false; ValueKnown = $true }
         )
     }
 
@@ -1064,32 +1094,27 @@ function Format-DecisionSchemaOutline {
         [psobject]$Schema
     )
 
-    if ($null -eq $Schema -or $null -eq $Schema.properties) { return '' }
-    $names = @($Schema.properties.PSObject.Properties.Name)
-    if ($names.Count -le 1) { return '' }
+    $fields = @(Get-DecisionSchemaFields -Schema $Schema)
+    if ($fields.Count -eq 0) { return '' }
 
     $lines = New-Object System.Collections.Generic.List[string]
     $fieldNumber = 0
-    foreach ($name in $names) {
-        $field = $Schema.properties.$name
-        $label = [string]$field.title
-        if ([string]::IsNullOrWhiteSpace($label)) { $label = $name }
+    foreach ($field in $fields) {
+        $label = [string]$field.Label
         $fieldNumber++
 
-        $options = @(Get-DecisionSchemaFieldOptions -Field $field)
+        $options = @($field.Options)
         if ($options.Count -gt 0) {
-            $lines.Add("$fieldNumber. $label")
-            $default = [string]$field.default
+            $lines.Add("$fieldNumber. $label$(if ($field.MultiSelect) { ' (multiple selections)' })")
             foreach ($option in $options) {
-                $marker = if (
-                    -not [string]::IsNullOrWhiteSpace($default) -and
-                    $option -eq $default
-                ) { ' (default)' } else { '' }
-                $lines.Add("   - $option$marker")
+                $lines.Add("   - $option")
             }
         }
         else {
-            $lines.Add("$fieldNumber. $label (free text)")
+            $lines.Add("$fieldNumber. $label ($($field.Type))")
+        }
+        if ($field.HasDefault) {
+            $lines.Add("   Default: $(ConvertTo-Json -InputObject $field.Default -Depth 64 -Compress)")
         }
     }
 
@@ -1173,7 +1198,7 @@ function Get-DecisionMultiSelectChoices {
     # A label the card would truncate can collide with another, and then the daemon
     # cannot tell which combination was chosen. Refuse rather than guess.
     foreach ($label in $labels) { if ($label.Length -gt 200) { return @() } }
-    if (@($labels | Select-Object -Unique).Count -ne $labels.Count) { return @() }
+    if (-not (Test-DecisionOptionLabels -Options $labels.ToArray())) { return @() }
     $labels.ToArray()
 }
 
@@ -1196,7 +1221,7 @@ function Resolve-DecisionMultiSelectChoice {
     $options = @($Field.Options | ForEach-Object { [string]$_ })
     $count = $options.Count
     foreach ($label in @(Get-DecisionMultiSelectChoices -Field $Field)) {
-        if ($label -ne $Choice) { continue }
+        if ($label -cne $Choice) { continue }
         $picked = New-Object System.Collections.Generic.List[string]
         for ($size = 1; $size -le $count; $size++) {
             for ($mask = 1; $mask -lt (1 -shl $count); $mask++) {
@@ -1204,7 +1229,7 @@ function Resolve-DecisionMultiSelectChoice {
                 for ($b = 0; $b -lt $count; $b++) { if ($mask -band (1 -shl $b)) { $bits++ } }
                 if ($bits -ne $size) { continue }
                 $these = for ($b = 0; $b -lt $count; $b++) { if ($mask -band (1 -shl $b)) { $options[$b] } }
-                if (($these -join $script:DecisionMultiSelectSeparator) -eq $Choice) {
+                if (($these -join $script:DecisionMultiSelectSeparator) -ceq $Choice) {
                     foreach ($t in $these) { $picked.Add([string]$t) }
                     return $picked.ToArray()
                 }
@@ -1212,6 +1237,19 @@ function Resolve-DecisionMultiSelectChoice {
         }
     }
     @()
+}
+
+function Test-DecisionOptionLabels {
+    <# An optimistic select must round-trip every label without clipping or aliases. #>
+    param([AllowEmptyCollection()][string[]]$Options)
+
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($option in $Options) {
+        if ([string]::IsNullOrWhiteSpace($option) -or $option.Length -gt 250 -or
+            $option -in @('Idle', 'Choose...', 'Awaiting answer...', 'Cancel request', 'unknown', 'unavailable') -or
+            -not $seen.Add($option)) { return $false }
+    }
+    $true
 }
 
 function Test-DecisionFieldsAnswerable {
@@ -1233,6 +1271,19 @@ function Test-DecisionFieldsAnswerable {
 
     $list = @($Fields)
     if ($list.Count -eq 0 -or $list.Count -gt $MaxFields) { return $false }
+    foreach ($field in $list) {
+        if ($null -eq $field) { return $false }
+        if ($field.PSObject.Properties['ValuesKnown'] -and -not $field.ValuesKnown) { return $false }
+        if (-not (Test-DecisionOptionLabels -Options @($field.Options))) { return $false }
+        # Copilot arrays are not Claude's numbered checkbox UI. Defaults also change
+        # initial focus/selection; neither can safely reuse the zero-based key walk.
+        if ($field.PSObject.Properties['Client'] -and $field.Client -eq 'copilot') {
+            if ($field.MultiSelect -or $field.HasDefault) { return $false }
+            if ((Test-DecisionFieldIsText -Field $field) -and $field.Type -notin @('', 'string')) { return $false }
+        }
+        if ((Test-DecisionFieldIsMultiSelect -Field $field) -and
+            @(Get-DecisionMultiSelectChoices -Field $field).Count -eq 0) { return $false }
+    }
     $textCount = @($list | Where-Object { Test-DecisionFieldIsText -Field $_ }).Count
     ($textCount -le 1)
 }
@@ -1252,28 +1303,37 @@ function Get-DecisionSchemaFields {
         left the card with no options at all, and the resulting free-text answer was
         swallowed by the live prompt.
 
-        Returns an array of @{ Label; Options; Values; IsText }, where Options are the
-        labels shown on the card and Values the schema values the CLI records, in the
-        same order.
+        Retains the schema name, type, default and required/multi-select metadata.
+        Options, Values and OptionIds share an order; labels are never substituted
+        for typed values or clipped to fit a selector.
     #>
     param(
         [AllowNull()][psobject]$Schema
     )
 
-    if ($null -eq $Schema -or $null -eq $Schema.properties) { return @() }
-    $names = @($Schema.properties.PSObject.Properties.Name)
+    if ($null -eq $Schema -or -not $Schema.PSObject.Properties['properties'] -or $null -eq $Schema.properties) { return @() }
+    $names = @($Schema.properties.PSObject.Properties | ForEach-Object { $_.Name })
     if ($names.Count -eq 0) { return @() }
 
     $fields = @()
     foreach ($name in $names) {
         $field = $Schema.properties.$name
-        $label = [string]$field.title
+        $label = if ($field.PSObject.Properties['title']) { [string]$field.title } else { '' }
         if ([string]::IsNullOrWhiteSpace($label)) { $label = $name }
         $choices = @(Get-DecisionSchemaFieldChoices -Field $field)
         $fields += [pscustomobject]@{
+            Name    = $name
             Label   = $label
+            Type    = if ($field.PSObject.Properties['type']) { [string]$field.type } else { '' }
+            Client  = 'copilot'
+            Required = [bool]($Schema.PSObject.Properties['required'] -and @($Schema.required) -ccontains $name)
+            HasDefault = [bool]$field.PSObject.Properties['default']
+            Default = if ($field.PSObject.Properties['default']) { ,$field.default } else { $null }
+            MultiSelect = [bool](($field.PSObject.Properties['type'] -and $field.type -eq 'array') -or $field.PSObject.Properties['items'])
             Options = @($choices | ForEach-Object { [string]$_.Label })
-            Values  = @($choices | ForEach-Object { [string]$_.Value })
+            Values  = @($choices | ForEach-Object { ,$_.Value })
+            ValuesKnown = @($choices | Where-Object { -not $_.ValueKnown }).Count -eq 0
+            OptionIds = @(for ($index = 0; $index -lt $choices.Count; $index++) { "${name}:$index" })
             IsText  = ($choices.Count -eq 0)
         }
     }
@@ -1355,10 +1415,8 @@ function Repair-DecisionToolArguments {
         restores the intended choice buttons. Real arguments always win over recovered
         ones.
 
-        A small multi-field form is turned into combined choice buttons (the cartesian
-        product of its fields) rather than a free-text outline, and the per-field
-        breakdown of each combo is returned in `Combos` so the selected button can be
-        reported to the model field by field.
+        Forms retain their ordered field definitions. Recovery repairs presentation,
+        not the native UI contract; the hook leaves recovered arguments terminal-only.
     #>
     param(
         [AllowNull()]
@@ -1370,16 +1428,17 @@ function Repair-DecisionToolArguments {
     $combos = @()
     $fields = @()
     $terminalOnly = $false
+    $schema = $null
 
     if ($null -ne $ToolArgs) {
         # Current Copilot CLI ask_user passes `message`; older builds passed `question`.
-        $rawQuestion = [string]$ToolArgs.message
+        $rawQuestion = if ($ToolArgs.PSObject.Properties['message']) { [string]$ToolArgs.message } else { '' }
         if ([string]::IsNullOrWhiteSpace($rawQuestion)) {
-            $rawQuestion = [string]$ToolArgs.question
+            $rawQuestion = if ($ToolArgs.PSObject.Properties['question']) { [string]$ToolArgs.question } else { '' }
         }
         $question = Repair-DecisionTextEncoding -Text $rawQuestion
 
-        if ($null -ne $ToolArgs.choices) {
+        if ($ToolArgs.PSObject.Properties['choices'] -and $null -ne $ToolArgs.choices) {
             if ($ToolArgs.choices -is [string]) {
                 # A choice list handed over as a JSON string rather than an array.
                 $choices = @(ConvertFrom-DecisionChoiceList -Text ([string]$ToolArgs.choices))
@@ -1399,39 +1458,12 @@ function Repair-DecisionToolArguments {
 
         # An explicit `choices` argument always wins; otherwise derive the options
         # from the modern `requestedSchema` form.
-        if ($choices.Count -eq 0 -and $null -ne $ToolArgs.requestedSchema) {
+        if ($choices.Count -eq 0 -and $ToolArgs.PSObject.Properties['requestedSchema'] -and $null -ne $ToolArgs.requestedSchema) {
             $schema = $ToolArgs.requestedSchema
             if ($schema -is [string]) {
                 $schema = ConvertFrom-DecisionSchemaText -Text ([string]$schema)
             }
-            $schemaChoices = @(ConvertFrom-DecisionRequestedSchema -Schema $schema)
-            if ($schemaChoices.Count -gt 0) {
-                $choices = @(
-                    $schemaChoices | ForEach-Object { Repair-DecisionTextEncoding -Text $_ }
-                )
-                $fields = @(Get-DecisionSchemaFields -Schema $schema)
-            }
-            else {
-                # A multi-field form is published as one dropdown per field, so the
-                # combined cartesian list is no longer used for display - it only
-                # remains as the text fallback. Capture the fields; leave $choices
-                # empty so nothing flattens into a single unreadable list.
-                $schemaFields = Get-DecisionSchemaFields -Schema $schema
-                if (@($schemaFields).Count -gt 1 -and (Test-DecisionFieldsAnswerable -Fields $schemaFields)) {
-                    $fields = @($schemaFields)
-                }
-                else {
-                    $outline = Format-DecisionSchemaOutline -Schema $schema
-                    if (-not [string]::IsNullOrWhiteSpace($outline)) {
-                        $question = "$question`n`n$outline"
-                    }
-                    # A multi-field prompt the card cannot drive must be flagged, not
-                    # quietly turned into a text box. The native prompt is an
-                    # arrow-key form, and typed characters sent to it are discarded -
-                    # the answer disappears and the prompt keeps waiting.
-                    if (@($schemaFields).Count -gt 1) { $terminalOnly = $true }
-                }
-            }
+            if ($null -eq $schema) { $terminalOnly = $true }
         }
     }
 
@@ -1491,35 +1523,8 @@ function Repair-DecisionToolArguments {
                         $payload = $payload.Substring(0, $close.Index)
                     }
                     $schema = ConvertFrom-DecisionSchemaText -Text $payload
-                    if ($null -ne $schema) {
-                        $schemaChoices = @(
-                            ConvertFrom-DecisionRequestedSchema -Schema $schema
-                        )
-                        if ($schemaChoices.Count -gt 0) {
-                            $choices = @(
-                                $schemaChoices |
-                                    ForEach-Object { Repair-DecisionTextEncoding -Text $_ }
-                            )
-                            $recovered = $true
-                        }
-                        else {
-                            $comboList = Get-DecisionSchemaCombos -Schema $schema
-                            if ($null -ne $comboList -and @($comboList).Count -gt 0) {
-                                $combos = @($comboList)
-                                $choices = @(
-                                    $combos | ForEach-Object { Repair-DecisionTextEncoding -Text $_.Label }
-                                )
-                                $recovered = $true
-                            }
-                            else {
-                                $outline = Format-DecisionSchemaOutline -Schema $schema
-                                if (-not [string]::IsNullOrWhiteSpace($outline)) {
-                                    $question = "$question`n`n$outline"
-                                    $recovered = $true
-                                }
-                            }
-                        }
-                    }
+                    $recovered = $null -ne $schema
+                    if (-not $recovered) { $terminalOnly = $true }
                 }
             }
 
@@ -1531,6 +1536,17 @@ function Repair-DecisionToolArguments {
             ).Trim()
         }
     }
+
+    if ($null -ne $schema) {
+        $fields = @(Get-DecisionSchemaFields -Schema $schema)
+        $terminalOnly = -not (Test-DecisionFieldsAnswerable -Fields $fields)
+        if ($fields.Count -eq 1 -and -not $fields[0].MultiSelect) { $choices = @($fields[0].Options) }
+        if ($terminalOnly) {
+            $outline = Format-DecisionSchemaOutline -Schema $schema
+            if ($outline) { $question = "$question`n`n$outline" }
+        }
+    }
+    if (-not (Test-DecisionOptionLabels -Options $choices)) { $terminalOnly = $true }
 
     if ([string]::IsNullOrWhiteSpace($question)) {
         $question = 'Copilot CLI needs your input.'
@@ -1966,12 +1982,14 @@ function Write-CopilotDecisionMarker {
 
         # The agent's own id for this question (Claude's tool_use_id), so its answer
         # is matched to this card and not to an earlier question in the transcript.
-        [string]$ToolCallId = ''
+        [string]$ToolCallId = '',
+        [string]$ToolName = 'ask_user'
     )
 
     $marker = @{
         decisionId = $DecisionId
         toolCallId = $ToolCallId
+        toolName = $ToolName
         question = $Question
         choices = @($Choices)
         combos = @($Combos)
@@ -1982,10 +2000,50 @@ function Write-CopilotDecisionMarker {
         mode = $Mode
         armedAt = [DateTimeOffset]::Now.ToString('o')
         injectedAnswer = ''
+        injectedSelections = @()
+        deliveryAttempted = $false
     }
     $path = Get-CopilotDecisionMarkerPath -SessionId $SessionId
-    $json = $marker | ConvertTo-Json -Depth 8 -Compress
-    Set-Content -LiteralPath $path -Value $json -Encoding UTF8
+    Invoke-DecisionMarkerLock -Path $path -Action {
+        Write-DecisionMarkerFile -Path $path -Marker $marker
+    }
+}
+
+function Invoke-DecisionMarkerLock {
+    <# Serializes generation checks with marker replacement, not with network I/O. #>
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][scriptblock]$Action)
+
+    $key = [IO.Path]::GetFullPath($Path)
+    if ($script:BridgeIsWindows) { $key = $key.ToUpperInvariant() }
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { $hash = [BitConverter]::ToString($sha.ComputeHash([Text.Encoding]::UTF8.GetBytes($key))).Replace('-', '') }
+    finally { $sha.Dispose() }
+    $mutex = [Threading.Mutex]::new($false, "AgentBridgeDecision_$hash")
+    $owned = $false
+    try {
+        try { $owned = $mutex.WaitOne(2000) }
+        catch [Threading.AbandonedMutexException] { $owned = $true }
+        if (-not $owned) { throw 'Decision marker is busy; no input was authorized.' }
+        & $Action
+    }
+    finally {
+        if ($owned) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
+    }
+}
+
+function Write-DecisionMarkerFile {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$Marker)
+
+    $temporary = "$Path.$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        $json = ConvertTo-Json -InputObject $Marker -Depth 64 -Compress -WarningAction Stop
+        [IO.File]::WriteAllText($temporary, $json, [Text.UTF8Encoding]::new($false))
+        [IO.File]::Move($temporary, $Path, $true)
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporary) { Remove-Item -LiteralPath $temporary -Force }
+    }
 }
 
 function Get-CopilotDecisionMarker {
@@ -1995,7 +2053,7 @@ function Get-CopilotDecisionMarker {
     try {
         $raw = Get-Content -LiteralPath $path -Raw -Encoding UTF8
         if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
-        return ($raw | ConvertFrom-Json)
+        return (ConvertFrom-DecisionJson -Json $raw)
     }
     catch {
         return $null
@@ -2004,43 +2062,56 @@ function Get-CopilotDecisionMarker {
 
 function Set-CopilotDecisionMarkerInjected {
     <#
-        Records the answer the daemon has already injected, so the same HA answer is
-        never injected twice while the ask_user is still (briefly) shown as pending.
+        Claims one delivery attempt for the current generation before console I/O.
+        The legacy injectedAnswer/Selections names are retained, but a claim is not
+        proof that the native prompt accepted the answer.
     #>
     param(
         [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][string]$DecisionId,
         [Parameter(Mandatory)][string]$Answer,
 
         # The per-field option labels that were driven into the prompt, kept so the
         # recorded answer can be checked against them once the tool completes.
         [AllowNull()][AllowEmptyCollection()][string[]]$Selections = @()
     )
-    $marker = Get-CopilotDecisionMarker -SessionId $SessionId
-    if ($null -eq $marker) { return }
     $path = Get-CopilotDecisionMarkerPath -SessionId $SessionId
-    $obj = @{}
-    foreach ($p in $marker.PSObject.Properties) { $obj[$p.Name] = $p.Value }
-    $obj['injectedAnswer'] = $Answer
-    $obj['injectedSelections'] = @($Selections)
-    Set-Content -LiteralPath $path -Value ($obj | ConvertTo-Json -Depth 8 -Compress) -Encoding UTF8
+    Invoke-DecisionMarkerLock -Path $path -Action {
+        $marker = Get-CopilotDecisionMarker -SessionId $SessionId
+        if ($null -eq $marker -or [string]$marker.decisionId -cne $DecisionId) { return $false }
+        if (($marker.PSObject.Properties['deliveryAttempted'] -and $marker.deliveryAttempted) -or
+            -not [string]::IsNullOrEmpty([string]$marker.injectedAnswer)) { return $false }
+        $marker | Add-Member -NotePropertyName deliveryAttempted -NotePropertyValue $true -Force
+        $marker | Add-Member -NotePropertyName injectedAnswer -NotePropertyValue $Answer -Force
+        $marker | Add-Member -NotePropertyName injectedSelections -NotePropertyValue @($Selections) -Force
+        Write-DecisionMarkerFile -Path $path -Marker $marker
+        $true
+    }
 }
 
 function Remove-CopilotDecisionMarker {
-    param([Parameter(Mandatory)][string]$SessionId)
+    param([Parameter(Mandatory)][string]$SessionId, [string]$DecisionId = '', [switch]$PassThru)
     $path = Get-CopilotDecisionMarkerPath -SessionId $SessionId
-    if (Test-Path -LiteralPath $path) {
-        Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    $removed = Invoke-DecisionMarkerLock -Path $path -Action {
+        if (-not (Test-Path -LiteralPath $path)) { return $false }
+        if ($DecisionId) {
+            $current = Get-CopilotDecisionMarker -SessionId $SessionId
+            if ($null -eq $current -or [string]$current.decisionId -cne $DecisionId) { return $false }
+        }
+        Remove-Item -LiteralPath $path -Force
+        $true
     }
+    if ($PassThru) { $removed }
 }
 
 # Answers already read out of a transcript, keyed by its path, each with the length
 # and write time they were read at (see Get-CopilotAskUserState).
-$script:CopilotAskUserStateCache = @{}
+$script:CopilotAskUserStateCache = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
 
 function Get-CopilotAskUserState {
     <#
-        Inspects the transcript for the most recent ask_user tool call and reports
-        whether it is still awaiting input.
+        Inspects one exact ask_user when ToolCallId is supplied. Unscoped status
+        callers retain the latest-question view; decision delivery must supply an id.
 
         The pair (tool.execution_start with toolName=ask_user) → (tool.execution_complete
         with the same toolCallId) is the authoritative "answered" signal, regardless of
@@ -2048,14 +2119,20 @@ function Get-CopilotAskUserState {
         reply. Returns:
           Started   - $true if an ask_user start was found
           Pending   - $true if that start has no matching complete yet
-          ToolCallId- the id of the most recent ask_user
+          ToolCallId- the id of the requested ask_user
           StartedAt - its timestamp
+          CanAnswer - the request is the sole current pending question
     #>
     param(
-        [Parameter(Mandatory)][string]$TranscriptPath
+        [Parameter(Mandatory)][string]$TranscriptPath,
+        [string]$ToolCallId = ''
     )
 
-    $result = [pscustomobject]@{ Started = $false; Pending = $false; ToolCallId = ''; StartedAt = $null; ResultContent = '' }
+    $result = [pscustomobject]@{
+        Started = $false; Pending = $false; ToolCallId = ''; StartedAt = $null
+        ResultContent = ''; CanAnswer = $false
+    }
+    $cacheKey = if ($ToolCallId) { "$TranscriptPath`n$ToolCallId" } else { $TranscriptPath }
 
     # A transcript is append-only, so the same length means the same events, and the
     # answer to "is this question still waiting?" cannot have changed. Parsing it
@@ -2074,7 +2151,8 @@ function Get-CopilotAskUserState {
     catch { }
 
     if ($stamp) {
-        $hit = $script:CopilotAskUserStateCache[$TranscriptPath]
+        $hit = $null
+        if ($script:CopilotAskUserStateCache.ContainsKey($cacheKey)) { $hit = $script:CopilotAskUserStateCache[$cacheKey] }
         if ($null -ne $hit -and [string]$hit.Stamp -eq $stamp) {
             # A copy, never the stored object: handing the same instance to every
             # caller would let one of them edit what the next one reads.
@@ -2092,7 +2170,7 @@ function Get-CopilotAskUserState {
             # grow an entry per transcript forever. Emptying it costs one parse per
             # session still being watched, which is rare enough not to matter.
             if ($script:CopilotAskUserStateCache.Count -ge 64) { $script:CopilotAskUserStateCache.Clear() }
-            $script:CopilotAskUserStateCache[$TranscriptPath] = @{ Stamp = $stamp; Result = $Answer.PSObject.Copy() }
+            $script:CopilotAskUserStateCache[$cacheKey] = @{ Stamp = $stamp; Result = $Answer.PSObject.Copy() }
         }
         $Answer
     }
@@ -2102,24 +2180,28 @@ function Get-CopilotAskUserState {
 
     # Walk forward, tracking the latest ask_user start and the set of completed ids.
     $latestStartId = ''
-    $latestStartAt = $null
-    $completed = @{}
-    $results = @{}
+    $starts = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $completed = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $duplicates = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     foreach ($line in $lines) {
-        if ($line -notmatch '"type":"tool\.execution_(start|complete)"') { continue }
+        if ($line -notmatch '"type"\s*:\s*"tool\.execution_(start|complete)"') { continue }
         try {
             $o = $line | ConvertFrom-Json
         }
         catch { continue }
 
-        if ($o.type -eq 'tool.execution_start' -and [string]$o.data.toolName -eq 'ask_user') {
-            $latestStartId = [string]$o.data.toolCallId
-            $latestStartAt = $o.timestamp
+        if (-not $o.PSObject.Properties['data'] -or $null -eq $o.data -or
+            -not $o.data.PSObject.Properties['toolCallId']) { continue }
+        $cid = [string]$o.data.toolCallId
+        if ([string]::IsNullOrWhiteSpace($cid)) { continue }
+        if ($o.type -eq 'tool.execution_start' -and $o.data.PSObject.Properties['toolName'] -and
+            [string]$o.data.toolName -ceq 'ask_user') {
+            $latestStartId = $cid
+            if ($starts.ContainsKey($cid)) { [void]$duplicates.Add($cid) }
+            $starts[$cid] = if ($o.PSObject.Properties['timestamp']) { $o.timestamp } else { $null }
         }
         elseif ($o.type -eq 'tool.execution_complete') {
-            $cid = [string]$o.data.toolCallId
-            if (-not [string]::IsNullOrWhiteSpace($cid)) {
-                $completed[$cid] = $true
+            if ($starts.ContainsKey($cid)) {
                 # Keep the answer the CLI actually recorded, so an injected form can be
                 # checked against it. An arrow-key selection that lands one option
                 # short is otherwise indistinguishable from a correct one, and answers
@@ -2135,106 +2217,215 @@ function Get-CopilotAskUserState {
                 if ($null -ne $data -and $data.PSObject.Properties.Name -contains 'result') {
                     $res = $data.result
                     if ($null -ne $res -and $res.PSObject.Properties.Name -contains 'content') {
-                        $content = [string]$res.content
+                        $content = $res.content
                     }
                 }
-                $results[$cid] = $content
+                if ($data.PSObject.Properties['success'] -and $data.success -eq $false) { $content = '' }
+                $completed[$cid] = $content
             }
         }
     }
 
-    if ([string]::IsNullOrWhiteSpace($latestStartId)) { return (& $remember $result) }
+    $wanted = if ($ToolCallId) { $ToolCallId } else { $latestStartId }
+    if (-not $wanted -or -not $starts.ContainsKey($wanted) -or $duplicates.Contains($wanted)) {
+        return (& $remember $result)
+    }
     $result.Started = $true
-    $result.ToolCallId = $latestStartId
-    $result.StartedAt = $latestStartAt
-    $result.Pending = -not $completed.ContainsKey($latestStartId)
-    if ($results.ContainsKey($latestStartId)) { $result.ResultContent = [string]$results[$latestStartId] }
+    $result.ToolCallId = $wanted
+    $result.StartedAt = $starts[$wanted]
+    $result.Pending = -not $completed.ContainsKey($wanted)
+    $pendingIds = @($starts.Keys | Where-Object { -not $completed.ContainsKey($_) })
+    $result.CanAnswer = $result.Pending -and $wanted -ceq $latestStartId -and $pendingIds.Count -eq 1
+    if ($completed.ContainsKey($wanted)) { $result.ResultContent = $completed[$wanted] }
     & $remember $result
 }
 
 function Test-CopilotAnswerMatchesSelections {
-    <#
-        Whether the answer the CLI recorded contains every option that was injected.
-
-        The injector drives an arrow-key list by index, so a single dropped keystroke
-        selects the neighbouring option and the prompt reports it as though the user
-        had chosen it. Nothing downstream can tell the difference, which makes it the
-        worst possible failure: a confident, wrong answer attributed to the user.
-
-        Comparing the recorded result against what was sent turns that into something
-        visible. Text fields are skipped - the CLI may reformat what was typed - so
-        this only asserts on the choice fields.
-
-        A choice is accepted by either of its two names. The card and the injector
-        work in labels; the CLI records the schema value - "release=cut_now", not
-        "Cut the release now" - so a label-only comparison called every richly
-        written form a mismatch, and then told the session to disregard an answer
-        that was right. Seen live on 2026-09-28. Matching either name keeps the
-        neighbour check intact, because a neighbouring option differs under both.
-    #>
+    <# True only for a confirmed match; absence of evidence is not a match. #>
     param(
-        [AllowEmptyString()][string]$ResultContent,
+        [AllowNull()][AllowEmptyString()]$ResultContent,
         [AllowNull()][AllowEmptyCollection()][object[]]$Fields,
         [AllowNull()][AllowEmptyCollection()][string[]]$Selections
     )
 
-    if ([string]::IsNullOrWhiteSpace($ResultContent)) { return $true }
+    (Get-CopilotAnswerVerification -ResultContent $ResultContent -Fields $Fields -Selections $Selections) -ceq 'Match'
+}
+
+function Get-CopilotAnswerVerification {
+    <# Match, Mismatch, or Unconfirmed. Only complete, field-addressed result shapes
+       are evidence; prose, missing fields and ambiguous encodings are not. #>
+    param(
+        [AllowNull()][AllowEmptyString()]$ResultContent,
+        [AllowNull()][AllowEmptyCollection()][object[]]$Fields,
+        [AllowNull()][AllowEmptyCollection()][AllowEmptyString()][string[]]$Selections
+    )
+
     $fieldList = @($Fields)
     $selectionList = @($Selections)
-    if ($fieldList.Count -eq 0 -or $selectionList.Count -ne $fieldList.Count) { return $true }
+    if ($null -eq $ResultContent -or $fieldList.Count -eq 0 -or $selectionList.Count -ne $fieldList.Count) { return 'Unconfirmed' }
 
+    $recorded = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $textFormat = ''
+    if ($ResultContent -is [string]) {
+        $text = $ResultContent.Trim()
+        if (-not $text) { return 'Unconfirmed' }
+        if ($text.StartsWith('{', [StringComparison]::Ordinal)) {
+            $document = $null
+            try {
+                $document = [System.Text.Json.JsonDocument]::Parse($text)
+                $keys = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+                foreach ($property in $document.RootElement.EnumerateObject()) {
+                    if (-not $keys.Add($property.Name)) { return 'Unconfirmed' }
+                }
+                $ResultContent = ConvertFrom-DecisionJson -Json $text
+            }
+            catch { return 'Unconfirmed' }
+            finally { if ($null -ne $document) { $document.Dispose() } }
+        }
+        elseif ($text.StartsWith('User responded: ', [StringComparison]::Ordinal)) {
+            $textFormat = 'copilot'
+            foreach ($part in ($text.Substring(16) -split ', (?=[^=,\r\n]+=)')) {
+                $pair = [regex]::Match($part, '\A(?<key>[^=,\r\n]+)=(?<value>[\s\S]*)\z')
+                if (-not $pair.Success -or $recorded.ContainsKey($pair.Groups['key'].Value)) { return 'Unconfirmed' }
+                $recorded[$pair.Groups['key'].Value] = $pair.Groups['value'].Value
+            }
+        }
+        else {
+            $textFormat = 'claude'
+            $body = $text -creplace '^Your questions have been answered: ', ''
+            $pattern = '(?<key>"(?:[^"\\]|\\.)*")\s*=\s*(?<value>"(?:[^"\\]|\\.)*")'
+            $pairs = [regex]::Matches($body, $pattern)
+            if ($pairs.Count -eq 0 -or ([regex]::Replace($body, $pattern, '') -notmatch '\A[\s,.]*\z')) { return 'Unconfirmed' }
+            foreach ($pair in $pairs) {
+                try {
+                    $key = ConvertFrom-Json -InputObject $pair.Groups['key'].Value -ErrorAction Stop
+                    $value = ConvertFrom-Json -InputObject $pair.Groups['value'].Value -ErrorAction Stop
+                }
+                catch { return 'Unconfirmed' }
+                if ($recorded.ContainsKey($key)) { return 'Unconfirmed' }
+                $recorded[$key] = $value
+            }
+        }
+    }
+    if (-not $textFormat) {
+        if ($ResultContent -is [Collections.IDictionary]) {
+            foreach ($key in $ResultContent.Keys) { $recorded[[string]$key] = $ResultContent[$key] }
+        }
+        elseif ($ResultContent -is [System.Management.Automation.PSCustomObject]) {
+            foreach ($property in $ResultContent.PSObject.Properties) { $recorded[$property.Name] = $property.Value }
+        }
+        else { return 'Unconfirmed' }
+    }
+    if ($recorded.Count -ne $fieldList.Count) { return 'Unconfirmed' }
+
+    $different = $false
+    $unconfirmed = $false
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     for ($i = 0; $i -lt $fieldList.Count; $i++) {
         $field = $fieldList[$i]
-        if (Test-DecisionFieldIsText -Field $field) { continue }
+        $key = if ($field.PSObject.Properties['Name']) { [string]$field.Name }
+            elseif ($field.PSObject.Properties['Title']) { [string]$field.Title }
+            else { [string]$field.Label }
+        if (-not $key -or -not $seen.Add($key) -or -not $recorded.ContainsKey($key)) { return 'Unconfirmed' }
+        $actual = $recorded[$key]
+        if ($actual -is [DateTime] -or $actual -is [DateTimeOffset]) { return 'Unconfirmed' }
         $wanted = [string]$selectionList[$i]
-        if ([string]::IsNullOrWhiteSpace($wanted)) { continue }
-
-        # A multi-select answer is one card label standing for several options, and
-        # the CLI records them its own way ("Billing, Search"), so the combination
-        # label never appears verbatim. Each option it stands for has to be there.
-        if (Test-DecisionFieldIsMultiSelect -Field $field) {
-            $picked = @(Resolve-DecisionMultiSelectChoice -Field $field -Choice $wanted)
-            if ($picked.Count -eq 0) { continue }
-            foreach ($option in $picked) {
-                if ($ResultContent -like "*$option*") { continue }
-                $value = Get-DecisionFieldOptionValue -Field $field -Option $option
-                if (-not [string]::IsNullOrWhiteSpace($value) -and $ResultContent -like "*$value*") { continue }
-                return $false
-            }
+        if (Test-DecisionFieldIsText -Field $field) {
+            # Clients may reformat text; do not turn that uncertainty into a correction.
+            if ($actual -isnot [string] -or $actual -cne $wanted) { $unconfirmed = $true }
             continue
         }
+        if (-not (Test-DecisionOptionLabels -Options @($field.Options))) { return 'Unconfirmed' }
 
-        if ($ResultContent -like "*$wanted*") { continue }
-
-        # Fall back to the schema value sitting behind the label that was picked.
-        # A marker written before this was carried has no Values, and then there is
-        # nothing better to compare than the label.
-        $value = Get-DecisionFieldOptionValue -Field $field -Option $wanted
-        if (-not [string]::IsNullOrWhiteSpace($value) -and $ResultContent -like "*$value*") { continue }
-        return $false
+        if (Test-DecisionFieldIsMultiSelect -Field $field) {
+            $picked = @(Resolve-DecisionMultiSelectChoice -Field $field -Choice $wanted)
+            if ($picked.Count -eq 0) { return 'Unconfirmed' }
+            $expected = @($picked | ForEach-Object { ,(Get-DecisionFieldOptionValue -Field $field -Option $_) })
+            if ($textFormat -eq 'claude') {
+                $candidates = @(foreach ($choice in @(Get-DecisionMultiSelectChoices -Field $field)) {
+                    $options = @(Resolve-DecisionMultiSelectChoice -Field $field -Choice $choice)
+                    if (($options -join ', ') -ceq [string]$actual) { ,$options }
+                })
+                if ($candidates.Count -ne 1) { return 'Unconfirmed' }
+                $actual = @($candidates[0] | ForEach-Object { ,(Get-DecisionFieldOptionValue -Field $field -Option $_) })
+            }
+            elseif ($textFormat) {
+                try { $actual = ConvertFrom-DecisionJson -Json ([string]$actual) }
+                catch { return 'Unconfirmed' }
+            }
+            if ($actual -isnot [array]) { return 'Unconfirmed' }
+            $actualJson = @($actual | ForEach-Object { ConvertTo-DecisionValueKey -Value $_ })
+            $expectedJson = @($expected | ForEach-Object { ConvertTo-DecisionValueKey -Value $_ })
+            if ($actualJson.Count -ne $expectedJson.Count -or
+                @($actualJson | Select-Object -Unique).Count -ne $actualJson.Count) { $different = $true; continue }
+            foreach ($value in $expectedJson) {
+                if ($actualJson -cnotcontains $value) { $different = $true }
+            }
+        }
+        else {
+            if (@($field.Options) -cnotcontains $wanted) { return 'Unconfirmed' }
+            $expected = Get-DecisionFieldOptionValue -Field $field -Option $wanted
+            # A primitive parsed by ConvertFrom-Json can carry a PSObject wrapper.
+            if ($expected -is [array] -or $expected -is [Collections.IDictionary] -or $expected -is [System.Management.Automation.PSCustomObject] -or
+                $expected -is [DateTime] -or $expected -is [DateTimeOffset] -or
+                $actual -is [array] -or $actual -is [Collections.IDictionary] -or $actual -is [System.Management.Automation.PSCustomObject]) { return 'Unconfirmed' }
+            if ($textFormat -and $expected -isnot [string]) {
+                try { $actual = ConvertFrom-DecisionJson -Json ([string]$actual) }
+                catch { return 'Unconfirmed' }
+            }
+            $expectedJson = ConvertTo-DecisionValueKey -Value $expected
+            $actualJson = ConvertTo-DecisionValueKey -Value $actual
+            if ($expectedJson -cne $actualJson) { $different = $true }
+        }
     }
-    $true
+    if ($different) { return 'Mismatch' }
+    if ($unconfirmed) { return 'Unconfirmed' }
+    'Match'
+}
+
+function ConvertTo-DecisionValueKey {
+    param([AllowNull()]$Value)
+
+    $json = ConvertTo-Json -InputObject $Value -Depth 64 -Compress
+    $number = [decimal]0
+    if ([decimal]::TryParse($json, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$number)) {
+        return $number.ToString('G29', [Globalization.CultureInfo]::InvariantCulture)
+    }
+    $json
 }
 
 function Get-DecisionFieldOptionValue {
     <#
-        The schema value behind one of a field's option labels, or '' when the field
-        does not carry values - a marker written by an older build, say.
+        The typed schema value behind an exact option label. Older fields without
+        Values use the label itself; callers must validate membership first.
     #>
     param(
         [AllowNull()][object]$Field,
         [AllowEmptyString()][string]$Option
     )
 
-    if ($null -eq $Field -or -not $Field.PSObject.Properties['Values']) { return '' }
+    if ($null -eq $Field) { return $null }
     $options = @($Field.Options)
-    $values = @($Field.Values)
+    $values = @($options)
+    if ($Field.PSObject.Properties['Values']) { $values = @($Field.Values) }
     for ($i = 0; $i -lt $options.Count; $i++) {
-        if ([string]$options[$i] -eq $Option -and $i -lt $values.Count) {
-            return [string]$values[$i]
+        if ([string]$options[$i] -ceq $Option -and $i -lt $values.Count) {
+            return ,$values[$i]
         }
     }
-    ''
+    $null
+}
+
+function ConvertTo-DecisionInstant {
+    param([AllowNull()]$Value)
+
+    # ConvertFrom-Json can return DateTime on newer PowerShell. A string cast would
+    # lose fractional seconds and could make a pre-request selection look newer.
+    if ($Value -is [DateTimeOffset]) { return $Value }
+    if ($Value -is [DateTime]) { return [DateTimeOffset]$Value.ToUniversalTime() }
+    $instant = [DateTimeOffset]::MinValue
+    if ([DateTimeOffset]::TryParse([string]$Value, [ref]$instant)) { return $instant }
+    $null
 }
 
 function Get-CopilotTranscriptTailLines {
@@ -2385,15 +2576,3 @@ function Send-BridgeNotification {
         Write-DecisionBridgeLog -Message "notification via $service failed: $($_.Exception.Message)"
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-

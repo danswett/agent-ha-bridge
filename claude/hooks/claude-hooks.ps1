@@ -30,6 +30,9 @@ function Invoke-ClaudeRegisterHook {
 
     $sessionId = [string]$HookEvent.session_id
     if ([string]::IsNullOrWhiteSpace($sessionId)) { return }
+    if ([string]$HookEvent.hook_event_name -eq 'UserPromptSubmit') {
+        [void](Remove-CopilotDecisionMarker -SessionId $sessionId)
+    }
 
     # At SessionStart the transcript may not have been written yet, so the path Claude
     # reports is kept as-is rather than verified and discarded.
@@ -61,6 +64,7 @@ function Invoke-ClaudeStopHook {
 
     $sessionId = [string]$HookEvent.session_id
     if ([string]::IsNullOrWhiteSpace($sessionId)) { return }
+    [void](Remove-CopilotDecisionMarker -SessionId $sessionId)
 
     $transcriptPath = Resolve-ClaudeTranscriptPath -SessionId $sessionId `
         -KnownPath ([string]$HookEvent.transcript_path)
@@ -135,6 +139,14 @@ function Invoke-ClaudeAskHook {
 
     $sessionId = [string]$HookEvent.session_id
     if ([string]::IsNullOrWhiteSpace($sessionId)) { $sessionId = "claude-$PID" }
+    $toolUseId = if ($HookEvent.PSObject.Properties['tool_use_id']) { [string]$HookEvent.tool_use_id } else { '' }
+    $current = Get-CopilotDecisionMarker -SessionId $sessionId
+    if ($toolUseId -and $null -ne $current -and $current.PSObject.Properties['toolCallId'] -and
+        [string]$current.toolCallId -ceq $toolUseId) {
+        Write-DecisionBridgeLog -Message "ignored repeated Claude question hook for $sessionId"
+        return
+    }
+    [void](Remove-CopilotDecisionMarker -SessionId $sessionId)
     $workingDirectory = [string]$HookEvent.cwd
 
     $parsed = ConvertFrom-ClaudeAskUserQuestion -ToolInput $HookEvent.tool_input
@@ -148,7 +160,7 @@ function Invoke-ClaudeAskHook {
         -TranscriptPath (Resolve-ClaudeTranscriptPath -SessionId $sessionId -KnownPath ([string]$HookEvent.transcript_path)) `
         -WorkingDirectory $workingDirectory -ProcessId $owningPid | Out-Null
 
-    $decisionId = "$(Get-CopilotMqttNodeId -SessionId $sessionId)-$([DateTimeOffset]::Now.ToUnixTimeMilliseconds())"
+    $decisionId = "$(Get-CopilotMqttNodeId -SessionId $sessionId)-$([guid]::NewGuid().ToString('N'))"
 
     # Local state first, before anything that can block. If Home Assistant is slow or
     # down, the hook still returns promptly and the daemon arms the card from this
@@ -161,7 +173,7 @@ function Invoke-ClaudeAskHook {
     # its options make (Get-DecisionMultiSelectChoices), and delivered by typing each
     # chosen option's number at the prompt. Only one that makes more combinations than
     # a dropdown can list is left to the terminal.
-    $terminalOnly = ($mode -eq 'multiple_choice' -and $markerFields.Count -eq 0)
+    $terminalOnly = -not (Test-DecisionFieldsAnswerable -Fields $markerFields)
     $tooManyCombinations = $false
     foreach ($markerField in $markerFields) {
         if ((Test-DecisionFieldIsMultiSelect -Field $markerField) -and
@@ -170,7 +182,7 @@ function Invoke-ClaudeAskHook {
         }
     }
     if ($tooManyCombinations) { $terminalOnly = $true }
-    $toolUseId = if ($HookEvent.PSObject.Properties['tool_use_id']) { [string]$HookEvent.tool_use_id } else { '' }
+    if (-not $toolUseId) { $terminalOnly = $true }
 
     # A prompt the daemon refuses to drive must offer no control that pretends to
     # drive it. This published the full set of dropdowns regardless, so a multi-select
@@ -181,11 +193,12 @@ function Invoke-ClaudeAskHook {
     # shows what is being asked, and nothing on it claims to be able to answer.
     $asked = "choices=$($choices.Count) fields=$($fields.Count)"
     if ($terminalOnly) {
-        $reason = if ($tooManyCombinations) { 'it offers more combinations than the dashboard can list' } else { '' }
+        $reason = if (-not $toolUseId) { 'this client did not identify the current request' }
+            elseif ($tooManyCombinations) { 'it offers more combinations than the dashboard can list' }
+            else { 'its fields or option labels cannot be represented safely' }
         $question = Add-ClaudeTerminalOnlyNotice -Question $question -Fields $markerFields -Reason $reason
         $choices = @()
         $fields = @()
-        $markerFields = @()
     }
     elseif ($choices.Count -gt 0 -and $markerFields.Count -eq 1 -and
             (Test-DecisionFieldIsMultiSelect -Field $markerFields[0])) {
@@ -197,7 +210,7 @@ function Invoke-ClaudeAskHook {
 
     Write-CopilotDecisionMarker -SessionId $sessionId -DecisionId $decisionId `
         -Question $question -Choices $choices -Combos @() -Fields $markerFields -Mode $mode `
-        -TerminalOnly:$terminalOnly -ToolCallId $toolUseId | Out-Null
+        -TerminalOnly:$terminalOnly -ToolCallId $toolUseId -ToolName 'AskUserQuestion' | Out-Null
 
     Write-DecisionBridgeLog -Message (
         "claude AskUserQuestion: session=$($sessionId.Substring(0,[Math]::Min(8,$sessionId.Length))) " +
@@ -218,7 +231,7 @@ function Invoke-ClaudeAskHook {
 
     Set-CopilotMqttDecision -SessionId $sessionId -SessionName $display.Name `
         -Machine $display.Machine -Question $question -Choices $choices `
-        -Fields $fields -DecisionId $decisionId -Headers $headers | Out-Null
+        -Fields $fields -DecisionId $decisionId -Headers $headers -TerminalOnly:$terminalOnly | Out-Null
 
     $numbered = ''
     if ($choices.Count -gt 0) {

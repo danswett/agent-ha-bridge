@@ -261,7 +261,7 @@ Test-That 'a missing transcript is simply not started' { -not (Get-ClaudeAskUser
 # cleared a brand-new card within seconds. A card judges its own question.
 Add-Content -LiteralPath $qFile -Value (New-Line 'user' @(@{ type = 'tool_result'; tool_use_id = 'ask2'; content = 'answered' }))
 $q = Get-ClaudeAskUserState -TranscriptPath $qFile -ToolCallId 'ask3-not-written-yet'
-Test-That 'a named question not yet in the transcript is pending, not answered' { $q.Started -and $q.Pending -and $q.ToolCallId -eq 'ask3-not-written-yet' }
+Test-That 'a hook alone does not prove the native question has started' { -not $q.Started -and -not $q.CanAnswer }
 $q = Get-ClaudeAskUserState -TranscriptPath $qFile -Since ([DateTimeOffset]::Now.AddMinutes(5).ToString('o'))
 Test-That 'without an id, an older answered question does not count' { -not $q.Started }
 Add-Content -LiteralPath $qFile -Value (New-Line 'user' @(@{ type = 'tool_result'; tool_use_id = 'ask3-not-written-yet'; content = '"Q"="Banana"' }))

@@ -192,7 +192,8 @@ Set-StrictMode -Off
 $script:Reachable = $false
 $script:Markers = @()
 $out = Invoke-CopilotAskUserHook -HookEvent ([pscustomobject]@{ sessionId = 's1'; cwd = 'w'; timestamp = 1; toolArgs = [pscustomobject]@{ question = 'Pick'; choices = @('A', 'B') } })
-Test-That 'ask_user with Home Assistant away writes nothing and leaves the reply to the script' { $null -eq $out -and $script:Markers.Count -eq 0 }
+Test-That 'ask_user persists before an outage and still writes nothing to the client' { $null -eq $out -and $script:Markers.Count -eq 1 }
+Test-That 'an unidentified request is explicitly left to the terminal' { $script:Markers[0].TerminalOnly }
 $script:Sent = @()
 function Send-BridgeNotification { param($Title, $Message, $Headers) $script:Sent += $Title }
 function Get-HomeAssistantHeaders { @{ Authorization = 'Bearer t' } }

@@ -11,6 +11,14 @@ $ErrorActionPreference = 'Stop'
 
 $script:Failures = 0
 
+function Test-Case {
+    param([string]$Name, [scriptblock]$Condition)
+    $ok = $false
+    try { $ok = [bool](& $Condition) } catch { Write-Host $_.Exception.Message }
+    if ($ok) { Write-Host "  PASS  $Name" -ForegroundColor Green }
+    else { $script:Failures++; Write-Host "  FAIL  $Name" -ForegroundColor Red }
+}
+
 function Assert-Case {
     param(
         [Parameter(Mandatory)][string]$Name,
@@ -108,8 +116,7 @@ Assert-Case -Name 'boolean becomes Yes/No' -ExpectedQuestion 'Overwrite producti
 }
 '@
 
-Assert-Case -Name 'multi-select items.enum' -ExpectedQuestion 'Which services?' `
-    -ExpectedChoices @('frigate', 'plex', 'pihole') -Json @'
+$arrayArgs = @'
 {
   "message": "Which services?",
   "requestedSchema": {
@@ -118,7 +125,13 @@ Assert-Case -Name 'multi-select items.enum' -ExpectedQuestion 'Which services?' 
     }
   }
 }
-'@
+'@ | ConvertFrom-Json
+$arrayParsed = Repair-DecisionToolArguments -ToolArgs $arrayArgs
+Test-Case 'Copilot arrays retain every option and require the native terminal contract' {
+    $arrayParsed.TerminalOnly -and $arrayParsed.Fields[0].MultiSelect -and
+    ($arrayParsed.Fields[0].Options -join ',') -eq 'frigate,plex,pihole' -and
+    $arrayParsed.Choices.Count -eq 0 -and $arrayParsed.Question -match 'multiple selections'
+}
 
 Assert-Case -Name 'free-text field stays freeform' -ExpectedQuestion 'What name?' `
     -ExpectedChoices @() -Json @'
@@ -142,9 +155,7 @@ Assert-Case -Name 'two-option-field form no longer flattens (per-field dropdowns
 }
 '@
 
-Assert-Case -Name 'a mixed choice + free-text form is answerable, not flattened to an outline' `
-    -ExpectedQuestion 'Pick' `
-    -ExpectedChoices @() -Json @'
+$defaultArgs = @'
 {
   "message": "Pick",
   "requestedSchema": {
@@ -157,7 +168,12 @@ Assert-Case -Name 'a mixed choice + free-text form is answerable, not flattened 
     }
   }
 }
-'@
+'@ | ConvertFrom-Json
+$defaultParsed = Repair-DecisionToolArguments -ToolArgs $defaultArgs
+Test-Case 'a default is preserved rather than assuming that focus starts on the first option' {
+    $defaultParsed.TerminalOnly -and $defaultParsed.Fields.Count -eq 2 -and
+    $defaultParsed.Fields[0].Default -ceq 'Patch only' -and $defaultParsed.Question -match 'Default:'
+}
 
 Assert-Case -Name 'multi-field form exposes per-field options, not a flattened list' `
     -ExpectedQuestion 'Two things' `
@@ -229,14 +245,6 @@ $mixed = @'
 $mixedParsed = Repair-DecisionToolArguments -ToolArgs $mixed
 $mixedFields = @($mixedParsed.Fields)
 
-function Test-Case {
-    param([string]$Name, [scriptblock]$Condition)
-    $ok = $false
-    try { $ok = [bool](& $Condition) } catch { }
-    if ($ok) { Write-Host "  PASS  $Name" -ForegroundColor Green }
-    else { $script:Failures++; Write-Host "  FAIL  $Name" -ForegroundColor Red }
-}
-
 Test-Case 'every field survives, including the free-text one' { $mixedFields.Count -eq 3 }
 Test-Case 'the dropdown fields keep their options' {
     ($mixedFields[0].Options -join ',') -eq 'Good,Bad,Ugly,Fine' -and
@@ -276,8 +284,8 @@ Write-Host "`n--- an injected answer is checked against what the CLI recorded --
 # user's choice. Seen live - a field picked as index 1 in Home Assistant came back
 # from the CLI as index 0 - and nothing downstream could tell.
 $checkFields = @(
-    [pscustomobject]@{ Label = 'Alignment'; Options = @('Aligned', 'Closer', 'No change'); IsText = $false }
-    [pscustomobject]@{ Label = 'Notes';     Options = @();                                  IsText = $true }
+    [pscustomobject]@{ Name = 'alignment'; Label = 'Alignment'; Options = @('Aligned', 'Closer', 'No change'); IsText = $false }
+    [pscustomobject]@{ Name = 'notes'; Label = 'Notes'; Options = @(); IsText = $true }
 )
 
 Test-Case 'a matching answer passes' {
@@ -291,15 +299,15 @@ Test-Case 'the neighbouring option is caught' {
         -Fields $checkFields -Selections @('Closer', 'whatever they typed'))
 }
 Test-Case 'a reworded free-text field is not treated as a mismatch' {
-    Test-CopilotAnswerMatchesSelections `
+    (Get-CopilotAnswerVerification `
         -ResultContent 'User responded: alignment=Closer, notes=trimmed differently' `
-        -Fields $checkFields -Selections @('Closer', '  trimmed differently  ')
+        -Fields $checkFields -Selections @('Closer', '  trimmed differently  ')) -eq 'Unconfirmed'
 }
 Test-Case 'no recorded result yet is not a mismatch' {
-    Test-CopilotAnswerMatchesSelections -ResultContent '' -Fields $checkFields -Selections @('Closer', 'x')
+    (Get-CopilotAnswerVerification -ResultContent '' -Fields $checkFields -Selections @('Closer', 'x')) -eq 'Unconfirmed'
 }
 Test-Case 'nothing injected is not a mismatch' {
-    Test-CopilotAnswerMatchesSelections -ResultContent 'anything' -Fields @() -Selections @()
+    (Get-CopilotAnswerVerification -ResultContent 'anything' -Fields @() -Selections @()) -eq 'Unconfirmed'
 }
 
 Write-Host "`n--- a failed tool call must not kill the reconcile loop ---"
@@ -384,7 +392,7 @@ Write-Host "`n--- a multi-select field is typed by number, then walked to Submit
 # wrong option. Down once per row - the options plus the "Type something" row - then
 # highlights Submit, which the caller's Enter presses.
 $msField = [pscustomobject]@{
-    Label = 'Features'; Options = @('Auth', 'Billing', 'Search'); IsText = $false; MultiSelect = $true
+    Name = 'Which features?'; Label = 'Features'; Options = @('Auth', 'Billing', 'Search'); IsText = $false; MultiSelect = $true
 }
 Test-Case 'every combination is offered, single picks first' {
     (@(Get-DecisionMultiSelectChoices -Field $msField) -join ' / ') -eq

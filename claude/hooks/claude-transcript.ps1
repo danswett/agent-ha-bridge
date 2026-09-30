@@ -220,7 +220,7 @@ function Get-ClaudeAskUserState {
         [AllowNull()]$Since = $null
     )
 
-    $result = [pscustomobject]@{ Started = $false; Pending = $false; ToolCallId = ''; StartedAt = $null; ResultContent = '' }
+    $result = [pscustomobject]@{ Started = $false; Pending = $false; ToolCallId = ''; StartedAt = $null; ResultContent = ''; CanAnswer = $false }
     if ([string]::IsNullOrWhiteSpace($TranscriptPath) -or -not (Test-Path -LiteralPath $TranscriptPath)) { return $result }
 
     $length = (Get-Item -LiteralPath $TranscriptPath).Length
@@ -228,12 +228,12 @@ function Get-ClaudeAskUserState {
 
     $latestId = ''
     $latestAt = $null
-    $answers = @{}
-    # A little slack for the clock: the card is armed a moment before Claude stamps
-    # the question it belongs to.
+    $answers = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $starts = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $duplicates = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $sinceAt = $null
     if ($null -ne $Since -and -not [string]::IsNullOrWhiteSpace([string]$Since)) {
-        try { $sinceAt = ([DateTimeOffset]::Parse([string]$Since)).AddSeconds(-10) } catch { $sinceAt = $null }
+        try { $sinceAt = [DateTimeOffset]::Parse([string]$Since) } catch { return $result }
     }
     foreach ($line in @($tail.Lines)) {
         if ($line -notmatch 'AskUserQuestion|"tool_result"') { continue }
@@ -246,7 +246,7 @@ function Get-ClaudeAskUserState {
             if ([string]$block.type -eq 'tool_use' -and $block.PSObject.Properties['name'] -and
                 [string]$block.name -eq 'AskUserQuestion' -and $block.PSObject.Properties['id']) {
                 $at = if ($entry.PSObject.Properties['timestamp']) { $entry.timestamp } else { $null }
-                if ($null -ne $sinceAt) {
+                if (-not $ToolCallId -and $null -ne $sinceAt) {
                     # Too old to be the question the card is for.
                     $when = $null
                     if ($at -is [datetime]) { $when = [DateTimeOffset]$at.ToUniversalTime() }
@@ -255,25 +255,34 @@ function Get-ClaudeAskUserState {
                 }
                 $latestId = [string]$block.id
                 $latestAt = $at
+                if (-not $latestId) { continue }
+                if ($starts.ContainsKey($latestId)) { [void]$duplicates.Add($latestId) }
+                $starts[$latestId] = $at
             }
             elseif ([string]$block.type -eq 'tool_result' -and $block.PSObject.Properties['tool_use_id']) {
-                $content = if ($block.content -is [string]) { [string]$block.content }
-                           else { (@($block.content) | ForEach-Object { [string]$_.text }) -join ' ' }
+                $content = ''
+                if ($block.PSObject.Properties['content']) {
+                    $content = if ($block.content -is [string]) { [string]$block.content }
+                        else { (@($block.content | Where-Object { $_.PSObject.Properties['text'] }) | ForEach-Object { [string]$_.text }) -join ' ' }
+                }
+                if ($block.PSObject.Properties['is_error'] -and $block.is_error) { $content = '' }
                 $answers[[string]$block.tool_use_id] = $content
             }
         }
     }
 
-    # A named question exists from the moment its hook fired, whether or not it has
-    # reached the transcript yet.
-    if (-not [string]::IsNullOrWhiteSpace($ToolCallId)) { $latestId = $ToolCallId }
-
-    if ([string]::IsNullOrWhiteSpace($latestId)) { return $result }
+    $wanted = if ($ToolCallId) { $ToolCallId } else { $latestId }
+    if (-not $wanted -or $duplicates.Contains($wanted)) { return $result }
+    # A hook precedes the native UI. It is not evidence that keys can be sent yet.
+    if (-not $starts.ContainsKey($wanted) -and -not $answers.ContainsKey($wanted)) { return $result }
+    if (-not $ToolCallId -and $null -ne $sinceAt -and $starts.Count -ne 1) { return $result }
     $result.Started = $true
-    $result.ToolCallId = $latestId
-    $result.StartedAt = $latestAt
-    $result.Pending = -not $answers.ContainsKey($latestId)
-    if (-not $result.Pending) { $result.ResultContent = [string]$answers[$latestId] }
+    $result.ToolCallId = $wanted
+    $result.StartedAt = if ($starts.ContainsKey($wanted)) { $starts[$wanted] } else { $latestAt }
+    $result.Pending = -not $answers.ContainsKey($wanted)
+    $pendingIds = @($starts.Keys | Where-Object { -not $answers.ContainsKey($_) })
+    $result.CanAnswer = $result.Pending -and $wanted -ceq $latestId -and $pendingIds.Count -eq 1
+    if (-not $result.Pending) { $result.ResultContent = [string]$answers[$wanted] }
     $result
 }
 

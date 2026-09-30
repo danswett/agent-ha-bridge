@@ -16,7 +16,7 @@
     disregard an answer that was correct. Seen live on 2026-09-28 against a form whose
     answer had arrived perfectly.
 
-    The fix is to carry the schema value next to the label and accept either. The risk
+    The fix is to carry typed schema values and field identities next to labels. The risk
     in that is entirely in the middle: the value is read where the schema is parsed,
     but the check runs in the daemon, minutes later, on the far side of a marker file
     that is JSON on disk. Reading values correctly and checking them correctly is not
@@ -63,9 +63,9 @@ Test-That 'an enumNames label keeps the enum value behind it' {
 
 $boolChoices = @(Get-DecisionSchemaFieldChoices -Field (('{"type":"boolean"}') | ConvertFrom-Json))
 Test-That 'a yes/no field is shown as Yes but recorded as true' {
-    $boolChoices[0].Label -eq 'Yes' -and $boolChoices[0].Value -eq 'true'
+    $boolChoices[0].Label -eq 'Yes' -and $boolChoices[0].Value -is [bool] -and $boolChoices[0].Value -eq $true
 }
-Test-That 'and No as false' { $boolChoices[1].Label -eq 'No' -and $boolChoices[1].Value -eq 'false' }
+Test-That 'and No as false' { $boolChoices[1].Label -eq 'No' -and $boolChoices[1].Value -is [bool] -and $boolChoices[1].Value -eq $false }
 
 $plainChoices = @(Get-DecisionSchemaFieldChoices -Field (('{"type":"string","enum":["Closer","Aligned"]}') | ConvertFrom-Json))
 Test-That 'a plain enum is its own label and value' {
@@ -134,8 +134,8 @@ try {
     # What the user tapped on the phone: the second option of each list, which is also
     # what makes this worth asserting - a first option would pass a broken check by
     # accident.
-    Set-CopilotDecisionMarkerInjected -SessionId $sessionId -Answer 'release=hold, next_task=keep_going' `
-        -Selections @('Hold until morning', 'Keep going', 'nothing to add')
+    [void](Set-CopilotDecisionMarkerInjected -SessionId $sessionId -DecisionId 'd1' -Answer 'release=hold, next_task=keep_going' `
+        -Selections @('Hold until morning', 'Keep going', 'nothing to add'))
 
     # Everything from here on reads the marker back off disk, exactly as the daemon
     # does - this is the stretch where a value that was read correctly gets lost.
@@ -177,10 +177,10 @@ try {
             -ResultContent 'User responded: release=hold, next_task=stop_here, notes=nothing to add' `
             -Fields $markerFields -Selections $injected)
     }
-    Test-That 'a reworded free-text field is not a mismatch' {
-        Test-CopilotAnswerMatchesSelections `
+    Test-That 'a reworded free-text field is unconfirmed, not a mismatch' {
+        (Get-CopilotAnswerVerification `
             -ResultContent 'User responded: release=hold, next_task=keep_going, notes=Nothing to add.' `
-            -Fields $markerFields -Selections $injected
+            -Fields $markerFields -Selections $injected) -eq 'Unconfirmed'
     }
 }
 finally {
@@ -196,7 +196,7 @@ Write-Host "`n--- a yes/no answer is not called a mismatch ---"
 # A checkbox could never match: the card offers Yes and No, the CLI writes true and
 # false, and the two have no characters in common.
 $boolFields = @(
-    [pscustomobject]@{ Label = 'Glow'; Options = @('Yes', 'No'); Values = @('true', 'false'); IsText = $false }
+    [pscustomobject]@{ Name = 'glow'; Label = 'Glow'; Options = @('Yes', 'No'); Values = @($true, $false); IsText = $false }
 )
 Test-That 'Yes answered on the phone matches true in the transcript' {
     Test-CopilotAnswerMatchesSelections -ResultContent 'User responded: glow=true' `
@@ -213,18 +213,18 @@ Test-That 'No answered on the phone matches false' {
 
 Write-Host "`n--- the old behaviour still holds where it was right ---"
 
-# A marker armed before values were carried is read by the new daemon after an
-# upgrade. It has labels only, and must be compared on labels rather than throwing.
+# An older marker may lack the schema's field name. Do not guess that its display
+# label names a result property, or send a correction based on that guess.
 $legacyFields = @(
     [pscustomobject]@{ Label = 'Alignment'; Options = @('Aligned', 'Closer'); IsText = $false }
 )
-Test-That 'a marker from before the upgrade is compared on labels' {
-    Test-CopilotAnswerMatchesSelections -ResultContent 'User responded: alignment=Closer' `
-        -Fields $legacyFields -Selections @('Closer')
+Test-That 'a legacy marker without field identity is explicitly unconfirmed' {
+    (Get-CopilotAnswerVerification -ResultContent 'User responded: alignment=Closer' `
+        -Fields $legacyFields -Selections @('Closer')) -eq 'Unconfirmed'
 }
-Test-That 'and a wrong one from before the upgrade is still caught' {
-    -not (Test-CopilotAnswerMatchesSelections -ResultContent 'User responded: alignment=Aligned' `
-        -Fields $legacyFields -Selections @('Closer'))
+Test-That 'nor is a differently recorded legacy answer called a proven mismatch' {
+    (Get-CopilotAnswerVerification -ResultContent 'User responded: alignment=Aligned' `
+        -Fields $legacyFields -Selections @('Closer')) -eq 'Unconfirmed'
 }
 
 if ($script:Failures -gt 0) {

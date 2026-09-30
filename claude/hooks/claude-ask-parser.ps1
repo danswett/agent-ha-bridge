@@ -33,7 +33,6 @@ Set-StrictMode -Version Latest
 
 $script:ClaudeMaxFields = 4
 $script:ClaudeMaxQuestionLength = 6000
-$script:ClaudeMaxChoiceLength = 600
 
 function ConvertFrom-ClaudeAskUserQuestion {
     <#
@@ -82,9 +81,6 @@ function ConvertFrom-ClaudeAskUserQuestion {
                         $option.description) {
                         $notes.Add("- **$label** - $([string]$option.description)")
                     }
-                    if ($label.Length -gt $script:ClaudeMaxChoiceLength) {
-                        $label = $label.Substring(0, $script:ClaudeMaxChoiceLength - 3) + '...'
-                    }
                     $label
                 }
             )
@@ -100,6 +96,11 @@ function ConvertFrom-ClaudeAskUserQuestion {
                               [string]$question.question
                           }
             Title       = [string]$question.question
+            Name        = [string]$question.question
+            Client      = 'claude'
+            Values      = $labels
+            Type        = if ($question.PSObject.Properties['multiSelect'] -and $question.multiSelect) { 'array' } else { 'string' }
+            IsText      = ($labels.Count -eq 0)
             Options     = $labels
             MultiSelect = [bool]($question.PSObject.Properties.Name -contains 'multiSelect' -and $question.multiSelect)
         }
@@ -145,7 +146,7 @@ function ConvertFrom-ClaudeAskUserQuestion {
         Question     = Limit-ClaudeText -Text (($prompt, ($outline -join "`n")) -join "`n`n")
         Choices      = @()
         Fields       = @()
-        MarkerFields = @()
+        MarkerFields = $fields
         MultiSelect  = $multiSelect
     }
 }

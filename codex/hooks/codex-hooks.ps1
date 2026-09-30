@@ -30,6 +30,13 @@ function Invoke-CodexHook {
     $eventName = [string]$HookEvent.hook_event_name
     $workingDirectory = [string]$HookEvent.cwd
 
+    # Later local lifecycle events revoke an approval even if discovery, the daemon
+    # fast path or Home Assistant is unavailable.
+    $approvalRemoved = $false
+    if ($eventName -in @('SessionStart', 'UserPromptSubmit', 'PreToolUse', 'Stop', 'SessionEnd')) {
+        $approvalRemoved = Remove-CodexApprovalMarker -SessionId $sessionId
+    }
+
     $field = {
         param([string]$Name)
         if ($HookEvent.PSObject.Properties.Name -contains $Name) { return [string]$HookEvent.$Name }
@@ -61,7 +68,7 @@ function Invoke-CodexHook {
             $activity = "Needs approval: $tool"
             if ($HookEvent.PSObject.Properties.Name -contains 'tool_input' -and
                 $HookEvent.tool_input -and
-                $HookEvent.tool_input.PSObject.Properties.Name -contains 'command') {
+                $HookEvent.tool_input.PSObject.Properties['command']) {
                 $command = [string]$HookEvent.tool_input.command
                 if ($command.Length -gt 300) { $command = $command.Substring(0, 297) + '...' }
                 if ($command) { $activity = "Needs approval: $command" }
@@ -75,7 +82,7 @@ function Invoke-CodexHook {
             # want to see before approving something from a phone.
             if ($HookEvent.PSObject.Properties.Name -contains 'tool_input' -and
                 $HookEvent.tool_input -and
-                $HookEvent.tool_input.PSObject.Properties.Name -contains 'command') {
+                $HookEvent.tool_input.PSObject.Properties['command']) {
                 $command = [string]$HookEvent.tool_input.command
                 if ($command.Length -gt 200) { $command = $command.Substring(0, 197) + '...' }
                 if ($command) { $activity = "$activity - $command" }
@@ -99,6 +106,22 @@ function Invoke-CodexHook {
         }
         'SessionEnd' { $status = 'ended' }
         default { return }
+    }
+
+    $decisionId = ''
+    $question = $activity
+    if ($pendingApproval) {
+        $requestId = & $field 'tool_use_id'
+        $current = Get-CodexApprovalMarker -SessionId $sessionId
+        if ($requestId -and $null -ne $current -and $current.PSObject.Properties['ToolCallId'] -and
+            [string]$current.ToolCallId -ceq $requestId) {
+            Write-DecisionBridgeLog -Message "ignored repeated codex approval hook for $sessionId"
+            return
+        }
+        [void](Remove-CodexApprovalMarker -SessionId $sessionId)
+        $decisionId = "$(Get-CopilotMqttNodeId -SessionId $sessionId)-$([guid]::NewGuid().ToString('N'))"
+        Write-CodexApprovalMarker -SessionId $sessionId -DecisionId $decisionId -Question $question `
+            -ToolCallId $requestId -ToolName (& $field 'tool_name') -TurnId (& $field 'turn_id')
     }
 
     # The window this session runs in, which replies are typed into. -Ancestors only
@@ -136,7 +159,6 @@ function Invoke-CodexHook {
     $headers = Enter-BridgeAdapterSession
     if (-not $headers) { return }
     $display = Get-CodexSessionDisplay -SessionId $sessionId -WorkingDirectory $workingDirectory
-    $node = Get-CopilotMqttNodeId -SessionId $sessionId
 
     [void](Confirm-BridgeSessionEntities -SessionId $sessionId -SessionName $display.Name `
         -Machine $display.Machine -Headers $headers)
@@ -153,27 +175,25 @@ function Invoke-CodexHook {
         # Arm the selector so the command can be approved from the dashboard. The
         # marker is the daemon's gate: while it exists, an answer on the card is
         # delivered into the session's own approval prompt.
-        $decisionId = "$node-$([DateTimeOffset]::Now.ToUnixTimeMilliseconds())"
-        $question = $activity
         $choices = @('Approve', 'Deny')
+        if (-not (& $field 'tool_use_id')) {
+            $choices = @()
+            $question += "`n`nAnswer in the terminal: this client did not identify the approval request."
+        }
         Set-CopilotMqttDecision -SessionId $sessionId -SessionName $display.Name `
             -Machine $display.Machine -Question $question -Choices $choices `
             -Fields @() -DecisionId $decisionId -Headers $headers | Out-Null
-        Write-CodexApprovalMarker -SessionId $sessionId -DecisionId $decisionId -Question $question | Out-Null
-
         Send-BridgeNotification -Title (Format-BridgeNotificationTitle "Approval needed: $($display.Name)") `
             -Message $question -Headers $headers | Out-Null
     }
-    elseif ($eventName -in @('PreToolUse', 'Stop')) {
+    elseif ($approvalRemoved) {
         # Whatever was awaiting approval has been answered - in the terminal or on the
         # dashboard - because the tool is now running or the turn has finished.
-        if (Remove-CodexApprovalMarker -SessionId $sessionId) {
-            try {
-                Clear-CopilotMqttDecision -SessionId $sessionId -SessionName $display.Name `
-                    -Machine $display.Machine -Headers $headers | Out-Null
-            }
-            catch { }
+        try {
+            Clear-CopilotMqttDecision -SessionId $sessionId -SessionName $display.Name `
+                -Machine $display.Machine -Headers $headers | Out-Null
         }
+        catch { Write-DecisionBridgeLog -Message "codex approval card clear failed: $($_.Exception.Message)" }
     }
 
     if ($eventName -eq 'Stop') {

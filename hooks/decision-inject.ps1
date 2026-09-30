@@ -527,6 +527,9 @@ function Get-BridgeFormPayloads {
         [Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Selections
     )
 
+    if ($Fields.Count -ne $Selections.Count -or -not (Test-DecisionFieldsAnswerable -Fields $Fields)) {
+        throw 'The native form contract is not established for these fields, defaults or labels.'
+    }
     $esc = [string][char]27
     for ($i = 0; $i -lt $Fields.Count; $i++) {
         if (Test-DecisionFieldIsText -Field $Fields[$i]) {
@@ -626,7 +629,8 @@ function Send-CopilotSessionForm {
 
         # Explicit target process, for front ends with no inuse.<pid>.lock (Claude,
         # Codex). Without it the form could only ever reach a Copilot session.
-        [int]$ProcessId = 0
+        [int]$ProcessId = 0,
+        [AllowNull()][scriptblock]$StillCurrent = $null
     )
 
     $result = [pscustomobject]@{ Delivered = $false; ProcessId = $null; Detail = '' }
@@ -689,6 +693,11 @@ function Send-CopilotSessionForm {
             $keys = @($steps[$i].Keys)
             $failed = $false
             for ($k = 0; $k -lt $keys.Count; $k++) {
+                if ($null -ne $StillCurrent -and -not (& $StillCurrent)) {
+                    $outcome = "request changed before field${i}; remaining input was not sent"
+                    $failed = $true
+                    break
+                }
                 $isLast = ($k -eq ($keys.Count - 1))
                 $r = Invoke-BridgeConsoleSend -ProcessId $processId -Text $keys[$k] -Submit $isLast -DelayMs $StepDelayMs
                 if (-not $r.StartsWith('ok')) { $outcome = "field${i}:$r"; $failed = $true; break }
