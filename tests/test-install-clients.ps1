@@ -334,6 +334,55 @@ Test-That 'the verdict is true only when nothing failed' {
     (Show-BridgeInstallVerdict -Checks $halfBroken 6>$null) -eq $false
 }
 
+Write-Host '--- the guidance an agent needs travels with the install, not the repository ---'
+
+# An agent driving the bridge is nearly always working in some other repository, so it
+# never reads this one's AGENTS.md. Copilot scans
+# $HOME/.copilot/instructions/**/*.instructions.md, so the bridge owns one file there.
+$script:InstrRoot = Join-Path ([IO.Path]::GetTempPath()) "bridge-instr-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+$script:InstrPath = Join-Path $script:InstrRoot 'instructions\agent-ha-bridge.instructions.md'
+try {
+    $script:WroteFirst = Install-BridgeAgentInstructions -Path $script:InstrPath
+
+    Test-That 'it writes the file, creating the directory Copilot scans' {
+        $script:WroteFirst -and (Test-Path -LiteralPath $script:InstrPath)
+    }
+    Test-That 'and names it so Copilot actually reads it' {
+        [IO.Path]::GetFileName($script:InstrPath).EndsWith('.instructions.md')
+    }
+    Test-That 'a second install changes nothing, so a re-run does not churn it' {
+        (Install-BridgeAgentInstructions -Path $script:InstrPath) -eq $false
+    }
+    Test-That 'but a damaged file is repaired' {
+        Set-Content -LiteralPath $script:InstrPath -Value 'clobbered' -Encoding UTF8
+        $repaired = Install-BridgeAgentInstructions -Path $script:InstrPath
+        $repaired -and (Get-Content -LiteralPath $script:InstrPath -Raw) -match 'AGENT_HA_AGENT_TOKEN'
+    }
+
+    $script:InstrText = Get-BridgeAgentInstructions
+    Test-That 'it names the token an agent writes with' {
+        $script:InstrText -match 'AGENT_HA_AGENT_TOKEN'
+    }
+    Test-That 'and that variable is the one the bridge actually hands over' {
+        # Tied to the default in decision-bridge-common.ps1: renaming one without the
+        # other would ship confident instructions naming a variable nothing sets.
+        $common = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\hooks\decision-bridge-common.ps1') -Raw
+        $common -match "agentTokenEnvVar'\s+'AGENT_HA_AGENT_TOKEN'"
+    }
+    Test-That 'and says where the answer from a session is read from' {
+        $script:InstrText -match '_activity' -and $script:InstrText -match 'response'
+    }
+    Test-That 'and warns off the notification that cannot be read back' {
+        $script:InstrText -match 'persistent_notification'
+    }
+    Test-That 'and says the bridge owns the file, so nobody hand-edits it' {
+        $script:InstrText -match 'uninstall' -and $script:InstrText -match 'overwritten'
+    }
+}
+finally {
+    Remove-Item -LiteralPath $script:InstrRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 Write-Host ''
 if ($script:Failures) {
     Write-Host "$($script:Failures) check(s) failed" -ForegroundColor Red

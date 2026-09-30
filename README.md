@@ -372,6 +372,15 @@ provisioning still run as you. The agent token goes into the environment of ever
 session the bridge launches (`AGENT_HA_AGENT_TOKEN`), so an agent that goes on to
 drive another session does so as itself.
 
+A token in the environment is only half of it, though: an agent has to know it should
+reach for that one rather than yours, and an agent driving the bridge is nearly always
+working in some unrelated repository, so this repository's `AGENTS.md` never reaches
+it. A Copilot install therefore also writes
+`~/.copilot/instructions/agent-ha-bridge.instructions.md` — a file the CLI reads in
+every session, wherever it is working. It is short, it says which token writes and
+where a session's answer is read back from, and it is removed on uninstall. Your own
+`~/.copilot/copilot-instructions.md` is never touched.
+
 **A non-administrator is genuinely enough**, and the split is deliberate. Driving a
 session is service calls and state reads, both of which a plain user may do. The MCP
 server is not given this token precisely because it *provisions* — it renames entities

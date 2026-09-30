@@ -125,6 +125,11 @@ $installerDir = Join-Path $bridgeHome 'installer'
 $binDir = Join-Path $bridgeHome 'bin'
 $configPath = Join-Path $bridgeHome 'config.json'
 $hookConfigPath = Join-Path $copilotHome 'hooks\decision-notifier.json'
+# Copilot reads $HOME/.copilot/instructions/**/*.instructions.md, so the bridge owns one
+# file in there rather than editing the user's own copilot-instructions.md beside it.
+# An agent that drives the bridge is usually working in some unrelated repository and
+# never sees this repository's AGENTS.md, which is where the rules used to live only.
+$agentInstructionsPath = Join-Path $copilotHome 'instructions\agent-ha-bridge.instructions.md'
 $taskName = 'AgentBridgeDaemon'
 # The macOS counterpart of the scheduled task.
 $launchAgentLabel = 'com.agent-ha-bridge.daemon'
@@ -1410,6 +1415,82 @@ $script:LegacyHookFiles = @(
     'test-decision-args.ps1', 'test-decision-retry.ps1'
 )
 
+function Get-BridgeAgentInstructions {
+    <#
+        What an agent driving the bridge has to know, in the form Copilot reads
+        globally.
+
+        Both rules below fail silently, which is why they are worth the context they
+        cost: nothing errors, nothing is logged, and the symptom shows up somewhere the
+        agent is not looking. Both were learned the hard way on 2026-09-29.
+
+        This lives here rather than only in the repository's AGENTS.md because an agent
+        driving the bridge is almost never working *in* the bridge's repository - it is
+        in some unrelated project on a machine that happens to have the bridge
+        installed, and it never sees that file.
+    #>
+    @'
+# agent-ha-bridge
+
+Installed and maintained by agent-ha-bridge. Removed when the bridge is uninstalled;
+local edits are overwritten on the next install.
+
+This machine runs a bridge that puts agent sessions on a Home Assistant dashboard. You
+can drive a session - yours, or one on another machine - through its entities. Two
+things about that fail silently, so they are worth knowing before you try.
+
+## Authenticate writes as the agent
+
+A press, a reply or a launch must use `$env:AGENT_HA_AGENT_TOKEN`. When the bridge
+launched this session that variable is already in its environment. The token in
+`~/.agent-ha-bridge/config.json` under `homeAssistant.token` is the *user's*, and is
+the right one for reads.
+
+Both tokens authenticate and both are authorised, so using the wrong one raises no
+error and writes no log line. The only symptom is that Home Assistant records the
+action against the user instead of the agent, and the session card is styled as the
+user's own.
+
+## Read a session's answer from its activity sensor
+
+`sensor.agent_bridge_<session>_activity` carries what the session said, in its
+`response` attribute. `sensor.agent_bridge_<session>_status` reads `idle` when a turn
+ends - but also briefly before the session starts working, so wait for a `response`
+rather than for the status alone.
+
+Do not ask a session to answer with a persistent notification. Home Assistant does not
+expose those through `GET /api/states`, so polling for a `persistent_notification.*`
+entity finds nothing however long you wait, and that silence looks exactly like the
+session having died.
+'@
+}
+
+function Install-BridgeAgentInstructions {
+    <#
+        Writes the instruction file, and says whether it changed anything.
+
+        Rewritten only when the content differs, so a re-install does not churn a file
+        the CLI may be reading, and so the common case prints nothing.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    $wanted = Get-BridgeAgentInstructions
+    if (Test-Path -LiteralPath $Path) {
+        $current = Get-Content -LiteralPath $Path -Raw -ErrorAction SilentlyContinue
+        # Both sides normalised: Set-Content writes the platform's line ending, so a
+        # file written on Windows and compared on macOS would differ every time.
+        if ($null -ne $current -and ($current -replace "`r`n", "`n").Trim() -eq ($wanted -replace "`r`n", "`n").Trim()) {
+            return $false
+        }
+    }
+    $parent = Split-Path -Parent $Path
+    if (-not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+    Set-Content -LiteralPath $Path -Value $wanted -Encoding UTF8
+    $true
+}
+
 function Invoke-BridgeLayoutMigration {
     <#
         Moves a pre-rename install into ~/.agent-ha-bridge and returns whether it had
@@ -2354,6 +2435,9 @@ if ($selectedClients -contains 'copilot') {
     @{ version = 1; hooks = $hookDefs } | ConvertTo-Json -Depth 8 |
         Set-Content -LiteralPath $hookConfigPath -Encoding UTF8
     Write-Host "    $hookConfigPath"
+    if (Install-BridgeAgentInstructions -Path $agentInstructionsPath) {
+        Write-Host "    $agentInstructionsPath"
+    }
 }
 elseif (Test-Path -LiteralPath $hookConfigPath) {
     # Copilot is not configured, so a definition left over from an earlier run would
@@ -2361,6 +2445,10 @@ elseif (Test-Path -LiteralPath $hookConfigPath) {
     Write-Step 'Removing the stale Copilot hook definition'
     Remove-Item -LiteralPath $hookConfigPath -Force -ErrorAction SilentlyContinue
     Write-Host "    $hookConfigPath"
+}
+if (-not ($selectedClients -contains 'copilot') -and (Test-Path -LiteralPath $agentInstructionsPath)) {
+    # Guidance for a client this install no longer configures is just context cost.
+    Remove-Item -LiteralPath $agentInstructionsPath -Force -ErrorAction SilentlyContinue
 }
 
 # ------------------------------------------------------------- scheduled task

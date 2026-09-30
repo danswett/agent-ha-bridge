@@ -100,6 +100,7 @@ $arpKey = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\AgentHaBrid
 $bridgeHome = Join-Path $installHome '.agent-ha-bridge'
 $hooksDir = Join-Path $bridgeHome 'hooks'
 $hookConfigPath = Join-Path $copilotHome 'hooks\decision-notifier.json'
+$agentInstructionsPath = Join-Path $copilotHome 'instructions\agent-ha-bridge.instructions.md'
 $legacySkillDir = Join-Path $copilotHome 'skills\decision-notifier'
 $configPath = Join-Path $bridgeHome 'config.json'
 $taskName = 'AgentBridgeDaemon'
@@ -344,10 +345,21 @@ foreach ($name in $files) {
     if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force; Write-Host "    $name" }
 }
 
-# The Copilot CLI's hook definition is the one bridge file outside the bridge root.
+# The two bridge files outside the bridge root: the Copilot CLI's hook definition, and
+# the instructions it reads globally. Leaving the latter behind would keep telling every
+# session how to drive a bridge that is no longer installed.
 if (Test-Path -LiteralPath $hookConfigPath) {
     Remove-Item -LiteralPath $hookConfigPath -Force
     Write-Host "    $hookConfigPath"
+}
+if (Test-Path -LiteralPath $agentInstructionsPath) {
+    Remove-Item -LiteralPath $agentInstructionsPath -Force
+    Write-Host "    $agentInstructionsPath"
+    # Only if the bridge's file was the only thing in there.
+    $instructionsDir = Split-Path -Parent $agentInstructionsPath
+    if (-not (Get-ChildItem -LiteralPath $instructionsDir -Force -ErrorAction SilentlyContinue)) {
+        Remove-Item -LiteralPath $instructionsDir -Force -ErrorAction SilentlyContinue
+    }
 }
 
 if (Test-Path -LiteralPath $legacySkillDir) {
