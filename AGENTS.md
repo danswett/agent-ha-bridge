@@ -184,6 +184,20 @@ already sitting in its own environment. Reading state is different - for a read
 `homeAssistant.token` is correct and simpler. The rule is about writes: a press, a
 reply, a launch.
 
+### Reading the answer back
+
+A session on another machine reports through its own entities, and the one that
+carries what it actually said is `sensor.agent_bridge_<session>_activity` - the text is
+in the `response` attribute, with `sensor.agent_bridge_<session>_status` going `idle`
+when the turn is done. Note that a session is briefly `idle` before it starts working
+too, so wait for a `response` rather than for the status alone.
+
+Do not ask a remote session to answer with a persistent notification. Home Assistant
+does not expose those through `GET /api/states`, so polling for a
+`persistent_notification.*` entity finds nothing however long you wait, and the silence
+looks exactly like the session having died. They can be listed over Home Assistant's
+WebSocket API, but the activity sensor is already there and needs no second connection.
+
 ## Style
 
 - Comments explain *why*, and especially what went wrong before. Most of the comments
