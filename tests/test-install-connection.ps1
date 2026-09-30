@@ -52,9 +52,12 @@ function Invoke-RestMethod {
         [string]$Uri,
         [hashtable]$Headers,
         [int]$TimeoutSec,
+        [int]$MaximumRedirection = -1,
         [Parameter(ValueFromRemainingArguments = $true)]$Rest
     )
-    $script:Requested += [pscustomobject]@{ Uri = $Uri; Authorization = [string]$Headers['Authorization'] }
+    $script:Requested += [pscustomobject]@{
+        Uri = $Uri; Authorization = [string]$Headers['Authorization']; MaximumRedirection = $MaximumRedirection
+    }
     if (-not $script:Responses.ContainsKey($Uri)) { throw "no stub for $Uri" }
     $value = $script:Responses[$Uri]
     if ($value -is [scriptblock]) { return (& $value) }
@@ -94,6 +97,10 @@ Test-That 'it notices mqtt.publish' { $result.MqttPublish }
 Test-That 'the token is sent as a bearer token' {
     $script:Requested[0].Authorization -eq 'Bearer good-token'
 }
+Test-That 'every authenticated check refuses redirects before sending a token elsewhere' {
+    $script:Requested.Count -eq 3 -and
+        @($script:Requested | Where-Object { $_.MaximumRedirection -ne 0 }).Count -eq 0
+}
 Test-That 'a trailing slash on the URL does not double up' {
     Set-HomeAssistantStub
     $trailing = Test-BridgeHomeAssistantConnection -BaseUrl 'http://ha.test:8123/' -Token 'good-token'
@@ -116,7 +123,10 @@ Test-That 'the version is simply blank' { $result.Version -eq '' }
 Test-That 'a missing /api/services does not fail the check either' { -not $result.MqttPublish }
 
 Write-Host '--- failures come back as a result, never an exception ---'
-Set-HomeAssistantStub -ApiFailure { throw 'The remote server returned an error: (401) Unauthorized.' }
+Set-HomeAssistantStub -ApiFailure {
+    throw [Microsoft.PowerShell.Commands.HttpResponseException]::new(
+        'Synthetic rejection', [Net.Http.HttpResponseMessage]::new([Net.HttpStatusCode]::Unauthorized))
+}
 $result = Test-BridgeHomeAssistantConnection -BaseUrl 'http://ha.test:8123' -Token 'bad-token'
 Test-That 'a rejected token reports failure' { -not $result.Ok }
 Test-That 'the reason is carried on the result' { $result.Error -match 'Unauthorized' }
@@ -135,6 +145,11 @@ Test-That 'an empty URL is refused' {
     Set-HomeAssistantStub
     $none = Test-BridgeHomeAssistantConnection -BaseUrl '' -Token 'good-token'
     (-not $none.Ok) -and ($none.Error -match 'URL')
+}
+Test-That 'an invalid URL is not reflected even when no bearer token was supplied' {
+    Set-HomeAssistantStub
+    $bad = Test-BridgeHomeAssistantConnection -BaseUrl 'https://user:synthetic-url-secret@ha.test' -Token ''
+    -not $bad.Ok -and $script:Requested.Count -eq 0 -and ($bad | ConvertTo-Json) -notmatch 'synthetic-url-secret'
 }
 
 Write-Host '--- HTTP failures are explained rather than echoed ---'
@@ -155,9 +170,13 @@ Test-That '404 points at the URL rather than the token' {
 Test-That 'an unrecognised status still names itself' {
     (Get-BridgeHttpErrorDetail -ErrorRecord (New-HttpError -Status 503)) -match '503'
 }
-Test-That 'a transport failure falls back to the exception message' {
+Test-That 'a redirect is an explicit failure rather than permission to use another endpoint' {
+    (Get-BridgeHttpErrorDetail -ErrorRecord (New-HttpError -Status 302)) -match 'redirect refused'
+}
+Test-That 'a transport failure gives safe actionable guidance instead of echoing a response' {
     $record = [pscustomobject]@{ Exception = [pscustomobject]@{ Message = 'No such host is known.'; Response = $null } }
-    (Get-BridgeHttpErrorDetail -ErrorRecord $record) -eq 'No such host is known.'
+    $detail = Get-BridgeHttpErrorDetail -ErrorRecord $record
+    $detail -match 'DNS' -and $detail -match 'TLS' -and $detail -notmatch 'No such host'
 }
 
 Write-Host '--- the URL prompt only appears when there is nothing to use ---'
@@ -182,6 +201,16 @@ Test-That 'a working config is never prompted about' {
 $script:Discovered = 0; $script:Prompted = 0
 $resolved = Resolve-BridgeHomeAssistantUrl -Configured 'http://stale.test:8123' -Probe $no `
     -Discover $discoverSomething -Prompt $prompt
+Test-That 'an offline configured endpoint is retained even when discovery would find another' {
+    $resolved.Url -eq 'http://stale.test:8123' -and $resolved.Source -eq 'unverified'
+}
+Test-That 'a saved endpoint failure never invokes discovery or an implicit replacement prompt' {
+    $script:Discovered -eq 0 -and $script:Prompted -eq 0 -and -not $resolved.Prompted
+}
+
+$script:Discovered = 0; $script:Prompted = 0
+$resolved = Resolve-BridgeHomeAssistantUrl -Configured '' -Probe $no `
+    -Discover $discoverSomething -Prompt $prompt
 Test-That 'a discovered Home Assistant is used' { $resolved.Url -eq 'http://found.test:8123' }
 Test-That 'its source is reported as discovery' { $resolved.Source -eq 'discovered' }
 Test-That 'discovery is not followed by a pointless prompt' {
@@ -189,27 +218,28 @@ Test-That 'discovery is not followed by a pointless prompt' {
 }
 
 $script:Discovered = 0; $script:Prompted = 0
-$resolved = Resolve-BridgeHomeAssistantUrl -Configured 'http://stale.test:8123' -Probe $no `
+$resolved = Resolve-BridgeHomeAssistantUrl -Configured '' -Probe $no `
     -Discover $discoverNothing -Prompt $prompt
 Test-That 'only a failed discovery leads to a prompt' { $script:Prompted -eq 1 }
 Test-That 'the typed answer is used' { $resolved.Url -eq 'http://typed.test:8123' }
 Test-That 'it is reported as typed' { ($resolved.Source -eq 'typed') -and $resolved.Prompted }
 
-Test-That 'pressing Enter at the prompt keeps the configured URL' {
+Test-That 'a configured endpoint is not offered for replacement after a failed probe' {
+    $script:Prompted = 0
     $r = Resolve-BridgeHomeAssistantUrl -Configured 'http://stale.test:8123' -Probe $no `
-        -Discover $discoverNothing -Prompt { param($c) '' }
-    $r.Url -eq 'http://stale.test:8123'
+        -Discover $discoverNothing -Prompt { param($c) $script:Prompted++; 'https://replacement.test' }
+    $r.Url -eq 'http://stale.test:8123' -and $script:Prompted -eq 0
 }
 Test-That 'a typed trailing slash is trimmed' {
     $r = Resolve-BridgeHomeAssistantUrl -Configured '' -Probe $no `
         -Discover $discoverNothing -Prompt { param($c) 'http://typed.test:8123/' }
     $r.Url -eq 'http://typed.test:8123'
 }
-Test-That 'the prompt is shown the current value as its default' {
-    $script:SeenDefault = ''
-    [void](Resolve-BridgeHomeAssistantUrl -Configured 'http://stale.test:8123' -Probe $no `
+Test-That 'initial setup prompts with no preapproved endpoint' {
+    $script:SeenDefault = 'not-called'
+    [void](Resolve-BridgeHomeAssistantUrl -Configured '' -Probe $no `
         -Discover $discoverNothing -Prompt { param($c) $script:SeenDefault = $c; '' })
-    $script:SeenDefault -eq 'http://stale.test:8123'
+    $script:SeenDefault -eq ''
 }
 
 Write-Host '--- with no prompt (a non-interactive run) it never blocks ---'
@@ -218,6 +248,42 @@ $resolved = Resolve-BridgeHomeAssistantUrl -Configured 'http://stale.test:8123' 
 Test-That 'the configured value is kept' { $resolved.Url -eq 'http://stale.test:8123' }
 Test-That 'it is flagged as unverified rather than claimed to work' {
     ($resolved.Source -eq 'unverified') -and (-not $resolved.Prompted)
+}
+
+foreach ($mode in 'interactive', 'unattended', 'update') {
+    Test-That "$mode cannot move a saved HTTPS credential binding to a discovered HTTP host" {
+        $script:Discovered = 0; $script:Prompted = 0
+        $options = @{ Configured = 'https://configured.test'; Probe = $no; Discover = $discoverSomething }
+        if ($mode -eq 'interactive') { $options.Prompt = $prompt }
+        $kept = Resolve-BridgeHomeAssistantUrl @options
+        $kept.Url -eq 'https://configured.test' -and $script:Discovered -eq 0 -and $script:Prompted -eq 0
+    }
+}
+foreach ($invalid in @(
+    'file:///tmp/ha', 'ftp://ha.test', 'ha.test:8123', '//ha.test:8123',
+    'https://user:synthetic-url-secret@ha.test', 'https://ha.test/?token=synthetic-url-secret',
+    'https://ha.test/#synthetic-url-secret', 'http://ha.test\other', "https://ha.test/`nsecret"
+)) {
+    Test-That 'an invalid credential endpoint is refused without a request or reflected URL' {
+        Set-HomeAssistantStub
+        $bad = Test-BridgeHomeAssistantConnection -BaseUrl $invalid -Token 'synthetic-test-token'
+        -not $bad.Ok -and $script:Requested.Count -eq 0 -and $bad.Error -match 'URL' -and
+            (($bad | ConvertTo-Json) -notmatch 'synthetic-url-secret')
+    }
+}
+Test-That 'credential-bearing invalid JSON is not copied into an error message' {
+    $badConfig = Join-Path $env:TEMP 'invalid-secret-config.json'
+    try {
+        Set-Content -LiteralPath $badConfig -Value '{"token":synthetic-parser-secret}' -Encoding utf8
+        $read = Read-BridgeConfigFile -Path $badConfig
+        $null -eq $read.Config -and $read.Error -and $read.Error -notmatch 'synthetic-parser-secret'
+    }
+    finally { Remove-Item -LiteralPath $badConfig -Force }
+}
+Test-That 'a reflected credential in a transport exception is not displayed' {
+    Set-HomeAssistantStub -ApiFailure { throw 'failed: synthetic-reflected-token' }
+    $bad = Test-BridgeHomeAssistantConnection -BaseUrl 'http://ha.test:8123' -Token 'synthetic-reflected-token'
+    -not $bad.Ok -and $bad.Error -and $bad.Error -notmatch 'synthetic-reflected-token'
 }
 
 Write-Host '--- discovery covers the cases mDNS cannot ---'
@@ -358,6 +424,13 @@ Test-That 'a token on its own account is stored' { $good.Store }
 Test-That 'and its user id comes off the token, so nobody copies one by hand' { $good.UserId -eq 'agent-id' } $good.UserId
 Test-That 'the account is named, so the install says what it just wired up' { $good.Name -eq 'Copilot' }
 Test-That 'nothing is warned about' { $good.Warning -eq '' } $good.Warning
+Test-That 'a verified environment-only agent identity can be saved without serializing its secret' {
+    $environmentIdentity = Resolve-BridgeAgentIdentity -BaseUrl 'http://ha.test:8123' `
+        -AgentToken 'agent-token' -OwnToken 'own-token' -Lookup $lookup -EnvironmentOnly
+    $saved = @{ agentToken = $environmentIdentity.Token; agentUserIds = @($environmentIdentity.UserId) }
+    $environmentIdentity.Store -and $environmentIdentity.Token -eq '' -and
+        $saved.agentUserIds[0] -eq 'agent-id' -and ($saved | ConvertTo-Json) -notmatch 'agent-token'
+}
 
 $same = Resolve-BridgeAgentIdentity -BaseUrl 'http://ha.test:8123' -AgentToken 'own-token' -OwnToken 'own-token' -Lookup $lookup
 Test-That 'a second token on your OWN account is refused' { -not $same.Store }

@@ -54,6 +54,12 @@ run [`install-mcp.ps1`](install-mcp.ps1) directly. It installs the server under
 it's present. The installer offers to install Node.js for you if it is missing. The
 rest of this document is the manual equivalent.
 
+Generated entries contain an absolute `HA_BRIDGE_CONFIG` path, not copies of the
+Home Assistant tokens. At startup the server reads the endpoint and both credential
+sources from that file together. Saved tokens take precedence over the named
+environment variables; environment-only values must be inherited by the MCP client.
+Restart the client after changing its environment or rotating credentials.
+
 ```bash
 cd mcp
 npm install
@@ -68,8 +74,7 @@ Claude Desktop — add to `claude_desktop_config.json`:
       "command": "node",
       "args": ["C:\\path\\to\\agent-ha-bridge\\mcp\\src\\server.js"],
       "env": {
-        "HA_BASE_URL": "http://homeassistant.local:8123",
-        "HA_TOKEN": "eyJ..."
+        "HA_BRIDGE_CONFIG": "C:\\path\\to\\your\\.agent-ha-bridge\\config.json"
       }
     }
   }
@@ -78,12 +83,28 @@ Claude Desktop — add to `claude_desktop_config.json`:
 
 | Variable | Meaning |
 |---|---|
-| `HA_BASE_URL` | Home Assistant base URL (required) |
-| `HA_TOKEN` | Long-lived access token (required) |
+| `HA_BRIDGE_CONFIG` | Absolute path to the protected bridge config. Reads `homeAssistant.baseUrl`, `token` / `tokenEnvVar`, and `agentToken` / `agentTokenEnvVar` at startup. When set, ambient `HA_BASE_URL`, `HA_TOKEN`, and `HA_AGENT_TOKEN` do not override this binding |
+| `HA_BASE_URL` | Home Assistant base URL (required when not using `HA_BRIDGE_CONFIG`) |
+| `HA_TOKEN` | Long-lived access token (required when not using `HA_BRIDGE_CONFIG`) |
 | `HA_AGENT_TOKEN` | The *agent's* token, used only for writes whose account Home Assistant records — a reply, a launch. Optional; without it those actions are recorded as you. See [Driving sessions](#driving-sessions) |
 | `HA_CARD_TITLE` | Device name for the card (default `Agent MCP`) |
 | `HA_TIMEOUT_MS` | How long to wait for an answer (default 30 min) |
 | `HA_DASHBOARD` | Fallback dashboard when the daemon is absent (default `agent-mcp`; set to empty to manage cards yourself) |
+
+Direct `HA_BASE_URL` / `HA_TOKEN` / `HA_AGENT_TOKEN` configuration remains supported
+for standalone use. Prefer your client's secret/environment mechanism to plaintext
+values in its config or command line. Invalid URLs, unreadable references, and a
+missing required token stop startup without echoing credentials. If the bridge config
+has `agentUserIds`, a missing agent credential is also an error rather than silently
+running session writes as the user. An unconfigured agent account remains optional.
+
+The installer protects the main config, snippet, Desktop config and `.bak` before
+writing any credential-bearing contents. Permission failures stop setup. On removal,
+`install-mcp.ps1 -Uninstall` (also called by the main uninstaller) removes only entries
+pointing to this install's server, from both Desktop files, and deletes the owned
+snippet. Unrelated servers/preferences and each backup's own contents are preserved.
+Manually pasted registrations and third-party backups need separate cleanup. The
+main bridge config is not deleted by MCP-only removal, and HA tokens are not revoked.
 
 ## Driving sessions
 

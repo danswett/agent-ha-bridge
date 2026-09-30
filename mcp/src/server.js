@@ -36,12 +36,11 @@ import {
   setStatus,
 } from './entities.js';
 import { describeSchema, outlineFor, valueForLabel } from './schema.js';
-import { DEFAULT_URL_PATH, ensureDashboard, removeFromDashboard } from './dashboard.js';
+import { ensureDashboard, removeFromDashboard } from './dashboard.js';
 import { launchSession, listSessions, readSession, replyToSession } from './sessions.js';
 import { startHttpTransport } from './http.js';
 import { readFileSync } from 'node:fs';
-
-const DEFAULT_TIMEOUT_MS = 30 * 60 * 1000;
+import { loadConfig } from './config.js';
 
 // Report the packaged version rather than a hard-coded literal, so an MCP client
 // shows the bridge release it is actually running. The VERSION file sits at the
@@ -62,44 +61,6 @@ function serverVersion() {
   } catch {
     return '0.0.0';
   }
-}
-
-function loadConfig() {
-  const baseUrl = process.env.HA_BASE_URL;
-  const token = process.env.HA_TOKEN;
-  if (!baseUrl || !token) {
-    throw new Error(
-      'Set HA_BASE_URL and HA_TOKEN. In Claude Desktop these go in the server\'s "env" block.',
-    );
-  }
-  return {
-    baseUrl,
-    token,
-    // The account an agent *drives* sessions as, which is deliberately not the one
-    // above. HA_TOKEN is the user's: it provisions, and renaming entities and writing
-    // dashboards is administrator-only, which is exactly what a separate agent account
-    // exists to avoid needing. Writes that Home Assistant records against an account -
-    // a reply, a launch - use this one instead, so a session an agent drove is marked
-    // as the agent's rather than silently as the user's.
-    agentToken: process.env.HA_AGENT_TOKEN || '',
-    title: process.env.HA_CARD_TITLE || 'Agent MCP',
-    timeoutMs: Number(process.env.HA_TIMEOUT_MS) || DEFAULT_TIMEOUT_MS,
-    // Set HA_DASHBOARD='' to manage cards yourself.
-    dashboard:
-      process.env.HA_DASHBOARD === undefined ? DEFAULT_URL_PATH : process.env.HA_DASHBOARD,
-    // stdio unless asked otherwise: the client starts the server, nothing listens,
-    // and there is nothing to secure.
-    transport: (process.env.MCP_TRANSPORT || 'stdio').toLowerCase(),
-    httpHost: process.env.MCP_HTTP_HOST || '127.0.0.1',
-    httpPort: Number(process.env.MCP_HTTP_PORT) || 8808,
-    httpToken: process.env.MCP_HTTP_TOKEN || '',
-    httpPath: process.env.MCP_HTTP_PATH || '/mcp',
-    // Extra Host header values to accept, for a tunnel or reverse proxy in front.
-    httpAllowedHosts: (process.env.MCP_HTTP_ALLOWED_HOSTS || '')
-      .split(',')
-      .map((entry) => entry.trim())
-      .filter(Boolean),
-  };
 }
 
 /**

@@ -337,13 +337,24 @@ else {
     }
 }
 
+if (Test-Path -LiteralPath (Join-Path $bridgeHome 'mcp')) {
+    $mcpSetup = Join-Path $PSScriptRoot 'mcp\install-mcp.ps1'
+    if (-not (Test-Path -LiteralPath $mcpSetup)) { $mcpSetup = Join-Path $bridgeHome 'installer\mcp\install-mcp.ps1' }
+    if (-not (Test-Path -LiteralPath $mcpSetup)) {
+        throw 'MCP credential cleanup is unavailable. Restore the installer payload before uninstalling.'
+    }
+    # Remove owned credentials before their helper payload disappears. A non-MCP
+    # uninstall never reads a Desktop configuration it did not register.
+    & $mcpSetup -TargetHome $installHome -Uninstall
+}
+
 Write-Step 'Removing hook scripts'
 $files = @(
     'decision-bridge-common.ps1', 'decision-mqtt.ps1', 'decision-ha-websocket.ps1',
     'decision-inject.ps1', 'agent-bridge-daemon.ps1', 'agent-bridge-supervisor.ps1',
     'agent-bridge-launch.vbs', 'route-ask-user-v3.ps1', 'notify-agent-response.ps1',
     'notify-home-assistant.ps1', 'bridge-adapter.ps1', 'bridge-update.ps1',
-    'bridge-frontend-cards.ps1', 'session-launch.ps1', 'bridge-platform.ps1', 'bridge-test-guard.ps1', 'VERSION',
+    'bridge-frontend-cards.ps1', 'session-launch.ps1', 'bridge-platform.ps1', 'bridge-test-guard.ps1', 'bridge-secrets.ps1', 'VERSION',
     'copilot-hooks.ps1', 'bridge-native-hook.ps1', 'daemon-agents.ps1', 'daemon-discovery.ps1', 'daemon-activity.ps1', 'daemon-sessions.ps1', 'daemon-replies.ps1',
     'daemon-decisions.ps1', 'daemon-launch.ps1', 'daemon-maintenance.ps1', 'daemon-hookspool.ps1'
 )
@@ -400,10 +411,6 @@ $mcpDir = Join-Path $bridgeHome 'mcp'
 if (Test-Path -LiteralPath $mcpDir) {
     Write-Step 'Removing the MCP server'
     Remove-Item -LiteralPath $mcpDir -Recurse -Force
-    # The Claude Desktop registration (and any other MCP client's) is left in place;
-    # remove it with `mcp/install-mcp.ps1 -Uninstall`, the same way the Claude and
-    # Codex client registrations are their own installers' job.
-    Write-Host '    (run mcp/install-mcp.ps1 -Uninstall to also remove it from Claude Desktop)'
 }
 
 # The bridge root goes at the end of this script, but the PATH entry pointing into it
@@ -470,9 +477,9 @@ else {
     catch { Write-Warning "Could not update PATH: $($_.Exception.Message)" }
 }
 
-if (-not $KeepConfig -and (Test-Path -LiteralPath $configPath)) {
+if (-not $KeepConfig) {
     Write-Step 'Removing the bridge config (it holds your token)'
-    Remove-Item -LiteralPath $configPath -Force
+    if (Test-Path -LiteralPath $configPath) { Remove-Item -LiteralPath $configPath -Force }
     # The install-time backup holds the same token.
     if (Test-Path -LiteralPath "$configPath.bak") { Remove-Item -LiteralPath "$configPath.bak" -Force }
 }

@@ -26,6 +26,7 @@ function Test-Blocked {
 
 # An unsupported scheme cannot send traffic even if a REST/WebSocket guard regresses.
 $fixtureUrl = 'offline-test://fixture'
+$validFixtureUrl = 'http://127.0.0.1:1'
 $hooksPath = Join-Path $PSScriptRoot '..\hooks'
 Write-Host '--- the installer has its own configuration-free boundary ---'
 Test-That 'loading installer helpers does not load runtime configuration' {
@@ -44,7 +45,7 @@ Test-Blocked 'the unauthenticated manifest probe does not hide a missing WebRequ
     Test-IsHomeAssistant -BaseUrl $fixtureUrl
 }
 Test-Blocked 'URL resolution does not hide an unstubbed configured-URL probe' {
-    Resolve-BridgeHomeAssistantUrl -Configured $fixtureUrl
+    Resolve-BridgeHomeAssistantUrl -Configured $validFixtureUrl
 }
 Test-Blocked 'a checker child is refused before loading any runtime configuration' {
     Invoke-BridgeFrontendCardCheck -HooksDir $hooksPath -ConfigPath 'not-a-config.json'
@@ -89,14 +90,14 @@ Test-That 'an explicitly injected resolver still supports offline candidate test
 Write-Host '--- a stub defined after the negative calls only replaces its own transport ---'
 $script:RestCalls = 0
 function Invoke-RestMethod {
-    param([string]$Uri, $Headers, $TimeoutSec)
+    param([string]$Uri, $Headers, $TimeoutSec, $MaximumRedirection)
     $script:RestCalls++
     if ($Uri.EndsWith('/api/config')) { return [pscustomobject]@{ version = 'test'; location_name = 'fixture' } }
     if ($Uri.EndsWith('/api/services')) { return @([pscustomobject]@{ domain = 'mqtt'; services = [pscustomobject]@{ publish = @{} } }) }
     [pscustomobject]@{ message = 'API running.' }
 }
 Test-That 'a correctly placed REST stub covers all three connection requests' {
-    $connection = Test-BridgeHomeAssistantConnection -BaseUrl $fixtureUrl -Token 'synthetic-test-token'
+    $connection = Test-BridgeHomeAssistantConnection -BaseUrl $validFixtureUrl -Token 'synthetic-test-token'
     $connection.Ok -and $connection.MqttPublish -and $script:RestCalls -eq 3
 }
 Test-Blocked 'a REST stub never permits the installer WebSocket' {
@@ -108,10 +109,10 @@ Test-Blocked 'a REST stub in the parent never permits a checker child' {
     Invoke-BridgeFrontendCardCheck -HooksDir $hooksPath -ConfigPath 'not-a-config.json'
 }
 function Invoke-WebRequest {
-    param($Uri, $TimeoutSec, [switch]$SkipHttpErrorCheck, $ErrorAction)
+    param($Uri, $TimeoutSec, [switch]$SkipHttpErrorCheck, $MaximumRedirection, $ErrorAction)
     [pscustomobject]@{ StatusCode = 200; Content = '{"name":"Home Assistant"}' }
 }
-Test-That 'a WebRequest stub permits only its own manifest probe' { Test-IsHomeAssistant -BaseUrl $fixtureUrl }
+Test-That 'a WebRequest stub permits only its own manifest probe' { Test-IsHomeAssistant -BaseUrl $validFixtureUrl }
 Test-Blocked 'both HTTP stubs still do not authorize WebSockets' {
     Get-BridgeHomeAssistantUser -BaseUrl $fixtureUrl -Token 'synthetic-test-token'
 }
@@ -122,13 +123,13 @@ Remove-Item Function:\Invoke-RestMethod
 foreach ($removeAfter in 1, 2) {
     $script:RestCalls = 0
     function Invoke-RestMethod {
-        param([string]$Uri, $Headers, $TimeoutSec)
+        param([string]$Uri, $Headers, $TimeoutSec, $MaximumRedirection)
         $script:RestCalls++
         if ($script:RestCalls -eq $removeAfter) { Remove-Item Function:\Invoke-RestMethod }
         [pscustomobject]@{ message = 'API running.'; version = 'test'; location_name = 'fixture' }
     }
     Test-Blocked "losing the REST stub after request $removeAfter cannot become cosmetic success" {
-        Test-BridgeHomeAssistantConnection -BaseUrl $fixtureUrl -Token 'synthetic-test-token'
+        Test-BridgeHomeAssistantConnection -BaseUrl $validFixtureUrl -Token 'synthetic-test-token'
     }
 }
 Test-That 'the real REST cmdlet is restored before policy-only checks' {
