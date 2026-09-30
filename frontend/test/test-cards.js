@@ -17,6 +17,18 @@ function check(name, condition, detail) {
   console.log(`  FAIL  ${name}${detail ? ` - ${detail}` : ''}`);
 }
 
+// Dotted versions compare as numbers, not as text: '1.20.0' sorts before '1.9.0' as a
+// string, which would have read as the card having fallen behind the dashboard.
+function cmpVersion(a, b) {
+  const pa = String(a).split('.').map(Number);
+  const pb = String(b).split('.').map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i++) {
+    const d = (pa[i] || 0) - (pb[i] || 0);
+    if (d) { return d < 0 ? -1 : 1; }
+  }
+  return 0;
+}
+
 // --- the card itself, in a DOM small enough to run it (card-harness.js) --------
 
 const { FakeElement, loadCards } = require('./card-harness');
@@ -208,7 +220,13 @@ check('the element is registered under its own name',
   /customElements\.define\('agent-bridge-choices-card'/.test(source));
 check('and offered in the card picker',
   sandbox.window.customCards.some((c) => c.type === 'agent-bridge-choices-card'));
-check('the card version is the one the dashboard gates the card on', CARD_VERSION === '1.19.0', CARD_VERSION);
+// The generator gates its newest card shape on 1.19.0. The card may run ahead of that
+// - a fix needing no new config key still has to change the version, because that is
+// what the resource URL is keyed on and an unchanged one is never re-served - but it
+// must never fall behind it, and a fix takes the patch place so that the next minor
+// is still free for the shape the generator will gate on.
+check('the card is at least the version the dashboard gates the card on',
+  cmpVersion(CARD_VERSION, '1.19.0') >= 0, CARD_VERSION);
 check('"decision" is required', (() => {
   try { new AgentBridgeChoicesCard().setConfig({}); return false; } catch (e) { return /decision/.test(e.message); }
 })());
@@ -650,6 +668,104 @@ check('"machines" is required', (() => {
     oldEnv.calls.some((c) => c.domain === 'text' && c.service === 'set_value' && c.data.value === 'short one'),
     JSON.stringify(oldEnv.calls));
   check('and no MQTT publish is attempted', !oldEnv.calls.some((c) => c.domain === 'mqtt'));
+
+  // --- attaching an image, and being told when it could not be attached -----------
+  //
+  // An image is the one thing on this card that cannot go over the websocket. A reply
+  // is published through hass.callService, which rides the page's connection and
+  // stays authenticated for as long as the tab is open; an image has to be POSTed to
+  // /api/image/upload over plain HTTP, which does not. So when Home Assistant starts
+  // refusing HTTP - a lapsed sign-in, or an ip_bans entry matching whatever address a
+  // reverse proxy reports the browser as - replies carry on working and images stop,
+  // which is a hard thing to guess at from a status line reading "403 Forbidden".
+  // Worse, a refused token renewal rejects with the bare number 2 and read simply
+  // "Upload failed: 2".
+  console.log('');
+  console.log('--- attaching an image ---');
+
+  const replyLoad = require('./card-harness').loadCards();
+  const { AgentBridgeReplyCard } = replyLoad;
+  const PNG = { name: 'shot.png', type: 'image/png' };
+  const ERR_INVALID_AUTH = 2;
+
+  // `auth` is what Home Assistant hands a card; `over` decides what each route does.
+  function replyCard({ viaHass, direct, refresh }) {
+    const card = new AgentBridgeReplyCard();
+    card.setConfig({ topic: 'copilot/cli/session/abc/replypayload' });
+    const tried = [];
+    replyLoad.sandbox.fetch = async () => { tried.push('direct'); return direct(); };
+    card.hass = {
+      auth: {
+        accessToken: 'tok',
+        expired: false,
+        refreshAccessToken: async () => {
+          tried.push('refresh');
+          if (refresh) { return refresh(); }
+          return undefined;
+        },
+      },
+      fetchWithAuth: async () => { tried.push('hass'); return viaHass(); },
+      callService: async () => {},
+    };
+    return { card, tried, status: () => card._els.status.textContent };
+  }
+
+  const ok = () => ({ ok: true, status: 200, json: async () => ({ id: 'img1', name: 'shot.png', content_type: 'image/png' }) });
+  const refused = (status, statusText) => ({ ok: false, status, statusText, json: async () => ({}) });
+
+  // The failure that was actually reported: the tab's token was due for renewal,
+  // Home Assistant turned the renewal down, and the card gave up without ever trying
+  // the token it was already holding - which the live websocket proved was fine.
+  let r = replyCard({
+    viaHass: () => { throw ERR_INVALID_AUTH; },
+    direct: ok,
+  });
+  await r.card._ingest([PNG]);
+  check('a refused token renewal no longer abandons the upload',
+    r.tried.includes('direct'), r.tried.join(','));
+  check('so the image is attached anyway, on the token already in hand',
+    r.card._images.length === 1 && r.card._images[0].id === 'img1');
+  check('and nothing is reported as gone wrong', r.status() === '', r.status());
+
+  r = replyCard({ viaHass: () => refused(403, 'Forbidden'), direct: () => refused(403, 'Forbidden') });
+  await r.card._ingest([PNG]);
+  check('a blocked browser is told it was blocked, not shown a status line',
+    /refused this browser \(403\)/.test(r.status()) && !/Forbidden/.test(r.status()), r.status());
+  check('and told why replies still work when images do not',
+    /websocket/.test(r.status()), r.status());
+  check('nothing is attached when the upload was refused', r.card._images.length === 0);
+
+  r = replyCard({
+    viaHass: () => refused(401, 'Unauthorized'),
+    direct: () => refused(401, 'Unauthorized'),
+    refresh: () => { throw ERR_INVALID_AUTH; },
+  });
+  await r.card._ingest([PNG]);
+  check('a lapsed sign-in says to reload the page', /reload/.test(r.status()), r.status());
+  check('and a thrown ERR_INVALID_AUTH never surfaces as the bare number it is',
+    !/:\s*2$/.test(r.status()), r.status());
+  check('a refused renewal still lets the attempt finish rather than throwing',
+    r.tried.filter((t) => t === 'direct').length >= 1, r.tried.join(','));
+
+  r = replyCard({ viaHass: () => refused(413, 'Payload Too Large'), direct: () => refused(413, 'Payload Too Large') });
+  await r.card._ingest([PNG]);
+  check('an image Home Assistant will not take says so in words', /larger than/.test(r.status()), r.status());
+
+  r = replyCard({ viaHass: () => refused(500, 'Internal Server Error'), direct: () => refused(500, 'Internal Server Error') });
+  await r.card._ingest([PNG]);
+  check('and any other refusal still names what came back',
+    /500 Internal Server Error/.test(r.status()), r.status());
+
+  r = replyCard({ viaHass: ok, direct: ok });
+  await r.card._ingest([{ name: 'notes.txt', type: 'text/plain' }]);
+  check('something that is not an image is not uploaded at all',
+    r.tried.length === 0 && r.card._images.length === 0, r.tried.join(','));
+
+  check('the element is registered under its own name',
+    /customElements\.define\('agent-bridge-reply-card'/.test(source));
+  check('"topic" is required', (() => {
+    try { new AgentBridgeReplyCard().setConfig({}); return false; } catch (e) { return /topic/.test(e.message); }
+  })());
 
   console.log('');
   if (failures) {

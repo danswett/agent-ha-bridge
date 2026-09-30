@@ -16,7 +16,7 @@
  * daemon downloads them and attaches them to the prompt.
  */
 
-const CARD_VERSION = '1.19.0';
+const CARD_VERSION = '1.19.1';
 
 // The working line, in the style of Claude Code's own spinner: its glyph cycle, and a
 // word picked once per turn. Claude Code does not record which word it chose, so the
@@ -29,6 +29,48 @@ const SPINNER_VERBS = [
   'Mulling', 'Cogitating', 'Simmering', 'Ruminating', 'Tinkering', 'Churning', 'Musing',
   'Crafting', 'Forging', 'Marinating', 'Synthesizing', 'Deliberating', 'Puttering',
 ];
+
+/*
+ * What to say when Home Assistant turns an upload down.
+ *
+ * "403 Forbidden" is accurate and useless. Both refusals that happen in practice
+ * leave the rest of the card working, which is what makes them so baffling to hit:
+ * a reply is published over the page's websocket, which stays authenticated for as
+ * long as the tab is open, while an image has to go over HTTP to /api/image/upload,
+ * which does not. So replies kept sending and images stopped, and nothing on screen
+ * said why - the card reported the status line and left you to guess.
+ *
+ * A 403 is not about the token at all. An ip_bans entry answers every HTTP request
+ * that way, and behind a reverse proxy the banned address is the one the proxy
+ * reports - which can be a public address shared by everyone arriving over it, so
+ * the block need have nothing to do with this browser or this account.
+ */
+function describeUploadRefusal(status, statusText) {
+  if (status === 401) {
+    return "this page's sign-in has lapsed - reload Home Assistant and try again";
+  }
+  if (status === 403) {
+    return 'Home Assistant refused this browser (403). Replies still work because they go over the '
+      + 'websocket, which uploads cannot use. Check its IP bans for the address it sees this browser as';
+  }
+  if (status === 413) {
+    return 'that image is larger than Home Assistant will accept (413)';
+  }
+  return `Home Assistant returned ${status}${statusText ? ` ${statusText}` : ''}`;
+}
+
+/*
+ * A thrown value is not always an Error. home-assistant-js-websocket rejects with
+ * bare numbers, so a token renewal Home Assistant turned down arrived here as the
+ * number 2 and reached the status line as "Upload failed: 2", which told nobody
+ * anything whatsoever.
+ */
+function describeThrown(err) {
+  if (err && err.message) { return err.message; }
+  if (err === 1 || err === 3) { return 'lost contact with Home Assistant - try again'; }
+  if (err === 2) { return "Home Assistant would not renew this page's sign-in - reload it and try again"; }
+  return String(err);
+}
 
 class AgentBridgeReplyCard extends HTMLElement {
   constructor() {
@@ -228,7 +270,7 @@ class AgentBridgeReplyCard extends HTMLElement {
         this._renderChips();
         this._setStatus('', '');
       } catch (err) {
-        this._setStatus(`Upload failed: ${err.message || err}`, 'err');
+        this._setStatus(`Upload failed: ${describeThrown(err)}`, 'err');
       }
     }
     this._busy = false;
@@ -241,7 +283,7 @@ class AgentBridgeReplyCard extends HTMLElement {
 
     const resp = await this._authFetch('/api/image/upload', { method: 'POST', body: form });
     if (!resp.ok) {
-      throw new Error(`${resp.status} ${resp.statusText}`);
+      throw new Error(describeUploadRefusal(resp.status, resp.statusText));
     }
     const body = await resp.json();
     if (!body || !body.id) { throw new Error('no image id returned'); }
@@ -264,25 +306,50 @@ class AgentBridgeReplyCard extends HTMLElement {
   // something asks - so reading hass.auth's token directly sent an expired one and
   // got a 401. hass.fetchWithAuth refreshes first; without it, refresh when expired,
   // and once more on a 401.
+  //
+  // No step here may end the attempt. fetchWithAuth renews the token before it sends,
+  // and a renewal Home Assistant turns down rejects with ERR_INVALID_AUTH - the bare
+  // number 2, not an Error - so an upload was abandoned before the token already in
+  // hand had been tried even once. That token is usually still good: the page's
+  // websocket is authenticated and streaming, which is exactly why replies went on
+  // working while images stopped.
   async _authFetch(path, init = {}) {
     const hass = this._hass;
-    if (hass && typeof hass.fetchWithAuth === 'function') {
-      const resp = await hass.fetchWithAuth(path, init);
-      if (resp.status !== 401) { return resp; }
-    }
     const auth = hass && hass.auth;
+    if (hass && typeof hass.fetchWithAuth === 'function') {
+      try {
+        const resp = await hass.fetchWithAuth(path, init);
+        if (resp.status !== 401 || !auth) { return resp; }
+      }
+      catch (err) {
+        // Nothing left to fall back to, so the caller should see what went wrong.
+        if (!auth) { throw err; }
+      }
+    }
     if (!auth) { throw new Error('no access token'); }
     const send = () => fetch(path, {
       ...init,
       headers: { ...(init.headers || {}), authorization: `Bearer ${this._accessToken()}` },
     });
-    if (auth.expired && typeof auth.refreshAccessToken === 'function') { await auth.refreshAccessToken(); }
+    if (auth.expired) { await this._refreshed(auth); }
     let resp = await send();
-    if (resp.status === 401 && typeof auth.refreshAccessToken === 'function') {
-      await auth.refreshAccessToken();
+    if (resp.status === 401 && await this._refreshed(auth)) {
       resp = await send();
     }
     return resp;
+  }
+
+  // Whether the token was renewed. Best effort by design: the answer decides only
+  // whether sending again is worth it, never whether to give up on what was asked.
+  async _refreshed(auth) {
+    if (!auth || typeof auth.refreshAccessToken !== 'function') { return false; }
+    try {
+      await auth.refreshAccessToken();
+      return true;
+    }
+    catch {
+      return false;
+    }
   }
 
   _renderChips() {
