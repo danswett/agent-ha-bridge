@@ -1260,6 +1260,33 @@ function Get-CopilotMqttMachineTopic {
     )
 }
 
+function Get-BridgeMachineForgetTopic {
+    <#
+        Every retained topic that has to be cleared to take one machine off the
+        dashboard: its own controls, and the sessions its retained sensor still lists.
+
+        A machine that was renamed - or reimaged, or thrown away - never comes back to
+        withdraw its own entities, so removing it cannot be something only its own
+        daemon can do. The X on the machine row publishes this list straight from the
+        browser, which is why it is built here from the same two lists an uninstall
+        walks rather than restated in the card: a topic missing from one of them leaves
+        an entity behind with nothing left to remove it.
+    #>
+    param(
+        [string]$Slug,
+        [AllowEmptyCollection()][AllowNull()][string[]]$SessionNodes = @()
+    )
+
+    $topics = [System.Collections.Generic.List[string]]::new()
+    foreach ($topic in (Get-CopilotMqttMachineTopic -Slug $Slug)) { $topics.Add($topic) }
+    foreach ($node in @($SessionNodes)) {
+        if ([string]::IsNullOrWhiteSpace($node)) { continue }
+        foreach ($topic in (Get-CopilotMqttSessionDiscoveryTopic -Node $node)) { $topics.Add($topic) }
+        foreach ($topic in (Get-CopilotMqttSessionStateTopic -Node $node)) { $topics.Add($topic) }
+    }
+    $topics.ToArray()
+}
+
 function Get-CopilotMqttLegacyMachineTopic {
     <#
         The retained topics from before entities were scoped to a machine.

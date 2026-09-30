@@ -657,6 +657,19 @@ sessions**, because knowing a machine exists but is currently off is exactly wha
 want when a session you expected is not there — but it gets no launch card, no install
 button, and its sessions are hidden, since none of them can be running.
 
+A machine that is *gone* — renamed, reimaged, retired — is a different thing, and it
+never comes back to withdraw what it published, so its row would read "offline" for
+good. Open **Agent sessions** and an offline row carries an **✕** where its **Detail**
+switch sits: one press asks, a second removes. That clears the machine's retained
+topics along with those of the sessions it was last listed as running, so Home
+Assistant drops its entities, its device and its rows, and the dashboard is rebuilt
+without it. Nothing belonging to any other machine is touched, and its Detailed
+activity switch — a helper rather than a retained topic — is swept up a reconcile later
+by whichever machine notices it has no machine left.
+
+Pressing it on a machine that is only switched off costs nothing lasting: it
+republishes everything when it next starts, and the row comes back.
+
 No machine talks to another. Each publishes a retained sensor describing what it is
 running, and every daemon reads all of them, so the picture is complete whichever
 machine happens to rebuild the dashboard.

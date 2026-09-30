@@ -147,6 +147,37 @@ Test-That 'a machine running a working copy is marked for the card to say so' {
     $card = @($script:SavedConfig.views[0].cards | Where-Object { $_['type'] -eq 'custom:agent-bridge-status-card' })[0]
     [bool]@($card['machines'])[0]['dev']
 }
+Test-That 'a card that predates the X is given no topics to clear with it' {
+    # An older card drops config keys it does not know without a word, so the rows
+    # would look fine while the X was never there to press.
+    -not @($status['machines'])[1].Contains('forget')
+}
+
+Write-Host '--- from card 1.20.0 a machine that is gone can be removed from the row ---'
+# A machine that was renamed or reimaged never publishes under its old name again, so
+# nothing it left behind would ever be withdrawn and its row read "offline" for good.
+$forgetful = @(
+    [pscustomobject]@{ Slug = 'dswett_home'; Machine = 'DSWETT-HOME'; Online = $true; IncludeProfile = $false; IncludeResume = $true; IncludeAgent = $true; IncludeDetailed = $true
+        SessionNodes = @('agent_bridge_abcdef0123456789') }
+    [pscustomobject]@{ Slug = 'old_name'; Machine = 'OLD-NAME'; Online = $false; IncludeProfile = $false; IncludeResume = $false; IncludeAgent = $false; IncludeDetailed = $false }
+)
+Save-CopilotSessionDashboard -Sessions $sessions -Machines $forgetful -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.20.0'
+$forgetStatus = @($script:SavedConfig.views[0].cards | Where-Object { $_['type'] -eq 'custom:agent-bridge-status-card' })[0]
+Test-That 'every machine is handed the topics that removing it would clear' {
+    @($forgetStatus['machines'] | Where-Object { @($_['forget']).Count -gt 0 }).Count -eq 2
+}
+Test-That 'they are that machine own controls, and nobody else' {
+    $topics = @(@($forgetStatus['machines'])[1]['forget'])
+    ($topics -contains 'homeassistant/sensor/agent_bridge_old_name/sessions/config') -and
+    ($topics -contains 'homeassistant/binary_sensor/agent_bridge_old_name/online/config') -and
+    @($topics | Where-Object { $_ -match 'dswett_home' }).Count -eq 0
+}
+Test-That 'a machine running sessions has those cleared with it' {
+    # Its session entities are retained too, and with the machine gone nothing else
+    # would ever come back for them.
+    $topics = @(@($forgetStatus['machines'])[0]['forget'])
+    @($topics | Where-Object { $_ -match 'agent_bridge_abcdef0123456789' }).Count -ge 2
+}
 
 Write-Host '--- an older served card keeps the pair it knows how to draw ---'
 Save-CopilotSessionDashboard -Sessions $sessions -Machines $twoMachines -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.18.0'

@@ -16,7 +16,7 @@
  * daemon downloads them and attaches them to the prompt.
  */
 
-const CARD_VERSION = '1.19.1';
+const CARD_VERSION = '1.20.0';
 
 // The working line, in the style of Claude Code's own spinner: its glyph cycle, and a
 // word picked once per turn. Claude Code does not record which word it chose, so the
@@ -1425,7 +1425,8 @@ class AgentBridgeLaunchCard extends HTMLElement {
  * It replaces a markdown summary card plus a separate Machines card - two cards that
  * between them took a third of a phone screen to say "three sessions, nothing
  * waiting". Folded it is one line of each; opened it is a row per machine, with that
- * machine's Detailed activity switch beside the name it belongs to.
+ * machine's Detailed activity switch beside the name it belongs to - or, when the
+ * machine is not running, an X that removes it from the dashboard for good.
  *
  * The counts are worked out here rather than by a Jinja template, so they follow
  * state as it arrives. A template is re-rendered by Home Assistant too, but its
@@ -1438,6 +1439,10 @@ const STATUS_QUIET = ['Idle', 'unavailable', 'unknown', ''];
 // Without it the next render - which can arrive before Home Assistant has changed
 // the state - snaps the switch back, and it visibly bounces.
 const STATUS_TOGGLE_GRACE = 5000;
+// How long the X on an offline machine stays armed after the first tap. Removing a
+// machine is not undoable from the dashboard, and the X sits where a Detail switch
+// sits on every other row, so it asks once before doing anything.
+const STATUS_FORGET_CONFIRM = 6000;
 
 class AgentBridgeStatusCard extends HTMLElement {
   constructor() {
@@ -1488,6 +1493,17 @@ class AgentBridgeStatusCard extends HTMLElement {
         .name { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .meta { font-size: 0.85em; color: var(--secondary-text-color); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
         .detail { display: flex; align-items: center; gap: 6px; flex: none; font-size: 0.85em; color: var(--secondary-text-color); }
+        /* The X sits exactly where the Detail switch does, because an offline machine
+           has nothing to switch and a machine that is gone has to be removable. */
+        .forget { flex: none; display: flex; align-items: center; }
+        .forget button {
+          display: inline-flex; align-items: center; gap: 4px; cursor: pointer;
+          font: inherit; font-size: 0.85em; padding: 3px 8px; border-radius: 14px;
+          background: none; border: 1px solid transparent; color: var(--secondary-text-color);
+        }
+        .forget button:hover { color: var(--error-color, #f44336); }
+        .forget button.confirm { color: var(--error-color, #f44336); border-color: var(--error-color, #f44336); }
+        .forget ha-icon { --mdc-icon-size: 20px; }
         [hidden] { display: none !important; }
       </style>
       <ha-card>
@@ -1537,7 +1553,7 @@ class AgentBridgeStatusCard extends HTMLElement {
       who.appendChild(meta);
       row.appendChild(dot);
       row.appendChild(who);
-      const entry = { machine, row, meta, toggle: null, pendingAt: 0, pendingFrom: '' };
+      const entry = { machine, row, meta, toggle: null, detail: null, forget: null, pendingAt: 0, pendingFrom: '' };
       // A machine running a bridge from before the switch existed reports no entity
       // for it and gets no switch - drawing one anyway would point at nothing.
       if (machine.detailed) {
@@ -1551,6 +1567,30 @@ class AgentBridgeStatusCard extends HTMLElement {
         box.appendChild(toggle);
         row.appendChild(box);
         entry.toggle = toggle;
+        entry.detail = box;
+      }
+      // And the X, for when that machine is not running. It is given the topics to
+      // clear rather than the machine's name, so the card never has to know how the
+      // bridge names anything: the dashboard that drew this row worked them out from
+      // the same lists an uninstall walks.
+      if (Array.isArray(machine.forget) && machine.forget.length) {
+        const box = document.createElement('div');
+        box.className = 'forget';
+        const button = document.createElement('button');
+        const icon = document.createElement('ha-icon');
+        icon.setAttribute('icon', 'mdi:close');
+        button.appendChild(icon);
+        button.setAttribute('title', `Remove ${machine.machine || 'this machine'} from the dashboard`);
+        button.setAttribute('aria-label', `Remove ${machine.machine || 'this machine'} from the dashboard`);
+        button.addEventListener('click', () => this._forget(entry));
+        box.appendChild(button);
+        box.hidden = true;
+        row.appendChild(box);
+        entry.forget = box;
+        entry.forgetButton = button;
+        entry.forgetIcon = icon;
+        entry.forgetArmedAt = 0;
+        entry.forgetBusy = false;
       }
       host.appendChild(row);
       return entry;
@@ -1597,6 +1637,66 @@ class AgentBridgeStatusCard extends HTMLElement {
     this._hass.callService(entityId.split('.')[0], 'toggle', { entity_id: entityId });
   }
 
+  // The X's label: the icon when it is idle, a word while it is armed or working.
+  // Assigning textContent drops the icon, which is exactly what a browser does too,
+  // so it is put back rather than hidden.
+  _setForgetLabel(entry, text) {
+    const button = entry.forgetButton;
+    if (!button) { return; }
+    button.textContent = text || '';
+    if (!text) { button.appendChild(entry.forgetIcon); }
+    button.classList.toggle('confirm', !!text);
+  }
+
+  _resetForget(entry) {
+    if (!entry.forget || entry.forgetBusy) { return; }
+    entry.forgetArmedAt = 0;
+    this._setForgetLabel(entry, '');
+  }
+
+  /*
+   * First tap arms, second removes. There is no undo from here: the machine's
+   * retained topics are cleared, which is what makes Home Assistant drop its
+   * entities. A machine that is merely switched off republishes all of it when it
+   * comes back, so the cost of a mistake is a row that returns - but a machine that
+   * has been renamed or reimaged never does, and that is what this is for.
+   */
+  _forget(entry) {
+    if (!entry.forget || entry.forgetBusy || !this._hass) { return undefined; }
+    const armed = entry.forgetArmedAt && Date.now() - entry.forgetArmedAt < STATUS_FORGET_CONFIRM;
+    if (!armed) {
+      entry.forgetArmedAt = Date.now();
+      this._setForgetLabel(entry, 'Remove?');
+      setTimeout(() => this._resetForget(entry), STATUS_FORGET_CONFIRM);
+      return undefined;
+    }
+    entry.forgetArmedAt = 0;
+    // Returned so a caller that needs the publishes finished - the tests - can wait
+    // for them. A click handler simply ignores it.
+    return this._publishForget(entry);
+  }
+
+  async _publishForget(entry) {
+    entry.forgetBusy = true;
+    this._setForgetLabel(entry, 'Removing...');
+    try {
+      // An empty retained payload is how a retained topic is withdrawn, and how the
+      // bridge itself clears every one of these on uninstall.
+      for (const topic of entry.machine.forget) {
+        await this._hass.callService('mqtt', 'publish', { topic, payload: '', retain: true, qos: 1 });
+      }
+      // The daemon rebuilds the dashboard within a reconcile and the row goes with
+      // it; hiding it now is so the tap has an answer before then.
+      entry.row.hidden = true;
+      entry.forgetBusy = false;
+      this._setForgetLabel(entry, '');
+    }
+    catch (e) {
+      entry.forgetBusy = false;
+      this._setForgetLabel(entry, 'Failed');
+    }
+  }
+
   _render() {
     if (!this._els || !this._hass || !this._config) { return; }
     this._els.card.classList.toggle('open', this._open);
@@ -1637,6 +1737,18 @@ class AgentBridgeStatusCard extends HTMLElement {
         }
         entry.toggle.disabled = value !== 'on' && value !== 'off';
       }
+
+      // An offline machine is shown the X instead of its Detail switch. The switch is
+      // a Home Assistant helper, so it can still be set for when the machine comes
+      // back - but the row it sits on is one line on a phone, and what you want from
+      // a machine that is not running is the ability to say it is not coming back.
+      // A row with no X keeps its switch, which is every dashboard drawn by a bridge
+      // older than this.
+      if (entry.forget) {
+        entry.forget.hidden = online;
+        if (online) { this._resetForget(entry); }
+      }
+      if (entry.detail) { entry.detail.hidden = !online && !!entry.forget; }
     }
 
     const pending = (this._config.decisions || [])
@@ -1685,7 +1797,7 @@ window.customCards.push({
 window.customCards.push({
   type: 'agent-bridge-status-card',
   name: 'Agent Bridge Status',
-  description: 'Live and pending counts, folding open to a row per machine with its Detail switch.',
+  description: 'Live and pending counts, folding open to a row per machine with its Detail switch, or an X when it is offline.',
 });
 window.customCards.push({
   type: 'agent-bridge-choices-card',

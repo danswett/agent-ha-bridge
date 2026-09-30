@@ -3,17 +3,18 @@
  * wiring test in tests/test-status-card.ps1.
  *
  * Reads a job on stdin:
- *   { config, states, open, flips: [<machine name>, ...] }
+ *   { config, states, open, flips: [<machine name>, ...], forgets: [<machine name>, ...] }
  * where `config` is the card config Save-CopilotSessionDashboard generated and
  * `states` are the entity states the bridge's own publishers produce. Each flip is
- * the name of the machine whose Detail switch to move, in order.
+ * the name of the machine whose Detail switch to move, in order; each forget is a
+ * machine whose X to press twice - once to arm it, once to remove it.
  *
  * Writes on stdout:
  *   { summary, waiting, hidden, size, rows: [...], calls: [...], missing: [...] }
  *
- * Nothing here knows which entity a row should read or a switch should set - that is
- * exactly what is under test. The card decides, and the caller checks the answer
- * against what the daemon publishes.
+ * Nothing here knows which entity a row should read, which switch should set it, or
+ * which topics a removal should clear - that is exactly what is under test. The card
+ * decides, and the caller checks the answer against what the daemon publishes.
  */
 'use strict';
 
@@ -22,7 +23,7 @@ const { loadCards } = require('./card-harness');
 let raw = '';
 process.stdin.setEncoding('utf8');
 process.stdin.on('data', (chunk) => { raw += chunk; });
-process.stdin.on('end', () => {
+process.stdin.on('end', async () => {
   const job = JSON.parse(raw);
   const { AgentBridgeStatusCard } = loadCards();
 
@@ -53,11 +54,22 @@ process.stdin.on('end', () => {
     entry.toggle.dispatch('change');
   }
 
+  for (const name of (job.forgets || [])) {
+    const entry = card._rows.find((r) => r.machine.machine === name);
+    if (!entry || !entry.forget) { missing.push(name); continue; }
+    // Two taps, because one only asks.
+    entry.forgetButton.click();
+    await card._forget(entry);
+  }
+
   const rows = card._rows.map((entry) => ({
     machine: entry.machine.machine,
     meta: entry.meta.textContent,
     online: entry.row.classList.contains('online'),
+    gone: !!entry.row.hidden,
     toggle: entry.toggle ? { checked: !!entry.toggle.checked, disabled: !!entry.toggle.disabled } : null,
+    detail: entry.detail ? { hidden: !!entry.detail.hidden } : null,
+    forget: entry.forget ? { hidden: !!entry.forget.hidden } : null,
   }));
 
   process.stdout.write(JSON.stringify({

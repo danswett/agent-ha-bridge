@@ -1148,6 +1148,14 @@ function Save-CopilotSessionDashboard {
     # waiting", and the switches sat in a list you had to match up to names by eye.
     $statusCard = $null
     if (Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.19.0') {
+        # From card 1.20.0 an offline machine's row carries an X, and pressing it
+        # clears these topics from the browser. A machine that was renamed or reimaged
+        # never comes back to withdraw its own entities, so its row would otherwise sit
+        # there as "offline" for good. Sent as the topics themselves rather than
+        # anything the card works out for itself: the two lists they come from are the
+        # ones an uninstall walks, and a rule restated in JavaScript is a rule that
+        # drifts.
+        $canForget = Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.20.0'
         $statusCard = [ordered]@{
             type      = 'custom:agent-bridge-status-card'
             title     = 'Agent sessions'
@@ -1166,6 +1174,11 @@ function Save-CopilotSessionDashboard {
                     $entry.detailed = Get-BridgeMachineEntityId -Domain 'input_boolean' -Key 'detailed_activity' -Slug $_.Slug
                 }
                 if ($_.PSObject.Properties['IsDev'] -and $_.IsDev) { $entry.dev = $true }
+                if ($canForget) {
+                    $nodes = @()
+                    if ($_.PSObject.Properties['SessionNodes']) { $nodes = @($_.SessionNodes) }
+                    $entry.forget = @(Get-BridgeMachineForgetTopic -Slug $_.Slug -SessionNodes $nodes)
+                }
                 $entry
             })
         }
