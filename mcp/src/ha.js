@@ -59,6 +59,18 @@ export class HomeAssistant {
   }
 
   /**
+   * Every state in one read.
+   *
+   * Finding the bridge's own entities means matching entity ids, and asking for them
+   * one at a time costs a round trip each - about 100 ms apiece on a machine reaching
+   * Home Assistant through a tunnel, times dozens of entities on a fleet.
+   */
+  async getStates() {
+    const states = await this.#request('/api/states');
+    return Array.isArray(states) ? states : [];
+  }
+
+  /**
    * Publishes a retained MQTT message through Home Assistant itself.
    *
    * This is why the bridge needs no broker credentials and no MQTT client: Home
