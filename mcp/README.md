@@ -97,7 +97,7 @@ sessions — the ones on your dashboard, on this machine and every other one:
 | `reply_to_agent_session` | Sends a message to a session, any length |
 | `launch_agent_session` | Starts a session on a machine, optionally with an opening prompt |
 
-They exist because doing this by hand has two failure modes that are completely
+They exist because doing this by hand has three failure modes that are completely
 silent:
 
 - **The wrong token.** Both yours and the agent's authenticate and both are
@@ -110,9 +110,28 @@ silent:
 - **Waiting on a notification.** Home Assistant does not expose persistent
   notifications through `GET /api/states`, so asking a session to answer with one and
   then polling finds nothing however long you wait — which looks exactly like the
-  session having died. `read_agent_session` reads the activity sensor instead, and
-  reports `done` only once a response is actually there (a session reads `idle`
-  briefly *before* it starts working, as well as when a turn ends).
+  session having died. `read_agent_session` reads the activity sensor instead.
+- **Reading the last answer as this one.** A session keeps the previous turn's
+  `response` while the next turn starts, and reads `idle` briefly before it begins
+  work, so a poll straight after replying would otherwise return the old answer marked
+  finished. `reply_to_agent_session` returns a `since` stamp; pass it to
+  `read_agent_session` and `done` only becomes true once the activity has moved on.
+
+### Why a reply takes one path or the other
+
+Sending a reply through both the text entity and the payload topic delivers it
+**twice**: the daemon takes the payload, skips the rest of that pass without consuming
+the Submit press, and the next pass then finds a fresh press beside a populated text
+box. So exactly one path is used, and which one is not a free choice:
+
+| | Carries an account | Length |
+|---|---|---|
+| Text box + Submit | **yes** — the press is a service call, so Home Assistant records who made it | 255 characters |
+| Payload topic | no — it arrives over MQTT, and an MQTT-published state has no context at all | unlimited |
+
+A reply that fits is therefore sent the attributed way; a longer one is sent whole and
+unmarked rather than silently truncated. `reply_to_agent_session` returns `attributed`
+so the caller knows which happened.
 
 ## Remote clients (HTTP transport)
 
