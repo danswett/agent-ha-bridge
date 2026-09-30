@@ -19,11 +19,35 @@
  * of truth and the tests pin the ones that matter.
  */
 
+import { createHash } from 'node:crypto';
+
 const SESSION_ACTIVITY = /^sensor\.agent_bridge_([0-9a-f]{16})_activity$/;
 const MACHINE_ONLINE = /^binary_sensor\.agent_bridge_(.+)_online$/;
 
 /** Home Assistant caps a state at 255 characters; longer text rides in an attribute. */
 const STATE_MAX_CHARS = 255;
+
+/**
+ * A marker for "the turn the card is showing now".
+ *
+ * Most activity carries an `updated` stamp, but Codex's does not: it publishes its own
+ * card rather than going through the shared path, and Set-CopilotMqttActivity sends the
+ * detail exactly as it is given. Keying only on `updated` therefore produced an empty
+ * marker for every Codex session, which compares as "changed" immediately and brings
+ * back the stale-answer bug this exists to prevent.
+ *
+ * So the response itself is the fallback, hashed rather than carried: it can run to
+ * thousands of characters and this value is passed back and forth through the tool
+ * call. Two consecutive turns answering with byte-identical text would look unchanged,
+ * which is worth it against always being wrong on one of the three agents.
+ */
+function turnMarker(activity) {
+  const updated = String(activity?.attributes?.updated ?? '');
+  if (updated) return updated;
+  const response = String(activity?.attributes?.response ?? '');
+  if (!response) return '';
+  return `r:${createHash('sha1').update(response).digest('hex').slice(0, 16)}`;
+}
 
 export function sessionNode(sessionId) {
   return `agent_bridge_${sessionId}`;
@@ -129,7 +153,7 @@ export async function readSession(ha, sessionId, { since = '' } = {}) {
   const response = String(attr(activity, 'response') ?? '');
   const state = String(status?.state ?? 'unknown');
   const updated = String(attr(activity, 'updated') ?? '');
-  const moved = !since || updated !== since;
+  const moved = !since || turnMarker(activity) !== since;
   return {
     sessionId,
     machine: attr(activity, 'machine') ?? '',
@@ -139,6 +163,7 @@ export async function readSession(ha, sessionId, { since = '' } = {}) {
     activity: activity.state ?? '',
     response,
     updated,
+    marker: turnMarker(activity),
     done: state === 'idle' && response.trim().length > 0 && moved,
   };
 }
@@ -172,9 +197,12 @@ export async function replyToSession(ha, sessionId, text) {
   if (!activity) throw new Error(`No session ${sessionId} in Home Assistant.`);
   // Captured before sending, so read_agent_session can tell the next answer from this
   // turn's leftover one.
-  const since = String(attr(activity, 'updated') ?? '');
+  const since = turnMarker(activity);
 
-  if (body.length <= STATE_MAX_CHARS) {
+  // Code points, not UTF-16 units. Home Assistant counts characters, so measuring with
+  // .length sends anything with emoji or other non-BMP characters down the unattributed
+  // path early - 128 emoji would be enough - and quietly loses the agent's mark on it.
+  if ([...body].length <= STATE_MAX_CHARS) {
     await ha.callService('text', 'set_value', { entity_id: ids.reply, value: body });
     await ha.callService('button', 'press', { entity_id: ids.submit });
     return { sessionId, sent: body.length, attributed: true, since };

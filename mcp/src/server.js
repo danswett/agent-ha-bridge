@@ -225,7 +225,8 @@ async function main() {
               type: 'string',
               description:
                 'The since value from reply_to_agent_session, so an answer only counts once ' +
-                'the activity has moved on from the turn you started.',
+                'the activity has moved on from the turn you started. A previous read\'s ' +
+                'marker field works too.',
             },
           },
           required: ['session_id'],
