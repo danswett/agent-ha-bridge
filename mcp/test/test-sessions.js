@@ -171,6 +171,55 @@ console.log('\n--- replying, by one path only ---');
   check('an empty reply is refused rather than sent', empty.length > 0);
 }
 
+console.log('\n--- a session whose card carries no update stamp ---');
+{
+  // Codex publishes its own card and Set-CopilotMqttActivity sends the detail as
+  // given, so there is no `updated` at all. Keying only on that produced an empty
+  // marker, which compares as changed straight away and reports the previous answer
+  // as this turn's - the exact bug the stamp exists to prevent.
+  const codex = [
+    {
+      entity_id: `sensor.agent_bridge_${SESSION}_activity`,
+      state: 'Working',
+      attributes: { machine: 'DEV', session: 'Codex: x', driver: 'agent', response: 'the old answer' },
+    },
+    { entity_id: `sensor.agent_bridge_${SESSION}_status`, state: 'idle', attributes: {} },
+  ];
+  const ha = stubHa(codex);
+  const sent = await replyToSession(ha, SESSION, 'go again');
+  check('a reply still gets a marker to poll against', sent.since.length > 0, `since='${sent.since}'`);
+
+  const stale = await readSession(stubHa(codex), SESSION, { since: sent.since });
+  check(
+    "the previous answer is not reported as this turn's",
+    stale.done === false,
+    'no updated attribute, so the response itself is the marker',
+  );
+
+  const answered = structuredClone(codex);
+  answered[0].attributes.response = 'a brand new answer';
+  const fresh = await readSession(stubHa(answered), SESSION, { since: sent.since });
+  check('and a genuinely new answer is', fresh.done === true);
+}
+
+console.log('\n--- measuring a reply the way Home Assistant does ---');
+{
+  // .length counts UTF-16 units, so 128 emoji would read as 256 and be pushed down the
+  // unattributed path despite fitting Home Assistant's 255 characters.
+  const emoji = '\u{1F600}'.repeat(200);
+  check('the test string really is non-BMP', emoji.length === 400 && [...emoji].length === 200);
+  const ha = stubHa(states);
+  const result = await replyToSession(ha, SESSION, emoji);
+  check('200 emoji still go the attributed way', result.attributed === true);
+  check('and through the text box, whole', ha.calls.find((c) => c.domain === 'text')?.data?.value === emoji);
+  check('with nothing published', ha.published.length === 0);
+
+  const tooMany = '\u{1F600}'.repeat(300);
+  const ha2 = stubHa(states);
+  const big = await replyToSession(ha2, SESSION, tooMany);
+  check('but 300 really is too many', big.attributed === false && ha2.published.length === 1);
+}
+
 console.log('\n--- launching ---');
 {
   const ha = stubHa(states);
