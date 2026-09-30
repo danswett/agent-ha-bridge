@@ -328,6 +328,7 @@ $realConfigBefore = if (Test-Path -LiteralPath $realConfig) {
     (Get-FileHash -LiteralPath $realConfig -Algorithm SHA256).Hash
 } else { 'absent' }
 $sandboxArpKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\AgentHaBridge_Sandbox_$suiteRegistryId"
+$desktopOverrideBefore = $env:BRIDGE_CLAUDE_DESKTOP_CONFIG
 
 try {
     $log = & pwsh -NoProfile -File (Join-Path $repoRoot 'install.ps1') `
@@ -353,6 +354,11 @@ try {
         $written = Get-Content -LiteralPath (Join-Path $sandboxHome 'config.json') -Raw | ConvertFrom-Json
         (@($written.clients) -join ',') -eq 'copilot'
     }
+    Test-That 'the new bridge root and its credential config are owner-only' {
+        (Test-BridgeSecretFileProtected -Path $sandboxHome) -and
+            (Test-BridgeSecretFileProtected -Path (Join-Path $sandboxHome 'config.json'))
+    }
+    Test-That 'the install log does not echo a supplied token' { $logText -notmatch 'sandbox-token' }
     Test-That 'the Copilot hook definition is written inside the sandbox' {
         Test-Path -LiteralPath (Join-Path $sandbox '.copilot\hooks\decision-notifier.json')
     }
@@ -410,11 +416,40 @@ try {
     Test-That 'version matches the VERSION file' { ($status -join '') -match [regex]::Escape($expected) }
 
     Write-Host '--- uninstalling the sandbox ---'
+    $desktopFixture = Join-Path $sandbox 'desktop-fixture.json'
+    $env:BRIDGE_CLAUDE_DESKTOP_CONFIG = $desktopFixture
+    $ownedMcpDir = Join-Path $sandboxHome 'mcp'
+    [void][IO.Directory]::CreateDirectory($ownedMcpDir)
+    Set-Content -LiteralPath (Join-Path $ownedMcpDir 'mcp-client-config.json') -Value '{"token":"synthetic-owned-secret"}'
+    $desktopConfig = @{
+        mcpServers = @{
+            'home-assistant-bridge' = @{
+                command = 'node'; args = @((Join-Path $ownedMcpDir 'src\server.js'))
+                env = @{ HA_TOKEN = 'synthetic-owned-secret'; HA_AGENT_TOKEN = 'synthetic-agent-secret' }
+            }
+            other = @{ command = 'unrelated-client' }
+        }
+        theme = 'current'
+    }
+    $desktopConfig | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath $desktopFixture -Encoding utf8
+    $desktopConfig.theme = 'backup'
+    $desktopConfig | ConvertTo-Json -Depth 10 | Set-Content -LiteralPath "$desktopFixture.bak" -Encoding utf8
     $uninstallLog = & pwsh -NoProfile -File (Join-Path $repoRoot 'uninstall.ps1') `
         -TargetHome $sandbox -TestRegistryId $suiteRegistryId 2>&1
     Test-That 'the sandbox uninstall succeeds' { $LASTEXITCODE -eq 0 }
     Test-That 'it leaves PATH alone for a sandbox' { ($uninstallLog -join "`n") -match 'Leaving PATH alone' }
     Test-That 'the sandbox bridge root is gone' { -not (Test-Path -LiteralPath $sandboxHome) }
+    Test-That 'main uninstall removes its Desktop credential entries and backup residue only' {
+        $current = Get-Content -LiteralPath $desktopFixture -Raw | ConvertFrom-Json -AsHashtable
+        $backup = Get-Content -LiteralPath "$desktopFixture.bak" -Raw | ConvertFrom-Json -AsHashtable
+        $current.mcpServers.other.command -eq 'unrelated-client' -and $current.theme -eq 'current' -and
+            $backup.mcpServers.other.command -eq 'unrelated-client' -and $backup.theme -eq 'backup' -and
+            (Get-Content -LiteralPath $desktopFixture, "$desktopFixture.bak" -Raw) -join '' -notmatch 'synthetic-owned|synthetic-agent|home-assistant-bridge'
+    }
+    Test-That 'uninstall leaves the preserved Desktop files protected' {
+        (Test-BridgeSecretFileProtected -Path $desktopFixture) -and
+            (Test-BridgeSecretFileProtected -Path "$desktopFixture.bak")
+    }
     Test-That 'the user PATH is still untouched after uninstalling' { (Get-BridgeUserPath) -eq $pathBefore }
     Test-That "the real install's config is still untouched" {
         $after = if (Test-Path -LiteralPath $realConfig) {
@@ -424,6 +459,7 @@ try {
     }
 }
 finally {
+    $env:BRIDGE_CLAUDE_DESKTOP_CONFIG = $desktopOverrideBefore
     Remove-Item -LiteralPath $sandbox -Recurse -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $sandboxArpKey -Recurse -Force -ErrorAction SilentlyContinue
 }
@@ -443,9 +479,9 @@ try {
         updates       = @{ repository = 'danswett/copilot-ha-bridge'; installedVersion = '1.2.0'; checkForUpdates = $true }
     } | ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $legacyBridge 'config.json') -Encoding UTF8
 
-    $null = & pwsh -NoProfile -File (Join-Path $repoRoot 'install.ps1') `
-        -TargetHome $legacy -TestRegistryId $suiteRegistryId -SkipTask -SkipPath -SkipDependencies -SkipVerify -NonInteractive `
-        -HomeAssistantUrl 'http://127.0.0.1:1' 2>&1
+    $upgradeLog = & pwsh -NoProfile -File (Join-Path $repoRoot 'install.ps1') `
+        -TargetHome $legacy -TestRegistryId $suiteRegistryId -SkipTask -SkipPath -SkipDependencies -SkipVerify -NonInteractive 2>&1
+    $upgradeExit = $LASTEXITCODE
     $after = Get-Content -LiteralPath (Join-Path $legacyBridge 'config.json') -Raw | ConvertFrom-Json
 
     Test-That 'the update repository is corrected' {
@@ -453,9 +489,37 @@ try {
     }
     Test-That 'the dashboard slug is corrected' { $after.dashboard.urlPath -eq 'agent-decisions' }
     Test-That 'the token survives the upgrade' { $after.homeAssistant.token -eq 'kept' }
+    Test-That 'an unattended update retains an offline configured endpoint without discovery' {
+        $upgradeExit -eq 0 -and $after.homeAssistant.baseUrl -eq 'http://127.0.0.1:1' -and
+            ($upgradeLog -join "`n") -notmatch 'probing |not found automatically'
+    }
+    Test-That 'the original and update backup remain owner-only' {
+        (Test-BridgeSecretFileProtected -Path (Join-Path $legacyBridge 'config.json')) -and
+            (Test-BridgeSecretFileProtected -Path (Join-Path $legacyBridge 'config.json.bak'))
+    }
     Test-That 'the remembered client selection survives' { (@($after.clients) -join ',') -eq 'copilot' }
     Test-That 'the recorded version is brought up to date' {
         $after.updates.installedVersion -eq (Get-Content -LiteralPath (Join-Path $repoRoot 'VERSION') -Raw).Trim()
+    }
+    $after.homeAssistant.baseUrl = 'https://previous.invalid'
+    $after | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath (Join-Path $legacyBridge 'config.json') -Encoding utf8
+    $changeLog = & pwsh -NoProfile -File (Join-Path $repoRoot 'install.ps1') `
+        -TargetHome $legacy -TestRegistryId $suiteRegistryId -SkipTask -SkipPath -SkipDependencies -SkipVerify -NonInteractive `
+        -HomeAssistantUrl 'http://127.0.0.1:1' 2>&1
+    $changeExit = $LASTEXITCODE
+    Test-That 'an explicit URL still authorizes an intentional unattended endpoint change' {
+        $changed = Get-Content -LiteralPath (Join-Path $legacyBridge 'config.json') -Raw | ConvertFrom-Json
+        $changeExit -eq 0 -and $changed.homeAssistant.baseUrl -eq 'http://127.0.0.1:1' -and
+            $changed.homeAssistant.token -eq 'kept' -and ($changeLog -join "`n") -notmatch 'probing '
+    }
+    $beforeInvalid = Get-Content -LiteralPath (Join-Path $legacyBridge 'config.json') -Raw
+    $invalidLog = & pwsh -NoProfile -File (Join-Path $repoRoot 'install.ps1') `
+        -TargetHome $legacy -TestRegistryId $suiteRegistryId -SkipTask -SkipPath -SkipDependencies -SkipVerify -NonInteractive `
+        -HomeAssistantUrl 'http://user:synthetic-url-secret@127.0.0.1:1' 2>&1
+    $invalidExit = $LASTEXITCODE
+    Test-That 'an invalid explicit endpoint is refused even with SkipVerify without echoing its credentials' {
+        $invalidExit -ne 0 -and ($invalidLog -join "`n") -notmatch 'synthetic-url-secret' -and
+            (Get-Content -LiteralPath (Join-Path $legacyBridge 'config.json') -Raw) -ceq $beforeInvalid
     }
 }
 finally {
@@ -533,7 +597,10 @@ try {
     Test-That 'a bad token is reported rather than accepted' {
         $run.Output -match 'could not connect to http://127\.0\.0\.1:1'
     }
-    Test-That 'the failure explains itself' { $run.Output -match 'refused|No connection' }
+    Test-That 'the failure offers safe connection troubleshooting' { $run.Output -match 'DNS.*TLS.*connectivity' }
+    Test-That 'interactive token input is never echoed into the install log' {
+        $run.Output -notmatch 'bad-one|bad-two|bad-three'
+    }
     Test-That 'it offers the token again instead of giving up at once' {
         ([regex]::Matches($run.Output, 'Home Assistant needs a long-lived access token')).Count -ge 2
     }

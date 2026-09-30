@@ -152,6 +152,34 @@ if (-not $script:BridgeIsWindows) {
         Test-That 'a missing file is handled without throwing' {
             (Protect-BridgeSecretFile -Path (Join-Path $env:TEMP ([guid]::NewGuid().ToString('N')))) -eq $false
         }
+        $nativeModeProbe = (Get-Command Test-BridgeUnixModeApi).ScriptBlock
+        function Test-BridgeUnixModeApi { $false }
+        $legacyModeDirectory = Join-Path $env:TEMP ("bridge-unix-mode-" + [guid]::NewGuid().ToString('N'))
+        try {
+            Test-That 'older Unix runtimes detect and repair weak modes through stat and chmod' {
+                & /bin/chmod '644' $secretFile
+                if ($LASTEXITCODE) { throw 'Could not prepare the permission fixture.' }
+                -not (Test-BridgeSecretFileProtected -Path $secretFile) -and
+                    (Protect-BridgeSecretFile -Path $secretFile) -and
+                    [IO.File]::GetUnixFileMode($secretFile) -eq [IO.UnixFileMode]'UserRead, UserWrite'
+            }
+            Test-That 'the older-runtime path also creates a private credential directory' {
+                [void][IO.Directory]::CreateDirectory($legacyModeDirectory)
+                (Protect-BridgeSecretFile -Path $legacyModeDirectory) -and
+                    [IO.File]::GetUnixFileMode($legacyModeDirectory) -eq [IO.UnixFileMode]'UserRead, UserWrite, UserExecute'
+            }
+            Test-That 'a native permission-command failure is explicit, not success-shaped' {
+                try {
+                    Set-BridgeSecretUnixMode -Path (Join-Path $legacyModeDirectory 'missing.json') -Mode '600'
+                    $false
+                }
+                catch { $true }
+            }
+        }
+        finally {
+            Set-Item -LiteralPath function:Test-BridgeUnixModeApi -Value $nativeModeProbe
+            if (Test-Path -LiteralPath $legacyModeDirectory) { Remove-Item -LiteralPath $legacyModeDirectory -Force }
+        }
     }
     finally { Remove-Item -LiteralPath $secretFile -Force -ErrorAction SilentlyContinue }
 }
@@ -206,6 +234,245 @@ try {
 finally {
     Remove-Item -LiteralPath $secretFile -Force -ErrorAction SilentlyContinue
 }
+}
+
+Write-Host '--- credential copies and client cleanup use isolated file-only helpers ---'
+$credentialRoot = Join-Path $env:TEMP ("bridge credentials ' " + [char]0x96EA + '-' + [guid]::NewGuid().ToString('N'))
+[void][IO.Directory]::CreateDirectory($credentialRoot)
+$env:BRIDGE_TEST_USER_TOKEN = 'synthetic-environment-user-secret'
+$env:BRIDGE_TEST_AGENT_TOKEN = 'synthetic-environment-agent-secret'
+try {
+    . (Join-Path $PSScriptRoot '..\mcp\install-mcp.ps1') -TargetHome $credentialRoot
+    $mcpRoot = Join-Path $credentialRoot 'mcp'
+    [void][IO.Directory]::CreateDirectory($mcpRoot)
+    $fixtureConfigPath = Join-Path $credentialRoot 'config.json'
+    $fixtureConfig = [pscustomobject]@{ homeAssistant = [pscustomobject]@{
+        baseUrl = 'http://127.0.0.1:1'; token = ''; tokenEnvVar = 'BRIDGE_TEST_USER_TOKEN'
+        agentToken = ''; agentTokenEnvVar = 'BRIDGE_TEST_AGENT_TOKEN'; agentUserIds = @('synthetic-agent')
+    } }
+    $fixtureConfig | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $fixtureConfigPath -Encoding utf8
+    $block = Get-BridgeMcpServerBlock -Config $fixtureConfig -ConfigPath $fixtureConfigPath -McpDir $mcpRoot
+    Test-That 'MCP setup references the bound config without materializing either environment token' {
+        $json = $block | ConvertTo-Json -Depth 8
+        $block.env.Contains('HA_BRIDGE_CONFIG') -and $block.env.HA_BRIDGE_CONFIG -eq $fixtureConfigPath -and
+            $json -notmatch 'synthetic-environment' -and $block.env.Count -eq 1
+    }
+    $fixtureConfig.homeAssistant.token = 'synthetic-saved-user-secret'
+    $fixtureConfig.homeAssistant.agentToken = 'synthetic-saved-agent-secret'
+    $savedBlock = Get-BridgeMcpServerBlock -Config $fixtureConfig -ConfigPath $fixtureConfigPath -McpDir $mcpRoot
+    Test-That 'saved tokens also stay in their original config rather than client replicas' {
+        ($savedBlock | ConvertTo-Json -Depth 8) -notmatch 'synthetic-saved'
+    }
+    $snippet = Join-Path $mcpRoot 'mcp-client-config.json'
+    Write-BridgeMcpSnippet -Path $snippet -ServerBlock $block
+    Test-That 'the generated snippet has explicit owner-only protection on its first write' {
+        Test-BridgeSecretFileProtected -Path $snippet
+    }
+    Test-That 'the snippet preserves a spaced apostrophe and Unicode path as one argument' {
+        $written = Get-Content -LiteralPath $snippet -Raw | ConvertFrom-Json -AsHashtable
+        $written.mcpServers['home-assistant-bridge'].args.Count -eq 1 -and
+            $written.mcpServers['home-assistant-bridge'].args[0] -eq (Join-Path $mcpRoot 'src\server.js')
+    }
+
+    $desktop = Join-Path $credentialRoot 'desktop.json'
+    $other = @{ mcpServers = @{ other = @{ command = 'other-client'; env = @{ OTHER_SECRET = 'synthetic-other-secret' } } }
+        preferences = @{ theme = 'dark'; nested = @{ unchanged = @('one', 'two') } } }
+    $other | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $desktop -Encoding utf8
+    Set-BridgeMcpClientConfig -Path $desktop -ServerBlock $block
+    Test-That 'Desktop originals and backups are both explicitly protected' {
+        (Test-BridgeSecretFileProtected -Path $desktop) -and
+            (Test-BridgeSecretFileProtected -Path "$desktop.bak")
+    }
+    Test-That 'install preserves unrelated client servers and preferences' {
+        $written = Get-Content -LiteralPath $desktop -Raw | ConvertFrom-Json -AsHashtable
+        $written.mcpServers.other.env.OTHER_SECRET -eq 'synthetic-other-secret' -and
+            $written.preferences.nested.unchanged -join ',' -eq 'one,two'
+    }
+    Set-BridgeMcpClientConfig -Path $desktop -ServerBlock $savedBlock
+    Test-That 'repeated registration does not relax the config or backup permissions' {
+        (Test-BridgeSecretFileProtected -Path $desktop) -and (Test-BridgeSecretFileProtected -Path "$desktop.bak")
+    }
+    Test-That 'registration repairs weakened Desktop and backup permissions' {
+        foreach ($file in @($desktop, "$desktop.bak")) {
+            if ($script:BridgeIsWindows) {
+                $item = Get-Item -LiteralPath $file
+                $acl = [IO.FileSystemAclExtensions]::GetAccessControl($item, [Security.AccessControl.AccessControlSections]::Access)
+                $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new('Everyone', 'Read', 'Allow'))
+                [IO.FileSystemAclExtensions]::SetAccessControl($item, $acl)
+            }
+            else { [IO.File]::SetUnixFileMode($file, [IO.UnixFileMode]'UserRead, UserWrite, GroupRead, OtherRead') }
+        }
+        Set-BridgeMcpClientConfig -Path $desktop -ServerBlock $block
+        (Test-BridgeSecretFileProtected -Path $desktop) -and (Test-BridgeSecretFileProtected -Path "$desktop.bak")
+    }
+
+    $legacy = @{
+        command = 'node'; args = @((Join-Path $mcpRoot 'src\server.js'))
+        env = @{ HA_TOKEN = 'synthetic-legacy-secret'; HA_AGENT_TOKEN = 'synthetic-legacy-agent-secret' }
+    }
+    $old = Get-Content -LiteralPath $desktop -Raw | ConvertFrom-Json -AsHashtable
+    $old.mcpServers['home-assistant-bridge'] = $legacy
+    $old | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $desktop -Encoding utf8
+    $old.preferences.theme = 'backup-only'
+    $old | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath "$desktop.bak" -Encoding utf8
+    Remove-BridgeMcpClientConfig -Path $desktop -ServerPath (Join-Path $mcpRoot 'src\server.js')
+    Test-That 'uninstall removes owned credentials from the original and the existing backup' {
+        foreach ($file in @($desktop, "$desktop.bak")) {
+            $text = Get-Content -LiteralPath $file -Raw
+            if ($text -match 'synthetic-legacy|home-assistant-bridge') { return $false }
+        }
+        $true
+    }
+    Test-That 'uninstall preserves each files unrelated data instead of overwriting the backup' {
+        $current = Get-Content -LiteralPath $desktop -Raw | ConvertFrom-Json -AsHashtable
+        $backup = Get-Content -LiteralPath "$desktop.bak" -Raw | ConvertFrom-Json -AsHashtable
+        $current.mcpServers.other.command -eq 'other-client' -and $current.preferences.theme -eq 'dark' -and
+            $backup.mcpServers.other.command -eq 'other-client' -and $backup.preferences.theme -eq 'backup-only'
+    }
+    Remove-Item -LiteralPath $desktop -Force
+    $old | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath "$desktop.bak" -Encoding utf8
+    Remove-BridgeMcpClientConfig -Path $desktop -ServerPath (Join-Path $mcpRoot 'src\server.js')
+    Test-That 'an orphaned Desktop backup is cleaned even when the primary config is absent' {
+        (Get-Content -LiteralPath "$desktop.bak" -Raw) -notmatch 'synthetic-legacy|home-assistant-bridge'
+    }
+    Test-That 'cleanup leaves a same-name registration belonging to another install untouched' {
+        $foreign = @{
+            mcpServers = @{ 'home-assistant-bridge' = @{
+                command = 'node'; args = @((Join-Path $credentialRoot 'other-install\src\server.js'))
+                env = @{ HA_TOKEN = 'synthetic-other-install-token' }
+            } }
+        }
+        $foreign | ConvertTo-Json -Depth 20 | Set-Content -LiteralPath $desktop -Encoding utf8
+        $before = [IO.File]::ReadAllText($desktop)
+        if ($script:BridgeIsWindows) {
+            $item = Get-Item -LiteralPath $desktop
+            $acl = [IO.FileSystemAclExtensions]::GetAccessControl($item, [Security.AccessControl.AccessControlSections]::Access)
+            $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new('Everyone', 'Read', 'Allow'))
+            [IO.FileSystemAclExtensions]::SetAccessControl($item, $acl)
+        }
+        else { [IO.File]::SetUnixFileMode($desktop, [IO.UnixFileMode]'UserRead, UserWrite, GroupRead, OtherRead') }
+        Remove-BridgeMcpClientConfig -Path $desktop -ServerPath (Join-Path $mcpRoot 'src\server.js') -WarningAction SilentlyContinue
+        [IO.File]::ReadAllText($desktop) -ceq $before -and -not (Test-BridgeSecretFileProtected -Path $desktop)
+    }
+    Test-That 'a malformed client config is not replaced or copied into diagnostics' {
+        $malformed = '{"mcpServers":synthetic-invalid-config-secret}'
+        Set-Content -LiteralPath $desktop -Value $malformed -NoNewline -Encoding utf8
+        try { Set-BridgeMcpClientConfig -Path $desktop -ServerBlock $block; return $false }
+        catch {
+            $_.Exception.Message -notmatch 'synthetic-invalid-config-secret' -and
+                [IO.File]::ReadAllText($desktop) -ceq $malformed
+        }
+    }
+
+    $realProtector = (Get-Command Protect-BridgeSecretFile).ScriptBlock
+    $script:ProtectionObservations = @()
+    function Protect-BridgeSecretFile {
+        param([string]$Path)
+        $script:ProtectionObservations += [pscustomobject]@{
+            Path = $Path; Before = if (Test-Path -LiteralPath $Path -PathType Leaf) { [IO.File]::ReadAllText($Path) } else { '' }
+        }
+        & $realProtector -Path $Path
+    }
+    try {
+        $private = Join-Path $credentialRoot 'new private directory\config.json'
+        Test-That 'a new main config is protected while empty, before its credential bytes are written' {
+            Write-BridgeSecretFile -Path $private -Content 'synthetic-write-secret'
+            (Test-BridgeSecretFileProtected -Path $private) -and [IO.File]::ReadAllText($private) -eq 'synthetic-write-secret' -and
+                @($script:ProtectionObservations | Where-Object { $_.Path -eq $private -and $_.Before -eq '' }).Count -gt 0
+        }
+        Test-That 'a new backup is protected while empty and keeps the exact original bytes' {
+            Copy-BridgeSecretFile -Source $private -Destination "$private.bak"
+            (Test-BridgeSecretFileProtected -Path "$private.bak") -and
+                [IO.File]::ReadAllText("$private.bak") -ceq [IO.File]::ReadAllText($private) -and
+                @($script:ProtectionObservations | Where-Object { $_.Path -eq "$private.bak" -and $_.Before -eq '' }).Count -gt 0
+        }
+    }
+    finally { Set-Item -LiteralPath function:Protect-BridgeSecretFile -Value $realProtector }
+
+    function Protect-BridgeSecretFile { param([string]$Path) $false }
+    try {
+        Test-That 'MCP writes fail closed without writing secret bytes if protection fails' {
+            $denied = Join-Path $credentialRoot 'denied.json'
+            try { Write-BridgeMcpSnippet -Path $denied -ServerBlock $legacy; return $false }
+            catch {
+                $_.Exception.Message -notmatch 'synthetic-legacy' -and
+                    (-not (Test-Path -LiteralPath $denied) -or [IO.File]::ReadAllText($denied) -eq '')
+            }
+            Test-That 'a failed protection step does not overwrite an existing credential file' {
+                $existing = Join-Path $credentialRoot 'unchanged.json'
+                Set-Content -LiteralPath $existing -Value 'synthetic-original-secret' -NoNewline
+                try { Write-BridgeSecretFile -Path $existing -Content 'synthetic-replacement-secret'; return $false }
+                catch { [IO.File]::ReadAllText($existing) -ceq 'synthetic-original-secret' }
+            }
+        }
+    }
+    finally { Set-Item -LiteralPath function:Protect-BridgeSecretFile -Value $realProtector }
+}
+finally {
+    Remove-Item Env:\BRIDGE_TEST_USER_TOKEN, Env:\BRIDGE_TEST_AGENT_TOKEN -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $credentialRoot -Recurse -Force
+}
+
+Write-Host '--- token prompts request masked input ---'
+function Read-Host {
+    param([string]$Prompt, [switch]$AsSecureString)
+    if (-not $AsSecureString) { throw 'Token input must be masked.' }
+    [Net.NetworkCredential]::new('', 'synthetic-entered-secret').SecurePassword
+}
+try {
+    Test-That 'the secret prompt reads a SecureString without echoing it' {
+        (Read-BridgeSecret -Prompt 'Synthetic token' -InputRedirected $false) -eq 'synthetic-entered-secret'
+    }
+}
+finally { Remove-Item Function:\Read-Host }
+
+Write-Host '--- redirected token input is consumed without a terminal or an echo ---'
+$inputRoot = Join-Path $env:TEMP ('bridge-secret-input-' + [guid]::NewGuid().ToString('N'))
+[void][IO.Directory]::CreateDirectory($inputRoot)
+$inputProbe = Join-Path $inputRoot 'read-secret.ps1'
+$probeText = @'
+$ErrorActionPreference = 'Stop'
+. '__SECRETS__'
+$choice = Read-Host 'Choice'
+$token = Read-BridgeSecret -Prompt 'Token'
+if ($choice -ne '1' -or $token -cne 'synthetic-piped-token') { throw 'Redirected input was not consumed correctly.' }
+Write-Output 'piped secret verified'
+'@
+$helperPath = (Join-Path $PSScriptRoot '..\hooks\bridge-secrets.ps1').Replace("'", "''")
+$probeText.Replace('__SECRETS__', $helperPath) | Set-Content -LiteralPath $inputProbe -Encoding utf8
+$inputProcess = [Diagnostics.Process]::new()
+$started = $false
+try {
+    # Only a prompt helper is run, not an installer. This process inherits the
+    # canonical runner's already-scrubbed environment and receives synthetic input.
+    $start = [Diagnostics.ProcessStartInfo]::new((Join-Path $PSHOME $(if ($IsWindows) { 'pwsh.exe' } else { 'pwsh' })))
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardInput = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    foreach ($argument in @('-NoLogo', '-NoProfile', '-File', $inputProbe)) { $start.ArgumentList.Add($argument) }
+    $inputProcess.StartInfo = $start
+    $started = $inputProcess.Start()
+    $stdout = $inputProcess.StandardOutput.ReadToEndAsync()
+    $stderr = $inputProcess.StandardError.ReadToEndAsync()
+    $inputProcess.StandardInput.WriteLine('1')
+    $inputProcess.StandardInput.WriteLine('synthetic-piped-token')
+    $inputProcess.StandardInput.Close()
+    $finished = $inputProcess.WaitForExit(5000)
+    if (-not $finished) { $inputProcess.Kill($true); $inputProcess.WaitForExit() }
+    $inputOutput = $stdout.GetAwaiter().GetResult() + $stderr.GetAwaiter().GetResult()
+    Test-That 'a token after a normal prompt is read from redirected stdin without hanging' {
+        $finished -and $inputProcess.ExitCode -eq 0 -and $inputOutput -match 'piped secret verified'
+    }
+    Test-That 'redirected token input is not echoed into either output stream' {
+        $finished -and $inputOutput -notmatch 'synthetic-piped-token'
+    }
+}
+finally {
+    if ($started -and -not $inputProcess.HasExited) { $inputProcess.Kill($true); $inputProcess.WaitForExit() }
+    $inputProcess.Dispose()
+    Remove-Item -LiteralPath $inputRoot -Recurse -Force
 }
 
 Write-Host '--- a scripted run is never offered things only a human can use ---'

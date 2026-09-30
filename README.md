@@ -201,7 +201,7 @@ Choosing **mcp** installs the Node server, writes a paste-ready client config to
 it's present; other MCP clients (Cursor, ChatGPT) use the snippet — see
 [`mcp/README.md`](mcp/README.md).
 
-Then it finds Home Assistant: it probes `homeassistant.local:8123` (the hostname Home
+On a first setup it finds Home Assistant: it probes `homeassistant.local:8123` (the hostname Home
 Assistant publishes over mDNS, which Windows resolves natively) and confirms the
 product from its unauthenticated `manifest.json`. **If that works it just uses it** —
 it doesn't ask you to confirm a question it already answered. You're only prompted for
@@ -214,8 +214,14 @@ and immediately shows you what you connected to:
     mqtt.publish available
 ```
 
-A token that doesn't work is reported there and then, with another go at pasting it,
-rather than failing at the end of the install.
+A token that doesn't work is reported there and then, with another go at pasting it
+into a masked prompt, rather than failing at the end of the install.
+
+An existing configured endpoint is never replaced by discovery, even when it is
+offline or its DNS/TLS probe fails. Use `agent-ha-bridge configure -HomeAssistantUrl
+<intended-url>` to deliberately change it; this explicitly authorizes using the
+configured credentials at that URL. Installer verification does not follow redirects.
+HTTP on a trusted LAN remains supported, with the existing unencrypted-token warning.
 
 Last it checks the three custom Lovelace cards the dashboard is drawn with. Without
 them the dashboard renders as a column of *Custom element doesn't exist* boxes — an
@@ -232,8 +238,14 @@ rights, and no SmartScreen warning.
 If you already know the details, skip the prompts entirely:
 
 ```powershell
-.\install.ps1 -HomeAssistantUrl http://homeassistant.local:8123 -Token 'eyJ...'
+.\install.ps1 -HomeAssistantUrl http://homeassistant.local:8123 -NonInteractive
 ```
+
+For unattended setup, supply `AGENT_HA_TOKEN` through your process's secret/environment
+configuration. `-Token` and `-AgentToken` remain supported, but their values can appear
+in shell history, process listings, and automation logs; do not put literal secrets
+in a command line. Omitting `-NonInteractive` lets the installer mask token entry.
+Redirected stdin remains supported and is read without echoing the token.
 
 Then `/restart` any running Copilot sessions so they pick up the hooks, and open the
 **Agent Sessions** dashboard in Home Assistant.
@@ -247,9 +259,10 @@ Optional out-of-band push when a session needs you:
 The installer is idempotent — re-run it to upgrade in place. Re-running with only
 some arguments keeps the rest of your settings, and the previous config is backed up
 to `config.json.bak` first. A config written by an older version has any keys it is
-missing filled in from the defaults, and one that cannot be parsed at all is reported
-and replaced rather than ending the install on a JSON error — the backup is taken
-before it is read, so nothing is lost either way.
+missing filled in from the defaults. An unreadable existing config is backed up and
+reported without echoing its contents; repair it or explicitly provide
+`-HomeAssistantUrl` before replacing it with defaults. A missing endpoint in an
+existing config also requires an explicit URL rather than discovery.
 
 It is **not interactive** when you pass `-NonInteractive`, which is what you want in a
 script; otherwise it prompts for anything missing. Use `-SkipVerify` for an offline
@@ -331,8 +344,28 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `updates.checkForUpdates` | Set to `false` to disable the update check |
 | `updates.checkHours` | How often to check GitHub for a release (default `6`, i.e. 4×/day) |
 
-Prefer keeping the token out of a file? Leave `token` empty and set `AGENT_HA_TOKEN`
-in your environment.
+Prefer keeping tokens out of a file? Leave `token` / `agentToken` empty and set the
+variables named by `tokenEnvVar` / `agentTokenEnvVar` in the environment of each process
+that needs them. Verification saves an environment-only agent's user ID, not its token.
+Environment-only credentials must also be available when the daemon or MCP client
+starts; a terminal's temporary environment does not automatically reach a desktop app.
+
+The installer protects main configs, MCP snippets, Claude Desktop configs, and their
+owned backups before writing: owner-only ACLs on Windows, `0600` files and `0700` new
+credential directories on Unix. When the .NET Unix mode APIs are unavailable, the
+credential helper uses the OS's `stat` and `chmod` and verifies the resulting mode.
+Protection failures stop the write instead of
+reporting success. Generated MCP entries reference the protected bridge config via
+`HA_BRIDGE_CONFIG`, so neither saved nor environment-only tokens are copied into
+the snippet. Existing saved credentials are still plaintext in the protected main
+config; OS protection is not encryption and does not exclude administrators.
+Installer credential-file targets must be regular files, not symlinks or reparse
+points; use the actual protected config location rather than a linked file.
+
+MCP removal strips this install's registration from Claude Desktop and its `.bak`
+without replacing unrelated settings. Copies pasted into other clients or backups
+made by other software must be removed there manually. `-KeepConfig` deliberately
+retains the main config and its backup; removing an adapter does not revoke HA tokens.
 
 ### Telling an agent's turn from yours
 
@@ -352,11 +385,12 @@ Giving the agent its own account is what makes the difference real:
 3. Hand it to the installer:
 
    ```powershell
-   agent-ha-bridge configure -AgentToken <the token>
+   agent-ha-bridge configure
    ```
 
-   An interactive install offers this step on its own; `homeAssistant.agentToken` in
-   the config, or the `AGENT_HA_AGENT_TOKEN` environment variable, does the same.
+   Use the optional masked agent-token prompt. A protected `homeAssistant.agentToken`
+   in the config, or the `AGENT_HA_AGENT_TOKEN` environment variable, does the same.
+   Automated `-AgentToken` input remains supported with the command-line risks above.
 
 That is the whole setup — there is no user id to copy. The installer reads the account
 back off the token (`auth/current_user`) and writes `agentUserIds` itself, because that
@@ -367,6 +401,8 @@ id, and using it means nothing is ever marked and nothing ever says why.
 It also refuses two tokens rather than storing them to fail quietly later: one Home
 Assistant rejects, and one belonging to *your own* account — which authenticates
 perfectly and can never mark anything.
+Secure account verification requires PowerShell 7.3 or newer so WebSocket redirects
+can be disabled. Older runtimes report the limitation without sending an agent token.
 
 Your own `homeAssistant.token` is left alone; the daemon, the hooks and the dashboard
 provisioning still run as you. The agent token goes into the environment of every
@@ -384,11 +420,12 @@ where a session's answer is read back from, and it is removed on uninstall. Your
 
 **A non-administrator is genuinely enough**, and the split is deliberate. Driving a
 session is service calls and state reads, both of which a plain user may do. The MCP
-server is not given this token precisely because it *provisions* — it renames entities
+server keeps the user's token for *provisioning* — it renames entities
 to deterministic ids and creates its own dashboard, and `config/entity_registry/update`,
 `lovelace/dashboards/create` and `lovelace/config/save` all return `unauthorized` to a
 plain user (measured against a real instance, with `config/auth/list` as the control).
-It keeps using yours, and presses nothing whose account the bridge ever reads back.
+Its session reply/launch tools use the separate agent token when configured; they do
+not need the user's administrator privileges.
 
 A session an agent starts or replies to is drawn with a purple edge — steady while
 idle, pulsing while it works — and hands back to the ordinary colours the moment you

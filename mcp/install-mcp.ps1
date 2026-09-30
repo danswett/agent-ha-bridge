@@ -5,8 +5,8 @@
 
 .DESCRIPTION
     Copies the Node MCP server into ~/.agent-ha-bridge/mcp so it survives deleting the clone,
-    installs its dependencies, and writes a paste-ready stdio config using the Home
-    Assistant URL and token already in the bridge config. If Claude Desktop is present,
+    installs its dependencies, and writes a paste-ready stdio reference to the Home
+    Assistant URL and credential sources in the bridge config. If Claude Desktop is present,
     the server is written straight into its config; other MCP clients (Cursor, ChatGPT)
     use the generated snippet.
 
@@ -31,6 +31,7 @@ param(
 $ErrorActionPreference = 'Stop'
 # Windows/macOS differences; on macOS also makes Join-Path accept '\'.
 . (Join-Path $PSScriptRoot '../hooks/bridge-platform.ps1')
+. (Join-Path $PSScriptRoot '../hooks/bridge-secrets.ps1')
 
 $installHome = if ($TargetHome) { $TargetHome } else { $HOME }
 $bridgeHome  = Join-Path $installHome '.agent-ha-bridge'
@@ -56,33 +57,88 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
 }
 
 function Get-JsonFile {
-    param([string]$Path)
+    param([string]$Path, [switch]$Protect)
     if (-not (Test-Path -LiteralPath $Path)) { return @{} }
-    $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
-    if ([string]::IsNullOrWhiteSpace($raw)) { return @{} }
-    # -AsHashtable so the map is mutable and exposes ContainsKey for merging.
-    $raw | ConvertFrom-Json -AsHashtable
+    if ($Protect -and -not (Protect-BridgeSecretFile -Path $Path)) { throw 'Could not protect the existing MCP configuration.' }
+    try {
+        $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8
+        if ([string]::IsNullOrWhiteSpace($raw)) { return @{} }
+        $parsed = $raw | ConvertFrom-Json -AsHashtable
+        if ($parsed -isnot [System.Collections.IDictionary]) { throw 'Expected a JSON object.' }
+        return $parsed
+    }
+    catch { throw 'The MCP configuration could not be read as a JSON object. Repair its syntax or permissions; it has not been replaced.' }
 }
 
 function Remove-BridgeMcpServer {
     <# Strips only this bridge's server, leaving any others the client has. #>
-    param([hashtable]$Config)
+    param([hashtable]$Config, [Parameter(Mandatory)][string]$ServerPath)
     if ($Config.ContainsKey('mcpServers') -and $Config['mcpServers'] -is [hashtable]) {
-        $Config['mcpServers'].Remove($serverName)
-        if ($Config['mcpServers'].Count -eq 0) { $Config.Remove('mcpServers') }
+        if (-not $Config['mcpServers'].ContainsKey($serverName)) { return $Config }
+        $entry = $Config['mcpServers'][$serverName]
+        $serverArgs = @(if ($entry -is [Collections.IDictionary] -and $entry.Contains('args')) { $entry['args'] })
+        $comparison = if ($script:BridgeIsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+        if ($serverArgs.Count -eq 0 -or $serverArgs[0] -isnot [string] -or
+            -not [IO.Path]::IsPathFullyQualified($serverArgs[0]) -or
+            -not [string]::Equals([IO.Path]::GetFullPath($serverArgs[0]), [IO.Path]::GetFullPath($ServerPath), $comparison)) {
+            Write-Warning 'The named MCP registration points elsewhere; leaving it and its credentials unchanged.'
+            return $Config
+        }
+        [void]$Config['mcpServers'].Remove($serverName)
+        if ($Config['mcpServers'].Count -eq 0) { [void]$Config.Remove('mcpServers') }
     }
     $Config
 }
 
+function Get-BridgeMcpServerBlock {
+    param([Parameter(Mandatory)]$Config, [Parameter(Mandatory)][string]$ConfigPath,
+        [Parameter(Mandatory)][string]$McpDir)
+
+    [void](ConvertTo-BridgeHomeAssistantUrl -Value ([string]$Config.homeAssistant.baseUrl))
+    # Keep the endpoint and both credential sources together. A generated client
+    # config must not freeze an environment-only secret or override its authority.
+    $serverEnv = [ordered]@{ HA_BRIDGE_CONFIG = [IO.Path]::GetFullPath($ConfigPath) }
+    [ordered]@{ command = 'node'; args = @([IO.Path]::GetFullPath((Join-Path $McpDir 'src\server.js'))); env = $serverEnv }
+}
+
+function Write-BridgeMcpSnippet {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$ServerBlock)
+    $content = [ordered]@{ mcpServers = [ordered]@{ $serverName = $ServerBlock } } | ConvertTo-Json -Depth 100
+    Write-BridgeSecretFile -Path $Path -Content $content
+}
+
+function Set-BridgeMcpClientConfig {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$ServerBlock)
+    $cd = Get-JsonFile -Path $Path -Protect
+    if ($cd.ContainsKey('mcpServers') -and $cd['mcpServers'] -isnot [hashtable]) {
+        throw 'The client mcpServers setting must be a JSON object; it has not been replaced.'
+    }
+    if (-not $cd.ContainsKey('mcpServers')) { $cd['mcpServers'] = @{} }
+    $cd['mcpServers'][$serverName] = $ServerBlock
+    if (Test-Path -LiteralPath $Path) { Copy-BridgeSecretFile -Source $Path -Destination "$Path.bak" }
+    Write-BridgeSecretFile -Path $Path -Content ($cd | ConvertTo-Json -Depth 100)
+}
+
+function Remove-BridgeMcpClientConfig {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$ServerPath)
+    foreach ($file in @($Path, "$Path.bak")) {
+        if (-not (Test-Path -LiteralPath $file)) { continue }
+        $current = Get-JsonFile $file
+        if (-not $current.ContainsKey('mcpServers') -or $current['mcpServers'] -isnot [hashtable] -or
+            -not $current['mcpServers'].ContainsKey($serverName)) { continue }
+        $updated = Remove-BridgeMcpServer -Config $current -ServerPath $ServerPath
+        if ($updated.ContainsKey('mcpServers') -and $updated['mcpServers'].ContainsKey($serverName)) { continue }
+        Write-BridgeSecretFile -Path $file -Content ($updated | ConvertTo-Json -Depth 100)
+    }
+}
+
+# Credential helpers can be exercised without installing packages or clients.
+if ($env:BRIDGE_INSTALL_NORUN) { return }
+
 # ------------------------------------------------------------------ uninstall
 if ($Uninstall) {
     Write-Step 'Removing the MCP server'
-    if (Test-Path -LiteralPath $claudeDesktopConfig) {
-        Copy-Item $claudeDesktopConfig "$claudeDesktopConfig.bak" -Force
-        (Remove-BridgeMcpServer -Config (Get-JsonFile $claudeDesktopConfig)) |
-            ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $claudeDesktopConfig -Encoding UTF8
-        Write-Host '    removed from Claude Desktop'
-    }
+    Remove-BridgeMcpClientConfig -Path $claudeDesktopConfig -ServerPath (Join-Path $mcpDir 'src\server.js')
     if (Test-Path -LiteralPath $mcpDir) {
         Remove-Item -LiteralPath $mcpDir -Recurse -Force
         Write-Host "    removed $mcpDir"
@@ -96,8 +152,7 @@ if (-not (Test-Path -LiteralPath $configPath)) {
     throw ("The bridge config was not found at $configPath. Run install.ps1 first - the " +
            'MCP setup reuses its Home Assistant URL and token.')
 }
-$config = Get-Content -LiteralPath $configPath -Raw -Encoding UTF8 | ConvertFrom-Json
-$baseUrl = [string]$config.homeAssistant.baseUrl
+$config = Get-JsonFile -Path $configPath -Protect
 # Two tokens, because this server does two different kinds of thing.
 #
 # HA_TOKEN is the bridge's own - the user's - because this server *provisions*:
@@ -115,19 +170,14 @@ $baseUrl = [string]$config.homeAssistant.baseUrl
 # too, and a press made with the user's token is indistinguishable from the user
 # pressing it, so it is the one thing here that must not use HA_TOKEN.
 #
-# Optional. Without it the tools still work; the actions are simply recorded as the
-# user, which is what happened before either existed, and the server says so on stderr.
-$token = [string]$config.homeAssistant.token
-if (-not $token -and $config.homeAssistant.tokenEnvVar) {
-    $token = [Environment]::GetEnvironmentVariable([string]$config.homeAssistant.tokenEnvVar)
-}
-$agentToken = [string]$config.homeAssistant.agentToken
-if (-not $agentToken -and $config.homeAssistant.agentTokenEnvVar) {
-    $agentToken = [Environment]::GetEnvironmentVariable([string]$config.homeAssistant.agentTokenEnvVar)
-}
+# An unconfigured agent is optional. A configured identity whose environment-only
+# credential is unavailable fails at startup instead of silently using the user.
 
 Write-Step "Installing the MCP server into $mcpDir"
-if (-not (Test-Path -LiteralPath $mcpDir)) { New-Item -ItemType Directory -Path $mcpDir -Force | Out-Null }
+if (-not (Test-Path -LiteralPath $mcpDir)) {
+    New-Item -ItemType Directory -Path $mcpDir -Force | Out-Null
+    if (-not (Protect-BridgeSecretFile -Path $mcpDir)) { throw 'Could not protect the MCP credential directory.' }
+}
 # A clean copy of src each time, so a removed file cannot linger.
 $destSrc = Join-Path $mcpDir 'src'
 if (Test-Path -LiteralPath $destSrc) { Remove-Item -LiteralPath $destSrc -Recurse -Force }
@@ -158,31 +208,16 @@ else {
 }
 
 # ------------------------------------------------------- paste-ready snippet
-# The token is written to files (the snippet and, below, Claude Desktop) but never
-# printed, so it does not land in console history.
-$serverJs = Join-Path $mcpDir 'src\server.js'
-$serverEnv = [ordered]@{ HA_BASE_URL = $baseUrl }
-$serverEnv['HA_TOKEN'] = if ($token) { $token } else { '<your Home Assistant long-lived token>' }
-# Only when there is one: an empty value would read as configured and silently record
-# every session an agent drove as the user.
-if ($agentToken) { $serverEnv['HA_AGENT_TOKEN'] = $agentToken }
-$serverBlock = [ordered]@{ command = 'node'; args = @($serverJs); env = $serverEnv }
-
-([ordered]@{ mcpServers = [ordered]@{ $serverName = $serverBlock } }) |
-    ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $snippetPath -Encoding UTF8
+# Only the config path is serialized. Credentials are resolved by the MCP process.
+$serverBlock = Get-BridgeMcpServerBlock -Config $config -ConfigPath $configPath -McpDir $mcpDir
+Write-BridgeMcpSnippet -Path $snippetPath -ServerBlock $serverBlock
 Write-Step "Wrote a paste-ready client config to $snippetPath"
-if (-not $token) {
-    Write-Warning 'No token was in the bridge config, so the snippet has a placeholder - fill in HA_TOKEN.'
-}
+Write-Host '    credentials are read at runtime; environment-only tokens must be available to the MCP client'
 
 # ----------------------------------------------------------- Claude Desktop
 $claudeDone = $false
 if (Test-Path -LiteralPath (Split-Path -Parent $claudeDesktopConfig)) {
-    $cd = Get-JsonFile $claudeDesktopConfig
-    if (-not $cd.ContainsKey('mcpServers') -or $cd['mcpServers'] -isnot [hashtable]) { $cd['mcpServers'] = @{} }
-    $cd['mcpServers'][$serverName] = $serverBlock
-    if (Test-Path -LiteralPath $claudeDesktopConfig) { Copy-Item $claudeDesktopConfig "$claudeDesktopConfig.bak" -Force }
-    $cd | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $claudeDesktopConfig -Encoding UTF8
+    Set-BridgeMcpClientConfig -Path $claudeDesktopConfig -ServerBlock $serverBlock
     Write-Step 'Registered with Claude Desktop'
     Write-Host "    added '$serverName' to $claudeDesktopConfig"
     $claudeDone = $true

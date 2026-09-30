@@ -17,7 +17,8 @@
     Everything is idempotent: re-running it upgrades an existing install in place.
 
 .PARAMETER HomeAssistantUrl
-    Base URL of Home Assistant, e.g. http://homeassistant.local:8123
+    Base URL of Home Assistant, e.g. http://homeassistant.local:8123. Supplying this
+    explicitly authorizes using the configured credentials at that endpoint.
 
 .PARAMETER Token
     A Home Assistant long-lived access token. Stored in the bridge config outside the
@@ -66,10 +67,10 @@
     and asks for anything it still needs.
 
 .EXAMPLE
-    .\install.ps1 -HomeAssistantUrl http://homeassistant.local:8123 -Token 'eyJ...'
+    .\install.ps1 -HomeAssistantUrl http://homeassistant.local:8123
 
 .EXAMPLE
-    .\install.ps1 -HomeAssistantUrl http://ha.lan:8123 -Token 'eyJ...' -NotifyService notify.mobile_app_pixel
+    .\install.ps1 -HomeAssistantUrl http://ha.lan:8123 -NotifyService notify.mobile_app_pixel
 
 .EXAMPLE
     # Once installed, reconfigure from anywhere - no clone needed.
@@ -103,6 +104,7 @@ $repoRoot = $PSScriptRoot
 . (Join-Path $repoRoot 'hooks/bridge-platform.ps1')
 . (Join-Path $repoRoot 'hooks/bridge-native-hook.ps1')
 . (Join-Path $repoRoot 'hooks/bridge-test-guard.ps1')
+. (Join-Path $repoRoot 'hooks/bridge-secrets.ps1')
 $installHome = if ($TargetHome) { $TargetHome } else { $HOME }
 
 # The VERSION file is the single source of truth, so the Apps & features entry, the
@@ -719,7 +721,7 @@ function Read-BridgeConfigFile {
         return [pscustomobject]@{ Config = ($raw | ConvertFrom-Json); Error = '' }
     }
     catch {
-        return [pscustomobject]@{ Config = $null; Error = $_.Exception.Message }
+        return [pscustomobject]@{ Config = $null; Error = 'the file could not be read as valid JSON; check its syntax and permissions' }
     }
 }
 
@@ -736,8 +738,11 @@ function Get-BridgeHttpErrorDetail {
         403 { return 'access was refused (403 Forbidden)' }
         404 { return 'no Home Assistant API at that URL (404) - check the port and any path prefix' }
         default {
-            if ($status) { return "HTTP $status - $($ErrorRecord.Exception.Message)" }
-            return $ErrorRecord.Exception.Message
+            if ($status -ge 300 -and $status -lt 400) {
+                return "HTTP $status redirect refused; configure the intended Home Assistant URL explicitly"
+            }
+            if ($status) { return "HTTP $status; check the configured Home Assistant endpoint" }
+            return 'request failed; check the configured URL, DNS, TLS certificate, and connectivity'
         }
     }
 }
@@ -759,7 +764,7 @@ function Test-BridgeHomeAssistantConnection {
     $base = ([string]$BaseUrl).TrimEnd('/')
     $result = [pscustomobject]@{
         Ok           = $false
-        BaseUrl      = $base
+        BaseUrl      = ''
         Message      = ''
         Version      = ''
         LocationName = ''
@@ -767,12 +772,18 @@ function Test-BridgeHomeAssistantConnection {
         Error        = ''
     }
     if ([string]::IsNullOrWhiteSpace($base)) { $result.Error = 'no Home Assistant URL'; return $result }
+    if (-not [string]::IsNullOrWhiteSpace($Token)) { Assert-BridgeHttpAllowed -Uri "$base/api/" }
+    try { $base = ConvertTo-BridgeHomeAssistantUrl -Value $base }
+    catch {
+        $result.BaseUrl = ''
+        $result.Error = 'invalid Home Assistant URL; use HTTP(S) without user info, a query, or a fragment'
+        return $result
+    }
+    $result.BaseUrl = $base
     if ([string]::IsNullOrWhiteSpace($Token)) { $result.Error = 'no Home Assistant token'; return $result }
-
     $headers = @{ Authorization = "Bearer $Token"; 'Content-Type' = 'application/json' }
-    Assert-BridgeHttpAllowed -Uri "$base/api/"
     try {
-        $api = Invoke-RestMethod -Uri "$base/api/" -Headers $headers -TimeoutSec $TimeoutSec
+        $api = Invoke-RestMethod -Uri "$base/api/" -Headers $headers -TimeoutSec $TimeoutSec -MaximumRedirection 0
         $result.Message = [string]$api.message
         $result.Ok = $true
     }
@@ -785,7 +796,7 @@ function Test-BridgeHomeAssistantConnection {
     # Home Assistant you are now attached to".
     Assert-BridgeHttpAllowed -Uri "$base/api/config"
     try {
-        $haConfig = Invoke-RestMethod -Uri "$base/api/config" -Headers $headers -TimeoutSec $TimeoutSec
+        $haConfig = Invoke-RestMethod -Uri "$base/api/config" -Headers $headers -TimeoutSec $TimeoutSec -MaximumRedirection 0
         $result.Version = [string]$haConfig.version
         $result.LocationName = [string]$haConfig.location_name
     }
@@ -795,7 +806,7 @@ function Test-BridgeHomeAssistantConnection {
     # every per-session entity is published through the mqtt.publish service.
     Assert-BridgeHttpAllowed -Uri "$base/api/services"
     try {
-        $services = Invoke-RestMethod -Uri "$base/api/services" -Headers $headers -TimeoutSec ($TimeoutSec + 5)
+        $services = Invoke-RestMethod -Uri "$base/api/services" -Headers $headers -TimeoutSec ($TimeoutSec + 5) -MaximumRedirection 0
         $mqtt = @($services) | Where-Object { $_.domain -eq 'mqtt' }
         $result.MqttPublish = [bool]($mqtt -and ($mqtt.services.PSObject.Properties.Name -contains 'publish'))
     }
@@ -831,13 +842,28 @@ function Get-BridgeHomeAssistantUser {
     if ([string]::IsNullOrWhiteSpace($BaseUrl)) { $result.Error = 'no Home Assistant URL'; return $result }
     if ([string]::IsNullOrWhiteSpace($Token)) { $result.Error = 'no token'; return $result }
 
-    $wsUrl = (([string]$BaseUrl).TrimEnd('/') -replace '^http', 'ws') + '/api/websocket'
-    Assert-BridgeHttpAllowed -Uri $wsUrl -Transport WebSocket
+    Assert-BridgeHttpAllowed -Uri "$(([string]$BaseUrl).TrimEnd('/') -replace '^http', 'ws')/api/websocket" -Transport WebSocket
+    try { $base = ConvertTo-BridgeHomeAssistantUrl -Value $BaseUrl }
+    catch { $result.Error = 'invalid Home Assistant URL'; return $result }
+    $wsUrl = ($base -replace '^http', 'ws') + '/api/websocket'
     $ws = $null
+    $cancel = $null
+    $invoker = $null
     try {
+        # Older runtimes cannot disable WebSocket redirects. Refuse account lookup
+        # there rather than authenticate a redirected socket with a saved credential.
+        $connect = [Net.WebSockets.ClientWebSocket].GetMethod('ConnectAsync',
+            [type[]]@([Uri], [Net.Http.HttpMessageInvoker], [Threading.CancellationToken]))
+        if (-not $connect) {
+            $result.Error = 'secure account verification requires PowerShell 7.3 or newer; update PowerShell and retry'
+            return $result
+        }
         $cancel = [Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds($TimeoutSec))
         $ws = [System.Net.WebSockets.ClientWebSocket]::new()
-        $ws.ConnectAsync([Uri]$wsUrl, $cancel.Token).Wait()
+        $handler = [Net.Http.SocketsHttpHandler]::new()
+        $handler.AllowAutoRedirect = $false
+        $invoker = [Net.Http.HttpMessageInvoker]::new($handler)
+        $ws.ConnectAsync([Uri]$wsUrl, $invoker, $cancel.Token).GetAwaiter().GetResult()
 
         $buffer = [byte[]]::new(65536)
         # Scriptblocks, not nested functions: a function declared inside a function is
@@ -878,10 +904,14 @@ function Get-BridgeHomeAssistantUser {
         $result
     }
     catch {
-        $result.Error = if ($_.Exception.InnerException) { $_.Exception.InnerException.Message } else { $_.Exception.Message }
+        $result.Error = 'account lookup failed; check the configured URL, DNS, TLS certificate, and connectivity; redirects are not followed'
         $result
     }
-    finally { if ($ws) { $ws.Dispose() } }
+    finally {
+        if ($ws) { $ws.Dispose() }
+        if ($invoker) { $invoker.Dispose() }
+        if ($cancel) { $cancel.Dispose() }
+    }
 }
 
 function Resolve-BridgeAgentIdentity {
@@ -909,6 +939,7 @@ function Resolve-BridgeAgentIdentity {
         [Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$BaseUrl,
         [AllowEmptyString()][AllowNull()][string]$AgentToken,
         [AllowEmptyString()][AllowNull()][string]$OwnToken,
+        [switch]$EnvironmentOnly,
         [scriptblock]$Lookup = $null
     )
 
@@ -943,7 +974,7 @@ function Resolve-BridgeAgentIdentity {
     }
 
     $result.Store = $true
-    $result.Token = [string]$AgentToken
+    $result.Token = if ($EnvironmentOnly) { '' } else { [string]$AgentToken }
     $result.UserId = [string]$agent.Id
     $result.Name = [string]$agent.Name
     $result.IsAdmin = [bool]$agent.IsAdmin
@@ -1223,8 +1254,9 @@ function Test-IsHomeAssistant {
 
     Assert-BridgeHttpAllowed -Uri "$($BaseUrl.TrimEnd('/'))/manifest.json" -Transport WebRequest
     try {
-        $response = Invoke-WebRequest -Uri "$($BaseUrl.TrimEnd('/'))/manifest.json" `
-            -TimeoutSec $TimeoutSec -SkipHttpErrorCheck -ErrorAction Stop
+        $base = ConvertTo-BridgeHomeAssistantUrl -Value $BaseUrl
+        $response = Invoke-WebRequest -Uri "$base/manifest.json" `
+            -TimeoutSec $TimeoutSec -SkipHttpErrorCheck -MaximumRedirection 0 -ErrorAction Stop
         if ($response.StatusCode -ne 200) { return $false }
         $body = if ($response.Content -is [byte[]]) {
             [Text.Encoding]::UTF8.GetString($response.Content)
@@ -1297,13 +1329,9 @@ function Resolve-BridgeHomeAssistantUrl {
     <#
         Settles on a Home Assistant URL, and prompts only when it has to.
 
-        The old flow discovered Home Assistant, printed what it found, and then asked
-        for the URL anyway - an empty Enter being the right answer to a question that
-        should never have been asked. Now a URL that answers as Home Assistant is
-        simply used: the one already in the config first (a re-run should not re-probe
-        a working install), then whatever discovery turns up. The prompt is the
-        fallback for when neither works, and -HomeAssistantUrl still overrides
-        everything.
+        A failed probe does not authorize moving saved credentials. Discovery and a
+        URL prompt are only for an unconfigured setup; -HomeAssistantUrl is the
+        deliberate way to change an existing endpoint, including in automation.
 
         -Probe, -Discover and -Prompt are injectable so the decision is testable
         without a Home Assistant on the network.
@@ -1318,13 +1346,15 @@ function Resolve-BridgeHomeAssistantUrl {
     if (-not $Discover) { $Discover = { Find-HomeAssistant } }
 
     $configured = ([string]$Configured).Trim().TrimEnd('/')
-    if ($configured -and (& $Probe $configured)) {
-        return [pscustomobject]@{ Url = $configured; Source = 'config'; Prompted = $false }
+    if ($configured) {
+        $configured = ConvertTo-BridgeHomeAssistantUrl -Value $configured
+        $source = if (& $Probe $configured) { 'config' } else { 'unverified' }
+        return [pscustomobject]@{ Url = $configured; Source = $source; Prompted = $false }
     }
 
     $found = & $Discover
     if ($found) {
-        return [pscustomobject]@{ Url = ([string]$found).TrimEnd('/'); Source = 'discovered'; Prompted = $false }
+        return [pscustomobject]@{ Url = (ConvertTo-BridgeHomeAssistantUrl -Value $found); Source = 'discovered'; Prompted = $false }
     }
 
     if (-not $Prompt) {
@@ -1332,83 +1362,8 @@ function Resolve-BridgeHomeAssistantUrl {
     }
     $answer = ([string](& $Prompt $configured)).Trim().TrimEnd('/')
     if (-not $answer) { $answer = $configured }
+    if ($answer) { $answer = ConvertTo-BridgeHomeAssistantUrl -Value $answer }
     [pscustomobject]@{ Url = $answer; Source = 'typed'; Prompted = $true }
-}
-
-function Test-BridgeSecretFileProtected {
-    <#
-        True when a file is already locked to the current user alone: inheritance off,
-        and exactly one allow rule granting this user full control.
-    #>
-    param([Parameter(Mandatory)][string]$Path)
-
-    try {
-        if (-not (Test-Path -LiteralPath $Path)) { return $false }
-        # macOS: owner read/write and nothing else.
-        if (-not $script:BridgeIsWindows) {
-            return ([IO.File]::GetUnixFileMode($Path) -eq ([IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite))
-        }
-        $acl = Get-Acl -LiteralPath $Path
-        if (-not $acl.AreAccessRulesProtected) { return $false }
-        $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-        $rules = @($acl.Access)
-        if ($rules.Count -ne 1) { return $false }
-        $rule = $rules[0]
-        if ($rule.AccessControlType -ne [System.Security.AccessControl.AccessControlType]::Allow) { return $false }
-        if ($rule.IdentityReference.Translate([System.Security.Principal.SecurityIdentifier]) -ne $me) { return $false }
-        $full = [System.Security.AccessControl.FileSystemRights]::FullControl
-        return (($rule.FileSystemRights -band $full) -eq $full)
-    }
-    catch { return $false }
-}
-
-function Protect-BridgeSecretFile {
-    <#
-        Restricts a file that holds the Home Assistant token to the current user, so
-        another local account cannot read the token off disk. Best-effort by design: a
-        machine with unusual ACL policy must not fail the whole install over this.
-
-        Returns $true when the file ends up with inheritance disabled and no identity
-        other than the current user granted access, so the behaviour is testable.
-
-        The write goes through the .NET API rather than Set-Acl. Set-Acl asks for
-        ACCESS_SYSTEM_SECURITY when the descriptor it is writing is protected, which a
-        normal user does not have (SeSecurityPrivilege) - so every re-install of an
-        already-hardened file failed with a warning, and a genuinely wrong ACL could
-        never be repaired at all. Scoping the write to the Access section does not
-        touch the SACL and needs no privilege.
-    #>
-    param([Parameter(Mandatory)][string]$Path)
-
-    try {
-        if (-not (Test-Path -LiteralPath $Path)) { return $false }
-        # Nothing to do is the common case on a re-install, and rewriting an identical
-        # descriptor is exactly what used to fail.
-        if (Test-BridgeSecretFileProtected -Path $Path) { return $true }
-
-        if (-not $script:BridgeIsWindows) {
-            [IO.File]::SetUnixFileMode($Path, ([IO.UnixFileMode]::UserRead -bor [IO.UnixFileMode]::UserWrite))
-            return (Test-BridgeSecretFileProtected -Path $Path)
-        }
-
-        $me = [System.Security.Principal.WindowsIdentity]::GetCurrent().User
-        $file = Get-Item -LiteralPath $Path -Force
-        $access = [System.Security.AccessControl.AccessControlSections]::Access
-        $acl = [System.IO.FileSystemAclExtensions]::GetAccessControl($file, $access)
-        # Disable inheritance and drop inherited rules, then strip every explicit rule
-        # so only the single current-user grant below remains.
-        $acl.SetAccessRuleProtection($true, $false)
-        @($acl.Access) | ForEach-Object { [void]$acl.RemoveAccessRule($_) }
-        $acl.AddAccessRule((New-Object System.Security.AccessControl.FileSystemAccessRule(
-            $me, 'FullControl', 'Allow')))
-        [System.IO.FileSystemAclExtensions]::SetAccessControl($file, $acl)
-
-        return (Test-BridgeSecretFileProtected -Path $Path)
-    }
-    catch {
-        Write-Host "    note: could not restrict permissions on $(Split-Path $Path -Leaf) ($($_.Exception.Message))" -ForegroundColor Yellow
-        return $false
-    }
 }
 
 # ------------------------------------------------------------------ migration
@@ -1599,17 +1554,20 @@ function Invoke-BridgeLayoutMigration {
 
     if (-not (Test-Path -LiteralPath $BridgeHome)) {
         New-Item -ItemType Directory -Path $BridgeHome -Force | Out-Null
+        if (-not (Protect-BridgeSecretFile -Path $BridgeHome)) { throw 'Could not protect the bridge credential directory.' }
     }
 
     # The config carries the Home Assistant token, so moving it rather than rewriting
     # it from scratch is what keeps an upgrade from prompting all over again.
     if ((Test-Path -LiteralPath $LegacyConfigPath) -and -not (Test-Path -LiteralPath $ConfigPath)) {
         Write-Once; $migrated = $true
-        Move-Item -LiteralPath $LegacyConfigPath -Destination $ConfigPath -Force
+        Copy-BridgeSecretFile -Source $LegacyConfigPath -Destination $ConfigPath
+        Remove-Item -LiteralPath $LegacyConfigPath -Force
         Write-Host "    config -> $ConfigPath"
     }
     if ((Test-Path -LiteralPath "$LegacyConfigPath.bak") -and -not (Test-Path -LiteralPath "$ConfigPath.bak")) {
-        Move-Item -LiteralPath "$LegacyConfigPath.bak" -Destination "$ConfigPath.bak" -Force
+        Copy-BridgeSecretFile -Source "$LegacyConfigPath.bak" -Destination "$ConfigPath.bak"
+        Remove-Item -LiteralPath "$LegacyConfigPath.bak" -Force
     }
 
     # ~/.copilot/mcp and ~/.copilot/codex-bridge are wholly the bridge's.
@@ -2014,20 +1972,21 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
         throw ("PowerShell 7 is required. Install it with:`n    " +
                (Get-BridgeDependencyCommand -Name 'pwsh'))
     }
-    if ($PSBoundParameters.ContainsKey('Token') -and $Token) {
-        throw ("PowerShell 7 is ready at $pwshPath, but -Token is not forwarded to it: a " +
-               "command line is readable by every process on the machine. Re-run there " +
-               "yourself:`n    & '$pwshPath' -NoProfile -File '$PSCommandPath' -Token '<token>'")
+    if (($PSBoundParameters.ContainsKey('Token') -and $Token) -or
+        ($PSBoundParameters.ContainsKey('AgentToken') -and $AgentToken)) {
+        throw ('PowerShell 7 is ready, but token arguments are not forwarded to a child process. ' +
+               'Re-run in PowerShell 7 using the masked prompts or token environment variables.')
     }
 
     Write-Step "Restarting under PowerShell 7 ($pwshPath)"
     $forwarded = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath) +
-                 @(ConvertTo-BridgeArgumentList -BoundParameters $PSBoundParameters -Exclude @('Token'))
+                 @(ConvertTo-BridgeArgumentList -BoundParameters $PSBoundParameters -Exclude @('Token', 'AgentToken'))
     & $pwshPath @forwarded
     exit $LASTEXITCODE
 }
 if (-not (Test-Path -LiteralPath $bridgeHome)) {
     New-Item -ItemType Directory -Path $bridgeHome -Force | Out-Null
+    if (-not (Protect-BridgeSecretFile -Path $bridgeHome)) { throw 'Could not protect the bridge credential directory.' }
 }
 
 $script:DidMigrate = Invoke-BridgeLayoutMigration `
@@ -2071,13 +2030,16 @@ $config = $null
 if ($configExisted) {
     # Never lose a working config to a mistyped re-run - and back it up before reading
     # it, so even an unreadable one is recoverable.
-    Copy-Item $configPath "$configPath.bak" -Force
-    [void](Protect-BridgeSecretFile -Path "$configPath.bak")
+    Copy-BridgeSecretFile -Source $configPath -Destination "$configPath.bak"
     Write-Host "    backed up existing config to $(Split-Path $configPath -Leaf).bak"
 
     $read = Read-BridgeConfigFile -Path $configPath
     if ($read.Config) { $config = $read.Config }
     else {
+        if (-not ($PSBoundParameters.ContainsKey('HomeAssistantUrl') -and $HomeAssistantUrl)) {
+            throw ('The existing configuration could not be read. Repair it, or explicitly supply ' +
+                   '-HomeAssistantUrl to authorize a replacement configuration. The protected backup is retained.')
+        }
         Write-Warning ("$configPath could not be read ($($read.Error)). Starting from the " +
                        "defaults; your previous file is at $(Split-Path $configPath -Leaf).bak.")
         # A config that cannot be read holds no remembered answers either.
@@ -2087,16 +2049,25 @@ if ($configExisted) {
 # Parsed separately rather than reusing $defaults: a fresh install would otherwise
 # merge an object into itself, and every later edit would mutate the defaults too.
 if (-not $config) { $config = $exampleRaw | ConvertFrom-Json }
+$configuredUrl = ''
+if ($configExisted -and $config.PSObject.Properties['homeAssistant'] -and $config.homeAssistant -and
+    $config.homeAssistant.PSObject.Properties['baseUrl']) {
+    $configuredUrl = [string]$config.homeAssistant.baseUrl
+}
 
 # A config from an older version is missing keys this installer reaches straight into.
 $filled = @(Merge-BridgeConfigDefaults -Config $config -Defaults $defaults)
 if ($filled) { Write-Host "    added missing setting(s): $($filled -join ', ')" }
 
 if ($PSBoundParameters.ContainsKey('HomeAssistantUrl') -and $HomeAssistantUrl) {
-    $config.homeAssistant.baseUrl = $HomeAssistantUrl.TrimEnd('/')
+    $config.homeAssistant.baseUrl = ConvertTo-BridgeHomeAssistantUrl -Value $HomeAssistantUrl
 }
 if ($PSBoundParameters.ContainsKey('Token') -and $Token) {
     $config.homeAssistant.token = $Token
+}
+if (($PSBoundParameters.ContainsKey('Token') -and $Token) -or
+    ($PSBoundParameters.ContainsKey('AgentToken') -and $AgentToken)) {
+    Write-Warning 'Token arguments can appear in shell history and process listings. Prefer masked prompts or environment variables.'
 }
 # -AgentToken is deliberately NOT stored here. It is a *candidate* until the agent
 # identity step below has asked Home Assistant who it belongs to: storing it first
@@ -2189,7 +2160,10 @@ if (-not ($PSBoundParameters.ContainsKey('HomeAssistantUrl') -and $HomeAssistant
             Read-Host "    Home Assistant URL [$current]"
         }
     }
-    $resolvedUrl = Resolve-BridgeHomeAssistantUrl -Configured $config.homeAssistant.baseUrl -Prompt $urlPrompt
+    if ($configExisted -and -not $configuredUrl) {
+        throw 'The existing configuration has no Home Assistant URL. Supply -HomeAssistantUrl explicitly before using its credentials.'
+    }
+    $resolvedUrl = Resolve-BridgeHomeAssistantUrl -Configured $configuredUrl -Prompt $urlPrompt
     if ($resolvedUrl.Url) { $config.homeAssistant.baseUrl = $resolvedUrl.Url }
     switch ($resolvedUrl.Source) {
         'config'     { Write-Host "    using $($resolvedUrl.Url) from the existing config" -ForegroundColor Green }
@@ -2202,8 +2176,9 @@ if (-not ($PSBoundParameters.ContainsKey('HomeAssistantUrl') -and $HomeAssistant
 # A long-lived token is sent on every request, so over plain HTTP it crosses the
 # network in the clear. Local Home Assistant installs are usually http, so this warns
 # rather than blocks.
-$base = ([string]$config.homeAssistant.baseUrl).TrimEnd('/')
-if ($base -match '^http://' -and $base -notmatch '^http://(localhost|127\.0\.0\.1|\[::1\])') {
+$base = ConvertTo-BridgeHomeAssistantUrl -Value $config.homeAssistant.baseUrl
+$config.homeAssistant.baseUrl = $base
+if (([Uri]$base).Scheme -eq 'http' -and -not ([Uri]$base).IsLoopback) {
     Write-Warning ("$base is plain HTTP, so the access token is sent unencrypted over your " +
                    'network. Prefer https:// if your Home Assistant has a certificate.')
 }
@@ -2241,7 +2216,7 @@ else {
                 catch { Write-Host "    could not open a browser; visit $profileUrl yourself" -ForegroundColor Yellow }
             }
         }
-        $entered = Read-Host '    Paste the token here'
+        $entered = Read-BridgeSecret -Prompt '    Paste the token here'
         if ([string]::IsNullOrWhiteSpace($entered)) {
             Write-Host '    nothing pasted; giving up on the token for now.' -ForegroundColor DarkGray
             break
@@ -2276,12 +2251,13 @@ if ($homeAssistantReady) {
     # Candidate order: what was passed, then what is already configured, then the
     # environment. Only the check below decides whether any of it is stored.
     $agentTokenValue = ''
+    $persistAgentToken = $false
     if ($PSBoundParameters.ContainsKey('AgentToken') -and $AgentToken) { $agentTokenValue = [string]$AgentToken }
     if (-not $agentTokenValue) { $agentTokenValue = [string]$config.homeAssistant.agentToken }
+    if ($agentTokenValue) { $persistAgentToken = $true }
     if (-not $agentTokenValue) {
         $agentEnvVar = [string]$config.homeAssistant.agentTokenEnvVar
-        if (-not $agentEnvVar) { $agentEnvVar = 'AGENT_HA_AGENT_TOKEN' }
-        $agentTokenValue = [string][Environment]::GetEnvironmentVariable($agentEnvVar)
+        if ($agentEnvVar) { $agentTokenValue = [string][Environment]::GetEnvironmentVariable($agentEnvVar) }
     }
 
     if (-not $agentTokenValue -and -not $NonInteractive -and (Test-BridgeConsoleInteractive)) {
@@ -2294,14 +2270,18 @@ if ($homeAssistantReady) {
             Write-Host '       call it Copilot, and leave it a non-administrator'
             Write-Host '    2. Log in as that user (a private browser window is easiest)'
             Write-Host '    3. On its profile, Security -> Long-lived access tokens -> Create token'
-            $enteredAgent = Read-Host '    Paste the agent token here (Enter to skip)'
-            if (-not [string]::IsNullOrWhiteSpace($enteredAgent)) { $agentTokenValue = $enteredAgent.Trim() }
+            $enteredAgent = Read-BridgeSecret -Prompt '    Paste the agent token here (Enter to skip)'
+            if (-not [string]::IsNullOrWhiteSpace($enteredAgent)) {
+                $agentTokenValue = $enteredAgent.Trim()
+                $persistAgentToken = $true
+            }
         }
     }
 
     if ($agentTokenValue) {
         Write-Step 'Checking the agent account'
-        $identity = Resolve-BridgeAgentIdentity -BaseUrl $base -AgentToken $agentTokenValue -OwnToken $effectiveToken
+        $identity = Resolve-BridgeAgentIdentity -BaseUrl $base -AgentToken $agentTokenValue -OwnToken $effectiveToken `
+            -EnvironmentOnly:(-not $persistAgentToken)
         if ($identity.Store) {
             $config.homeAssistant.agentToken = $identity.Token
             # Written from the token, never asked for: this is the step that used to
@@ -2334,14 +2314,16 @@ else {
 }
 
 Write-Step "Writing bridge config to $configPath"
-$config | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $configPath -Encoding UTF8
-# The token lives here; keep it readable only by the current user and out of any
-# shared listing.
-[void](Protect-BridgeSecretFile -Path $configPath)
+Write-BridgeSecretFile -Path $configPath -Content ($config | ConvertTo-Json -Depth 8)
+$hasAgentToken = -not [string]::IsNullOrWhiteSpace([string]$config.homeAssistant.agentToken)
+if (-not $hasAgentToken -and $config.homeAssistant.agentTokenEnvVar) {
+    $hasAgentToken = -not [string]::IsNullOrWhiteSpace(
+        [Environment]::GetEnvironmentVariable([string]$config.homeAssistant.agentTokenEnvVar))
+}
 Write-Host "    baseUrl      : $($config.homeAssistant.baseUrl)"
 Write-Host "    token        : $(if ($config.homeAssistant.token) { 'set in config' } else { "from `$env:$($config.homeAssistant.tokenEnvVar)" })"
 Write-Host "    agent account: $(
-    if ($config.homeAssistant.agentToken -and @($config.homeAssistant.agentUserIds).Count) { 'set - agent-driven sessions are marked' }
+    if ($hasAgentToken -and @($config.homeAssistant.agentUserIds).Count) { 'set - agent-driven sessions are marked' }
     elseif ($config.homeAssistant.agentToken -or @($config.homeAssistant.agentUserIds).Count) { 'half set - see the warning below' }
     else { 'none - an agent drives the bridge as you' })"
 Write-Host "    notifications: $(if ($config.notifications.enabled) { $config.notifications.service } else { 'disabled' })"
@@ -2490,7 +2472,7 @@ if ($selectedClients -contains 'copilot') {
     Write-Host "    $hookConfigPath"
     if (Install-BridgeAgentInstructions -Path $agentInstructionsPath `
             -EnvVarName ([string]$config.homeAssistant.agentTokenEnvVar) `
-            -HasAgentToken:([bool][string]$config.homeAssistant.agentToken)) {
+            -HasAgentToken:$hasAgentToken) {
         Write-Host "    $agentInstructionsPath"
     }
 }
