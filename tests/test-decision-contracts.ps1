@@ -8,6 +8,7 @@ $repo = Split-Path $PSScriptRoot -Parent
 . (Join-Path $repo 'hooks\copilot-hooks.ps1')
 . (Join-Path $repo 'hooks\daemon-agents.ps1')
 . (Join-Path $repo 'hooks\daemon-decisions.ps1')
+. (Join-Path $repo 'hooks\daemon-replies.ps1')
 . (Join-Path $repo 'hooks\decision-inject.ps1')
 . (Join-Path $repo 'hooks\daemon-launch.ps1')
 . (Join-Path $repo 'codex\hooks\codex-session.ps1')
@@ -99,6 +100,96 @@ function Initialize-TestQuestion {
 }
 
 try {
+    & {
+        $script:OwnershipCardReads = 0
+        $script:OwnershipDiagnostics = [Collections.Generic.List[string]]::new()
+        function Get-DaemonEntityState {
+            param($EntityId, $Headers)
+            $script:OwnershipCardReads++
+            [pscustomobject]@{ state = 'Idle'; attributes = [pscustomobject]@{ question = '' } }
+        }
+        function Write-DaemonLog { param($Message) $script:OwnershipDiagnostics.Add([string]$Message) }
+
+        foreach ($kind in @('copilot', 'codex')) {
+            $reader = if ($kind -eq 'copilot') { 'Get-CopilotDecisionMarker' } else { 'Get-CodexApprovalMarker' }
+            $markerPath = if ($kind -eq 'copilot') { Get-CopilotDecisionMarkerPath -SessionId $sid }
+                else { Get-CodexApprovalMarkerPath -SessionId $sid }
+            if (-not [IO.Path]::GetFullPath($markerPath).StartsWith(
+                $env:AGENT_HA_BRIDGE_TEST_ROOT + [IO.Path]::DirectorySeparatorChar,
+                [StringComparison]::OrdinalIgnoreCase)) { throw 'Refusing a marker outside the test sandbox.' }
+            if (Test-Path -LiteralPath $markerPath) { throw 'Refusing an existing ownership fixture.' }
+            $ownerSession = [pscustomobject]@{ SessionId = $sid; Kind = $kind }
+            Test-That "a genuinely absent $kind marker leaves continuation free with real readers" {
+                $null -eq (& $reader -SessionId $sid) -and
+                (Test-DaemonReplyBoxFree -SessionId $sid -Session $ownerSession -State $state -Headers $headers)
+            }
+
+            if ($kind -eq 'copilot') {
+                Write-CopilotDecisionMarker -SessionId $sid -DecisionId 'real-owner' -Question 'Synthetic ownership' -Mode freeform
+            }
+            else { Write-CodexApprovalMarker -SessionId $sid -DecisionId 'real-owner' -Question 'Synthetic ownership' }
+            try {
+                Test-That "a valid pending $kind marker owns input with real readers" {
+                    $script:OwnershipCardReads = 0
+                    $marker = & $reader -SessionId $sid
+                    $marker.DecisionId -ceq 'real-owner' -and
+                    -not (Test-DaemonReplyBoxFree -SessionId $sid -Session $ownerSession -State $state -Headers $headers) -and
+                    $script:OwnershipCardReads -eq 0
+                }
+                if ($script:BridgeIsWindows) {
+                    $locked = [IO.File]::Open($markerPath, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+                    try {
+                        Test-That "an exclusively locked $kind file is unreadable, not absent" {
+                            $script:OwnershipCardReads = 0
+                            $script:OwnershipDiagnostics.Clear()
+                            $null -eq (& $reader -SessionId $sid) -and
+                            -not (Test-DaemonReplyBoxFree -SessionId $sid -Session $ownerSession -State $state -Headers $headers) -and
+                            $script:OwnershipCardReads -eq 0 -and $script:OwnershipDiagnostics.Count -gt 0
+                        }
+                    }
+                    finally { $locked.Dispose() }
+                }
+                else { Write-Host "SKIP  Windows exclusive-sharing $kind read error; directory read errors are covered on every platform" }
+            }
+            finally { Remove-Item -LiteralPath $markerPath -Force }
+
+            foreach ($content in @(
+                @{ Name = 'corrupt'; Text = '{"private-synthetic-payload":' }
+                @{ Name = 'empty'; Text = '' }
+                @{ Name = 'whitespace'; Text = " `r`n " }
+                @{ Name = 'JSON null'; Text = 'null' }
+                @{ Name = 'JSON empty array'; Text = '[]' }
+            )) {
+                [IO.File]::WriteAllText($markerPath, $content.Text)
+                try {
+                    Test-That "a real $($content.Name) $kind marker cannot become free continuation" {
+                        $script:OwnershipCardReads = 0
+                        $script:OwnershipDiagnostics.Clear()
+                        $free = Test-DaemonReplyBoxFree -SessionId $sid -Session $ownerSession -State $state -Headers $headers
+                        -not $free -and [IO.File]::Exists($markerPath) -and $script:OwnershipCardReads -eq 0 -and
+                        $script:OwnershipDiagnostics.Count -gt 0 -and
+                        ($script:OwnershipDiagnostics -join ' ') -notmatch 'private-synthetic-payload'
+                    }
+                }
+                finally { Remove-Item -LiteralPath $markerPath -Force }
+            }
+
+            [void][IO.Directory]::CreateDirectory($markerPath)
+            try {
+                Test-That "a real $kind directory read error is not mistaken for an absent marker" {
+                    $script:OwnershipCardReads = 0
+                    $script:OwnershipDiagnostics.Clear()
+                    -not (Test-DaemonReplyBoxFree -SessionId $sid -Session $ownerSession -State $state -Headers $headers) -and
+                    $script:OwnershipCardReads -eq 0 -and $script:OwnershipDiagnostics.Count -gt 0
+                }
+            }
+            finally { Remove-Item -LiteralPath $markerPath -Force }
+            Test-That "removing the $kind marker restores ordinary unowned continuation" {
+                Test-DaemonReplyBoxFree -SessionId $sid -Session $ownerSession -State $state -Headers $headers
+            }
+        }
+    }
+
     foreach ($eventName in @('PreToolUse', 'UserPromptSubmit', 'Stop', 'SessionEnd')) {
         Test-That "$eventName invalidates an old Codex approval before any early return" {
             Write-CodexApprovalMarker -SessionId $sid -DecisionId 'old' -Question 'Old approval'

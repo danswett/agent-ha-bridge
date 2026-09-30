@@ -172,8 +172,12 @@ $script:DaemonAgents = [ordered]@{
         # Codex asks, inside Codex, for its hooks to be trusted once; that is left to the user.
         SetupNote = { ' Open Codex once and approve the agent-ha-bridge hooks so its sessions show here.' }
         ApprovalMarker = {
-            param($SessionId)
-            if (-not $script:CodexAdapterLoaded) { return $null }
+            param($SessionId, [bool]$RequireReadable = $false)
+            if (-not $script:CodexAdapterLoaded) {
+                if ($RequireReadable) { throw 'Codex approval state reader is unavailable.' }
+                return $null
+            }
+            if ($RequireReadable) { return Get-CodexApprovalMarker -SessionId $SessionId -RequireReadable }
             Get-CodexApprovalMarker -SessionId $SessionId
         }
         # Codex reports its own status: a turn begins at UserPromptSubmit and ends at

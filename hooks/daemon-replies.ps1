@@ -347,9 +347,9 @@ function Test-DaemonReplyBoxFree {
     $sessionId = $SessionId
     $ownsInput = {
         try {
-            if ($null -ne (Get-CopilotDecisionMarker -SessionId $sessionId)) { return $true }
+            if ($null -ne (Get-CopilotDecisionMarker -SessionId $sessionId -RequireReadable)) { return $true }
             $readApproval = (Get-DaemonAgent -Kind (Get-DaemonEntryKind -Entry $Session)).ApprovalMarker
-            if ($readApproval) { return $null -ne (& $readApproval $sessionId) }
+            if ($readApproval) { return $null -ne (& $readApproval $sessionId $true) }
             $false
         }
         catch {

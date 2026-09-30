@@ -2046,18 +2046,33 @@ function Write-DecisionMarkerFile {
     }
 }
 
-function Get-CopilotDecisionMarker {
-    param([Parameter(Mandatory)][string]$SessionId)
-    $path = Get-CopilotDecisionMarkerPath -SessionId $SessionId
-    if (-not (Test-Path -LiteralPath $path)) { return $null }
+function Read-DecisionMarkerFile {
+    <# Ownership callers require readable state: only a missing file means no owner.
+       Other callers retain best-effort reads without losing the failure diagnostic. #>
+    param([Parameter(Mandatory)][string]$Path, [switch]$RequireReadable)
+
     try {
-        $raw = Get-Content -LiteralPath $path -Raw -Encoding UTF8
-        if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
-        return (ConvertFrom-DecisionJson -Json $raw)
+        $raw = [IO.File]::ReadAllText($Path)
+        if ([string]::IsNullOrWhiteSpace($raw)) { throw [IO.InvalidDataException]::new('Empty marker.') }
+        $marker = ConvertFrom-DecisionJson -Json $raw
+        if ($marker -isnot [System.Management.Automation.PSCustomObject]) {
+            throw [IO.InvalidDataException]::new('Marker is not a JSON object.')
+        }
+        return $marker
     }
+    catch [IO.FileNotFoundException] { return $null }
+    catch [IO.DirectoryNotFoundException] { return $null }
     catch {
+        $message = "Local decision marker is unreadable: $Path"
+        if ($RequireReadable) { throw [IO.InvalidDataException]::new($message, $_.Exception) }
+        Write-DecisionBridgeLog -Message $message
         return $null
     }
+}
+
+function Get-CopilotDecisionMarker {
+    param([Parameter(Mandatory)][string]$SessionId, [switch]$RequireReadable)
+    Read-DecisionMarkerFile -Path (Get-CopilotDecisionMarkerPath -SessionId $SessionId) -RequireReadable:$RequireReadable
 }
 
 function Set-CopilotDecisionMarkerInjected {
