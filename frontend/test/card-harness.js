@@ -44,6 +44,14 @@ class FakeElement {
     if (this._text === '') { this.children = []; }
   }
   get textContent() { return this._text; }
+  // Markup replaces whatever was in the element. The cards use this to build once and
+  // to empty a container before refilling it, and the second is the one that matters:
+  // without it a re-render appended to the old children instead of replacing them.
+  set innerHTML(value) {
+    this._html = String(value);
+    this.children = [];
+  }
+  get innerHTML() { return this._html || ''; }
   // A card writes `el.className = 'row'` and later reads `el.classList`; in a browser
   // those are two views of one thing, so they are here too. Without this a class set
   // at build time was invisible to every classList check.
@@ -92,6 +100,22 @@ function seedStatusParts(slots) {
   }
 }
 
+// The reply card builds an <ha-card>, fills it with markup and then looks its parts
+// up inside it. Seeded for the same reason as the launch card's: a selector the card
+// asks for and the harness does not model comes back null and fails loudly.
+function seedReplyParts(card) {
+  const slots = {};
+  for (const [sel, tag] of [
+    ['textarea', 'textarea'], ['button.attach', 'button'], ['button.send', 'button'],
+    ['.chips', 'div'], ['.status', 'div'], ['input[type=file]', 'input'],
+  ]) {
+    slots[sel] = new FakeElement(tag);
+  }
+  slots.textarea.value = '';
+  card._slots = slots;
+  return card;
+}
+
 // The choices card builds itself by assigning innerHTML, then looks its parts up.
 // The stand-in hands back the same objects for those two selectors.
 function makeShadow() {
@@ -113,7 +137,11 @@ function loadCards() {
   const sandbox = {
     console: { info() {}, log() {} },
     window: { customCards: [] },
-    document: { createElement: (tag) => new FakeElement(tag) },
+    document: {
+      createElement: (tag) => (String(tag).toLowerCase() === 'ha-card'
+        ? seedReplyParts(new FakeElement(tag))
+        : new FakeElement(tag)),
+    },
     customElements: { get: () => undefined, define: () => {}, whenDefined: () => new Promise(() => {}) },
     HTMLElement: class {
       constructor() { this.hidden = false; }
@@ -122,6 +150,15 @@ function loadCards() {
     },
     CustomEvent: class { constructor(type, init) { this.type = type; Object.assign(this, init); } },
     localStorage: { getItem: () => null, setItem: () => {} },
+    // What the reply card needs to upload an image. `fetch` is deliberately a
+    // failing stub: a test that means to exercise the direct-token path replaces it
+    // on the returned sandbox, and one that does not should hear about the attempt.
+    FormData: class {
+      constructor() { this.parts = []; }
+      append(name, value, filename) { this.parts.push({ name, value, filename }); }
+    },
+    URL: { createObjectURL: () => 'blob:stub' },
+    fetch: async () => { throw new Error('fetch was not stubbed'); },
     // The launch card arms a timer while a press is in flight. Recorded rather than
     // run: a real timer would keep the test process alive for its full delay, and
     // nothing here needs it to fire.
@@ -134,10 +171,10 @@ function loadCards() {
   const source = fs.readFileSync(sourcePath, 'utf8');
   const context = vm.createContext(sandbox);
   vm.runInContext(
-    `${source}\n;globalThis.__cards = { AgentBridgeChoicesCard, AgentBridgeSessionCard, AgentBridgeLaunchCard, AgentBridgeStatusCard, CARD_VERSION };`,
+    `${source}\n;globalThis.__cards = { AgentBridgeReplyCard, AgentBridgeChoicesCard, AgentBridgeSessionCard, AgentBridgeLaunchCard, AgentBridgeStatusCard, CARD_VERSION };`,
     context,
     { filename: sourcePath });
   return Object.assign({ sandbox, source }, sandbox.__cards);
 }
 
-module.exports = { FakeClassList, FakeElement, makeShadow, loadCards };
+module.exports = { FakeClassList, FakeElement, makeShadow, seedReplyParts, loadCards };
