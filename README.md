@@ -30,6 +30,7 @@ prompt, so the terminal never stops working and nothing is ever answered twice.
 | **Real forms** | Multi-field questions become one dropdown per field plus a Send button. |
 | **Continuation** | Reply to a finished turn from your phone; it's typed into the session. |
 | **Paste an image** | Paste or attach a screenshot in the reply box and it's attached to the prompt. |
+| **Attach a file** | Attach a document, log or diff the same way; up to 256 KB travels in the reply itself. |
 | **Start a conversation** | A session appears as soon as it opens, so you can send it its first prompt from the dashboard. |
 | **Launch a session** | Pick a workspace, type an opening prompt, press a button — a new CLI session opens on your desktop. |
 | **End a session** | An **End session** row on every card, so sessions don't just accumulate. |
@@ -871,6 +872,18 @@ Get-Content $env:TEMP\agent-bridge-daemon.log -Tail 20
 * **Images go via Home Assistant.** A pasted image is uploaded to Home Assistant, pulled
   down by the daemon, attached to the prompt as `@<path>`, and then deleted from Home
   Assistant. Local copies are kept for a day in case the CLI is slow to read them.
+* **Other files go inside the reply.** `/api/image/upload` decodes what it is given and
+  refuses anything that is not an image, so a document is base64'd into the reply payload
+  instead and written out by the daemon. That puts it in a Home Assistant state attribute,
+  hence the **256 KB** ceiling; a larger file is refused on the card rather than sent. The
+  name is rewritten before it is written to disk — `@<path>` has no quoting, so a space in
+  a file name would split one attachment into two broken words.
+* **A file needs the receiving machine updated too.** The card is one shared resource, so
+  it offers file attachments for every session as soon as any machine has installed this
+  release, while a machine still on an older bridge ignores the `files` in the payload and
+  delivers only the text. Unlike a missing dashboard row this announces itself — the agent
+  answers that it cannot see an attachment — and the fix is to update that machine, which
+  its `button.agent_bridge_<slug>_install_update` does without a shell on it.
 * **Multi-field questions cap at 4 fields**; larger forms fall back to a text outline.
 * **Hooks never wait on a missing Home Assistant.** Each one probes first and skips its
   Home Assistant work if the host doesn't answer within about a second, so an outage

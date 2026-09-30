@@ -95,19 +95,90 @@ Test-That 'once the approval is gone the card is cleared as before' {
 Remove-Item function:Get-DaemonAgent
 $script:Ha = @{}
 
+Write-Host '--- a file attachment that is not an image ---'
+# Images go up to Home Assistant and are fetched back by id. /api/image/upload runs
+# what it is handed through an image decoder and answers 400 for a document, so a .md
+# arrives as bytes inside the payload and is written out here instead.
+$script:AttachRoot = Join-Path ([IO.Path]::GetTempPath()) "test-daemon-attach-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+New-Item -ItemType Directory -Path $script:AttachRoot -Force | Out-Null
+function Get-BridgeAttachmentRoot { $script:AttachRoot }
+
+$plan = "# plan`nchoose B"
+$planB64 = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes($plan))
+function New-PayloadState { param([string]$Stamp, [string]$Text, [object[]]$Files)
+    [pscustomobject]@{ state = $Stamp; attributes = [pscustomobject]@{ text = $Text; files = $Files } }
+}
+
+Test-That 'the payload carries a file alongside the text' {
+    $p = Get-BridgeReplyPayload -State (New-PayloadState -Stamp 'f1' -Text 'thoughts?' -Files @([pscustomobject]@{ name = 'plan.md'; b64 = $planB64 }))
+    $p.Files.Count -eq 1 -and $p.Files[0].Name -eq 'plan.md' -and $p.Files[0].Base64 -eq $planB64
+}
+Test-That 'a file with no bytes is not carried at all' {
+    $p = Get-BridgeReplyPayload -State (New-PayloadState -Stamp 'f2' -Text 'x' -Files @([pscustomobject]@{ name = 'e.md'; b64 = '' }))
+    $p.Files.Count -eq 0
+}
+Test-That 'a file on its own, with no text, is still a submission' {
+    $null -ne (Get-BridgeReplyPayload -State (New-PayloadState -Stamp 'f3' -Text '' -Files @([pscustomobject]@{ name = 'p.md'; b64 = $planB64 })))
+}
+Test-That 'and a payload from a card too old to send files still reads' {
+    $p = Get-BridgeReplyPayload -State ([pscustomobject]@{ state = 'f4'; attributes = [pscustomobject]@{ text = 'hello' } })
+    $null -ne $p -and $p.Files.Count -eq 0
+}
+
+Write-Host '--- a file name that has to be safe to hand the CLI ---'
+# The CLI references an attachment as `@<path>`, which has no quoting, so a space
+# would split one attachment into two broken words. The name comes from a browser, so
+# a separator or a `..` in it would put the file outside the attachment root.
+Test-That 'a space cannot survive into a name the @path syntax must carry' {
+    (Get-BridgeAttachmentFileName -Name 'my notes.md') -notmatch '\s'
+}
+Test-That 'the extension does survive, because the CLI reads the kind from it' {
+    (Get-BridgeAttachmentFileName -Name 'my notes.md').EndsWith('.md')
+}
+Test-That 'a directory the browser sent is dropped' {
+    (Get-BridgeAttachmentFileName -Name 'C:\Users\x\plan.md') -eq 'plan.md'
+}
+Test-That 'and so is a traversal' {
+    (Get-BridgeAttachmentFileName -Name '../../../etc/passwd') -eq 'passwd'
+}
+Test-That 'a name that is only punctuation still yields a usable one' {
+    (Get-BridgeAttachmentFileName -Name '...') -eq 'attachment'
+} (Get-BridgeAttachmentFileName -Name '...')
+Test-That 'an empty name does too' { (Get-BridgeAttachmentFileName -Name '') -eq 'attachment' }
+
+Write-Host '--- writing an inline attachment to disk ---'
+$written = Save-BridgeReplyFile -Name 'my plan.md' -Base64 $planB64
+Test-That 'it lands under the attachment root' { $written.StartsWith($script:AttachRoot) } $written
+Test-That 'carrying the bytes it was sent' { (Get-Content -LiteralPath $written -Raw) -match 'choose B' }
+Test-That 'under a name the @path syntax can carry' { (Split-Path -Leaf $written) -notmatch '\s' } $written
+Test-That 'two replies sending the same name do not overwrite each other' {
+    $a = Save-BridgeReplyFile -Name 'plan.md' -Base64 $planB64
+    $b = Save-BridgeReplyFile -Name 'plan.md' -Base64 $planB64
+    $a -ne $b -and (Test-Path -LiteralPath $a) -and (Test-Path -LiteralPath $b)
+}
+Test-That 'something that is not base64 is refused rather than written' {
+    (Save-BridgeReplyFile -Name 'x.md' -Base64 'not base64 at all!!') -eq ''
+}
+Test-That 'and so is a file past the limit, whatever the card let through' {
+    (Save-BridgeReplyFile -Name 'big.bin' -Base64 ([Convert]::ToBase64String([byte[]]::new(300000)))) -eq ''
+}
+Remove-Item -LiteralPath $script:AttachRoot -Recurse -Force -ErrorAction SilentlyContinue
+
 Write-Host '--- a payload from the reply card ---'
-$script:Replies = @(); $script:Removed = @(); $script:Saved = @()
+$script:Replies = @(); $script:Removed = @(); $script:Saved = @(); $script:Wrote = @()
 function Invoke-DaemonReply { param($SessionId, $Text, $Headers, $DisplayText, [switch]$ClearReplyBox) $script:Replies += [pscustomobject]@{ Text = $Text; StampAtDelivery = $state[$sid].LastReplyPayloadAt }; $true }
 function Save-BridgeReplyAttachment { param($ImageId, $Name, $Headers) $script:Saved += $ImageId; "C:\att\$ImageId.png" }
+function Save-BridgeReplyFile { param($Name, $Base64, $MaxBytes) $script:Wrote += $Name; "C:\att\$Name" }
 function Remove-BridgeHomeAssistantImage { param($ImageId) $script:Removed += $ImageId; 'emitted' }
 function Remove-BridgeStaleAttachment { 'emitted' }
-function Set-Payload { param([string]$Stamp, [string]$Text, [object[]]$Images = @())
-    $script:Ha = @{ "sensor.${node}_reply_payload" = [pscustomobject]@{ state = $Stamp; attributes = [pscustomobject]@{ text = $Text; images = $Images } } }
+function Set-Payload { param([string]$Stamp, [string]$Text, [object[]]$Images = @(), [object[]]$Files = @())
+    $script:Ha = @{ "sensor.${node}_reply_payload" = [pscustomobject]@{ state = $Stamp; attributes = [pscustomobject]@{ text = $Text; images = $Images; files = $Files } } }
 }
 function Get-BridgeReplyPayload { param($State)
     if ($null -eq $State -or -not $State.state) { return $null }
     [pscustomobject]@{ Stamp = [string]$State.state; Text = [string]$State.attributes.text
-        Images = @($State.attributes.images | ForEach-Object { [pscustomobject]@{ Id = $_; Name = "$_.png" } }) }
+        Images = @($State.attributes.images | ForEach-Object { [pscustomobject]@{ Id = $_; Name = "$_.png" } })
+        Files = @($State.attributes.files | ForEach-Object { [pscustomobject]@{ Name = $_; Base64 = 'Yg==' } }) }
 }
 
 $entry = $state[$sid]
@@ -121,6 +192,17 @@ Test-That 'what a call emits never joins the result' { $handled -is [bool] }
 
 $script:Replies = @()
 Test-That 'the same payload is not delivered twice' { (Send-DaemonCardPayload -SessionId $sid -Entry $entry -Headers $headers) -eq $false -and $script:Replies.Count -eq 0 }
+
+$script:Replies = @(); $script:Removed = @()
+Set-Payload -Stamp 't2' -Text 'read this' -Files @('plan.md')
+$handled = Send-DaemonCardPayload -SessionId $sid -Entry $entry -Headers $headers
+Test-That 'a payload carrying a file delivers it as an attachment too' {
+    $handled -eq $true -and $script:Replies.Count -eq 1 -and $script:Replies[0].Text -match '@C:\\att\\plan\.md'
+} $(if ($script:Replies.Count) { $script:Replies[0].Text })
+Test-That 'the file is written out rather than fetched from Home Assistant' {
+    ($script:Wrote -join ',') -eq 'plan.md' -and $script:Removed.Count -eq 0
+}
+
 $script:Ha = @{}
 Test-That 'no payload sensor leaves the text box to do its job' { (Send-DaemonCardPayload -SessionId $sid -Entry $entry -Headers $headers) -eq $false }
 

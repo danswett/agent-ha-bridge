@@ -79,13 +79,31 @@ function Get-BridgeReplyPayload {
         }
     }
 
+    # Anything that is not an image arrives as bytes rather than an id. Home
+    # Assistant's /api/image/upload runs what it is given through an image decoder
+    # and answers 400 for a document, so there is nothing to fetch back by id and the
+    # card base64s the file into this payload instead.
+    $files = [System.Collections.Generic.List[object]]::new()
+    if ($attrs.PSObject.Properties['files'] -and $null -ne $attrs.files) {
+        foreach ($file in @($attrs.files)) {
+            if ($null -eq $file) { continue }
+            $b64 = ''
+            if ($file.PSObject.Properties['b64']) { $b64 = [string]$file.b64 }
+            if ([string]::IsNullOrWhiteSpace($b64)) { continue }
+            $name = ''
+            if ($file.PSObject.Properties['name']) { $name = [string]$file.name }
+            $files.Add([pscustomobject]@{ Name = $name; Base64 = $b64 })
+        }
+    }
+
     # An empty submission is not an error, it is just nothing to do.
-    if ([string]::IsNullOrWhiteSpace($text) -and $images.Count -eq 0) { return $null }
+    if ([string]::IsNullOrWhiteSpace($text) -and $images.Count -eq 0 -and $files.Count -eq 0) { return $null }
 
     [pscustomobject]@{
         Stamp  = $stamp
         Text   = $text
         Images = $images.ToArray()
+        Files  = $files.ToArray()
     }
 }
 
@@ -149,6 +167,91 @@ function Save-BridgeReplyAttachment {
     }
     catch {
         Write-DaemonLog -Message "could not fetch attachment $ImageId : $($_.Exception.Message)"
+        return ''
+    }
+
+    if (-not (Test-Path -LiteralPath $path)) { return '' }
+    $path
+}
+
+function Get-BridgeAttachmentFileName {
+    <#
+        A file name from the reply card, rewritten into one that is safe to hand the
+        CLI as `@<path>`.
+
+        Every part of this is load-bearing. That syntax has no quoting, so a space
+        would split one attachment into two broken words - the same reason
+        Get-BridgeAttachmentRoot refuses a root containing one. The name arrives from
+        a browser, so a directory separator or `..` in it would write the file
+        somewhere other than the attachment root. The extension is kept, and only the
+        extension is trusted to be short, because the CLI decides how to treat an
+        attachment from it.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Name)
+
+    # Greedy, so everything up to the last separator goes - including a `..` segment.
+    $leaf = ([string]$Name) -replace '.*[\\/]', ''
+
+    # An extension is a dot and a few alphanumerics, or it is not one worth keeping.
+    # That also disposes of a trailing dot and of a name that is only punctuation.
+    $extension = [IO.Path]::GetExtension($leaf)
+    if ($extension -notmatch '^\.[0-9A-Za-z]{1,12}$') { $extension = '' }
+
+    $base = [IO.Path]::GetFileNameWithoutExtension($leaf) -replace '[^0-9A-Za-z._-]', '-'
+    $base = $base.Trim('-', '.')
+    if ($base.Length -gt 48) { $base = $base.Substring(0, 48) }
+    if ([string]::IsNullOrWhiteSpace($base)) { $base = 'attachment' }
+
+    "$base$extension"
+}
+
+function Save-BridgeReplyFile {
+    <#
+        Writes one non-image attachment the reply card sent inline.
+
+        Returns the local path, or '' if it could not be written. Images take the
+        other route - uploaded to Home Assistant, fetched back by id - because that
+        endpoint decodes what it is given and answers 400 for anything that is not an
+        image, so a document has nowhere to go but the payload itself.
+
+        The size is checked again here rather than trusted from the card: the card's
+        limit keeps the state machine healthy, and this one is what stops a payload
+        that did not come from the card writing whatever it likes to disk.
+
+        The name is prefixed with a random token so that two replies sending the same
+        file name do not overwrite each other - attachments live for a day, which is
+        long enough for that to happen.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Name,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Base64,
+        [int]$MaxBytes = 262144
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Base64)) { return '' }
+
+    $bytes = $null
+    try { $bytes = [Convert]::FromBase64String($Base64) }
+    catch {
+        Write-DaemonLog -Message "could not decode attachment '$Name': $($_.Exception.Message)"
+        return ''
+    }
+
+    if ($null -eq $bytes -or $bytes.Length -eq 0) { return '' }
+    if ($bytes.Length -gt $MaxBytes) {
+        Write-DaemonLog -Message "attachment '$Name' is $($bytes.Length) bytes, over the $MaxBytes limit"
+        return ''
+    }
+
+    $safe = Get-BridgeAttachmentFileName -Name $Name
+    $token = [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $path = Join-Path (Get-BridgeAttachmentRoot) "$token-$safe"
+
+    try {
+        [IO.File]::WriteAllBytes($path, $bytes)
+    }
+    catch {
+        Write-DaemonLog -Message "could not write attachment '$Name': $($_.Exception.Message)"
         return ''
     }
 
@@ -355,6 +458,17 @@ function Send-DaemonCardPayload {
         if (-not [string]::IsNullOrWhiteSpace($saved)) {
             $paths.Add($saved)
             $fetched.Add($image.Id)
+        }
+    }
+
+    # Guarded rather than read straight through: under StrictMode a payload with no
+    # such property - one an older reply card produced, or a test's own shape - would
+    # throw here and lose a reply that had nothing wrong with it.
+    if ($payload.PSObject.Properties['Files']) {
+        foreach ($file in @($payload.Files)) {
+            if ($null -eq $file) { continue }
+            $written = Save-BridgeReplyFile -Name $file.Name -Base64 $file.Base64
+            if (-not [string]::IsNullOrWhiteSpace($written)) { $paths.Add($written) }
         }
     }
 
