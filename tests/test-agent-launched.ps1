@@ -353,6 +353,34 @@ finally {
     Remove-Item -LiteralPath $script:DaemonConfig.LogFile -Force -ErrorAction SilentlyContinue
 }
 
+Write-Host "`n--- the one rule no code can enforce ---"
+
+# An agent driving the bridge calls Home Assistant itself, so nothing in this
+# repository is on that path and nothing here can make it use the right token. Saying
+# so in AGENTS.md is the only control there is, which makes the wording load-bearing
+# rather than decorative - so it is checked, the way the README's card names are.
+#
+# On 2026-09-29 AGENTS.md said none of this: an agent took the first token out of
+# config.json, launched a session on another machine, and the card came back blue
+# because Home Assistant had recorded the user's account against the press.
+$script:AgentsDoc = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\AGENTS.md') -Raw
+$script:CommonSource = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\hooks\decision-bridge-common.ps1') -Raw
+
+Test-That 'AGENTS.md tells an agent which token to drive the bridge with' {
+    $script:AgentsDoc -match 'AGENT_HA_AGENT_TOKEN'
+}
+Test-That 'and the variable it names is the one the bridge actually hands over' {
+    # Tied to the default in decision-bridge-common.ps1 so renaming one without the
+    # other fails here rather than in someone's session months later.
+    $script:CommonSource -match "agentTokenEnvVar'\s+'AGENT_HA_AGENT_TOKEN'"
+}
+Test-That 'and says plainly which token is not the one to use' {
+    $script:AgentsDoc -match 'homeAssistant\.token'
+}
+Test-That 'and names what silently goes wrong, so the reason survives an edit' {
+    $script:AgentsDoc -match 'agentUserIds' -and $script:AgentsDoc -match 'purple'
+}
+
 if ($script:Failures -gt 0) {
     Write-Host "`n$($script:Failures) failed" -ForegroundColor Red
     exit 1
