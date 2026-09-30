@@ -14,9 +14,27 @@
  * publishes over MQTT rather than writing an entity state, which removes the
  * length cap. Images are uploaded to Home Assistant and referenced by id; the
  * daemon downloads them and attaches them to the prompt.
+ *
+ * Anything that is not an image travels inside the payload itself, base64'd. It
+ * cannot go the way images go: /api/image/upload runs the upload through an image
+ * decoder and answers 400 for a .md, a .log or a .csv, so there is no id to hand
+ * over. The reply is already published over MQTT with no length cap, which leaves
+ * the file bytes somewhere to ride - hence the size limit below, since unlike an
+ * uploaded image these sit in the sensor's attributes.
  */
 
-const CARD_VERSION = '1.20.0';
+const CARD_VERSION = '1.21.0';
+
+/*
+ * How large a non-image attachment may be.
+ *
+ * Images are not counted against this: they are uploaded to Home Assistant and only
+ * their id travels. An inline file, though, becomes base64 (a third larger again) in
+ * an MQTT payload that Home Assistant keeps as a state attribute, so the ceiling is
+ * about being a good citizen of the state machine rather than about any hard limit -
+ * 256 KB carried intact in testing, and covers the documents this is for.
+ */
+const MAX_INLINE_FILE_BYTES = 256 * 1024;
 
 // The working line, in the style of Claude Code's own spinner: its glyph cycle, and a
 // word picked once per turn. Claude Code does not record which word it chose, so the
@@ -59,6 +77,26 @@ function describeUploadRefusal(status, statusText) {
   return `Home Assistant returned ${status}${statusText ? ` ${statusText}` : ''}`;
 }
 
+function describeSize(bytes) {
+  return bytes >= 1024 ? `${Math.round(bytes / 1024)} KB` : `${bytes} bytes`;
+}
+
+/*
+ * Base64 for the bytes of an inline attachment.
+ *
+ * In chunks because btoa needs a binary string and String.fromCharCode takes the
+ * bytes as arguments: spreading a whole file into one call overflows the argument
+ * stack and throws on anything but a tiny file.
+ */
+function toBase64(bytes) {
+  const CHUNK = 0x8000;
+  let binary = '';
+  for (let i = 0; i < bytes.length; i += CHUNK) {
+    binary += String.fromCharCode.apply(null, bytes.subarray(i, i + CHUNK));
+  }
+  return btoa(binary);
+}
+
 /*
  * A thrown value is not always an Error. home-assistant-js-websocket rejects with
  * bare numbers, so a token renewal Home Assistant turned down arrived here as the
@@ -78,6 +116,7 @@ class AgentBridgeReplyCard extends HTMLElement {
     this.attachShadow({ mode: 'open' });
     this._built = false;
     this._images = [];
+    this._files = [];
     this._busy = false;
     this._statusTimer = null;
   }
@@ -172,6 +211,12 @@ class AgentBridgeReplyCard extends HTMLElement {
         color: var(--primary-text-color, #fff);
       }
       .chip img { width: 28px; height: 28px; object-fit: cover; border-radius: 11px; display: block; background: var(--divider-color, #444); }
+      .chip ha-icon {
+        --mdc-icon-size: 18px;
+        width: 28px; height: 28px; border-radius: 11px;
+        display: flex; align-items: center; justify-content: center;
+        background: var(--divider-color, #444); color: var(--primary-text-color, #fff);
+      }
       .chip .x { cursor: pointer; opacity: 0.6; padding: 0 3px; }
       .chip .x:hover { opacity: 1; }
       .status { margin-top: 8px; font-size: 12px; min-height: 1em; }
@@ -187,14 +232,14 @@ class AgentBridgeReplyCard extends HTMLElement {
       <div class="row">
         <textarea part="input"></textarea>
         <div class="actions">
-          <button class="ghost attach" title="Attach an image"><ha-icon icon="mdi:paperclip"></ha-icon></button>
+          <button class="ghost attach" title="Attach a file"><ha-icon icon="mdi:paperclip"></ha-icon></button>
           <button class="send">Send</button>
         </div>
       </div>
       <div class="chips"></div>
       <div class="status"></div>
-      <div class="hint">Paste or attach an image to send it with your reply.</div>
-      <input type="file" accept="image/*" multiple />
+      <div class="hint">Paste or attach an image or file to send it with your reply.</div>
+      <input type="file" multiple />
     `;
 
     this.shadowRoot.appendChild(style);
@@ -243,13 +288,16 @@ class AgentBridgeReplyCard extends HTMLElement {
     const items = (event.clipboardData && event.clipboardData.items) || [];
     const files = [];
     for (const item of items) {
-      if (item.kind === 'file' && item.type && item.type.startsWith('image/')) {
+      // Any pasted file, not only an image: a document copied from a file manager
+      // arrives here exactly as a screenshot does. `kind` is what keeps this safe -
+      // pasted text and rich text are 'string' items and are left well alone.
+      if (item.kind === 'file') {
         const file = item.getAsFile();
         if (file) { files.push(file); }
       }
     }
     if (files.length) {
-      // Only swallow the paste when it carried an image; a plain text paste must
+      // Only swallow the paste when it carried a file; a plain text paste must
       // still land in the textarea normally.
       event.preventDefault();
       this._ingest(files);
@@ -257,24 +305,53 @@ class AgentBridgeReplyCard extends HTMLElement {
   }
 
   async _ingest(files) {
-    const images = files.filter((f) => f.type && f.type.startsWith('image/'));
-    if (!images.length) { return; }
+    const usable = files.filter((f) => f && (f.name || f.type));
+    if (!usable.length) { return; }
 
     this._busy = true;
     this._syncSendState();
-    for (const file of images) {
-      this._setStatus(`Uploading ${file.name || 'image'}...`, 'busy');
+    for (const file of usable) {
+      const isImage = !!(file.type && file.type.startsWith('image/'));
+      const label = file.name || (isImage ? 'image' : 'file');
+      this._setStatus(`${isImage ? 'Uploading' : 'Reading'} ${label}...`, 'busy');
       try {
-        const uploaded = await this._upload(file);
-        this._images.push(uploaded);
+        if (isImage) { this._images.push(await this._upload(file)); }
+        else { this._files.push(await this._read(file)); }
         this._renderChips();
         this._setStatus('', '');
       } catch (err) {
-        this._setStatus(`Upload failed: ${describeThrown(err)}`, 'err');
+        this._setStatus(`${isImage ? 'Upload' : 'Attach'} failed: ${describeThrown(err)}`, 'err');
       }
     }
     this._busy = false;
     this._syncSendState();
+  }
+
+  /*
+   * Reads a non-image attachment into the payload.
+   *
+   * The length is checked twice on purpose. A File's `size` is metadata, and the
+   * cheap check keeps a large file from being read into memory at all; the one
+   * after the read is the one that is actually true, because a file growing between
+   * being picked and being read is exactly the case the first check cannot see.
+   */
+  async _read(file) {
+    const tooBig = (n) => new Error(
+      `${describeSize(n)} is over the ${describeSize(MAX_INLINE_FILE_BYTES)} limit for a file attachment`);
+
+    if (typeof file.size === 'number' && file.size > MAX_INLINE_FILE_BYTES) { throw tooBig(file.size); }
+    if (typeof file.arrayBuffer !== 'function') { throw new Error('this browser cannot read that file'); }
+
+    const bytes = new Uint8Array(await file.arrayBuffer());
+    if (bytes.length > MAX_INLINE_FILE_BYTES) { throw tooBig(bytes.length); }
+    if (!bytes.length) { throw new Error('that file is empty'); }
+
+    return {
+      name: file.name || 'attachment',
+      content_type: file.type || 'application/octet-stream',
+      size: bytes.length,
+      b64: toBase64(bytes),
+    };
   }
 
   async _upload(file) {
@@ -355,9 +432,6 @@ class AgentBridgeReplyCard extends HTMLElement {
   _renderChips() {
     this._els.chips.innerHTML = '';
     this._images.forEach((img, index) => {
-      const chip = document.createElement('div');
-      chip.className = 'chip';
-
       const thumb = document.createElement('img');
       thumb.alt = img.name;
       // The serve endpoint needs auth, so the thumbnail is fetched as a blob
@@ -366,31 +440,47 @@ class AgentBridgeReplyCard extends HTMLElement {
         .then((r) => (r.ok ? r.blob() : null))
         .then((b) => { if (b) { thumb.src = URL.createObjectURL(b); } })
         .catch(() => {});
-
-      const label = document.createElement('span');
-      label.textContent = img.name.length > 18 ? `${img.name.slice(0, 15)}...` : img.name;
-
-      const remove = document.createElement('span');
-      remove.className = 'x';
-      remove.textContent = '\u2715';
-      remove.title = 'Remove';
-      remove.addEventListener('click', () => {
-        this._images.splice(index, 1);
-        this._renderChips();
-        this._syncSendState();
-      });
-
-      chip.appendChild(thumb);
-      chip.appendChild(label);
-      chip.appendChild(remove);
-      this._els.chips.appendChild(chip);
+      this._addChip(this._images, index, img.name, img.name, thumb);
     });
+    this._files.forEach((file, index) => {
+      // Nothing to show a thumbnail of, so an icon stands in. The size goes in the
+      // tooltip rather than the label: it is the one thing about a file attachment
+      // that can get it refused, and the name is what identifies it.
+      const icon = document.createElement('ha-icon');
+      icon.setAttribute('icon', 'mdi:file-document-outline');
+      this._addChip(this._files, index, file.name, `${file.name} (${describeSize(file.size)})`, icon);
+    });
+  }
+
+  _addChip(list, index, name, title, leading) {
+    const chip = document.createElement('div');
+    chip.className = 'chip';
+    chip.setAttribute('title', title);
+
+    const label = document.createElement('span');
+    label.textContent = name.length > 18 ? `${name.slice(0, 15)}...` : name;
+
+    const remove = document.createElement('span');
+    remove.className = 'x';
+    remove.textContent = '\u2715';
+    remove.title = 'Remove';
+    remove.addEventListener('click', () => {
+      list.splice(index, 1);
+      this._renderChips();
+      this._syncSendState();
+    });
+
+    chip.appendChild(leading);
+    chip.appendChild(label);
+    chip.appendChild(remove);
+    this._els.chips.appendChild(chip);
   }
 
   _syncSendState() {
     if (!this._els) { return; }
     const hasText = this._els.textarea.value.trim().length > 0;
-    this._els.send.disabled = this._busy || (!hasText && this._images.length === 0);
+    this._els.send.disabled = this._busy
+      || (!hasText && this._images.length === 0 && this._files.length === 0);
   }
 
   _setStatus(text, kind) {
@@ -407,7 +497,7 @@ class AgentBridgeReplyCard extends HTMLElement {
     // Read straight from the element. This is the whole point of the card: the
     // value cannot be stale because nothing had to commit it first.
     const text = this._els.textarea.value;
-    if (!text.trim() && this._images.length === 0) { return; }
+    if (!text.trim() && this._images.length === 0 && this._files.length === 0) { return; }
 
     this._busy = true;
     this._syncSendState();
@@ -417,6 +507,7 @@ class AgentBridgeReplyCard extends HTMLElement {
       at: new Date().toISOString(),
       text: text,
       images: this._images.map((i) => ({ id: i.id, name: i.name, content_type: i.content_type })),
+      files: this._files.map((f) => ({ name: f.name, content_type: f.content_type, b64: f.b64 })),
       card_version: CARD_VERSION,
     };
 
@@ -429,6 +520,7 @@ class AgentBridgeReplyCard extends HTMLElement {
       });
       this._els.textarea.value = '';
       this._images = [];
+      this._files = [];
       this._renderChips();
       this._setStatus('Sent', 'ok');
     } catch (err) {
@@ -1787,7 +1879,7 @@ window.customCards = window.customCards || [];
 window.customCards.push({
   type: 'agent-bridge-reply-card',
   name: 'Agent Bridge Reply',
-  description: 'Reply box for a bridged coding-agent session, with image attachments.',
+  description: 'Reply box for a bridged coding-agent session, with image and file attachments.',
 });
 window.customCards.push({
   type: 'agent-bridge-activity-card',

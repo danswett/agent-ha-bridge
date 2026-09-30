@@ -774,6 +774,7 @@ check('"machines" is required', (() => {
     const card = new AgentBridgeReplyCard();
     card.setConfig({ topic: 'copilot/cli/session/abc/replypayload' });
     const tried = [];
+    const published = [];
     replyLoad.sandbox.fetch = async () => { tried.push('direct'); return direct(); };
     card.hass = {
       auth: {
@@ -786,9 +787,9 @@ check('"machines" is required', (() => {
         },
       },
       fetchWithAuth: async () => { tried.push('hass'); return viaHass(); },
-      callService: async () => {},
+      callService: async (domain, service, data) => { published.push({ domain, service, data }); },
     };
-    return { card, tried, status: () => card._els.status.textContent };
+    return { card, tried, published, status: () => card._els.status.textContent };
   }
 
   const ok = () => ({ ok: true, status: 200, json: async () => ({ id: 'img1', name: 'shot.png', content_type: 'image/png' }) });
@@ -837,10 +838,81 @@ check('"machines" is required', (() => {
   check('and any other refusal still names what came back',
     /500 Internal Server Error/.test(r.status()), r.status());
 
+  // --- attaching something that is not an image -----------------------------------
+  //
+  // A document cannot travel the way an image does: /api/image/upload runs whatever
+  // it is handed through an image decoder and answers 400 for a .md, a .log or a
+  // .csv, so there is no id to put in the payload. Until this, the picker did not
+  // offer them and _ingest dropped them without a word - the file had to go via
+  // cloud storage and come back on the desktop's filesystem instead. They now ride
+  // inside the payload itself, which is already published over MQTT with no length
+  // cap, and the daemon writes them out next to the downloaded images.
+  console.log('');
+  console.log('--- attaching a file that is not an image ---');
+
+  const doc = (name, text, type) => ({
+    name,
+    type: type === undefined ? 'text/markdown' : type,
+    size: Buffer.byteLength(text, 'utf8'),
+    arrayBuffer: async () => Buffer.from(text, 'utf8'),
+  });
+  const sentFiles = (published) => (published[0] && published[0].data
+    ? JSON.parse(published[0].data.payload).files
+    : []);
+
   r = replyCard({ viaHass: ok, direct: ok });
-  await r.card._ingest([{ name: 'notes.txt', type: 'text/plain' }]);
-  check('something that is not an image is not uploaded at all',
+  await r.card._ingest([doc('notes.md', '# hello')]);
+  check('a document is never sent to the image endpoint',
     r.tried.length === 0 && r.card._images.length === 0, r.tried.join(','));
+  check('it is carried in the payload as base64 instead',
+    r.card._files.length === 1
+      && r.card._files[0].name === 'notes.md'
+      && Buffer.from(r.card._files[0].b64, 'base64').toString('utf8') === '# hello',
+    JSON.stringify(r.card._files));
+  check('and nothing is reported as gone wrong', r.status() === '', r.status());
+  check('a file on its own is enough to enable Send', r.card._els.send.disabled === false);
+
+  await r.card._send();
+  check('the published reply carries the file', sentFiles(r.published).length === 1,
+    JSON.stringify(r.published));
+  check('with its bytes intact after the round trip through JSON',
+    Buffer.from(sentFiles(r.published)[0].b64, 'base64').toString('utf8') === '# hello');
+  check('and the card is emptied, so the next reply does not resend it',
+    r.card._files.length === 0 && r.card._els.textarea.value === '');
+
+  // Both routes at once, because they are chosen per file rather than per send.
+  r = replyCard({ viaHass: ok, direct: ok });
+  await r.card._ingest([PNG, doc('notes.md', 'hi')]);
+  check('an image and a document in one attach each take their own route',
+    r.card._images.length === 1 && r.card._files.length === 1,
+    `${r.card._images.length} image(s), ${r.card._files.length} file(s)`);
+
+  // Unlike an uploaded image, an inline file sits in a Home Assistant state
+  // attribute, so it has a ceiling - and being told about it beats a reply that
+  // looks sent and never arrives.
+  r = replyCard({ viaHass: ok, direct: ok });
+  await r.card._ingest([doc('huge.log', 'x'.repeat(256 * 1024 + 1))]);
+  check('a file over the limit says so in words', /over the 256 KB limit/.test(r.status()), r.status());
+  check('and is not attached', r.card._files.length === 0);
+
+  // size is metadata. A file that grew after being picked reports the old length,
+  // which is why the length that decides is the one measured after the read.
+  r = replyCard({ viaHass: ok, direct: ok });
+  await r.card._ingest([{
+    name: 'liar.md', type: 'text/markdown', size: 10,
+    arrayBuffer: async () => Buffer.alloc(256 * 1024 + 1, 0x61),
+  }]);
+  check('a file that under-reports its size is still caught, after the read',
+    /over the/.test(r.status()), r.status());
+  check('and it is not attached either', r.card._files.length === 0);
+
+  r = replyCard({ viaHass: ok, direct: ok });
+  await r.card._ingest([doc('empty.md', '')]);
+  check('an empty file is refused rather than attached as nothing',
+    r.card._files.length === 0 && /empty/.test(r.status()), r.status());
+
+  check('the file picker no longer limits itself to images',
+    !/accept="image\/\*"/.test(source) && /<input type="file" multiple/.test(source));
 
   check('the element is registered under its own name',
     /customElements\.define\('agent-bridge-reply-card'/.test(source));

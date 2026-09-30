@@ -158,6 +158,10 @@ function loadCards() {
       append(name, value, filename) { this.parts.push({ name, value, filename }); }
     },
     URL: { createObjectURL: () => 'blob:stub' },
+    // Non-image attachments are base64'd into the payload rather than uploaded,
+    // because /api/image/upload refuses anything that is not an image.
+    btoa: (s) => Buffer.from(s, 'binary').toString('base64'),
+    Uint8Array,
     fetch: async () => { throw new Error('fetch was not stubbed'); },
     // The launch card arms a timer while a press is in flight. Recorded rather than
     // run: a real timer would keep the test process alive for its full delay, and
