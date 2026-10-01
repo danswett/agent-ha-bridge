@@ -14,6 +14,9 @@
       * Invoke-PendingStops - the press-timestamp contract shared with the Submit and
         Launch buttons: one press acts once, a retained press from a previous run is
         ignored, and a session that is not live is never touched.
+      * The confirmation a session that is not idle asks for: one press arms and says
+        so, a second within the window ends it, and a confirmation nobody makes in
+        time lapses rather than leaving the card asking.
       * The stop button is published, cleared with the rest of the session, and
         carries a deterministic entity id.
 #>
@@ -138,27 +141,35 @@ function Stop-BridgeCopilotSession {
 function Set-CopilotMqttActivity {
     param([string]$SessionId, [string]$Summary, $Detail, [hashtable]$Headers)
     $script:Activity += $Summary
+    $script:ActivityDetail = $Detail
 }
 
 $node = Get-CopilotMqttNodeId -SessionId 'aaaaaaaa-1111-2222-3333-444444444444'
+$sid = 'aaaaaaaa-1111-2222-3333-444444444444'
 
 function Reset-PressTest {
-    param([string]$Press, [bool]$Live = $true)
+    # Status defaults to idle: the press-timestamp checks below are about the press,
+    # not about the confirmation a session that is still working asks for.
+    param([string]$Press, [bool]$Live = $true, [string]$Status = 'idle')
     $script:Stopped = @()
     $script:Activity = @()
+    $script:ActivityDetail = $null
+    $script:DaemonStopArmed = @{}
     $script:DaemonStartedAt = [DateTimeOffset]::Parse('2026-01-01T00:00:00Z')
     $script:HaStates = @{ "button.${node}_stop" = $Press }
-    $state = @{ 'aaaaaaaa-1111-2222-3333-444444444444' = [pscustomobject]@{ Name = 'S'; Offset = 0 } }
+    $entry = [pscustomobject]@{ Name = 'S'; Offset = 0 }
+    if ($Status) { $entry | Add-Member -NotePropertyName Status -NotePropertyValue $Status }
+    $state = @{ $sid = $entry }
     $liveSet = @{}
     if ($Live) {
-        $liveSet['aaaaaaaa-1111-2222-3333-444444444444'] = [pscustomobject]@{ SessionId = 'aaaaaaaa-1111-2222-3333-444444444444'; ProcessId = 999 }
+        $liveSet[$sid] = [pscustomobject]@{ SessionId = $sid; ProcessId = 999 }
     }
     @{ State = $state; Live = $liveSet }
 }
 
 $ctx = Reset-PressTest -Press '2026-06-01T12:00:00+00:00'
 Invoke-PendingStops -Headers $headers -State $ctx.State -Live $ctx.Live
-Test-That 'a fresh press ends the session' { $script:Stopped.Count -eq 1 }
+Test-That 'a fresh press ends an idle session' { $script:Stopped.Count -eq 1 }
 Test-That 'it passes the live process id' { $script:Stopped[0].ProcessId -eq 999 }
 Test-That 'it shows progress on the card' { ($script:Activity -join ' ') -match 'Ending' }
 
@@ -183,6 +194,101 @@ $ctx = Reset-PressTest -Press '2026-06-01T12:00:00+00:00'
 $script:HaStates = @{}
 Invoke-PendingStops -Headers $headers -State $ctx.State -Live $ctx.Live
 Test-That 'a missing stop button is survived' { $script:Stopped.Count -eq 0 }
+
+# --- the confirmation ------------------------------------------------------------
+
+Write-Host ''
+Write-Host '--- a session that is not idle takes two presses ---'
+# End sits a tap away from Send on the card, and a stray tap mid-turn throws away the
+# turn in flight. The transcript survives and the session resumes, but what it was
+# doing does not come back.
+
+$ctx = Reset-PressTest -Press '2026-06-01T12:00:00+00:00' -Status 'working'
+Invoke-PendingStops -Headers $headers -State $ctx.State -Live $ctx.Live
+Test-That 'one press does not end a working session' { $script:Stopped.Count -eq 0 }
+Test-That 'the card asks for a second press' {
+    $script:Activity[-1] -eq $script:CopilotEndSessionConfirmNote
+}
+Test-That 'and says what the second press would interrupt' {
+    "$($script:ActivityDetail.hint)" -match 'still working'
+}
+Test-That 'the session is left alone, not marked ending' { [string]$ctx.State[$sid].Status -eq 'working' }
+
+# The second press is a different press, so the press-stamp contract sees it.
+$script:HaStates["button.${node}_stop"] = '2026-06-01T12:00:04+00:00'
+Invoke-PendingStops -Headers $headers -State $ctx.State -Live $ctx.Live
+Test-That 'a second press within the window ends it' { $script:Stopped.Count -eq 1 }
+Test-That 'and the confirmation is spent, not left armed' { $script:DaemonStopArmed.Count -eq 0 }
+
+# A session the daemon has not classified yet may well be mid-turn, so it is guarded
+# too: asking for a second press is the direction that cannot lose work.
+$ctx = Reset-PressTest -Press '2026-06-01T12:00:00+00:00' -Status ''
+Invoke-PendingStops -Headers $headers -State $ctx.State -Live $ctx.Live
+Test-That 'a session with no status yet is guarded as well' { $script:Stopped.Count -eq 0 }
+Test-That 'and is described honestly rather than guessed at' {
+    "$($script:ActivityDetail.hint)" -match 'still working'
+}
+
+Write-Host ''
+Write-Host '--- a confirmation nobody makes in time lapses ---'
+
+$ctx = Reset-PressTest -Press '2026-06-01T12:00:00+00:00' -Status 'waiting'
+Invoke-PendingStops -Headers $headers -State $ctx.State -Live $ctx.Live
+Test-That 'a waiting session is guarded too' { $script:Stopped.Count -eq 0 }
+Test-That 'and the prompt names what it is waiting on' {
+    "$($script:ActivityDetail.hint)" -match 'waiting on you'
+}
+
+# Backdated rather than slept through: the window is the daemon's own clock.
+$script:DaemonStopArmed[$sid].At = [DateTimeOffset]::Now.AddSeconds(-($script:DaemonConfig.StopConfirmSeconds + 1))
+Test-That 'it no longer reads as armed' { -not (Test-DaemonStopArmed -SessionId $sid) }
+Clear-DaemonExpiredStopArms -Headers $headers -State $ctx.State
+Test-That 'the sweep disarms it' { $script:DaemonStopArmed.Count -eq 0 }
+Test-That 'and the card says so rather than going on asking' {
+    $script:Activity[-1] -eq $script:CopilotEndSessionLapsedNote
+}
+# A card left asking for a second press would be asking for something that had
+# quietly stopped confirming anything and become a fresh first press.
+$script:HaStates["button.${node}_stop"] = '2026-06-01T12:00:30+00:00'
+Invoke-PendingStops -Headers $headers -State $ctx.State -Live $ctx.Live
+Test-That 'a press after it lapsed arms again rather than ending' { $script:Stopped.Count -eq 0 }
+Test-That 'and asks once more' { $script:Activity[-1] -eq $script:CopilotEndSessionConfirmNote }
+
+# A session that has gone while armed must not be reported on; its card is already
+# being retired.
+Set-DaemonStopArm -SessionId $sid -Status 'working'
+$script:DaemonStopArmed[$sid].At = [DateTimeOffset]::Now.AddMinutes(-5)
+$script:Activity = @()
+Clear-DaemonExpiredStopArms -Headers $headers -State @{}
+Test-That 'a session that has gone is still disarmed' { $script:DaemonStopArmed.Count -eq 0 }
+Test-That 'but nothing is published to its retired card' { $script:Activity.Count -eq 0 }
+
+Write-Host ''
+Write-Host '--- the prompt stays up while the transcript keeps flowing ---'
+# Ten seconds is not long to notice a line that the next batch of tool output would
+# otherwise wipe, which made the press look as though it had done nothing.
+
+$script:DaemonStopArmed = @{}
+Set-DaemonStopArm -SessionId $sid -Status 'waiting'
+# Not $detail: Test-That declares a [string]$Detail parameter, and a script block it
+# runs resolves the name in *its* scope, so the hashtable would arrive as ''.
+$cardDetail = @{ response = 'half a sentence' }
+Test-That 'the status line is taken over while armed' {
+    (Get-DaemonCardSummary -SessionId $sid -Summary 'Running: grep' -Detail $cardDetail) -eq $script:CopilotEndSessionConfirmNote
+}
+Test-That 'the rest of the card stays live underneath' { $cardDetail.response -eq 'half a sentence' }
+Test-That 'and the prompt carries its own hint' { "$($cardDetail.hint)" -match 'lapses in' }
+# The status the user was told about at the press, not whatever the session has moved
+# on to since: rewriting the question underneath them would be worse than slightly
+# stale.
+Test-That 'the hint keeps saying what the press was answered about' {
+    "$($cardDetail.hint)" -match 'waiting on you'
+}
+
+$script:DaemonStopArmed = @{}
+Test-That 'an unarmed session reports what it is doing, as before' {
+    (Get-DaemonCardSummary -SessionId $sid -Summary 'Running: grep' -Detail @{}) -eq 'Running: grep'
+}
 
 # --- discovery payloads ----------------------------------------------------------
 

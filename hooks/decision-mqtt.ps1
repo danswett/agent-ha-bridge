@@ -38,6 +38,16 @@ $script:CopilotMqttConfig = @{
 # selector's state against it and the dashboard shows it as the default.
 $script:CopilotMqttNewSessionOption = 'New session'
 
+# What the card's status line says while End session is waiting for the second press
+# that confirms it, and what it says when nobody made one in time.
+#
+# Shared constants rather than two literals, because the daemon publishes them and
+# the dashboard card lists them as the states it renders for: they have to match
+# exactly, and a card listing a string the daemon no longer sends shows nothing at
+# all - silently, which is the worst way for this to break.
+$script:CopilotEndSessionConfirmNote = 'Press End session again to end it'
+$script:CopilotEndSessionLapsedNote = 'End session NOT confirmed'
+
 function Get-CopilotMqttNodeId {
     <#
         A stable, MQTT-safe node id for a session. Discovery topics and object ids
@@ -452,9 +462,10 @@ function Publish-CopilotMqttSession {
     # being able to start work remotely but not stop it means a session that has gone
     # wrong can only be dealt with at the keyboard.
     #
-    # Safe to press: the stop is graceful, and the transcript survives, so the
-    # session stays in the resume list and can be reopened. A mistaken press costs a
-    # window, not the work.
+    # The stop is graceful and the transcript survives, so the session stays in the
+    # resume list and can be reopened - a mistaken press costs a window, not the
+    # work. It does cost the turn in flight, though, which is why a session that is
+    # not idle takes two presses rather than one (Invoke-PendingStops).
     $stopConfig = @{
         name          = 'End session'
         unique_id     = "${node}_stop"

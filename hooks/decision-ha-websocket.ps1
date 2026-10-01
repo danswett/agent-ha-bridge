@@ -1882,6 +1882,10 @@ ha-card {
             'Not sent - answer every field'
             'Answer may be wrong - check the terminal'
             'Ending session...', 'Could not end session'
+            # End session asking for its second press, and giving up on one. Taken from
+            # the constants the daemon publishes rather than written out again here: a
+            # string that matches all but exactly renders as nothing at all, silently.
+            $script:CopilotEndSessionConfirmNote, $script:CopilotEndSessionLapsedNote
         )
         $sendStatusCard = @{
             type = 'conditional'
@@ -1893,7 +1897,7 @@ ha-card {
                 card_mod = @{ style = $bareChild }
                 content = @"
 {% set a = states('$activityEntity') %}{% set d = state_attr('$activityEntity','error') %}{% set h = state_attr('$activityEntity','hint') %}{% set w = state_attr('$activityEntity','waiting_on') %}
-<span style="font-size:0.9em">{% if 'NOT' in a or 'Could not' in a or 'may be wrong' in a %}⚠️ {% elif 'sent' in a %}✅ {% else %}⏳ {% endif %}**{{ a }}**{% if w %} — {{ w }}{% elif h %} — {{ h }}{% elif d %} — {{ d }}{% endif %}</span>
+<span style="font-size:0.9em">{% if a == '$($script:CopilotEndSessionConfirmNote)' or 'NOT' in a or 'Could not' in a or 'may be wrong' in a %}⚠️ {% elif 'sent' in a %}✅ {% else %}⏳ {% endif %}**{{ a }}**{% if w %} — {{ w }}{% elif h %} — {{ h }}{% elif d %} — {{ d }}{% endif %}</span>
 "@
             }
         }

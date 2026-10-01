@@ -46,6 +46,21 @@ function New-LifecycleEvent {
     }
 }
 
+function Confirm-LifecycleStop {
+    <#
+        Puts the sessions in $State past the confirmation a session that is not idle
+        asks for, so a single Invoke-PendingStops below actually ends them.
+
+        Everything here is about what a stop *does* - the error it records, how that
+        survives restart, the statuses it publishes - and every fixture is deliberately
+        fixed at 'working'. Without this they would only ever arm, and the failures
+        these assert on would never happen. The confirmation itself is covered where it
+        belongs, in tests/test-stop-session.ps1.
+    #>
+    param([Parameter(Mandatory)][hashtable]$State)
+    foreach ($id in @($State.Keys)) { Set-DaemonStopArm -SessionId $id -Status 'working' }
+}
+
 try {
     & {
         Write-Host '--- later lifecycle invalidation, without native request IDs ---'
@@ -472,6 +487,7 @@ try {
         try {
             foreach ($kind in @('copilot', 'claude', 'codex')) {
                 $fixture = New-RestorationFixture -Kind $kind
+                Confirm-LifecycleStop -State $fixture.State
                 Invoke-PendingStops -Headers $headers -State $fixture.State -Live $fixture.Live
                 Test-That "the real $kind failed-stop producer records its error and consumed press" {
                     $fixture.State[$fixture.Id].Status -ceq 'error' -and
@@ -587,6 +603,7 @@ try {
                 foreach ($hookRepresentation in @('offset-text', 'utc-text', 'offset-object', 'utc-datetime', 'local-datetime', 'persisted')) {
                     foreach ($timestampCase in $precisionCases) {
                         $fixture = New-RestorationFixture -Kind claude
+                        Confirm-LifecycleStop -State $fixture.State
                         Invoke-PendingStops -Headers $headers -State $fixture.State -Live $fixture.Live
                         if ($hookRepresentation -eq 'persisted') {
                             $fixture.State[$fixture.Id] | Add-Member NativeHookTimeFixture ($timestampCase.At.ToString('o'))
@@ -612,6 +629,7 @@ try {
                 foreach ($registrationRepresentation in @('offset-text', 'utc-text')) {
                     foreach ($timestampCase in $precisionCases) {
                         $fixture = New-RestorationFixture -Kind codex
+                        Confirm-LifecycleStop -State $fixture.State
                         Invoke-PendingStops -Headers $headers -State $fixture.State -Live $fixture.Live
                         Write-DaemonState -State $fixture.State
                         $fixture.State = Read-DaemonState
@@ -726,6 +744,7 @@ try {
             $script:DaemonReconcileNow = $false
             $state = @{ $sid = [pscustomobject]@{ Name = 'Synthetic'; Machine = 'TEST'; Status = 'working' } }
             $live = @{ $sid = [pscustomobject]@{ ProcessId = 0 } }
+            Confirm-LifecycleStop -State $state
             Invoke-PendingStops -Headers $headers -State $state -Live $live
             $outcome = if ($stopped) { 'ended' } else { 'error' }
             $statusTopic = (Get-CopilotMqttTopics -SessionId $sid).StatusState
@@ -741,6 +760,7 @@ try {
             $script:StopDiagnostics.Clear()
             $script:StopCalls = 0
             $state[$sid] = [pscustomobject]@{ Name = 'Synthetic'; Machine = 'TEST'; Status = 'working' }
+            Confirm-LifecycleStop -State $state
             Invoke-PendingStops -Headers $headers -State $state -Live $live
             Test-That "a publication outage preserves and diagnoses the local $outcome outcome" {
                 $state[$sid].Status -ceq $outcome -and $script:StopCalls -eq 1 -and
@@ -748,6 +768,24 @@ try {
                 ($stopped -or $script:StopActivity -ceq 'Could not end session')
             }
             $script:StatusPublishFails = $false
+        }
+        # The guard, against the same real publisher. A first press on a working
+        # session must publish nothing at all: an 'ending' that goes out and is never
+        # followed by 'ended' leaves the card claiming the session is closing while it
+        # quietly carries on working.
+        $script:StopCalls = 0
+        $script:StopActivity = ''
+        $script:StatusMessages.Clear()
+        $script:DaemonStopArmed = @{}
+        $state = @{ $sid = [pscustomobject]@{ Name = 'Synthetic'; Machine = 'TEST'; Status = 'working' } }
+        Invoke-PendingStops -Headers $headers -State $state -Live $live
+        Test-That 'an unconfirmed press publishes no status and stops nothing' {
+            $statusTopic = (Get-CopilotMqttTopics -SessionId $sid).StatusState
+            @($script:StatusMessages | Where-Object { $_.Topic -ceq $statusTopic }).Count -eq 0 -and
+            $script:StopCalls -eq 0 -and $state[$sid].Status -ceq 'working'
+        }
+        Test-That 'and the card asks for the second press instead' {
+            $script:StopActivity -ceq $script:CopilotEndSessionConfirmNote
         }
         Test-That 'the real publisher retains existing vocabulary and accepts terminal outcomes' {
             foreach ($status in @('working', 'idle', 'waiting', 'offline', 'ending', 'ended', 'error')) {

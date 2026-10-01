@@ -33,7 +33,7 @@ prompt, so the terminal never stops working and nothing is ever answered twice.
 | **Attach a file** | Attach a document, log or diff the same way; up to 256 KB travels in the reply itself. |
 | **Start a conversation** | A session appears as soon as it opens, so you can send it its first prompt from the dashboard. |
 | **Launch a session** | Pick a workspace, type an opening prompt, press a button — a new CLI session opens on your desktop. |
-| **End a session** | An **End session** row on every card, so sessions don't just accumulate. |
+| **End a session** | An **End session** row on every card, so sessions don't just accumulate — and a second press to confirm if it isn't idle. |
 | **No polling** | State changes arrive over a Home Assistant WebSocket subscription. |
 
 The card glows **blue** while working, **amber** while waiting on you, and not at all
@@ -743,8 +743,24 @@ when it fails. A failed stop keeps the failure detail on the card rather than lo
 like an idle session. If status publication fails, the daemon retains the local
 outcome and logs the publication failure.
 
-It is safe to press. The transcript survives either way, so an ended session stays in
-the **Resume** list and can be reopened — a mistaken press costs a window, not the work.
+**A session that is not idle takes two presses.** End sits one tap away from Send, and
+a stray tap landing mid-turn throws away the turn in flight. So the first press only
+arms: the card's status line changes to *Press End session again to end it*, naming
+what the second press would interrupt, and the session carries on untouched. A second
+press within ten seconds ends it; without one the confirmation lapses, the card says
+*End session NOT confirmed*, and the next press starts over. An idle session has
+nothing in flight to lose and still ends on a single press, as does a session whose
+status the daemon has not yet worked out — that one is guarded too, since it may well
+be mid-turn.
+
+The guard lives in the daemon rather than in the dashboard card, deliberately. The
+same button is pressed from a phone, from an automation and by other agents, and only
+the daemon sees all of those; a confirmation dialog would protect the dashboard and
+leave everything else ending a working session on one press.
+
+Beyond that it is safe to press. The transcript survives either way, so an ended
+session stays in the **Resume** list and can be reopened — a mistaken press costs a
+window, not the work.
 
 ---
 

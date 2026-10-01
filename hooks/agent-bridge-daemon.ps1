@@ -152,6 +152,10 @@ $script:DaemonConfig = @{
     # those. Ten minutes for the same reason the Send arm is: honouring it late is
     # right, attributing a turn nobody drove is not.
     DriverArmSeconds = 600
+    # How long a first press of End session stays armed, waiting for the second press
+    # that confirms it. Only a session that is not idle is guarded this way; see
+    # Invoke-PendingStops for why one press is not enough.
+    StopConfirmSeconds = 10
     ResumeCacheSeconds = 180
     # How soon to retry after a fetch that failed or came back empty, rather than
     # waiting out the full interval with a list known to be wrong.
@@ -268,6 +272,15 @@ $script:DaemonLaunchedPids = @{}
 # card without the line, rather than showing settings from the wrong launch.
 $script:DaemonLaunchedTuning = @{}
 $script:DaemonPendingTuningKey = '(pending)'
+
+# Sessions whose End button has been pressed once and is waiting for the second
+# press that confirms it, keyed by session id, holding the moment it was armed.
+#
+# In memory and never persisted, deliberately: a daemon that restarts between the
+# two presses must come back disarmed. Coming back still armed would turn the next
+# press - made after a restart, possibly minutes later - into a confirmation of
+# something the user had long since given up on.
+$script:DaemonStopArmed = @{}
 
 # Anything the dashboard reports as happening before this is a leftover from a
 # previous run rather than something the user just did.

@@ -295,6 +295,23 @@ Test-That 'it only shows while reporting on something you just did' {
     $status = @($sessionCard.cards | Where-Object { $_.type -eq 'conditional' -and $_.card.type -eq 'markdown' })[0]
     @($status.conditions[0].state) -contains 'Sending...' -and @($status.conditions[0].state) -contains 'Reply NOT sent'
 }
+# End session asking for its second press is the one note here that has to be seen,
+# and it has only the length of the confirmation window to be seen in.
+$sendStatus = @($sessionCard.cards | Where-Object { $_.type -eq 'conditional' -and $_.card.type -eq 'markdown' })[0]
+Test-That 'End session asking for confirmation is one of them' {
+    @($sendStatus.conditions[0].state) -contains $script:CopilotEndSessionConfirmNote
+}
+Test-That 'and so is giving up on one' {
+    @($sendStatus.conditions[0].state) -contains $script:CopilotEndSessionLapsedNote
+}
+Test-That 'the question is marked as a warning, not as something in progress' {
+    "$($sendStatus.card.content)" -match [regex]::Escape("a == '$script:CopilotEndSessionConfirmNote'")
+}
+# Spelled with a capital NOT so it falls into the same warning branch as 'Reply NOT
+# sent' without a second special case.
+Test-That 'and so is the lapse, by the rule the other outcomes already use' {
+    $script:CopilotEndSessionLapsedNote -cmatch 'NOT'
+}
 Test-That 'it is separated by a hairline rather than butting up to Send' {
     @($stop.styles.card | Where-Object { $_.ContainsKey('border-top') }).Count -gt 0
 }
