@@ -22,8 +22,9 @@ Set-StrictMode -Version Latest
 . $(if (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'bridge-platform.ps1')) { Join-Path $PSScriptRoot 'bridge-platform.ps1' }
     else { Join-Path $PSScriptRoot '../../hooks/bridge-platform.ps1' })
 
-$script:ClaudeStateRoot = Join-Path $env:TEMP 'agent-bridge-claude'
-$script:ClaudeProjectsRoot = Join-Path $HOME '.claude\projects'
+$script:BridgeInstallContext = Resolve-BridgeInstallContext -EntryDirectory $PSScriptRoot
+$script:ClaudeStateRoot = Get-BridgeRuntimePath 'agent-bridge-claude'
+$script:ClaudeProjectsRoot = Join-Path $script:BridgeInstallContext.ClaudeHome 'projects'
 # A session whose registry entry has not been refreshed in this long is treated as
 # gone, so a crashed session cannot hold entities open forever.
 $script:ClaudeSessionStaleMinutes = 240

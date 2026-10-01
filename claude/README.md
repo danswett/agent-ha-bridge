@@ -52,6 +52,16 @@ Existing settings and any hooks you added yourself are preserved; re-running is 
 and `-Uninstall` removes only this bridge's entries. Restart Claude sessions
 afterwards; the daemon picks them up on its own.
 
+Installation metadata binds the adapter, settings and shared core to the selected
+installation. A normal install honors `CLAUDE_CONFIG_DIR`; an isolated
+`-TargetHome` uses that home's `.claude` instead of the invoking account's settings.
+The adapter carries a `bridge-root.json` pointer, and new registration state lives
+under the owning bridge's `runtime\agent-bridge-claude` directory. Uninstall removes
+only this installation's exact hook commands from settings and its backup, preserving
+other installations and unrelated hooks. An explicit client selection cannot be
+expanded by daemon discovery. See [installation ownership](../docs/installation-isolation.md)
+for migration, removal and legacy-data limits.
+
 ## What is verified, and what is not
 
 This matters, so it is spelled out rather than implied. Verified against a real,

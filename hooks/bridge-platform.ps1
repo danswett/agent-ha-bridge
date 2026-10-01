@@ -54,7 +54,7 @@ function Add-BridgeCompiledType {
     param(
         [Parameter(Mandatory)][string]$TypeName,
         [Parameter(Mandatory)][string]$Source,
-        [string]$CacheDir = (Join-Path $HOME '.agent-ha-bridge\cache')
+        [string]$CacheDir = (Join-Path (Get-BridgeInstallContext).BridgeHome 'cache')
     )
 
     if (([Management.Automation.PSTypeName]$TypeName).Type) { return }
@@ -110,6 +110,9 @@ if (-not $script:BridgeIsWindows) {
         }
     }
 }
+
+$installContextLibrary = Join-Path $PSScriptRoot 'bridge-install-context.ps1'
+if (Test-Path -LiteralPath $installContextLibrary) { . $installContextLibrary }
 
 function ConvertFrom-BridgeElapsedTime {
     <# `ps -o etime` ([[dd-]hh:]mm:ss) as a start time. #>
@@ -215,14 +218,245 @@ function Get-BridgeProcessesNamed {
 
     if ($script:BridgeIsWindows) {
         return @(Get-Process -Name $Name -ErrorAction SilentlyContinue |
-            ForEach-Object { ConvertFrom-BridgeProcessObject -Process $_ -WithCommandLine:$WithCommandLine })
+                ForEach-Object { ConvertFrom-BridgeProcessObject -Process $_ -WithCommandLine:$WithCommandLine })
     }
     $all = try { @(& /bin/ps -A -o 'pid=,ppid=,etime=,ucomm=' 2>$null) } catch { @() }
     $global:LASTEXITCODE = 0
     @($all | ForEach-Object { ConvertFrom-BridgePsLine -Line $_ } | Where-Object { $_ -and $_.Name -eq $Name } | ForEach-Object {
-        if ($WithCommandLine) { $_.CommandLine = Get-BridgeCommandLine -ProcessId $_.ProcessId }
-        $_
-    })
+            if ($WithCommandLine) { $_.CommandLine = Get-BridgeCommandLine -ProcessId $_.ProcessId }
+            $_
+        })
+}
+
+function Test-BridgeRuntimeProcess {
+    param([Parameter(Mandatory)]$Process, [Parameter(Mandatory)]$Context,
+        [Parameter(Mandatory)][ValidateSet('daemon', 'supervisor', 'setup-copilot', 'setup-claude', 'setup-codex', 'setup-mcp')][string]$Role)
+    if (-not $Process.ProcessId -or -not $Process.Path -or -not $Process.CreationDate -or
+        [IO.Path]::GetFileNameWithoutExtension([string]$Process.Path) -notin @('pwsh', 'powershell')) { return $false }
+    $targetSuffix = ''
+    $paths = if ($Role.StartsWith('setup-')) {
+        $client = $Role.Substring(6)
+        $target = [regex]::Escape($Context.BridgeHome)
+        $targetSuffix = "\s+(?i:-InstallRoot)\s+(?:`"$target`"|'$target'|$target)(?=\s|$)"
+        if ($client -eq 'copilot') { @(Join-Path $Context.BridgeHome 'installer\install.ps1') }
+        else { @(Join-Path $Context.BridgeHome "installer\$client\install-$client.ps1") }
+    } else {
+        @((Join-Path $Context.HooksDir "agent-bridge-$Role.ps1"),
+            (Join-Path $Context.CopilotHome "hooks\copilot-bridge-$Role.ps1"))
+    }
+    $prefix = '^\s*(?:"(?<exe>[^"]+)"|(?<exe>\S+))\s+(?:(?i:-NoProfile|-NonInteractive|-NoLogo|-WindowStyle\s+Hidden|-ExecutionPolicy\s+\w+)\s+)*(?i:-File)\s+'
+    $options = if ($script:BridgeIsWindows) { [Text.RegularExpressions.RegexOptions]::IgnoreCase } else { [Text.RegularExpressions.RegexOptions]::None }
+    foreach ($path in $paths) {
+        $escaped = [regex]::Escape($path)
+        $match = [regex]::Match([string]$Process.CommandLine, ($prefix + "(?:`"$escaped`"|'$escaped'|$escaped)(?=\s|$)" + $targetSuffix), $options)
+        if ($match.Success) {
+            $executable = $match.Groups['exe'].Value
+            if ([IO.Path]::IsPathFullyQualified($executable)) { return Test-BridgeInstallPath $executable ([string]$Process.Path) }
+            return $executable -in @('pwsh', 'pwsh.exe', 'powershell', 'powershell.exe')
+        }
+    }
+    $false
+}
+
+function Get-BridgeRuntimeProcess {
+    param([Parameter(Mandatory)][int]$ProcessId, [Parameter(Mandatory)]$Context,
+        [Parameter(Mandatory)][ValidateSet('daemon', 'supervisor', 'setup-copilot', 'setup-claude', 'setup-codex', 'setup-mcp')][string]$Role,
+        [switch]$RequireReadable)
+    $process = Get-BridgeProcessInfo -ProcessId $ProcessId -WithCommandLine
+    if (-not $process) {
+        if ($RequireReadable) {
+            $readErrors = @()
+            $remaining = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue -ErrorVariable readErrors
+            if ($remaining -or @($readErrors | Where-Object {
+                $_.FullyQualifiedErrorId -notlike 'NoProcessFoundForGivenId,*'
+            }).Count) { throw 'Runtime ownership could not be read; cleanup was not authorized.' }
+        }
+        return $null
+    }
+    if (-not $process.Path -or -not $process.CreationDate) {
+        try {
+            $native = Get-Process -Id $ProcessId -ErrorAction Stop
+            $process.Path = $native.Path
+            $process.CreationDate = $native.StartTime
+        }
+        catch {
+            if ($RequireReadable) { throw 'Runtime ownership could not be read; cleanup was not authorized.' }
+            return $null
+        }
+    }
+    if ($RequireReadable -and (-not $process.Path -or -not $process.CreationDate -or -not $process.CommandLine)) {
+        throw 'Runtime ownership is unreadable; cleanup was not authorized.'
+    }
+    if (-not (Test-BridgeRuntimeProcess -Process $process -Context $Context -Role $Role)) { return $null }
+    $record = Read-BridgeInstallRecord -Path (Get-BridgeRuntimePath -Name "$Role.process.json" -Context $Context)
+    if ($record -and [int]$record['pid'] -eq $ProcessId) {
+        if ([string]$record['installationId'] -cne [string]$Context.Id -or
+            -not $record['executable'] -or
+            -not (Test-BridgeInstallPath ([string]$record['executable']) ([string]$process.Path)) -or
+            [long]$record['startedUtcTicks'] -ne ([datetime]$process.CreationDate).ToUniversalTime().Ticks) { return $null }
+    }
+    $process
+}
+
+function Get-BridgeOwnedRuntimeProcesses {
+    param([Parameter(Mandatory)]$Context,
+        [ValidateSet('daemon', 'supervisor', 'setup-copilot', 'setup-claude', 'setup-codex', 'setup-mcp')]
+        [string[]]$Roles = @('supervisor', 'daemon', 'setup-copilot', 'setup-claude', 'setup-codex', 'setup-mcp'),
+        [switch]$RequireReadable)
+    $candidates = @(Get-BridgeProcessesNamed -Name 'pwsh' -WithCommandLine)
+    foreach ($role in $Roles) {
+        $scriptName = if ($role -eq 'setup-copilot') { 'install.ps1' }
+        elseif ($role.StartsWith('setup-')) { "install-$($role.Substring(6)).ps1" }
+        else { "bridge-$role.ps1" }
+        $processIds = @(foreach ($candidate in $candidates) {
+            if ($candidate.ProcessId -ne $PID -and [string]$candidate.CommandLine -match [regex]::Escape($scriptName)) {
+                [int]$candidate.ProcessId
+            }
+        })
+        $record = if ($RequireReadable) {
+            Read-BridgeInstallRecord -Path (Get-BridgeRuntimePath -Name "$role.process.json" -Context $Context)
+        } else { $null }
+        if ($record -and [int]$record['pid'] -gt 0 -and [int]$record['pid'] -ne $PID) {
+            $processIds += [int]$record['pid']
+        }
+        foreach ($processId in @($processIds | Select-Object -Unique)) {
+            $requireProof = $RequireReadable -and $record -and [int]$record['pid'] -eq $processId
+            $owned = Get-BridgeRuntimeProcess -ProcessId $processId -Context $Context -Role $role -RequireReadable:$requireProof
+            if ($owned) {
+                $owned | Add-Member -NotePropertyName BridgeRuntimeRole -NotePropertyValue $role -Force
+                $owned
+            }
+        }
+    }
+}
+
+function Register-BridgeRuntimeProcess {
+    param([Parameter(Mandatory)]$Context, [Parameter(Mandatory)][ValidateSet('daemon', 'supervisor')][string]$Role)
+    $process = Get-Process -Id $PID -ErrorAction Stop
+    $directory = Get-BridgeRuntimeRoot -Context $Context
+    [void][IO.Directory]::CreateDirectory($directory)
+    @{
+        pid = $PID; installationId = $Context.Id; executable = $process.Path
+        startedUtcTicks = $process.StartTime.ToUniversalTime().Ticks
+    } | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $directory "$Role.process.json") -Encoding utf8
+}
+
+function Stop-BridgeOwnedRuntime {
+    param([Parameter(Mandatory)]$Context,
+        [ValidateSet('supervisor', 'daemon', 'setup-copilot', 'setup-claude', 'setup-codex', 'setup-mcp')]
+        [string[]]$Roles = @('supervisor', 'daemon', 'setup-copilot', 'setup-claude', 'setup-codex', 'setup-mcp'))
+    foreach ($process in @(Get-BridgeOwnedRuntimeProcesses -Context $Context -Roles $Roles -RequireReadable)) {
+        $role = $process.BridgeRuntimeRole
+        $current = Get-BridgeRuntimeProcess -ProcessId ([int]$process.ProcessId) -Context $Context -Role $role -RequireReadable
+        if (-not $current -or
+            ([datetime]$current.CreationDate).ToUniversalTime().Ticks -ne ([datetime]$process.CreationDate).ToUniversalTime().Ticks -or
+            -not (Test-BridgeInstallPath ([string]$current.Path) ([string]$process.Path))) {
+            throw 'Runtime ownership changed before shutdown; cleanup has not been authorized.'
+        }
+        Stop-Process -Id ([int]$process.ProcessId) -Force -ErrorAction Stop
+        $exited = $false
+        for ($attempt = 0; $attempt -lt 30; $attempt++) {
+            $remaining = Get-BridgeRuntimeProcess -ProcessId ([int]$process.ProcessId) -Context $Context -Role $role -RequireReadable
+            if (-not $remaining -or
+                ([datetime]$remaining.CreationDate).ToUniversalTime().Ticks -ne ([datetime]$process.CreationDate).ToUniversalTime().Ticks) {
+                $exited = $true
+                break
+            }
+            Start-Sleep -Milliseconds 100
+        }
+        if (-not $exited) { throw 'The owned runtime did not stop; its files were preserved.' }
+    }
+    if ($Roles -contains 'supervisor' -and @(Get-BridgeOwnedRuntimeProcesses -Context $Context -Roles $Roles -RequireReadable).Count) {
+        throw 'An owned runtime restarted during shutdown; cleanup was not authorized.'
+    }
+}
+
+function Test-BridgeTaskOwnership {
+    param([Parameter(Mandatory)]$Task, [Parameter(Mandatory)]$Context)
+    if (@($Task.Actions).Count -ne 1) { return $false }
+    $launchers = @(
+        (Join-Path $Context.HooksDir 'agent-bridge-launch.vbs'),
+        (Join-Path $Context.CopilotHome 'hooks\copilot-bridge-launch.vbs')
+    )
+    foreach ($action in @($Task.Actions)) {
+        if ([IO.Path]::GetFileName([string]$action.Execute) -ieq 'wscript.exe' -and
+            $launchers -contains ([string]$action.Arguments).Trim().Trim('"')) { return $true }
+    }
+    $false
+}
+
+function Test-BridgeLaunchAgentOwnership {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$Context)
+    $settings = [Xml.XmlReaderSettings]::new()
+    $settings.DtdProcessing = [Xml.DtdProcessing]::Ignore
+    $settings.XmlResolver = $null
+    $reader = [Xml.XmlReader]::Create($Path, $settings)
+    try {
+        $document = [Xml.XmlDocument]::new()
+        $document.XmlResolver = $null
+        $document.Load($reader)
+        if ($document.SelectSingleNode('/plist/dict/key[text()="Program"]')) { return $false }
+        $key = $document.SelectSingleNode('/plist/dict/key[text()="ProgramArguments"]')
+        if (-not $key -or -not $key.NextSibling -or $key.NextSibling.Name -ne 'array') { return $false }
+        $arguments = @($key.NextSibling.SelectNodes('string') | ForEach-Object { $_.InnerText })
+        if ($arguments.Count -lt 3 -or $key.NextSibling.ChildNodes.Count -ne $arguments.Count -or
+            [IO.Path]::GetFileNameWithoutExtension([string]$arguments[0]) -notin @('pwsh', 'powershell')) { return $false }
+        for ($index = 1; $index -lt $arguments.Count; $index++) {
+            if ($arguments[$index] -eq '-File') {
+                return $index + 1 -lt $arguments.Count -and
+                    (Test-BridgeInstallPath ([string]$arguments[$index + 1]) (Join-Path $Context.HooksDir 'agent-bridge-daemon.ps1'))
+            }
+            if ($arguments[$index] -in @('-NoProfile', '-NonInteractive', '-NoLogo')) { continue }
+            if ($arguments[$index] -in @('-ExecutionPolicy', '-WindowStyle') -and $index + 1 -lt $arguments.Count) {
+                $index++
+                if ($arguments[$index] -match '^\w+$') { continue }
+            }
+            return $false
+        }
+        $false
+    }
+    finally { $reader.Dispose() }
+}
+
+function Stop-BridgeOwnedService {
+    param([Parameter(Mandatory)]$Context, [switch]$Remove)
+    if ($Context.Isolated) { return }
+    if ($script:BridgeIsWindows) {
+        foreach ($name in @($Context.TaskName, 'AgentBridgeDaemon', 'CopilotBridgeDaemon') | Select-Object -Unique) {
+            $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+            if (-not $task) { continue }
+            if (-not (Test-BridgeTaskOwnership -Task $task -Context $Context)) {
+                if ($name -eq $Context.TaskName) { throw 'The installation task points elsewhere; no cleanup was authorized.' }
+                continue
+            }
+            Stop-ScheduledTask -TaskName $name -ErrorAction Stop
+            if ($Remove -or $name -ne $Context.TaskName) { Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction Stop }
+        }
+    }
+    else {
+        foreach ($label in @($Context.LaunchAgentLabel, 'com.agent-ha-bridge.daemon') | Select-Object -Unique) {
+            $plist = Join-Path $Context.Home "Library\LaunchAgents\$label.plist"
+            if (-not [IO.File]::Exists($plist)) { continue }
+            if (-not (Test-BridgeLaunchAgentOwnership -Path $plist -Context $Context)) {
+                if ($label -eq $Context.LaunchAgentLabel) { throw 'The installation LaunchAgent points elsewhere; no cleanup was authorized.' }
+                continue
+            }
+            $userId = (& id -u | Out-String).Trim()
+            if ($LASTEXITCODE -ne 0 -or $userId -notmatch '^\d+$') { throw 'Could not identify the LaunchAgent owner for shutdown.' }
+            $service = "gui/$userId/$label"
+            & launchctl print $service 2>$null | Out-Null
+            $readCode = $LASTEXITCODE
+            if ($readCode -eq 0) {
+                & launchctl bootout $service 2>$null | Out-Null
+                if ($LASTEXITCODE -ne 0) { throw "LaunchAgent shutdown failed (bootout exit $LASTEXITCODE); its files were preserved." }
+                & launchctl print $service 2>$null | Out-Null
+                $readCode = $LASTEXITCODE
+            }
+            if ($readCode -ne 113) { throw "LaunchAgent shutdown could not be confirmed (print exit $readCode); its files were preserved." }
+            $global:LASTEXITCODE = 0
+            if ($Remove -or $label -ne $Context.LaunchAgentLabel) { Remove-Item -LiteralPath $plist -Force }
+        }
+    }
 }
 function Test-BridgeAgentProcess {
     <#
@@ -244,7 +478,7 @@ function Test-BridgeAgentProcess {
 
     if ($name -notin @('node', 'bun')) { return $false }
     $commandLine = if ($Process.PSObject.Properties['CommandLine'] -and $Process.CommandLine) { [string]$Process.CommandLine }
-        else { Get-BridgeCommandLine -ProcessId ([int]$(if ($Process.PSObject.Properties['Id']) { $Process.Id } else { $Process.ProcessId })) }
+    else { Get-BridgeCommandLine -ProcessId ([int]$(if ($Process.PSObject.Properties['Id']) { $Process.Id } else { $Process.ProcessId })) }
     $package = switch ($Agent) {
         'copilot' { '@github/copilot' }
         'claude'  { '@anthropic-ai/claude-code' }
@@ -272,8 +506,8 @@ function Get-BridgeAgentProcesses {
     param([Parameter(Mandatory)][string]$Agent)
     if ($script:BridgeIsWindows) { return @(Get-Process -Name $Agent -ErrorAction SilentlyContinue) }
     $candidates = @(@($Agent, "$Agent.exe", 'node', 'bun') | ForEach-Object {
-        Get-Process -Name $_ -ErrorAction SilentlyContinue
-    })
+            Get-Process -Name $_ -ErrorAction SilentlyContinue
+        })
     @($candidates | Sort-Object -Property Id -Unique | Where-Object { Test-BridgeAgentProcess -Process $_ -Agent $Agent })
 }
 

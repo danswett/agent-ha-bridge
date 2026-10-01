@@ -26,19 +26,25 @@
 [CmdletBinding()]
 param(
     [string]$TargetHome,
+    [string]$InstallRoot,
+    [switch]$RepairOnly,
+    [switch]$KeepSelection,
     [switch]$Uninstall
 )
 
 $ErrorActionPreference = 'Stop'
 # Windows/macOS differences; on macOS also makes Join-Path accept '\'.
 . (Join-Path $PSScriptRoot '../hooks/bridge-platform.ps1')
+. (Join-Path $PSScriptRoot '../hooks/bridge-secrets.ps1')
 
-$installHome = if ($TargetHome) { $TargetHome } else { $HOME }
-$bridgeRoot = Join-Path $installHome '.agent-ha-bridge\codex-bridge'
+$installContext = Resolve-BridgeInstallContext -TargetHome $TargetHome -BridgeHome $InstallRoot
+$bridgeRoot = Join-Path $installContext.BridgeHome 'codex-bridge'
 $marketplaceName = 'agent-ha-bridge'
 $pluginName = 'agent-ha-bridge'
 $pluginRoot = Join-Path $bridgeRoot "plugins\$pluginName"
-$coreDir = Join-Path $installHome '.agent-ha-bridge\hooks'
+$coreDir = $installContext.HooksDir
+$ownerFile = Join-Path $installContext.CodexHome 'agent-ha-bridge-owner.json'
+$legacyBridgeRoot = Join-Path $installContext.CopilotHome 'codex-bridge'
 
 function Write-Step { param([string]$Message) Write-Host "==> $Message" -ForegroundColor Cyan }
 
@@ -59,20 +65,83 @@ function Get-CodexExecutable {
 
 $codex = Get-CodexExecutable
 
+function Invoke-BridgeCodexCommand {
+    param([Parameter(Mandatory)][string[]]$Arguments)
+    if (-not $codex) { throw 'Codex CLI is unavailable; its registration could not be verified and the adapter was preserved.' }
+    $previousHome = $env:CODEX_HOME
+    $previousConfig = $env:AGENT_HA_BRIDGE_CONFIG
+    Push-Location $installContext.Home
+    try {
+        $env:CODEX_HOME = $installContext.CodexHome
+        $env:AGENT_HA_BRIDGE_CONFIG = $installContext.ConfigPath
+        $output = & $codex @Arguments 2>&1 | Out-String
+        if ($LASTEXITCODE -ne 0) { throw "Codex registration command failed (exit $LASTEXITCODE); no further adapter cleanup was performed." }
+        $output
+    }
+    finally {
+        $env:CODEX_HOME = $previousHome
+        $env:AGENT_HA_BRIDGE_CONFIG = $previousConfig
+        Pop-Location
+    }
+}
+
+function Get-BridgeCodexMarketplace {
+    $owner = Read-BridgeInstallRecord -Path $ownerFile
+    if ($owner -and (-not $owner['bridgeHome'] -or
+        -not (Test-BridgeInstallPath ([string]$owner['bridgeHome']) $installContext.BridgeHome))) {
+        throw 'This Codex home is registered to another bridge installation.'
+    }
+    $listing = Invoke-BridgeCodexCommand -Arguments @('plugin', 'marketplace', 'list', '--json') | ConvertFrom-Json
+    if (-not $listing -or -not $listing.PSObject.Properties['marketplaces']) {
+        throw 'Codex did not return a readable marketplace listing; its registrations were not changed.'
+    }
+    $matches = @($listing.marketplaces | Where-Object { $_.name -eq $marketplaceName })
+    if ($matches.Count -gt 1) { throw 'The bridge marketplace name is ambiguous; its registrations were not changed.' }
+    if ($matches.Count -eq 0) { return $null }
+    if (-not $matches[0].PSObject.Properties['root'] -or
+        (-not (Test-BridgeInstallPath ([string]$matches[0].root) $bridgeRoot) -and
+         (-not $installContext.LegacyLayout -or -not (Test-BridgeInstallPath ([string]$matches[0].root) $legacyBridgeRoot)))) {
+        throw 'The named Codex marketplace belongs to another installation; it was preserved.'
+    }
+    $matches[0]
+}
+
+function Remove-BridgeCodexAdapter {
+    $record = Read-BridgeInstallRecord -Path $installContext.MetadataPath
+    $recorded = $record -and $record.Contains('adapters') -and @($record['adapters']) -contains 'codex'
+    if (-not (Test-Path -LiteralPath $bridgeRoot) -and -not (Test-Path -LiteralPath $ownerFile) -and
+        -not $recorded -and (-not $installContext.LegacyLayout -or -not (Test-Path -LiteralPath $legacyBridgeRoot))) {
+        Set-BridgeAdapterEnrollment -Context $installContext -Client codex -Installed $false -KeepSelection:$KeepSelection
+        return
+    }
+    $marketplace = Get-BridgeCodexMarketplace
+    $owner = Read-BridgeInstallRecord -Path $ownerFile
+    if (-not $marketplace -and -not $owner) {
+        throw 'Codex registration ownership is unknown; the adapter was preserved for a verified cleanup.'
+    }
+    [void](Invoke-BridgeCodexCommand -Arguments @('plugin', 'remove', "$pluginName@$marketplaceName"))
+    if ($marketplace) { [void](Invoke-BridgeCodexCommand -Arguments @('plugin', 'marketplace', 'remove', $marketplaceName)) }
+    if ($marketplace -and (Test-BridgeInstallPath ([string]$marketplace.root) $legacyBridgeRoot) -and
+        (Test-Path -LiteralPath $legacyBridgeRoot)) {
+        Remove-Item -LiteralPath $legacyBridgeRoot -Recurse -Force
+    }
+    if (Test-Path -LiteralPath $bridgeRoot) { Remove-Item -LiteralPath $bridgeRoot -Recurse -Force }
+    if (Test-Path -LiteralPath $ownerFile) { Remove-Item -LiteralPath $ownerFile -Force }
+    if (-not $installContext.Legacy) {
+        $stateRoot = Get-BridgeRuntimePath -Name 'agent-bridge-codex' -Context $installContext
+        if (Test-Path -LiteralPath $stateRoot) { Remove-Item -LiteralPath $stateRoot -Recurse -Force }
+    }
+    Set-BridgeAdapterEnrollment -Context $installContext -Client codex -Installed $false -KeepSelection:$KeepSelection
+}
+
+if ($env:BRIDGE_INSTALL_NORUN) { return }
+if ($RepairOnly -and -not $Uninstall) { Assert-BridgeAdapterSelection -Context $installContext -Client codex }
+
 # ------------------------------------------------------------------ uninstall
 if ($Uninstall) {
     Write-Step 'Removing the Codex adapter'
-    if ($codex) {
-        & $codex plugin remove "$pluginName@$marketplaceName" 2>&1 | Out-Null
-        & $codex plugin marketplace remove $marketplaceName 2>&1 | Out-Null
-        Write-Host '    plugin and marketplace removed'
-    }
-    if (Test-Path -LiteralPath $bridgeRoot) {
-        Remove-Item -LiteralPath $bridgeRoot -Recurse -Force
-        Write-Host '    adapter removed'
-    }
-    $stateRoot = Join-Path $env:TEMP 'agent-bridge-codex'
-    if (Test-Path -LiteralPath $stateRoot) { Remove-Item -LiteralPath $stateRoot -Recurse -Force }
+    Stop-BridgeOwnedRuntime -Context $installContext
+    Remove-BridgeCodexAdapter
     Write-Step 'Done'
     Write-Host 'Trust entries under [hooks.state] in the Codex config are left alone;' -ForegroundColor Yellow
     Write-Host 'they are harmless and Codex prunes them itself.' -ForegroundColor Yellow
@@ -90,11 +159,13 @@ if (-not (Test-Path -LiteralPath (Join-Path $coreDir 'decision-mqtt.ps1'))) {
 if (-not $codex) {
     throw 'Codex CLI was not found. Install it with: npm install -g @openai/codex'
 }
+$existingMarketplace = Get-BridgeCodexMarketplace
 
 Write-Step "Installing the adapter into $pluginRoot"
 New-Item -ItemType Directory -Path (Join-Path $pluginRoot '.codex-plugin') -Force | Out-Null
 $hooksTarget = Join-Path $pluginRoot 'hooks'
 New-Item -ItemType Directory -Path $hooksTarget -Force | Out-Null
+Set-BridgeAdapterRoot -Directory $hooksTarget -Context $installContext
 Get-ChildItem (Join-Path $PSScriptRoot 'hooks') -File | ForEach-Object {
     Copy-Item $_.FullName $hooksTarget -Force
     Write-Host "    $($_.Name)"
@@ -102,6 +173,7 @@ Get-ChildItem (Join-Path $PSScriptRoot 'hooks') -File | ForEach-Object {
 # The hooks run apart from the core, so they carry their own copy of the
 # Windows/macOS layer.
 Copy-Item (Join-Path (Split-Path $PSScriptRoot -Parent) 'hooks/bridge-platform.ps1') $hooksTarget -Force
+Copy-Item (Join-Path (Split-Path $PSScriptRoot -Parent) 'hooks/bridge-install-context.ps1') $hooksTarget -Force
 Write-Host '    bridge-platform.ps1'
 
 $versionFile = Join-Path (Split-Path $PSScriptRoot -Parent) 'VERSION'
@@ -136,7 +208,7 @@ if (-not $script:BridgeIsWindows) {
 # like the rest, so only from a path without a space. Changing the command makes Codex
 # ask for the hooks to be trusted again, once.
 . (Join-Path $PSScriptRoot '../hooks/bridge-native-hook.ps1')
-$nativeHook = Get-BridgeNativeHookPath -BridgeHome (Join-Path $installHome '.agent-ha-bridge')
+$nativeHook = Get-BridgeNativeHookPath -BridgeHome $installContext.BridgeHome
 $usesNativeHook = $nativeHook -and $nativeHook -notmatch '\s' -and $hookScript -notmatch '\s'
 if ($usesNativeHook) { $command = "$nativeHook codex hook $hookScript" }
 
@@ -172,15 +244,22 @@ New-Item -ItemType Directory -Path $marketplaceDir -Force | Out-Null
     )
 } | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $marketplaceDir 'marketplace.json') -Encoding UTF8
 
-& $codex plugin marketplace remove $marketplaceName 2>&1 | Out-Null
-$added = & $codex plugin marketplace add $bridgeRoot 2>&1 | Out-String
-if ($added -notmatch 'Added marketplace') { throw "Could not register the marketplace: $added" }
+if ($existingMarketplace) {
+    [void](Invoke-BridgeCodexCommand -Arguments @('plugin', 'remove', "$pluginName@$marketplaceName"))
+    [void](Invoke-BridgeCodexCommand -Arguments @('plugin', 'marketplace', 'remove', $marketplaceName))
+}
+[void](Invoke-BridgeCodexCommand -Arguments @('plugin', 'marketplace', 'add', $bridgeRoot))
 Write-Host "    $marketplaceName"
 
 Write-Step 'Installing the plugin'
-& $codex plugin remove "$pluginName@$marketplaceName" 2>&1 | Out-Null
-$installed = & $codex plugin add "$pluginName@$marketplaceName" 2>&1 | Out-String
-if ($installed -notmatch 'Added plugin') { throw "Could not install the plugin: $installed" }
+[void](Invoke-BridgeCodexCommand -Arguments @('plugin', 'add', "$pluginName@$marketplaceName"))
+if ($existingMarketplace -and (Test-BridgeInstallPath ([string]$existingMarketplace.root) $legacyBridgeRoot) -and
+    (Test-Path -LiteralPath $legacyBridgeRoot)) {
+    Remove-Item -LiteralPath $legacyBridgeRoot -Recurse -Force
+}
+[void][IO.Directory]::CreateDirectory($installContext.CodexHome)
+@{ bridgeHome = $installContext.BridgeHome } | ConvertTo-Json | Set-Content -LiteralPath $ownerFile -Encoding utf8
+Set-BridgeAdapterEnrollment -Context $installContext -Client codex -Installed $true -RepairOnly:$RepairOnly
 Write-Host "    $pluginName@$marketplaceName"
 
 Write-Step 'Done'
@@ -190,4 +269,4 @@ Write-Host '  Start Codex once and approve the hook trust prompt.' -ForegroundCo
 Write-Host '  Until you do, Codex skips these hooks silently: no error, no log line,' -ForegroundColor Yellow
 Write-Host '  which looks exactly like a broken install.' -ForegroundColor Yellow
 Write-Host ''
-Write-Host "Logs: `$env:TEMP\agent-decision-bridge.log"
+Write-Host "Logs: $(Get-BridgeRuntimePath -Name 'agent-decision-bridge.log' -Context $installContext)"

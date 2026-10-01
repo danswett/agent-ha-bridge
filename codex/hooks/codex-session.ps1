@@ -37,9 +37,10 @@ Set-StrictMode -Version Latest
 . $(if (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'bridge-platform.ps1')) { Join-Path $PSScriptRoot 'bridge-platform.ps1' }
     else { Join-Path $PSScriptRoot '../../hooks/bridge-platform.ps1' })
 
-$script:CodexStateRoot = Join-Path $env:TEMP 'agent-bridge-codex'
+$script:BridgeInstallContext = Resolve-BridgeInstallContext -EntryDirectory $PSScriptRoot
+$script:CodexStateRoot = Get-BridgeRuntimePath 'agent-bridge-codex'
 # Codex writes rollouts under CODEX_HOME/sessions/<yyyy>/<MM>/<dd>/.
-$script:CodexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+$script:CodexHome = $script:BridgeInstallContext.CodexHome
 $script:CodexSessionStaleMinutes = 240
 
 function Get-CodexStateRoot {

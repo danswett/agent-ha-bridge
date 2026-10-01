@@ -27,18 +27,22 @@
 [CmdletBinding()]
 param(
     [string]$TargetHome,
+    [string]$InstallRoot,
+    [switch]$RepairOnly,
+    [switch]$KeepSelection,
     [switch]$Uninstall
 )
 
 $ErrorActionPreference = 'Stop'
 # Windows/macOS differences; on macOS also makes Join-Path accept '\'.
 . (Join-Path $PSScriptRoot '../hooks/bridge-platform.ps1')
+. (Join-Path $PSScriptRoot '../hooks/bridge-secrets.ps1')
 
-$installHome = if ($TargetHome) { $TargetHome } else { $HOME }
-$claudeHome = Join-Path $installHome '.claude'
+$installContext = Resolve-BridgeInstallContext -TargetHome $TargetHome -BridgeHome $InstallRoot
+$claudeHome = $installContext.ClaudeHome
 $adapterDir = Join-Path $claudeHome 'ha-bridge'
 $settingsPath = Join-Path $claudeHome 'settings.json'
-$coreDir = Join-Path $installHome '.agent-ha-bridge\hooks'
+$coreDir = $installContext.HooksDir
 
 function Write-Step { param([string]$Message) Write-Host "==> $Message" -ForegroundColor Cyan }
 
@@ -59,7 +63,7 @@ $hookLauncher = Join-Path $adapterDir 'run-hook.cmd'
 # runs: each hook then starts in tens of milliseconds, not half a second, and falls back
 # to its PowerShell script itself whenever the daemon is not running.
 . (Join-Path $PSScriptRoot '../hooks/bridge-native-hook.ps1')
-$nativeHook = Get-BridgeNativeHookPath -BridgeHome (Join-Path $installHome '.agent-ha-bridge')
+$nativeHook = Get-BridgeNativeHookPath -BridgeHome $installContext.BridgeHome
 
 function Get-Settings {
     if (-not (Test-Path -LiteralPath $settingsPath)) { return @{} }
@@ -96,7 +100,20 @@ function Remove-BridgeHooks {
         foreach ($matcherEntry in @($hooks[$eventName])) {
             $inner = @()
             foreach ($hook in @($matcherEntry['hooks'])) {
-                if ([string]$hook['command'] -notmatch 'ha-bridge') { $inner += $hook }
+                $command = [string]$hook['command']
+                $owned = $false
+                foreach ($scriptName in @('route-askuserquestion.ps1', 'route-notification.ps1', 'notify-claude-stop.ps1', 'register-claude-session.ps1')) {
+                    $scriptPath = [regex]::Escape((Join-Path $adapterDir $scriptName))
+                    $launcherPath = [regex]::Escape((Join-Path $adapterDir 'run-hook.cmd'))
+                    $nativePath = [regex]::Escape((Join-Path $installContext.BridgeHome 'bin\agent-bridge-hook'))
+                    if ($command -match "^`"$launcherPath`"\s+`"$scriptPath`"$" -or
+                        $command -match "^[`"']$nativePath(?:\.exe)?[`"']\s+claude\s+(?:ask|stop|notification|register)\s+[`"']$scriptPath[`"']$" -or
+                        $command -match "^'[^']*/pwsh'\s+-NoProfile\s+-NonInteractive\s+-File\s+'$scriptPath'$") {
+                        $owned = $true
+                        break
+                    }
+                }
+                if (-not $owned) { $inner += $hook }
             }
             if ($inner.Count -gt 0) {
                 $matcherEntry['hooks'] = $inner
@@ -156,22 +173,33 @@ function Add-BridgeHook {
     $Settings
 }
 
+function Remove-BridgeClaudeAdapter {
+    if (-not (Test-BridgeAdapterRoot -Directory $adapterDir -Context $installContext)) {
+        throw 'The Claude adapter belongs to another installation; its hooks and files were preserved.'
+    }
+    foreach ($file in @($settingsPath, "$settingsPath.bak")) {
+        if (-not (Test-Path -LiteralPath $file)) { continue }
+        $settings = Get-Content -LiteralPath $file -Raw -Encoding utf8 | ConvertFrom-Json -AsHashtable
+        $before = $settings | ConvertTo-Json -Depth 12
+        $after = Remove-BridgeHooks -Settings $settings | ConvertTo-Json -Depth 12
+        if ($before -cne $after) { Set-Content -LiteralPath $file -Value $after -Encoding utf8 }
+    }
+    if (Test-Path -LiteralPath $adapterDir) { Remove-Item -LiteralPath $adapterDir -Recurse -Force }
+    if (-not $installContext.Legacy) {
+        $stateRoot = Get-BridgeRuntimePath -Name 'agent-bridge-claude' -Context $installContext
+        if (Test-Path -LiteralPath $stateRoot) { Remove-Item -LiteralPath $stateRoot -Recurse -Force }
+    }
+    Set-BridgeAdapterEnrollment -Context $installContext -Client claude -Installed $false -KeepSelection:$KeepSelection
+}
+
+if ($env:BRIDGE_INSTALL_NORUN) { return }
+if ($RepairOnly -and -not $Uninstall) { Assert-BridgeAdapterSelection -Context $installContext -Client claude }
+
 # ------------------------------------------------------------------ uninstall
 if ($Uninstall) {
     Write-Step 'Removing the Claude Code adapter'
-    if (Test-Path -LiteralPath $settingsPath) {
-        Save-Settings -Settings (Remove-BridgeHooks -Settings (Get-Settings))
-        Write-Host '    hook registrations removed'
-    }
-    if (Test-Path -LiteralPath $adapterDir) {
-        Remove-Item -LiteralPath $adapterDir -Recurse -Force
-        Write-Host '    adapter removed'
-    }
-    # The session registry lives in the real %TEMP%, which -TargetHome does not
-    # redirect, so a sandboxed uninstall must not touch it: it holds the live
-    # registrations of every Claude session actually running on this machine.
-    $stateRoot = Join-Path $env:TEMP 'agent-bridge-claude'
-    if (-not $TargetHome -and (Test-Path -LiteralPath $stateRoot)) { Remove-Item -LiteralPath $stateRoot -Recurse -Force }
+    Stop-BridgeOwnedRuntime -Context $installContext
+    Remove-BridgeClaudeAdapter
     Write-Step 'Done'
     return
 }
@@ -183,6 +211,7 @@ if (-not (Test-Path -LiteralPath (Join-Path $coreDir 'decision-mqtt.ps1'))) {
 }
 
 Write-Step "Installing the adapter into $adapterDir"
+Set-BridgeAdapterRoot -Directory $adapterDir -Context $installContext
 if (-not (Test-Path -LiteralPath $adapterDir)) {
     New-Item -ItemType Directory -Path $adapterDir -Force | Out-Null
 }
@@ -193,6 +222,7 @@ Get-ChildItem (Join-Path $PSScriptRoot 'hooks') -File | ForEach-Object {
 # The hooks run apart from the core, so they carry their own copy of the
 # Windows/macOS layer.
 Copy-Item (Join-Path (Split-Path $PSScriptRoot -Parent) 'hooks/bridge-platform.ps1') $adapterDir -Force
+Copy-Item (Join-Path (Split-Path $PSScriptRoot -Parent) 'hooks/bridge-install-context.ps1') $adapterDir -Force
 Write-Host '    bridge-platform.ps1'
 
 Write-Step "Registering hooks in $settingsPath"
@@ -213,6 +243,7 @@ $settings = Add-BridgeHook -Settings $settings -EventName 'SessionStart' -Matche
 $settings = Add-BridgeHook -Settings $settings -EventName 'UserPromptSubmit' -Matcher '' `
     -ScriptName 'register-claude-session.ps1' -TimeoutSeconds 15 -NativeName 'register'
 Save-Settings -Settings $settings
+Set-BridgeAdapterEnrollment -Context $installContext -Client claude -Installed $true -RepairOnly:$RepairOnly
 Write-Host '    PreToolUse (AskUserQuestion), Notification, Stop, SessionStart and UserPromptSubmit registered'
 if ($nativeHook) { Write-Host "    through the native hook: $nativeHook" }
 
@@ -221,4 +252,4 @@ Write-Host ''
 Write-Host 'Next steps:' -ForegroundColor Yellow
 Write-Host '  1. Restart any running Claude Code sessions so they pick up the hooks.'
 Write-Host '  2. The bridge daemon finds Claude sessions on its own; no restart needed.'
-Write-Host "     Logs: `$env:TEMP\agent-decision-bridge.log and agent-bridge-daemon.log"
+Write-Host "     Logs: $(Get-BridgeRuntimeRoot -Context $installContext)"

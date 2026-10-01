@@ -36,19 +36,25 @@
 param(
     [switch]$Check,
     [switch]$Force,
-    [switch]$Yes
+    [switch]$Yes,
+    [string]$TargetHome,
+    [string]$InstallRoot
 )
 
 $ErrorActionPreference = 'Stop'
 
-$hooksDir = Join-Path $HOME '.agent-ha-bridge/hooks'
-if (-not (Test-Path -LiteralPath (Join-Path $hooksDir 'bridge-update.ps1'))) {
-    # Fall back to the copy in this clone, so -Check works before a first install.
-    $hooksDir = Join-Path $PSScriptRoot 'hooks'
+$bootstrapHooks = Join-Path $PSScriptRoot 'hooks'
+. (Join-Path $bootstrapHooks 'bridge-platform.ps1')
+$updateContext = Resolve-BridgeInstallContext -TargetHome $TargetHome -BridgeHome $InstallRoot -EntryDirectory $PSScriptRoot
+$hooksDir = $updateContext.HooksDir
+if (-not (Test-Path -LiteralPath (Join-Path $hooksDir 'bridge-update.ps1'))) { $hooksDir = $bootstrapHooks }
+$previousConfig = $env:AGENT_HA_BRIDGE_CONFIG
+try {
+    $env:AGENT_HA_BRIDGE_CONFIG = $updateContext.ConfigPath
+    . (Join-Path $hooksDir 'decision-bridge-common.ps1')
+    . (Join-Path $hooksDir 'bridge-update.ps1')
 }
-
-. (Join-Path $hooksDir 'decision-bridge-common.ps1')
-. (Join-Path $hooksDir 'bridge-update.ps1')
+finally { $env:AGENT_HA_BRIDGE_CONFIG = $previousConfig }
 
 Write-Host '==> Checking for updates' -ForegroundColor Cyan
 $status = Get-BridgeUpdateStatus -Force
@@ -94,8 +100,8 @@ if ($Check) {
 Write-Host '==> Installing' -ForegroundColor Cyan
 # Not detached: run in the foreground so the outcome is visible. The daemon uses the
 # detached path instead, because the installer restarts the task it runs under.
-$result = Invoke-BridgeSelfUpdate
+$result = Invoke-BridgeSelfUpdate -InstallRoot $updateContext.BridgeHome -TargetHome $(if ($updateContext.Isolated) { $updateContext.Home } else { '' })
 Write-Host "    $($result.Detail)"
 Write-Host ''
-Write-Host "Log: $env:TEMP\agent-bridge-update.log"
+Write-Host "Log: $(Get-BridgeRuntimePath -Name 'agent-bridge-update.log' -Context $updateContext)"
 Write-Host 'Restart any running Copilot or Claude sessions to pick up the new hooks.' -ForegroundColor Yellow

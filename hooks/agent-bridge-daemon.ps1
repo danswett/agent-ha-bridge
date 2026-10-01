@@ -82,7 +82,7 @@ $script:DaemonEntity = @{
 }
 
 $script:DaemonConfig = @{
-    MutexName = 'Local\AgentBridgeDaemon'
+    MutexName = 'Local\' + $script:BridgeInstallContext.TaskName
     # Per machine, so one machine can be watched in detail while the others are not.
     # Home Assistant slugifies a helper's name into its id, so the name is built from
     # the same slug the entity id is, and the id itself comes from
@@ -90,17 +90,17 @@ $script:DaemonConfig = @{
     VerboseHelperId = "agent_bridge_${script:DaemonMachineSlug}_detailed_activity"
     VerboseHelperName = "Agent Bridge $($script:DaemonMachineSlug -replace '_', ' ') Detailed Activity"
     VerboseToggle = (Get-BridgeMachineEntityId -Domain 'input_boolean' -Key 'detailed_activity' -Slug $script:DaemonMachineSlug)
-    LogFile = (Join-Path $env:TEMP 'agent-bridge-daemon.log')
-    StateFile = (Join-Path $env:TEMP 'agent-bridge-daemon-state.json')
+    LogFile = (Get-BridgeRuntimePath 'agent-bridge-daemon.log')
+    StateFile = (Get-BridgeRuntimePath 'agent-bridge-daemon-state.json')
     # Written by the self-updater when an install finishes, read by whichever daemon
     # is running next, so a press of the install button ends in a visible
     # "updated to X" (or a failure) notification.
-    UpdateOutcomeFile = (Join-Path $env:TEMP 'agent-bridge-update-outcome.json')
+    UpdateOutcomeFile = (Get-BridgeRuntimePath 'agent-bridge-update-outcome.json')
     # Written once the pre-rename entities have been swept, so the sweep does not
     # repeat on every daemon start.
-    LegacyCleanupMarker = (Join-Path $env:TEMP 'agent-bridge-legacy-cleanup.json')
+    LegacyCleanupMarker = (Get-BridgeRuntimePath 'agent-bridge-legacy-cleanup.json')
     # The same, for the entities that predate being scoped to a machine.
-    UnscopedCleanupMarker = (Join-Path $env:TEMP 'agent-bridge-unscoped-cleanup.json')
+    UnscopedCleanupMarker = (Get-BridgeRuntimePath 'agent-bridge-unscoped-cleanup.json')
     # Cap how much transcript is read in one pass, so a session that produced a huge
     # burst cannot stall the loop.
     MaxTailBytes = 512000
@@ -187,7 +187,7 @@ $script:DaemonClientSetup = @{}
 $script:DaemonRestartRequested = ''
 # The agent last published as the dashboard's default, kept across restarts so a
 # selection still showing it can be told apart from one the user made.
-$script:DaemonDefaultAgentFile = Join-Path $env:TEMP 'agent-bridge-default-agent.txt'
+$script:DaemonDefaultAgentFile = Get-BridgeRuntimePath 'agent-bridge-default-agent.txt'
 $script:DaemonDefaultAgent = $null
 try { $script:DaemonDefaultAgent = ([System.IO.File]::ReadAllText($script:DaemonDefaultAgentFile)).Trim() } catch { }
 
@@ -286,8 +286,11 @@ function Write-DaemonLog {
 # optional - when it is not installed, these degrade to returning nothing.
 
 $script:ClaudeAdapterLoaded = $false
-$claudeHooks = Join-Path $HOME '.claude\ha-bridge'
-if (Test-Path -LiteralPath (Join-Path $claudeHooks 'claude-session.ps1')) {
+$configuredClients = Get-BridgeSelectedClients
+$claudeHooks = Join-Path $script:BridgeInstallContext.ClaudeHome 'ha-bridge'
+if (($null -eq $configuredClients -or $configuredClients -contains 'claude') -and
+    (Test-BridgeAdapterRoot -Directory $claudeHooks -Context $script:BridgeInstallContext) -and
+    (Test-Path -LiteralPath (Join-Path $claudeHooks 'claude-session.ps1'))) {
     try {
         . (Join-Path $claudeHooks 'claude-session.ps1')
         . (Join-Path $claudeHooks 'claude-transcript.ps1')
@@ -308,8 +311,10 @@ if (Test-Path -LiteralPath (Join-Path $claudeHooks 'claude-session.ps1')) {
 }
 
 $script:CodexAdapterLoaded = $false
-$codexHooks = Join-Path $HOME '.agent-ha-bridge\codex-bridge\plugins\agent-ha-bridge\hooks'
-if (Test-Path -LiteralPath (Join-Path $codexHooks 'codex-session.ps1')) {
+$codexHooks = Join-Path $script:BridgeInstallContext.BridgeHome 'codex-bridge\plugins\agent-ha-bridge\hooks'
+if (($null -eq $configuredClients -or $configuredClients -contains 'codex') -and
+    (Test-BridgeAdapterRoot -Directory $codexHooks -Context $script:BridgeInstallContext) -and
+    (Test-Path -LiteralPath (Join-Path $codexHooks 'codex-session.ps1'))) {
     try {
         . (Join-Path $codexHooks 'codex-session.ps1')
         . (Join-Path $codexHooks 'codex-transcript.ps1')
@@ -853,6 +858,7 @@ if (-not $env:AGENT_BRIDGE_DAEMON_NORUN) {
             Write-DaemonLog -Message 'another daemon instance is already running; exiting'
             return
         }
+        Register-BridgeRuntimeProcess -Context $script:BridgeInstallContext -Role daemon
         Start-BridgeDaemon
     }
     catch {
@@ -864,6 +870,5 @@ if (-not $env:AGENT_BRIDGE_DAEMON_NORUN) {
         $mutex.Dispose()
     }
 }
-
 
 

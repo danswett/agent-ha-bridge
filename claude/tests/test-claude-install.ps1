@@ -34,6 +34,8 @@ $coreHooks = Join-Path $sandbox '.agent-ha-bridge\hooks'
 New-Item -ItemType Directory -Path $coreHooks -Force | Out-Null
 # The installer only checks that the main bridge is present.
 Set-Content -LiteralPath (Join-Path $coreHooks 'decision-mqtt.ps1') -Value '# placeholder'
+@{ homeAssistant = @{ baseUrl = 'http://127.0.0.1:1'; token = 'synthetic-claude-token' } } |
+    ConvertTo-Json -Depth 4 | Set-Content -LiteralPath (Join-Path $sandbox '.agent-ha-bridge\config.json') -Encoding utf8
 
 # $env:TEMP on macOS, and $script:BridgeIsWindows.
 . (Join-Path $PSScriptRoot '../../hooks/bridge-platform.ps1')
@@ -47,7 +49,12 @@ $env:TEMP = Join-Path $sandbox 'temp'
 New-Item -ItemType Directory -Path $env:TEMP -Force | Out-Null
 
 $sessionId = "00000000-0000-4000-8000-$([guid]::NewGuid().ToString('N').Substring(0,12))"
-$registration = Join-Path $env:TEMP "agent-bridge-claude\$sessionId.json"
+$runtimeRoot = Join-Path $sandbox '.agent-ha-bridge\runtime'
+$registration = Join-Path $runtimeRoot "agent-bridge-claude\$sessionId.json"
+$legacyRegistry = Join-Path $env:TEMP 'agent-bridge-claude'
+[void][IO.Directory]::CreateDirectory($legacyRegistry)
+$legacySentinel = Join-Path $legacyRegistry 'unrelated-legacy.json'
+[IO.File]::WriteAllText($legacySentinel, '{"legacy":"unattributed"}')
 
 try {
     Write-Host ''
@@ -151,15 +158,15 @@ try {
                 $output = $payload | & $bash -c $command 2>&1
                 Test-That 'with no daemon, the script runs through the native hook, under Bash' {
                     $LASTEXITCODE -eq 0 -and [string]::IsNullOrWhiteSpace(($output | Out-String)) -and
-                    (Test-Path -LiteralPath (Join-Path $sandboxTemp "agent-bridge-claude\$sessionId.json"))
+                    (Test-Path -LiteralPath $registration)
                 } ($output | Out-String)
 
                 # A fresh heartbeat: the event is spooled for the daemon instead.
-                [IO.File]::WriteAllText((Join-Path $sandboxTemp 'agent-bridge-daemon.heartbeat'), '1')
+                [IO.File]::WriteAllText((Join-Path $runtimeRoot 'agent-bridge-daemon.heartbeat'), '1')
                 $output = $payload | & $bash -c $command 2>&1
                 Test-That 'with the daemon running, the event is spooled for it, and nothing printed' {
                     $LASTEXITCODE -eq 0 -and [string]::IsNullOrWhiteSpace(($output | Out-String)) -and
-                    @(Get-ChildItem (Join-Path $sandboxTemp 'agent-bridge-spool') -Filter '*.json' -ErrorAction SilentlyContinue).Count -eq 1
+                    @(Get-ChildItem (Join-Path $runtimeRoot 'agent-bridge-spool') -Filter '*.json' -ErrorAction SilentlyContinue).Count -eq 1
                 } ($output | Out-String)
             }
             finally {
@@ -170,13 +177,27 @@ try {
 
     Write-Host ''
     Write-Host '--- uninstall ---'
+    $settingsPath = Join-Path $sandbox '.claude\settings.json'
+    $foreignCommand = '"{0}" "{1}"' -f (Join-Path $sandbox 'other-install\ha-bridge\run-hook.cmd'), (Join-Path $sandbox 'other-install\ha-bridge\notify-claude-stop.ps1')
+    $mixed = Get-Content -LiteralPath $settingsPath -Raw | ConvertFrom-Json -AsHashtable
+    $mixed.hooks.Stop[0].hooks += @(
+        @{ type = 'command'; command = $foreignCommand },
+        @{ type = 'command'; command = 'echo unrelated-ha-bridge-note' }
+    )
+    $mixed | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $settingsPath -Encoding utf8
     & (Join-Path $PSScriptRoot '..\install-claude.ps1') -TargetHome $sandbox -Uninstall *> $null
     $after = Get-Content -LiteralPath (Join-Path $sandbox '.claude\settings.json') -Raw | ConvertFrom-Json
-    Test-That 'uninstall removes every hook it added' { -not $after.PSObject.Properties['hooks'] }
+    Test-That 'uninstall removes its hooks while preserving another installation and unrelated hooks' {
+        @($after.hooks.PSObject.Properties).Count -eq 1 -and
+            @($after.hooks.Stop[0].hooks).Count -eq 2 -and
+            $after.hooks.Stop[0].hooks[0].command -eq $foreignCommand -and
+            $after.hooks.Stop[0].hooks[1].command -eq 'echo unrelated-ha-bridge-note'
+    }
+    Test-That 'uninstall removes the owned registry rather than the ambient registry' { -not (Test-Path -LiteralPath $registration) }
     # A sandboxed uninstall once deleted the real session registry, retiring every
     # live Claude session on the machine.
     Test-That 'a sandboxed uninstall leaves the real session registry alone' {
-        Test-Path -LiteralPath $registration
+        [IO.File]::ReadAllText($legacySentinel) -eq '{"legacy":"unattributed"}'
     }
 }
 finally {

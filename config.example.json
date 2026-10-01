@@ -1,4 +1,5 @@
 {
+  "autoConfigureClients": true,
   "homeAssistant": {
     "baseUrl": "http://homeassistant.local:8123",
     "token": "",

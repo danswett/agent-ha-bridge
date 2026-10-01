@@ -42,6 +42,10 @@
     testing a build without touching a working install; $HOME is read-only in
     PowerShell, so it cannot be redirected any other way.
 
+.PARAMETER InstallRoot
+    The bridge directory owned by an installed command. When combined with TargetHome,
+    it must be inside that home. Installed commands forward this automatically.
+
 .PARAMETER Clients
     Which clients to configure: any of copilot, claude, codex (comma-separated).
     Omit it to be asked interactively, or to reuse a previously chosen set on a
@@ -94,6 +98,8 @@ param(
     [string]$NotifyService,
     [string]$TickerCategory,
     [string]$TargetHome,
+    [string]$InstallRoot,
+    [switch]$RepairOnly,
     [string[]]$Clients,
     [switch]$SkipVerify,
     [switch]$SkipDependencies,
@@ -117,7 +123,14 @@ $repoRoot = $PSScriptRoot
 . (Join-Path $repoRoot 'hooks/bridge-secrets.ps1')
 # No param block of its own, so dot-sourcing it cannot rebind anything here.
 . (Join-Path $repoRoot 'hooks/bridge-devbox.ps1')
-$installHome = if ($TargetHome) { $TargetHome } else { $HOME }
+$installContext = if ($PSVersionTable.PSVersion.Major -ge 7) {
+    Resolve-BridgeInstallContext -TargetHome $TargetHome -BridgeHome $InstallRoot
+} else { $null }
+$installHome = if ($installContext) { $installContext.Home } elseif ($TargetHome) { $TargetHome } else { $HOME }
+if ($installContext -and $installContext.Isolated) {
+    $SkipTask = $true
+    $SkipDependencies = $true
+}
 
 # The VERSION file is the single source of truth, so the Apps & features entry, the
 # recorded config and the update check can never disagree about what is installed.
@@ -138,14 +151,14 @@ $installedFromSource = (Test-Path -LiteralPath (Join-Path $repoRoot '.git'))
 # definition there, and reads the transcripts under session-state. Everything the
 # bridge owns lives in its own root, so a Claude-, Codex- or MCP-only install never
 # creates a Copilot directory.
-$copilotHome = Join-Path $installHome '.copilot'
-$bridgeHome = Join-Path $installHome '.agent-ha-bridge'
+$copilotHome = if ($installContext) { $installContext.CopilotHome } else { Join-Path $installHome '.copilot' }
+$bridgeHome = if ($installContext) { $installContext.BridgeHome } else { Join-Path $installHome '.agent-ha-bridge' }
 $hooksDir = Join-Path $bridgeHome 'hooks'
 # A copy of the installer, so `agent-ha-bridge configure` works on a machine that
 # never had the repository - which is every machine installed from the one-liner.
 $installerDir = Join-Path $bridgeHome 'installer'
 $binDir = Join-Path $bridgeHome 'bin'
-$configPath = Join-Path $bridgeHome 'config.json'
+$configPath = if ($installContext) { $installContext.ConfigPath } else { Join-Path $bridgeHome 'config.json' }
 $hookConfigPath = Join-Path $copilotHome 'hooks\decision-notifier.json'
 # Copilot reads $HOME/.copilot/instructions/**/*.instructions.md, so the bridge owns one
 # file in there rather than editing the user's own copilot-instructions.md beside it.
@@ -1079,8 +1092,7 @@ function Test-BridgeClientInstalled {
 
 function Get-BridgeDaemonProcess {
     <# The running daemon, or nothing. Same test on both platforms. #>
-    @(Get-BridgeProcessesNamed -Name 'pwsh' -WithCommandLine |
-        Where-Object { $_.CommandLine -match 'agent-bridge-daemon\.ps1' })
+    @(Get-BridgeOwnedRuntimeProcesses -Context $installContext -Roles daemon)
 }
 
 function Get-BridgeInstallHealth {
@@ -1493,12 +1505,17 @@ function Install-BridgeAgentInstructions {
     param(
         [Parameter(Mandatory)][string]$Path,
         [string]$EnvVarName = 'AGENT_HA_AGENT_TOKEN',
-        [switch]$HasAgentToken
+        [switch]$HasAgentToken,
+        [string]$InstallationId
     )
 
     $wanted = Get-BridgeAgentInstructions -EnvVarName $EnvVarName -HasAgentToken:$HasAgentToken
+    if ($InstallationId) { $wanted = "<!-- agent-ha-bridge-owner:$InstallationId -->`n$wanted" }
     if (Test-Path -LiteralPath $Path) {
         $current = Get-Content -LiteralPath $Path -Raw -ErrorAction SilentlyContinue
+        if ($InstallationId -and $current -match '^<!-- agent-ha-bridge-owner:([a-f0-9]{32}) -->' -and $Matches[1] -cne $InstallationId) {
+            throw 'The agent instruction file belongs to another installation.'
+        }
         # Both sides normalised: Set-Content writes the platform's line ending, so a
         # file written on Windows and compared on macOS would differ every time.
         if ($null -ne $current -and ($current -replace "`r`n", "`n").Trim() -eq ($wanted -replace "`r`n", "`n").Trim()) {
@@ -1533,10 +1550,21 @@ function Invoke-BridgeLayoutMigration {
         [Parameter(Mandatory)][string]$LegacyBridgeHome,
         [string]$LegacyArpKey,
         [string]$LegacyTaskName,
+        [string]$TargetHome,
         [switch]$SkipMachineWide
     )
 
     $migrated = $false
+    $migrationContext = Resolve-BridgeInstallContext -TargetHome $TargetHome -BridgeHome $BridgeHome
+    $legacyOwned = -not $migrationContext.Recorded -and
+        (Test-BridgeInstallPath $BridgeHome (Join-Path $migrationContext.Home '.agent-ha-bridge')) -and
+        (Test-Path -LiteralPath $LegacyConfigPath)
+    $script:LegacyLayoutOwned = $legacyOwned
+    if (-not (Test-Path -LiteralPath $BridgeHome)) {
+        New-Item -ItemType Directory -Path $BridgeHome -Force | Out-Null
+        if (-not (Protect-BridgeSecretFile -Path $BridgeHome)) { throw 'Could not protect the bridge credential directory.' }
+    }
+    if (-not $legacyOwned) { return $false }
     function Write-Once {
         if (-not $script:MigrationAnnounced) {
             Write-Step 'Migrating the pre-rename install'
@@ -1548,28 +1576,14 @@ function Invoke-BridgeLayoutMigration {
     if (-not $SkipMachineWide -and $LegacyTaskName) {
         # The old daemon holds the old script paths in memory, so it has to go first:
         # otherwise it keeps rewriting the state files the new one is about to adopt.
-        if (Get-ScheduledTask -TaskName $LegacyTaskName -ErrorAction SilentlyContinue) {
+        $legacyTask = Get-ScheduledTask -TaskName $LegacyTaskName -ErrorAction SilentlyContinue
+        if ($legacyTask -and (Test-BridgeTaskOwnership -Task $legacyTask -Context $migrationContext)) {
             Write-Once; $migrated = $true
             Stop-ScheduledTask -TaskName $LegacyTaskName -ErrorAction SilentlyContinue
             Unregister-ScheduledTask -TaskName $LegacyTaskName -Confirm:$false -ErrorAction SilentlyContinue
             Write-Host "    removed the '$LegacyTaskName' scheduled task"
         }
-        foreach ($proc in Get-Process pwsh -ErrorAction SilentlyContinue) {
-            try {
-                $cmd = (Get-CimInstance Win32_Process -Filter "ProcessId=$($proc.Id)" -ErrorAction Stop).CommandLine
-                if ($cmd -match 'copilot-bridge-(daemon|supervisor)\.ps1') {
-                    Write-Once; $migrated = $true
-                    Stop-Process -Id $proc.Id -Force -ErrorAction SilentlyContinue
-                    Write-Host "    stopped the old daemon (pid $($proc.Id))"
-                }
-            }
-            catch { }
-        }
-    }
-
-    if (-not (Test-Path -LiteralPath $BridgeHome)) {
-        New-Item -ItemType Directory -Path $BridgeHome -Force | Out-Null
-        if (-not (Protect-BridgeSecretFile -Path $BridgeHome)) { throw 'Could not protect the bridge credential directory.' }
+        Stop-BridgeOwnedRuntime -Context $migrationContext
     }
 
     # The config carries the Home Assistant token, so moving it rather than rewriting
@@ -1589,14 +1603,19 @@ function Invoke-BridgeLayoutMigration {
     foreach ($name in @('mcp', 'codex-bridge')) {
         $from = Join-Path $CopilotHome $name
         $to = Join-Path $BridgeHome $name
-        if ((Test-Path -LiteralPath $from) -and -not (Test-Path -LiteralPath $to)) {
+        if ($legacyOwned -and (Test-Path -LiteralPath $from) -and -not (Test-Path -LiteralPath $to)) {
             Write-Once; $migrated = $true
-            Move-Item -LiteralPath $from -Destination $to -Force
+            if ($name -eq 'codex-bridge') {
+                # Codex must still be able to read its registered source before it
+                # can prove ownership and replace the marketplace registration.
+                Copy-Item -LiteralPath $from -Destination $to -Recurse -Force
+            }
+            else { Move-Item -LiteralPath $from -Destination $to -Force }
             Write-Host "    $name -> $to"
         }
     }
 
-    if (Test-Path -LiteralPath $LegacyHooksDir) {
+    if ($legacyOwned -and (Test-Path -LiteralPath $LegacyHooksDir)) {
         $removed = 0
         foreach ($name in $script:LegacyHookFiles) {
             $path = Join-Path $LegacyHooksDir $name
@@ -1621,12 +1640,13 @@ function Invoke-BridgeLayoutMigration {
         }
     }
 
-    if (Test-Path -LiteralPath $LegacyBridgeHome) {
+    if ($legacyOwned -and (Test-Path -LiteralPath $LegacyBridgeHome)) {
         Write-Once; $migrated = $true
         Remove-Item -LiteralPath $LegacyBridgeHome -Recurse -Force -ErrorAction SilentlyContinue
         Write-Host "    removed $LegacyBridgeHome"
     }
-    if ($LegacyArpKey -and (Test-Path -LiteralPath $LegacyArpKey)) {
+    if (-not $SkipMachineWide -and $LegacyArpKey -and (Test-Path -LiteralPath $LegacyArpKey) -and
+        (Test-BridgeUninstallEntryOwnership -Path $LegacyArpKey -Context (Resolve-BridgeInstallContext -BridgeHome $BridgeHome) -Legacy)) {
         Write-Once; $migrated = $true
         Remove-Item -LiteralPath $LegacyArpKey -Recurse -Force -ErrorAction SilentlyContinue
         Write-Host '    removed the old Apps & features entry'
@@ -1634,6 +1654,83 @@ function Invoke-BridgeLayoutMigration {
 
     if ($migrated) { Write-Host '    the dashboard moves to /agent-decisions once the daemon restarts' }
     $migrated
+}
+
+function Get-BridgeLegacyRuntimeClaim {
+    param([Parameter(Mandatory)]$Context)
+    if (-not $Context.Legacy) { return $null }
+    $heartbeat = Get-BridgeRuntimePath -Name 'agent-bridge-daemon.heartbeat' -Context $Context
+    if (-not [IO.File]::Exists($heartbeat)) { return $null }
+    $processId = 0
+    if (-not [int]::TryParse([IO.File]::ReadAllText($heartbeat), [ref]$processId)) { return $null }
+    $owner = Get-BridgeRuntimeProcess -ProcessId $processId -Context $Context -Role daemon
+    if (-not $owner -or [IO.File]::GetLastWriteTimeUtc($heartbeat) -lt ([datetime]$owner.CreationDate).ToUniversalTime()) { return $null }
+    [pscustomobject]@{ Owner = $owner; Heartbeat = $heartbeat; Stamp = [IO.File]::GetLastWriteTimeUtc($heartbeat).Ticks }
+}
+
+function Copy-BridgeLegacyRuntimeState {
+    <# The old global mutex and a verified heartbeat identify the writer. Unknown
+       legacy files remain untouched; state is copied byte-for-byte, not reinterpreted. #>
+    param([Parameter(Mandatory)]$PreviousContext, [Parameter(Mandatory)]$Context, $Claim)
+    if (-not $Claim) { return }
+    if (-not $PreviousContext.Legacy -or
+        -not (Test-BridgeInstallPath $PreviousContext.BridgeHome $Context.BridgeHome) -or
+        -not (Test-BridgeRuntimeProcess -Process $Claim.Owner -Context $PreviousContext -Role daemon)) {
+        throw 'Legacy runtime state cannot be reassigned to a different installation.'
+    }
+    $mutex = [Threading.Mutex]::new($false, ('Local\' + $PreviousContext.TaskName))
+    $owned = $false
+    try {
+        try { $owned = $mutex.WaitOne([TimeSpan]::FromSeconds(2)) }
+        catch [Threading.AbandonedMutexException] { $owned = $true }
+        if (-not $owned -or -not [IO.File]::Exists($Claim.Heartbeat) -or
+            [IO.File]::GetLastWriteTimeUtc($Claim.Heartbeat).Ticks -ne $Claim.Stamp -or
+            [IO.File]::ReadAllText($Claim.Heartbeat).Trim() -ne [string]$Claim.Owner.ProcessId) {
+            Write-Warning 'Legacy runtime ownership changed; shared state was preserved in its old location.'
+            return
+        }
+        foreach ($name in @('agent-bridge-daemon-state.json', 'agent-bridge-daemon-state.json.bak',
+            'agent-bridge-default-agent.txt', 'agent-bridge-legacy-cleanup.json', 'agent-bridge-unscoped-cleanup.json')) {
+            $source = Get-BridgeRuntimePath -Name $name -Context $PreviousContext
+            $destination = Get-BridgeRuntimePath -Name $name -Context $Context
+            if ([IO.File]::Exists($source) -and -not [IO.File]::Exists($destination)) {
+                Copy-BridgeSecretFile -Source $source -Destination $destination
+            }
+        }
+        $statePath = Get-BridgeRuntimePath -Name 'agent-bridge-daemon-state.json' -Context $PreviousContext
+        if ([IO.File]::Exists($statePath)) {
+            $state = @{}
+            try { $state = Read-BridgeInstallRecord -Path $statePath }
+            catch { Write-Warning 'Legacy state and backup bytes were preserved, but unreadable state prevents attributing legacy registrations.' }
+            foreach ($id in $(if ($state) { $state.Keys })) {
+                if ($id -notmatch '^[a-zA-Z0-9][a-zA-Z0-9._-]{0,95}$') { continue }
+                $entry = $state[$id]
+                $kind = if ($entry -is [Collections.IDictionary] -and $entry.Contains('Kind')) { [string]$entry.Kind } else { 'copilot' }
+                if ($kind -notin @('claude', 'codex')) { continue }
+                $relative = "agent-bridge-$kind\$id.json"
+                $source = Get-BridgeRuntimePath -Name $relative -Context $PreviousContext
+                $registration = $null
+                try { $registration = Read-BridgeInstallRecord -Path $source }
+                catch { Write-Warning "An unreadable legacy registration was preserved: $source" }
+                if (-not $registration -or [string]$registration['SessionId'] -cne $id -or -not $registration['TranscriptPath']) { continue }
+                $clientRoot = if ($kind -eq 'claude') { $Context.ClaudeHome } else { $Context.CodexHome }
+                if (-not (Test-BridgeInstallDescendant ([string]$registration['TranscriptPath']) $clientRoot)) { continue }
+                Copy-BridgeSecretFile -Source $source -Destination (Get-BridgeRuntimePath -Name $relative -Context $Context)
+                foreach ($marker in @("agent-bridge-$kind\$id.approval.json", "copilot-bridge-markers\$id\agent-pending-decision.json")) {
+                    $sourceMarker = Get-BridgeRuntimePath -Name $marker -Context $PreviousContext
+                    $destination = Get-BridgeRuntimePath -Name $marker -Context $Context
+                    if ([IO.File]::Exists($sourceMarker) -and -not [IO.File]::Exists($destination)) {
+                        Copy-BridgeSecretFile -Source $sourceMarker -Destination $destination
+                    }
+                }
+            }
+        }
+        [IO.File]::Delete($Claim.Heartbeat)
+    }
+    finally {
+        if ($owned) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
+    }
 }
 
 function Invoke-BridgeFrontendCardCheck {
@@ -2098,11 +2195,32 @@ if (-not (Test-Path -LiteralPath $bridgeHome)) {
     if (-not (Protect-BridgeSecretFile -Path $bridgeHome)) { throw 'Could not protect the bridge credential directory.' }
 }
 
+if ($RepairOnly) {
+    $repairConfig = Read-BridgeConfigFile -Path $configPath
+    if (-not $repairConfig.Config -or -not $repairConfig.Config.PSObject.Properties['clients']) {
+        throw 'Automatic repair requires a readable explicit client selection.'
+    }
+    $repairSelection = @(ConvertTo-BridgeClientList @($repairConfig.Config.clients))
+    if (@(ConvertTo-BridgeClientList $Clients | Where-Object { $repairSelection -notcontains $_ }).Count) {
+        throw 'The requested clients are no longer selected; automatic repair did not change the installation.'
+    }
+}
+$legacyRuntimeClaim = Get-BridgeLegacyRuntimeClaim -Context $installContext
+$previousInstallContext = $installContext
+Stop-BridgeOwnedService -Context $installContext
+Stop-BridgeOwnedRuntime -Context $installContext
 $script:DidMigrate = Invoke-BridgeLayoutMigration `
     -CopilotHome $copilotHome -BridgeHome $bridgeHome -ConfigPath $configPath `
     -LegacyHooksDir $legacyHooksDir -LegacyConfigPath $legacyConfigPath `
-    -LegacyBridgeHome $legacyBridgeHome -LegacyArpKey $legacyArpKey `
-    -LegacyTaskName $legacyTaskName -SkipMachineWide:([bool]$TargetHome -or -not $script:BridgeIsWindows)
+    -LegacyBridgeHome $legacyBridgeHome -LegacyArpKey $(if (-not $installContext.Isolated -or $TestRegistryId) { $legacyArpKey } else { '' }) `
+    -LegacyTaskName $legacyTaskName -TargetHome $TargetHome -SkipMachineWide:($installContext.Isolated -or -not $script:BridgeIsWindows)
+$installContext = Initialize-BridgeInstallIdentity -Context $installContext -TestRegistryId $TestRegistryId -LegacyLayout:$script:LegacyLayoutOwned
+Copy-BridgeLegacyRuntimeState -PreviousContext $previousInstallContext -Context $installContext -Claim $legacyRuntimeClaim
+$script:BridgeInstallContext = $installContext
+$taskName = $installContext.TaskName
+$launchAgentLabel = $installContext.LaunchAgentLabel
+$launchAgentPath = Join-Path $installHome "Library\LaunchAgents\$launchAgentLabel.plist"
+if (-not $TestRegistryId) { $arpKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\AgentHaBridge_$($installContext.Id)" }
 
 # ---------------------------------------------------------------- hook scripts
 Write-Step "Copying hook scripts to $hooksDir"
@@ -2253,6 +2371,7 @@ $requestedClients = if ($PSBoundParameters.ContainsKey('Clients')) { $Clients } 
 # the shipped example is what used to make the picker never appear.
 $persistedClients = @()
 if ($configExisted -and $config.PSObject.Properties['clients']) { $persistedClients = @($config.clients) }
+if ($RepairOnly) { $requestedClients = $persistedClients }
 $selectedClients = Resolve-BridgeClients -Requested $requestedClients -Persisted $persistedClients `
     -NonInteractive:$NonInteractive -Prompt { Read-BridgeClientSelection -Detected $detectedClients }
 if ($config.PSObject.Properties['clients']) { $config.clients = @($selectedClients) }
@@ -2517,9 +2636,12 @@ if ($agentIdentityWarning) { Write-Warning $agentIdentityWarning }
 # install on the check", not "do not talk to Home Assistant" - so with a token to hand,
 # try. Nothing here throws: the card check reports and returns.
 $canReachHomeAssistant = $homeAssistantReady -or (-not [string]::IsNullOrWhiteSpace($effectiveToken))
-if ($canReachHomeAssistant) {
+if ($canReachHomeAssistant -and -not $installContext.Isolated) {
     Write-Step 'Checking the dashboard frontend cards'
     [void](Invoke-BridgeFrontendCardCheck -HooksDir $hooksDir -ConfigPath $configPath -Register)
+}
+elseif ($installContext.Isolated) {
+    Write-Step 'Leaving shared Home Assistant resources alone (isolated installation)'
 }
 
 
@@ -2528,7 +2650,7 @@ if ($canReachHomeAssistant) {
 # failed lookup plus a round of reasoning to rediscover that the preToolUse hook already
 # does the work. Remove it on upgrade rather than leaving the stale copy behind, whatever
 # clients are selected now.
-if (Test-Path -LiteralPath $legacySkillDir) {
+if ($installContext.LegacyLayout -and (Test-Path -LiteralPath $legacySkillDir)) {
     Write-Step 'Removing the obsolete decision-notifier skill'
     Remove-Item -LiteralPath $legacySkillDir -Recurse -Force
     Write-Host "    $legacySkillDir"
@@ -2607,12 +2729,22 @@ if ($selectedClients -contains 'copilot') {
             }
         }
     }
-    @{ version = 1; hooks = $hookDefs } | ConvertTo-Json -Depth 8 |
+    $copilotConfig = if (Test-Path -LiteralPath $hookConfigPath) {
+        Get-Content -LiteralPath $hookConfigPath -Raw | ConvertFrom-Json -AsHashtable
+    } else { @{} }
+    $copilotConfig = Remove-BridgeCopilotHookEntries -Config $copilotConfig -Context $installContext
+    if (-not $copilotConfig.ContainsKey('hooks')) { $copilotConfig['hooks'] = @{} }
+    foreach ($eventName in $hookDefs.Keys) {
+        $previousHooks = if ($copilotConfig.hooks.ContainsKey($eventName)) { @($copilotConfig.hooks[$eventName]) } else { @() }
+        $copilotConfig.hooks[$eventName] = $previousHooks + @($hookDefs[$eventName])
+    }
+    $copilotConfig['version'] = 1
+    $copilotConfig | ConvertTo-Json -Depth 12 |
         Set-Content -LiteralPath $hookConfigPath -Encoding UTF8
     Write-Host "    $hookConfigPath"
     if (Install-BridgeAgentInstructions -Path $agentInstructionsPath `
             -EnvVarName ([string]$config.homeAssistant.agentTokenEnvVar) `
-            -HasAgentToken:$hasAgentToken) {
+            -HasAgentToken:$hasAgentToken -InstallationId $installContext.Id) {
         Write-Host "    $agentInstructionsPath"
     }
 }
@@ -2620,12 +2752,19 @@ elseif (Test-Path -LiteralPath $hookConfigPath) {
     # Copilot is not configured, so a definition left over from an earlier run would
     # point the CLI at scripts this install has just moved out from under it.
     Write-Step 'Removing the stale Copilot hook definition'
-    Remove-Item -LiteralPath $hookConfigPath -Force -ErrorAction SilentlyContinue
+    $copilotConfig = Get-Content -LiteralPath $hookConfigPath -Raw | ConvertFrom-Json -AsHashtable
+    $copilotConfig = Remove-BridgeCopilotHookEntries -Config $copilotConfig -Context $installContext
+    if ($copilotConfig.ContainsKey('hooks')) {
+        $copilotConfig | ConvertTo-Json -Depth 12 | Set-Content -LiteralPath $hookConfigPath -Encoding utf8
+    }
+    else { Remove-Item -LiteralPath $hookConfigPath -Force }
     Write-Host "    $hookConfigPath"
 }
 if (-not ($selectedClients -contains 'copilot') -and (Test-Path -LiteralPath $agentInstructionsPath)) {
     # Guidance for a client this install no longer configures is just context cost.
-    Remove-Item -LiteralPath $agentInstructionsPath -Force -ErrorAction SilentlyContinue
+    if ([IO.File]::ReadAllText($agentInstructionsPath).StartsWith("<!-- agent-ha-bridge-owner:$($installContext.Id) -->")) {
+        Remove-Item -LiteralPath $agentInstructionsPath -Force
+    }
 }
 
 # ------------------------------------------------------------- scheduled task
@@ -2633,7 +2772,7 @@ $taskRegistered = $false
 if (-not $SkipTask -and -not $script:BridgeIsWindows) {
     Write-Step "Registering the '$launchAgentLabel' LaunchAgent"
     try {
-        if ($TargetHome) { throw 'a -TargetHome sandbox does not register a LaunchAgent' }
+        if ($installContext.Isolated) { throw 'an isolated installation does not register a LaunchAgent' }
         $pwshPath = (Get-Command pwsh -CommandType Application | Select-Object -First 1).Source
         $pathValue = @(@($env:PATH -split ':') + @('/opt/homebrew/bin', '/usr/local/bin', '/opt/local/bin', '/usr/bin', '/bin', '/usr/sbin', '/sbin') |
             Where-Object { $_ } | Select-Object -Unique) -join ':'
@@ -2663,7 +2802,11 @@ elseif (-not $SkipTask) {
         $principal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
             -LogonType Interactive -RunLevel Limited
 
-        if (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue) {
+        $existingTask = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+        if ($existingTask) {
+            if (-not (Test-BridgeTaskOwnership -Task $existingTask -Context $installContext)) {
+                throw 'The named task belongs to another installation.'
+            }
             Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
             Set-ScheduledTask -TaskName $taskName -Action $action -Trigger $trigger `
                 -Settings $settings -Principal $principal | Out-Null
@@ -2679,21 +2822,7 @@ elseif (-not $SkipTask) {
         # supervisor saw one already running and quit - so an install or update never
         # took effect until the next logon. They are stopped here, sparing this
         # installer's own ancestors: a dashboard update runs it from the daemon.
-        if (-not $TargetHome) {
-            $ancestors = @{}
-            $walk = $PID
-            for ($i = 0; $i -lt 16 -and $walk; $i++) {
-                $ancestors[[int]$walk] = $true
-                $walk = (Get-CimInstance Win32_Process -Filter "ProcessId=$walk" -ErrorAction SilentlyContinue).ParentProcessId
-            }
-            foreach ($proc in @(Get-CimInstance Win32_Process -Filter "Name='pwsh.exe'" -ErrorAction SilentlyContinue)) {
-                if ($ancestors.ContainsKey([int]$proc.ProcessId)) { continue }
-                if ([string]$proc.CommandLine -match 'agent-bridge-(supervisor|daemon)\.ps1') {
-                    Stop-Process -Id $proc.ProcessId -Force -ErrorAction SilentlyContinue
-                    Write-Host "    stopped the running $($Matches[1]) (pid $($proc.ProcessId))"
-                }
-            }
-        }
+        Stop-BridgeOwnedRuntime -Context $installContext
         Start-ScheduledTask -TaskName $taskName
         Write-Host '    registered and started'
         $taskRegistered = $true
@@ -2757,7 +2886,8 @@ elseif ($script:BridgeIsWindows -and -not $TargetHome) {
 # them by running their own installers. Each is idempotent and warns rather than fails
 # if the client turns out not to be present.
 foreach ($client in @('claude', 'codex', 'mcp')) {
-    if ($selectedClients -notcontains $client) { continue }
+    $removing = $persistedClients -contains $client -and $selectedClients -notcontains $client
+    if ($selectedClients -notcontains $client -and -not $removing) { continue }
     $adapterInstaller = Join-Path $repoRoot "$client\install-$client.ps1"
     if (-not (Test-Path -LiteralPath $adapterInstaller)) {
         Write-Warning "The $($script:ClientLabels[$client]) installer was not found at $adapterInstaller; skipping."
@@ -2765,10 +2895,13 @@ foreach ($client in @('claude', 'codex', 'mcp')) {
     }
     Write-Step "Configuring $($script:ClientLabels[$client])"
     try {
-        if ($TargetHome) { & $adapterInstaller -TargetHome $TargetHome }
-        else { & $adapterInstaller }
+        $adapterArgs = @{ InstallRoot = $bridgeHome }
+        if ($installContext.Isolated) { $adapterArgs.TargetHome = $installHome }
+        if ($removing) { $adapterArgs.Uninstall = $true }
+        & $adapterInstaller @adapterArgs
     }
     catch {
+        if ($removing) { throw "The $client adapter could not be removed; its remaining registration requires cleanup before reconfiguration can complete." }
         Write-Warning "$($script:ClientLabels[$client]) did not configure cleanly: $($_.Exception.Message)"
     }
 }
@@ -2787,7 +2920,7 @@ if ($SkipPath) {
     Write-Step 'Leaving PATH alone (-SkipPath)'
     Write-Host "    run it as $commandPath" -ForegroundColor DarkGray
 }
-elseif ($TargetHome) {
+elseif ($installContext.Isolated) {
     # A sandbox install shares the user's PATH with the real one, so putting its bin
     # directory there would shadow the real command with a throwaway copy.
     Write-Step 'Leaving PATH alone (-TargetHome)'
@@ -2840,16 +2973,19 @@ else {
 if (-not (Test-Path -LiteralPath $bridgeHome)) { New-Item -ItemType Directory -Path $bridgeHome -Force | Out-Null }
 Copy-Item (Join-Path $repoRoot 'uninstall.ps1') $bridgeHome -Force
 $uninstallScript = Join-Path $bridgeHome 'uninstall.ps1'
-if ($script:BridgeIsWindows) {
+if ($script:BridgeIsWindows -and (-not $installContext.Isolated -or $TestRegistryId)) {
 Write-Step 'Registering in Apps & features'
 
 # A sandbox install must uninstall itself, not the real one, so the entry carries its
 # own location. A normal install omits it and lets uninstall.ps1 use $HOME, which also
 # keeps the machine-wide cleanup (scheduled task, daemon processes) enabled.
-$uninstallArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$uninstallScript`" -ClearEntities"
-if ($TargetHome) { $uninstallArgs += " -TargetHome `"$installHome`"" }
+$uninstallArgs = "-NoProfile -ExecutionPolicy Bypass -File `"$uninstallScript`" -ClearEntities -InstallRoot `"$bridgeHome`""
+if ($installContext.Isolated) { $uninstallArgs += " -TargetHome `"$installHome`"" }
 if ($TestRegistryId) { $uninstallArgs += " -TestRegistryId $TestRegistryId" }
 
+if ((Test-Path -LiteralPath $arpKey) -and -not (Test-BridgeUninstallEntryOwnership -Path $arpKey -Context $installContext)) {
+    throw 'The named Apps & features entry belongs to another installation.'
+}
 New-Item -Path $arpKey -Force | Out-Null
 $arpValues = @{
     DisplayName     = 'AI coding agent Home Assistant bridge'
@@ -2870,6 +3006,12 @@ foreach ($name in $arpValues.Keys) { Set-ItemProperty -Path $arpKey -Name $name 
 Set-ItemProperty -Path $arpKey -Name NoModify -Value 1 -Type DWord
 Set-ItemProperty -Path $arpKey -Name NoRepair -Value 1 -Type DWord
 Write-Host "    'AI coding agent Home Assistant bridge' is now uninstallable from Settings"
+if (-not $installContext.Isolated) {
+    $oldEntry = 'HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\AgentHaBridge'
+    if ((Test-Path -LiteralPath $oldEntry) -and (Test-BridgeUninstallEntryOwnership -Path $oldEntry -Context $installContext)) {
+        Remove-Item -LiteralPath $oldEntry -Recurse -Force
+    }
+}
 }
 
 Write-Step 'Done'
@@ -2899,7 +3041,7 @@ if ($selectedClients -contains 'mcp') {
     $stepNo++
 }
 Write-Host "  $stepNo. Open the Agent Sessions dashboard in Home Assistant."
-Write-Host "     Logs: $(Join-Path $env:TEMP 'agent-bridge-daemon.log') and agent-decision-bridge.log"
+Write-Host "     Logs: $(Get-BridgeRuntimePath -Name 'agent-bridge-daemon.log' -Context $installContext) and agent-decision-bridge.log"
 if (-not $script:BridgeIsWindows) {
     $stepNo++
     Write-Host "  $stepNo. macOS: the dashboard types replies into sessions running in tmux. Sessions it"

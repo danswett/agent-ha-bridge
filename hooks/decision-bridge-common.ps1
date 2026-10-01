@@ -107,29 +107,23 @@ function Get-BridgeTuningAxisIcon {
 }
 
 function Get-BridgeUserConfig {
-    $candidates = @()
-    if (-not [string]::IsNullOrWhiteSpace($env:AGENT_HA_BRIDGE_CONFIG)) {
-        $candidates += $env:AGENT_HA_BRIDGE_CONFIG
+    $context = Resolve-BridgeInstallContext -EntryDirectory $PSScriptRoot
+    $path = $context.ConfigPath
+    if (-not (Test-Path -LiteralPath $path)) {
+        if ($context.ExplicitConfig -or $context.Recorded -or -not $context.Legacy) { throw "The selected bridge configuration is missing: $path" }
+        return $null
     }
-    $candidates += (Join-Path $HOME '.agent-ha-bridge\config.json')
-    if (-not [string]::IsNullOrWhiteSpace($env:COPILOT_HA_BRIDGE_CONFIG)) {
-        $candidates += $env:COPILOT_HA_BRIDGE_CONFIG
+    try {
+        $raw = Get-Content -LiteralPath $path -Raw -Encoding UTF8
+        if (-not [string]::IsNullOrWhiteSpace($raw)) { return ($raw | ConvertFrom-Json) }
+        throw 'Empty configuration.'
     }
-    $candidates += (Join-Path $HOME '.copilot\copilot-ha-bridge.config.json')
-
-    foreach ($path in $candidates) {
-        if (-not (Test-Path -LiteralPath $path)) { continue }
-        try {
-            $raw = Get-Content -LiteralPath $path -Raw -Encoding UTF8
-            if (-not [string]::IsNullOrWhiteSpace($raw)) { return ($raw | ConvertFrom-Json) }
-        }
-        catch {
-            throw "Agent HA bridge config at '$path' is not valid JSON: $($_.Exception.Message)"
-        }
+    catch {
+        throw "Agent HA bridge config at '$path' could not be read as JSON."
     }
-    $null
 }
 
+$script:BridgeInstallContext = Resolve-BridgeInstallContext -EntryDirectory $PSScriptRoot
 $script:BridgeUserConfig = Get-BridgeUserConfig
 
 function Get-BridgeSetting {
@@ -164,7 +158,7 @@ $script:DecisionBridgeConfig = @{
     # the one above - see Get-BridgeAgentToken.
     HomeAssistantAgentToken = (Get-BridgeSetting 'homeAssistant.agentToken' '')
     HomeAssistantAgentTokenEnvVar = (Get-BridgeSetting 'homeAssistant.agentTokenEnvVar' 'AGENT_HA_AGENT_TOKEN')
-    SessionStateRoot = (Get-BridgeSetting 'copilot.sessionStateRoot' (Join-Path $HOME '.copilot\session-state'))
+    SessionStateRoot = (Get-BridgeSetting 'copilot.sessionStateRoot' (Join-Path $script:BridgeInstallContext.CopilotHome 'session-state'))
     DashboardUrlPath = (Get-BridgeSetting 'dashboard.urlPath' 'agent-decisions')
     DashboardPath = ('/' + (Get-BridgeSetting 'dashboard.urlPath' 'agent-decisions') + '/decision')
     # Notifications are optional. `service` is any HA notify-style service, e.g.
@@ -178,12 +172,17 @@ $script:DecisionBridgeConfig = @{
     DecisionChoiceMaxChars = 600
     ResponsePlaceholder = 'Select an answer...'
     CancelOption = 'Cancel request'
-    LogFile = (Join-Path $env:TEMP 'agent-decision-bridge.log')
+    LogFile = (Get-BridgeRuntimePath 'agent-decision-bridge.log')
     HttpRetryCount = 4
     HttpRetryInitialDelayMs = 400
     # How long the ask_user wait tolerates an unreachable Home Assistant before it
     # gives up. A restart of Home Assistant takes well under this.
     WaitTransientFailureGraceMinutes = 5
+}
+
+if ($script:BridgeInstallContext.Isolated -and
+    -not (Test-BridgeInstallDescendant $script:DecisionBridgeConfig.SessionStateRoot $script:BridgeInstallContext.Home)) {
+    throw 'An isolated installation cannot read session state outside its target home.'
 }
 
 # How long to stay away from Home Assistant after it rejects the bridge's credentials,
@@ -434,18 +433,21 @@ function Test-HomeAssistantReachable {    <#
 # that trusts a stale answer spends its budget on a host that has gone.
 $script:BridgeReachableFreshSeconds = 20
 
-function Get-BridgeReachableMarker { Join-Path $env:TEMP 'agent-bridge-ha-reachable' }
+function Get-BridgeReachableMarker { Get-BridgeRuntimePath 'agent-bridge-ha-reachable' }
 
 function Set-BridgeHomeAssistantReachable {
     <# Records that Home Assistant just answered. Best effort. #>
     try { [IO.File]::WriteAllText((Get-BridgeReachableMarker), [DateTimeOffset]::Now.ToString('o')) } catch { }
 }
 
-function Get-BridgeDaemonHeartbeat { Join-Path $env:TEMP 'agent-bridge-daemon.heartbeat' }
+function Get-BridgeDaemonHeartbeat { Get-BridgeRuntimePath 'agent-bridge-daemon.heartbeat' }
 
 function Set-BridgeDaemonAlive {
     <# The daemon's heartbeat, written each pass. Best effort. #>
-    try { [IO.File]::WriteAllText((Get-BridgeDaemonHeartbeat), [string]$PID) } catch { }
+    try {
+        [void][IO.Directory]::CreateDirectory((Get-BridgeRuntimeRoot))
+        [IO.File]::WriteAllText((Get-BridgeDaemonHeartbeat), [string]$PID)
+    } catch { }
 }
 
 function Get-BridgeDaemonPid {
@@ -466,13 +468,8 @@ function Get-BridgeDaemonPid {
         $id = 0
         if (-not [int]::TryParse(([IO.File]::ReadAllText($path)).Trim(), [ref]$id)) { return 0 }
         if ($id -le 0) { return 0 }
-        $proc = Get-Process -Id $id -ErrorAction SilentlyContinue
+        $proc = Get-BridgeRuntimeProcess -ProcessId $id -Context (Get-BridgeInstallContext) -Role daemon
         if ($null -eq $proc) { return 0 }
-
-        # A fresh heartbeat naming a pid that has since been recycled would otherwise
-        # report some unrelated process as the daemon. The name is the cheap half of
-        # the identity the command-line scan used to establish.
-        if ($proc.ProcessName -notin @('pwsh', 'powershell')) { return 0 }
         $id
     }
     catch { 0 }
@@ -1939,7 +1936,7 @@ function Get-CopilotDecisionMarkerPath {
         return Join-Path $sessionDirectory 'agent-pending-decision.json'
     }
 
-    $fallback = Join-Path (Join-Path $env:TEMP 'copilot-bridge-markers') $key
+    $fallback = Join-Path (Get-BridgeRuntimePath 'copilot-bridge-markers') $key
     if (-not (Test-Path -LiteralPath $fallback)) {
         New-Item -ItemType Directory -Path $fallback -Force | Out-Null
     }
@@ -2400,7 +2397,6 @@ function Send-BridgeNotification {
         Write-DecisionBridgeLog -Message "notification via $service failed: $($_.Exception.Message)"
     }
 }
-
 
 
 

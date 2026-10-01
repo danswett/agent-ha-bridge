@@ -20,19 +20,22 @@ function Get-BridgeAttachmentRoot {
         user name containing a space would make every attachment unusable - hence
         the fallback to the public profile, which never contains one.
     #>
+    param([switch]$NoCreate)
+    $context = Get-BridgeInstallContext
     $root = ''
     # macOS: beside the bridge's config, or /tmp for a home folder with a space.
     if (-not $script:BridgeIsWindows) {
-        $root = Join-Path $HOME '.agent-ha-bridge/attachments'
+        $root = Join-Path $context.BridgeHome 'attachments'
         if ($root -match '\s') { $root = Join-Path $env:TEMP 'agent-ha-bridge-attachments' }
     }
-    elseif (-not [string]::IsNullOrWhiteSpace($env:LOCALAPPDATA)) {
-        $root = Join-Path ([string]$env:LOCALAPPDATA) 'agent-ha-bridge\attachments'
+    elseif (-not [string]::IsNullOrWhiteSpace($context.LocalAppData)) {
+        $root = Join-Path $context.LocalAppData 'agent-ha-bridge\attachments'
     }
     if ([string]::IsNullOrWhiteSpace($root) -or $root -match '\s') {
-        $root = Join-Path ([string]$env:PUBLIC) 'agent-ha-bridge\attachments'
+        $root = Join-Path $context.PublicRoot 'agent-ha-bridge\attachments'
     }
-    if (-not (Test-Path -LiteralPath $root)) {
+    if (-not $context.Legacy) { $root = Join-Path $root "install-$($context.Id)" }
+    if (-not $NoCreate -and -not (Test-Path -LiteralPath $root)) {
         New-Item -ItemType Directory -Path $root -Force | Out-Null
     }
     $root
