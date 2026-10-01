@@ -482,7 +482,7 @@ function Invoke-WebRequest {
                 Test-That "the actual client-aware caller preserves pending Claude answering with native ID supplied=$supplied" {
                     $pending.Started -and $pending.Pending -and $pending.ToolCallId -ceq 'Native-Question'
                 }
-                '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"Native-Question","content":"\"Confirm?\"=\"No\""}]}}' |
+                '{"type":"user","message":{"content":[{"type":"tool_result","tool_use_id":"Native-Question","content":"Your questions have been answered: \"Confirm?\"=\"No\"."}]}}' |
                     Add-Content -LiteralPath $transcript -Encoding utf8
                 $answered = Get-DaemonAskUserState -Session $session -Marker $claudeMarker
                 Test-That "the actual Claude caller completes and verifies its own result with ID supplied=$supplied" {

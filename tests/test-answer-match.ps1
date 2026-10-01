@@ -228,6 +228,45 @@ Test-That 'and a wrong one from before the upgrade is still caught' {
         -Fields $legacyFields -Selections @('Closer'))
 }
 
+Write-Host "`n--- structured text is compared within its own field too ---"
+$structuredFields = @(
+    [pscustomobject]@{ Name = 'choice'; Label = 'Choice'; Options = @('Yes', 'No'); Values = @('yes', 'no'); IsText = $false }
+    [pscustomobject]@{ Name = 'notes'; Label = 'Notes'; Options = @(); IsText = $true }
+)
+Test-That 'matching structured choice and text fields are confirmed together' {
+    (Test-CopilotAnswerMatchesSelections -ResultContent '{"choice":"no","notes":"keep exactly"}' `
+        -Fields $structuredFields -Selections @('No', 'keep exactly') -Detailed).Status -ceq 'Matched'
+}
+Test-That 'a structured text mismatch cannot hide behind a matching choice' {
+    (Test-CopilotAnswerMatchesSelections -ResultContent '{"choice":"no","notes":"different"}' `
+        -Fields $structuredFields -Selections @('No', 'keep exactly') -Detailed).Status -ceq 'Mismatch'
+}
+Test-That 'a non-string structured text result remains unconfirmed rather than coerced' {
+    (Test-CopilotAnswerMatchesSelections -ResultContent '{"choice":"no","notes":false}' `
+        -Fields $structuredFields -Selections @('No', 'false') -Detailed).Status -ceq 'Unconfirmed'
+}
+Test-That 'an exact structured text-only answer can be confirmed' {
+    (Test-CopilotAnswerMatchesSelections -ResultContent '{"notes":"2030-01-02T03:04:05Z"}' `
+        -Fields @($structuredFields[1]) -Selections @('2030-01-02T03:04:05Z') -Detailed).Status -ceq 'Matched'
+}
+Test-That 'different date-looking text spellings remain a structured text mismatch' {
+    (Test-CopilotAnswerMatchesSelections -ResultContent '{"notes":"2030-01-02T03:04:05.000Z"}' `
+        -Fields @($structuredFields[1]) -Selections @('2030-01-02T03:04:05Z') -Detailed).Status -ceq 'Mismatch'
+}
+$claudeField = [pscustomobject]@{ Name = 'Which?'; Label = 'Database'; Options = @('No', 'Not now', 'SQLite.'); IsText = $false }
+Test-That 'the established Claude envelope still distinguishes No from Not now' {
+    (Test-CopilotAnswerMatchesSelections -ResultContent 'Your questions have been answered: "Which?"="Not now".' `
+        -Fields @($claudeField) -Selections @('No') -Detailed).Status -ceq 'Mismatch'
+}
+Test-That 'stripping the Claude envelope preserves punctuation inside the actual value' {
+    (Test-CopilotAnswerMatchesSelections -ResultContent 'Your questions have been answered: "Which?"="SQLite.".' `
+        -Fields @($claudeField) -Selections @('SQLite.') -Detailed).Status -ceq 'Matched'
+}
+Test-That 'an unknown trailing Claude sentence is not silently discarded' {
+    (Test-CopilotAnswerMatchesSelections -ResultContent 'Your questions have been answered: "Which?"="No". Something else.' `
+        -Fields @($claudeField) -Selections @('No') -Detailed).Status -ceq 'Unconfirmed'
+}
+
 if ($script:Failures -gt 0) {
     Write-Host "`n$($script:Failures) failed" -ForegroundColor Red
     exit 1

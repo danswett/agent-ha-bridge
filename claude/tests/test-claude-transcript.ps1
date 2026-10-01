@@ -250,6 +250,11 @@ Add-Content -LiteralPath $qFile -Value (New-Line 'user' @(@{ type = 'tool_result
 $q = Get-ClaudeAskUserState -TranscriptPath $qFile
 Test-That 'its answer ends the wait' { $q.Started -and -not $q.Pending }
 Test-That 'and carries the chosen label for the mismatch check' { $q.ResultContent -like '*"SQLite"*' }
+Test-That 'the established Claude result envelope verifies through the real transcript reader' {
+    $field = [pscustomobject]@{ Name = 'Which?'; Label = 'Database'; Options = @('PostgreSQL', 'SQLite'); IsText = $false }
+    (Test-CopilotAnswerMatchesSelections -ResultContent $q.ResultContent -Fields @($field) `
+        -Selections @('SQLite') -Detailed).Status -ceq 'Matched'
+}
 
 Add-Content -LiteralPath $qFile -Value (New-Line 'assistant' @(@{ type = 'tool_use'; id = 'ask2'; name = 'AskUserQuestion'; input = @{ questions = @() } }))
 $q = Get-ClaudeAskUserState -TranscriptPath $qFile

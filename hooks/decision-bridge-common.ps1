@@ -2243,8 +2243,9 @@ function Get-CopilotAskUserState {
 function Test-CopilotAnswerMatchesSelections {
     <#
         Verifies choice identities within their own fields, never by substring.
-        Structured JSON preserves scalar types. Known text encodings are supported
-        only when each observed label/value maps to one option unambiguously.
+        Structured JSON preserves scalar types and compares text fields literally.
+        Known text encodings verify choices only, when each observed label/value maps
+        to one option unambiguously; legacy free-text rendering may reformat input.
 
         Detailed returns Matched, Mismatch or Unconfirmed. Missing/unsupported data
         is not a match and is not evidence for overriding a terminal answer. Legacy
@@ -2287,6 +2288,10 @@ function Test-CopilotAnswerMatchesSelections {
                 $text = $text.Substring('User has answered your questions: '.Length)
                 $suffix = ". You can now continue with the user's answers in mind."
                 if ($text.EndsWith($suffix, [StringComparison]::Ordinal)) { $text = $text.Substring(0, $text.Length - $suffix.Length) }
+            }
+            elseif ($text.StartsWith('Your questions have been answered: ', [StringComparison]::Ordinal)) {
+                $text = $text.Substring('Your questions have been answered: '.Length)
+                if ($text.EndsWith('".', [StringComparison]::Ordinal)) { $text = $text.Substring(0, $text.Length - 1) }
             }
             if ($nativeSingle -and $fieldList.Count -eq 1 -and -not $text.Contains('=')) {
                 $singleValue = $true
@@ -2352,7 +2357,13 @@ function Test-CopilotAnswerMatchesSelections {
             $key = $keys[0]
         }
         if (-not $consumed.Add($key)) { return (& $finish 'Unconfirmed') }
-        if (Test-DecisionFieldIsText -Field $field) { continue }
+        if (Test-DecisionFieldIsText -Field $field) {
+            if ($textMode) { continue }
+            if ($answers[$key] -isnot [string]) { return (& $finish 'Unconfirmed') }
+            if (-not [StringComparer]::Ordinal.Equals($answers[$key], $selectionList[$i])) { $mismatch = $true }
+            $verified++
+            continue
+        }
 
         $multi = Test-DecisionFieldIsMultiSelect -Field $field
         $options = @($field.Options)
