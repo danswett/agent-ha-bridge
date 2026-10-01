@@ -389,9 +389,21 @@ function Get-CopilotSessionProcessId {
     <#
         Resolves the CLI process that owns a session.
 
-        Each live session directory holds an `inuse.<pid>.lock` file. A lock whose
-        process is gone is stale and ignored, which also keeps a resumed session from
-        being delivered to a dead pid.
+        Two sources, in the same order and for the same reason as
+        Get-LiveCopilotSessions: the `--session-id` on a process's command line first,
+        then the `inuse.<pid>.lock` files for the processes it could not answer for. A
+        lock whose process is gone is stale and ignored, which keeps a reply from being
+        delivered to a dead pid.
+
+        The locks alone used to be the whole answer, and a resumed session could not
+        be typed into for it: resuming onto an id that already has history writes no
+        lock until the CLI takes its first turn. On 2026-10-01 a session resumed from
+        the dashboard got its card back - discovery already reads the `--session-id`
+        off the command line - but every reply from the phone came back
+        "attach-failed:1341" for the five and a half minutes until the user typed in
+        the terminal, which is the moment the lock finally appeared. The command line
+        names the session for a resume and a new session alike, so it is the fallback
+        here too.
     #>
     param(
         [Parameter(Mandatory)]
@@ -403,16 +415,35 @@ function Get-CopilotSessionProcessId {
         return $null
     }
 
+    # The command line is asked first, because it names exactly one session where a
+    # lock only says a pid touched a directory at some point. A process that resumed a
+    # different session leaves its old `inuse.<pid>.lock` behind, and that lock names a
+    # live CLI - working somewhere else. Taking locks first typed the reply into that
+    # other session, silently: the pid was alive and was `copilot`, so every guard
+    # here was satisfied. Get-LiveCopilotSessions settles the same ambiguity the same
+    # way round, and the two must agree or a reply lands where the card did not.
+    #
+    # Reading a command line is expensive, but the answers are memoised per process
+    # and daemon discovery has already paid for them on this pass.
+    $named = Get-BridgeAgentProcessSessionIds -Processes @(Get-BridgeAgentProcesses -Agent 'copilot')
+    foreach ($entry in $named.GetEnumerator()) {
+        if ([string]$entry.Value -eq $SessionId) { return [int]$entry.Key }
+    }
+
+    # Then the locks, for the processes the command line could not answer for. A pid
+    # that is in $named named some other session, so its lock here is the stale one
+    # left behind by a resume rather than evidence about this session.
     $locks = @(Get-ChildItem -LiteralPath $dir -Filter 'inuse.*.lock' -ErrorAction SilentlyContinue)
     foreach ($lock in $locks) {
         if ($lock.Name -notmatch '^inuse\.(\d+)\.lock$') { continue }
-        $processId = [int]$Matches[1]
-        $process = Get-Process -Id $processId -ErrorAction SilentlyContinue
+        $lockedPid = [int]$Matches[1]
+        if ($named.ContainsKey($lockedPid)) { continue }
+        $process = Get-Process -Id $lockedPid -ErrorAction SilentlyContinue
         if ($null -eq $process) { continue }
         # Exact match only. The machine also runs `copilotapp` and `copilotapphost`,
         # which a prefix match would happily accept and then type into.
         if (-not (Test-BridgeAgentProcess -Process $process -Agent 'copilot')) { continue }
-        return $processId
+        return $lockedPid
     }
 
     $null
@@ -474,17 +505,23 @@ function Send-CopilotSessionPrompt {
         return $result
     }
 
-    $processId = if ($ProcessId -gt 0) { $ProcessId } else { Get-CopilotSessionProcessId -SessionId $SessionId }
-    if ($null -eq $processId) {
+    # NOT $processId: PowerShell matches variable names case-insensitively, so that
+    # name *is* the [int]$ProcessId parameter, and assigning a missing pid to it
+    # stored 0 rather than $null. The guard below then never fired - "no live process
+    # for session" was never once logged - and AttachConsole(0) came back as
+    # "attach-failed:1341" (ERROR_SERVER_DISABLED), which is what a resumed session's
+    # replies failed with until it wrote its lock file.
+    $targetPid = if ($ProcessId -gt 0) { $ProcessId } else { Get-CopilotSessionProcessId -SessionId $SessionId }
+    if ($null -eq $targetPid) {
         $result.Detail = 'no live process for session'
         return $result
     }
-    $result.ProcessId = $processId
+    $result.ProcessId = $targetPid
 
     $clean = Get-CopilotInjectableText -Text $Text
 
     try {
-        $outcome = Invoke-BridgeConsoleSend -ProcessId $processId -Text $clean `
+        $outcome = Invoke-BridgeConsoleSend -ProcessId $targetPid -Text $clean `
             -Submit (-not $NoSubmit.IsPresent) -DelayMs $SubmitDelayMs
         $result.Detail = $outcome
         $result.Delivered = $outcome.StartsWith('ok:')
@@ -666,12 +703,13 @@ function Send-CopilotSessionForm {
     }
     $result.Detail = ($trace -join ' ; ')
 
-    $processId = if ($ProcessId -gt 0) { $ProcessId } else { Get-CopilotSessionProcessId -SessionId $SessionId }
-    if ($null -eq $processId) {
+    # $targetPid, not $processId; see Send-CopilotSessionPrompt.
+    $targetPid = if ($ProcessId -gt 0) { $ProcessId } else { Get-CopilotSessionProcessId -SessionId $SessionId }
+    if ($null -eq $targetPid) {
         $result.Detail = 'no live process for session'
         return $result
     }
-    $result.ProcessId = $processId
+    $result.ProcessId = $targetPid
 
     try {
         # One attach-write-detach per FIELD, with that field's arrows and its
@@ -699,7 +737,7 @@ function Send-CopilotSessionForm {
             $failed = $false
             for ($k = 0; $k -lt $keys.Count; $k++) {
                 $isLast = ($k -eq ($keys.Count - 1))
-                $r = Invoke-BridgeConsoleSend -ProcessId $processId -Text $keys[$k] -Submit $isLast -DelayMs $StepDelayMs
+                $r = Invoke-BridgeConsoleSend -ProcessId $targetPid -Text $keys[$k] -Submit $isLast -DelayMs $StepDelayMs
                 if (-not $r.StartsWith('ok')) { $outcome = "field${i}:$r"; $failed = $true; break }
                 if (-not $isLast) { Start-Sleep -Milliseconds $script:BridgeFormKeyGapMs }
             }
@@ -762,12 +800,13 @@ function Send-CopilotSessionChoice {
         return $result
     }
 
-    $processId = if ($ProcessId -gt 0) { $ProcessId } else { Get-CopilotSessionProcessId -SessionId $SessionId }
-    if ($null -eq $processId) {
+    # $targetPid, not $processId; see Send-CopilotSessionPrompt.
+    $targetPid = if ($ProcessId -gt 0) { $ProcessId } else { Get-CopilotSessionProcessId -SessionId $SessionId }
+    if ($null -eq $targetPid) {
         $result.Detail = 'no live process for session'
         return $result
     }
-    $result.ProcessId = $processId
+    $result.ProcessId = $targetPid
 
     $clean = Get-CopilotInjectableText -Text $Text
     # A couple of extra Downs guarantee the caret reaches the trailing "Other" entry
@@ -775,7 +814,7 @@ function Send-CopilotSessionChoice {
     $downs = [Math]::Max(1, $ChoiceCount + 2)
 
     try {
-        $outcome = Invoke-BridgeConsoleChoice -ProcessId $processId -DownCount $downs -Text $clean -StepDelayMs $StepDelayMs
+        $outcome = Invoke-BridgeConsoleChoice -ProcessId $targetPid -DownCount $downs -Text $clean -StepDelayMs $StepDelayMs
         $result.Detail = $outcome
         $result.Delivered = $outcome.StartsWith('ok:')
     }

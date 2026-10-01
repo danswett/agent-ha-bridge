@@ -105,7 +105,9 @@ function Write-DaemonLog { param([string]$Message) }
 function Get-Process {
     [CmdletBinding()]
     param([int]$Id, [string]$Name)
-    if ($script:LivePids.ContainsKey($Id)) { return [pscustomobject]@{ Id = $Id } }
+    # ProcessName matters: Get-CopilotSessionProcessId puts whatever a lock names
+    # through Test-BridgeAgentProcess before typing into it.
+    if ($script:LivePids.ContainsKey($Id)) { return [pscustomobject]@{ Id = $Id; ProcessName = 'copilot' } }
     $null
 }
 
@@ -281,6 +283,103 @@ try {
     Test-That 'a dead lock and an unrelated process is not registered' {
         (Get-BridgeRegisteredSessionId -SessionId $freshId -Launcher 'copilot') -eq ''
     }
+
+    Write-Host "`n--- the process a reply is typed into ---"
+
+    Get-ChildItem -LiteralPath $root -Directory | Remove-Item -Recurse -Force
+    $null = New-FixtureSession -Id $resumedId -WithTranscript
+    Set-FixtureProcesses @((New-FixtureProcess -Id 400 -CommandLine (New-CopilotCommandLine -SessionId $resumedId)))
+    Test-That 'a resumed session with no lock still resolves the process to type into' {
+        (Get-CopilotSessionProcessId -SessionId $resumedId) -eq 400
+    } "got: $(Get-CopilotSessionProcessId -SessionId $resumedId)"
+
+    Get-ChildItem -LiteralPath $root -Directory | Remove-Item -Recurse -Force
+    $null = New-FixtureSession -Id $freshId -LockPids 401 -WithTranscript
+    Set-FixtureProcesses @((New-FixtureProcess -Id 401 -CommandLine (New-CopilotCommandLine -SessionId $freshId)))
+    Test-That 'a lock is still what settles it when there is one' {
+        (Get-CopilotSessionProcessId -SessionId $freshId) -eq 401
+    }
+
+    Get-ChildItem -LiteralPath $root -Directory | Remove-Item -Recurse -Force
+    $null = New-FixtureSession -Id $freshId -LockPids 402 -WithTranscript
+    Set-FixtureProcesses @((New-FixtureProcess -Id 403 -CommandLine (New-CopilotCommandLine -SessionId $otherId)))
+    Test-That 'a session no live CLI is in resolves no process at all' {
+        $null -eq (Get-CopilotSessionProcessId -SessionId $freshId)
+    } "got: $(Get-CopilotSessionProcessId -SessionId $freshId)"
+
+    # The reason the command line has to be asked before the locks rather than after
+    # them. A CLI resumed onto another session leaves its `inuse.<pid>.lock` behind in
+    # the directory it came from, and that pid is still alive and still `copilot` - so
+    # every guard the lock path applies is satisfied and the reply was typed into
+    # whichever session that process moved to. Get-LiveCopilotSessions already resolves
+    # this ambiguity command-line-first; a reply that disagreed with the card would be
+    # delivered to a session the user was not looking at, with nothing logged.
+    Get-ChildItem -LiteralPath $root -Directory | Remove-Item -Recurse -Force
+    $null = New-FixtureSession -Id $freshId -LockPids 500 -WithTranscript
+    $null = New-FixtureSession -Id $otherId -WithTranscript
+    Set-FixtureProcesses @((New-FixtureProcess -Id 500 -CommandLine (New-CopilotCommandLine -SessionId $otherId)))
+    Test-That 'a lock left behind by a CLI that resumed another session does not capture the reply' {
+        $null -eq (Get-CopilotSessionProcessId -SessionId $freshId)
+    } "got: $(Get-CopilotSessionProcessId -SessionId $freshId)"
+
+    Test-That 'and the session that CLI actually moved to still resolves to it' {
+        (Get-CopilotSessionProcessId -SessionId $otherId) -eq 500
+    } "got: $(Get-CopilotSessionProcessId -SessionId $otherId)"
+
+    # The lock is still the answer for a process the command line cannot speak for,
+    # which is what keeps the pre-existing lock path working rather than replacing it.
+    Get-ChildItem -LiteralPath $root -Directory | Remove-Item -Recurse -Force
+    $null = New-FixtureSession -Id $freshId -LockPids 501 -WithTranscript
+    Set-FixtureProcesses @((New-FixtureProcess -Id 501 -NoCommandLineProperty))
+    Test-That 'a lock still settles it when that process has no readable session id' {
+        (Get-CopilotSessionProcessId -SessionId $freshId) -eq 501
+    } "got: $(Get-CopilotSessionProcessId -SessionId $freshId)"
+
+    # The injector's own guard. $processId would be the [int]$ProcessId parameter -
+    # PowerShell matches names case-insensitively - so a missing pid was stored as 0,
+    # the guard never fired, and AttachConsole(0) returned "attach-failed:1341". Every
+    # reply to a resumed session failed that way until the CLI wrote its lock.
+    $script:SentTo = @()
+    function Invoke-BridgeConsoleSend {
+        param([int]$ProcessId, [string]$Text, [bool]$Submit = $true, [int]$DelayMs = 0)
+        $script:SentTo += $ProcessId
+        'ok:' + $Text.Length
+    }
+    function Invoke-BridgeConsoleChoice {
+        param([int]$ProcessId, [int]$DownCount, [string]$Text, [int]$StepDelayMs = 0)
+        $script:SentTo += $ProcessId
+        'ok:choice'
+    }
+
+    Get-ChildItem -LiteralPath $root -Directory | Remove-Item -Recurse -Force
+    $null = New-FixtureSession -Id $freshId -LockPids 404 -WithTranscript
+    Set-FixtureProcesses @((New-FixtureProcess -Id 405 -CommandLine (New-CopilotCommandLine -SessionId $otherId)))
+    $script:SentTo = @()
+    $refused = Send-CopilotSessionPrompt -SessionId $freshId -Text 'are you there?'
+    Test-That 'a reply to a session with no live process is refused, not typed into pid 0' {
+        -not $refused.Delivered -and $refused.Detail -eq 'no live process for session' -and $script:SentTo.Count -eq 0
+    } "delivered: $($refused.Delivered), detail: '$($refused.Detail)', sent to: $($script:SentTo -join ',')"
+
+    $script:SentTo = @()
+    $refusedChoice = Send-CopilotSessionChoice -SessionId $freshId -Text 'yes' -ChoiceCount 2
+    Test-That 'and so is an answer to a question it asked' {
+        -not $refusedChoice.Delivered -and $refusedChoice.Detail -eq 'no live process for session' -and $script:SentTo.Count -eq 0
+    } "delivered: $($refusedChoice.Delivered), detail: '$($refusedChoice.Detail)', sent to: $($script:SentTo -join ',')"
+
+    Get-ChildItem -LiteralPath $root -Directory | Remove-Item -Recurse -Force
+    $null = New-FixtureSession -Id $resumedId -WithTranscript
+    Set-FixtureProcesses @((New-FixtureProcess -Id 406 -CommandLine (New-CopilotCommandLine -SessionId $resumedId)))
+    $script:SentTo = @()
+    $delivered = Send-CopilotSessionPrompt -SessionId $resumedId -Text 'hello'
+    Test-That 'a reply to a resumed session reaches the CLI its command line names' {
+        $delivered.Delivered -and $delivered.ProcessId -eq 406 -and $script:SentTo -contains 406
+    } "delivered: $($delivered.Delivered), pid: $($delivered.ProcessId), sent to: $($script:SentTo -join ',')"
+
+    $script:SentTo = @()
+    $explicit = Send-CopilotSessionPrompt -SessionId $resumedId -Text 'hello' -ProcessId 999
+    Test-That 'an explicitly named process still overrides what the session resolves to' {
+        $explicit.Delivered -and $script:SentTo -contains 999
+    } "sent to: $($script:SentTo -join ',')"
 }
 finally {
     Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
