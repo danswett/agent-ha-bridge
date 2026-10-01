@@ -373,6 +373,36 @@ Test-That 'the uninstaller removes the keep-awake task' {
     (Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\uninstall.ps1') -Raw) -match 'AgentBridgeDevBoxKeepAwake'
 }
 
+# Building a trigger registers nothing - New-ScheduledTaskTrigger only returns a CIM
+# object - so this is safe to run anywhere the module exists. It does not exist on the
+# macOS CI leg, hence the skip rather than a guard inside the check.
+if ($IsWindows -and (Get-Command New-ScheduledTaskTrigger -ErrorAction SilentlyContinue)) {
+    # An explicit user: the runner clears USERNAME, and -AtLogOn refuses an empty one.
+    $script:Triggers = @()
+    Test-That 'the triggers build at all' {
+        $script:Triggers = @(New-BridgeDevBoxKeepAwakeTrigger -IntervalHours 4 -User 'someone')
+        $script:Triggers.Count -eq 2
+    }
+
+    $repeating = @($script:Triggers | Where-Object {
+        $_.PSObject.Properties['Repetition'] -and $_.Repetition -and $_.Repetition.Interval
+    })
+
+    Test-That 'the task repeats on the interval it was given' {
+        $repeating.Count -eq 1 -and $repeating[0].Repetition.Interval -eq 'PT4H'
+    } "intervals: $(@($script:Triggers | ForEach-Object { if ($_.Repetition) { $_.Repetition.Interval } }) -join ',')"
+
+    # P99999999DT23H59M59S - what [TimeSpan]::MaxValue serialises to - is rejected by
+    # Task Scheduler, so 1.25.0 warned and registered nothing. An empty duration is
+    # "forever" and is accepted.
+    Test-That 'and repeats forever, which is an empty duration rather than MaxValue' {
+        $repeating.Count -eq 1 -and [string]::IsNullOrEmpty($repeating[0].Repetition.Duration)
+    } "duration: '$(if ($repeating.Count) { $repeating[0].Repetition.Duration })'"
+}
+else {
+    Write-Host '  SKIP  the trigger shape: no ScheduledTasks module on this platform'
+}
+
 Write-Host ''
 if ($script:Failures) {
     Write-Host "$($script:Failures) check(s) failed" -ForegroundColor Red
