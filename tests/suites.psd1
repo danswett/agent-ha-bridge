@@ -40,6 +40,7 @@
         'tests\test-reliability.ps1'
         'tests\test-reply-card.ps1'
         'tests\test-restart-restore.ps1'
+        'tests\test-resume-discovery.ps1'
         'tests\test-runner.ps1'
         'tests\test-security.ps1'
         'tests\test-state-read.ps1'

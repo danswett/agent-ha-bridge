@@ -22,6 +22,11 @@
 
 $script:BridgeIsWindows = [bool]($IsWindows -or $PSVersionTable.PSEdition -eq 'Desktop')
 
+# pid|start-time -> the session id on that process's command line, or ''. Memoised
+# because reading a command line costs about 77 ms and the daemon asks every few
+# seconds; Get-BridgeAgentProcessSessionIds prunes it as processes go.
+$script:BridgeAgentSessionIdCache = @{}
+
 function Initialize-BridgePlatform {
     <#
         On macOS, sets $env:TEMP - the name every script uses for the temporary folder
@@ -270,6 +275,84 @@ function Get-BridgeAgentProcesses {
         Get-Process -Name $_ -ErrorAction SilentlyContinue
     })
     @($candidates | Sort-Object -Property Id -Unique | Where-Object { Test-BridgeAgentProcess -Process $_ -Agent $Agent })
+}
+
+function Get-BridgeAgentProcessSessionIds {
+    <#
+        Which session each of $Processes is working in, as a pid -> session id map,
+        read from the `--session-id` on its own command line.
+
+        The `inuse.<pid>.lock` files under the session state root are not enough on
+        their own. A Copilot session resumed onto an id that already has history
+        writes no lock at all: on 2026-09-30 a resume loaded all 103 turns and ran
+        normally, while the bridge - which found Copilot sessions only by those locks -
+        never saw it. No card, no reply box, and a launch note stuck on "may still be
+        starting" until a second Resume press put a second CLI on the same transcript,
+        which is the one thing Get-LiveCopilotSessions exists to prevent. The command
+        line carries the id for a new session and a resumed one alike, and names
+        exactly one, where a lock only says a pid touched a directory at some point.
+
+        Reading a command line is expensive - about 77 ms per process, through the
+        Get-Process property and WMI alike - and the daemon asks this every few
+        seconds, so each answer is memoised. The key is the pid *and* its start time:
+        a pid on its own is reused, and a recycled one would otherwise keep answering
+        with the dead process's session for as long as the daemon ran.
+    #>
+    param([AllowEmptyCollection()][object[]]$Processes = @())
+
+    $sessions = @{}
+    $seen = @{}
+    foreach ($process in @($Processes)) {
+        if ($null -eq $process) { continue }
+        $processId = 0
+        try { $processId = [int]$process.Id } catch { continue }
+        if ($processId -le 0) { continue }
+
+        # Cheap, unlike the command line, so it costs nothing to pin the key with it.
+        $startedAt = ''
+        try { $startedAt = [string]$process.StartTime.Ticks } catch { }
+        $key = "$processId|$startedAt"
+        $seen[$key] = $true
+
+        if (-not $script:BridgeAgentSessionIdCache.ContainsKey($key)) {
+            # Read once and keep it: this is the expensive line in the function, and
+            # testing the property for emptiness before using it would pay for it
+            # twice.
+            $commandLine = ''
+            if ($process.PSObject.Properties['CommandLine']) {
+                try { $commandLine = [string]$process.CommandLine } catch { $commandLine = '' }
+            }
+            if ([string]::IsNullOrWhiteSpace($commandLine)) {
+                $commandLine = Get-BridgeCommandLine -ProcessId $processId
+            }
+            # `--session-id <id>` and `--session-id=<id>` are both spelled by the CLI,
+            # and the value is matched as a UUID so a prefix or a name cannot be taken
+            # for one.
+            $found = ''
+            if ($commandLine -match '--session-id[=\s]+"?([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
+                $found = $Matches[1]
+            }
+            $script:BridgeAgentSessionIdCache[$key] = $found
+        }
+
+        $sessionId = [string]$script:BridgeAgentSessionIdCache[$key]
+        if (-not [string]::IsNullOrWhiteSpace($sessionId)) { $sessions[$processId] = $sessionId }
+    }
+
+    # A process that has gone takes its entry with it, so a daemon up for days does
+    # not keep one for every session it ever saw. Only entries this call did not
+    # account for are looked at, so an ordinary pass does no work here at all, and
+    # the test is that the process is gone rather than merely absent from
+    # $Processes - a caller may legitimately ask about one agent at a time.
+    foreach ($key in @($script:BridgeAgentSessionIdCache.Keys)) {
+        if ($seen.ContainsKey($key)) { continue }
+        $cachedPid = 0
+        if ([string]$key -match '^(\d+)\|') { $cachedPid = [int]$Matches[1] }
+        if ($cachedPid -gt 0 -and (Get-Process -Id $cachedPid -ErrorAction SilentlyContinue)) { continue }
+        [void]$script:BridgeAgentSessionIdCache.Remove($key)
+    }
+
+    $sessions
 }
 
 function Find-BridgeAgentAncestor {
