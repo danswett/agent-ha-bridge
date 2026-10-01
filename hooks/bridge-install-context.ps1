@@ -66,6 +66,10 @@ function Resolve-BridgeInstallContext {
                  [IO.File]::Exists((Join-Path $parent 'installation.json')))) {
                 $BridgeHome = $parent
             }
+            elseif ((Split-Path $EntryDirectory -Leaf) -in @('hooks', 'bin', 'installer') -and
+                [IO.File]::Exists((Join-Path $parent 'installer\install.ps1'))) {
+                throw "Installation metadata is missing for this custom root: $parent"
+            }
         }
     }
     if (-not $BridgeHome) {
@@ -240,9 +244,18 @@ function Test-BridgeAdapterRoot {
 }
 
 function Get-BridgeSelectedClients {
-    $config = Get-Variable -Name BridgeUserConfig -Scope Script -ErrorAction SilentlyContinue
-    if (-not $config -or -not $config.Value -or -not $config.Value.PSObject.Properties['clients']) { return $null }
-    $clients = @($config.Value.clients)
+    $context = Get-BridgeInstallContext
+    if ($context.Recorded) {
+        $config = Read-BridgeInstallRecord -Path $context.ConfigPath
+        if (-not $config) { throw 'The recorded installation configuration is missing; client discovery and repair were not authorized.' }
+        if (-not $config.Contains('clients')) { return $null }
+        $clients = @($config['clients'])
+    }
+    else {
+        $config = Get-Variable -Name BridgeUserConfig -Scope Script -ErrorAction SilentlyContinue
+        if (-not $config -or -not $config.Value -or -not $config.Value.PSObject.Properties['clients']) { return $null }
+        $clients = @($config.Value.clients)
+    }
     foreach ($client in $clients) {
         if ($client -isnot [string] -or $client -notin @('copilot', 'claude', 'codex', 'mcp')) {
             throw 'The configured client selection is invalid; no additional clients were enrolled.'
@@ -292,7 +305,8 @@ function Test-BridgeUninstallEntryOwnership {
 function Set-BridgeAdapterEnrollment {
     param([Parameter(Mandatory)]$Context,
         [Parameter(Mandatory)][ValidateSet('claude', 'codex', 'mcp')][string]$Client,
-        [Parameter(Mandatory)][bool]$Installed, [switch]$RepairOnly, [switch]$KeepSelection)
+        [Parameter(Mandatory)][bool]$Installed, [switch]$RepairOnly, [switch]$KeepSelection,
+        [switch]$KeepAdapterRecord)
     if (-not $KeepSelection) {
         $config = Read-BridgeInstallRecord -Path $Context.ConfigPath
         if (-not $config -and $Installed) { throw 'The selected bridge configuration is missing; the adapter cannot be enrolled.' }
@@ -308,6 +322,7 @@ function Set-BridgeAdapterEnrollment {
 
         }
     }
+    if ($KeepAdapterRecord) { return }
     $record = Read-BridgeInstallRecord -Path $Context.MetadataPath
     if (-not $record) { return }
     if ([string]$record['id'] -cne $Context.Id) { throw 'Installation ownership changed while recording adapter enrollment.' }

@@ -140,7 +140,8 @@ if ($RepairOnly -and -not $Uninstall) { Assert-BridgeAdapterSelection -Context $
 # ------------------------------------------------------------------ uninstall
 if ($Uninstall) {
     Write-Step 'Removing the Codex adapter'
-    Stop-BridgeOwnedRuntime -Context $installContext
+    Set-BridgeAdapterEnrollment -Context $installContext -Client codex -Installed $false -KeepSelection:$KeepSelection -KeepAdapterRecord
+    Stop-BridgeOwnedRuntime -Context $installContext -Roles setup-codex
     Remove-BridgeCodexAdapter
     Write-Step 'Done'
     Write-Host 'Trust entries under [hooks.state] in the Codex config are left alone;' -ForegroundColor Yellow

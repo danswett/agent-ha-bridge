@@ -177,6 +177,8 @@ func installationRuntimeRoot(fallback string) (string, error) {
 			bridge = candidate
 		} else if !os.IsNotExist(statErr) {
 			return "", fmt.Errorf("cannot read installation metadata")
+		} else {
+			return filepath.Join(candidate, "runtime"), fmt.Errorf("installation metadata is missing")
 		}
 	}
 	if bridge == "" && filepath.IsAbs(fallback) {

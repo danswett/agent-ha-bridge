@@ -200,6 +200,29 @@ func TestInstalledExecutableKeepsItsRecordedRoot(t *testing.T) {
 	}
 }
 
+func TestCustomExecutableWithoutMetadataCannotUseAnotherInstallation(t *testing.T) {
+	ambient, fallbacks := setup(t, 0)
+	custom := filepath.Join(t.TempDir(), "custom-bridge")
+	nativeExecutable = func() (string, error) { return filepath.Join(custom, "bin", "agent-bridge-hook.exe"), nil }
+	foreign := t.TempDir()
+	foreignRuntime := filepath.Join(foreign, "runtime")
+	if err := os.MkdirAll(foreignRuntime, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config := filepath.Join(foreign, "config.json")
+	if err := os.WriteFile(config, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(foreignRuntime, "agent-bridge-daemon.heartbeat"), []byte("1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENT_HA_BRIDGE_CONFIG", config)
+	invoke([]string{"claude", "stop", "fallback.ps1"}, `{}`)
+	if len(*fallbacks) != 1 || len(spoolFiles(t, foreignRuntime)) != 0 || len(spoolFiles(t, ambient)) != 0 {
+		t.Error("a damaged custom installation used an unrelated daemon instead of its fallback")
+	}
+}
+
 func TestSpoolNamesSortByTime(t *testing.T) {
 	temp, _ := setup(t, 0)
 	start := time.Now()

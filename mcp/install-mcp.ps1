@@ -147,7 +147,8 @@ if ($RepairOnly -and -not $Uninstall) { Assert-BridgeAdapterSelection -Context $
 # ------------------------------------------------------------------ uninstall
 if ($Uninstall) {
     Write-Step 'Removing the MCP server'
-    Stop-BridgeOwnedRuntime -Context $installContext
+    Set-BridgeAdapterEnrollment -Context $installContext -Client mcp -Installed $false -KeepSelection:$KeepSelection -KeepAdapterRecord
+    Stop-BridgeOwnedRuntime -Context $installContext -Roles setup-mcp
     Remove-BridgeMcpClientConfig -Path $claudeDesktopConfig -ServerPath (Join-Path $mcpDir 'src\server.js') `
         -LegacyServerPath $legacyServerPath
     if (Test-Path -LiteralPath $mcpDir) {

@@ -2207,7 +2207,7 @@ if ($RepairOnly) {
 }
 $legacyRuntimeClaim = Get-BridgeLegacyRuntimeClaim -Context $installContext
 $previousInstallContext = $installContext
-Stop-BridgeOwnedService -Context $installContext
+Stop-BridgeOwnedService -Context $installContext -Remove:(-not $installContext.Recorded)
 Stop-BridgeOwnedRuntime -Context $installContext
 $script:DidMigrate = Invoke-BridgeLayoutMigration `
     -CopilotHome $copilotHome -BridgeHome $bridgeHome -ConfigPath $configPath `

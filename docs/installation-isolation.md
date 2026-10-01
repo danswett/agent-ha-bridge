@@ -4,6 +4,8 @@ The bridge records a local installation identity and its resolved paths in
 `installation.json` beside `config.json`. This file contains paths and an opaque
 identifier, not credentials. Keep it with the installation; copying another
 installation's metadata to a different root is rejected.
+An installed custom native binary missing that metadata cannot use an ambient
+daemon. Restore its metadata before relying on that installation.
 
 ## Path binding
 
@@ -46,6 +48,8 @@ does not activate an omitted local client. `autoConfigureClients` defaults to
 maintenance. Removing a client is not undone by the next discovery pass. Running
 an adapter installer explicitly records that opt-in; automatic repair must still
 find the client in the saved selection before changing it.
+Recorded installations read that selection again during discovery and repair, so
+a standalone adapter removal takes effect without stopping the remaining bridge.
 Pre-selection legacy configurations keep their compatibility behavior until the
 installer records a selection.
 
@@ -56,6 +60,9 @@ before clearing entities or removing registrations and payloads. A process name 
 heartbeat PID alone is insufficient: executable, start identity, script path and
 installation ownership are checked. Unrelated processes and registrations are not
 stopped or replaced.
+Standalone adapter removal first opts that client out and stops only its setup
+worker. Whole-install removal and reconfiguration own the daemon/service shutdown;
+the first identity upgrade also removes its verified pre-metadata service.
 An unreadable recorded process or an unconfirmed service shutdown blocks removal
 rather than treating the writer as stopped. Unattributed pre-rename configurations,
 hooks and skills are preserved, even when they use historical bridge filenames.

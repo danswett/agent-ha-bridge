@@ -198,7 +198,8 @@ if ($RepairOnly -and -not $Uninstall) { Assert-BridgeAdapterSelection -Context $
 # ------------------------------------------------------------------ uninstall
 if ($Uninstall) {
     Write-Step 'Removing the Claude Code adapter'
-    Stop-BridgeOwnedRuntime -Context $installContext
+    Set-BridgeAdapterEnrollment -Context $installContext -Client claude -Installed $false -KeepSelection:$KeepSelection -KeepAdapterRecord
+    Stop-BridgeOwnedRuntime -Context $installContext -Roles setup-claude
     Remove-BridgeClaudeAdapter
     Write-Step 'Done'
     return

@@ -832,6 +832,66 @@ function Get-BridgeUpdateStatus {
             (Get-Content -LiteralPath $contextA.MetadataPath -Raw | ConvertFrom-Json).adapters -notcontains 'codex'
     }
     Set-BridgeAdapterEnrollment -Context $contextA -Client mcp -Installed $true
+    $savedSelectionContext = $script:BridgeInstallContext
+    $savedSelectionConfig = $script:BridgeUserConfig
+    $savedStopRuntime = (Get-Command Stop-BridgeOwnedRuntime).ScriptBlock
+    $savedInstallerContext = $installContext
+    try {
+        $script:BridgeInstallContext = $contextA
+        $script:BridgeUserConfig = [pscustomobject]@{ clients = @('claude', 'codex', 'mcp') }
+        Set-BridgeAdapterEnrollment -Context $contextA -Client codex -Installed $false
+        Test-That 'a running installation observes a saved adapter opt-out rather than its startup selection' {
+            (Get-BridgeSelectedClients) -notcontains 'codex' -and (Get-BridgeSelectedClients) -contains 'claude'
+        }
+        $installContext = $contextA
+        Set-Variable -Name KeepSelection -Value $false
+        function Stop-BridgeOwnedRuntime {
+            param($Context, [string[]]$Roles)
+            $script:AdapterStopRoles = $Roles -join ','
+            $script:AdapterSelectionAtStop = @((Read-BridgeInstallRecord -Path $Context.ConfigPath)['clients'])
+            $script:AdapterRecordsAtStop = @((Read-BridgeInstallRecord -Path $Context.MetadataPath)['adapters'])
+        }
+        foreach ($client in @('claude', 'codex', 'mcp')) {
+            Set-BridgeAdapterEnrollment -Context $contextA -Client $client -Installed $true
+            $ast = [Management.Automation.Language.Parser]::ParseFile(
+                (Join-Path $PSScriptRoot "..\$client\install-$client.ps1"), [ref]$null, [ref]$null)
+            $branch = $ast.EndBlock.Statements | Where-Object {
+                $_ -is [Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -eq '$Uninstall'
+            } | Select-Object -First 1
+            if (-not $branch) { throw "No actual $client uninstall branch was found." }
+            $prefix = @(foreach ($statement in $branch.Clauses[0].Item2.Statements) {
+                if ($statement.Extent.Text -match '^Remove-Bridge') { break }
+                $statement.Extent.Text
+            })
+            & ([scriptblock]::Create($prefix -join "`n"))
+            Test-That "standalone $client removal stops only that adapters setup worker" {
+                $script:AdapterStopRoles -eq "setup-$client"
+            }
+            Test-That "standalone $client opts out before stopping setup, retaining cleanup ownership until success" {
+                $script:AdapterSelectionAtStop -notcontains $client -and $script:AdapterRecordsAtStop -contains $client
+            }
+        }
+        Set-BridgeAdapterEnrollment -Context $contextA -Client claude -Installed $true
+        Set-BridgeAdapterEnrollment -Context $contextA -Client mcp -Installed $true
+    }
+    finally {
+        Set-Item Function:\Stop-BridgeOwnedRuntime -Value $savedStopRuntime
+        $installContext = $savedInstallerContext
+        $script:BridgeInstallContext = $savedSelectionContext
+        $script:BridgeUserConfig = $savedSelectionConfig
+    }
+    $customRoot = Join-Path $homes[0] 'custom-bridge'
+    $customContext = Initialize-BridgeInstallIdentity -Context (
+        Resolve-BridgeInstallContext -TargetHome $homes[0] -BridgeHome $customRoot)
+    [void][IO.Directory]::CreateDirectory((Join-Path $customRoot 'installer'))
+    [void][IO.Directory]::CreateDirectory($customContext.HooksDir)
+    [IO.File]::WriteAllText((Join-Path $customRoot 'installer\install.ps1'), '# synthetic installed payload')
+    [IO.File]::WriteAllText($customContext.ConfigPath, '{"clients":[]}')
+    Remove-Item -LiteralPath $customContext.MetadataPath -Force
+    Test-That 'a damaged custom core cannot fall through to another installation without its metadata' {
+        try { $null = Resolve-BridgeInstallContext -EntryDirectory $customContext.HooksDir; $false }
+        catch { $_.Exception.Message -match 'metadata.*missing|missing.*metadata' }
+    }
     $taskA = [pscustomobject]@{ Actions = @([pscustomobject]@{
         Execute = 'wscript.exe'; Arguments = '"' + (Join-Path $contextA.HooksDir 'agent-bridge-launch.vbs') + '"'
     }) }
@@ -844,6 +904,40 @@ function Get-BridgeUpdateStatus {
             Execute = 'unrelated.exe'; Arguments = ''
         }) }
         -not (Test-BridgeTaskOwnership -Task $mixedTask -Context $contextA)
+    }
+    $savedInstallerContext = $installContext
+    $savedServicePlatform = $script:BridgeIsWindows
+    $script:RetiredLegacyTasks = @()
+    $installContext = $contextA | Select-Object *
+    $installContext.Recorded = $false
+    $installContext.Legacy = $true
+    $installContext.Isolated = $false
+    $installContext.TaskName = 'AgentBridgeDaemon'
+    $script:BridgeIsWindows = $true
+    function Get-ScheduledTask { param($TaskName, $ErrorAction) if ($TaskName -eq 'AgentBridgeDaemon') { $taskA } }
+    function Stop-ScheduledTask { param($TaskName, $ErrorAction) }
+    function Unregister-ScheduledTask {
+        [CmdletBinding(SupportsShouldProcess)]
+        param($TaskName)
+        if ($PSCmdlet.ShouldProcess($TaskName, 'Remove fixture task')) { $script:RetiredLegacyTasks += $TaskName }
+    }
+    try {
+        $installerAst = [Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PSScriptRoot '..\install.ps1'), [ref]$null, [ref]$null)
+        $stopService = $installerAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Stop-BridgeOwnedService'
+        }, $true)
+        if (-not $stopService) { throw 'The actual installer service shutdown was not found.' }
+        & ([scriptblock]::Create($stopService.Extent.Text))
+        Test-That 'the actual installer retires its verified legacy task before identity rollover' {
+            $script:RetiredLegacyTasks -join ',' -eq 'AgentBridgeDaemon'
+        }
+    }
+    finally {
+        $installContext = $savedInstallerContext
+        $script:BridgeIsWindows = $savedServicePlatform
+        Remove-Item Function:\Get-ScheduledTask, Function:\Stop-ScheduledTask, Function:\Unregister-ScheduledTask
     }
     $plistPath = Join-Path $contextA.Home "Library\LaunchAgents\$($contextA.LaunchAgentLabel).plist"
     [void][IO.Directory]::CreateDirectory((Split-Path $plistPath -Parent))
