@@ -907,6 +907,26 @@ function Get-BridgeRegisteredCardArtifact {
     @{ version = $versionText; hash = $hash }
 }
 
+function Get-BridgePinnedCardFailure {
+    param([Parameter(Mandatory)]$State)
+    if (-not $State.Policy -or $State.Policy.mode -cne 'pin') { return '' }
+    if ([string]::IsNullOrWhiteSpace($State.CardUrl)) {
+        return 'Pinned card is missing; repair required with the exact pinned artifact before the dashboard can be current.'
+    }
+    try { $registered = Get-BridgeRegisteredCardArtifact -Url $State.CardUrl }
+    catch {
+        if ($_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        return "Pinned card cannot be verified; repair required: $($_.Exception.Message)"
+    }
+    if (-not $registered.hash) {
+        return 'Pinned card content cannot be verified from a version-only file URL; repair required with the exact pinned inline artifact.'
+    }
+    if ($registered.version -cne $State.Policy.card.version -or $registered.hash -cne $State.Policy.card.hash) {
+        return "Pinned card version/content does not match the exact $($State.Policy.card.version) target; repair required before the dashboard can be current."
+    }
+    ''
+}
+
 function Assert-BridgePublicationPolicy {
     param([Parameter(Mandatory)]$Policy)
     $keys = @('protocol', 'authority', 'writer', 'generation', 'dashboard', 'mode', 'card', 'render', 'highCard', 'highRender', 'legacyCard')
@@ -1118,6 +1138,10 @@ function Assert-BridgePublicationWriter {
             }
             throw 'Publication bootstrap required: configure a designated writer and explicitly run Set-BridgePublicationPolicy after successful absence reads.'
         }
+        if ($Component -ceq 'render') {
+            $cardFailure = Get-BridgePinnedCardFailure -State $State
+            if ($cardFailure) { throw $cardFailure }
+        }
         $settings = Get-BridgePublicationSettings
         if ($settings.authority -cne $State.Policy.authority -or $settings.writer -cne $State.Policy.writer -or
             $settings.generation -ne $State.Policy.generation -or $settings.participant -cne $State.Policy.writer) {
@@ -1273,6 +1297,8 @@ function Get-BridgeDashboardInputSignature {
 function Get-BridgeDashboardPublication {
     $state = Read-BridgePublicationState
     $result = [pscustomobject]@{ State = $state; Verified = $false; InputSignature = ''; ReferencedNodes = @(); Reason = 'missing policy or published receipt' }
+    $cardFailure = Get-BridgePinnedCardFailure -State $state
+    if ($cardFailure) { $result.Reason = $cardFailure; return $result }
     if (-not $state.Policy -or -not $state.Config -or -not $state.Config.Contains('agent_bridge_publication')) { return $result }
     $receipt = $state.Config['agent_bridge_publication']
     if ($receipt -isnot [System.Collections.IDictionary]) { throw 'Malformed dashboard publication receipt.' }
