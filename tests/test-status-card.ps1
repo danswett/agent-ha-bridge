@@ -167,11 +167,13 @@ $haStates[$detailedEntity] = @{ state = 'off'; attributes = @{} }
 # --- 2. the card config the dashboard really generates ----------------------------
 
 $script:SavedConfig = $null
+. (Join-Path $PSScriptRoot 'test-dashboard.ps1') -PublicationFixturesOnly
 function Invoke-CopilotHaWebSocket {
     param([Parameter(Mandatory)][object[]]$Commands)
-    $script:SavedConfig = $Commands[0].config
-    @()
+    Invoke-TestPublicationCommands -Commands $Commands
 }
+Initialize-TestPublicationStore
+Initialize-TestPublicationAuthority
 
 # Gated on the version the installer reads out of the card file itself, rather than a
 # number written down again here.
@@ -187,6 +189,7 @@ $machines = @(
     [pscustomobject]@{ Slug = $dark.Slug; Machine = $dark.Machine; Online = $false; IncludeProfile = $false; IncludeResume = $true; IncludeAgent = $false; IncludeDetailed = $false
         SessionNodes = @($darkNodes) }
 )
+Set-TestPublicationCardUrl -Url "/local/agent-bridge-reply-card.js?v=$cardVersion"
 Save-CopilotSessionDashboard -Sessions $sessions -Machines $machines `
     -MachineSelector 'input_select.agent_bridge_launch_machine' `
     -ReplyCardUrl "/local/agent-bridge-reply-card.js?v=$cardVersion"

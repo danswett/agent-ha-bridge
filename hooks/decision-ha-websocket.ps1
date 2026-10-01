@@ -5,6 +5,10 @@
     load, so it cannot be dot-sourced just to reuse its socket code.
 #>
 
+. (Join-Path $PSScriptRoot 'bridge-secrets.ps1')
+$script:BridgeDashboardRenderVersion = '1.0.0'
+$script:BridgeDashboardObservation = $null
+
 function Invoke-CopilotHaWebSocket {
     <#
         Runs a list of WebSocket commands against Home Assistant and returns one
@@ -812,63 +816,531 @@ function Remove-BridgeMachineSelector {
 
 $script:BridgeDashboardReady = $false
 
+function ConvertTo-BridgePublicationJson {
+    param([AllowNull()]$Value)
+    if ($null -eq $Value) { return 'null' }
+    # Pipeline-decorated strings can also satisfy "-is [pscustomobject]". Treat
+    # primitives first or Sort-Object turns a node string into {"Length":...}.
+    if ($Value -is [string] -or $Value -is [ValueType]) {
+        return ConvertTo-Json -InputObject $Value -Compress -Depth 10
+    }
+    if ($Value -is [System.Collections.IDictionary] -or $Value -is [pscustomobject]) {
+        $keys = if ($Value -is [System.Collections.IDictionary]) { @($Value.Keys) } else { @($Value.PSObject.Properties.Name) }
+        $keys = [string[]]$keys
+        [array]::Sort($keys, [StringComparer]::Ordinal)
+        $members = foreach ($key in $keys) {
+            if ($Value -is [System.Collections.IDictionary]) { $item = $Value[$key] }
+            else { $item = $Value.$key }
+            ($key | ConvertTo-Json -Compress) + ':' + (ConvertTo-BridgePublicationJson $item)
+        }
+        return '{' + ($members -join ',') + '}'
+    }
+    if ($Value -is [System.Collections.IEnumerable] -and $Value -isnot [string]) {
+        $items = foreach ($item in $Value) { ConvertTo-BridgePublicationJson $item }
+        return '[' + ($items -join ',') + ']'
+    }
+    ConvertTo-Json -InputObject $Value -Compress -Depth 10
+}
+
+function Get-BridgePublicationHash {
+    param([AllowEmptyString()][Parameter(Mandatory)][string]$Text)
+    [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($Text))).ToLowerInvariant()
+}
+
+function Get-BridgeRenderArtifact {
+    $source = @(
+        foreach ($name in @('Save-CopilotSessionDashboard', 'Test-BridgeActivityCardServed', 'Get-BridgeDashboardInputSignature', 'ConvertTo-BridgePublicationJson')) {
+            (Get-Command $name).ScriptBlock.ToString().Replace("`r`n", "`n")
+        }
+    ) -join "`n"
+    @{
+        version = $script:BridgeDashboardRenderVersion
+        hash = Get-BridgePublicationHash $source
+    }
+}
+
+function Assert-BridgePublicationArtifact {
+    param([Parameter(Mandatory)]$Artifact)
+    if ($Artifact -isnot [System.Collections.IDictionary] -or
+        $Artifact.Count -ne 2 -or -not $Artifact.Contains('version') -or -not $Artifact.Contains('hash') -or
+        $Artifact.version -isnot [string] -or $Artifact.version -cnotmatch '^\d+\.\d+\.\d+(\.\d+)?$' -or
+        $Artifact.hash -isnot [string] -or $Artifact.hash -cnotmatch '^[a-f0-9]{64}$') {
+        throw 'Publication artifact requires an exact numeric version and SHA256 content hash.'
+    }
+    $parsed = $null
+    if (-not [version]::TryParse($Artifact.version, [ref]$parsed)) { throw 'Invalid publication artifact version.' }
+}
+
+function Get-BridgePublicationTarget {
+    <# Inspect these exact targets before passing them to the one-shot policy operation. #>
+    param([string]$CardSourcePath = (Join-Path (Split-Path -Parent $PSScriptRoot) 'frontend\agent-bridge-reply-card.js'))
+    $card = @{
+        version = Get-BridgeReplyCardFileVersion -SourcePath $CardSourcePath
+        hash = (Get-FileHash -LiteralPath $CardSourcePath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant()
+    }
+    Assert-BridgePublicationArtifact $card
+    @{ card = $card; render = Get-BridgeRenderArtifact }
+}
+
+function Get-BridgeRegisteredCardArtifact {
+    param([Parameter(Mandatory)][string]$Url)
+    if ($Url -notmatch '[?&]v=(\d+\.\d+\.\d+(?:\.\d+)?)(?:&|$)') {
+        throw 'The registered card version is unknown; inspect and restore a versioned resource before migration.'
+    }
+    $versionText = $Matches[1]
+    $version = $null
+    if (-not [version]::TryParse($versionText, [ref]$version)) { throw 'The registered card version is malformed.' }
+    $hash = $null
+    if ($Url.StartsWith('data:', [StringComparison]::Ordinal)) {
+        $prefix = 'data:text/javascript;base64,'
+        $fragment = $Url.IndexOf('#', [StringComparison]::Ordinal)
+        if (-not $Url.StartsWith($prefix, [StringComparison]::Ordinal) -or $fragment -le $prefix.Length) {
+            throw 'The registered inline card is malformed.'
+        }
+        $bytes = [Convert]::FromBase64String($Url.Substring($prefix.Length, $fragment - $prefix.Length))
+        $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
+        if ($text -notmatch "CARD_VERSION\s*=\s*'([^']+)'" -or $Matches[1] -cne $versionText) {
+            throw 'The registered card content and declared version conflict.'
+        }
+        $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+    }
+    @{ version = $versionText; hash = $hash }
+}
+
+function Assert-BridgePublicationPolicy {
+    param([Parameter(Mandatory)]$Policy)
+    $keys = @('protocol', 'authority', 'writer', 'generation', 'dashboard', 'mode', 'card', 'render', 'highCard', 'highRender', 'legacyCard')
+    if ($Policy -isnot [System.Collections.IDictionary] -or
+        @($keys | Where-Object { -not $Policy.Contains($_) }).Count -or $Policy.Count -ne $keys.Count) {
+        throw 'Malformed publication policy; restore the known policy rather than bootstrapping over it.'
+    }
+    if (($Policy.protocol -isnot [int] -and $Policy.protocol -isnot [long]) -or $Policy.protocol -ne 1) {
+        throw 'Unsupported publication fencing protocol.'
+    }
+    foreach ($key in @('authority', 'writer')) {
+        if ($Policy[$key] -isnot [string] -or $Policy[$key] -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$') {
+            throw "Invalid publication $key identity."
+        }
+    }
+    if (($Policy.generation -isnot [int] -and $Policy.generation -isnot [long]) -or
+        $Policy.generation -lt 1 -or $Policy.generation -gt [int]::MaxValue -or
+        $Policy.dashboard -cne $script:DecisionBridgeConfig.DashboardUrlPath -or
+        $Policy.mode -cnotin @('advance', 'pin') -or $Policy.legacyCard -isnot [string] -or
+        ($Policy.legacyCard -and $Policy.legacyCard -cnotmatch '^[a-f0-9]{64}$')) {
+        throw 'Invalid publication generation, dashboard, mode or migration target.'
+    }
+    foreach ($component in @('card', 'render')) {
+        $high = if ($component -eq 'card') { 'highCard' } else { 'highRender' }
+        Assert-BridgePublicationArtifact $Policy[$component]
+        Assert-BridgePublicationArtifact $Policy[$high]
+        if ([version]$Policy[$component].version -gt [version]$Policy[$high].version -or
+            ($Policy.mode -ceq 'advance' -and
+             (ConvertTo-BridgePublicationJson $Policy[$component]) -cne (ConvertTo-BridgePublicationJson $Policy[$high]))) {
+            throw 'Publication high-water fence is inconsistent with its target.'
+        }
+    }
+}
+
+function Get-BridgePublicationSettings {
+    $value = Get-BridgeSetting 'dashboard.publication' $null
+    if ($null -eq $value) {
+        throw 'Publication is not configured. Choose a designated writer and explicitly bootstrap or migrate with Set-BridgePublicationPolicy.'
+    }
+    $settings = $value | ConvertTo-Json -Depth 10 | ConvertFrom-Json -AsHashtable
+    if ($settings -isnot [System.Collections.IDictionary]) { throw 'dashboard.publication must be an explicit configuration object.' }
+    foreach ($key in @('authority', 'participant', 'writer')) {
+        if (-not $settings.Contains($key) -or $settings[$key] -isnot [string] -or
+            $settings[$key] -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._:-]{0,79}$') {
+            throw "Configure an explicit dashboard.publication.$key; publication identities are never inferred."
+        }
+    }
+    if (-not $settings.Contains('generation') -or
+        ($settings.generation -isnot [int] -and $settings.generation -isnot [long]) -or
+        $settings.generation -lt 1 -or $settings.generation -gt [int]::MaxValue) {
+        throw 'Configure an explicit positive integer dashboard.publication.generation.'
+    }
+    $settings
+}
+
+function Get-BridgePublicationReceiptPath {
+    $key = "$($script:DecisionBridgeConfig.HomeAssistantBaseUrl.TrimEnd('/'))|$($script:DecisionBridgeConfig.DashboardUrlPath)"
+    Get-BridgeRuntimePath -Name ("publication-" + (Get-BridgePublicationHash $key).Substring(0, 24) + '.json')
+}
+
+function Assert-BridgePublicationProgress {
+    param([Parameter(Mandatory)]$Previous, [Parameter(Mandatory)]$Current)
+    Assert-BridgePublicationPolicy $Previous
+    Assert-BridgePublicationPolicy $Current
+    if ($Previous.authority -cne $Current.authority -or $Current.generation -lt $Previous.generation) {
+        throw 'Publication authority or generation conflicts with this installation''s established receipt.'
+    }
+    if ($Current.generation -eq $Previous.generation -and
+        ($Current.writer -cne $Previous.writer -or $Current.mode -cne $Previous.mode)) {
+        throw 'Changing the publication writer or rollback mode requires a new explicit generation.'
+    }
+    foreach ($component in @('card', 'render')) {
+        $high = if ($component -eq 'card') { 'highCard' } else { 'highRender' }
+        $comparison = ([version]$Current[$high].version).CompareTo([version]$Previous[$high].version)
+        if ($comparison -lt 0 -or ($comparison -eq 0 -and $Current[$high].hash -cne $Previous[$high].hash)) {
+            throw 'Publication high-water version/content conflicts with the established receipt.'
+        }
+        if ($Current.generation -eq $Previous.generation) {
+            $comparison = ([version]$Current[$component].version).CompareTo([version]$Previous[$component].version)
+            if (($Current.mode -ceq 'pin' -and
+                 (ConvertTo-BridgePublicationJson $Current[$component]) -cne (ConvertTo-BridgePublicationJson $Previous[$component])) -or
+                $comparison -lt 0 -or ($comparison -eq 0 -and $Current[$component].hash -cne $Previous[$component].hash)) {
+                throw 'Publication target changed without bounded rollback authority.'
+            }
+        }
+    }
+}
+
+function Save-BridgePublicationReceipt {
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Policy)
+    $path = Get-BridgePublicationReceiptPath
+    $text = ConvertTo-BridgePublicationJson $Policy
+    # This local mutex serializes receipts only. It is not an HA/distributed lease.
+    $mutexKey = if ($IsWindows) { $path.ToLowerInvariant() } else { $path }
+    $mutex = [Threading.Mutex]::new($false, ('AgentBridgePublication_' + (Get-BridgePublicationHash $mutexKey)))
+    $held = $false
+    $temporary = "$path.$([guid]::NewGuid().ToString('N')).tmp"
+    try {
+        try { $held = $mutex.WaitOne(5000) }
+        catch [Threading.AbandonedMutexException] { $held = $true }
+        if (-not $held) { throw 'Publication receipt is busy; no shared write is authorized.' }
+        $previous = Read-BridgeInstallRecord -Path $path
+        if ($previous) {
+            Assert-BridgePublicationProgress -Previous $previous -Current $Policy
+            if ((ConvertTo-BridgePublicationJson $previous) -ceq $text) { return }
+        }
+        Write-BridgeSecretFile -Path $temporary -Content $text
+        [IO.File]::Move($temporary, $path, $true)
+    }
+    finally {
+        if (Test-Path -LiteralPath $temporary -PathType Leaf) { Remove-Item -LiteralPath $temporary -Force }
+        if ($held) { $mutex.ReleaseMutex() }
+        $mutex.Dispose()
+    }
+}
+
+function Read-BridgePublicationState {
+    param([scriptblock]$Invoker, [scriptblock]$Resources)
+    if (-not $Invoker) { $Invoker = { param($commands) Invoke-CopilotHaWebSocket -Commands $commands } }
+    $read = {
+        param([hashtable]$command)
+        $responses = & $Invoker @($command)
+        if ($responses -isnot [array] -or $responses.Count -ne 1) { throw "Malformed HA result for $($command.type); it is not absence." }
+        return , $responses[0]
+    }
+    if ($Resources) { $resourceList = @(& $Resources) }
+    else { $resourceList = & $read @{ type = 'lovelace/resources' } }
+    $dashboards = & $read @{ type = 'lovelace/dashboards/list' }
+    if ($resourceList -isnot [array] -or $dashboards -isnot [array]) { throw 'Unreadable HA publication inventory; it is not absence.' }
+    $policyResources = @()
+    $cardResources = @()
+    foreach ($resource in $resourceList) {
+        if (-not $resource -or -not $resource.PSObject.Properties['url'] -or $resource.url -isnot [string]) {
+            throw 'Malformed HA resource inventory; refusing publication.'
+        }
+        if ($resource.url -match '#agent-bridge-publication-policy\.js(?:\?|$)') { $policyResources += $resource }
+        $named = if ($resource.url.StartsWith('data:') -and $resource.url.Contains('#')) { $resource.url.Split('#')[-1] } else { $resource.url }
+        if ((($named -split '\?')[0] -split '[/\\]')[-1] -ceq 'agent-bridge-reply-card.js') { $cardResources += $resource }
+    }
+    if ($policyResources.Count -gt 1 -or $cardResources.Count -gt 1) { throw 'Multiple publication/card resources make writer ownership ambiguous.' }
+    foreach ($owned in @($policyResources) + @($cardResources)) {
+        if (-not $owned.PSObject.Properties['id'] -or $owned.id -isnot [string] -or -not $owned.id -or
+            -not $owned.PSObject.Properties['type'] -or $owned.type -cne 'module') { throw 'Bridge resources require unambiguous storage-mode module registrations.' }
+    }
+    foreach ($dashboard in $dashboards) {
+        if (-not $dashboard -or -not $dashboard.PSObject.Properties['url_path'] -or
+            $dashboard.url_path -isnot [string] -or -not $dashboard.PSObject.Properties['id'] -or
+            $dashboard.id -isnot [string] -or -not $dashboard.id) {
+            throw 'Malformed HA dashboard inventory; it is not absence.'
+        }
+    }
+    $target = @($dashboards | Where-Object { $_.url_path -ceq $script:DecisionBridgeConfig.DashboardUrlPath })
+    if ($target.Count -gt 1) { throw 'Multiple target dashboards make publication ambiguous.' }
+    $config = $null
+    if ($target.Count) {
+        try {
+            $raw = & $read @{ type = 'lovelace/config'; url_path = $script:DecisionBridgeConfig.DashboardUrlPath }
+            if ($null -eq $raw -or ($raw -isnot [pscustomobject] -and $raw -isnot [System.Collections.IDictionary])) {
+                throw 'Malformed dashboard config read; it is not a missing view.'
+            }
+            $config = $raw | ConvertTo-Json -Depth 100 | ConvertFrom-Json -AsHashtable -Depth 100
+        }
+        catch {
+            $failure = $_
+            $prefix = "WebSocket command 'lovelace/config' failed: "
+            if (-not $failure.Exception.Message.StartsWith($prefix, [StringComparison]::Ordinal)) { throw }
+            try { $detail = $failure.Exception.Message.Substring($prefix.Length) | ConvertFrom-Json -AsHashtable }
+            catch { throw $failure }
+            if ($detail -isnot [System.Collections.IDictionary] -or -not $detail.Contains('code') -or $detail.code -cne 'config_not_found') { throw $failure }
+        }
+    }
+    $receipt = Read-BridgeInstallRecord -Path (Get-BridgePublicationReceiptPath)
+    $policy = $null
+    $policyResource = $null
+    if ($policyResources.Count) {
+        $policyResource = $policyResources[0]
+        $prefix = 'data:text/javascript;base64,ZXhwb3J0IHt9Ow==#agent-bridge-publication-policy.js?policy='
+        if (-not $policyResource.url.StartsWith($prefix, [StringComparison]::Ordinal)) { throw 'Malformed publication policy resource; restore the established policy.' }
+        $payload = $policyResource.url.Substring($prefix.Length)
+        if ($payload.Length -gt 16384) { throw 'Publication policy exceeds its bounded format.' }
+        $policy = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($payload)) | ConvertFrom-Json -AsHashtable -Depth 10
+        Assert-BridgePublicationPolicy $policy
+        if ($receipt) { Assert-BridgePublicationProgress -Previous $receipt -Current $policy }
+        Save-BridgePublicationReceipt $policy
+    }
+    elseif ($receipt -or ($config -and $config.Contains('agent_bridge_publication'))) {
+        throw 'Publication policy was lost after establishment. Restore the known policy resource/receipt; do not bootstrap or reset its fences.'
+    }
+    $card = if ($cardResources.Count) { $cardResources[0] } else { $null }
+    $cardUrl = if ($card) { [string]$card.url } else { '' }
+    $legacy = [bool]($card -or @($dashboards | Where-Object { $_.url_path -cin @($script:DecisionBridgeConfig.DashboardUrlPath, 'copilot-decisions') }).Count)
+    [pscustomobject]@{
+        Policy = $policy; PolicyResource = $policyResource; CardResource = $card; CardUrl = $cardUrl
+        Dashboards = $dashboards; DashboardExists = [bool]$target.Count; Config = $config
+        Kind = $(if ($policy) { 'established' } elseif ($legacy) { 'legacy' } else { 'empty' })
+    }
+}
+
+function Assert-BridgePublicationWriter {
+    param([Parameter(Mandatory)]$State, [ValidateSet('card', 'render')][string]$Component, $Artifact)
+    try {
+        if (-not $State.Policy) {
+            if ($State.Kind -ceq 'legacy') {
+                throw 'Publication migration required: preserve the unfenced dashboard/card, configure a designated writer, then explicitly run Set-BridgePublicationPolicy.'
+            }
+            throw 'Publication bootstrap required: configure a designated writer and explicitly run Set-BridgePublicationPolicy after successful absence reads.'
+        }
+        $settings = Get-BridgePublicationSettings
+        if ($settings.authority -cne $State.Policy.authority -or $settings.writer -cne $State.Policy.writer -or
+            $settings.generation -ne $State.Policy.generation -or $settings.participant -cne $State.Policy.writer) {
+            throw 'This participant is not the configured writer for the established publication authority/generation.'
+        }
+        if ($Component) {
+            Assert-BridgePublicationArtifact $Artifact
+            $target = $State.Policy[$Component]
+            $comparison = ([version]$Artifact.version).CompareTo([version]$target.version)
+            if ($State.Policy.mode -ceq 'pin') {
+                if ($comparison -ne 0 -or $Artifact.hash -cne $target.hash) { throw 'Authorized rollback pins an exact publication target; automatic writers cannot leave that pin.' }
+            }
+            elseif ($comparison -lt 0) { throw "An older $Component cannot cross the publication version fence." }
+            elseif ($comparison -eq 0 -and $Artifact.hash -cne $target.hash) { throw "Equal $Component versions have conflicting content; bump the version or explicitly authorize a pinned generation." }
+        }
+    }
+    catch {
+        $_.Exception.Data['BridgePublicationRefused'] = $true
+        throw
+    }
+}
+
+function New-BridgePublicationResourceCommand {
+    param([Parameter(Mandatory)][System.Collections.IDictionary]$Policy, $Resource)
+    $payload = [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes((ConvertTo-BridgePublicationJson $Policy)))
+    $command = @{
+        type = 'lovelace/resources/create'; res_type = 'module'
+        url = 'data:text/javascript;base64,ZXhwb3J0IHt9Ow==#agent-bridge-publication-policy.js?policy=' + $payload
+    }
+    if ($Resource) { $command.type = 'lovelace/resources/update'; $command.resource_id = [string]$Resource.id }
+    $command
+}
+
+function Update-BridgePublicationFence {
+    param([ValidateSet('card', 'render')][Parameter(Mandatory)][string]$Component,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Artifact, [scriptblock]$Invoker)
+    if (-not $Invoker) { $Invoker = { param($commands) Invoke-CopilotHaWebSocket -Commands $commands } }
+    $state = Read-BridgePublicationState -Invoker $Invoker
+    Assert-BridgePublicationWriter -State $state -Component $Component -Artifact $Artifact
+    if ((ConvertTo-BridgePublicationJson $state.Policy[$Component]) -cne (ConvertTo-BridgePublicationJson $Artifact)) {
+        $next = (ConvertTo-BridgePublicationJson $state.Policy) | ConvertFrom-Json -AsHashtable
+        $next[$Component] = $Artifact
+        $next[$(if ($Component -ceq 'card') { 'highCard' } else { 'highRender' })] = $Artifact
+        [void](& $Invoker @((New-BridgePublicationResourceCommand -Policy $next -Resource $state.PolicyResource)))
+        $state = Read-BridgePublicationState -Invoker $Invoker
+        if ((ConvertTo-BridgePublicationJson $state.Policy) -cne (ConvertTo-BridgePublicationJson $next)) {
+            throw 'Publication fence write was not confirmed; no artifact write is authorized.'
+        }
+    }
+    $state
+}
+
+function Set-BridgePublicationPolicy {
+    <#
+        One-shot operator action, never called by automatic publication. Target is
+        an explicitly inspected Get-BridgePublicationTarget result. Generation is
+        configured locally and must be exactly ExpectedGeneration + 1. An existing
+        policy additionally requires its exact Get-BridgePublicationHash digest.
+        Stop the designated writer while changing policy; this is not an atomic HA lease.
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateRange(0, 2147483646)][int]$ExpectedGeneration,
+        [Parameter(Mandatory)][string]$ExpectedPolicyHash,
+        [Parameter(Mandatory)][hashtable]$Target,
+        [ValidateSet('advance', 'pin')][string]$Mode = 'advance',
+        [scriptblock]$Invoker
+    )
+    if (-not $Invoker) { $Invoker = { param($commands) Invoke-CopilotHaWebSocket -Commands $commands } }
+    $settings = Get-BridgePublicationSettings
+    if ($settings.participant -cne $settings.writer -or $settings.generation -ne ($ExpectedGeneration + 1)) {
+        throw 'Explicit policy action requires the designated local writer and exactly the next configured generation.'
+    }
+    if ($Target.Count -ne 2 -or -not $Target.ContainsKey('card') -or -not $Target.ContainsKey('render')) {
+        throw 'Supply explicit card and render targets, each with version and content hash.'
+    }
+    Assert-BridgePublicationArtifact $Target.card
+    Assert-BridgePublicationArtifact $Target.render
+    $state = Read-BridgePublicationState -Invoker $Invoker
+    if ($state.Policy) {
+        if ($state.Policy.authority -cne $settings.authority -or $state.Policy.generation -ne $ExpectedGeneration -or
+            (Get-BridgePublicationHash (ConvertTo-BridgePublicationJson $state.Policy)) -cne $ExpectedPolicyHash) {
+            throw 'The expected publication authority/generation/content no longer matches; no policy change was sent.'
+        }
+        $highCard = $state.Policy.highCard
+        $highRender = $state.Policy.highRender
+    }
+    else {
+        if ($ExpectedGeneration -ne 0 -or $ExpectedPolicyHash -cne 'absent') { throw 'Bootstrap requires explicit expected generation zero and policy hash absent.' }
+        $highCard = $Target.card
+        $highRender = $Target.render
+    }
+    if ($state.CardUrl) {
+        $registered = Get-BridgeRegisteredCardArtifact -Url $state.CardUrl
+        $comparison = ([version]$registered.version).CompareTo([version]$highCard.version)
+        if ($registered.hash) {
+            if ($comparison -gt 0) { $highCard = $registered }
+            elseif ($comparison -eq 0 -and $registered.hash -cne $highCard.hash -and $Mode -ceq 'advance') {
+                throw 'The observed equal-version card content conflicts; an explicit pinned generation is required.'
+            }
+        }
+        elseif ($comparison -gt 0) {
+            throw 'An older target cannot establish a rollback fence for an opaque newer file resource; migrate its known version first.'
+        }
+    }
+    $next = @{
+        protocol = 1; authority = $settings.authority; writer = $settings.writer
+        generation = $settings.generation; dashboard = $script:DecisionBridgeConfig.DashboardUrlPath
+        mode = $Mode; card = $Target.card; render = $Target.render
+        highCard = $highCard; highRender = $highRender
+        legacyCard = $(if ($state.CardUrl) { Get-BridgePublicationHash $state.CardUrl } else { '' })
+    }
+    foreach ($component in @('card', 'render')) {
+        $high = if ($component -ceq 'card') { 'highCard' } else { 'highRender' }
+        $comparison = ([version]$Target[$component].version).CompareTo([version]$next[$high].version)
+        if ($Mode -ceq 'advance' -and ($comparison -lt 0 -or
+            ($comparison -eq 0 -and $Target[$component].hash -cne $next[$high].hash))) {
+            throw 'An older or conflicting target requires an explicit pinned rollback generation.'
+        }
+        if ($comparison -gt 0) { $next[$high] = $Target[$component] }
+    }
+    Assert-BridgePublicationPolicy $next
+    [void](& $Invoker @((New-BridgePublicationResourceCommand -Policy $next -Resource $state.PolicyResource)))
+    $confirmed = Read-BridgePublicationState -Invoker $Invoker
+    if ((ConvertTo-BridgePublicationJson $confirmed.Policy) -cne (ConvertTo-BridgePublicationJson $next)) { throw 'Explicit publication policy was not confirmed.' }
+    $confirmed.Policy
+}
+
+function Get-BridgeDashboardInputSignature {
+    param([AllowEmptyCollection()][object[]]$Sessions, [AllowEmptyCollection()][object[]]$Machines,
+        [AllowEmptyString()][string]$MachineSelector, [AllowEmptyString()][string]$ReplyCardUrl)
+    $sessionInputs = @($Sessions | Sort-Object Node | ForEach-Object {
+        $entry = $_
+        $item = @{}
+        foreach ($key in @('Node', 'Name', 'Machine', 'Kind')) {
+            $item[$key] = if ($entry.PSObject.Properties[$key]) { [string]$entry.$key } else { '' }
+        }
+        $item
+    })
+    $machineInputs = @($Machines | Sort-Object Slug | ForEach-Object {
+        $entry = $_
+        $item = @{ Slug = [string]$entry.Slug; Machine = [string]$entry.Machine }
+        foreach ($key in @('IncludeProfile', 'IncludeResume', 'IncludeAgent', 'IncludeTuning', 'IncludePermissions', 'IncludeDetailed', 'IsDev', 'Online')) {
+            $item[$key] = if ($entry.PSObject.Properties[$key]) { [bool]$entry.$key } else { $key -ceq 'Online' }
+        }
+        $item.SessionNodes = if ($entry.PSObject.Properties['SessionNodes']) { @($entry.SessionNodes | Sort-Object) } else { @() }
+        $item
+    })
+    Get-BridgePublicationHash (ConvertTo-BridgePublicationJson @{
+        sessions = $sessionInputs; machines = $machineInputs; selector = $MachineSelector; cardUrl = $ReplyCardUrl
+    })
+}
+
+function Get-BridgeDashboardPublication {
+    $state = Read-BridgePublicationState
+    $result = [pscustomobject]@{ State = $state; Verified = $false; InputSignature = ''; ReferencedNodes = @(); Reason = 'missing policy or published receipt' }
+    if (-not $state.Policy -or -not $state.Config -or -not $state.Config.Contains('agent_bridge_publication')) { return $result }
+    $receipt = $state.Config['agent_bridge_publication']
+    if ($receipt -isnot [System.Collections.IDictionary]) { throw 'Malformed dashboard publication receipt.' }
+    foreach ($key in @('protocol', 'authority', 'generation', 'writer', 'render', 'inputHash', 'contentHash', 'cardUrlHash', 'renderedNodes')) {
+        if (-not $receipt.Contains($key)) { throw 'Incomplete dashboard publication receipt.' }
+    }
+    if (($receipt.protocol -isnot [int] -and $receipt.protocol -isnot [long]) -or $receipt.protocol -ne 1 -or
+        ($receipt.generation -isnot [int] -and $receipt.generation -isnot [long]) -or
+        $receipt.authority -isnot [string] -or $receipt.writer -isnot [string] -or
+        $receipt.renderedNodes -isnot [array] -or
+        @($receipt.renderedNodes | Where-Object { $_ -isnot [string] -or $_ -cnotmatch '^[A-Za-z0-9_-]+$' }).Count) {
+        throw 'Malformed dashboard publication receipt types.'
+    }
+    foreach ($key in @('inputHash', 'contentHash', 'cardUrlHash')) {
+        if ($receipt[$key] -isnot [string] -or $receipt[$key] -cnotmatch '^[a-f0-9]{64}$') { throw 'Malformed dashboard publication receipt hash.' }
+    }
+    Assert-BridgePublicationArtifact $receipt.render
+    $sealed = (ConvertTo-BridgePublicationJson $state.Config) | ConvertFrom-Json -AsHashtable -Depth 100
+    [void]$sealed.agent_bridge_publication.Remove('contentHash')
+    if ($receipt.authority -cne $state.Policy.authority -or $receipt.generation -ne $state.Policy.generation -or $receipt.writer -cne $state.Policy.writer) {
+        $result.Reason = 'published authority/generation does not match policy'
+    }
+    elseif ((ConvertTo-BridgePublicationJson $receipt.render) -cne (ConvertTo-BridgePublicationJson $state.Policy.render)) {
+        $result.Reason = 'published renderer does not match policy'
+    }
+    elseif ($receipt.cardUrlHash -cne (Get-BridgePublicationHash $state.CardUrl)) { $result.Reason = 'served card changed' }
+    elseif ($receipt.contentHash -cne (Get-BridgePublicationHash (ConvertTo-BridgePublicationJson $sealed))) {
+        $result.Reason = 'published content/receipt digest mismatch'
+    }
+    else { $result.Verified = $true; $result.Reason = '' }
+    if ($result.Verified) {
+        $result.InputSignature = $receipt.inputHash
+        $result.ReferencedNodes = @($receipt.renderedNodes)
+    }
+    $result
+}
+
+function Remove-BridgeLegacyDashboard {
+    $publication = Get-BridgeDashboardPublication
+    Assert-BridgePublicationWriter -State $publication.State -Component render -Artifact (Get-BridgeRenderArtifact)
+    if (-not $publication.Verified) { throw 'Legacy cleanup requires an actually published and verified replacement.' }
+    if ($script:DecisionBridgeConfig.DashboardUrlPath -ceq 'copilot-decisions') { return }
+    foreach ($legacy in @($publication.State.Dashboards | Where-Object { $_.url_path -ceq 'copilot-decisions' })) {
+        [void](Invoke-CopilotHaWebSocket -Commands @(@{ type = 'lovelace/dashboards/delete'; dashboard_id = [string]$legacy.id }))
+        Write-DecisionBridgeLog "removed the pre-rename 'copilot-decisions' dashboard after verified publication"
+    }
+}
+
 function Initialize-BridgeDashboard {
     <#
         Makes sure the Lovelace dashboard the bridge writes to actually exists, and
-        retires the pre-rename `copilot-decisions` one.
+        checks the actual publication authority, including for manual callers.
 
         `lovelace/config/save` only works against a registered dashboard, so a fresh
         install - or the slug change that came with the rename - needs the dashboard
-        created first. Runs once per process; the daemon is long-lived, so repeating
-        the round trip on every session change would be pure overhead.
+        created first. Cached readiness cannot prove it still exists after deletion.
+        Legacy cleanup happens only after Save verifies the replacement's contents.
     #>
     param([switch]$Force)
 
-    if ($script:BridgeDashboardReady -and -not $Force) { return }
-
+    # Force remains a compatibility parameter, never an authority/version bypass.
+    [void]$Force
+    $state = Update-BridgePublicationFence -Component render -Artifact (Get-BridgeRenderArtifact)
     $target = $script:DecisionBridgeConfig.DashboardUrlPath
-    $legacy = 'copilot-decisions'
-
-    try {
-        # Invoke-CopilotHaWebSocket already unwraps each command's `result`, so this is
-        # the dashboard list itself - indexing into `.result` again would find nothing.
-        $dashboards = @((Invoke-CopilotHaWebSocket -Commands @(
-            @{ type = 'lovelace/dashboards/list' }
-        ))[0])
-
-        if (-not (@($dashboards) | Where-Object { [string]$_.url_path -eq $target })) {
-            [void](Invoke-CopilotHaWebSocket -Commands @(
-                @{
-                    type = 'lovelace/dashboards/create'
-                    url_path = $target
-                    title = 'Agent Sessions'
-                    icon = 'mdi:robot'
-                    show_in_sidebar = $true
-                    require_admin = $false
-                }
-            ))
-            Write-DecisionBridgeLog "created the '$target' dashboard"
-        }
-
-        # Only once the replacement is in place, so a failure part way through never
-        # leaves the user with no dashboard at all.
-        if ($target -ne $legacy) {
-            $stale = @($dashboards) | Where-Object { [string]$_.url_path -eq $legacy } | Select-Object -First 1
-            if ($stale) {
-                [void](Invoke-CopilotHaWebSocket -Commands @(
-                    @{ type = 'lovelace/dashboards/delete'; dashboard_id = $stale.id }
-                ))
-                Write-DecisionBridgeLog "removed the pre-rename '$legacy' dashboard"
-            }
-        }
-
-        $script:BridgeDashboardReady = $true
+    if (-not $state.DashboardExists) {
+        [void](Invoke-CopilotHaWebSocket -Commands @(@{
+            type = 'lovelace/dashboards/create'; url_path = $target; title = 'Agent Sessions'
+            icon = 'mdi:robot'; show_in_sidebar = $true; require_admin = $false
+        }))
+        Write-DecisionBridgeLog "created the '$target' dashboard"
     }
-    catch {
-        # A save against an existing dashboard still works, so this must never be
-        # fatal - the next cycle retries.
-        Write-DecisionBridgeLog "dashboard preparation failed: $($_.Exception.Message)"
-    }
+    $script:BridgeDashboardReady = $true
 }
 
 function Test-BridgeActivityCardServed {
@@ -968,9 +1440,8 @@ function Save-CopilotSessionDashboard {
 
         There is one dashboard however many machines are running, and it shows all of
         them. Each machine publishes what it is running to a sensor of its own, so any
-        machine can render the whole picture without talking to the others - and every
-        machine generates identical content, which is what makes it safe for all of
-        them to rebuild it.
+        machine can render the whole picture without talking to the others. Only the
+        explicitly configured writer may publish it; peers observe accepted output.
 
         Live count and pending-decision count are rendered as Jinja templates over the
         exact entity ids, so they stay current between rebuilds as turn state and
@@ -1017,6 +1488,10 @@ function Save-CopilotSessionDashboard {
         [AllowEmptyString()]
         [string]$ReplyCardUrl = ''
     )
+
+    $publication = Update-BridgePublicationFence -Component render -Artifact (Get-BridgeRenderArtifact)
+    if (-not $PSBoundParameters.ContainsKey('ReplyCardUrl')) { $ReplyCardUrl = $publication.CardUrl }
+    elseif ($ReplyCardUrl -cne $publication.CardUrl) { throw 'The served card changed; retry against the actual registered resource before rendering.' }
 
     $decisionEntities = @($Sessions | ForEach-Object { "select.$($_.Node)_decision" })
     $decisionList = ($decisionEntities | ForEach-Object { "'$_'" }) -join ','
@@ -2046,6 +2521,17 @@ ha-card {
         })
     }
 
+    $inputSignature = Get-BridgeDashboardInputSignature -Sessions $Sessions -Machines $machineList `
+        -MachineSelector $MachineSelector -ReplyCardUrl $ReplyCardUrl
+    $config['agent_bridge_publication'] = @{
+        protocol = 1; authority = $publication.Policy.authority; generation = $publication.Policy.generation
+        writer = $publication.Policy.writer; render = Get-BridgeRenderArtifact; inputHash = $inputSignature
+        cardUrlHash = Get-BridgePublicationHash $ReplyCardUrl
+        # Protocol 1 binds the rendered session set as well as the view. Text in a
+        # session's display name must not keep an unrelated retired entity alive.
+        renderedNodes = @($Sessions | ForEach-Object { [string]$_.Node } | Sort-Object -Unique)
+    }
+    $config.agent_bridge_publication['contentHash'] = Get-BridgePublicationHash (ConvertTo-BridgePublicationJson $config)
     Initialize-BridgeDashboard
     [void](Invoke-CopilotHaWebSocket -Commands @(
         @{
@@ -2054,6 +2540,11 @@ ha-card {
             config = $config
         }
     ))
+    $confirmed = Get-BridgeDashboardPublication
+    if (-not $confirmed.Verified -or $confirmed.InputSignature -cne $inputSignature) {
+        throw "Dashboard publication was not confirmed by its actual stored content ($($confirmed.Reason)); it is not current."
+    }
+    Remove-BridgeLegacyDashboard
 }
 
 function Set-CopilotMqttEntityIds {
