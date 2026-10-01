@@ -390,9 +390,10 @@ function Get-CopilotSessionProcessId {
         Resolves the CLI process that owns a session.
 
         Two sources, in the same order and for the same reason as
-        Get-LiveCopilotSessions. Each live session directory holds an
-        `inuse.<pid>.lock` file; a lock whose process is gone is stale and ignored,
-        which keeps a reply from being delivered to a dead pid.
+        Get-LiveCopilotSessions: the `--session-id` on a process's command line first,
+        then the `inuse.<pid>.lock` files for the processes it could not answer for. A
+        lock whose process is gone is stale and ignored, which keeps a reply from being
+        delivered to a dead pid.
 
         The locks alone used to be the whole answer, and a resumed session could not
         be typed into for it: resuming onto an id that already has history writes no
@@ -414,24 +415,35 @@ function Get-CopilotSessionProcessId {
         return $null
     }
 
+    # The command line is asked first, because it names exactly one session where a
+    # lock only says a pid touched a directory at some point. A process that resumed a
+    # different session leaves its old `inuse.<pid>.lock` behind, and that lock names a
+    # live CLI - working somewhere else. Taking locks first typed the reply into that
+    # other session, silently: the pid was alive and was `copilot`, so every guard
+    # here was satisfied. Get-LiveCopilotSessions settles the same ambiguity the same
+    # way round, and the two must agree or a reply lands where the card did not.
+    #
+    # Reading a command line is expensive, but the answers are memoised per process
+    # and daemon discovery has already paid for them on this pass.
+    $named = Get-BridgeAgentProcessSessionIds -Processes @(Get-BridgeAgentProcesses -Agent 'copilot')
+    foreach ($entry in $named.GetEnumerator()) {
+        if ([string]$entry.Value -eq $SessionId) { return [int]$entry.Key }
+    }
+
+    # Then the locks, for the processes the command line could not answer for. A pid
+    # that is in $named named some other session, so its lock here is the stale one
+    # left behind by a resume rather than evidence about this session.
     $locks = @(Get-ChildItem -LiteralPath $dir -Filter 'inuse.*.lock' -ErrorAction SilentlyContinue)
     foreach ($lock in $locks) {
         if ($lock.Name -notmatch '^inuse\.(\d+)\.lock$') { continue }
         $lockedPid = [int]$Matches[1]
+        if ($named.ContainsKey($lockedPid)) { continue }
         $process = Get-Process -Id $lockedPid -ErrorAction SilentlyContinue
         if ($null -eq $process) { continue }
         # Exact match only. The machine also runs `copilotapp` and `copilotapphost`,
         # which a prefix match would happily accept and then type into.
         if (-not (Test-BridgeAgentProcess -Process $process -Agent 'copilot')) { continue }
         return $lockedPid
-    }
-
-    # No lock names a live CLI, so ask the running processes which session each was
-    # started on. Only reached when the lock lookup found nothing, and the command
-    # lines are memoised per process, so the common path pays nothing for this.
-    $named = Get-BridgeAgentProcessSessionIds -Processes @(Get-BridgeAgentProcesses -Agent 'copilot')
-    foreach ($entry in $named.GetEnumerator()) {
-        if ([string]$entry.Value -eq $SessionId) { return [int]$entry.Key }
     }
 
     $null

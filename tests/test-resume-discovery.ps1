@@ -307,6 +307,34 @@ try {
         $null -eq (Get-CopilotSessionProcessId -SessionId $freshId)
     } "got: $(Get-CopilotSessionProcessId -SessionId $freshId)"
 
+    # The reason the command line has to be asked before the locks rather than after
+    # them. A CLI resumed onto another session leaves its `inuse.<pid>.lock` behind in
+    # the directory it came from, and that pid is still alive and still `copilot` - so
+    # every guard the lock path applies is satisfied and the reply was typed into
+    # whichever session that process moved to. Get-LiveCopilotSessions already resolves
+    # this ambiguity command-line-first; a reply that disagreed with the card would be
+    # delivered to a session the user was not looking at, with nothing logged.
+    Get-ChildItem -LiteralPath $root -Directory | Remove-Item -Recurse -Force
+    $null = New-FixtureSession -Id $freshId -LockPids 500 -WithTranscript
+    $null = New-FixtureSession -Id $otherId -WithTranscript
+    Set-FixtureProcesses @((New-FixtureProcess -Id 500 -CommandLine (New-CopilotCommandLine -SessionId $otherId)))
+    Test-That 'a lock left behind by a CLI that resumed another session does not capture the reply' {
+        $null -eq (Get-CopilotSessionProcessId -SessionId $freshId)
+    } "got: $(Get-CopilotSessionProcessId -SessionId $freshId)"
+
+    Test-That 'and the session that CLI actually moved to still resolves to it' {
+        (Get-CopilotSessionProcessId -SessionId $otherId) -eq 500
+    } "got: $(Get-CopilotSessionProcessId -SessionId $otherId)"
+
+    # The lock is still the answer for a process the command line cannot speak for,
+    # which is what keeps the pre-existing lock path working rather than replacing it.
+    Get-ChildItem -LiteralPath $root -Directory | Remove-Item -Recurse -Force
+    $null = New-FixtureSession -Id $freshId -LockPids 501 -WithTranscript
+    Set-FixtureProcesses @((New-FixtureProcess -Id 501 -NoCommandLineProperty))
+    Test-That 'a lock still settles it when that process has no readable session id' {
+        (Get-CopilotSessionProcessId -SessionId $freshId) -eq 501
+    } "got: $(Get-CopilotSessionProcessId -SessionId $freshId)"
+
     # The injector's own guard. $processId would be the [int]$ProcessId parameter -
     # PowerShell matches names case-insensitively - so a missing pid was stored as 0,
     # the guard never fired, and AttachConsole(0) returned "attach-failed:1341". Every
