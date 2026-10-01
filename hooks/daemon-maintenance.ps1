@@ -231,10 +231,12 @@ function Get-DaemonClientInstaller {
     param([Parameter(Mandatory)][string]$Client)
 
     # $script:DaemonInstallerPayload lets a test point this at a fake payload.
-    $payload = if ($script:DaemonInstallerPayload) { $script:DaemonInstallerPayload } else { Join-Path $HOME '.agent-ha-bridge\installer' }
+    $context = Get-BridgeInstallContext
+    $payload = if ($script:DaemonInstallerPayload) { $script:DaemonInstallerPayload } else { Join-Path $context.BridgeHome 'installer' }
     $own = (Get-DaemonAgent -Kind $Client).Installer
-    if ($own) { return & $own $payload }
-    [pscustomobject]@{ Path = Join-Path $payload "$Client\install-$Client.ps1"; Arguments = '' }
+    $installer = if ($own) { & $own $payload }
+        else { [pscustomobject]@{ Path = Join-Path $payload "$Client\install-$Client.ps1"; Arguments = '' } }
+    $installer
 }
 
 function Add-DaemonConfiguredClient {
@@ -245,12 +247,15 @@ function Add-DaemonConfiguredClient {
     #>
     param([Parameter(Mandatory)][string]$Client)
 
-    $path = Join-Path $HOME '.agent-ha-bridge\config.json'
+    $path = (Get-BridgeInstallContext).ConfigPath
     if (-not (Test-Path -LiteralPath $path)) { return }
     $config = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json
     $clients = @()
     if ($config.PSObject.Properties['clients']) { $clients = @($config.clients | ForEach-Object { [string]$_ }) }
     if ($clients -contains $Client) { return }
+    if ($config.PSObject.Properties['clients']) {
+        throw "The $Client client is not selected; maintenance cannot enroll it."
+    }
     $clients += $Client
     if ($config.PSObject.Properties['clients']) { $config.clients = @($clients) }
     else { $config | Add-Member -NotePropertyName 'clients' -NotePropertyValue @($clients) -Force }
@@ -281,7 +286,21 @@ function Sync-DaemonClients {
     if (-not [bool](Get-BridgeSetting 'autoConfigureClients' $true)) { return }
 
     # Every agent with an adapter the daemon can set up (see daemon-agents.ps1).
-    $clients = @($script:DaemonAgents.Keys | Where-Object { $null -ne (Get-DaemonAgent -Kind $_).AdapterInstalled })
+    $selected = Get-BridgeSelectedClients
+    if ($null -ne $selected) {
+        foreach ($client in @($script:DaemonClientSetup.Keys)) {
+            if ($selected -contains $client) { continue }
+            $job = $script:DaemonClientSetup[$client]
+            if ($job -and -not $job.Done -and $job.Process -and -not $job.Process.HasExited) {
+                Stop-BridgeOwnedRuntime -Context (Get-BridgeInstallContext) -Roles "setup-$client"
+            }
+            [void]$script:DaemonClientSetup.Remove($client)
+        }
+    }
+    $clients = @($script:DaemonAgents.Keys | Where-Object {
+        $null -ne (Get-DaemonAgent -Kind $_).AdapterInstalled -and
+        ($null -eq $selected -or $selected -contains $_)
+    })
     foreach ($client in $clients) {
         $job = $script:DaemonClientSetup[$client]
 
@@ -315,12 +334,17 @@ function Sync-DaemonClients {
 
         $installer = Get-DaemonClientInstaller -Client $client
         if (-not (Test-Path -LiteralPath $installer.Path)) { continue }
+        $context = Get-BridgeInstallContext
+        $target = "-InstallRoot `"$($context.BridgeHome)`""
+        if ($context.Isolated) { $target += " -TargetHome `"$($context.Home)`"" }
+        $target += ' -RepairOnly'
 
-        $log = Join-Path $env:TEMP "agent-bridge-setup-$client.log"
+        $log = Get-BridgeRuntimePath "agent-bridge-setup-$client.log"
+        [void][IO.Directory]::CreateDirectory((Split-Path $log -Parent))
         try {
             $setup = @{
                 FilePath               = 'pwsh'
-                ArgumentList           = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$($installer.Path)`" $($installer.Arguments)".TrimEnd()
+                ArgumentList           = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -File `"$($installer.Path)`" $target $($installer.Arguments)".TrimEnd()
                 PassThru               = $true
                 RedirectStandardOutput = $log
                 RedirectStandardError  = "$log.err"

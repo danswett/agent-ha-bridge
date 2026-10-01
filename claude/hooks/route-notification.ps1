@@ -16,7 +16,7 @@ try {
     . (Join-Path $PSScriptRoot 'claude-session.ps1')
 
     # The shared Home Assistant layer is installed with the main bridge.
-    $core = Join-Path $HOME '.agent-ha-bridge\hooks'
+    $core = (Resolve-BridgeInstallContext -EntryDirectory $PSScriptRoot).HooksDir
     . (Join-Path $core 'decision-bridge-common.ps1')
     . (Join-Path $core 'decision-mqtt.ps1')
     . (Join-Path $core 'decision-ha-websocket.ps1')

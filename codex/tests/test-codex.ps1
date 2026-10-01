@@ -273,6 +273,97 @@ finally {
     . (Join-Path $PSScriptRoot '../../hooks/bridge-platform.ps1')
 }
 
+Write-Host '--- Codex registration commands are bound to their installation ---'
+. (Join-Path $PSScriptRoot '..\..\hooks\bridge-secrets.ps1')
+$installerRoot = Join-Path $env:TEMP ('codex-install-roots-' + [guid]::NewGuid().ToString('N'))
+$fakeCodex = Join-Path $installerRoot 'fake-codex.ps1'
+[void][IO.Directory]::CreateDirectory($installerRoot)
+Set-Content -LiteralPath $fakeCodex -Encoding utf8 -Value @'
+$ErrorActionPreference = 'Stop'
+@{ arguments = @($args); codexHome = $env:CODEX_HOME; config = $env:AGENT_HA_BRIDGE_CONFIG; cwd = (Get-Location).Path } |
+    ConvertTo-Json -Compress | Add-Content -LiteralPath (Join-Path $env:CODEX_HOME 'operations.jsonl')
+if (($args -join ' ') -eq 'plugin marketplace list --json') {
+    Get-Content -LiteralPath (Join-Path $env:CODEX_HOME 'marketplaces-fixture.json') -Raw
+}
+elseif (($args -join ' ') -like 'plugin remove *' -or ($args -join ' ') -like 'plugin marketplace remove *') {
+    Write-Output 'removed'
+}
+else { throw 'Unexpected synthetic Codex operation.' }
+$global:LASTEXITCODE = 0
+'@
+$previousNoRun = $env:BRIDGE_INSTALL_NORUN
+$previousCodexHome = $env:CODEX_HOME
+$previousBridgeConfig = $env:AGENT_HA_BRIDGE_CONFIG
+function Invoke-IsolatedCodexRemoval {
+    param([string]$HomeRoot, [string]$Program, [switch]$Foreign)
+    $env:BRIDGE_INSTALL_NORUN = '1'
+    . (Join-Path $PSScriptRoot '..\install-codex.ps1') -TargetHome $HomeRoot
+    Set-Variable -Name codex -Value $Program
+    if ($Foreign) {
+        try { Remove-BridgeCodexAdapter; return $false }
+        catch { return $_.Exception.Message -like '*another installation*' }
+    }
+    Remove-BridgeCodexAdapter
+    $true
+}
+try {
+    $homes = @((Join-Path $installerRoot 'A'), (Join-Path $installerRoot 'B'))
+    foreach ($homeRoot in $homes) {
+        $context = Resolve-BridgeInstallContext -TargetHome $homeRoot
+        [void][IO.Directory]::CreateDirectory($context.CodexHome)
+        [void][IO.Directory]::CreateDirectory((Join-Path $context.BridgeHome 'codex-bridge'))
+        @{ marketplaces = @(@{ name = 'agent-ha-bridge'; root = (Join-Path $context.BridgeHome 'codex-bridge') }) } |
+            ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $context.CodexHome 'marketplaces-fixture.json') -Encoding utf8
+        @{ bridgeHome = $context.BridgeHome } | ConvertTo-Json |
+            Set-Content -LiteralPath (Join-Path $context.CodexHome 'agent-ha-bridge-owner.json') -Encoding utf8
+    }
+    $contextA = Resolve-BridgeInstallContext -TargetHome $homes[0]
+    $contextB = Resolve-BridgeInstallContext -TargetHome $homes[1]
+    $bRecord = [IO.File]::ReadAllText((Join-Path $contextB.CodexHome 'agent-ha-bridge-owner.json'))
+    Test-That 'actual Codex cleanup removes the selected installation' { Invoke-IsolatedCodexRemoval -HomeRoot $homes[0] -Program $fakeCodex }
+    $calls = @(Get-Content -LiteralPath (Join-Path $contextA.CodexHome 'operations.jsonl') | ConvertFrom-Json)
+    Test-That 'every Codex command receives A roots and an A working directory, never ambient roots' {
+        $calls.Count -eq 3 -and @($calls | Where-Object {
+            $_.codexHome -ne $contextA.CodexHome -or $_.config -ne $contextA.ConfigPath -or $_.cwd -ne $contextA.Home
+        }).Count -eq 0
+    }
+    Test-That 'the caller environment is restored after Codex dispatch' {
+        $env:CODEX_HOME -eq $previousCodexHome -and $env:AGENT_HA_BRIDGE_CONFIG -eq $previousBridgeConfig
+    }
+    Test-That 'removing A preserves B registration and payload' {
+        [IO.File]::ReadAllText((Join-Path $contextB.CodexHome 'agent-ha-bridge-owner.json')) -ceq $bRecord -and
+            (Test-Path -LiteralPath (Join-Path $contextB.BridgeHome 'codex-bridge'))
+    }
+    @{ marketplaces = @(@{ name = 'agent-ha-bridge'; root = (Join-Path $contextA.BridgeHome 'codex-bridge') }) } |
+        ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $contextB.CodexHome 'marketplaces-fixture.json') -Encoding utf8
+    Test-That 'the real marketplace reader refuses a same-name registration pointing elsewhere' {
+        Invoke-IsolatedCodexRemoval -HomeRoot $homes[1] -Program $fakeCodex -Foreign
+    }
+    $foreignCalls = @(Get-Content -LiteralPath (Join-Path $contextB.CodexHome 'operations.jsonl') | ConvertFrom-Json)
+    Test-That 'refused ownership performs only the read and preserves the adapter' {
+        $foreignCalls.Count -eq 1 -and
+            ($foreignCalls[0].arguments -join ' ') -eq 'plugin marketplace list --json' -and
+            (Test-Path -LiteralPath (Join-Path $contextB.BridgeHome 'codex-bridge'))
+    }
+    $contextA = Initialize-BridgeInstallIdentity -Context $contextA
+    @{ clients = @('codex') } | ConvertTo-Json |
+        Set-Content -LiteralPath $contextA.ConfigPath -Encoding utf8
+    Set-BridgeAdapterEnrollment -Context $contextA -Client codex -Installed $true
+    Remove-Item -LiteralPath (Join-Path $contextA.CodexHome 'operations.jsonl') -Force
+    [void](Invoke-IsolatedCodexRemoval -HomeRoot $homes[0] -Program $fakeCodex)
+    Test-That 'recorded Codex enrollment still cleans registration after payload and owner-file loss' {
+        $operations = @(Get-Content -LiteralPath (Join-Path $contextA.CodexHome 'operations.jsonl') | ConvertFrom-Json)
+        $operations.Count -eq 3 -and
+            (Get-Content -LiteralPath $contextA.MetadataPath -Raw | ConvertFrom-Json).adapters -notcontains 'codex'
+    }
+}
+finally {
+    $env:BRIDGE_INSTALL_NORUN = $previousNoRun
+    $env:CODEX_HOME = $previousCodexHome
+    $env:AGENT_HA_BRIDGE_CONFIG = $previousBridgeConfig
+    Remove-Item -LiteralPath $installerRoot -Recurse -Force
+}
+
 Write-Host ''
 if ($script:Failures) {
     Write-Host "$($script:Failures) test(s) failed" -ForegroundColor Red

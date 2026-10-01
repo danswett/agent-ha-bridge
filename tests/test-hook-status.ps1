@@ -194,6 +194,8 @@ function Start-Process {
 $script:DaemonClientSetup = @{}
 $script:DaemonRestartRequested = ''
 $script:FakeSettings = @{ clients = @('claude') }
+$savedSelectionConfig = $script:BridgeUserConfig
+$script:BridgeUserConfig = [pscustomobject]@{ clients = @('claude') }
 function Get-BridgeSetting { param([string]$Path, $Default) if ($script:FakeSettings.ContainsKey($Path)) { $script:FakeSettings[$Path] } else { $Default } }
 
 Sync-DaemonClients -Headers $headers
@@ -201,7 +203,13 @@ Test-That 'an agent that is not installed is left alone' { $script:Started.Count
 
 $script:Installed.codex = $true
 Sync-DaemonClients -Headers $headers
-Test-That 'a newly installed agent gets its adapter installer run' {
+Test-That 'a newly discovered unselected agent is not enrolled' {
+    $script:Started.Count -eq 0 -and -not $script:DaemonClientSetup.ContainsKey('codex')
+}
+$script:FakeSettings.clients = @('claude', 'codex')
+$script:BridgeUserConfig.clients = @('claude', 'codex')
+Sync-DaemonClients -Headers $headers
+Test-That 'an explicitly selected missing adapter gets its installer run' {
     $script:Started.Count -eq 1 -and $script:Started[0] -match 'install-codex\.ps1'
 }
 Test-That 'in the background, without waiting' { -not $script:DaemonClientSetup.codex.Done }
@@ -213,7 +221,10 @@ Test-That 'it is not started twice while running' { $script:Started.Count -eq 1 
 $script:FakeProcess.HasExited = $true
 $script:Adapters.codex = $true
 Sync-DaemonClients -Headers $headers
-Test-That 'on success the agent joins the configured clients' { $script:Recorded -contains 'codex' }
+Test-That 'success retains the explicit selection without adding an unselected client' {
+    $script:BridgeUserConfig.clients -contains 'codex' -and
+        @($script:Recorded | Where-Object { $script:BridgeUserConfig.clients -notcontains $_ }).Count -eq 0
+}
 Test-That 'the note says to approve the hooks in Codex' { ($script:Notes -join ' ') -match 'approve the agent-ha-bridge hooks' }
 Test-That 'and the daemon restarts to load the adapter' { $script:DaemonRestartRequested -match 'Codex' }
 
@@ -235,12 +246,14 @@ $script:Started = @()
 Sync-DaemonClients -Headers $headers
 Test-That 'and not retried in a loop' { $script:Started.Count -eq 0 }
 
-# An adapter installed by hand but missing from the list is recorded, not reinstalled.
+# Discovery cannot opt a hand-installed adapter back into an explicit selection.
 $script:DaemonClientSetup = @{}
 $script:Adapters.codex = $true
 $script:Recorded = @(); $script:Started = @()
+$script:BridgeUserConfig.clients = @('claude')
+$script:FakeSettings.clients = @('claude')
 Sync-DaemonClients -Headers $headers
-Test-That 'a hand-installed adapter is recorded without running its installer' { ($script:Recorded -contains 'codex') -and $script:Started.Count -eq 0 }
+Test-That 'an unselected hand-installed adapter is neither recorded nor repaired' { $script:Recorded.Count -eq 0 -and $script:Started.Count -eq 0 }
 
 $script:DaemonClientSetup = @{}
 $script:Adapters.codex = $false
@@ -253,15 +266,21 @@ Test-That 'autoConfigureClients: false turns it off' { $script:Started.Count -eq
 # listed - so it is run with Copilot added to the clients already configured.
 $script:DaemonClientSetup = @{}
 $script:FakeSettings = @{ clients = @('claude', 'codex') }
+$script:BridgeUserConfig.clients = @('claude', 'codex')
 $script:Installed.copilot = $true
 $script:Adapters.copilot = $false
 $script:Adapters.codex = $true
 $script:Started = @()
 Sync-DaemonClients -Headers $headers
-Test-That 'Copilot installed later is set up by the main installer' {
+Test-That 'an unselected Copilot is not added just because it is installed' { $script:Started.Count -eq 0 }
+$script:FakeSettings.clients = @('claude', 'codex', 'copilot')
+$script:BridgeUserConfig.clients = @('claude', 'codex', 'copilot')
+Sync-DaemonClients -Headers $headers
+Test-That 'an explicitly selected Copilot is repaired by the main installer' {
     $script:Started.Count -eq 1 -and $script:Started[0] -match '[\\/]install\.ps1"' -and $script:Started[0] -match '-NonInteractive'
 }
-Test-That 'with Copilot added to the configured clients, not replacing them' { $script:Started[0] -match '-Clients claude,codex,copilot$' }
+Test-That 'the main installer preserves the complete explicit selection' { $script:Started[0] -match '-Clients claude,codex,copilot$' }
+$script:BridgeUserConfig = $savedSelectionConfig
 
 Write-Host ''
 Write-Host '--- Codex status from its registration ---'
@@ -318,9 +337,33 @@ try {
         $other = [Diagnostics.Process]::Start($psi)
         try {
             [IO.File]::WriteAllText((Get-BridgeDaemonHeartbeat), [string]$other.Id)
-            Test-That 'status finds the daemon at the pid the daemon wrote' {
-                (Get-BridgeDaemonPid) -eq $other.Id
-            } "got $(Get-BridgeDaemonPid), wanted $($other.Id), this process is $PID"
+            Test-That 'an arbitrary sleeping PowerShell PID is not an owned daemon' { (Get-BridgeDaemonPid) -eq 0 }
+            $realProcessInfo = (Get-Command Get-BridgeProcessInfo).ScriptBlock
+            $ownedContext = Get-BridgeInstallContext
+            function Get-BridgeProcessInfo {
+                param($ProcessId, [switch]$WithCommandLine)
+                if ($ProcessId -ne $other.Id) { return & $realProcessInfo -ProcessId $ProcessId -WithCommandLine:$WithCommandLine }
+                [pscustomobject]@{
+                    ProcessId = $other.Id; Path = $other.Path; CreationDate = $other.StartTime
+                    CommandLine = '"' + $other.Path + '" -File "' + (Join-Path $ownedContext.HooksDir 'agent-bridge-daemon.ps1') + '"'
+                }
+            }
+            $receipt = Get-BridgeRuntimePath 'daemon.process.json'
+            @{
+                pid = $other.Id; installationId = $ownedContext.Id; executable = $other.Path
+                startedUtcTicks = $other.StartTime.ToUniversalTime().Ticks
+            } | ConvertTo-Json | Set-Content -LiteralPath $receipt -Encoding utf8
+            try {
+                Test-That 'owned script, executable and process-start metadata identify the daemon' { (Get-BridgeDaemonPid) -eq $other.Id }
+                $record = Get-Content -LiteralPath $receipt -Raw | ConvertFrom-Json
+                $record.startedUtcTicks++
+                $record | ConvertTo-Json | Set-Content -LiteralPath $receipt -Encoding utf8
+                Test-That 'a start-time mismatch rejects a recycled owned PID' { (Get-BridgeDaemonPid) -eq 0 }
+            }
+            finally {
+                Set-Item Function:\Get-BridgeProcessInfo -Value $realProcessInfo
+                Remove-Item -LiteralPath $receipt -Force
+            }
             Test-That 'and not at its own' { (Get-BridgeDaemonPid) -ne $PID }
         }
         finally { try { $other.Kill() } catch { } }

@@ -25,6 +25,9 @@
 [CmdletBinding()]
 param(
     [string]$TargetHome,
+    [string]$InstallRoot,
+    [switch]$RepairOnly,
+    [switch]$KeepSelection,
     [switch]$Uninstall
 )
 
@@ -33,22 +36,16 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '../hooks/bridge-platform.ps1')
 . (Join-Path $PSScriptRoot '../hooks/bridge-secrets.ps1')
 
-$installHome = if ($TargetHome) { $TargetHome } else { $HOME }
-$bridgeHome  = Join-Path $installHome '.agent-ha-bridge'
+$installContext = Resolve-BridgeInstallContext -TargetHome $TargetHome -BridgeHome $InstallRoot
+$bridgeHome  = $installContext.BridgeHome
 $mcpDir      = Join-Path $bridgeHome 'mcp'
-$configPath  = Join-Path $bridgeHome 'config.json'
+$configPath  = $installContext.ConfigPath
 $snippetPath = Join-Path $mcpDir 'mcp-client-config.json'
 $serverName  = 'home-assistant-bridge'
 # Overridable so a sandbox test never touches the real Claude Desktop config.
-$claudeDesktopConfig = if ($env:BRIDGE_CLAUDE_DESKTOP_CONFIG) {
-    $env:BRIDGE_CLAUDE_DESKTOP_CONFIG
-}
-elseif (-not $script:BridgeIsWindows) {
-    Join-Path $HOME 'Library/Application Support/Claude/claude_desktop_config.json'
-}
-else {
-    Join-Path $env:APPDATA 'Claude\claude_desktop_config.json'
-}
+$claudeDesktopConfig = $installContext.DesktopConfig
+$legacyMcpDir = if ($installContext.LegacyLayout) { Join-Path $installContext.CopilotHome 'mcp' } else { '' }
+$legacyServerPath = if ($legacyMcpDir) { Join-Path $legacyMcpDir 'src\server.js' } else { '' }
 
 function Write-Step { param([string]$Message) Write-Host "==> $Message" -ForegroundColor Cyan }
 
@@ -72,7 +69,7 @@ function Get-JsonFile {
 
 function Remove-BridgeMcpServer {
     <# Strips only this bridge's server, leaving any others the client has. #>
-    param([hashtable]$Config, [Parameter(Mandatory)][string]$ServerPath)
+    param([hashtable]$Config, [Parameter(Mandatory)][string]$ServerPath, [string]$LegacyServerPath)
     if ($Config.ContainsKey('mcpServers') -and $Config['mcpServers'] -is [hashtable]) {
         if (-not $Config['mcpServers'].ContainsKey($serverName)) { return $Config }
         $entry = $Config['mcpServers'][$serverName]
@@ -80,7 +77,8 @@ function Remove-BridgeMcpServer {
         $comparison = if ($script:BridgeIsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
         if ($serverArgs.Count -eq 0 -or $serverArgs[0] -isnot [string] -or
             -not [IO.Path]::IsPathFullyQualified($serverArgs[0]) -or
-            -not [string]::Equals([IO.Path]::GetFullPath($serverArgs[0]), [IO.Path]::GetFullPath($ServerPath), $comparison)) {
+            (-not [string]::Equals([IO.Path]::GetFullPath($serverArgs[0]), [IO.Path]::GetFullPath($ServerPath), $comparison) -and
+             (-not $LegacyServerPath -or -not (Test-BridgeInstallPath $serverArgs[0] $LegacyServerPath)))) {
             Write-Warning 'The named MCP registration points elsewhere; leaving it and its credentials unchanged.'
             return $Config
         }
@@ -108,25 +106,35 @@ function Write-BridgeMcpSnippet {
 }
 
 function Set-BridgeMcpClientConfig {
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$ServerBlock)
-    $cd = Get-JsonFile -Path $Path -Protect
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)]$ServerBlock, [string]$LegacyServerPath)
+    $cd = Get-JsonFile -Path $Path
     if ($cd.ContainsKey('mcpServers') -and $cd['mcpServers'] -isnot [hashtable]) {
         throw 'The client mcpServers setting must be a JSON object; it has not been replaced.'
     }
     if (-not $cd.ContainsKey('mcpServers')) { $cd['mcpServers'] = @{} }
+    if ($cd['mcpServers'].ContainsKey($serverName)) {
+        $existing = $cd['mcpServers'][$serverName]
+        if ($existing -isnot [Collections.IDictionary] -or -not $existing.Contains('args') -or
+            @($existing.args).Count -eq 0 -or $existing.args[0] -isnot [string] -or
+            -not [IO.Path]::IsPathFullyQualified($existing.args[0]) -or
+            (-not (Test-BridgeInstallPath $existing.args[0] $ServerBlock.args[0]) -and
+             (-not $LegacyServerPath -or -not (Test-BridgeInstallPath $existing.args[0] $LegacyServerPath)))) {
+            throw 'The named MCP registration belongs to another installation; it was not replaced.'
+        }
+    }
     $cd['mcpServers'][$serverName] = $ServerBlock
     if (Test-Path -LiteralPath $Path) { Copy-BridgeSecretFile -Source $Path -Destination "$Path.bak" }
     Write-BridgeSecretFile -Path $Path -Content ($cd | ConvertTo-Json -Depth 100)
 }
 
 function Remove-BridgeMcpClientConfig {
-    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$ServerPath)
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$ServerPath, [string]$LegacyServerPath)
     foreach ($file in @($Path, "$Path.bak")) {
         if (-not (Test-Path -LiteralPath $file)) { continue }
         $current = Get-JsonFile $file
         if (-not $current.ContainsKey('mcpServers') -or $current['mcpServers'] -isnot [hashtable] -or
             -not $current['mcpServers'].ContainsKey($serverName)) { continue }
-        $updated = Remove-BridgeMcpServer -Config $current -ServerPath $ServerPath
+        $updated = Remove-BridgeMcpServer -Config $current -ServerPath $ServerPath -LegacyServerPath $LegacyServerPath
         if ($updated.ContainsKey('mcpServers') -and $updated['mcpServers'].ContainsKey($serverName)) { continue }
         Write-BridgeSecretFile -Path $file -Content ($updated | ConvertTo-Json -Depth 100)
     }
@@ -134,15 +142,23 @@ function Remove-BridgeMcpClientConfig {
 
 # Credential helpers can be exercised without installing packages or clients.
 if ($env:BRIDGE_INSTALL_NORUN) { return }
+if ($RepairOnly -and -not $Uninstall) { Assert-BridgeAdapterSelection -Context $installContext -Client mcp }
 
 # ------------------------------------------------------------------ uninstall
 if ($Uninstall) {
     Write-Step 'Removing the MCP server'
-    Remove-BridgeMcpClientConfig -Path $claudeDesktopConfig -ServerPath (Join-Path $mcpDir 'src\server.js')
+    Set-BridgeAdapterEnrollment -Context $installContext -Client mcp -Installed $false -KeepSelection:$KeepSelection -KeepAdapterRecord
+    Stop-BridgeOwnedRuntime -Context $installContext -Roles setup-mcp
+    Remove-BridgeMcpClientConfig -Path $claudeDesktopConfig -ServerPath (Join-Path $mcpDir 'src\server.js') `
+        -LegacyServerPath $legacyServerPath
     if (Test-Path -LiteralPath $mcpDir) {
         Remove-Item -LiteralPath $mcpDir -Recurse -Force
         Write-Host "    removed $mcpDir"
     }
+    if ($legacyMcpDir -and (Test-Path -LiteralPath $legacyMcpDir)) {
+        Remove-Item -LiteralPath $legacyMcpDir -Recurse -Force
+    }
+    Set-BridgeAdapterEnrollment -Context $installContext -Client mcp -Installed $false -KeepSelection:$KeepSelection
     Write-Step 'Done'
     return
 }
@@ -217,11 +233,13 @@ Write-Host '    credentials are read at runtime; environment-only tokens must be
 # ----------------------------------------------------------- Claude Desktop
 $claudeDone = $false
 if (Test-Path -LiteralPath (Split-Path -Parent $claudeDesktopConfig)) {
-    Set-BridgeMcpClientConfig -Path $claudeDesktopConfig -ServerBlock $serverBlock
+    Set-BridgeMcpClientConfig -Path $claudeDesktopConfig -ServerBlock $serverBlock `
+        -LegacyServerPath $legacyServerPath
     Write-Step 'Registered with Claude Desktop'
     Write-Host "    added '$serverName' to $claudeDesktopConfig"
     $claudeDone = $true
 }
+Set-BridgeAdapterEnrollment -Context $installContext -Client mcp -Installed $true -RepairOnly:$RepairOnly
 
 Write-Step 'Done'
 Write-Host ''

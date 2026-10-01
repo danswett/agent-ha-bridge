@@ -60,6 +60,13 @@ sources from that file together. Saved tokens take precedence over the named
 environment variables; environment-only values must be inherited by the MCP client.
 Restart the client after changing its environment or rotating credentials.
 
+The installer records which installation and Desktop path own the registration.
+`-TargetHome` uses an isolated Desktop path rather than the invoking account's
+APPDATA or macOS home. An inherited Desktop override cannot redirect later cleanup
+away from that recorded binding. Setup refuses to replace a same-name MCP server
+pointing at another installation. See [installation ownership](../docs/installation-isolation.md)
+for the shared path and safe-removal contract.
+
 ```bash
 cd mcp
 npm install

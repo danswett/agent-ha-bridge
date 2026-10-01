@@ -672,6 +672,673 @@ finally {
     Remove-Item -LiteralPath $script:InstrRoot -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+Write-Host '--- two installations keep their roots and enrollment separate ---'
+$isolationRoot = Join-Path $env:TEMP ('bridge-isolation-' + [guid]::NewGuid().ToString('N'))
+$savedIsolationConfig = $env:AGENT_HA_BRIDGE_CONFIG
+$savedIsolationCodex = $env:CODEX_HOME
+$homes = @((Join-Path $isolationRoot 'home A'), (Join-Path $isolationRoot 'home B'))
+$registrationFiles = @()
+try {
+    foreach ($homeRoot in $homes) {
+        $bridge = Join-Path $homeRoot '.agent-ha-bridge'
+        foreach ($relative in @('hooks', 'bin', 'installer', 'installer\hooks', 'installer\claude', 'installer\codex')) {
+            [void][IO.Directory]::CreateDirectory((Join-Path $bridge $relative))
+        }
+        @{ clients = @('claude'); homeAssistant = @{ baseUrl = 'http://127.0.0.1:1'; token = 'synthetic-isolation-token' } } |
+            ConvertTo-Json -Depth 5 | Set-Content -LiteralPath (Join-Path $bridge 'config.json') -Encoding utf8
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot '..\bin\agent-ha-bridge.ps1') -Destination (Join-Path $bridge 'bin\agent-ha-bridge.ps1')
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot '..\update.ps1') -Destination (Join-Path $bridge 'installer\update.ps1')
+        foreach ($relative in @('installer\install.ps1', 'uninstall.ps1', 'installer\claude\install-claude.ps1', 'installer\codex\install-codex.ps1')) {
+            Set-Content -LiteralPath (Join-Path $bridge $relative) -Encoding utf8 -Value @'
+[CmdletBinding()]
+param([string]$TargetHome, [string]$InstallRoot, [switch]$ClearEntities)
+@{ TargetHome = $TargetHome } | ConvertTo-Json -Compress
+'@
+        }
+        foreach ($relative in @('hooks', 'installer\hooks')) {
+            foreach ($helper in @('bridge-platform.ps1', 'bridge-install-context.ps1')) {
+                Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\hooks\$helper") -Destination (Join-Path $bridge "$relative\$helper")
+            }
+            Set-Content -LiteralPath (Join-Path $bridge "$relative\decision-bridge-common.ps1") -Value '# inert update dependency' -Encoding utf8
+            Set-Content -LiteralPath (Join-Path $bridge "$relative\bridge-update.ps1") -Encoding utf8 -Value @'
+function Get-BridgeUpdateRepository { 'selected-install' }
+function Get-BridgeUpdateStatus {
+    param([switch]$Force)
+    [pscustomobject]@{ Installed = '1'; Latest = '1'; Available = $false }
+}
+'@
+        }
+    }
+    $ambientHooks = Join-Path $HOME '.agent-ha-bridge\hooks'
+    [void][IO.Directory]::CreateDirectory($ambientHooks)
+    Set-Content -LiteralPath (Join-Path $ambientHooks 'decision-bridge-common.ps1') -Value '# inert ambient dependency' -Encoding utf8
+    Set-Content -LiteralPath (Join-Path $ambientHooks 'bridge-update.ps1') -Encoding utf8 -Value @'
+function Get-BridgeUpdateRepository { 'other-install' }
+function Get-BridgeUpdateStatus {
+    param([switch]$Force)
+    [pscustomobject]@{ Installed = '1'; Latest = '1'; Available = $false }
+}
+'@
+    $pwshFixture = Join-Path $PSHOME $(if ($IsWindows) { 'pwsh.exe' } else { 'pwsh' })
+    foreach ($homeRoot in $homes) {
+        $cli = Join-Path $homeRoot '.agent-ha-bridge\bin\agent-ha-bridge.ps1'
+        foreach ($operation in @('configure', 'uninstall')) {
+            $output = @(& $pwshFixture -NoProfile -File $cli $operation 2>&1)
+            $exit = $LASTEXITCODE
+            $record = $output | Where-Object { [string]$_ -like '{"TargetHome"*' } | Select-Object -Last 1 | ConvertFrom-Json
+            Test-That "$operation carries the owning home for $(Split-Path $homeRoot -Leaf)" {
+                $exit -eq 0 -and $record.TargetHome -eq $homeRoot
+            }
+        }
+        $output = & $pwshFixture -NoProfile -File $cli update -Check -Yes 2>&1 | Out-String
+        Test-That "the real update entry point uses $(Split-Path $homeRoot -Leaf), not ambient HOME" {
+            $LASTEXITCODE -eq 0 -and $output -match 'selected-install' -and $output -notmatch 'other-install'
+        }
+    }
+
+    $runtimePaths = @()
+    $attachmentPaths = @()
+    $codexPaths = @()
+    $sameSession = 'p2-' + [guid]::NewGuid().ToString('N')
+    foreach ($homeRoot in $homes) {
+        $env:AGENT_HA_BRIDGE_CONFIG = Join-Path $homeRoot '.agent-ha-bridge\config.json'
+        $env:CODEX_HOME = Join-Path $homeRoot '.codex'
+        . (Join-Path $PSScriptRoot '..\hooks\decision-bridge-common.ps1')
+        . (Join-Path $PSScriptRoot '..\hooks\daemon-hookspool.ps1')
+        . (Join-Path $PSScriptRoot '..\hooks\daemon-replies.ps1')
+        . (Join-Path $PSScriptRoot '..\codex\hooks\codex-session.ps1')
+        $runtimePaths += [pscustomobject]@{ Heartbeat = Get-BridgeDaemonHeartbeat; Spool = $script:DaemonHookSpoolDirectory }
+        $attachmentPaths += Get-BridgeAttachmentRoot
+        $path = Write-CodexSessionRegistration -SessionId $sameSession -ProcessId 424242 -WorkingDirectory $homeRoot -Status 'idle'
+        $codexPaths += $path
+        $registrationFiles += $path
+        if ($homeRoot -eq $homes[0]) { $firstRegistration = [IO.File]::ReadAllText($path) }
+    }
+    Test-That 'the two real heartbeat readers have different roots' { $runtimePaths[0].Heartbeat -ne $runtimePaths[1].Heartbeat }
+    Test-That 'the two real spool readers have different roots' { $runtimePaths[0].Spool -ne $runtimePaths[1].Spool }
+    Test-That 'new attachment storage is installation-specific' { $attachmentPaths[0] -ne $attachmentPaths[1] }
+    Test-That 'Codex writes the same session ID into different owned files' { $codexPaths[0] -ne $codexPaths[1] }
+    Test-That 'writing B leaves the actual A registration unchanged' { [IO.File]::ReadAllText($codexPaths[0]) -ceq $firstRegistration }
+    $env:AGENT_HA_BRIDGE_CONFIG = Join-Path $homes[1] '.agent-ha-bridge\missing.json'
+    Test-That 'a missing explicit config cannot fall through into ambient HOME' {
+        try { $null -eq (Get-BridgeUserConfig) } catch { $_.Exception.Message -like '*missing.json*' }
+    }
+    $env:AGENT_HA_BRIDGE_CONFIG = Join-Path $homes[1] '.agent-ha-bridge\config.json'
+    . (Join-Path $PSScriptRoot '..\hooks\decision-bridge-common.ps1')
+    . (Join-Path $PSScriptRoot '..\hooks\daemon-agents.ps1')
+    . (Join-Path $PSScriptRoot '..\hooks\daemon-maintenance.ps1')
+    $script:DaemonInstallerPayload = Join-Path $homes[1] '.agent-ha-bridge\installer'
+    $script:DaemonClientSetup = @{}
+    $script:SetupCalls = @()
+    function Get-BridgeLauncherPath { param($Launcher) "synthetic-$Launcher" }
+    function Get-BridgeLauncherLabel { param($Launcher) $Launcher }
+    function Write-DaemonLog { param($Message) }
+    function Start-Process {
+        param($FilePath, $ArgumentList, [switch]$PassThru, $RedirectStandardOutput, $RedirectStandardError, $ErrorAction, $WindowStyle)
+        $script:SetupCalls += [string]$ArgumentList
+        [pscustomobject]@{ Id = 424242; HasExited = $false }
+    }
+    try {
+        Sync-DaemonClients -Headers @{}
+        Test-That 'maintenance does not enroll unselected Copilot or Codex' {
+            @($script:SetupCalls | Where-Object { $_ -notmatch 'install-claude\.ps1' }).Count -eq 0
+        }
+    }
+    finally { Remove-Item Function:\Start-Process, Function:\Get-BridgeLauncherPath, Function:\Get-BridgeLauncherLabel, Function:\Write-DaemonLog }
+
+    Write-Host '--- persisted identities, owned runtime and actual uninstall orchestration ---'
+    $contextA = Initialize-BridgeInstallIdentity -Context (Resolve-BridgeInstallContext -TargetHome $homes[0])
+    $contextB = Initialize-BridgeInstallIdentity -Context (Resolve-BridgeInstallContext -TargetHome $homes[1])
+    Test-That 'installation identities persist and do not collide' {
+        $contextA.Id -ne $contextB.Id -and
+            (Resolve-BridgeInstallContext -BridgeHome $contextA.BridgeHome).Id -ceq $contextA.Id -and
+            $contextA.TaskName -ne $contextB.TaskName
+    }
+    Test-That 'isolated roots do not inherit ambient client or Desktop settings' {
+        $contextA.CopilotHome -eq (Join-Path $homes[0] '.copilot') -and
+            $contextA.ClaudeHome -eq (Join-Path $homes[0] '.claude') -and
+            $contextA.CodexHome -eq (Join-Path $homes[0] '.codex') -and
+            (Test-BridgeInstallDescendant $contextA.DesktopConfig $homes[0])
+    }
+    $savedAttachmentContext = $script:BridgeInstallContext
+    $savedAttachmentPlatform = $script:BridgeIsWindows
+    try {
+        $script:BridgeInstallContext = Resolve-BridgeInstallContext -TargetHome (Join-Path $isolationRoot 'home with spaces')
+        $script:BridgeIsWindows = $false
+        Test-That 'macOS attachment isolation preserves the existing space-free TEMP fallback' {
+            $expected = Join-Path (Join-Path $env:TEMP 'agent-ha-bridge-attachments') "install-$($script:BridgeInstallContext.Id)"
+            (Get-BridgeAttachmentRoot -NoCreate) -eq $expected
+        }
+    }
+    finally {
+        $script:BridgeInstallContext = $savedAttachmentContext
+        $script:BridgeIsWindows = $savedAttachmentPlatform
+    }
+    Test-That 'automatic repair reads the real selection and cannot opt an omitted adapter in' {
+        try { Assert-BridgeAdapterSelection -Context $contextA -Client codex; $false }
+        catch { $_.Exception.Message -like '*not selected*' }
+    }
+    Test-That 'automatic repair accepts a genuinely selected adapter through the actual reader' {
+        Assert-BridgeAdapterSelection -Context $contextA -Client claude
+        $true
+    }
+    Set-BridgeAdapterEnrollment -Context $contextA -Client codex -Installed $true
+    Test-That 'an explicitly invoked adapter installer records the deliberate selection' {
+        (Get-Content -LiteralPath $contextA.ConfigPath -Raw | ConvertFrom-Json).clients -contains 'codex'
+    }
+    Set-BridgeAdapterEnrollment -Context $contextA -Client codex -Installed $false -KeepSelection
+    Test-That 'whole-install removal can retain the selected clients for KeepConfig' {
+        (Get-Content -LiteralPath $contextA.ConfigPath -Raw | ConvertFrom-Json).clients -contains 'codex' -and
+            (Get-Content -LiteralPath $contextA.MetadataPath -Raw | ConvertFrom-Json).adapters -notcontains 'codex'
+    }
+    Set-BridgeAdapterEnrollment -Context $contextA -Client mcp -Installed $true
+    $savedSelectionContext = $script:BridgeInstallContext
+    $savedSelectionConfig = $script:BridgeUserConfig
+    $savedStopRuntime = (Get-Command Stop-BridgeOwnedRuntime).ScriptBlock
+    $savedInstallerContext = $installContext
+    try {
+        $script:BridgeInstallContext = $contextA
+        $script:BridgeUserConfig = [pscustomobject]@{ clients = @('claude', 'codex', 'mcp') }
+        Set-BridgeAdapterEnrollment -Context $contextA -Client codex -Installed $false
+        Test-That 'a running installation observes a saved adapter opt-out rather than its startup selection' {
+            (Get-BridgeSelectedClients) -notcontains 'codex' -and (Get-BridgeSelectedClients) -contains 'claude'
+        }
+        $installContext = $contextA
+        Set-Variable -Name KeepSelection -Value $false
+        function Stop-BridgeOwnedRuntime {
+            param($Context, [string[]]$Roles)
+            $script:AdapterStopRoles = $Roles -join ','
+            $script:AdapterSelectionAtStop = @((Read-BridgeInstallRecord -Path $Context.ConfigPath)['clients'])
+            $script:AdapterRecordsAtStop = @((Read-BridgeInstallRecord -Path $Context.MetadataPath)['adapters'])
+        }
+        foreach ($client in @('claude', 'codex', 'mcp')) {
+            Set-BridgeAdapterEnrollment -Context $contextA -Client $client -Installed $true
+            $ast = [Management.Automation.Language.Parser]::ParseFile(
+                (Join-Path $PSScriptRoot "..\$client\install-$client.ps1"), [ref]$null, [ref]$null)
+            $branch = $ast.EndBlock.Statements | Where-Object {
+                $_ -is [Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -eq '$Uninstall'
+            } | Select-Object -First 1
+            if (-not $branch) { throw "No actual $client uninstall branch was found." }
+            $prefix = @(foreach ($statement in $branch.Clauses[0].Item2.Statements) {
+                if ($statement.Extent.Text -match '^Remove-Bridge') { break }
+                $statement.Extent.Text
+            })
+            & ([scriptblock]::Create($prefix -join "`n"))
+            Test-That "standalone $client removal stops only that adapters setup worker" {
+                $script:AdapterStopRoles -eq "setup-$client"
+            }
+            Test-That "standalone $client opts out before stopping setup, retaining cleanup ownership until success" {
+                $script:AdapterSelectionAtStop -notcontains $client -and $script:AdapterRecordsAtStop -contains $client
+            }
+        }
+        Set-BridgeAdapterEnrollment -Context $contextA -Client claude -Installed $true
+        Set-BridgeAdapterEnrollment -Context $contextA -Client mcp -Installed $true
+    }
+    finally {
+        Set-Item Function:\Stop-BridgeOwnedRuntime -Value $savedStopRuntime
+        $installContext = $savedInstallerContext
+        $script:BridgeInstallContext = $savedSelectionContext
+        $script:BridgeUserConfig = $savedSelectionConfig
+    }
+    $customRoot = Join-Path $homes[0] 'custom-bridge'
+    $customContext = Initialize-BridgeInstallIdentity -Context (
+        Resolve-BridgeInstallContext -TargetHome $homes[0] -BridgeHome $customRoot)
+    [void][IO.Directory]::CreateDirectory((Join-Path $customRoot 'installer'))
+    [void][IO.Directory]::CreateDirectory($customContext.HooksDir)
+    [IO.File]::WriteAllText((Join-Path $customRoot 'installer\install.ps1'), '# synthetic installed payload')
+    [IO.File]::WriteAllText($customContext.ConfigPath, '{"clients":[]}')
+    Remove-Item -LiteralPath $customContext.MetadataPath -Force
+    Test-That 'a damaged custom core cannot fall through to another installation without its metadata' {
+        try { $null = Resolve-BridgeInstallContext -EntryDirectory $customContext.HooksDir; $false }
+        catch { $_.Exception.Message -match 'metadata.*missing|missing.*metadata' }
+    }
+    $taskA = [pscustomobject]@{ Actions = @([pscustomobject]@{
+        Execute = 'wscript.exe'; Arguments = '"' + (Join-Path $contextA.HooksDir 'agent-bridge-launch.vbs') + '"'
+    }) }
+    Test-That 'task ownership requires the exact installation launcher, not the task name' {
+        (Test-BridgeTaskOwnership -Task $taskA -Context $contextA) -and
+            -not (Test-BridgeTaskOwnership -Task $taskA -Context $contextB)
+    }
+    Test-That 'an owned launcher does not claim unrelated actions in the same task' {
+        $mixedTask = [pscustomobject]@{ Actions = @($taskA.Actions) + @([pscustomobject]@{
+            Execute = 'unrelated.exe'; Arguments = ''
+        }) }
+        -not (Test-BridgeTaskOwnership -Task $mixedTask -Context $contextA)
+    }
+    $savedInstallerContext = $installContext
+    $savedServicePlatform = $script:BridgeIsWindows
+    $script:RetiredLegacyTasks = @()
+    $installContext = $contextA | Select-Object *
+    $installContext.Recorded = $false
+    $installContext.Legacy = $true
+    $installContext.Isolated = $false
+    $installContext.TaskName = 'AgentBridgeDaemon'
+    $script:BridgeIsWindows = $true
+    function Get-ScheduledTask { param($TaskName, $ErrorAction) if ($TaskName -eq 'AgentBridgeDaemon') { $taskA } }
+    function Stop-ScheduledTask { param($TaskName, $ErrorAction) }
+    function Unregister-ScheduledTask {
+        [CmdletBinding(SupportsShouldProcess)]
+        param($TaskName)
+        if ($PSCmdlet.ShouldProcess($TaskName, 'Remove fixture task')) { $script:RetiredLegacyTasks += $TaskName }
+    }
+    try {
+        $installerAst = [Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PSScriptRoot '..\install.ps1'), [ref]$null, [ref]$null)
+        $stopService = $installerAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Stop-BridgeOwnedService'
+        }, $true)
+        if (-not $stopService) { throw 'The actual installer service shutdown was not found.' }
+        & ([scriptblock]::Create($stopService.Extent.Text))
+        Test-That 'the actual installer retires its verified legacy task before identity rollover' {
+            $script:RetiredLegacyTasks -join ',' -eq 'AgentBridgeDaemon'
+        }
+    }
+    finally {
+        $installContext = $savedInstallerContext
+        $script:BridgeIsWindows = $savedServicePlatform
+        Remove-Item Function:\Get-ScheduledTask, Function:\Stop-ScheduledTask, Function:\Unregister-ScheduledTask
+    }
+    $plistPath = Join-Path $contextA.Home "Library\LaunchAgents\$($contextA.LaunchAgentLabel).plist"
+    [void][IO.Directory]::CreateDirectory((Split-Path $plistPath -Parent))
+    $plistExecutable = [Security.SecurityElement]::Escape($pwshFixture)
+    $plistScript = [Security.SecurityElement]::Escape((Join-Path $contextA.HooksDir 'agent-bridge-daemon.ps1'))
+    $ownedPlist = "<plist><dict><key>ProgramArguments</key><array><string>$plistExecutable</string><string>-NoProfile</string><string>-File</string><string>$plistScript</string></array></dict></plist>"
+    [IO.File]::WriteAllText($plistPath, $ownedPlist)
+    Test-That 'a LaunchAgent claims only its actual installation script' {
+        (Test-BridgeLaunchAgentOwnership -Path $plistPath -Context $contextA) -and
+            -not (Test-BridgeLaunchAgentOwnership -Path $plistPath -Context $contextB)
+    }
+    [IO.File]::WriteAllText($plistPath, $ownedPlist.Replace('<string>-NoProfile</string>', '<string>-Command</string><string>Write-Output</string>'))
+    Test-That 'a LaunchAgent command mentioning File is not an owned script invocation' {
+        -not (Test-BridgeLaunchAgentOwnership -Path $plistPath -Context $contextA)
+    }
+    [IO.File]::WriteAllText($plistPath, $ownedPlist)
+    $savedWindows = $script:BridgeIsWindows
+    $contextA.Isolated = $false
+    $script:BridgeIsWindows = $false
+    $script:LaunchdFixtureMode = 'failed'
+    $script:LaunchdStopCalls = 0
+    function id { param($Option) $global:LASTEXITCODE = 0; '1000' }
+    function launchctl {
+        param($Action, $Service)
+        if ($Action -eq 'bootout') {
+            $script:LaunchdStopCalls++
+            $global:LASTEXITCODE = if ($script:LaunchdFixtureMode -eq 'failed') { 5 } else { 0 }
+            if ($global:LASTEXITCODE -eq 0) { $script:LaunchdFixtureMode = 'absent' }
+        }
+        else { $global:LASTEXITCODE = if ($script:LaunchdFixtureMode -eq 'absent') { 113 } else { 0 } }
+    }
+    try {
+        Test-That 'a failed service shutdown preserves its registration and blocks cleanup' {
+            $rejected = $false
+            try { Stop-BridgeOwnedService -Context $contextA -Remove }
+            catch { $rejected = $_.Exception.Message -match 'stop|shutdown|bootout' }
+            $rejected -and (Test-Path -LiteralPath $plistPath)
+        }
+        $script:LaunchdFixtureMode = 'running'
+        $script:LaunchdStopCalls = 0
+        Stop-BridgeOwnedService -Context $contextA -Remove
+        Test-That 'confirmed service shutdown removes only the owned LaunchAgent' {
+            $script:LaunchdStopCalls -eq 1 -and -not (Test-Path -LiteralPath $plistPath)
+        }
+        [IO.File]::WriteAllText($plistPath, $ownedPlist)
+        $script:LaunchdStopCalls = 0
+        Stop-BridgeOwnedService -Context $contextA -Remove
+        Test-That 'a positively absent service needs no stop before its owned registration is removed' {
+            $script:LaunchdStopCalls -eq 0 -and -not (Test-Path -LiteralPath $plistPath)
+        }
+    }
+    finally {
+        $contextA.Isolated = $true
+        $script:BridgeIsWindows = $savedWindows
+        Remove-Item Function:\id, Function:\launchctl
+    }
+    $started = [datetime]'2026-01-01T00:00:00Z'
+    $script:OwnedProcessFixture = @{}
+    foreach ($fixture in @(
+        @{ Id = 910001; Context = $contextA; Role = 'supervisor' },
+        @{ Id = 910002; Context = $contextA; Role = 'daemon' },
+        @{ Id = 910003; Context = $contextB; Role = 'daemon' },
+        @{ Id = 910005; Context = $contextA; Role = 'devbox-keepawake' },
+        @{ Id = 910006; Context = $contextB; Role = 'devbox-keepawake' }
+    )) {
+        $scriptPath = Join-Path $fixture.Context.HooksDir "agent-bridge-$($fixture.Role).ps1"
+        $script:OwnedProcessFixture[$fixture.Id] = [pscustomobject]@{
+            ProcessId = $fixture.Id; Path = $pwshFixture; CreationDate = $started
+            CommandLine = '"' + $pwshFixture + '" -NoProfile -File "' + $scriptPath + '"'
+        }
+        @{ pid = $fixture.Id; installationId = $fixture.Context.Id; executable = $pwshFixture; startedUtcTicks = $started.ToUniversalTime().Ticks } |
+            ConvertTo-Json | Set-Content -LiteralPath (Get-BridgeRuntimePath -Name "$($fixture.Role).process.json" -Context $fixture.Context) -Encoding utf8
+    }
+    $script:OwnedProcessFixture[910004] = [pscustomobject]@{
+        ProcessId = 910004; Path = $pwshFixture; CreationDate = $started
+        CommandLine = '"' + $pwshFixture + '" -NoProfile -Command Start-Sleep'
+    }
+    $env:BRIDGE_UNINSTALL_NORUN = '1'
+    . (Join-Path $PSScriptRoot '..\uninstall.ps1') -TargetHome $homes[0]
+    $savedProcessInfo = (Get-Command Get-BridgeProcessInfo).ScriptBlock
+    $savedProcessList = (Get-Command Get-BridgeProcessesNamed).ScriptBlock
+    $script:ShutdownOrder = @()
+    function Get-BridgeProcessInfo { param($ProcessId, [switch]$WithCommandLine) $script:OwnedProcessFixture[[int]$ProcessId] }
+    function Get-BridgeProcessesNamed { param($Name, [switch]$WithCommandLine) @($script:OwnedProcessFixture.Values) }
+    function Stop-Process {
+        param($Id, [switch]$Force, $ErrorAction)
+        $script:ShutdownOrder += [int]$Id
+        [void]$script:OwnedProcessFixture.Remove([int]$Id)
+    }
+    try {
+        Test-That 'a heartbeat PID alone cannot claim an unrelated PowerShell process' {
+            $null -eq (Get-BridgeRuntimeProcess -ProcessId 910004 -Context $contextA -Role daemon)
+        }
+        $script:OwnedProcessFixture[910004].CommandLine = '"' + $pwshFixture + '" -Command ''Write-Output -File "' +
+            (Join-Path $contextA.HooksDir 'agent-bridge-daemon.ps1') + '" ignored'''
+        Test-That 'a quoted command mentioning an owned script is not that runtime' {
+            $null -eq (Get-BridgeRuntimeProcess -ProcessId 910004 -Context $contextA -Role daemon)
+        }
+        $script:OwnedProcessFixture[910002].CreationDate = $started.AddSeconds(1)
+        Test-That 'a reused PID is rejected even when its script and executable match' {
+            $null -eq (Get-BridgeRuntimeProcess -ProcessId 910002 -Context $contextA -Role daemon)
+        }
+        $script:OwnedProcessFixture[910002].CreationDate = $started
+        $savedDaemonCommand = $script:OwnedProcessFixture[910002].CommandLine
+        $script:OwnedProcessFixture[910002].CommandLine = ''
+        try {
+            Test-That 'an unreadable recorded runtime is not assumed stopped during cleanup' {
+                try { Stop-BridgeOwnedRuntime -Context $contextA -Roles daemon; $false }
+                catch { $_.Exception.Message -match 'read|ownership' }
+            }
+        }
+        finally { $script:OwnedProcessFixture[910002].CommandLine = $savedDaemonCommand }
+        $cliAst = [Management.Automation.Language.Parser]::ParseFile(
+            (Join-Path $PSScriptRoot '..\bin\agent-ha-bridge.ps1'), [ref]$null, [ref]$null)
+        $restart = $cliAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-Restart'
+        }, $true)
+        . ([scriptblock]::Create($restart.Extent.Text))
+        $commandContext = $contextA
+        $taskName = $commandContext.TaskName
+        $savedWindows = $script:BridgeIsWindows
+        $script:BridgeIsWindows = $true
+        $script:TaskActions = @()
+        function Get-ScheduledTask { param($TaskName, $ErrorAction) $taskA }
+        function Stop-ScheduledTask { param($TaskName, $ErrorAction) $script:TaskActions += "stop:$TaskName" }
+        function Start-ScheduledTask { param($TaskName) $script:TaskActions += "start:$TaskName" }
+        $savedSupervisor = $script:OwnedProcessFixture[910001]
+        $savedDaemon = $script:OwnedProcessFixture[910002]
+        $savedKeepAwake = $script:OwnedProcessFixture[910005]
+        try {
+            Invoke-Restart
+            Test-That 'the actual CLI restart stops and starts only its owned task and runtime' {
+                $script:TaskActions -join ',' -eq "stop:$($contextA.TaskName),start:$($contextA.TaskName)" -and
+                    $script:ShutdownOrder -join ',' -eq '910001,910002,910005' -and
+                    $script:OwnedProcessFixture.ContainsKey(910003) -and $script:OwnedProcessFixture.ContainsKey(910004) -and
+                    $script:OwnedProcessFixture.ContainsKey(910006)
+            }
+        }
+        finally {
+            $script:BridgeIsWindows = $savedWindows
+            Remove-Item Function:\Get-ScheduledTask, Function:\Stop-ScheduledTask, Function:\Start-ScheduledTask
+            $script:OwnedProcessFixture[910001] = $savedSupervisor
+            $script:OwnedProcessFixture[910002] = $savedDaemon
+            $script:OwnedProcessFixture[910005] = $savedKeepAwake
+            $script:ShutdownOrder = @()
+        }
+        $script:BridgeInstallContext = $contextA
+        $ownedAttachments = Get-BridgeAttachmentRoot
+        [IO.File]::WriteAllText((Join-Path $ownedAttachments 'owned.txt'), 'synthetic-A')
+        $legacyAttachment = Join-Path (Split-Path $ownedAttachments -Parent) 'legacy-sentinel.txt'
+        [IO.File]::WriteAllText($legacyAttachment, 'unattributed legacy data')
+        $sentinelB = Join-Path $contextB.BridgeHome 'other-install.txt'
+        [IO.File]::WriteAllText($sentinelB, 'B must survive')
+        $unrelatedA = Join-Path $contextA.BridgeHome 'unrelated.txt'
+        [IO.File]::WriteAllText($unrelatedA, 'not an installer payload')
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot '..\hooks\daemon-replies.ps1') -Destination $contextA.HooksDir
+        $payload = Join-Path $contextA.BridgeHome 'installer'
+        foreach ($client in @('claude', 'codex', 'mcp')) {
+            $directory = if ($client -eq 'claude') { Join-Path $contextA.ClaudeHome 'ha-bridge' }
+                elseif ($client -eq 'codex') { Join-Path $contextA.BridgeHome 'codex-bridge' }
+                else { Join-Path $contextA.BridgeHome 'mcp' }
+            [void][IO.Directory]::CreateDirectory($directory)
+            $stub = @'
+param([string]$TargetHome, [string]$InstallRoot, [switch]$Uninstall, [switch]$KeepSelection)
+if (-not $Uninstall -or -not (Test-Path -LiteralPath (Join-Path $InstallRoot 'hooks\bridge-platform.ps1'))) { throw 'Adapter cleanup ran after its payload disappeared.' }
+if ($OwnedProcessFixture.ContainsKey(910001) -or $OwnedProcessFixture.ContainsKey(910002) -or $OwnedProcessFixture.ContainsKey(910005)) { throw 'Adapter cleanup ran before owned shutdown.' }
+Add-Content -LiteralPath (Join-Path $InstallRoot 'cleanup-order.txt') -Value '__CLIENT__'
+if (Test-Path -LiteralPath '__DIRECTORY__') { Remove-Item -LiteralPath '__DIRECTORY__' -Recurse -Force }
+'@
+            [void][IO.Directory]::CreateDirectory((Join-Path $payload $client))
+            $stub.Replace('__CLIENT__', $client).Replace('__DIRECTORY__', $directory.Replace("'", "''")) |
+                Set-Content -LiteralPath (Join-Path $payload "$client\install-$client.ps1") -Encoding utf8
+        }
+        Remove-Item -LiteralPath (Join-Path $contextA.BridgeHome 'mcp') -Recurse -Force
+        $hookFile = Join-Path $contextA.CopilotHome 'hooks\decision-notifier.json'
+        [void][IO.Directory]::CreateDirectory((Split-Path $hookFile -Parent))
+        @{ version = 1; hooks = @{ agentStop = @(
+            @{ powershell = "& '$(Join-Path $contextA.HooksDir 'notify-agent-response.ps1')'" },
+            @{ powershell = 'Write-Output unrelated-hook' }
+        ) } } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $hookFile -Encoding utf8
+        $unattributedLegacy = @(
+            (Join-Path $contextA.CopilotHome 'hooks\VERSION'),
+            (Join-Path $contextA.CopilotHome 'copilot-ha-bridge.config.json'),
+            (Join-Path $contextA.CopilotHome 'copilot-ha-bridge\unrelated.txt'),
+            (Join-Path $contextA.CopilotHome 'skills\decision-notifier\SKILL.md')
+        )
+        foreach ($path in $unattributedLegacy) {
+            [void][IO.Directory]::CreateDirectory((Split-Path $path -Parent))
+            [IO.File]::WriteAllText($path, '{"owner":"unattributed legacy installation"}')
+        }
+        Invoke-BridgeUninstall -AdapterPayloadRoot $payload
+        Test-That 'real uninstall stops A before every adapter, including an MCP payload already missing' {
+            $script:ShutdownOrder -join ',' -eq '910001,910002,910005' -and
+                ([IO.File]::ReadAllText((Join-Path $contextA.BridgeHome 'cleanup-order.txt')) -split '\s+' | Where-Object { $_ }) -join ',' -eq 'claude,codex,mcp'
+        }
+        Test-That 'uninstall preserves B and unrelated processes, hooks and files' {
+            $script:OwnedProcessFixture.ContainsKey(910003) -and $script:OwnedProcessFixture.ContainsKey(910004) -and
+                $script:OwnedProcessFixture.ContainsKey(910006) -and
+                [IO.File]::ReadAllText($sentinelB) -eq 'B must survive' -and
+                [IO.File]::ReadAllText($unrelatedA) -eq 'not an installer payload' -and
+                (Get-Content -LiteralPath $hookFile -Raw | ConvertFrom-Json).hooks.agentStop[0].powershell -eq 'Write-Output unrelated-hook'
+        }
+        Test-That 'uninstall removes A credentials and owned storage, preserving unknown legacy attachments' {
+            -not (Test-Path -LiteralPath $contextA.ConfigPath) -and
+                -not (Test-Path -LiteralPath $contextA.MetadataPath) -and
+                -not (Test-Path -LiteralPath $ownedAttachments) -and
+                [IO.File]::ReadAllText($legacyAttachment) -eq 'unattributed legacy data'
+        }
+        Test-That 'new-layout removal does not claim unknown legacy files or skills by their names' {
+            @($unattributedLegacy | Where-Object {
+                [IO.File]::Exists($_) -and [IO.File]::ReadAllText($_) -eq '{"owner":"unattributed legacy installation"}'
+            }).Count -eq $unattributedLegacy.Count
+        }
+    }
+    finally {
+        Set-Item Function:\Get-BridgeProcessInfo -Value $savedProcessInfo
+        Set-Item Function:\Get-BridgeProcessesNamed -Value $savedProcessList
+        Remove-Item Function:\Stop-Process
+        Remove-Item Env:\BRIDGE_UNINSTALL_NORUN -ErrorAction SilentlyContinue
+    }
+}
+finally {
+    $env:AGENT_HA_BRIDGE_CONFIG = $savedIsolationConfig
+    $env:CODEX_HOME = $savedIsolationCodex
+    foreach ($path in @($registrationFiles | Select-Object -Unique)) {
+        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+    }
+    if (Test-Path -LiteralPath $isolationRoot) { Remove-Item -LiteralPath $isolationRoot -Recurse -Force }
+}
+
+Write-Host '--- linked payloads are refused before foreign imports or mutation ---'
+function Invoke-LinkedPayloadRemovalFixture {
+    param([string]$Repository, $Owner, [string]$Mode)
+    if ($Mode -eq 'invoke') {
+        . (Join-Path $Repository 'uninstall.ps1') -TargetHome $Owner.Home
+        function Get-BridgeProcessesNamed { param($Name, [switch]$WithCommandLine) @() }
+        Invoke-BridgeUninstall -AdapterPayloadRoot (Join-Path $Owner.BridgeHome 'installer')
+    }
+    else {
+        $entry = if ($Mode -eq 'uninstaller-bootstrap') { 'uninstall.ps1' } else { 'install.ps1' }
+        & (Join-Path $Owner.BridgeHome $entry) -TargetHome $Owner.Home
+    }
+}
+$linkedRoot = Join-Path $env:TEMP ('linked-payload-' + [guid]::NewGuid().ToString('N'))
+$savedInstallNoRun = $env:BRIDGE_INSTALL_NORUN
+$savedUninstallNoRun = $env:BRIDGE_UNINSTALL_NORUN
+$env:BRIDGE_INSTALL_NORUN = '1'
+$env:BRIDGE_UNINSTALL_NORUN = '1'
+try {
+    foreach ($mode in @('invoke', 'uninstaller-bootstrap', 'installer-bootstrap')) {
+        $caseRoot = Join-Path $linkedRoot $mode
+        $owner = Initialize-BridgeInstallIdentity -Context (Resolve-BridgeInstallContext -TargetHome (Join-Path $caseRoot 'A'))
+        $foreign = Initialize-BridgeInstallIdentity -Context (Resolve-BridgeInstallContext -TargetHome (Join-Path $caseRoot 'B'))
+        Write-BridgeSecretFile -Path $owner.ConfigPath -Content '{"clients":[]}'
+        Write-BridgeSecretFile -Path $foreign.ConfigPath -Content '{"clients":[]}'
+        [void][IO.Directory]::CreateDirectory($foreign.HooksDir)
+        Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot '..\hooks') -File |
+            Copy-Item -Destination $foreign.HooksDir
+        $executed = Join-Path $foreign.BridgeHome 'foreign-helper-executed.txt'
+        $instrumented = Join-Path $foreign.HooksDir $(if ($mode -eq 'invoke') { 'daemon-replies.ps1' } else { 'bridge-platform.ps1' })
+        $prefix = "[IO.File]::WriteAllText('$($executed.Replace("'", "''"))', 'executed')`n"
+        [IO.File]::WriteAllText($instrumented, $prefix + [IO.File]::ReadAllText($instrumented))
+        $version = Join-Path $foreign.HooksDir 'VERSION'
+        $sentinel = Join-Path $foreign.HooksDir 'unrelated.txt'
+        [IO.File]::WriteAllText($version, 'foreign version')
+        [IO.File]::WriteAllText($sentinel, 'foreign sentinel')
+        $beforeHelper = [IO.File]::ReadAllText($instrumented)
+        foreach ($entry in @('install.ps1', 'uninstall.ps1')) {
+            Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\$entry") -Destination $owner.BridgeHome
+        }
+        $link = $owner.HooksDir
+        $linkType = if ($IsWindows) { 'Junction' } else { 'SymbolicLink' }
+        New-Item -ItemType $linkType -Path $link -Target $foreign.HooksDir | Out-Null
+        if (-not ((Get-Item -LiteralPath $link -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw 'The fixture did not create a real directory link.'
+        }
+        try {
+            $refusal = ''
+            try { Invoke-LinkedPayloadRemovalFixture -Repository (Split-Path $PSScriptRoot -Parent) -Owner $owner -Mode $mode }
+            catch { $refusal = $_.Exception.Message }
+            Test-That "$mode refuses the real linked payload" { $refusal -match 'link|reparse' } $refusal
+            Test-That "$mode refuses before executing a foreign helper" { -not [IO.File]::Exists($executed) }
+            Test-That "$mode preserves foreign helper and version bytes, not only unrelated files" {
+                [IO.File]::Exists($instrumented) -and [IO.File]::ReadAllText($instrumented) -ceq $beforeHelper -and
+                    [IO.File]::Exists($version) -and [IO.File]::ReadAllText($version) -ceq 'foreign version' -and
+                    [IO.File]::ReadAllText($sentinel) -ceq 'foreign sentinel'
+            }
+            Test-That "$mode preserves the rejected owners metadata and credentials" {
+                [IO.File]::Exists($owner.MetadataPath) -and [IO.File]::Exists($owner.ConfigPath)
+            }
+        }
+        finally {
+            if (-not ((Get-Item -LiteralPath $link -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                throw 'The fixture link changed unexpectedly; recursive cleanup was not authorized.'
+            }
+            [IO.Directory]::Delete($link)
+        }
+    }
+}
+finally {
+    $env:BRIDGE_INSTALL_NORUN = $savedInstallNoRun
+    $env:BRIDGE_UNINSTALL_NORUN = $savedUninstallNoRun
+    if (Test-Path -LiteralPath $linkedRoot) { Remove-Item -LiteralPath $linkedRoot -Recurse -Force }
+}
+
+Write-Host '--- adapter entity cleanup does not require Copilot storage ---'
+function Invoke-AdapterEntityCleanupFixture {
+    $repository = Split-Path $PSScriptRoot -Parent
+    . (Join-Path $repository 'uninstall.ps1')
+    $fixtureContext = Initialize-BridgeInstallIdentity -Context $installContext
+    if ($fixtureContext.Isolated -or -not (Test-BridgeInstallDescendant $fixtureContext.Home $env:AGENT_HA_BRIDGE_TEST_ROOT)) {
+        throw 'Entity cleanup requires the ordinary installation inside canonical synthetic HOME.'
+    }
+    $installContext = $fixtureContext
+    $script:BridgeInstallContext = $fixtureContext
+    $hooksDir = $fixtureContext.HooksDir
+    [void][IO.Directory]::CreateDirectory($hooksDir)
+    Get-ChildItem -LiteralPath (Join-Path $repository 'hooks') -File | Copy-Item -Destination $hooksDir -Force
+    $unusedState = Join-Path $fixtureContext.CopilotHome ('unused-' + [guid]::NewGuid().ToString('N'))
+    $script:CleanupPublications = [Collections.Generic.List[object]]::new()
+    function Invoke-RestMethod {
+        param($Method, $Uri, $Headers, $Body, $ContentType, $TimeoutSec, $MaximumRedirection)
+        if ($Uri -like '*/api/services/mqtt/publish') {
+            if ($Body -isnot [byte[]]) { throw 'The real service helper must send UTF-8 bytes.' }
+            $publication = [Text.Encoding]::UTF8.GetString($Body) | ConvertFrom-Json
+            if (-not $publication.PSObject.Properties['topic']) { throw 'The MQTT fixture did not decode a real publication.' }
+            $script:CleanupPublications.Add($publication)
+            return @()
+        }
+        if ($Uri -like '*/api/states') { return @() }
+        throw "Unexpected synthetic REST operation: $Method $Uri"
+    }
+    $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repository 'uninstall.ps1'), [ref]$null, [ref]$null)
+    $uninstall = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-BridgeUninstall'
+    }, $true)
+    $cleanup = $uninstall.Body.EndBlock.Statements | Where-Object {
+        $_ -is [Management.Automation.Language.IfStatementAst] -and
+            $_.Clauses[0].Item1.Extent.Text -eq '$ClearEntities -and $installContext.Isolated'
+    } | Select-Object -First 1
+    if (-not $cleanup) { throw 'The actual entity-cleanup branch was not found.' }
+    Set-Variable -Name ClearEntities -Value $true
+    Set-Variable -Name KeepShared -Value $true
+    Set-Variable -Name ClearShared -Value $false
+    foreach ($fixtureClient in @('claude', 'codex')) {
+        $config = @{
+            clients = @($fixtureClient)
+            homeAssistant = @{ baseUrl = 'http://127.0.0.1:1'; token = 'synthetic-cleanup-token' }
+            copilot = @{ sessionStateRoot = $unusedState }
+        }
+        Write-BridgeSecretFile -Path $fixtureContext.ConfigPath -Content ($config | ConvertTo-Json -Depth 6)
+        $session = [guid]::NewGuid().ToString()
+        $registry = Get-BridgeRuntimePath -Name "agent-bridge-$fixtureClient" -Context $fixtureContext
+        [void][IO.Directory]::CreateDirectory($registry)
+        $registration = Join-Path $registry "$session.json"
+        @{ SessionId = $session; TranscriptPath = (Join-Path $fixtureContext.Home 'synthetic.jsonl') } |
+            ConvertTo-Json | Set-Content -LiteralPath $registration -Encoding utf8
+        try {
+            if (Test-Path -LiteralPath $unusedState) { throw 'The missing-Copilot fixture was not empty.' }
+            $script:CleanupPublications.Clear()
+            . ([scriptblock]::Create($cleanup.Extent.Text))
+            $node = Get-CopilotMqttNodeId -SessionId $session
+            $without = @($script:CleanupPublications | Where-Object { $_.topic -like "*/$node/*" })
+            Test-That "$fixtureClient-only uninstall publishes the complete 21-message cleanup with no Copilot directory" {
+                $without.Count -eq 21 -and
+                    $without[0].topic -eq (Get-CopilotMqttTopics -SessionId $session).Availability -and
+                    $without[0].payload -ceq 'offline' -and
+                    @($without | Where-Object { -not $_.retain }).Count -eq 0 -and
+                    @($without | Select-Object -Skip 1 | Where-Object { $_.payload -cne '' }).Count -eq 0
+            }
+            Test-That "$fixtureClient-only machine cleanup remains a separate 22-topic control" {
+                $script:CleanupPublications.Count - $without.Count -eq 22
+            }
+            [void][IO.Directory]::CreateDirectory($unusedState)
+            $script:CleanupPublications.Clear()
+            . ([scriptblock]::Create($cleanup.Extent.Text))
+            $with = @($script:CleanupPublications | Where-Object { $_.topic -like "*/$node/*" }).Count
+            Test-That "adding an empty Copilot directory does not change $fixtureClient cleanup" {
+                $with -eq 21 -and $without.Count -eq $with -and $script:CleanupPublications.Count - $with -eq 22
+            }
+        }
+        finally {
+            Remove-Item -LiteralPath $registration -Force
+            if (Test-Path -LiteralPath $unusedState) { [IO.Directory]::Delete($unusedState) }
+        }
+    }
+}
+$savedEntityConfig = $env:AGENT_HA_BRIDGE_CONFIG
+$savedEntityNoRun = $env:BRIDGE_UNINSTALL_NORUN
+$savedEntityContext = $script:BridgeInstallContext
+$env:AGENT_HA_BRIDGE_CONFIG = Join-Path $HOME '.agent-ha-bridge\config.json'
+$env:BRIDGE_UNINSTALL_NORUN = '1'
+try { Invoke-AdapterEntityCleanupFixture }
+finally {
+    $env:AGENT_HA_BRIDGE_CONFIG = $savedEntityConfig
+    $env:BRIDGE_UNINSTALL_NORUN = $savedEntityNoRun
+    $script:BridgeInstallContext = $savedEntityContext
+}
+
 Write-Host ''
 if ($script:Failures) {
     Write-Host "$($script:Failures) check(s) failed" -ForegroundColor Red

@@ -24,7 +24,7 @@
 Set-StrictMode -Version Latest
 
 $script:BridgeUpdateConfig = @{
-    CacheFile     = Join-Path $env:TEMP 'agent-bridge-update.json'
+    CacheFile     = Get-BridgeRuntimePath 'agent-bridge-update.json'
     # How often to check GitHub for a new release. Four times a day catches a release
     # within a few hours and still barely touches the unauthenticated GitHub rate
     # limit (60/hour/IP). Tunable with updates.checkHours in the config.
@@ -201,6 +201,7 @@ function Invoke-BridgeSelfUpdate {
     param(
         [switch]$Detached,
         [string]$TargetHome,
+        [string]$InstallRoot,
         # Return the generated updater script instead of writing and launching it, so
         # its content can be verified in tests without downloading or installing.
         [switch]$ScriptOnly
@@ -214,24 +215,35 @@ function Invoke-BridgeSelfUpdate {
         return [pscustomobject]@{ Started = $false; Detail = 'the release has no downloadable archive' }
     }
 
-    $staging = Join-Path $env:TEMP "agent-ha-bridge-update-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+    $resolvedTarget = $TargetHome
+    if ($TargetHome) {
+        $resolvedTarget = try { (Resolve-Path -LiteralPath $TargetHome -ErrorAction Stop).Path } catch { $null }
+        if (-not $resolvedTarget -or -not (Test-Path -LiteralPath $resolvedTarget -PathType Container)) {
+            return [pscustomobject]@{ Started = $false; Detail = "TargetHome '$TargetHome' is not an existing directory" }
+        }
+    }
+    $updateContext = if ($TargetHome -or $InstallRoot) { Resolve-BridgeInstallContext -TargetHome $resolvedTarget -BridgeHome $InstallRoot }
+        else { Get-BridgeInstallContext }
+    $staging = Get-BridgeRuntimePath -Name "agent-ha-bridge-update-$([guid]::NewGuid().ToString('N').Substring(0,8))" -Context $updateContext
     $script = Join-Path $staging 'run-update.ps1'
 
     # Validate and single-quote-escape TargetHome before it is written into the
     # generated script, so a value containing a quote cannot alter the command line.
     $targetArgument = ''
     if ($TargetHome) {
-        $resolvedTarget = try { (Resolve-Path -LiteralPath $TargetHome -ErrorAction Stop).Path } catch { $null }
-        if (-not $resolvedTarget -or -not (Test-Path -LiteralPath $resolvedTarget -PathType Container)) {
-            return [pscustomobject]@{ Started = $false; Detail = "TargetHome '$TargetHome' is not an existing directory" }
-        }
         $targetArgument = " -TargetHome '$($resolvedTarget -replace "'", "''")'"
     }
+    elseif ($updateContext.Isolated) { $targetArgument = " -TargetHome '$($updateContext.Home.Replace("'", "''"))'" }
+    if ($updateContext.Isolated) { $targetArgument += ' -SkipTask -SkipPath -SkipDependencies' }
+    $rootArgument = " -InstallRoot '$($updateContext.BridgeHome.Replace("'", "''"))'"
+    $logPath = Get-BridgeRuntimePath -Name 'agent-bridge-update.log' -Context $updateContext
+    $outcomePath = Get-BridgeRuntimePath -Name 'agent-bridge-update-outcome.json' -Context $updateContext
     $scriptText = @"
 `$ErrorActionPreference = 'Stop'
-`$staging = '$staging'
-`$log = Join-Path `$env:TEMP 'agent-bridge-update.log'
-`$outcomeFile = Join-Path `$env:TEMP 'agent-bridge-update-outcome.json'
+`$staging = '$($staging.Replace("'", "''"))'
+`$log = '$($logPath.Replace("'", "''"))'
+`$outcomeFile = '$($outcomePath.Replace("'", "''"))'
+`$env:AGENT_HA_BRIDGE_CONFIG = '$($updateContext.ConfigPath.Replace("'", "''"))'
 function Write-UpdateLog { param([string]`$Message) Add-Content -LiteralPath `$log -Value ("{0} {1}" -f [DateTimeOffset]::Now.ToString('o'), `$Message) }
 
 try {
@@ -256,7 +268,11 @@ try {
     Write-UpdateLog "installing from `$(`$root.FullName)"
     # The existing config is preserved and backed up by the installer, so no
     # settings are passed here.
-    & (Join-Path `$root.FullName 'install.ps1') -NonInteractive -SkipVerify$targetArgument
+    `$installer = Join-Path `$root.FullName 'install.ps1'
+    if (-not (Get-Command `$installer).Parameters.ContainsKey('InstallRoot')) {
+        throw 'The release installer cannot preserve this installation root; it was not run.'
+    }
+    & (Join-Path `$root.FullName 'install.ps1') -NonInteractive -SkipVerify$targetArgument$rootArgument
     Write-UpdateLog 'update complete'
     @{ success = `$true; version = '$($status.Latest)'; releaseUrl = '$($status.Url)'; at = [DateTimeOffset]::Now.ToString('o') } |
         ConvertTo-Json -Compress | Set-Content -LiteralPath `$outcomeFile -Encoding UTF8
@@ -264,15 +280,9 @@ try {
     # the running daemon is detached and survives the scheduled-task restart. Killing it
     # makes the supervisor relaunch a fresh one, which reads the marker above and
     # announces the result.
-    if (`$IsWindows) {
-        Get-CimInstance Win32_Process -Filter "Name='pwsh.exe'" -ErrorAction SilentlyContinue |
-            Where-Object { `$_.CommandLine -match 'agent-bridge-daemon\.ps1' } |
-            ForEach-Object { Stop-Process -Id `$_.ProcessId -Force -ErrorAction SilentlyContinue }
-    }
-    else {
-        # launchd (KeepAlive) starts it again.
-        & pkill -f 'agent-bridge-daemon\.ps1' 2>`$null
-    }
+    . '$((Join-Path $updateContext.HooksDir 'bridge-platform.ps1').Replace("'", "''"))'
+    `$ownedContext = Resolve-BridgeInstallContext -BridgeHome '$($updateContext.BridgeHome.Replace("'", "''"))'
+    Stop-BridgeOwnedRuntime -Context `$ownedContext -Roles daemon
 }
 catch {
     Write-UpdateLog "update FAILED: `$(`$_.Exception.Message)"

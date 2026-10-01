@@ -50,7 +50,7 @@ $script:DaemonAgents = [ordered]@{
         Activity = { param($Lines, $VerboseMode) Get-ActivityFromEvents -Lines $Lines -VerboseMode $VerboseMode }
         IsWorking = { param($SessionId, $Transcript, $Status) Test-CopilotSessionWorking -SessionId $SessionId }
         AskUserState = { param($Session, $Marker) Get-CopilotAskUserState -TranscriptPath ([string]$Session.Transcript) }
-        AdapterInstalled = { Test-Path -LiteralPath (Join-Path $HOME '.copilot\hooks\decision-notifier.json') }
+        AdapterInstalled = { Test-Path -LiteralPath (Join-Path (Get-BridgeInstallContext).CopilotHome 'hooks\decision-notifier.json') }
         # Copilot's hooks are written by the main installer, which also removes them
         # whenever Copilot is not among the configured clients - so it is run with
         # Copilot added to the list, which makes the setup stick.
@@ -109,7 +109,7 @@ $script:DaemonAgents = [ordered]@{
             # The path never changes, and building it was most of a tick's cost.
             $registration = $script:ClaudeRegistrationPaths[$Id]
             if (-not $registration) {
-                $registration = Join-Path $env:TEMP "agent-bridge-claude\$(Get-ClaudeSafeSessionKey -SessionId $Id).json"
+                $registration = Get-BridgeRuntimePath "agent-bridge-claude\$(Get-ClaudeSafeSessionKey -SessionId $Id).json"
                 $script:ClaudeRegistrationPaths[$Id] = $registration
             }
             $stamp = [IO.File]::GetLastWriteTimeUtc($registration).Ticks
@@ -140,7 +140,7 @@ $script:DaemonAgents = [ordered]@{
             }
             Get-ClaudeAskUserState -TranscriptPath ([string]$Session.Transcript) -ToolCallId $toolCallId -Since $since
         }
-        AdapterInstalled = { Test-Path -LiteralPath (Join-Path $HOME '.claude\ha-bridge\claude-session.ps1') }
+        AdapterInstalled = { Test-Path -LiteralPath (Join-Path (Get-BridgeInstallContext).ClaudeHome 'ha-bridge\claude-session.ps1') }
         HookStatus = $true
         InlineReasoning = $true
         KnowsProcessId = $true
@@ -155,7 +155,7 @@ $script:DaemonAgents = [ordered]@{
             Get-CodexSessionDisplay -SessionId $SessionId -WorkingDirectory $WorkingDirectory
         }
         KnowsProcessId = $true
-        AdapterInstalled = { Test-Path -LiteralPath (Join-Path $HOME '.agent-ha-bridge\codex-bridge\plugins\agent-ha-bridge\hooks\codex-session.ps1') }
+        AdapterInstalled = { Test-Path -LiteralPath (Join-Path (Get-BridgeInstallContext).BridgeHome 'codex-bridge\plugins\agent-ha-bridge\hooks\codex-session.ps1') }
         # Codex asks, inside Codex, for its hooks to be trusted once; that is left to the user.
         SetupNote = { ' Open Codex once and approve the agent-ha-bridge hooks so its sessions show here.' }
         ApprovalMarker = {

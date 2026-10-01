@@ -143,6 +143,11 @@ try {
     Write-Host '--- running it again is a no-op ---'
     Test-That 'a second pass reports nothing to do' { -not (Invoke-Migration -Install $install 6>$null) }
     Test-That 'the config is still there afterwards' { Test-Path -LiteralPath $config }
+    $recorded = Initialize-BridgeInstallIdentity -Context (Resolve-BridgeInstallContext -TargetHome $install.Root) -LegacyLayout
+    Test-That 'the canonical migration can retain its exact legacy client-root ownership' {
+        $recorded.LegacyLayout -and
+            (Get-Content -LiteralPath $recorded.MetadataPath -Raw | ConvertFrom-Json).legacyCopilotHome -eq $install.CopilotHome
+    }
 }
 finally {
     Remove-Item -LiteralPath $install.Root -Recurse -Force -ErrorAction SilentlyContinue
@@ -202,6 +207,66 @@ try {
 }
 finally {
     Remove-Item -LiteralPath $bare.Root -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host '--- a second root cannot adopt the existing legacy installation ---'
+$separate = New-LegacyInstall
+try {
+    $separate.BridgeHome = Join-Path $separate.Root 'second-bridge'
+    $result = Invoke-Migration -Install $separate 6>$null
+    Test-That 'a noncanonical root leaves the legacy configuration and adapter payload untouched' {
+        -not $result -and
+            (Test-Path -LiteralPath (Join-Path $separate.CopilotHome 'copilot-ha-bridge.config.json')) -and
+            (Test-Path -LiteralPath (Join-Path $separate.CopilotHome 'mcp\mcp-client-config.json')) -and
+            -not (Test-Path -LiteralPath (Join-Path $separate.BridgeHome 'config.json'))
+    }
+}
+finally { Remove-Item -LiteralPath $separate.Root -Recurse -Force }
+
+Write-Host '--- a verified legacy writer hands off state without rewriting lifecycle fields ---'
+$previousContext = Resolve-BridgeInstallContext
+if (-not $previousContext.Legacy -or $previousContext.Recorded) { throw 'The migration fixture requires an unrecorded private default installation.' }
+$previousContext.TaskName = 'P2LegacyFixture_' + [guid]::NewGuid().ToString('N')
+$heartbeat = Get-BridgeRuntimePath -Name 'agent-bridge-daemon.heartbeat' -Context $previousContext
+$oldState = Get-BridgeRuntimePath -Name 'agent-bridge-daemon-state.json' -Context $previousContext
+$stateText = '{"legacy-session":{"Kind":"claude","Status":"stopped","LastResponse":"unchanged","StopAcceptedAt":"2026-01-01T00:00:00Z"}}'
+$savedProcessInfo = (Get-Command Get-BridgeProcessInfo).ScriptBlock
+$fixtureExecutable = (Get-Process -Id $PID).Path
+$fixtureStart = [datetime]::UtcNow.AddMinutes(-1)
+function Get-BridgeProcessInfo {
+    param($ProcessId, [switch]$WithCommandLine)
+    [pscustomobject]@{
+        ProcessId = $ProcessId; Path = $fixtureExecutable; CreationDate = $fixtureStart
+        CommandLine = '"' + $fixtureExecutable + '" -File "' + (Join-Path $previousContext.HooksDir 'agent-bridge-daemon.ps1') + '"'
+    }
+}
+try {
+    [IO.File]::WriteAllText($heartbeat, '910100')
+    [IO.File]::WriteAllText($oldState, $stateText)
+    [IO.File]::WriteAllText("$oldState.bak", $stateText)
+    $claim = Get-BridgeLegacyRuntimeClaim -Context $previousContext
+    $context = Initialize-BridgeInstallIdentity -Context $previousContext
+    Copy-BridgeLegacyRuntimeState -PreviousContext $previousContext -Context $context -Claim $claim
+    $newState = Get-BridgeRuntimePath -Name 'agent-bridge-daemon-state.json' -Context $context
+    Test-That 'verified state and backup retain their exact saved lifecycle bytes' {
+        $null -ne $claim -and [IO.File]::ReadAllText($newState) -ceq $stateText -and
+            [IO.File]::ReadAllText("$newState.bak") -ceq $stateText
+    }
+    Test-That 'legacy copies remain, but the stopped owners heartbeat cannot misroute old native hooks' {
+        [IO.File]::ReadAllText($oldState) -ceq $stateText -and -not (Test-Path -LiteralPath $heartbeat)
+    }
+    Remove-Item -LiteralPath $newState -Force
+    [IO.File]::WriteAllText($heartbeat, '910101')
+    Copy-BridgeLegacyRuntimeState -PreviousContext $previousContext -Context $context -Claim $claim -WarningAction SilentlyContinue
+    Test-That 'a changed legacy writer cannot hand its state to this installation' {
+        -not (Test-Path -LiteralPath $newState) -and [IO.File]::ReadAllText($heartbeat) -eq '910101'
+    }
+}
+finally {
+    Set-Item Function:\Get-BridgeProcessInfo -Value $savedProcessInfo
+    foreach ($path in @($heartbeat, $oldState, "$oldState.bak")) {
+        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+    }
 }
 
 Write-Host ''

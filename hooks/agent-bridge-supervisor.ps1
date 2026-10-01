@@ -12,8 +12,11 @@
 
 $ErrorActionPreference = 'Continue'
 
+. (Join-Path $PSScriptRoot 'bridge-platform.ps1')
+$supervisorContext = Resolve-BridgeInstallContext -EntryDirectory $PSScriptRoot
 $daemon = Join-Path $PSScriptRoot 'agent-bridge-daemon.ps1'
-$logFile = Join-Path $env:TEMP 'agent-bridge-supervisor.log'
+$logFile = Get-BridgeRuntimePath -Name 'agent-bridge-supervisor.log' -Context $supervisorContext
+[void][IO.Directory]::CreateDirectory((Split-Path $logFile -Parent))
 
 function Write-SupervisorLog {
     param([string]$Message)
@@ -27,7 +30,8 @@ function Write-SupervisorLog {
 # trigger, a manual start - the second instance must not spawn a competing daemon
 # that then loops against the first one's mutex. Hold a named mutex for the lifetime
 # of the supervisor; a second instance that cannot acquire it exits immediately.
-$supervisorMutex = [Threading.Mutex]::new($false, 'Local\CopilotBridgeSupervisor')
+$mutexName = 'Local\CopilotBridgeSupervisor' + $(if ($supervisorContext.Id) { "_$($supervisorContext.Id)" } else { '' })
+$supervisorMutex = [Threading.Mutex]::new($false, $mutexName)
 $ownsSupervisor = $false
 try {
     $ownsSupervisor = $supervisorMutex.WaitOne([TimeSpan]::FromSeconds(2))
@@ -41,6 +45,7 @@ if (-not $ownsSupervisor) {
 }
 
 Write-SupervisorLog -Message "supervisor starting (pid $PID)"
+Register-BridgeRuntimeProcess -Context $supervisorContext -Role supervisor
 
 $backoffSeconds = 5
 $maxBackoff = 120
@@ -56,10 +61,12 @@ try {
     while ($true) {
         $started = [DateTimeOffset]::Now
         try {
-            $process = Start-Process -FilePath 'pwsh' `
-                -ArgumentList '-NoProfile', '-WindowStyle', 'Hidden', '-ExecutionPolicy', 'Bypass', '-File', $daemon `
-                -WindowStyle Hidden -PassThru
-            $process.WaitForExit()
+            $start = [Diagnostics.ProcessStartInfo]::new((Get-BridgePwshPath))
+            $start.UseShellExecute = $false
+            foreach ($argument in @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $daemon)) { $start.ArgumentList.Add($argument) }
+            if ($script:BridgeIsWindows) { $start.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden }
+            $process = [Diagnostics.Process]::Start($start)
+            try { $process.WaitForExit() } finally { $process.Dispose() }
         }
         catch {
             Write-SupervisorLog -Message "daemon launch error: $($_.Exception.Message)"
@@ -85,4 +92,3 @@ finally {
     }
     $supervisorMutex.Dispose()
 }
-

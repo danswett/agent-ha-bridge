@@ -19,6 +19,13 @@ func setup(t *testing.T, heartbeatAge time.Duration) (temp string, fallbacks *[]
 	temp = t.TempDir()
 	t.Setenv("TEMP", temp)
 	t.Setenv("AGENT_BRIDGE_HOOKS_PUBLISH", "")
+	t.Setenv("AGENT_HA_BRIDGE_CONFIG", "")
+	t.Setenv("COPILOT_HA_BRIDGE_CONFIG", "")
+	previousExecutable, previousHome := nativeExecutable, nativeHome
+	home := t.TempDir()
+	nativeExecutable = func() (string, error) { return filepath.Join(home, "uninstalled-hook.exe"), nil }
+	nativeHome = func() (string, error) { return home, nil }
+	t.Cleanup(func() { nativeExecutable, nativeHome = previousExecutable, previousHome })
 	if heartbeatAge >= 0 {
 		beat := filepath.Join(temp, "agent-bridge-daemon.heartbeat")
 		os.WriteFile(beat, []byte("1"), 0o600)
@@ -95,6 +102,124 @@ func TestSpoolsWhenTheDaemonIsAlive(t *testing.T) {
 	}
 	if string(got.Event) != `{"session_id":"s1"}` {
 		t.Errorf("event %s, want it verbatim", got.Event)
+	}
+}
+
+func TestExplicitInstallationsOwnTheirSpoolAndLog(t *testing.T) {
+	ambient, fallbacks := setup(t, 0)
+	for _, owner := range []string{"A", "B"} {
+		bridge := filepath.Join(t.TempDir(), owner, ".agent-ha-bridge")
+		root := filepath.Join(bridge, "runtime")
+		if err := os.MkdirAll(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		config := filepath.Join(bridge, "config.json")
+		if err := os.WriteFile(config, []byte(`{}`), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(filepath.Join(root, "agent-bridge-daemon.heartbeat"), []byte("1"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("AGENT_HA_BRIDGE_CONFIG", config)
+		if got := invoke([]string{"claude", "register", "unused.ps1"}, `{"session_id":"same"}`); got != "" {
+			t.Fatalf("owner %s changed the hook reply: %q", owner, got)
+		}
+		if got := len(spoolFiles(t, root)); got != 1 {
+			t.Errorf("owner %s has %d events in its spool, want 1", owner, got)
+		}
+		if got := len(readLog(t, root)); got != 1 {
+			t.Errorf("owner %s has %d own log entries, want 1", owner, got)
+		}
+	}
+	if len(spoolFiles(t, ambient)) != 0 || len(readLog(t, ambient)) != 0 {
+		t.Error("explicit installations wrote into the ambient legacy runtime")
+	}
+	if len(*fallbacks) != 0 {
+		t.Error("root isolation must not add a PowerShell hop to the live fast path")
+	}
+}
+
+func TestMissingExplicitConfigCannotUseAnotherDaemon(t *testing.T) {
+	ambient, fallbacks := setup(t, 0)
+	t.Setenv("AGENT_HA_BRIDGE_CONFIG", filepath.Join(t.TempDir(), "missing.json"))
+	if got := invoke([]string{"claude", "stop", "fallback.ps1"}, `{}`); got != "FROM-POWERSHELL" {
+		t.Errorf("missing explicit config should keep the existing fallback contract, got %q", got)
+	}
+	if len(*fallbacks) != 1 || len(spoolFiles(t, ambient)) != 0 {
+		t.Error("a missing explicit installation used the ambient daemon")
+	}
+}
+
+func TestLegacyPayloadKeepsItsRuntimeWithoutAnExplicitInstallation(t *testing.T) {
+	ambient, fallbacks := setup(t, 0)
+	t.Setenv("AGENT_HA_BRIDGE_CONFIG", "")
+	t.Setenv("COPILOT_HA_BRIDGE_CONFIG", "")
+	invoke([]string{"codex", "hook", "legacy.ps1"}, `{}`)
+	if len(spoolFiles(t, ambient)) != 1 || len(*fallbacks) != 0 {
+		t.Error("an unbound legacy payload lost its existing runtime contract")
+	}
+}
+
+func TestInstalledExecutableKeepsItsRecordedRoot(t *testing.T) {
+	ambient, fallbacks := setup(t, 0)
+	bridge := filepath.Join(t.TempDir(), "custom-install")
+	root := filepath.Join(bridge, "runtime")
+	if err := os.MkdirAll(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config := filepath.Join(bridge, "settings.json")
+	if err := os.WriteFile(config, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	record, err := json.Marshal(map[string]any{
+		"schemaVersion": 1, "id": strings.Repeat("a", 32),
+		"bridgeHome": bridge, "configPath": config,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	metadata := filepath.Join(bridge, "installation.json")
+	if err := os.WriteFile(metadata, record, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "agent-bridge-daemon.heartbeat"), []byte("1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	nativeExecutable = func() (string, error) { return filepath.Join(bridge, "bin", "agent-bridge-hook.exe"), nil }
+	t.Setenv("AGENT_HA_BRIDGE_CONFIG", filepath.Join(t.TempDir(), "other-install.json"))
+	invoke([]string{"claude", "stop", "fallback.ps1"}, `{}`)
+	if len(spoolFiles(t, root)) != 1 || len(spoolFiles(t, ambient)) != 0 || len(*fallbacks) != 0 {
+		t.Error("the installed executable lost its binding to ambient configuration")
+	}
+	if err := os.WriteFile(metadata, []byte(`{"schemaVersion":1,"id":"invalid"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	invoke([]string{"claude", "stop", "fallback.ps1"}, `{}`)
+	if len(spoolFiles(t, root)) != 1 || len(spoolFiles(t, ambient)) != 0 || len(*fallbacks) != 1 {
+		t.Error("invalid installation metadata routed an event instead of retaining fallback behavior")
+	}
+}
+
+func TestCustomExecutableWithoutMetadataCannotUseAnotherInstallation(t *testing.T) {
+	ambient, fallbacks := setup(t, 0)
+	custom := filepath.Join(t.TempDir(), "custom-bridge")
+	nativeExecutable = func() (string, error) { return filepath.Join(custom, "bin", "agent-bridge-hook.exe"), nil }
+	foreign := t.TempDir()
+	foreignRuntime := filepath.Join(foreign, "runtime")
+	if err := os.MkdirAll(foreignRuntime, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config := filepath.Join(foreign, "config.json")
+	if err := os.WriteFile(config, []byte(`{}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(foreignRuntime, "agent-bridge-daemon.heartbeat"), []byte("1"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AGENT_HA_BRIDGE_CONFIG", config)
+	invoke([]string{"claude", "stop", "fallback.ps1"}, `{}`)
+	if len(*fallbacks) != 1 || len(spoolFiles(t, foreignRuntime)) != 0 || len(spoolFiles(t, ambient)) != 0 {
+		t.Error("a damaged custom installation used an unrelated daemon instead of its fallback")
 	}
 }
 

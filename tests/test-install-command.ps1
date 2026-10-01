@@ -157,19 +157,25 @@ try {
     $fakeInstaller = Join-Path $fakeHome 'installer'
     New-Item -ItemType Directory -Path $fakeInstaller -Force | Out-Null
     [void](Install-BridgeCommand -RepoRoot $repoRoot -BinDir $fakeBin)
+    $fakeHooks = Join-Path $fakeHome 'hooks'
+    [void][IO.Directory]::CreateDirectory($fakeHooks)
+    foreach ($helper in @('bridge-platform.ps1', 'bridge-install-context.ps1')) {
+        Copy-Item -LiteralPath (Join-Path $repoRoot "hooks\$helper") -Destination $fakeHooks
+    }
+    $fakeTargetHome = Split-Path $fakeHome -Parent
     $record = Join-Path $fakeHome 'invoked.txt'
 
     Set-Content -LiteralPath (Join-Path $fakeInstaller 'install.ps1') -Encoding UTF8 -Value @"
-param([string]`$HomeAssistantUrl, [string[]]`$Clients, [switch]`$NonInteractive)
+param([string]`$HomeAssistantUrl, [string[]]`$Clients, [switch]`$NonInteractive, [string]`$TargetHome, [string]`$InstallRoot)
 Add-Content -LiteralPath '$record' -Value ("install url=[`$HomeAssistantUrl] clients=[" +
     (@(`$Clients) -join ',') + "] nonInteractive=[`$NonInteractive]")
 "@
     Set-Content -LiteralPath (Join-Path $fakeInstaller 'update.ps1') -Encoding UTF8 -Value @"
-param([switch]`$Check, [switch]`$Force, [switch]`$Yes)
+param([switch]`$Check, [switch]`$Force, [switch]`$Yes, [string]`$TargetHome, [string]`$InstallRoot)
 Add-Content -LiteralPath '$record' -Value "update check=[`$Check] force=[`$Force]"
 "@
     Set-Content -LiteralPath (Join-Path $fakeInstaller 'uninstall.ps1') -Encoding UTF8 -Value @"
-param([switch]`$KeepConfig, [switch]`$ClearEntities, [string]`$TargetHome)
+param([switch]`$KeepConfig, [switch]`$ClearEntities, [string]`$TargetHome, [string]`$InstallRoot)
 Add-Content -LiteralPath '$record' -Value ("uninstall keepConfig=[`$KeepConfig] " +
     "clearEntities=[`$ClearEntities] targetHome=[`$TargetHome]")
 "@
@@ -209,7 +215,7 @@ Add-Content -LiteralPath '$record' -Value ("uninstall keepConfig=[`$KeepConfig] 
         (Invoke-Cli @('update', '-Check')) -eq 'update check=[True] force=[False]'
     }
     Test-That 'uninstall passes -KeepConfig as a switch, not as a target directory' {
-        (Invoke-Cli @('uninstall', '-KeepConfig')) -eq 'uninstall keepConfig=[True] clearEntities=[False] targetHome=[]'
+        (Invoke-Cli @('uninstall', '-KeepConfig')) -eq "uninstall keepConfig=[True] clearEntities=[False] targetHome=[$fakeTargetHome]"
     }
     Test-That 'a bare uninstall clears the Home Assistant entities by default' {
         (Invoke-Cli @('uninstall')) -match 'clearEntities=\[True\]'
@@ -279,6 +285,11 @@ try {
     $statusInstaller = Join-Path $statusHome 'installer'
     New-Item -ItemType Directory -Path $statusInstaller -Force | Out-Null
     [void](Install-BridgeCommand -RepoRoot $repoRoot -BinDir $statusBin)
+    $statusHooks = Join-Path $statusHome 'hooks'
+    [void][IO.Directory]::CreateDirectory($statusHooks)
+    foreach ($helper in @('bridge-platform.ps1', 'bridge-install-context.ps1')) {
+        Copy-Item -LiteralPath (Join-Path $repoRoot "hooks\$helper") -Destination $statusHooks
+    }
 
     # A stand-in installer that declares the same parameters as the real one - that is
     # the whole point - and reports what the check was actually handed.
@@ -286,7 +297,7 @@ try {
 [CmdletBinding()]
 param(
     [string]$HomeAssistantUrl, [string]$Token, [string]$NotifyService, [string]$TickerCategory,
-    [string]$TargetHome, [string[]]$Clients, [switch]$SkipVerify, [switch]$SkipDependencies,
+    [string]$TargetHome, [string]$InstallRoot, [string[]]$Clients, [switch]$SkipVerify, [switch]$SkipDependencies,
     [switch]$SkipPath, [switch]$NonInteractive, [switch]$SkipTask
 )
 function Test-BridgeHomeAssistantConnection {
@@ -363,17 +374,12 @@ try {
         Test-Path -LiteralPath (Join-Path $sandbox '.copilot\hooks\decision-notifier.json')
     }
     Test-That 'it explains that PATH was left alone' { $logText -match 'Leaving PATH alone' }
-    Test-That 'a -SkipVerify install still delivers the dashboard card' {
-        # The reply card is only ever delivered from here, and this step used to be
-        # gated on a *verified* connection. A self-update runs the installer with
-        # -SkipVerify, so no update ever refreshed the card: dashboards sat on a card
-        # several releases old while the machine reported itself fully up to date, and
-        # a card feature could ship and never appear. Reaching a bogus host fails, and
-        # must fail gracefully - what matters is that it was attempted.
-        $logText -match 'Checking the dashboard frontend cards'
+    Test-That 'an isolated install does not modify the shared Home Assistant dashboard' {
+        $logText -notmatch 'Checking the dashboard frontend cards' -and
+            $logText -match 'Leaving shared Home Assistant resources alone'
     }
-    Test-That 'and a card that cannot be delivered does not fail the install' {
-        $LASTEXITCODE -eq 0 -and $logText -match 'reply card'
+    Test-That 'isolated local setup remains available while shared provisioning is skipped' {
+        $LASTEXITCODE -eq 0 -and (Test-Path -LiteralPath (Join-Path $sandboxHome 'frontend'))
     }
     Test-That 'it points at the agent-ha-bridge command at the end' {
         $logText -match 'agent-ha-bridge configure'
@@ -416,8 +422,8 @@ try {
     Test-That 'version matches the VERSION file' { ($status -join '') -match [regex]::Escape($expected) }
 
     Write-Host '--- uninstalling the sandbox ---'
-    $desktopFixture = Join-Path $sandbox 'desktop-fixture.json'
-    $env:BRIDGE_CLAUDE_DESKTOP_CONFIG = $desktopFixture
+    $desktopFixture = [string](Get-Content -LiteralPath (Join-Path $sandboxHome 'installation.json') -Raw | ConvertFrom-Json).desktopConfig
+    [void][IO.Directory]::CreateDirectory((Split-Path $desktopFixture -Parent))
     $ownedMcpDir = Join-Path $sandboxHome 'mcp'
     [void][IO.Directory]::CreateDirectory($ownedMcpDir)
     Set-Content -LiteralPath (Join-Path $ownedMcpDir 'mcp-client-config.json') -Value '{"token":"synthetic-owned-secret"}'

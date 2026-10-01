@@ -63,12 +63,16 @@ $bridgeHome = if ($isInstalled) { $root } else { Join-Path $HOME '.agent-ha-brid
 $platform = Join-Path (Join-Path $root 'hooks') 'bridge-platform.ps1'
 if (Test-Path -LiteralPath $platform) { . $platform }
 else { $script:BridgeIsWindows = [bool]$IsWindows }
-$configPath = Join-Path $bridgeHome 'config.json'
-$taskName = 'AgentBridgeDaemon'
-$launchAgentLabel = 'com.agent-ha-bridge.daemon'
+$commandContext = if (Get-Command Resolve-BridgeInstallContext -ErrorAction SilentlyContinue) {
+    if ($isInstalled) { Resolve-BridgeInstallContext -BridgeHome $bridgeHome }
+    else { Resolve-BridgeInstallContext }
+} else { $null }
+$configPath = if ($commandContext) { $commandContext.ConfigPath } else { Join-Path $bridgeHome 'config.json' }
+$taskName = if ($commandContext) { $commandContext.TaskName } else { '' }
+$launchAgentLabel = if ($commandContext) { $commandContext.LaunchAgentLabel } else { '' }
 # pwsh beside this one: pwsh.exe on Windows, pwsh elsewhere.
 $pwshHere = Join-Path $PSHOME $(if ($script:BridgeIsWindows) { 'pwsh.exe' } else { 'pwsh' })
-$daemonLog = Join-Path $env:TEMP 'agent-bridge-daemon.log'
+$daemonLog = if ($commandContext) { Get-BridgeRuntimePath -Name 'agent-bridge-daemon.log' -Context $commandContext } else { '' }
 
 function Write-Step { param([string]$Message) Write-Host "==> $Message" -ForegroundColor Cyan }
 
@@ -89,8 +93,23 @@ function Invoke-BridgeScript {
     )
     $pwsh = $pwshHere
     if (-not (Test-Path -LiteralPath $pwsh)) { $pwsh = 'pwsh' }
-    & $pwsh -NoProfile -ExecutionPolicy Bypass -File $Path @Passthrough
-    exit $LASTEXITCODE
+    if (-not $commandContext) { throw 'The installation root helper is missing. Restore the installer payload before changing this installation.' }
+    $targetArguments = @()
+    if ($isInstalled) {
+        if (@($Passthrough | Where-Object { $_ -match '^-(TargetHome|InstallRoot)(:|$)' }).Count) {
+            throw 'An installed command cannot be retargeted to another installation.'
+        }
+        $targetArguments = @('-InstallRoot', $commandContext.BridgeHome)
+        if ($commandContext.Isolated) { $targetArguments += @('-TargetHome', $commandContext.Home) }
+    }
+    $savedConfig = $env:AGENT_HA_BRIDGE_CONFIG
+    try {
+        $env:AGENT_HA_BRIDGE_CONFIG = $commandContext.ConfigPath
+        & $pwsh -NoProfile -ExecutionPolicy Bypass -File $Path @Passthrough @targetArguments
+        $exitCode = $LASTEXITCODE
+    }
+    finally { $env:AGENT_HA_BRIDGE_CONFIG = $savedConfig }
+    exit $exitCode
 }
 
 function Get-InstalledVersion {
@@ -167,6 +186,7 @@ function Show-HomeAssistantStatus {
 }
 
 function Show-Status {
+    if (-not $commandContext) { throw 'Installation helpers are missing; restore the installer payload to read its status safely.' }
     Write-Host 'agent-ha-bridge' -ForegroundColor Cyan
     Write-Host "    version    : $(Get-InstalledVersion)"
     Write-Host "    install    : $bridgeHome"
@@ -195,7 +215,7 @@ function Show-Status {
     elseif (-not $script:BridgeIsWindows) {
         $loaded = [bool](& launchctl print "gui/$(& id -u)/$launchAgentLabel" 2>$null)
         if ($daemonPid -le 0) {
-            $daemon = @(Get-BridgeProcessesNamed -Name 'pwsh' -WithCommandLine | Where-Object { $_.CommandLine -match 'agent-bridge-daemon\.ps1' })
+            $daemon = @(Get-BridgeOwnedRuntimeProcesses -Context $commandContext -Roles daemon)
             if ($daemon) { $daemonPid = [int]$daemon[0].ProcessId }
         }
         if ($daemonPid -gt 0) { Write-Host "    daemon     : running (pid $daemonPid)" -ForegroundColor Green }
@@ -205,8 +225,7 @@ function Show-Status {
     }
     elseif ($task) {
         if ($daemonPid -le 0) {
-            $daemon = @(Get-CimInstance Win32_Process -Filter "Name='pwsh.exe'" -ErrorAction SilentlyContinue |
-                Where-Object { $_.CommandLine -match 'agent-bridge-daemon\.ps1' })
+            $daemon = @(Get-BridgeOwnedRuntimeProcesses -Context $commandContext -Roles daemon)
             if ($daemon) { $daemonPid = [int]$daemon[0].ProcessId }
         }
         if ($daemonPid -gt 0) {
@@ -227,7 +246,7 @@ function Show-Status {
         $nativePath = Get-BridgeNativeHookPath -BridgeHome $bridgeHome
         if ($nativePath) {
             $nativeVersion = (& $nativePath --version 2>$null | Out-String).Trim()
-            Write-Host "    hooks      : native ($nativeVersion) - $(Format-BridgeHookStats -Stats (Get-BridgeHookStats -Hours 24) -Hours 24)"
+            Write-Host "    hooks      : native ($nativeVersion) - $(Format-BridgeHookStats -Stats (Get-BridgeHookStats -Hours 24 -LogPath (Get-BridgeRuntimePath -Name 'agent-bridge-hook.log' -Context $commandContext)) -Hours 24)"
             # Installed is not the same as used. Copilot only runs the native hook from
             # a version that can launch one directly, and below it the installer writes
             # PowerShell hooks instead - which cost 587 ms a hook against 21 ms, on the
@@ -398,26 +417,31 @@ if ($stale.Count) {
 }
 
 function Invoke-Restart {
+    if (-not $commandContext) { throw 'The installation root helper is missing; no runtime was stopped.' }
     Write-Step 'Restarting the bridge daemon'
     if (-not $script:BridgeIsWindows) {
+        $plist = Join-Path $commandContext.Home "Library\LaunchAgents\$launchAgentLabel.plist"
+        if (-not (Test-Path -LiteralPath $plist) -or
+            -not (Test-BridgeLaunchAgentOwnership -Path $plist -Context $commandContext)) {
+            throw 'No owned LaunchAgent is registered; no other installation was restarted.'
+        }
         $target = "gui/$(& id -u)/$launchAgentLabel"
         & launchctl kickstart -k $target 2>&1 | Out-Null
         if ($LASTEXITCODE -ne 0) { throw "The '$launchAgentLabel' LaunchAgent is not loaded. Run: agent-ha-bridge configure" }
         Write-Host '    restarted' -ForegroundColor Green
         return
     }
-    if (-not (Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue)) {
+    $task = Get-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    if (-not $task) {
         throw "The '$taskName' scheduled task is not registered. Run: agent-ha-bridge configure"
+    }
+    if (-not (Test-BridgeTaskOwnership -Task $task -Context $commandContext)) {
+        throw 'The scheduled task points at another installation; it was not changed.'
     }
     # The daemon is detached from the task, so stopping the task alone leaves it
     # running; kill it and let the supervisor bring up a fresh one.
-    Get-CimInstance Win32_Process -Filter "Name='pwsh.exe'" -ErrorAction SilentlyContinue |
-        Where-Object { $_.CommandLine -match 'agent-bridge-(daemon|supervisor)\.ps1' } |
-        ForEach-Object {
-            Stop-Process -Id $_.ProcessId -Force -ErrorAction SilentlyContinue
-            Write-Host "    stopped pid $($_.ProcessId)"
-        }
-    Stop-ScheduledTask -TaskName $taskName -ErrorAction SilentlyContinue
+    Stop-ScheduledTask -TaskName $taskName -ErrorAction Stop
+    Stop-BridgeOwnedRuntime -Context $commandContext
     Start-ScheduledTask -TaskName $taskName
     Write-Host '    started' -ForegroundColor Green
 }

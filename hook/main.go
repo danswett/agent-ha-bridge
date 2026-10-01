@@ -61,6 +61,9 @@ var runFallback = runPowerShell
 // tests can replace it.
 var ancestry = parentChain
 
+var nativeExecutable = os.Executable
+var nativeHome = os.UserHomeDir
+
 func main() {
 	os.Exit(run(os.Args[1:], os.Stdin, os.Stdout, time.Now()))
 }
@@ -93,12 +96,16 @@ func run(args []string, stdin io.Reader, stdout io.Writer, now time.Time) (code 
 	}
 
 	event, _ := io.ReadAll(io.LimitReader(stdin, maxEventBytes))
-	temp := tempDir()
+	temp, rootErr := installationRuntimeRoot(fallback)
 
 	// Every run from here is recorded (record), so how often the PowerShell path is
 	// taken, and why, can be measured (Get-BridgeHookStats).
 	outcome := outcomeLine{Agent: args[0], Hook: args[1]}
-	defer func() { record(temp, outcome, now) }()
+	defer func() {
+		if temp != "" {
+			record(temp, outcome, now)
+		}
+	}()
 
 	// fallBack runs the PowerShell hook, or - when there is none, or it fails - prints
 	// the fixed reply, and notes which.
@@ -118,6 +125,10 @@ func run(args []string, stdin io.Reader, stdout io.Writer, now time.Time) (code 
 		outcome.Path = "fallback"
 	}
 
+	if rootErr != nil {
+		fallBack("installation root unavailable: " + rootErr.Error())
+		return 0
+	}
 	if alive, why := daemonState(temp, now); !alive {
 		fallBack(why)
 		return 0
@@ -139,6 +150,108 @@ func run(args []string, stdin io.Reader, stdout io.Writer, now time.Time) (code 
 	outcome.Path = "spool"
 	io.WriteString(stdout, reply)
 	return 0
+}
+
+func sameInstallPath(left, right string) bool {
+	left, right = filepath.Clean(left), filepath.Clean(right)
+	if runtime.GOOS == "windows" {
+		return strings.EqualFold(left, right)
+	}
+	return left == right
+}
+
+func installationRuntimeRoot(fallback string) (string, error) {
+	home, err := nativeHome()
+	if err != nil {
+		return "", err
+	}
+	defaultBridge := filepath.Join(home, ".agent-ha-bridge")
+	bridge := ""
+	config := ""
+	explicit := false
+	if executable, exeErr := nativeExecutable(); exeErr == nil && filepath.Base(filepath.Dir(executable)) == "bin" {
+		candidate := filepath.Dir(filepath.Dir(executable))
+		if filepath.Base(candidate) == ".agent-ha-bridge" {
+			bridge = candidate
+		} else if _, statErr := os.Stat(filepath.Join(candidate, "installation.json")); statErr == nil {
+			bridge = candidate
+		} else if !os.IsNotExist(statErr) {
+			return "", fmt.Errorf("cannot read installation metadata")
+		} else {
+			return filepath.Join(candidate, "runtime"), fmt.Errorf("installation metadata is missing")
+		}
+	}
+	if bridge == "" && filepath.IsAbs(fallback) {
+		data, readErr := os.ReadFile(filepath.Join(filepath.Dir(fallback), "bridge-root.json"))
+		if readErr == nil {
+			var pointer struct {
+				BridgeHome string `json:"bridgeHome"`
+			}
+			if json.Unmarshal(data, &pointer) != nil || !filepath.IsAbs(pointer.BridgeHome) {
+				return "", fmt.Errorf("invalid adapter installation pointer")
+			}
+			bridge = pointer.BridgeHome
+		} else if !os.IsNotExist(readErr) {
+			return "", fmt.Errorf("cannot read adapter installation pointer")
+		}
+	}
+	if bridge == "" {
+		config = os.Getenv("AGENT_HA_BRIDGE_CONFIG")
+		if config == "" {
+			if _, statErr := os.Stat(filepath.Join(defaultBridge, "config.json")); os.IsNotExist(statErr) {
+				config = os.Getenv("COPILOT_HA_BRIDGE_CONFIG")
+			}
+		}
+		if config != "" {
+			if !filepath.IsAbs(config) {
+				return "", fmt.Errorf("explicit configuration path is not absolute")
+			}
+			explicit = true
+			bridge = filepath.Dir(config)
+			if sameInstallPath(config, filepath.Join(home, ".copilot", "copilot-ha-bridge.config.json")) {
+				bridge = defaultBridge
+			}
+		} else {
+			bridge = defaultBridge
+		}
+	}
+	bridge = filepath.Clean(bridge)
+	root := filepath.Join(bridge, "runtime")
+	recorded := false
+	data, readErr := os.ReadFile(filepath.Join(bridge, "installation.json"))
+	if readErr == nil {
+		var record struct {
+			SchemaVersion int    `json:"schemaVersion"`
+			ID            string `json:"id"`
+			BridgeHome    string `json:"bridgeHome"`
+			ConfigPath    string `json:"configPath"`
+		}
+		if json.Unmarshal(data, &record) != nil || record.SchemaVersion != 1 ||
+			len(record.ID) != 32 || !filepath.IsAbs(record.BridgeHome) ||
+			!sameInstallPath(record.BridgeHome, bridge) || !filepath.IsAbs(record.ConfigPath) {
+			return "", fmt.Errorf("invalid installation metadata")
+		}
+		if _, err := hex.DecodeString(record.ID); err != nil || record.ID != strings.ToLower(record.ID) {
+			return "", fmt.Errorf("invalid installation identity")
+		}
+		config, recorded = record.ConfigPath, true
+	} else if !os.IsNotExist(readErr) {
+		return "", fmt.Errorf("cannot read installation metadata")
+	}
+	if config == "" {
+		config = filepath.Join(bridge, "config.json")
+	}
+	legacyConfig := sameInstallPath(config, filepath.Join(defaultBridge, "config.json")) ||
+		sameInstallPath(config, filepath.Join(home, ".copilot", "copilot-ha-bridge.config.json"))
+	if explicit || recorded || !sameInstallPath(bridge, defaultBridge) {
+		if info, statErr := os.Stat(config); statErr != nil || info.IsDir() {
+			return root, fmt.Errorf("selected configuration is missing or unreadable")
+		}
+	}
+	if !recorded && sameInstallPath(bridge, defaultBridge) && legacyConfig {
+		return tempDir(), nil
+	}
+	return root, nil
 }
 
 // tempDir is the folder the bridge's PowerShell uses as $env:TEMP: TEMP when set

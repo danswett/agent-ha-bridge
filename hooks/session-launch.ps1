@@ -149,7 +149,7 @@ function Get-BridgeDiscoveredWorkspaces {
 
     # Hook registrations: what is running, or ran recently.
     foreach ($stateDir in @('agent-bridge-claude', 'agent-bridge-codex')) {
-        $dir = Join-Path $env:TEMP $stateDir
+        $dir = Get-BridgeRuntimePath $stateDir
         if (-not [System.IO.Directory]::Exists($dir)) { continue }
         foreach ($file in Get-ChildItem -LiteralPath $dir -Filter '*.json' -File -ErrorAction SilentlyContinue) {
             if ($file.Name -like '*.approval.json') { continue }
@@ -162,7 +162,7 @@ function Get-BridgeDiscoveredWorkspaces {
 
     # Claude transcripts: the history, one folder per project. The cwd is on nearly
     # every line, so only the head of the newest transcript in each is read.
-    $projects = Join-Path $HOME '.claude\projects'
+    $projects = Join-Path (Get-BridgeInstallContext).ClaudeHome 'projects'
     if ([System.IO.Directory]::Exists($projects)) {
         $dirs = Get-ChildItem -LiteralPath $projects -Directory -ErrorAction SilentlyContinue |
             Sort-Object LastWriteTime -Descending | Select-Object -First ($limit * 3)
@@ -2831,10 +2831,10 @@ function Get-BridgeRegisteredSessionId {
     )
 
     # Agents that register through their hooks (Claude, Codex) record the owning pid
-    # under %TEMP%; the rest are Copilot sessions, found by their lock files below.
+    # under the installation runtime root; the rest are Copilot sessions, found by their lock files below.
     $registrations = (Get-BridgeLauncher -Launcher $Launcher).RegistrationFiles
     if ($registrations) {
-        $stateDir = Join-Path $env:TEMP "agent-bridge-$Launcher"
+        $stateDir = Get-BridgeRuntimePath "agent-bridge-$Launcher"
         if (-not [System.IO.Directory]::Exists($stateDir)) { return '' }
         $files = @(& $registrations $stateDir $SessionId $Since)
         foreach ($file in $files) {
@@ -2906,4 +2906,3 @@ function Wait-BridgeSessionRegistered {
     }
     $false
 }
-

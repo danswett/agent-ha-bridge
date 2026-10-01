@@ -21,7 +21,7 @@ try {
 
     . (Join-Path $PSScriptRoot 'codex-session.ps1')
 
-    $core = Join-Path $HOME '.agent-ha-bridge\hooks'
+    $core = (Resolve-BridgeInstallContext -EntryDirectory $PSScriptRoot).HooksDir
     . (Join-Path $core 'decision-bridge-common.ps1')
     . (Join-Path $core 'decision-mqtt.ps1')
     . (Join-Path $core 'decision-ha-websocket.ps1')

@@ -428,7 +428,9 @@ function Get-LiveMcpSessions {
 function Get-LiveBridgeSessions {
     <# Every live session across the front ends the bridge supports (see daemon-agents.ps1). #>
     $live = @{}
+    $selected = Get-BridgeSelectedClients
     foreach ($kind in @($script:DaemonAgents.Keys)) {
+        if ($null -ne $selected -and $selected -notcontains $kind) { continue }
         $find = (Get-DaemonAgent -Kind $kind).FindSessions
         if (-not $find) { continue }
         foreach ($entry in (& $find).GetEnumerator()) {

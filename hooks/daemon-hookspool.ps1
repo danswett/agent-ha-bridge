@@ -26,9 +26,9 @@
 
 $script:DaemonHookSpoolAttempts = @{}
 
-# The native hook writes here; the same %TEMP% the registrations live under. Resolved
+# The native hook writes here, under the same installation root as registrations. Resolved
 # once, since Join-Path alone costs more than an idle tick.
-$script:DaemonHookSpoolDirectory = Join-Path $env:TEMP 'agent-bridge-spool'
+$script:DaemonHookSpoolDirectory = Get-BridgeRuntimePath 'agent-bridge-spool'
 
 $script:DaemonHookSpoolWatcher = $null
 $script:DaemonHookSpoolEvents = $null
@@ -93,6 +93,11 @@ function Invoke-DaemonHookEvent {
     #>
     param([Parameter(Mandatory)]$Spooled)
 
+    $selected = Get-BridgeSelectedClients
+    if ($null -ne $selected -and $selected -notcontains [string]$Spooled.agent) {
+        Write-DaemonLog -Message "ignored a hook for the unselected $([string]$Spooled.agent) client"
+        return
+    }
     $key = "$([string]$Spooled.agent)/$([string]$Spooled.hook)"
     $handler = $script:DaemonHookHandlers[$key]
     if ($null -eq $handler) { throw "no handler for $key" }
