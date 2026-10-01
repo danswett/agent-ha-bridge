@@ -13,6 +13,7 @@
         'tests\test-daemon-sessions.ps1'
         'tests\test-dashboard.ps1'
         'tests\test-decision-args.ps1'
+        'tests\test-decision-lifecycle.ps1'
         'tests\test-decision-retry.ps1'
         'tests\test-decision-select-race.ps1'
         'tests\test-detailed-activity.ps1'

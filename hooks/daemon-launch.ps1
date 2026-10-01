@@ -71,6 +71,7 @@ function Invoke-PendingStops {
         # gone.
         # Separately guarded, so a failed status publish cannot also cost the card its
         # "Ending session..." line.
+        $entry | Add-Member -NotePropertyName Status -NotePropertyValue 'ending' -Force
         try {
             Set-CopilotMqttStatus -SessionId $sessionId -Status 'ending' -Headers $Headers -Attributes (
                 Add-DaemonTuningAttributes -Attributes @{
@@ -79,9 +80,11 @@ function Invoke-PendingStops {
                     process_id = $processId
                     updated    = [DateTimeOffset]::Now.ToString('o')
                 } -Tuning $entry)
-            $entry.Status = 'ending'
         }
-        catch { }
+        catch {
+            if ($_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+            Write-DaemonLog -Message "ending status publish failed for $short : $($_.Exception.Message)"
+        }
         try {
             Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Ending session...' `
                 -Headers $Headers
@@ -89,6 +92,20 @@ function Invoke-PendingStops {
         catch { }
 
         $stop = Stop-BridgeCopilotSession -SessionId $sessionId -ProcessId $processId
+        $entry.Status = if ($stop.Stopped) { 'ended' } else { 'error' }
+        try {
+            Set-CopilotMqttStatus -SessionId $sessionId -Status $entry.Status -Headers $Headers -Attributes (
+                Add-DaemonTuningAttributes -Attributes @{
+                    session = $entry.Name
+                    machine = $entry.Machine
+                    process_id = $processId
+                    updated = [DateTimeOffset]::Now.ToString('o')
+                } -Tuning $entry)
+        }
+        catch {
+            if ($_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+            Write-DaemonLog -Message "stop outcome publish failed for $short : $($_.Exception.Message)"
+        }
         if ($stop.Stopped) {
             Write-DaemonLog -Message "ended $short : $($stop.Detail)"
             # Retire it now rather than on the next pass, so the card goes when the
