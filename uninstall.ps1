@@ -99,8 +99,17 @@ trap {
 
 # Windows/macOS differences; on macOS also makes Join-Path accept '\'. Beside this
 # script in both the repository and an install.
-$platform = Join-Path (Join-Path $PSScriptRoot 'hooks') 'bridge-platform.ps1'
-if (Test-Path -LiteralPath $platform) { . $platform } else { $script:BridgeIsWindows = [bool]$IsWindows }
+$bootstrapHooks = Join-Path $PSScriptRoot 'hooks'
+$contextLibrary = Join-Path $bootstrapHooks 'bridge-install-context.ps1'
+# The shared guard cannot be loaded through the link it is meant to reject.
+foreach ($path in @($PSScriptRoot, $bootstrapHooks, $contextLibrary)) {
+    if ((Get-Item -LiteralPath $path -Force -ErrorAction Stop).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw "A linked installer bootstrap was preserved before loading helpers: $path"
+    }
+}
+. $contextLibrary
+Assert-BridgeInstallPayload -Root $PSScriptRoot -RelativePaths @('hooks')
+. (Join-Path $bootstrapHooks 'bridge-platform.ps1')
 
 $installContext = Resolve-BridgeInstallContext -TargetHome $TargetHome -BridgeHome $InstallRoot -EntryDirectory $PSScriptRoot
 $installHome = $installContext.Home
@@ -197,14 +206,23 @@ function Get-BridgeSharedStateDecision {
     }
 }
 
-function Remove-BridgeOwnedInstallationFiles {
-    param([Parameter(Mandatory)]$Context, [switch]$KeepConfig)
+function Assert-BridgeUninstallOwnership {
+    param([Parameter(Mandatory)]$Context)
+    Assert-BridgeInstallPayload -Root $Context.BridgeHome -RelativePaths @(
+        'hooks', 'bin', 'installer', 'frontend', 'cache', 'runtime', 'mcp', 'codex-bridge', 'installation.json', 'uninstall.ps1')
     if ($Context.Recorded) {
         $record = Read-BridgeInstallRecord -Path $Context.MetadataPath
         if (-not $record -or [string]$record['id'] -cne $Context.Id -or
             -not (Test-BridgeInstallPath ([string]$record['bridgeHome']) $Context.BridgeHome)) {
             throw 'Installation ownership changed; no payload cleanup was authorized.'
         }
+    }
+}
+
+function Remove-BridgeOwnedInstallationFiles {
+    param([Parameter(Mandatory)]$Context, [switch]$KeepConfig)
+    Assert-BridgeUninstallOwnership -Context $Context
+    if ($Context.Recorded) {
         foreach ($relative in @('hooks', 'bin', 'installer', 'frontend', 'cache', 'runtime')) {
             $path = Join-Path $Context.BridgeHome $relative
             if (-not (Test-Path -LiteralPath $path)) { continue }
@@ -246,6 +264,7 @@ function Remove-BridgeInstalledAdapters {
         if (-not (Test-Path -LiteralPath $paths[$client]) -and $recordedAdapters -notcontains $client -and
             (-not $legacyPath -or -not (Test-Path -LiteralPath $legacyPath))) { continue }
         $setup = Join-Path $Payload "$client\install-$client.ps1"
+        Assert-BridgeInstallPayload -Root $Payload -RelativePaths @("$client\install-$client.ps1", 'hooks')
         if (-not (Test-Path -LiteralPath $setup)) {
             throw "The $client cleanup helper is unavailable. Restore the installer payload before uninstalling."
         }
@@ -258,6 +277,11 @@ function Remove-BridgeInstalledAdapters {
 function Invoke-BridgeUninstall {
     param([string]$AdapterPayloadRoot)
 
+    Assert-BridgeUninstallOwnership -Context $installContext
+    $adapterPayload = if ($AdapterPayloadRoot) { $AdapterPayloadRoot }
+    elseif (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'claude\install-claude.ps1')) { $PSScriptRoot }
+    else { Join-Path $bridgeHome 'installer' }
+    Assert-BridgeInstallPayload -Root $adapterPayload -RelativePaths @('hooks', 'claude', 'codex', 'mcp')
     Stop-BridgeOwnedService -Context $installContext -Remove
     Stop-BridgeOwnedRuntime -Context $installContext
 
@@ -281,15 +305,15 @@ function Invoke-BridgeUninstall {
                 Get-ChildItem -LiteralPath $root -Directory | ForEach-Object {
                     try { Remove-CopilotMqttSession -SessionId $_.Name -Headers $headers } catch { }
                 }
-                foreach ($client in @('claude', 'codex')) {
-                    $registry = Get-BridgeRuntimePath -Name "agent-bridge-$client" -Context $installContext
-                    if (-not (Test-Path -LiteralPath $registry)) { continue }
-                    foreach ($file in Get-ChildItem -LiteralPath $registry -Filter '*.json' -File) {
-                        if ($file.Name -like '*.approval.json') { continue }
-                        $entry = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json
-                        if ($entry.PSObject.Properties['SessionId'] -and $entry.SessionId) {
-                            Remove-CopilotMqttSession -SessionId ([string]$entry.SessionId) -Headers $headers | Out-Null
-                        }
+            }
+            foreach ($client in @('claude', 'codex')) {
+                $registry = Get-BridgeRuntimePath -Name "agent-bridge-$client" -Context $installContext
+                if (-not (Test-Path -LiteralPath $registry)) { continue }
+                foreach ($file in Get-ChildItem -LiteralPath $registry -Filter '*.json' -File) {
+                    if ($file.Name -like '*.approval.json') { continue }
+                    $entry = Get-Content -LiteralPath $file.FullName -Raw | ConvertFrom-Json
+                    if ($entry.PSObject.Properties['SessionId'] -and $entry.SessionId) {
+                        Remove-CopilotMqttSession -SessionId ([string]$entry.SessionId) -Headers $headers | Out-Null
                     }
                 }
             }
@@ -377,9 +401,6 @@ function Invoke-BridgeUninstall {
         Write-Host "    removed $devBoxTaskName"
     }
 
-    $adapterPayload = if ($AdapterPayloadRoot) { $AdapterPayloadRoot }
-    elseif (Test-Path -LiteralPath (Join-Path $PSScriptRoot 'claude\install-claude.ps1')) { $PSScriptRoot }
-    else { Join-Path $bridgeHome 'installer' }
     Remove-BridgeInstalledAdapters -Context $installContext -Payload $adapterPayload
 
     if (-not $installContext.Legacy) {

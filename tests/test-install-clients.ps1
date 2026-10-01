@@ -1163,6 +1163,176 @@ finally {
     if (Test-Path -LiteralPath $isolationRoot) { Remove-Item -LiteralPath $isolationRoot -Recurse -Force }
 }
 
+Write-Host '--- linked payloads are refused before foreign imports or mutation ---'
+function Invoke-LinkedPayloadRemovalFixture {
+    param([string]$Repository, $Owner, [string]$Mode)
+    if ($Mode -eq 'invoke') {
+        . (Join-Path $Repository 'uninstall.ps1') -TargetHome $Owner.Home
+        function Get-BridgeProcessesNamed { param($Name, [switch]$WithCommandLine) @() }
+        Invoke-BridgeUninstall -AdapterPayloadRoot (Join-Path $Owner.BridgeHome 'installer')
+    }
+    else {
+        $entry = if ($Mode -eq 'uninstaller-bootstrap') { 'uninstall.ps1' } else { 'install.ps1' }
+        & (Join-Path $Owner.BridgeHome $entry) -TargetHome $Owner.Home
+    }
+}
+$linkedRoot = Join-Path $env:TEMP ('linked-payload-' + [guid]::NewGuid().ToString('N'))
+$savedInstallNoRun = $env:BRIDGE_INSTALL_NORUN
+$savedUninstallNoRun = $env:BRIDGE_UNINSTALL_NORUN
+$env:BRIDGE_INSTALL_NORUN = '1'
+$env:BRIDGE_UNINSTALL_NORUN = '1'
+try {
+    foreach ($mode in @('invoke', 'uninstaller-bootstrap', 'installer-bootstrap')) {
+        $caseRoot = Join-Path $linkedRoot $mode
+        $owner = Initialize-BridgeInstallIdentity -Context (Resolve-BridgeInstallContext -TargetHome (Join-Path $caseRoot 'A'))
+        $foreign = Initialize-BridgeInstallIdentity -Context (Resolve-BridgeInstallContext -TargetHome (Join-Path $caseRoot 'B'))
+        Write-BridgeSecretFile -Path $owner.ConfigPath -Content '{"clients":[]}'
+        Write-BridgeSecretFile -Path $foreign.ConfigPath -Content '{"clients":[]}'
+        [void][IO.Directory]::CreateDirectory($foreign.HooksDir)
+        Get-ChildItem -LiteralPath (Join-Path $PSScriptRoot '..\hooks') -File |
+            Copy-Item -Destination $foreign.HooksDir
+        $executed = Join-Path $foreign.BridgeHome 'foreign-helper-executed.txt'
+        $instrumented = Join-Path $foreign.HooksDir $(if ($mode -eq 'invoke') { 'daemon-replies.ps1' } else { 'bridge-platform.ps1' })
+        $prefix = "[IO.File]::WriteAllText('$($executed.Replace("'", "''"))', 'executed')`n"
+        [IO.File]::WriteAllText($instrumented, $prefix + [IO.File]::ReadAllText($instrumented))
+        $version = Join-Path $foreign.HooksDir 'VERSION'
+        $sentinel = Join-Path $foreign.HooksDir 'unrelated.txt'
+        [IO.File]::WriteAllText($version, 'foreign version')
+        [IO.File]::WriteAllText($sentinel, 'foreign sentinel')
+        $beforeHelper = [IO.File]::ReadAllText($instrumented)
+        foreach ($entry in @('install.ps1', 'uninstall.ps1')) {
+            Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\$entry") -Destination $owner.BridgeHome
+        }
+        $link = $owner.HooksDir
+        $linkType = if ($IsWindows) { 'Junction' } else { 'SymbolicLink' }
+        New-Item -ItemType $linkType -Path $link -Target $foreign.HooksDir | Out-Null
+        if (-not ((Get-Item -LiteralPath $link -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            throw 'The fixture did not create a real directory link.'
+        }
+        try {
+            $refusal = ''
+            try { Invoke-LinkedPayloadRemovalFixture -Repository (Split-Path $PSScriptRoot -Parent) -Owner $owner -Mode $mode }
+            catch { $refusal = $_.Exception.Message }
+            Test-That "$mode refuses the real linked payload" { $refusal -match 'link|reparse' } $refusal
+            Test-That "$mode refuses before executing a foreign helper" { -not [IO.File]::Exists($executed) }
+            Test-That "$mode preserves foreign helper and version bytes, not only unrelated files" {
+                [IO.File]::Exists($instrumented) -and [IO.File]::ReadAllText($instrumented) -ceq $beforeHelper -and
+                    [IO.File]::Exists($version) -and [IO.File]::ReadAllText($version) -ceq 'foreign version' -and
+                    [IO.File]::ReadAllText($sentinel) -ceq 'foreign sentinel'
+            }
+            Test-That "$mode preserves the rejected owners metadata and credentials" {
+                [IO.File]::Exists($owner.MetadataPath) -and [IO.File]::Exists($owner.ConfigPath)
+            }
+        }
+        finally {
+            if (-not ((Get-Item -LiteralPath $link -Force).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                throw 'The fixture link changed unexpectedly; recursive cleanup was not authorized.'
+            }
+            [IO.Directory]::Delete($link)
+        }
+    }
+}
+finally {
+    $env:BRIDGE_INSTALL_NORUN = $savedInstallNoRun
+    $env:BRIDGE_UNINSTALL_NORUN = $savedUninstallNoRun
+    if (Test-Path -LiteralPath $linkedRoot) { Remove-Item -LiteralPath $linkedRoot -Recurse -Force }
+}
+
+Write-Host '--- adapter entity cleanup does not require Copilot storage ---'
+function Invoke-AdapterEntityCleanupFixture {
+    $repository = Split-Path $PSScriptRoot -Parent
+    . (Join-Path $repository 'uninstall.ps1')
+    $fixtureContext = Initialize-BridgeInstallIdentity -Context $installContext
+    if ($fixtureContext.Isolated -or -not (Test-BridgeInstallDescendant $fixtureContext.Home $env:AGENT_HA_BRIDGE_TEST_ROOT)) {
+        throw 'Entity cleanup requires the ordinary installation inside canonical synthetic HOME.'
+    }
+    $installContext = $fixtureContext
+    $script:BridgeInstallContext = $fixtureContext
+    $hooksDir = $fixtureContext.HooksDir
+    [void][IO.Directory]::CreateDirectory($hooksDir)
+    Get-ChildItem -LiteralPath (Join-Path $repository 'hooks') -File | Copy-Item -Destination $hooksDir -Force
+    $unusedState = Join-Path $fixtureContext.CopilotHome ('unused-' + [guid]::NewGuid().ToString('N'))
+    $script:CleanupPublications = [Collections.Generic.List[object]]::new()
+    function Invoke-RestMethod {
+        param($Method, $Uri, $Headers, $Body, $ContentType, $TimeoutSec, $MaximumRedirection)
+        if ($Uri -like '*/api/services/mqtt/publish') {
+            if ($Body -isnot [byte[]]) { throw 'The real service helper must send UTF-8 bytes.' }
+            $publication = [Text.Encoding]::UTF8.GetString($Body) | ConvertFrom-Json
+            if (-not $publication.PSObject.Properties['topic']) { throw 'The MQTT fixture did not decode a real publication.' }
+            $script:CleanupPublications.Add($publication)
+            return @()
+        }
+        if ($Uri -like '*/api/states') { return @() }
+        throw "Unexpected synthetic REST operation: $Method $Uri"
+    }
+    $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repository 'uninstall.ps1'), [ref]$null, [ref]$null)
+    $uninstall = $ast.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-BridgeUninstall'
+    }, $true)
+    $cleanup = $uninstall.Body.EndBlock.Statements | Where-Object {
+        $_ -is [Management.Automation.Language.IfStatementAst] -and
+            $_.Clauses[0].Item1.Extent.Text -eq '$ClearEntities -and $installContext.Isolated'
+    } | Select-Object -First 1
+    if (-not $cleanup) { throw 'The actual entity-cleanup branch was not found.' }
+    Set-Variable -Name ClearEntities -Value $true
+    Set-Variable -Name KeepShared -Value $true
+    Set-Variable -Name ClearShared -Value $false
+    foreach ($fixtureClient in @('claude', 'codex')) {
+        $config = @{
+            clients = @($fixtureClient)
+            homeAssistant = @{ baseUrl = 'http://127.0.0.1:1'; token = 'synthetic-cleanup-token' }
+            copilot = @{ sessionStateRoot = $unusedState }
+        }
+        Write-BridgeSecretFile -Path $fixtureContext.ConfigPath -Content ($config | ConvertTo-Json -Depth 6)
+        $session = [guid]::NewGuid().ToString()
+        $registry = Get-BridgeRuntimePath -Name "agent-bridge-$fixtureClient" -Context $fixtureContext
+        [void][IO.Directory]::CreateDirectory($registry)
+        $registration = Join-Path $registry "$session.json"
+        @{ SessionId = $session; TranscriptPath = (Join-Path $fixtureContext.Home 'synthetic.jsonl') } |
+            ConvertTo-Json | Set-Content -LiteralPath $registration -Encoding utf8
+        try {
+            if (Test-Path -LiteralPath $unusedState) { throw 'The missing-Copilot fixture was not empty.' }
+            $script:CleanupPublications.Clear()
+            . ([scriptblock]::Create($cleanup.Extent.Text))
+            $node = Get-CopilotMqttNodeId -SessionId $session
+            $without = @($script:CleanupPublications | Where-Object { $_.topic -like "*/$node/*" })
+            Test-That "$fixtureClient-only uninstall publishes the complete 21-message cleanup with no Copilot directory" {
+                $without.Count -eq 21 -and
+                    $without[0].topic -eq (Get-CopilotMqttTopics -SessionId $session).Availability -and
+                    $without[0].payload -ceq 'offline' -and
+                    @($without | Where-Object { -not $_.retain }).Count -eq 0 -and
+                    @($without | Select-Object -Skip 1 | Where-Object { $_.payload -cne '' }).Count -eq 0
+            }
+            Test-That "$fixtureClient-only machine cleanup remains a separate 22-topic control" {
+                $script:CleanupPublications.Count - $without.Count -eq 22
+            }
+            [void][IO.Directory]::CreateDirectory($unusedState)
+            $script:CleanupPublications.Clear()
+            . ([scriptblock]::Create($cleanup.Extent.Text))
+            $with = @($script:CleanupPublications | Where-Object { $_.topic -like "*/$node/*" }).Count
+            Test-That "adding an empty Copilot directory does not change $fixtureClient cleanup" {
+                $with -eq 21 -and $without.Count -eq $with -and $script:CleanupPublications.Count - $with -eq 22
+            }
+        }
+        finally {
+            Remove-Item -LiteralPath $registration -Force
+            if (Test-Path -LiteralPath $unusedState) { [IO.Directory]::Delete($unusedState) }
+        }
+    }
+}
+$savedEntityConfig = $env:AGENT_HA_BRIDGE_CONFIG
+$savedEntityNoRun = $env:BRIDGE_UNINSTALL_NORUN
+$savedEntityContext = $script:BridgeInstallContext
+$env:AGENT_HA_BRIDGE_CONFIG = Join-Path $HOME '.agent-ha-bridge\config.json'
+$env:BRIDGE_UNINSTALL_NORUN = '1'
+try { Invoke-AdapterEntityCleanupFixture }
+finally {
+    $env:AGENT_HA_BRIDGE_CONFIG = $savedEntityConfig
+    $env:BRIDGE_UNINSTALL_NORUN = $savedEntityNoRun
+    $script:BridgeInstallContext = $savedEntityContext
+}
+
 Write-Host ''
 if ($script:Failures) {
     Write-Host "$($script:Failures) check(s) failed" -ForegroundColor Red

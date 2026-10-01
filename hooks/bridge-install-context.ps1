@@ -17,6 +17,34 @@ function Test-BridgeInstallDescendant {
         (ConvertTo-BridgeInstallPath $Root) + [IO.Path]::DirectorySeparatorChar, $comparison)
 }
 
+function Assert-BridgeInstallPayload {
+    param([Parameter(Mandatory)][string]$Root, [string[]]$RelativePaths = @())
+    foreach ($relative in @('') + $RelativePaths) {
+        if ([IO.Path]::IsPathRooted($relative) -or $relative -match '(^|[\\/])\.\.([\\/]|$)') {
+            throw 'A payload boundary must remain within its installation root.'
+        }
+        $path = $Root
+        $components = @('') + @($relative -split '[\\/]' | Where-Object { $_ })
+        $item = $null
+        foreach ($component in $components) {
+            if ($component) { $path = Join-Path $path $component }
+            $item = $null
+            try { $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop }
+            catch [Management.Automation.ItemNotFoundException] { continue }
+            if ($item.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                throw "A linked installation payload was preserved before access: $path"
+            }
+        }
+        if ($relative -and $item -and $item.PSIsContainer) {
+            foreach ($child in Get-ChildItem -LiteralPath $item.FullName -Force -ErrorAction Stop) {
+                if ($child.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                    throw "A linked installation payload was preserved before access: $($child.FullName)"
+                }
+            }
+        }
+    }
+}
+
 function Read-BridgeInstallRecord {
     param([Parameter(Mandatory)][string]$Path)
     try {
@@ -99,6 +127,7 @@ function Resolve-BridgeInstallContext {
     if (-not $ConfigPath) { $ConfigPath = Join-Path $BridgeHome 'config.json' }
     $ConfigPath = ConvertTo-BridgeInstallPath $ConfigPath
     $metadataPath = Join-Path $BridgeHome 'installation.json'
+    Assert-BridgeInstallPayload -Root $BridgeHome -RelativePaths @('installation.json')
     $record = Read-BridgeInstallRecord -Path $metadataPath
     $isolated = [bool]$TargetHome -or -not (Test-BridgeInstallPath $homeRoot $defaultHome) -or
         -not (Test-BridgeInstallPath $BridgeHome $defaultBridge)

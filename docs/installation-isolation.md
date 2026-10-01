@@ -66,6 +66,9 @@ the first identity upgrade also removes its verified pre-metadata service.
 An unreadable recorded process or an unconfirmed service shutdown blocks removal
 rather than treating the writer as stopped. Unattributed pre-rename configurations,
 hooks and skills are preserved, even when they use historical bridge filenames.
+Installer and uninstaller bootstrap paths are checked before shared helpers load.
+Owned payload boundaries are checked before imports or child-file changes; linked
+payloads are refused without executing or deleting the linked installation's files.
 
 Claude removal matches the installation's actual hook commands, including backups;
 unrelated hooks survive. Codex operations run with the recorded `CODEX_HOME` and
@@ -74,6 +77,8 @@ Codex CLI or a required cleanup helper is unavailable, removal reports the block
 and retains the payload rather than leaving an active registration pointing at
 deleted code. MCP retains its config-reference credential model and removes only
 entries pointing to this server, from both the Desktop file and its existing backup.
+Claude and Codex session-entity cleanup reads each adapter's owned registry
+independently; it does not require a Copilot session-state directory.
 
 New attachment storage is partitioned by installation identity under the existing
 attachment allocation policy. This does **not** change its space-free path,

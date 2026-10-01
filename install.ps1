@@ -117,7 +117,17 @@ $testRegistrySuffix = if ($TestRegistryId) { "_$TestRegistryId" } else { '' }
 $repoRoot = $PSScriptRoot
 # Windows/macOS differences, before any path is built: on macOS it also makes
 # Join-Path accept the Windows separators used throughout.
-. (Join-Path $repoRoot 'hooks/bridge-platform.ps1')
+$bootstrapHooks = Join-Path $repoRoot 'hooks'
+$contextLibrary = Join-Path $bootstrapHooks 'bridge-install-context.ps1'
+# Validate the guard's own location before importing it.
+foreach ($path in @($repoRoot, $bootstrapHooks, $contextLibrary)) {
+    if ((Get-Item -LiteralPath $path -Force -ErrorAction Stop).Attributes -band [IO.FileAttributes]::ReparsePoint) {
+        throw "A linked installer bootstrap was preserved before loading helpers: $path"
+    }
+}
+. $contextLibrary
+Assert-BridgeInstallPayload -Root $repoRoot -RelativePaths @('hooks')
+. (Join-Path $bootstrapHooks 'bridge-platform.ps1')
 . (Join-Path $repoRoot 'hooks/bridge-native-hook.ps1')
 . (Join-Path $repoRoot 'hooks/bridge-test-guard.ps1')
 . (Join-Path $repoRoot 'hooks/bridge-secrets.ps1')
@@ -126,6 +136,10 @@ $repoRoot = $PSScriptRoot
 $installContext = if ($PSVersionTable.PSVersion.Major -ge 7) {
     Resolve-BridgeInstallContext -TargetHome $TargetHome -BridgeHome $InstallRoot
 } else { $null }
+if ($installContext) {
+    Assert-BridgeInstallPayload -Root $installContext.BridgeHome -RelativePaths @(
+        'hooks', 'bin', 'installer', 'frontend', 'cache', 'runtime', 'mcp', 'codex-bridge')
+}
 $installHome = if ($installContext) { $installContext.Home } elseif ($TargetHome) { $TargetHome } else { $HOME }
 if ($installContext -and $installContext.Isolated) {
     $SkipTask = $true
