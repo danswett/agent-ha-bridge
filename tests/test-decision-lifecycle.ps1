@@ -544,6 +544,119 @@ try {
                 }
             }
 
+            Write-Host '--- persisted subsecond stop and native timestamp boundaries ---'
+            $precisionStop = [DateTimeOffset]::Parse('2026-09-30T17:00:00.900-07:00')
+            function Get-PrecisionInput {
+                param([DateTimeOffset]$Instant, [string]$Representation)
+                switch ($Representation) {
+                    'offset-text' { $Instant.ToOffset([TimeSpan]::FromHours(-7)).ToString('o') }
+                    'utc-text' { $Instant.UtcDateTime.ToString('o') }
+                    'offset-object' { $Instant.ToOffset([TimeSpan]::FromHours(-7)) }
+                    'utc-datetime' { $Instant.UtcDateTime }
+                    'local-datetime' { $Instant.LocalDateTime }
+                    default { throw "Unknown precision fixture representation: $Representation" }
+                }
+            }
+            foreach ($representation in @('offset-text', 'utc-text', 'offset-object', 'utc-datetime', 'local-datetime')) {
+                $exact = $precisionStop.AddTicks(7)
+                $value = Get-PrecisionInput -Instant $exact -Representation $representation
+                Test-That "the failed-stop consumer preserves every tick of a $representation value" {
+                    $entry = [pscustomobject]@{ Status = 'error'; LastStopAt = $value }
+                    $actual = Get-DaemonFailedStopRequestTime -Entry $entry
+                    $actual -is [DateTimeOffset] -and $actual.UtcTicks -eq $exact.UtcTicks
+                }
+            }
+
+            $precisionCases = @(
+                @{ Label = 'older'; At = $precisionStop.AddMilliseconds(-100); Expected = 'error'; HookStatus = 'idle' }
+                @{ Label = 'equal'; At = $precisionStop; Expected = 'error'; HookStatus = 'idle' }
+                @{ Label = 'one-tick-newer'; At = $precisionStop.AddTicks(1); Expected = 'working'; HookStatus = 'working' }
+                @{ Label = 'newer'; At = $precisionStop.AddMilliseconds(50); Expected = 'working'; HookStatus = 'working' }
+            )
+            foreach ($stopRepresentation in @('offset-text', 'utc-text')) {
+                $script:RestorePress = Get-PrecisionInput -Instant $precisionStop -Representation $stopRepresentation
+                foreach ($hookRepresentation in @('offset-text', 'utc-text', 'offset-object', 'utc-datetime', 'local-datetime', 'persisted')) {
+                    foreach ($timestampCase in $precisionCases) {
+                        $fixture = New-RestorationFixture -Kind claude
+                        Invoke-PendingStops -Headers $headers -State $fixture.State -Live $fixture.Live
+                        if ($hookRepresentation -eq 'persisted') {
+                            $fixture.State[$fixture.Id] | Add-Member NativeHookTimeFixture ($timestampCase.At.ToString('o'))
+                        }
+                        Write-DaemonState -State $fixture.State
+                        $fixture.State = Read-DaemonState
+                        $entry = $fixture.State[$fixture.Id]
+                        $fixture.Session.HookStatus = $timestampCase.HookStatus
+                        $fixture.Session.HookStatusAt = if ($hookRepresentation -eq 'persisted') {
+                            $entry.NativeHookTimeFixture
+                        }
+                        else { Get-PrecisionInput -Instant $timestampCase.At -Representation $hookRepresentation }
+                        Test-That "persisted $stopRepresentation stop handles $($timestampCase.Label) same-second Claude $hookRepresentation precisely" {
+                            $savedStop = Get-DaemonFailedStopRequestTime -Entry $entry
+                            $observed = Sync-DaemonHookStatus -SessionId $fixture.Id -Entry $entry -Session $fixture.Session -Headers $headers
+                            $entry.LastStopAt -is [datetime] -and
+                            $savedStop.UtcTicks -eq $precisionStop.UtcTicks -and
+                            $observed.UtcTicks -eq $timestampCase.At.UtcTicks -and
+                            $entry.Status -ceq $timestampCase.Expected
+                        }
+                    }
+                }
+                foreach ($registrationRepresentation in @('offset-text', 'utc-text')) {
+                    foreach ($timestampCase in $precisionCases) {
+                        $fixture = New-RestorationFixture -Kind codex
+                        Invoke-PendingStops -Headers $headers -State $fixture.State -Live $fixture.Live
+                        Write-DaemonState -State $fixture.State
+                        $fixture.State = Read-DaemonState
+                        $registeredAt = Get-PrecisionInput -Instant $timestampCase.At -Representation $registrationRepresentation
+                        Set-RestorationCodexRegistration -SessionId $fixture.Id -Status $timestampCase.HookStatus `
+                            -At $registeredAt -Transcript $fixture.Transcript
+                        $script:DaemonRegistrationStamps = @{}
+                        Test-That "persisted $stopRepresentation stop handles $($timestampCase.Label) same-second Codex $registrationRepresentation precisely" {
+                            $savedStop = Get-DaemonFailedStopRequestTime -Entry $fixture.State[$fixture.Id]
+                            $changed = Sync-DaemonCodexHookStatus -Id $fixture.Id -Entry $fixture.State[$fixture.Id] -Headers $headers
+                            $savedStop.UtcTicks -eq $precisionStop.UtcTicks -and
+                            $fixture.State[$fixture.Id].Status -ceq $timestampCase.Expected -and
+                            $changed -eq ($timestampCase.Expected -eq 'working')
+                        }
+                    }
+                }
+            }
+
+            foreach ($hookRepresentation in @('offset-object', 'utc-datetime', 'local-datetime', 'utc-text')) {
+                $fixture = New-RestorationFixture -Kind claude
+                $entry = $fixture.State[$fixture.Id]
+                $entry.Status = 'idle'
+                $entry.HookStatusAt = $precisionStop.AddMilliseconds(-100).ToString('o')
+                Write-DaemonState -State $fixture.State
+                $fixture.State = Read-DaemonState
+                $entry = $fixture.State[$fixture.Id]
+                $next = $precisionStop.AddMilliseconds(50).AddTicks(7)
+                $fixture.Session.HookStatus = 'working'
+                $fixture.Session.HookStatusAt = Get-PrecisionInput -Instant $next -Representation $hookRepresentation
+                Test-That "a persisted seen timestamp does not hide a newer same-second $hookRepresentation hook" {
+                    $observed = Sync-DaemonHookStatus -SessionId $fixture.Id -Entry $entry -Session $fixture.Session -Headers $headers
+                    $entry.Status -ceq 'working' -and $observed.UtcTicks -eq $next.UtcTicks
+                }
+                Test-That "adopting $hookRepresentation preserves precise hook time through a second real state round-trip" {
+                    Write-DaemonState -State $fixture.State
+                    $fixture.State = Read-DaemonState
+                    $saved = $fixture.State[$fixture.Id].HookStatusAt
+                    $saved -is [datetime] -and $saved.ToUniversalTime().Ticks -eq $next.UtcTicks
+                }
+                $entry = $fixture.State[$fixture.Id]
+                # Later transcript work can change status without changing the last hook.
+                $entry.Status = 'idle'
+                $fixture.Session.HookStatusAt = $next.ToOffset([TimeSpan]::FromHours(2)).ToString('o')
+                Test-That "an equivalent offset timestamp cannot replay an already seen $hookRepresentation hook" {
+                    [void](Sync-DaemonHookStatus -SessionId $fixture.Id -Entry $entry -Session $fixture.Session -Headers $headers)
+                    $entry.Status -ceq 'idle'
+                }
+                $fixture.Session.HookStatusAt = $next.AddTicks(1).UtcDateTime
+                Test-That "a truly newer tick still recovers after the $hookRepresentation duplicate is rejected" {
+                    [void](Sync-DaemonHookStatus -SessionId $fixture.Id -Entry $entry -Session $fixture.Session -Headers $headers)
+                    $entry.Status -ceq 'working'
+                }
+            }
+
             foreach ($savedSummary in @('', 'Working', 'Earlier native activity')) {
                 Test-That "error priming has a truthful label instead of the saved summary '$savedSummary'" {
                     $entry = [pscustomobject]@{ Name = 'Synthetic'; Machine = 'TEST'; LastSummary = $savedSummary; LastResponse = 'Retained response' }

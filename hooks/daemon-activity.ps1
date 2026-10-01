@@ -58,14 +58,26 @@ function Test-BridgeSessionWorking {
     [bool](& (Get-DaemonAgent -Kind $Kind).IsWorking $SessionId $Transcript $Status)
 }
 
+function ConvertTo-DaemonActivityInstant {
+    <# JSON may already have decoded a date; formatting it first loses ticks and Kind. #>
+    param([AllowNull()][object]$Value)
+
+    if ($Value -is [DateTimeOffset]) { return $Value }
+    if ($Value -is [datetime]) { return [DateTimeOffset]::new($Value) }
+    if ($Value -is [string]) {
+        $instant = [DateTimeOffset]::MinValue
+        if ([DateTimeOffset]::TryParse($Value, [ref]$instant)) { return $instant }
+    }
+    $null
+}
+
 function Get-DaemonFailedStopRequestTime {
     <# An old stop press is not an error once native activity has recovered the entry. #>
     param([Parameter(Mandatory)]$Entry)
 
     if ($Entry.PSObject.Properties['Status'] -and [string]$Entry.Status -eq 'error' -and
         $Entry.PSObject.Properties['LastStopAt']) {
-        $at = [DateTimeOffset]::MinValue
-        if ([DateTimeOffset]::TryParse([string]$Entry.LastStopAt, [ref]$at)) { return $at }
+        return (ConvertTo-DaemonActivityInstant -Value $Entry.LastStopAt)
     }
     $null
 }
@@ -90,14 +102,14 @@ function Sync-DaemonHookStatus {
     )
 
     if (-not $Session.PSObject.Properties['HookStatus'] -or [string]::IsNullOrWhiteSpace([string]$Session.HookStatus)) { return $null }
-    $at = [DateTimeOffset]::MinValue
-    if (-not [DateTimeOffset]::TryParse([string]$Session.HookStatusAt, [ref]$at)) { return $null }
+    $at = ConvertTo-DaemonActivityInstant -Value $Session.HookStatusAt
+    if ($null -eq $at) { return $null }
 
     $failedStopAt = Get-DaemonFailedStopRequestTime -Entry $Entry
     if ($null -ne $failedStopAt -and $at -le $failedStopAt) { return $at }
 
-    $seen = if ($Entry.PSObject.Properties['HookStatusAt']) { [string]$Entry.HookStatusAt } else { '' }
-    if ($seen -eq [string]$Session.HookStatusAt) { return $at }
+    $seen = if ($Entry.PSObject.Properties['HookStatusAt']) { ConvertTo-DaemonActivityInstant -Value $Entry.HookStatusAt } else { $null }
+    if ($null -ne $seen -and $seen -eq $at) { return $at }
 
     $status = [string]$Session.HookStatus
     if ($status -eq 'working' -and $status -ne [string]$Entry.Status) {
@@ -118,8 +130,8 @@ function Sync-DaemonHookStatus {
     }
 
     $Entry.Status = $status
-    if ($Entry.PSObject.Properties['HookStatusAt']) { $Entry.HookStatusAt = [string]$Session.HookStatusAt }
-    else { $Entry | Add-Member -NotePropertyName HookStatusAt -NotePropertyValue ([string]$Session.HookStatusAt) -Force }
+    if ($Entry.PSObject.Properties['HookStatusAt']) { $Entry.HookStatusAt = $at.ToString('o') }
+    else { $Entry | Add-Member -NotePropertyName HookStatusAt -NotePropertyValue ($at.ToString('o')) -Force }
     $at
 }
 
@@ -692,11 +704,9 @@ function Sync-DaemonCodexHookStatus {
     if ($null -eq $fresh) { return $false }
     $failedStopAt = Get-DaemonFailedStopRequestTime -Entry $Entry
     if ($null -ne $failedStopAt) {
-        $registeredAt = [DateTimeOffset]::MinValue
         # The first read after restart is not itself new native activity.
-        if (-not $fresh.PSObject.Properties['Updated'] -or
-            -not [DateTimeOffset]::TryParse([string]$fresh.Updated, [ref]$registeredAt) -or
-            $registeredAt -le $failedStopAt) { return $false }
+        $registeredAt = if ($fresh.PSObject.Properties['Updated']) { ConvertTo-DaemonActivityInstant -Value $fresh.Updated } else { $null }
+        if ($null -eq $registeredAt -or $registeredAt -le $failedStopAt) { return $false }
     }
     $status = [string]$fresh.Status
     $activity = [string]$fresh.Activity
