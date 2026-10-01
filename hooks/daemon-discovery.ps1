@@ -12,25 +12,39 @@
 
 function Get-LiveCopilotSessions {
     <#
-        Live sessions, keyed by session id, resolved from the `inuse.<pid>.lock` files
-        that the CLI maintains. A lock whose process is gone is stale and skipped.
+        Live sessions, keyed by session id.
+
+        Two sources, because neither is complete on its own. The `--session-id` on a
+        process's own command line names its session outright, for a new session and a
+        resumed one alike, and is what settles the pid. The `inuse.<pid>.lock` files
+        the CLI maintains cover anything whose command line could not be read.
+
+        The locks alone used to be the whole answer, and a resumed session was
+        invisible for it: resuming onto an id that already has history writes no lock,
+        so on 2026-09-30 a session resumed from the dashboard ran normally with all
+        103 of its turns while the bridge never saw it - no card and no reply box,
+        then a second Resume press onto the same transcript.
 
         Built to stay cheap even with hundreds of historical session directories on
         disk (this machine has ~480). The live Copilot pids are fetched once up front,
         directory and lock enumeration go through the .NET APIs rather than the
         PowerShell provider, and no per-lock Get-Process call is made. An earlier
         version cost about 1.9 seconds per call and, run every few seconds, pinned a
-        third of a CPU core on its own.
+        third of a CPU core on its own; command lines are memoised per process for the
+        same reason.
     #>
     $root = $script:DecisionBridgeConfig.SessionStateRoot
     if (-not [IO.Directory]::Exists($root)) { return @{} }
 
     # One process snapshot; membership is then a hash lookup per lock.
+    $processes = @(Get-BridgeAgentProcesses -Agent 'copilot')
     $livePids = @{}
-    foreach ($process in @(Get-BridgeAgentProcesses -Agent 'copilot')) {
+    foreach ($process in $processes) {
         $livePids[$process.Id] = $true
     }
     if ($livePids.Count -eq 0) { return @{} }
+
+    $named = Get-BridgeAgentProcessSessionIds -Processes $processes
 
     $candidates = @()
     foreach ($dir in [IO.Directory]::EnumerateDirectories($root)) {
@@ -43,40 +57,82 @@ function Get-LiveCopilotSessions {
         }
         if ($null -eq $processId) { continue }
 
-        $transcript = [IO.Path]::Combine($dir, 'events.jsonl')
-
-        # A session that has not taken its first turn has no transcript yet. It is
-        # still a real, live session, so it is included rather than skipped: the card
-        # shows it as idle and, more usefully, its reply box can start the
-        # conversation from Home Assistant. Streaming begins on its own once the
-        # transcript appears.
-        $hasTranscript = [IO.File]::Exists($transcript)
-
-        $candidates += [pscustomobject]@{
-            SessionId = [IO.Path]::GetFileName($dir)
-            ProcessId = $processId
-            Transcript = $transcript
-            HasTranscript = $hasTranscript
-            # A missing file reports a 1601 sentinel, which naturally loses the
-            # per-pid tie-break below to any session that has actually written one.
-            LastWrite = if ($hasTranscript) { [IO.File]::GetLastWriteTimeUtc($transcript) } else { [DateTime]::MinValue }
-            Kind = 'copilot'
-        }
+        # Null only if the directory went between enumerating it and reading it;
+        # appending that would put a $null in the list for the tie-break to trip over.
+        $candidate = New-DaemonCopilotSession -Directory $dir -ProcessId $processId
+        if ($null -ne $candidate) { $candidates += $candidate }
     }
 
     # One CLI process owns exactly one live session. A process that resumed a
     # different session leaves the old `inuse.<pid>.lock` behind, so the same pid can
     # appear under several session directories. Publishing all of them would create
     # phantom sessions in Home Assistant and, worse, deliver a reply meant for one
-    # session into whichever session shares the pid. Keep only the most recently
-    # written transcript for each pid.
+    # session into whichever session shares the pid.
+    #
+    # A command line settles that outright, so it is taken first and the lock-based
+    # tie-break is left to the processes it could not answer for.
     $live = @{}
+    $settled = @{}
+    foreach ($entry in $named.GetEnumerator()) {
+        $processId = [int]$entry.Key
+        $sessionId = [string]$entry.Value
+        $winner = @($candidates | Where-Object { $_.ProcessId -eq $processId -and $_.SessionId -eq $sessionId })
+
+        # No lock for it: a resume, which is exactly the case the locks miss. The
+        # directory is the session's own, so it still describes it.
+        $resolved = if ($winner.Count -gt 0) { $winner[0] }
+            else { New-DaemonCopilotSession -Directory ([IO.Path]::Combine($root, $sessionId)) -ProcessId $processId }
+        if ($null -eq $resolved) { continue }
+
+        $live[$sessionId] = $resolved
+        $settled[$processId] = $true
+    }
+
     foreach ($group in ($candidates | Group-Object -Property ProcessId)) {
+        if ($settled.ContainsKey([int]$group.Name)) { continue }
+        # Keep only the most recently written transcript for each pid.
         $winner = $group.Group | Sort-Object LastWrite -Descending | Select-Object -First 1
-        $live[$winner.SessionId] = $winner
+        if (-not $live.ContainsKey($winner.SessionId)) { $live[$winner.SessionId] = $winner }
     }
 
     $live
+}
+
+function New-DaemonCopilotSession {
+    <#
+        One live Copilot session, as Get-LiveCopilotSessions describes them. Shared so
+        that a session found by its lock and one found by its command line cannot come
+        out in different shapes.
+
+        Returns $null for a directory that is not there - a command line can name a
+        session whose state directory has been cleaned away.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Directory,
+        [Parameter(Mandatory)][int]$ProcessId
+    )
+
+    if (-not [IO.Directory]::Exists($Directory)) { return $null }
+
+    $transcript = [IO.Path]::Combine($Directory, 'events.jsonl')
+
+    # A session that has not taken its first turn has no transcript yet. It is
+    # still a real, live session, so it is included rather than skipped: the card
+    # shows it as idle and, more usefully, its reply box can start the
+    # conversation from Home Assistant. Streaming begins on its own once the
+    # transcript appears.
+    $hasTranscript = [IO.File]::Exists($transcript)
+
+    [pscustomobject]@{
+        SessionId = [IO.Path]::GetFileName($Directory)
+        ProcessId = $ProcessId
+        Transcript = $transcript
+        HasTranscript = $hasTranscript
+        # A missing file reports a 1601 sentinel, which naturally loses the
+        # per-pid tie-break to any session that has actually written one.
+        LastWrite = if ($hasTranscript) { [IO.File]::GetLastWriteTimeUtc($transcript) } else { [DateTime]::MinValue }
+        Kind = 'copilot'
+    }
 }
 
 function Get-LiveCodexSessions {

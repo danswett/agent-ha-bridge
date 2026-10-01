@@ -2810,9 +2810,16 @@ function Get-BridgeRegisteredSessionId {
         The session directory and its `inuse.<pid>.lock` are what the daemon discovers
         Copilot sessions from; Claude and Codex register through their hooks under
         %TEMP% instead, recording the owning pid. Either way the pid is checked against
-        the running processes: a resumed session's directory usually still holds the
-        lock from the run that created it, so the file alone would report success for a
+        the running processes: a resumed session's directory may still hold the lock
+        from the run that created it, so the file alone would report success for a
         resume that never started.
+
+        A resume writes no lock of its own, though - resuming onto an id that already
+        has history leaves the CLI running with nothing under the session directory to
+        say so - so a live process naming the session on its command line counts as
+        registered too. Without that, a resumed session never registered at all: the
+        launch note sat on "may still be starting" while the session was up and
+        answering, and pressing Resume again put a second CLI on its transcript.
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$SessionId,
@@ -2846,12 +2853,18 @@ function Get-BridgeRegisteredSessionId {
 
     $directory = Join-Path $script:DecisionBridgeConfig.SessionStateRoot $SessionId
     if (-not [System.IO.Directory]::Exists($directory)) { return '' }
+    $processes = @(Get-BridgeAgentProcesses -Agent 'copilot')
     $livePids = @{}
-    foreach ($process in @(Get-BridgeAgentProcesses -Agent 'copilot')) { $livePids[$process.Id] = $true }
+    foreach ($process in $processes) { $livePids[$process.Id] = $true }
     foreach ($lock in [System.IO.Directory]::EnumerateFiles($directory, 'inuse.*.lock')) {
         $name = [System.IO.Path]::GetFileName($lock)
         if ($name -notmatch '^inuse\.(\d+)\.lock$') { continue }
         if ($livePids.ContainsKey([int]$Matches[1])) { return $SessionId }
+    }
+
+    # The resume case, which leaves no lock to find.
+    foreach ($named in (Get-BridgeAgentProcessSessionIds -Processes $processes).Values) {
+        if ([string]$named -eq $SessionId) { return $SessionId }
     }
     ''
 }
