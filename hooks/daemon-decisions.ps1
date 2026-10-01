@@ -421,8 +421,8 @@ function Invoke-DaemonDecisionAnswer {
     <#
         Injects a single Home Assistant answer into a live ask_user prompt. Freeform
         answers are typed as text; choices are handled by the choice-injection
-        strategy. Marks the marker as injected on success so it is not repeated, and
-        blanks the Home Assistant input field.
+        strategy. On success, records the answer and the selections actually used by
+        form delivery for completion verification, then blanks the Home Assistant input.
     #>
     param(
         [Parameter(Mandatory)][string]$SessionId,
@@ -437,6 +437,7 @@ function Invoke-DaemonDecisionAnswer {
     $node = Get-CopilotMqttNodeId -SessionId $SessionId
     # Claude and Codex leave no lock file for the injector to find their process by.
     $processId = Get-DaemonSessionProcessId -SessionId $SessionId
+    $deliveredSelections = @()
 
     if ($IsChoice) {
         # The native prompt is one arrow-key option list per field (tabbed when there
@@ -453,6 +454,11 @@ function Invoke-DaemonDecisionAnswer {
         $delivery = $null
         if ($fields.Count -gt 0 -and $sel.Count -eq $fields.Count) {
             $delivery = Send-CopilotSessionForm -SessionId $SessionId -Fields $fields -Selections $sel -ProcessId $processId
+            if ($null -ne $delivery -and $delivery.Delivered) {
+                # The single selector supplied Answer, not Selections. Keep the
+                # effective form input, never infer it later from the recorded result.
+                $deliveredSelections = @($sel)
+            }
         }
         if ($null -eq $delivery -or -not $delivery.Delivered) {
             if ($null -ne $delivery) {
@@ -473,7 +479,7 @@ function Invoke-DaemonDecisionAnswer {
     }
 
     if ($delivery.Delivered) {
-        Set-CopilotDecisionMarkerInjected -SessionId $SessionId -Answer $Answer -Selections @($Selections)
+        Set-CopilotDecisionMarkerInjected -SessionId $SessionId -Answer $Answer -Selections $deliveredSelections
         try {
             Invoke-HomeAssistantService -Domain 'text' -Service 'set_value' -Headers $Headers `
                 -Data @{ entity_id = "text.${node}_reply"; value = $script:DaemonConfig.ReplyBlankValue }

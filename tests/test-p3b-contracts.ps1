@@ -553,6 +553,295 @@ function Invoke-WebRequest {
         }
     }
 
+    $deliveryInitialFailures = $script:Failures
+    $deliveryInitialChecks = $script:Checks
+    & {
+        Write-Host '--- actual selector delivery persists the selections used by completion ---'
+        . (Join-Path $repo 'claude\hooks\claude-session.ps1')
+        . (Join-Path $repo 'claude\hooks\claude-ask-parser.ps1')
+        . (Join-Path $repo 'claude\hooks\claude-hooks.ps1')
+        . (Join-Path $repo 'claude\hooks\claude-transcript.ps1')
+        $previousLive = $script:DaemonLive
+        $previousClaudeLoaded = $script:ClaudeAdapterLoaded
+        $previousClaudeRoot = $script:ClaudeStateRoot
+        $script:ClaudeAdapterLoaded = $true
+        $script:ClaudeStateRoot = Join-Path $root 'delivery-claude'
+
+        function Test-HomeAssistantReachable { $false }
+        function Get-ClaudeOwningProcessId { param($Ancestors) 0 }
+        function Add-DeliveryResult {
+            $fixture = $script:DeliveryFixture
+            if ($fixture.ResultWritten) { throw 'This fixture already has a terminal result.' }
+            if ($fixture.Kind -eq 'copilot') {
+                $data = @{ toolCallId = $fixture.CallId }
+                if ($fixture.ResultKind -ne 'missing') { $data.result = @{ content = $fixture.Content } }
+                $entry = @{ type = 'tool.execution_complete'; timestamp = [DateTimeOffset]::Now.ToString('o'); data = $data }
+            }
+            else {
+                $block = @{ type = 'tool_result'; tool_use_id = $fixture.CallId }
+                if ($fixture.ResultKind -ne 'missing') { $block.content = $fixture.Content }
+                $entry = @{ type = 'user'; timestamp = [DateTimeOffset]::Now.ToString('o'); message = @{ content = @($block) } }
+            }
+            [IO.File]::AppendAllText($fixture.Transcript, (($entry | ConvertTo-Json -Depth 8 -Compress) + "`n"))
+            $fixture.ResultWritten = $true
+        }
+        function Get-HomeAssistantState {
+            param($EntityId, $Headers)
+            $fixture = $script:DeliveryFixture
+            if ($EntityId -ceq $fixture.DecisionEntity) {
+                $fixture.DecisionReads++
+                if ($fixture.TerminalOnRead -and $fixture.DecisionReads -eq 2) { Add-DeliveryResult }
+            }
+            if (-not $fixture.Ha.ContainsKey($EntityId)) { throw "Unexpected synthetic entity: $EntityId" }
+            $fixture.Ha[$EntityId]
+        }
+        function Publish-CopilotMqttMessage {
+            param($Topic, $Payload, $Headers, [switch]$Retain)
+            if ($Topic -ceq $script:DeliveryFixture.Topics.DecisionAttributes -and $Payload -ceq '{}') {
+                $script:DeliveryFixture.CardClears++
+            }
+        }
+        function Invoke-HomeAssistantService {
+            param($Domain, $Service, $Headers, $Data)
+            $fixture = $script:DeliveryFixture
+            if ($Domain -eq 'text' -and $Service -eq 'set_value') {
+                $fixture.Ha[$Data.entity_id].state = [string]$Data.value
+            }
+            elseif ($Domain -eq 'select' -and $Service -eq 'select_option') {
+                $fixture.Ha[$Data.entity_id].state = [string]$Data.option
+            }
+            else { throw "Unexpected synthetic service: $Domain.$Service" }
+        }
+        function Set-DaemonTransientActivity {
+            param($SessionId, $Summary, $Extra, $Headers)
+            $script:DeliveryFixture.Activity.Add([string]$Summary)
+        }
+        function Send-CopilotSessionForm {
+            param($SessionId, $Fields, $Selections, $ProcessId)
+            $fixture = $script:DeliveryFixture
+            $before = Get-CopilotDecisionMarker -SessionId $SessionId -RequireReadable
+            $fixture.Inputs.Add([pscustomobject]@{
+                Route = 'form'; Selections = @($Selections)
+                Payloads = @(Get-BridgeFormPayloads -Fields $Fields -Selections $Selections)
+                StoredBeforeInput = $(if ($before.PSObject.Properties['injectedSelections']) { @($before.injectedSelections).Count } else { 0 })
+            })
+            if ($fixture.FormDelivered -and $fixture.Kind -eq 'claude') { Add-DeliveryResult }
+            [pscustomobject]@{ Delivered = $fixture.FormDelivered; ProcessId = 0; Detail = 'Synthetic native form boundary' }
+        }
+        function Send-CopilotSessionChoice {
+            param($SessionId, $Text, $ChoiceCount, $ProcessId)
+            $fixture = $script:DeliveryFixture
+            $fixture.Inputs.Add([pscustomobject]@{ Route = 'text-choice'; Text = $Text })
+            if ($fixture.FallbackDelivered -and $fixture.Kind -eq 'claude') { Add-DeliveryResult }
+            [pscustomobject]@{ Delivered = $fixture.FallbackDelivered; ProcessId = 0; Detail = 'Synthetic native fallback boundary' }
+        }
+        function Send-CopilotSessionPrompt {
+            param($SessionId, $Text, $ProcessId)
+            $script:DeliveryFixture.UnexpectedInput++
+            throw 'Completion must never override the terminal answer.'
+        }
+        function Invoke-BridgeConsoleSend {
+            param($ProcessId, $Text, $Submit, $DelayMs)
+            $script:DeliveryFixture.UnexpectedInput++
+            throw 'This fixture completes through the actual transcript, not an extra native Enter.'
+        }
+        function New-DeliveryFixture {
+            param(
+                [string]$Kind,
+                [string]$ResultKind = 'mismatch',
+                [string]$Selection = 'No',
+                [switch]$MultiField
+            )
+            $sid = [guid]::NewGuid().ToString()
+            $directory = Join-Path $script:DecisionBridgeConfig.SessionStateRoot $sid
+            [void][IO.Directory]::CreateDirectory($directory)
+            $transcript = Join-Path $directory 'events.jsonl'
+            [IO.File]::WriteAllText($transcript, '')
+            $callId = "synthetic-$sid"
+            $topics = Get-CopilotMqttTopics -SessionId $sid
+            $session = [pscustomobject]@{ Kind = $Kind; SessionId = $sid; Transcript = $transcript; ProcessId = 0 }
+            $script:DaemonLive = @{ $sid = $session }
+            if ($Kind -eq 'copilot') {
+                $properties = [ordered]@{
+                    answer = [pscustomobject]@{ type = 'string'; title = 'Confirm'; enum = @('No', 'Not now'); default = 'Not now' }
+                }
+                if ($MultiField) { $properties.region = [pscustomobject]@{ type = 'string'; title = 'Region'; enum = @('East', 'West') } }
+                $hook = [pscustomobject]@{
+                    sessionId = $sid; cwd = $root; timestamp = 44; toolName = 'ask_user'
+                    toolArgs = [pscustomobject]@{ message = 'Synthetic selection'; requestedSchema = [pscustomobject]@{ properties = [pscustomobject]$properties } }
+                }
+                & { Set-StrictMode -Off; Invoke-CopilotAskUserHook -HookEvent $hook } | Out-Null
+                $start = @{ type = 'tool.execution_start'; timestamp = [DateTimeOffset]::Now.ToString('o'); data = @{ toolName = 'ask_user'; toolCallId = $callId } }
+            }
+            else {
+                $questions = @([pscustomobject]@{ question = 'Confirm?'; header = 'Confirm'; options = @('No', 'Not now') })
+                if ($MultiField) { $questions += [pscustomobject]@{ question = 'Region?'; header = 'Region'; options = @('East', 'West') } }
+                Invoke-ClaudeAskHook -HookEvent ([pscustomobject]@{
+                    session_id = $sid; transcript_path = $transcript; cwd = $root
+                    tool_name = 'AskUserQuestion'; tool_use_id = $callId; tool_input = [pscustomobject]@{ questions = $questions }
+                }) | Out-Null
+                $start = @{ type = 'assistant'; timestamp = [DateTimeOffset]::Now.ToString('o'); message = @{
+                    content = @(@{ type = 'tool_use'; id = $callId; name = 'AskUserQuestion' })
+                } }
+            }
+            [IO.File]::AppendAllText($transcript, (($start | ConvertTo-Json -Depth 8 -Compress) + "`n"))
+            $marker = Get-CopilotDecisionMarker -SessionId $sid -RequireReadable
+            $recorded = if ($ResultKind -eq 'mismatch') { 'Not now' } else { $Selection }
+            $content = if ($ResultKind -in @('missing', 'empty')) { '' }
+                       elseif ($ResultKind -eq 'unsupported') { '{"unexpected":"shape"}' }
+                       elseif ($Kind -eq 'copilot') {
+                           if ($MultiField) { @{ answer = $recorded; region = 'East' } | ConvertTo-Json -Compress }
+                           else { "User responded: $recorded" }
+                       }
+                       else {
+                           $answer = '"Confirm?"="' + $recorded + '"'
+                           if ($MultiField) { $answer += ', "Region?"="East"' }
+                           "Your questions have been answered: $answer."
+                       }
+            $ha = @{
+                "select.$($topics.Node)_decision" = [pscustomobject]@{
+                    state = $(if ($MultiField) { 'Awaiting answer...' } else { $Selection })
+                    attributes = [pscustomobject]@{ question = $marker.question; options = @($marker.choices); decision_id = $marker.decisionId }
+                }
+                "text.$($topics.Node)_reply" = [pscustomobject]@{ state = 'old reply' }
+                "button.$($topics.Node)_submit" = [pscustomobject]@{ state = ([DateTimeOffset]$marker.armedAt).AddSeconds(1).ToString('o') }
+            }
+            for ($index = 1; $index -le $script:CopilotMqttMaxFields; $index++) {
+                $ha[(Get-CopilotMqttFieldEntityId -Node $topics.Node -Index $index)] = [pscustomobject]@{
+                    state = $(if ($MultiField -and $index -eq 1) { $Selection } elseif ($MultiField -and $index -eq 2) { 'East' } else { 'Idle' })
+                }
+            }
+            $script:DeliveryFixture = [pscustomobject]@{
+                Kind = $Kind; SessionId = $sid; CallId = $callId; Transcript = $transcript
+                Topics = $topics; DecisionEntity = "select.$($topics.Node)_decision"; ReplyEntity = "text.$($topics.Node)_reply"
+                State = @{ $sid = [pscustomobject]@{ Name = 'Synthetic'; Machine = 'TEST'; LastReply = 'old reply' } }
+                Ha = $ha; Inputs = [Collections.Generic.List[object]]::new(); Activity = [Collections.Generic.List[string]]::new()
+                ExpectedSelections = $(if ($MultiField) { @($Selection, 'East') } else { @($Selection) })
+                ResultKind = $ResultKind; Content = $content; ResultWritten = $false
+                FormDelivered = $true; FallbackDelivered = $false; UnexpectedInput = 0
+                DecisionReads = 0; TerminalOnRead = $false; CardClears = 0
+            }
+            $script:DeliveryFixture
+        }
+        function Invoke-DeliveryPass {
+            Invoke-PendingDecisions -Headers @{} -State $script:DeliveryFixture.State -Live $script:DaemonLive
+        }
+
+        try {
+            foreach ($kind in @('copilot', 'claude')) {
+                foreach ($case in @(
+                    @{ Result = 'matching'; Multi = $false; Selection = 'No' }
+                    @{ Result = 'mismatch'; Multi = $false; Selection = 'No' }
+                    @{ Result = 'unsupported'; Multi = $false; Selection = 'No' }
+                    @{ Result = 'missing'; Multi = $false; Selection = 'No' }
+                    @{ Result = 'empty'; Multi = $false; Selection = 'No' }
+                    @{ Result = 'matching'; Multi = $false; Selection = 'Not now' }
+                    @{ Result = 'matching'; Multi = $true; Selection = 'No' }
+                    @{ Result = 'mismatch'; Multi = $true; Selection = 'No' }
+                )) {
+                    $fixture = New-DeliveryFixture -Kind $kind -ResultKind $case.Result -Selection $case.Selection -MultiField:$case.Multi
+                    $label = "$kind $($case.Result), fields=$(if ($case.Multi) { 2 } else { 1 }), selected=$($case.Selection)"
+                    $marker = Get-CopilotDecisionMarker -SessionId $fixture.SessionId -RequireReadable
+                    $read = Read-DaemonDecisionAnswer -SessionId $fixture.SessionId -Marker $marker -State $fixture.State -Headers @{}
+                    Test-That "$label reads the ordinary dashboard selection without seeding the marker" {
+                        $read.IsChoice -and $read.Answer -ceq ($fixture.ExpectedSelections -join ' + ') -and
+                            @($read.Selections).Count -eq $(if ($case.Multi) { 2 } else { 0 }) -and
+                            (-not $marker.PSObject.Properties['injectedSelections'] -or @($marker.injectedSelections).Count -eq 0)
+                    }
+                    Test-That "$label preserves the actual client hook identity" {
+                        -not $marker.terminalOnly -and
+                            $(if ($kind -eq 'copilot') { $marker.toolCallId -ceq '' } else { $marker.toolCallId -ceq $fixture.CallId })
+                    }
+                    Invoke-DeliveryPass
+                    $delivered = Get-CopilotDecisionMarker -SessionId $fixture.SessionId -RequireReadable
+                    Test-That "$label reaches the native boundary with the actual per-field selections and focus" {
+                        $expectedPayload = if ($kind -eq 'copilot' -and $case.Selection -ceq 'No') { [string][char]27 + '[A' }
+                                           elseif ($kind -eq 'claude' -and $case.Selection -ceq 'Not now') { [string][char]27 + '[B' }
+                                           else { '' }
+                        $fixture.Inputs.Count -eq 1 -and $fixture.Inputs[0].Route -ceq 'form' -and
+                            ($fixture.Inputs[0].Selections -join '|') -ceq ($fixture.ExpectedSelections -join '|') -and
+                            $fixture.Inputs[0].StoredBeforeInput -eq 0 -and $fixture.Inputs[0].Payloads[0].Payload -ceq $expectedPayload
+                    }
+                    Test-That "$label persists exactly the selections used by successful form delivery" {
+                        $null -ne $delivered -and $delivered.injectedAnswer -ceq $read.Answer -and
+                            @($delivered.injectedSelections).Count -eq @($fixture.ExpectedSelections).Count -and
+                            ($delivered.injectedSelections -join '|') -ceq ($fixture.Inputs[0].Selections -join '|')
+                    }
+                    if (-not $fixture.ResultWritten) {
+                        Invoke-DeliveryPass
+                        Add-DeliveryResult
+                    }
+                    $expectedStatus = if ($case.Result -eq 'matching') { 'Matched' }
+                                      elseif ($case.Result -eq 'mismatch') { 'Mismatch' } else { 'Unconfirmed' }
+                    $ask = Get-DaemonAskUserState -Session $script:DaemonLive[$fixture.SessionId] -Marker $delivered
+                    Test-That "$label uses the real client transcript with the expected $expectedStatus result" {
+                        $ask.Started -and -not $ask.Pending -and
+                            (Test-CopilotAnswerMatchesSelections -ResultContent $ask.ResultContent -Fields @($delivered.fields) `
+                                -Selections $fixture.ExpectedSelections -Detailed).Status -ceq $expectedStatus
+                    }
+                    Invoke-DeliveryPass
+                    $warnings = @($fixture.Activity | Where-Object { $_ -like 'Answer differs*' -or $_ -like 'Answer unconfirmed*' })
+                    Test-That "$label completes with the expected verification and no competing correction input" {
+                        $fixture.Inputs.Count -eq 1 -and $fixture.UnexpectedInput -eq 0 -and
+                            $(if ($expectedStatus -ceq 'Matched') { $warnings.Count -eq 0 }
+                              elseif ($expectedStatus -ceq 'Mismatch') { $warnings.Count -eq 1 -and $warnings[0] -ceq 'Answer differs - check the terminal' }
+                              else { $warnings.Count -eq 1 -and $warnings[0] -ceq 'Answer unconfirmed - check the terminal' })
+                    }
+                    Test-That "$label retains real marker, card and reply cleanup" {
+                        $null -eq (Get-CopilotDecisionMarker -SessionId $fixture.SessionId) -and $fixture.CardClears -eq 1 -and
+                            $fixture.Ha[$fixture.DecisionEntity].state -ceq 'Idle' -and
+                            $fixture.Ha[$fixture.ReplyEntity].state -ceq $script:DaemonConfig.ReplyBlankValue -and
+                            $fixture.State[$fixture.SessionId].LastReply -ceq ''
+                    }
+                    Write-Host ('A19 delivery evidence: ' + ([ordered]@{
+                        Kind = $kind; Result = $case.Result; Fields = @($marker.fields).Count
+                        NativeAttempts = $fixture.Inputs.Count; StoredSelections = @($delivered.injectedSelections).Count
+                        DirectMatcher = $expectedStatus; CompletionWarnings = $warnings
+                    } | ConvertTo-Json -Compress))
+                }
+                foreach ($timing in @('before-pass', 'during-selector-read')) {
+                    $fixture = New-DeliveryFixture -Kind $kind
+                    if ($timing -eq 'before-pass') { Add-DeliveryResult } else { $fixture.TerminalOnRead = $true }
+                    Invoke-DeliveryPass
+                    Invoke-DeliveryPass
+                    Test-That "$kind terminal answer $timing prevents input and removes the pending marker" {
+                        $fixture.ResultWritten -and $fixture.Inputs.Count -eq 0 -and $fixture.UnexpectedInput -eq 0 -and
+                            $null -eq (Get-CopilotDecisionMarker -SessionId $fixture.SessionId) -and
+                            $fixture.CardClears -eq 1 -and $fixture.Activity.Count -eq 0
+                    }
+                }
+                foreach ($fallback in @($false, $true)) {
+                    $fixture = New-DeliveryFixture -Kind $kind -ResultKind matching -MultiField
+                    $fixture.FormDelivered = $false
+                    $fixture.FallbackDelivered = $fallback
+                    Invoke-DeliveryPass
+                    $marker = Get-CopilotDecisionMarker -SessionId $fixture.SessionId -RequireReadable
+                    Test-That "$kind failed form with fallback=$fallback never records unused per-field selections" {
+                        $fixture.Inputs.Count -eq 2 -and $fixture.Inputs[1].Route -ceq 'text-choice' -and
+                            (-not $marker.PSObject.Properties['injectedSelections'] -or @($marker.injectedSelections).Count -eq 0) -and
+                            $fixture.UnexpectedInput -eq 0 -and
+                            $(if ($fallback) { $marker.injectedAnswer -ceq 'No + East' } else { $marker.injectedAnswer -ceq '' })
+                    }
+                    if (-not $fixture.ResultWritten) { Add-DeliveryResult }
+                    Invoke-DeliveryPass
+                    Test-That "$kind fallback=$fallback keeps terminal cleanup without guessing selections from its result" {
+                        $null -eq (Get-CopilotDecisionMarker -SessionId $fixture.SessionId) -and
+                            $fixture.Inputs.Count -eq 2 -and $fixture.UnexpectedInput -eq 0 -and
+                            @($fixture.Activity | Where-Object { $_ -like 'Answer differs*' -or $_ -like 'Answer unconfirmed*' }).Count -eq 0
+                    }
+                }
+            }
+        }
+        finally {
+            $script:DaemonLive = $previousLive
+            $script:ClaudeAdapterLoaded = $previousClaudeLoaded
+            $script:ClaudeStateRoot = $previousClaudeRoot
+        }
+    }
+    $deliveryFailures = $script:Failures - $deliveryInitialFailures
+    $deliveryChecks = $script:Checks - $deliveryInitialChecks
+    Write-Host "A19 delivery assertions: $($deliveryChecks - $deliveryFailures) passed, $deliveryFailures failed."
+
     $a23InitialFailures = $script:Failures
     $a23InitialChecks = $script:Checks
     & {
@@ -739,7 +1028,8 @@ function Invoke-WebRequest {
         }
         Test-That 'successful delivery is persisted without inventing a native hook ID' {
             $null -ne $delivered -and $delivered.injectedAnswer -ceq 'No' -and
-            [string]$delivered.toolCallId -ceq '' -and $delivered.decisionId -ceq "$($fixture.Topics.Node)-"
+            [string]$delivered.toolCallId -ceq '' -and $delivered.decisionId -ceq "$($fixture.Topics.Node)-" -and
+            @($delivered.injectedSelections).Count -eq 1 -and $delivered.injectedSelections[0] -ceq 'No'
         }
         Add-A23QuestionResult -Fixture $fixture -Content 'User responded: false'
         Invoke-PendingDecisions -Headers $headers -State $fixture.State -Live $script:DaemonLive
