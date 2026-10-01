@@ -111,6 +111,7 @@ $agentInstructionsPath = Join-Path $copilotHome 'instructions\agent-ha-bridge.in
 $legacySkillDir = Join-Path $copilotHome 'skills\decision-notifier'
 $configPath = Join-Path $bridgeHome 'config.json'
 $taskName = 'AgentBridgeDaemon'
+$devBoxTaskName = 'AgentBridgeDevBoxKeepAwake'
 # Pre-rename artefacts, removed too so an upgrade-then-uninstall leaves nothing.
 $legacyTaskName = 'CopilotBridgeDaemon'
 $legacyHooksDir = Join-Path $copilotHome 'hooks'
@@ -322,6 +323,13 @@ else {
         else {
             Write-Host "    $name not registered"
         }
+    }
+    # Reported only when it exists: a machine that was never a Dev Box should not be
+    # told about a task it never had.
+    if (Get-ScheduledTask -TaskName $devBoxTaskName -ErrorAction SilentlyContinue) {
+        Stop-ScheduledTask -TaskName $devBoxTaskName -ErrorAction SilentlyContinue
+        Unregister-ScheduledTask -TaskName $devBoxTaskName -Confirm:$false
+        Write-Host "    removed $devBoxTaskName"
     }
 
     Write-Step 'Stopping any running daemon or supervisor'

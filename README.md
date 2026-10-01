@@ -340,6 +340,8 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `newSession.copilotPath` | Full path to `copilot.exe` if it is not on the daemon's PATH |
 | `newSession.agencyPath` | Full path to `agency.exe` if it is not on the daemon's PATH |
 | `newSession.claudePath` / `.codexPath` | Full path to `claude.exe` / the Codex CLI if not on the daemon's PATH |
+| `devBox.keepAwake` | On a Microsoft Dev Box, keep the machine from hibernating itself while the bridge runs (default `false`; you are asked once on a Dev Box). See [Running on a Microsoft Dev Box](#running-on-a-microsoft-dev-box) |
+| `devBox.intervalHours` | How often the keep-awake task runs (default `4`) |
 | `updates.repository` | Repository to check for releases (default `danswett/agent-ha-bridge`) |
 | `updates.checkForUpdates` | Set to `false` to disable the update check |
 | `updates.checkHours` | How often to check GitHub for a release (default `6`, i.e. 4×/day) |
@@ -366,6 +368,60 @@ MCP removal strips this install's registration from Claude Desktop and its `.bak
 without replacing unrelated settings. Copies pasted into other clients or backups
 made by other software must be removed there manually. `-KeepConfig` deliberately
 retains the main config and its backup; removing an adapter does not revoke HA tokens.
+
+### Running on a Microsoft Dev Box
+
+A Dev Box pool commonly has **stop-on-disconnect** enabled, and when it does the Dev
+Box agent hibernates the machine a set number of minutes after your last RDP or tunnel
+session goes away. Idleness there is measured by *sessions*, not by load, so a Dev Box
+busy running the daemon and several agent sessions looks exactly as idle as one doing
+nothing. The daemon stops mid-reconcile, its liveness beat stops, and the machine shows
+as offline on the dashboard with nothing anywhere saying why.
+
+The installer detects a Dev Box and offers to register a second scheduled task,
+`AgentBridgeDevBoxKeepAwake`, which clears the pending stop every few hours through
+Dev Center's own API:
+
+```powershell
+.\install.ps1 -DevBoxKeepAwake          # or answer the prompt
+.\install.ps1 -DevBoxKeepAwake:$false   # turn it off again; the task is removed
+```
+
+It uses the documented, **user-scoped** developer API (`users/me`) and your existing
+Azure CLI login — nothing is reconfigured on the Dev Box agent, and the agent keeps
+reporting health as normal. Each pass asks Dev Center to skip the pending stop, falling
+back to delaying it as far as the service allows. Two service limits are why it runs on
+a timer rather than once:
+
+- a delay may not exceed **8 hours past where the action originally landed**, so delays
+  do not stack;
+- **neither lever works while the stop is more than 24 hours away** — which is the state
+  worth reaching, so the task reports that as already safe and does nothing.
+
+Passes are logged to `$env:TEMP\agent-bridge-devbox-keepawake.log`. To see what it would
+do without changing anything:
+
+```powershell
+pwsh -File ~\.agent-ha-bridge\hooks\agent-bridge-devbox-keepawake.ps1 -DryRun
+```
+
+Requirements: the Azure CLI, signed in as you (`az login`). If that login expires the
+task logs it and exits non-zero rather than failing quietly, because a silent failure
+here looks exactly like the Dev Box hibernating for no reason.
+
+This is a per-occurrence reprieve, not a policy change. The durable fix is for whoever
+administers the pool to raise `gracePeriodMinutes` (up to 480) or disable
+stop-on-disconnect; you can read the current setting yourself with:
+
+```powershell
+$t = az account get-access-token --resource https://devcenter.azure.com --query accessToken -o tsv
+Invoke-RestMethod -Headers @{ Authorization = "Bearer $t" } `
+  -Uri "$devCenterUri/projects/$project/pools/$pool?api-version=2024-02-01" |
+  Select-Object -ExpandProperty stopOnDisconnect
+```
+
+Keeping a Dev Box awake around the clock has a real cost, so it is off unless you turn
+it on.
 
 ### Telling an agent's turn from yours
 
@@ -888,12 +944,20 @@ inside a disposable machine, not permission to exercise installation on a real o
 | "Entity not found" on a card | The daemon provisions entities on its next pass; check the daemon log. |
 | Answers picked in Home Assistant do nothing | The session predates the install — `/restart` it. |
 | Nothing at all happens | Check `$env:TEMP\agent-bridge-daemon.log` and `agent-decision-bridge.log`. |
+| A Dev Box goes offline mid-session every evening | Its pool hibernates on disconnect. See [Running on a Microsoft Dev Box](#running-on-a-microsoft-dev-box). |
 
 The daemon runs as the hidden scheduled task `AgentBridgeDaemon`:
 
 ```powershell
 Get-ScheduledTask -TaskName AgentBridgeDaemon
 Get-Content $env:TEMP\agent-bridge-daemon.log -Tail 20
+```
+
+On a Dev Box with keep-awake enabled there is a second task beside it:
+
+```powershell
+Get-ScheduledTask -TaskName AgentBridgeDevBoxKeepAwake
+Get-Content $env:TEMP\agent-bridge-devbox-keepawake.log -Tail 20
 ```
 
 ---

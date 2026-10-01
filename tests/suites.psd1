@@ -17,6 +17,7 @@
         'tests\test-decision-retry.ps1'
         'tests\test-decision-select-race.ps1'
         'tests\test-detailed-activity.ps1'
+        'tests\test-devbox-keepawake.ps1'
         'tests\test-driver-card.ps1'
         'tests\test-hook-functions.ps1'
         'tests\test-hook-spool.ps1'
