@@ -123,14 +123,9 @@ function Get-BridgeDiscoveredWorkspaces {
     <#
         Folders agent sessions on this machine have recently worked in, newest first.
 
-        A fresh install has no `newSession.workspaces`, and the folders a user actually
-        works in are already known: every Claude transcript records its cwd, and the
-        Claude and Codex hooks register theirs. Offering those means the launch card
-        works on a new machine without editing any config.
-
-        These come only from files the agents write locally, never from Home
-        Assistant, so they sit inside the same boundary as the configured list. System
-        folders are dropped (see Test-BridgeSystemDirectory). Disabled with
+        These are suggestions for explicit approval in `newSession.workspaces`, not
+        executable targets or a liveness authority. System folders are dropped
+        (see Test-BridgeSystemDirectory). Disabled with
         `newSession.discoverWorkspaces: false`; `newSession.discoverCount` caps it.
 
         Cached for a minute, because the daemon asks several times per reconcile and
@@ -170,8 +165,11 @@ function Get-BridgeDiscoveredWorkspaces {
             $newest = Get-ChildItem -LiteralPath $dir.FullName -Filter '*.jsonl' -File -ErrorAction SilentlyContinue |
                 Sort-Object LastWriteTime -Descending | Select-Object -First 1
             if ($null -eq $newest) { continue }
+            $reader = $null
             try {
-                foreach ($line in [System.Linq.Enumerable]::Take([System.IO.File]::ReadLines($newest.FullName), 40)) {
+                $reader = [System.IO.File]::OpenText($newest.FullName)
+                for ($index = 0; $index -lt 40 -and -not $reader.EndOfStream; $index++) {
+                    $line = $reader.ReadLine()
                     if ($line -notmatch '"cwd"') { continue }
                     $cwd = [string]($line | ConvertFrom-Json).cwd
                     if ($cwd) {
@@ -181,6 +179,7 @@ function Get-BridgeDiscoveredWorkspaces {
                 }
             }
             catch { }
+            finally { if ($null -ne $reader) { $reader.Dispose() } }
         }
     }
 
@@ -202,9 +201,8 @@ function Get-BridgeDiscoveredWorkspaces {
 
 function Get-BridgeWorkspaceChoices {
     <#
-        The directories offered as launch targets: `newSession.workspaces` first, then
-        folders recent sessions worked in (Get-BridgeDiscoveredWorkspaces), and the home
-        folder if both are empty, so the launch card is never left with nothing.
+        Explicitly configured executable targets. Discovery and an empty configuration
+        cannot grant permission to launch in an additional directory.
 
         Each configured entry is either a plain path string or an object with `label`
         and `path`. A label keeps the dropdown readable on a phone, where a full path is
@@ -213,7 +211,7 @@ function Get-BridgeWorkspaceChoices {
         This list is also the security boundary. The daemon never launches a path
         that came from Home Assistant; it launches a path from this list, selected by
         label. A wrong or tampered entity state can therefore only ever pick a
-        directory the user configured or already worked in, or nothing at all.
+        directory the user configured, or nothing at all.
 
         Paths that do not exist are dropped rather than offered, so the dashboard
         cannot present a choice that is guaranteed to fail.
@@ -245,28 +243,17 @@ function Get-BridgeWorkspaceChoices {
         # ever set on a configured entry: a discovered folder is somewhere the user
         # happened to work, not somewhere they asked the bridge to manage.
         $isolate = $false
-        if ($null -ne $entry -and $entry.PSObject.Properties['isolate']) { $isolate = [bool]$entry.isolate }
+        if ($null -ne $entry -and $entry.PSObject.Properties['isolate']) {
+            if ($entry.isolate -isnot [bool]) {
+                Write-Warning "Workspace '$label' has a non-Boolean isolate setting; it is not an executable target."
+                continue
+            }
+            $isolate = $entry.isolate
+        }
 
         [pscustomobject]@{ Label = $label; Path = $path; Isolate = $isolate }
     }
     $choices = @($choices)
-
-    $known = @{}
-    foreach ($choice in $choices) { $known[$choice.Path.TrimEnd('\', '/').ToLowerInvariant()] = $true }
-    # The worktrees the bridge makes for isolated launches are working directories of
-    # real sessions, so discovery finds them - and without this the picker fills up
-    # with a fresh entry for every session ever started. They are an implementation
-    # detail of the workspace they came from, and that is the entry to pick.
-    foreach ($path in @(Get-BridgeDiscoveredWorkspaces)) {
-        if ($known.ContainsKey($path.ToLowerInvariant())) { continue }
-        if (Test-BridgeManagedWorktree -Path $path) { continue }
-        $known[$path.ToLowerInvariant()] = $true
-        $choices += [pscustomobject]@{ Label = [System.IO.Path]::GetFileName($path); Path = $path; Isolate = $false }
-    }
-
-    if ($choices.Count -eq 0 -and [System.IO.Directory]::Exists($HOME)) {
-        $choices = @([pscustomobject]@{ Label = 'Home'; Path = [System.IO.Path]::GetFullPath($HOME); Isolate = $false })
-    }
 
     # Home Assistant select options must be unique, so a duplicate label would make
     # two entries indistinguishable. Keep the first and suffix the rest with their
@@ -308,27 +295,343 @@ function Get-BridgeWorkspaceChoice {
     Get-BridgeWorkspaceChoices | Where-Object { $_.Label -eq $Label } | Select-Object -First 1
 }
 
+function Resolve-BridgeWorkspaceDirectory {
+    <# GetFullPath alone does not resolve a junction or a symlink in an ancestor. #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not [System.IO.Path]::IsPathFullyQualified($Path)) { throw 'A workspace directory must be absolute.' }
+    $full = [System.IO.Path]::GetFullPath($Path)
+    $root = [System.IO.Path]::GetPathRoot($full)
+    $resolved = $root
+    foreach ($part in ($full.Substring($root.Length) -split '[\\/]' | Where-Object { $_ })) {
+        $entry = [System.IO.DirectoryInfo]::new((Join-Path $resolved $part))
+        if (-not $entry.Exists) { throw "Workspace directory is missing or unreadable: $Path" }
+        if ($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+            $entry = $entry.ResolveLinkTarget($true)
+            if ($null -eq $entry -or -not $entry.Exists -or $entry -isnot [System.IO.DirectoryInfo]) {
+                throw "Workspace directory link could not be resolved: $Path"
+            }
+        }
+        $resolved = $entry.FullName
+    }
+    [System.IO.Path]::TrimEndingDirectorySeparator($resolved)
+}
+
+function Get-BridgeWorkspaceRelativeDirectory {
+    param([Parameter(Mandatory)][string]$Path, [Parameter(Mandatory)][string]$RepositoryRoot)
+    $root = Resolve-BridgeWorkspaceDirectory -Path $RepositoryRoot
+    $directory = Resolve-BridgeWorkspaceDirectory -Path $Path
+    if (-not (Test-BridgeInstallPath -Left $directory -Right $root) -and
+        -not (Test-BridgeInstallDescendant -Path $directory -Root $root)) {
+        throw 'The configured workspace is outside its repository root.'
+    }
+    [System.IO.Path]::GetRelativePath($root, $directory)
+}
+
+function Test-BridgeWorkspacePathApproved {
+    <# A resume stays in an approved folder, or in a managed worktree derived from
+       an approved isolated repository. Historical discovery is not approval. #>
+    param([AllowEmptyString()][AllowNull()][string]$Path)
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not [System.IO.Directory]::Exists($Path)) { return $false }
+    try {
+        $resolved = Resolve-BridgeWorkspaceDirectory -Path $Path
+        $choices = @(Get-BridgeWorkspaceChoices)
+        foreach ($choice in $choices) {
+            if (Test-BridgeInstallPath -Left $resolved -Right (Resolve-BridgeWorkspaceDirectory $choice.Path)) { return $true }
+        }
+        if (@($choices | Where-Object Isolate).Count -eq 0) { return $false }
+        $top = Invoke-BridgeGit -Directory $Path -Arguments @('rev-parse', '--show-toplevel')
+        if (-not $top.Ok -or -not (Test-BridgeManagedWorktree -Path $top.Output)) { return $false }
+        foreach ($choice in @($choices | Where-Object Isolate)) {
+            $source = Invoke-BridgeGit -Directory $choice.Path -Arguments @('rev-parse', '--show-toplevel')
+            if (-not $source.Ok) { continue }
+            $relative = Get-BridgeWorkspaceRelativeDirectory -Path $choice.Path -RepositoryRoot $source.Output
+            $targetRoot = Resolve-BridgeWorkspaceDirectory -Path $top.Output
+            $corresponding = [System.IO.Path]::GetFullPath($relative, $targetRoot)
+            if (-not [System.IO.Directory]::Exists($corresponding)) { continue }
+            $corresponding = Resolve-BridgeWorkspaceDirectory -Path $corresponding
+            if (-not (Test-BridgeInstallPath -Left $corresponding -Right $targetRoot) -and
+                -not (Test-BridgeInstallDescendant -Path $corresponding -Root $targetRoot)) { continue }
+            if (-not (Test-BridgeInstallPath -Left $resolved -Right $corresponding) -and
+                -not (Test-BridgeInstallDescendant -Path $resolved -Root $corresponding)) { continue }
+            foreach ($worktree in @(Get-BridgeManagedWorktree -RepositoryPath $choice.Path)) {
+                if (Test-BridgeInstallPath -Left (Resolve-BridgeWorkspaceDirectory $top.Output) `
+                    -Right (Resolve-BridgeWorkspaceDirectory $worktree)) { return $true }
+            }
+        }
+    }
+    catch { Write-Warning "Workspace approval could not be established: $($_.Exception.Message)" }
+    $false
+}
+
 function Invoke-BridgeGit {
     <#
         Runs git in a directory and hands back its output and exit code, with stderr
-        folded in. Never throws: every caller here treats git being missing, or the
-        directory not being a repository, as "no isolation", not as a failed launch.
+        folded in. Callers must check Ok; a failed Git read is not an empty answer.
     #>
     param(
         [Parameter(Mandatory)][string]$Directory,
-        [Parameter(Mandatory)][string[]]$Arguments
+        [Parameter(Mandatory)][string[]]$Arguments,
+        [string]$IndexFile = ''
     )
 
     $result = [pscustomobject]@{ Ok = $false; Output = ''; Code = -1 }
-    if (-not (Get-Command git -CommandType Application -ErrorAction SilentlyContinue)) { return $result }
+    $git = Get-Command git -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($null -eq $git) {
+        $result.Output = 'Git is not available on PATH.'
+        return $result
+    }
+    $process = [System.Diagnostics.Process]::new()
     try {
-        $output = & git -C $Directory @Arguments 2>&1 | Out-String
-        $result.Code = $LASTEXITCODE
-        $result.Output = $output.Trim()
-        $result.Ok = ($LASTEXITCODE -eq 0)
+        $start = [System.Diagnostics.ProcessStartInfo]::new($git.Source)
+        $start.UseShellExecute = $false
+        $start.CreateNoWindow = $true
+        $start.RedirectStandardInput = $true
+        $start.RedirectStandardOutput = $true
+        $start.RedirectStandardError = $true
+        $start.StandardOutputEncoding = [System.Text.UTF8Encoding]::new($false)
+        $start.StandardErrorEncoding = [System.Text.UTF8Encoding]::new($false)
+        foreach ($argument in @('-C', $Directory) + $Arguments) { $start.ArgumentList.Add($argument) }
+        # The declared directory, not the launching shell's Git context, owns this
+        # operation. Cleanup's alternate index belongs only to this child.
+        foreach ($name in @('GIT_DIR', 'GIT_WORK_TREE', 'GIT_COMMON_DIR', 'GIT_INDEX_FILE',
+            'GIT_OBJECT_DIRECTORY', 'GIT_ALTERNATE_OBJECT_DIRECTORIES')) {
+            [void]$start.Environment.Remove($name)
+        }
+        if ($IndexFile) { $start.Environment['GIT_INDEX_FILE'] = $IndexFile }
+        $start.Environment['GIT_TERMINAL_PROMPT'] = '0'
+        $process.StartInfo = $start
+        if (-not $process.Start()) { throw 'Git did not start.' }
+        $process.StandardInput.Close()
+        $stdout = $process.StandardOutput.ReadToEndAsync()
+        $stderr = $process.StandardError.ReadToEndAsync()
+        $process.WaitForExit()
+        $result.Code = $process.ExitCode
+        $result.Output = ($stdout.GetAwaiter().GetResult() + $stderr.GetAwaiter().GetResult()).Trim()
+        $result.Ok = ($result.Code -eq 0)
     }
     catch { $result.Output = $_.Exception.Message }
+    finally { $process.Dispose() }
     $result
+}
+
+function Enter-BridgeWorktreeOperation {
+    param([Parameter(Mandatory)][string]$RepositoryPath)
+
+    $common = Invoke-BridgeGit -Directory $RepositoryPath -Arguments @('rev-parse', '--path-format=absolute', '--git-common-dir')
+    if (-not $common.Ok) { throw "Cannot establish repository ownership: $($common.Output)" }
+    $directory = Resolve-BridgeWorkspaceDirectory -Path $common.Output
+    $key = if ($script:BridgeIsWindows) { $directory.ToLowerInvariant() } else { $directory }
+    $hash = [Convert]::ToHexString([System.Security.Cryptography.SHA256]::HashData(
+        [System.Text.Encoding]::UTF8.GetBytes($key))).ToLowerInvariant()
+    $mutex = [System.Threading.Mutex]::new($false, "Local\AgentBridgeWorktree_$hash")
+    $owned = $false
+    try {
+        try { $owned = $mutex.WaitOne([TimeSpan]::Zero) }
+        catch [System.Threading.AbandonedMutexException] { $owned = $true }
+        if (-not $owned) { throw 'Another worktree operation is in progress; retry the launch after it finishes.' }
+        [pscustomobject]@{ Mutex = $mutex; CommonDirectory = $directory }
+    }
+    catch { $mutex.Dispose(); throw }
+}
+
+function Get-BridgeWorkspaceManagedWorktree {
+    param([Parameter(Mandatory)][string]$Path)
+    $top = Invoke-BridgeGit -Directory $Path -Arguments @('rev-parse', '--show-toplevel')
+    if ($top.Ok -and (Test-BridgeManagedWorktree -Path $top.Output)) { return $top.Output }
+    ''
+}
+
+function New-BridgeWorktreeLaunchReservation {
+    <# Git's own lock protects the gap between native start and registration, even
+       across daemon failure and when worktreeIdleHours is zero. #>
+    param([Parameter(Mandatory)][string]$WorktreePath)
+
+    $marker = Get-BridgeWorktreeMarkerPath -Path $WorktreePath
+    if (-not $marker) { throw 'Cannot reserve an unowned worktree for launch.' }
+    $locked = Join-Path (Split-Path $marker -Parent) 'locked'
+    if ([System.IO.File]::Exists($locked)) { return $null }
+    $token = 'agent-bridge-launch:' + [guid]::NewGuid().ToString('N')
+    $result = Invoke-BridgeGit -Directory $WorktreePath -Arguments @('worktree', 'lock', '--reason', $token, $WorktreePath)
+    if (-not $result.Ok) { throw "Cannot protect the worktree while its session starts: $($result.Output)" }
+    [pscustomobject]@{ Path = $WorktreePath; Token = $token }
+}
+
+function Remove-BridgeWorktreeLaunchReservation {
+    param([Parameter(Mandatory)]$Reservation)
+    $operation = $null
+    try {
+        if ([string]$Reservation.Token -cnotmatch '^agent-bridge-launch:[a-f0-9]{32}$') {
+            throw 'The launch reservation does not identify a bridge-owned lock.'
+        }
+        $operation = Enter-BridgeWorktreeOperation -RepositoryPath ([string]$Reservation.Path)
+        $marker = Get-BridgeWorktreeMarkerPath -Path ([string]$Reservation.Path)
+        if (-not $marker) { throw 'The reserved worktree identity is no longer readable.' }
+        $locked = Join-Path (Split-Path $marker -Parent) 'locked'
+        if (-not [System.IO.File]::Exists($locked)) { return $true }
+        if ([System.IO.File]::ReadAllText($locked).Trim() -cne [string]$Reservation.Token) {
+            throw 'The worktree lock belongs to another owner; it was preserved.'
+        }
+        $result = Invoke-BridgeGit -Directory ([string]$Reservation.Path) `
+            -Arguments @('worktree', 'unlock', [string]$Reservation.Path)
+        if (-not $result.Ok) { throw "Cannot release the completed launch reservation: $($result.Output)" }
+        $true
+    }
+    catch {
+        Write-Warning "The worktree remains protected: $($_.Exception.Message)"
+        $false
+    }
+    finally {
+        if ($null -ne $operation) { $operation.Mutex.ReleaseMutex(); $operation.Mutex.Dispose() }
+    }
+}
+
+function Read-BridgeCopilotWorkspace {
+    param([Parameter(Mandatory)][string]$Path)
+    $fields = @{}
+    foreach ($line in [System.IO.File]::ReadAllLines($Path)) {
+        if ($line -notmatch '^(\w+):\s*(.*)$') { continue }
+        $key = $Matches[1]
+        $value = $Matches[2].Trim().Trim('"', "'")
+        if ($key -eq 'cwd' -and $fields.ContainsKey($key)) { throw 'A Copilot workspace has ambiguous working directories.' }
+        $fields[$key] = $value
+    }
+    $fields
+}
+
+function Get-BridgeWorktreeUsage {
+    <# A read-only safety snapshot, not session discovery: no caps, cached answers,
+       enrollment filtering, age-based retirement or deletion of registrations.
+       An incomplete snapshot cannot authorize cleanup. #>
+    $directories = [System.Collections.Generic.List[string]]::new()
+    try {
+        $processes = @(Get-Process -ErrorAction Stop)
+        $allProcesses = @{}
+        foreach ($process in $processes) { $allProcesses[[int]$process.Id] = $process }
+        $agents = @{}
+        if (-not $script:BridgeIsWindows) {
+            foreach ($process in $processes) {
+                if ($process.ProcessName -in @('node', 'bun') -and
+                    [string]::IsNullOrWhiteSpace((Get-BridgeCommandLine -ProcessId $process.Id))) {
+                    throw 'A potential native agent process has an unreadable command line.'
+                }
+            }
+        }
+        foreach ($kind in @('copilot', 'claude', 'codex')) {
+            $agents[$kind] = @{}
+            foreach ($process in $processes) {
+                if (Test-BridgeAgentProcess -Process $process -Agent $kind) {
+                    [void]$process.StartTime
+                    $agents[$kind][[int]$process.Id] = $process
+                }
+                if (@($processes | Where-Object { Test-BridgeAgentProcess -Process $_ -Agent 'agency' }).Count) {
+                    throw 'An Agency launcher is active; cleanup cannot rule out a session still starting.'
+                }
+            }
+        }
+
+        $stateRoot = [string]$script:DecisionBridgeConfig.SessionStateRoot
+        $copilotProcesses = @($agents.copilot.Values)
+        $named = Get-BridgeAgentProcessSessionIds -Processes $copilotProcesses
+        $accounted = @{}
+        if (Test-Path -LiteralPath $stateRoot -ErrorAction Stop) {
+            foreach ($session in Get-ChildItem -LiteralPath $stateRoot -Directory -Force -ErrorAction Stop) {
+                if ($session.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                    throw 'A linked Copilot session directory cannot establish complete workspace usage.'
+                }
+                $owners = @{}
+                foreach ($processId in $named.Keys) {
+                    if ([string]$named[$processId] -eq $session.Name) { $owners[[int]$processId] = $true }
+                }
+                foreach ($lock in Get-ChildItem -LiteralPath $session.FullName -Filter 'inuse.*.lock' -File -Force -ErrorAction Stop) {
+                    if ($lock.Name -notmatch '^inuse\.(\d+)\.lock$') { throw 'An invalid Copilot process lock prevents cleanup.' }
+                    $processId = [int]$Matches[1]
+                    if ($agents.copilot.ContainsKey($processId) -and
+                        (-not $named.ContainsKey($processId) -or [string]$named[$processId] -eq $session.Name)) {
+                        if (-not $named.ContainsKey($processId) -and
+                            $lock.LastWriteTimeUtc -lt $agents.copilot[$processId].StartTime.ToUniversalTime()) {
+                            throw 'A Copilot lock predates the current process generation; workspace usage is uncertain.'
+                        }
+                        $owners[$processId] = $true
+                    }
+                }
+                if ($owners.Count -eq 0) { continue }
+                $workspace = Read-BridgeCopilotWorkspace -Path (Join-Path $session.FullName 'workspace.yaml')
+                $cwd = [string]$workspace['cwd']
+                if (-not $cwd) { throw 'A live Copilot/Agency session has no readable working directory.' }
+                $directories.Add((Resolve-BridgeWorkspaceDirectory -Path $cwd))
+                foreach ($owner in $owners.Keys) { $accounted[$owner] = $true }
+            }
+        }
+        foreach ($processId in $agents.copilot.Keys) {
+            if (-not $accounted.ContainsKey($processId)) {
+                throw 'A live Copilot/Agency process has no authoritative session working directory.'
+            }
+        }
+
+        foreach ($kind in @('claude', 'codex')) {
+            $root = Get-BridgeRuntimePath "agent-bridge-$kind"
+            $accounted = @{}
+            if (Test-Path -LiteralPath $root -ErrorAction Stop) {
+                foreach ($file in Get-ChildItem -LiteralPath $root -Filter '*.json' -File -Force -ErrorAction Stop) {
+                    if ($kind -eq 'codex' -and $file.Name -like '*.approval.json') { continue }
+                    if ($file.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+                        throw "A linked $kind registration prevents cleanup."
+                    }
+                    $entry = [System.IO.File]::ReadAllText($file.FullName) | ConvertFrom-Json -AsHashtable -ErrorAction Stop
+                    if ($entry -isnot [System.Collections.IDictionary] -or -not $entry['SessionId']) {
+                        throw "An incomplete $kind registration prevents cleanup."
+                    }
+                    if ($kind -eq 'codex' -and $entry.Contains('Ended')) {
+                        if ($entry['Ended'] -isnot [bool]) { throw 'An invalid Codex ended state prevents cleanup.' }
+                        if ($entry['Ended']) { continue }
+                    }
+                    $processId = 0
+                    if (-not [int]::TryParse([string]$entry['ProcessId'], [ref]$processId) -or $processId -le 0) {
+                        throw "A $kind registration has no authoritative process identity."
+                    }
+                    if (-not $agents[$kind].ContainsKey($processId)) {
+                        if ($allProcesses.ContainsKey($processId)) {
+                            throw "A $kind registration names a different live process; ownership is uncertain."
+                        }
+                        continue
+                    }
+                    $rawUpdated = $entry['Updated']
+                    if ($rawUpdated -isnot [datetime] -and $rawUpdated -isnot [DateTimeOffset] -and
+                        $rawUpdated -isnot [string]) { throw "A $kind registration has no valid process-generation timestamp." }
+                    $updated = [DateTimeOffset]$rawUpdated
+                    $started = [DateTimeOffset]$agents[$kind][$processId].StartTime
+                    if ($updated -lt $started -or $updated -gt [DateTimeOffset]::Now) {
+                        throw "A $kind registration does not establish ownership of the current process generation."
+                    }
+                    if (-not $entry['WorkingDirectory']) { throw "A live $kind session has no working directory." }
+                    $directories.Add((Resolve-BridgeWorkspaceDirectory -Path ([string]$entry['WorkingDirectory'])))
+                    $accounted[$processId] = $true
+                }
+            }
+            foreach ($processId in $agents[$kind].Keys) {
+                if (-not $accounted.ContainsKey($processId)) {
+                    throw "A live $kind process has no authoritative registration."
+                }
+            }
+        }
+        [pscustomobject]@{ Known = $true; Directories = @($directories.ToArray()); Detail = '' }
+    }
+    catch {
+        [pscustomobject]@{ Known = $false; Directories = @(); Detail = $_.Exception.Message }
+    }
+}
+
+function Test-BridgeWorktreeInUse {
+    param([Parameter(Mandatory)][string]$WorktreePath, [Parameter(Mandatory)]$Usage)
+    if (-not $Usage.Known) { return $true }
+    $directory = Resolve-BridgeWorkspaceDirectory -Path $WorktreePath
+    foreach ($cwd in $Usage.Directories) {
+        if ((Test-BridgeInstallPath -Left $cwd -Right $directory) -or
+            (Test-BridgeInstallDescendant -Path $cwd -Root $directory)) { return $true }
+    }
+    $false
 }
 
 function Get-BridgeRepositoryBaseRef {
@@ -344,10 +647,14 @@ function Get-BridgeRepositoryBaseRef {
 
     $head = Invoke-BridgeGit -Directory $RepositoryPath -Arguments @('symbolic-ref', '--quiet', 'refs/remotes/origin/HEAD')
     if ($head.Ok -and $head.Output -match 'refs/remotes/(origin/.+)$') { return $Matches[1] }
+    if ($head.Code -notin @(0, 1)) { throw "Cannot read the repository's default reference: $($head.Output)" }
     foreach ($candidate in @('origin/main', 'origin/master')) {
         $check = Invoke-BridgeGit -Directory $RepositoryPath -Arguments @('rev-parse', '--verify', '--quiet', $candidate)
         if ($check.Ok -and $check.Output) { return $candidate }
+        if ($check.Code -ne 1) { throw "Cannot read repository reference '$candidate': $($check.Output)" }
     }
+    $local = Invoke-BridgeGit -Directory $RepositoryPath -Arguments @('rev-parse', '--verify', '--quiet', 'HEAD')
+    if (-not $local.Ok) { throw 'The repository has no readable base commit for an isolated worktree.' }
     'HEAD'
 }
 
@@ -367,7 +674,7 @@ function Get-BridgeWorktreeMarkerPath {
     if (-not [System.IO.File]::Exists($dotGit)) { return '' }
     $text = try { [System.IO.File]::ReadAllText($dotGit) } catch { '' }
     if ($text -notmatch '(?m)^gitdir:\s*(.+?)\s*$') { return '' }
-    try { Join-Path ([System.IO.Path]::GetFullPath($Matches[1])) 'agent-bridge-created' } catch { '' }
+    try { Join-Path ([System.IO.Path]::GetFullPath($Matches[1], [System.IO.Path]::GetFullPath($Path))) 'agent-bridge-created' } catch { '' }
 }
 
 function Test-BridgeManagedWorktree {
@@ -389,37 +696,38 @@ function Test-BridgeManagedWorktree {
 }
 
 function Get-BridgeWorktreeCreatedAt {
-    <# When the bridge made this worktree, from its marker; its directory otherwise. #>
+    <# An unreadable or malformed ownership marker cannot prove a tree old enough. #>
     param([Parameter(Mandatory)][string]$Path)
 
     $marker = Get-BridgeWorktreeMarkerPath -Path $Path
     if ($marker -and [System.IO.File]::Exists($marker)) {
-        $raw = try { [System.IO.File]::ReadAllText($marker).Trim() } catch { '' }
+        $raw = [System.IO.File]::ReadAllText($marker).Trim()
         $parsed = [datetime]::MinValue
-        if ($raw -and [datetime]::TryParse($raw, [ref]$parsed)) { return $parsed }
+        if ($raw -and [datetime]::TryParseExact($raw, 'o', [Globalization.CultureInfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed)) { return $parsed }
     }
-    try { (Get-Item -LiteralPath $Path -Force).CreationTime } catch { [datetime]::Now }
+    throw "The worktree's ownership timestamp is missing or invalid: $Path"
+}
+
+function Get-BridgeRepositoryWorktree {
+    param([Parameter(Mandatory)][string]$RepositoryPath)
+
+    $listed = Invoke-BridgeGit -Directory $RepositoryPath -Arguments @('worktree', 'list', '--porcelain', '-z')
+    if (-not $listed.Ok) { throw "Cannot enumerate the repository's worktrees: $($listed.Output)" }
+
+    $found = [System.Collections.Generic.List[string]]::new()
+    foreach ($field in ($listed.Output -split "`0")) {
+        if (-not $field.StartsWith('worktree ')) { continue }
+        $found.Add([System.IO.Path]::GetFullPath($field.Substring(9)))
+    }
+    @($found.ToArray())
 }
 
 function Get-BridgeManagedWorktree {
-    <#
-        The worktrees of a repository that the bridge made for itself. Never the
-        repository's own working tree, and never one made by hand.
-    #>
+    <# The repository's registered, marked linked worktrees; never its primary tree. #>
     param([Parameter(Mandatory)][string]$RepositoryPath)
-
-    $listed = Invoke-BridgeGit -Directory $RepositoryPath -Arguments @('worktree', 'list', '--porcelain')
-    if (-not $listed.Ok) { return @() }
-
-    $found = [System.Collections.Generic.List[string]]::new()
-    foreach ($line in ($listed.Output -split "`r?`n")) {
-        if ($line -notmatch '^worktree\s+(.+)$') { continue }
-        $path = $Matches[1].Trim()
-        try { $path = [System.IO.Path]::GetFullPath($path) } catch { continue }
-        if (-not (Test-BridgeManagedWorktree -Path $path)) { continue }
-        $found.Add($path)
-    }
-    @($found)
+    @(Get-BridgeRepositoryWorktree -RepositoryPath $RepositoryPath |
+        Where-Object { Test-BridgeManagedWorktree -Path $_ })
 }
 
 function Test-BridgeWorktreeFinished {
@@ -447,57 +755,141 @@ function Test-BridgeWorktreeFinished {
     if (-not [System.IO.Directory]::Exists($WorktreePath)) { return $false }
 
     # --no-optional-locks so asking the question cannot itself write to the index.
-    $status = Invoke-BridgeGit -Directory $WorktreePath -Arguments @('--no-optional-locks', 'status', '--porcelain')
+    $status = Invoke-BridgeGit -Directory $WorktreePath -Arguments @('--no-optional-locks', 'status', '--porcelain', '--untracked-files=all', '--ignored=matching')
     if (-not $status.Ok -or $status.Output) { return $false }
 
     $branch = Invoke-BridgeGit -Directory $WorktreePath -Arguments @('symbolic-ref', '--quiet', 'HEAD')
-    if ($branch.Ok) { return $false }
+    if ($branch.Ok -or $branch.Code -ne 1) { return $false }
 
     $ahead = Invoke-BridgeGit -Directory $WorktreePath -Arguments @('rev-list', '--count', "$BaseRef..HEAD")
     if (-not $ahead.Ok -or $ahead.Output -ne '0') { return $false }
 
-    try { $created = Get-BridgeWorktreeCreatedAt -Path $WorktreePath } catch { return $false }
+    try { $created = Get-BridgeWorktreeCreatedAt -Path $WorktreePath }
+    catch { Write-Warning $_.Exception.Message; return $false }
     ([datetime]::Now - $created).TotalHours -ge $IdleHours
 }
 
-function Remove-BridgeFinishedWorktree {
-    <#
-        Removes managed worktrees that hold nothing worth keeping, and returns how
-        many went.
-
-        A directory a session has recently worked in is left alone whatever its git
-        state says, because that is the one signal here that something may still be
-        using it.
-    #>
+function Remove-BridgeWorktreeFiles {
+    <# Even non-forced `git worktree remove` recursively deletes ignored files.
+       Remove only clean tracked paths through a private index, then use rmdir's
+       atomic empty-directory check. Never recursively delete a working directory. #>
     param(
-        [Parameter(Mandatory)][string]$RepositoryPath,
+        [Parameter(Mandatory)][string]$WorktreePath,
+        [Parameter(Mandatory)][string]$BaseRef,
         [double]$IdleHours = 12
     )
 
-    $baseRef = Get-BridgeRepositoryBaseRef -RepositoryPath $RepositoryPath
+    $marker = Get-BridgeWorktreeMarkerPath -Path $WorktreePath
+    if (-not $marker) { return $false }
+    $admin = Split-Path $marker -Parent
+    if ([System.IO.File]::Exists((Join-Path $admin 'locked'))) { return $false }
+    $ownedLocks = [System.Collections.Generic.List[object]]::new()
+    $temporaryIndex = Join-Path $admin ("agent-bridge-cleanup-" + [guid]::NewGuid().ToString('N') + '.index')
+    $dotGit = Join-Path $WorktreePath '.git'
+    $stagedPointer = Join-Path (Split-Path $WorktreePath -Parent) ('.agent-bridge-cleanup-' + [guid]::NewGuid().ToString('N'))
+    $removedTracked = $false
+    $removedDirectory = $false
+    try {
+        foreach ($name in @('HEAD.lock', 'index.lock')) {
+            $path = Join-Path $admin $name
+            $stream = [System.IO.File]::Open($path, [System.IO.FileMode]::CreateNew,
+                [System.IO.FileAccess]::Write, [System.IO.FileShare]::None)
+            $ownedLocks.Add([pscustomobject]@{ Stream = $stream; Path = $path })
+        }
+        if (-not (Test-BridgeWorktreeFinished -WorktreePath $WorktreePath -BaseRef $BaseRef -IdleHours $IdleHours)) { return $false }
+        $usage = Get-BridgeWorktreeUsage
+        if (-not $usage.Known) { throw "Workspace usage is unknown: $($usage.Detail)" }
+        if (Test-BridgeWorktreeInUse -WorktreePath $WorktreePath -Usage $usage) { return $false }
 
-    # Keyed on the worktree's git admin directory as well as its path. The admin
-    # directory is written into the worktree's own `.git` file by git, so it reads the
-    # same whichever spelling of the path you arrive through - and on macOS there are
-    # two, because /var and /private/var are the same place. A session reporting the
-    # one and git reporting the other is how a worktree in use could look idle.
-    $inUse = @{}
-    foreach ($recent in @(Get-BridgeDiscoveredWorkspaces)) {
-        $inUse[$recent.TrimEnd('\', '/').ToLowerInvariant()] = $true
-        $marker = Get-BridgeWorktreeMarkerPath -Path $recent
-        if ($marker) { $inUse[$marker.ToLowerInvariant()] = $true }
+        $entries = Invoke-BridgeGit -Directory $WorktreePath -Arguments @('ls-files', '--stage', '-z')
+        if (-not $entries.Ok) { throw "Cannot read the tracked-file inventory: $($entries.Output)" }
+        $directories = [System.Collections.Generic.HashSet[string]]::new(
+            $(if ($script:BridgeIsWindows) { [StringComparer]::OrdinalIgnoreCase } else { [StringComparer]::Ordinal }))
+        $count = 0
+        foreach ($entry in ($entries.Output -split "`0" | Where-Object { $_ })) {
+            # Submodules and symlinks require operator cleanup, not traversal here.
+            if ($entry -notmatch '(?s)^100(?:644|755) [a-f0-9]+ 0\t(.+)$') {
+                throw 'Linked, conflicted or unsupported tracked entries require explicit worktree cleanup.'
+            }
+            $file = [System.IO.Path]::GetFullPath($Matches[1], $WorktreePath)
+            if (-not (Test-BridgeInstallDescendant -Path $file -Root $WorktreePath)) { throw 'A tracked path escaped its worktree.' }
+            $parent = Split-Path $file -Parent
+            while (Test-BridgeInstallDescendant -Path $parent -Root $WorktreePath) {
+                [void]$directories.Add($parent)
+                $parent = Split-Path $parent -Parent
+            }
+            $count++
+        }
+        $prepared = Invoke-BridgeGit -Directory $WorktreePath -Arguments @('read-tree', 'HEAD') -IndexFile $temporaryIndex
+        if (-not $prepared.Ok) { throw "Cannot prepare safe tracked-file cleanup: $($prepared.Output)" }
+        if ($count -gt 0) {
+            $removedTracked = $true
+            $files = Invoke-BridgeGit -Directory $WorktreePath -Arguments @('rm', '-r', '--quiet', '--', '.') -IndexFile $temporaryIndex
+            if (-not $files.Ok) { throw "Tracked-file cleanup was refused: $($files.Output)" }
+        }
+        foreach ($directory in @($directories | Sort-Object Length -Descending)) {
+            if ([System.IO.Directory]::Exists($directory)) { [System.IO.Directory]::Delete($directory, $false) }
+        }
+        [System.IO.File]::Move($dotGit, $stagedPointer)
+        [System.IO.Directory]::Delete($WorktreePath, $false)
+        $removedDirectory = $true
     }
+    catch { Write-Warning "Worktree cleanup stopped without recursive deletion: $($_.Exception.Message)" }
+    finally {
+        if (-not $removedDirectory) {
+            if ([System.IO.File]::Exists($stagedPointer)) {
+                try { [System.IO.File]::Move($stagedPointer, $dotGit) }
+                catch { Write-Warning "Worktree metadata was retained at '$stagedPointer'; automatic restoration was refused: $($_.Exception.Message)" }
+            }
+            if ($removedTracked -and [System.IO.File]::Exists($dotGit)) {
+                # Without --force, checkout-index restores missing files only. A new
+                # user file is never overwritten to make an aborted cleanup look clean.
+                $restore = Invoke-BridgeGit -Directory $WorktreePath -Arguments @('checkout-index', '--all')
+                if (-not $restore.Ok) { Write-Warning "Existing files were preserved; inspect the stopped worktree cleanup: $($restore.Output)" }
+            }
+        }
+        foreach ($temporary in @($temporaryIndex) + $(if ($removedDirectory) { @($stagedPointer) } else { @() })) {
+            try { if ([System.IO.File]::Exists($temporary)) { [System.IO.File]::Delete($temporary) } }
+            catch { Write-Warning "Cleanup metadata was retained at '$temporary': $($_.Exception.Message)" }
+        }
+        foreach ($lock in $ownedLocks) {
+            try { $lock.Stream.Dispose() }
+            finally {
+                try { [System.IO.File]::Delete($lock.Path) }
+                catch { Write-Warning "The owned cleanup lock could not be removed: $($_.Exception.Message)" }
+            }
+        }
+    }
+    # Leave the missing worktree's administration to Git's normal maintenance.
+    # A repository-wide prune here would also retire other owners' missing trees.
+    $removedDirectory
+}
+
+function Remove-BridgeFinishedWorktree {
+    param([Parameter(Mandatory)][string]$RepositoryPath, [double]$IdleHours = 12)
 
     $removed = 0
-    foreach ($worktree in @(Get-BridgeManagedWorktree -RepositoryPath $RepositoryPath)) {
-        if ($inUse.ContainsKey($worktree.TrimEnd('\', '/').ToLowerInvariant())) { continue }
-        $marker = Get-BridgeWorktreeMarkerPath -Path $worktree
-        if ($marker -and $inUse.ContainsKey($marker.ToLowerInvariant())) { continue }
-        if (-not (Test-BridgeWorktreeFinished -WorktreePath $worktree -BaseRef $baseRef -IdleHours $IdleHours)) { continue }
-        $gone = Invoke-BridgeGit -Directory $RepositoryPath -Arguments @('worktree', 'remove', '--force', $worktree)
-        if ($gone.Ok) { $removed++ }
+    $operation = $null
+    try {
+        $operation = Enter-BridgeWorktreeOperation -RepositoryPath $RepositoryPath
+        $baseRef = Get-BridgeRepositoryBaseRef -RepositoryPath $RepositoryPath
+        $usage = Get-BridgeWorktreeUsage
+        if (-not $usage.Known) { throw "Workspace usage is unknown: $($usage.Detail)" }
+        foreach ($worktree in @(Get-BridgeManagedWorktree -RepositoryPath $RepositoryPath)) {
+            if (Test-BridgeWorktreeInUse -WorktreePath $worktree -Usage $usage) { continue }
+            $common = Invoke-BridgeGit -Directory $worktree -Arguments @('rev-parse', '--path-format=absolute', '--git-common-dir')
+            if (-not $common.Ok -or -not (Test-BridgeInstallPath -Left (Resolve-BridgeWorkspaceDirectory $common.Output) -Right $operation.CommonDirectory)) {
+                Write-Warning "Worktree repository ownership is uncertain; preserving '$worktree'."
+                continue
+            }
+            if (-not (Test-BridgeWorktreeFinished -WorktreePath $worktree -BaseRef $baseRef -IdleHours $IdleHours)) { continue }
+            if (Remove-BridgeWorktreeFiles -WorktreePath $worktree -BaseRef $baseRef -IdleHours $IdleHours) { $removed++ }
+        }
     }
-    if ($removed -gt 0) { [void](Invoke-BridgeGit -Directory $RepositoryPath -Arguments @('worktree', 'prune')) }
+    catch { Write-Warning "Managed worktrees were retained because cleanup could not be authorized: $($_.Exception.Message)" }
+    finally {
+        if ($null -ne $operation) { $operation.Mutex.ReleaseMutex(); $operation.Mutex.Dispose() }
+    }
     $removed
 }
 
@@ -507,10 +899,8 @@ function New-BridgeSessionWorktree {
         repository cannot move each other's HEAD - which is the whole reason this
         exists. Returns the directory to launch in and a line for the log.
 
-        Every failure returns the repository itself. Isolation is worth a great deal,
-        but not a launch that does not happen: git missing, a workspace that is not a
-        repository, a full disk - all of them mean "launch where you were told to",
-        with the reason recorded.
+        Failure has no executable path. The caller must refuse the launch rather than
+        silently trading away requested isolation.
     #>
     param(
         [Parameter(Mandatory)][string]$RepositoryPath,
@@ -518,68 +908,109 @@ function New-BridgeSessionWorktree {
         [double]$IdleHours = -1
     )
 
-    $fallback = [pscustomobject]@{ Path = $RepositoryPath; Isolated = $false; Detail = '' }
+    $refused = [pscustomobject]@{ Path = ''; Isolated = $false; Detail = '' }
     if ($Limit -lt 0) { $Limit = [int](Get-BridgeSetting 'newSession.worktreeLimit' 10) }
     if ($IdleHours -lt 0) { $IdleHours = [double](Get-BridgeSetting 'newSession.worktreeIdleHours' 12) }
+    if ($Limit -lt 0 -or $IdleHours -lt 0 -or [double]::IsNaN($IdleHours) -or [double]::IsInfinity($IdleHours)) {
+        $refused.Detail = 'Worktree limits and idle hours must be nonnegative, finite values.'
+        return $refused
+    }
 
     $root = Get-BridgeWorktreeRoot
-    if (-not $root) { return $fallback }
+    if (-not $root) {
+        $refused.Detail = 'The configured worktree root is empty or invalid; correct newSession.worktreeRoot.'
+        return $refused
+    }
 
     $inside = Invoke-BridgeGit -Directory $RepositoryPath -Arguments @('rev-parse', '--show-toplevel')
     if (-not $inside.Ok) {
-        $fallback.Detail = "$RepositoryPath is not a git repository, so the session runs there directly"
-        return $fallback
+        $refused.Detail = "Cannot establish the repository for isolation: $($inside.Output)"
+        return $refused
     }
 
-    # Finished worktrees are cleared before the cap is judged, so a long-lived
-    # install does not end up refusing isolation because of sessions that ended days
-    # ago. Best effort: a prune that fails must not stop a launch.
-    $removed = 0
-    try { $removed = Remove-BridgeFinishedWorktree -RepositoryPath $RepositoryPath -IdleHours $IdleHours } catch { }
-
-    $existing = @(Get-BridgeManagedWorktree -RepositoryPath $RepositoryPath)
-    if ($Limit -gt 0 -and $existing.Count -ge $Limit) {
-        $fallback.Detail = "$($existing.Count) worktrees already exist (limit $Limit), so the session runs in $RepositoryPath - finish or remove some"
-        return $fallback
-    }
-
-    # Fetch first so the worktree starts from what the remote has now, not from
-    # whatever this clone last saw. Best effort: offline is not a reason to refuse.
-    [void](Invoke-BridgeGit -Directory $RepositoryPath -Arguments @('fetch', 'origin', '--quiet'))
-    $baseRef = Get-BridgeRepositoryBaseRef -RepositoryPath $RepositoryPath
-
-    $leaf = [System.IO.Path]::GetFileName($RepositoryPath.TrimEnd('\', '/'))
-    if ([string]::IsNullOrWhiteSpace($leaf)) { $leaf = 'repo' }
-    # Named for when it was made, so the directory says which session it belongs to
-    # and two launches in the same second still get their own.
-    $stamp = [DateTime]::Now.ToString('yyyyMMdd-HHmmss')
-    $target = Join-Path $root "$leaf-$stamp"
-    $suffix = 1
-    while ([System.IO.Directory]::Exists($target)) {
-        $target = Join-Path $root "$leaf-$stamp-$suffix"
-        $suffix++
-        if ($suffix -gt 50) { return $fallback }
-    }
-
-    try { [void][System.IO.Directory]::CreateDirectory($root) } catch { }
-    $added = Invoke-BridgeGit -Directory $RepositoryPath -Arguments @('worktree', 'add', '--detach', $target, $baseRef)
-    if (-not $added.Ok -or -not [System.IO.Directory]::Exists($target)) {
-        $fallback.Detail = "could not create a worktree ($($added.Output)), so the session runs in $RepositoryPath"
-        return $fallback
-    }
-
-    # The marker is what makes this one the bridge's to tidy up later, and carries the
-    # moment it was made. If it cannot be written the worktree simply stays unmanaged
-    # and is never pruned - the safe direction to fail in.
+    $operation = $null
     try {
-        $marker = Get-BridgeWorktreeMarkerPath -Path $target
-        if ($marker) { [System.IO.File]::WriteAllText($marker, [DateTime]::Now.ToString('o')) }
-    }
-    catch { }
+        $operation = Enter-BridgeWorktreeOperation -RepositoryPath $RepositoryPath
+        # Finished worktrees are cleared before the cap is judged, so a long-lived
+        # install does not end up refusing isolation because of sessions that ended days
+        # ago. Best effort: a prune that fails must not stop a launch.
+        $removed = 0
+        try { $removed = Remove-BridgeFinishedWorktree -RepositoryPath $RepositoryPath -IdleHours $IdleHours }
+        catch { Write-Warning "Worktree cleanup was refused; existing trees were retained: $($_.Exception.Message)" }
 
-    $detail = "$target from $baseRef"
-    if ($removed -gt 0) { $detail += " (removed $removed finished)" }
-    [pscustomobject]@{ Path = $target; Isolated = $true; Detail = $detail }
+        $existing = @(Get-BridgeManagedWorktree -RepositoryPath $RepositoryPath)
+        $registered = @(Get-BridgeRepositoryWorktree -RepositoryPath $RepositoryPath)
+        if ($Limit -gt 0 -and $existing.Count -ge $Limit) {
+            $refused.Detail = "$($existing.Count) managed worktrees already exist (limit $Limit); finish or explicitly remove some before launching."
+            return $refused
+        }
+
+        # Fetch first so the worktree starts from what the remote has now, not from
+        # whatever this clone last saw. Best effort: offline is not a reason to refuse.
+        $fetch = Invoke-BridgeGit -Directory $RepositoryPath -Arguments @('fetch', 'origin', '--quiet')
+        $baseRef = Get-BridgeRepositoryBaseRef -RepositoryPath $RepositoryPath
+
+        $leaf = [System.IO.Path]::GetFileName($RepositoryPath.TrimEnd('\', '/'))
+        if ([string]::IsNullOrWhiteSpace($leaf)) { $leaf = 'repo' }
+        # Named for when it was made, so the directory says which session it belongs to
+        # and two launches in the same second still get their own.
+        $stamp = [DateTime]::Now.ToString('yyyyMMdd-HHmmss')
+        $target = Join-Path $root "$leaf-$stamp"
+        $suffix = 1
+        while ((Test-Path -LiteralPath $target) -or @($registered | Where-Object { Test-BridgeInstallPath -Left $_ -Right $target }).Count -gt 0) {
+            $target = Join-Path $root "$leaf-$stamp-$suffix"
+            $suffix++
+            if ($suffix -gt 50) {
+                $refused.Detail = 'No unused worktree name is available; existing directories were preserved.'
+                return $refused
+            }
+        }
+
+        try { [void][System.IO.Directory]::CreateDirectory($root) }
+        catch {
+            $refused.Detail = "Cannot create the worktree root: $($_.Exception.Message)"
+            return $refused
+        }
+        $added = Invoke-BridgeGit -Directory $RepositoryPath -Arguments @('worktree', 'add', '--detach', $target, $baseRef)
+        if (-not $added.Ok -or -not [System.IO.Directory]::Exists($target)) {
+            $refused.Detail = "Could not create an isolated worktree: $($added.Output)"
+            return $refused
+        }
+
+        # The marker is what makes this one the bridge's to tidy up later, and carries the
+        # moment it was made. If it cannot be written the worktree simply stays unmanaged
+        # and is never pruned - the safe direction to fail in.
+        try {
+            $marker = Get-BridgeWorktreeMarkerPath -Path $target
+            if ($marker) { [System.IO.File]::WriteAllText($marker, [DateTime]::Now.ToString('o')) }
+        }
+        catch { Write-Warning "The isolated worktree is retained unmanaged because its marker could not be written: $($_.Exception.Message)" }
+
+        $relative = Get-BridgeWorkspaceRelativeDirectory -Path $RepositoryPath -RepositoryRoot $inside.Output
+        $targetRoot = Resolve-BridgeWorkspaceDirectory -Path $target
+        $launchPath = [System.IO.Path]::GetFullPath($relative, $targetRoot)
+        if (-not [System.IO.Directory]::Exists($launchPath)) {
+            $refused.Detail = 'The approved subdirectory is absent from the isolated base; the new worktree was retained without launching.'
+            return $refused
+        }
+        $launchPath = Resolve-BridgeWorkspaceDirectory -Path $launchPath
+        if (-not (Test-BridgeInstallPath -Left $launchPath -Right $targetRoot) -and
+            -not (Test-BridgeInstallDescendant -Path $launchPath -Root $targetRoot)) {
+            $refused.Detail = 'The approved subdirectory escapes the isolated worktree; launch was refused.'
+            return $refused
+        }
+        $detail = "$launchPath from $baseRef"
+        if ($removed -gt 0) { $detail += " (removed $removed finished)" }
+        if (-not $fetch.Ok) { $detail += '; origin fetch failed, so the existing local base was used' }
+        [pscustomobject]@{ Path = $launchPath; Isolated = $true; Detail = $detail }
+    }
+    catch {
+        $refused.Detail = "Could not provide requested isolation: $($_.Exception.Message)"
+        $refused
+    }
+    finally {
+        if ($null -ne $operation) { $operation.Mutex.ReleaseMutex(); $operation.Mutex.Dispose() }
+    }
 }
 
 function Resolve-BridgeWorkspacePath {
@@ -1931,14 +2362,13 @@ function Get-BridgeCopilotSessionEntries {
         $updated = [DateTimeOffset]$dir.LastWriteTimeUtc
         $workspace = Join-Path $dir.FullName 'workspace.yaml'
         if ([System.IO.File]::Exists($workspace)) {
-            foreach ($line in [System.IO.File]::ReadAllLines($workspace)) {
-                if ($line -match '^(\w+):\s*(.*)$') {
-                    $value = $Matches[2].Trim().Trim('"', "'")
-                    switch ($Matches[1]) {
-                        'cwd' { $folder = $value }
-                        'summary' { $summary = $value }
-                        'updated_at' { $parsed = [DateTimeOffset]::MinValue; if ([DateTimeOffset]::TryParse($value, [ref]$parsed)) { $updated = $parsed } }
-                    }
+            $fields = Read-BridgeCopilotWorkspace -Path $workspace
+            foreach ($key in $fields.Keys) {
+                $value = [string]$fields[$key]
+                switch ($key) {
+                    'cwd' { $folder = $value }
+                    'summary' { $summary = $value }
+                    'updated_at' { $parsed = [DateTimeOffset]::MinValue; if ([DateTimeOffset]::TryParse($value, [ref]$parsed)) { $updated = $parsed } }
                 }
             }
         }

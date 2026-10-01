@@ -20,6 +20,18 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '..\hooks\decision-bridge-common.ps1')
 . (Join-Path $PSScriptRoot '..\hooks\session-launch.ps1')
 
+# This suite has no agent processes. The real process/registration matrix lives in
+# test-p4-worktree-safety; unrelated developer sessions are outside this fixture.
+function Get-Process {
+    [CmdletBinding()]
+    [OutputType([System.Diagnostics.Process], [object[]])]
+    param([string[]]$Name = @(), [int[]]$Id = @())
+    $own = Microsoft.PowerShell.Management\Get-Process -Id $PID
+    if ($Id.Count -and $PID -notin $Id) { return @() }
+    if ($Name.Count -and @($Name | Where-Object { $own.ProcessName -like $_ }).Count -eq 0) { return @() }
+    $own
+}
+
 $script:Failures = 0
 function Test-That {
     param([string]$Name, [scriptblock]$Condition, [string]$Detail = '')
@@ -94,8 +106,8 @@ try {
     $first = New-BridgeSessionWorktree -RepositoryPath $repo
     Test-That 'it reports the session is isolated' { $first.Isolated }
     Test-That 'the directory exists' { [System.IO.Directory]::Exists($first.Path) }
-    Test-That 'it is under the configured root, which is what makes it the bridge''s to prune' {
-        $first.Path.StartsWith($root)
+    Test-That 'it is physically under the configured worktree root' {
+        Test-BridgeInstallDescendant -Path $first.Path -Root (Resolve-BridgeWorkspaceDirectory -Path $root)
     } "[$($first.Path)]"
     Test-That 'it is a real worktree of that repository' {
         Test-Listed -List @(Get-BridgeManagedWorktree -RepositoryPath $repo) -Path $first.Path
@@ -211,31 +223,34 @@ try {
     Write-Host '--- a session in a folder is left alone whatever git says about it ---'
     $busyWorktree = (New-BridgeSessionWorktree -RepositoryPath $repo).Path
         Set-Aged -Path $busyWorktree -Hours 48
-        # Named distinctly on purpose. A stub's free variables are resolved in whatever
-        # scope calls it, so a stub returning `$busy` would pick up a local called $busy
-        # inside the function under test rather than this one - which is exactly what
-        # happened, and it failed with "Hashtable does not contain a method named
-        # TrimEnd" from deep inside the pruner.
-        function Get-BridgeDiscoveredWorkspaces { @($busyWorktree) }
-        Test-That 'a recently used worktree survives a prune' {
-            (Remove-BridgeFinishedWorktree -RepositoryPath $repo -IdleHours 12) -eq 0 -and
-            (Test-Listed -List @(Get-BridgeManagedWorktree -RepositoryPath $repo) -Path $busyWorktree)
+        # This is the caller's reported-usage control, not proof of the reader.
+        # test-p4-worktree-safety exercises actual processes and registration files.
+        $realUsage = ${function:Get-BridgeWorktreeUsage}
+        try {
+            $script:ReportedWorktree = $busyWorktree
+            function Get-BridgeWorktreeUsage {
+                [pscustomobject]@{ Known = $true; Directories = @($script:ReportedWorktree); Detail = '' }
+            }
+            Test-That 'a worktree reported in use survives cleanup' {
+                (Remove-BridgeFinishedWorktree -RepositoryPath $repo -IdleHours 12) -eq 0 -and
+                (Test-Listed -List @(Get-BridgeManagedWorktree -RepositoryPath $repo) -Path $busyWorktree)
+            }
         }
-        function Get-BridgeDiscoveredWorkspaces { @() }
+        finally { ${function:Get-BridgeWorktreeUsage} = $realUsage }
 
     Write-Host ''
-    Write-Host '--- a launch is never blocked by any of this ---'
+    Write-Host '--- requested isolation never falls back to the repository ---'
     $notRepo = Join-Path $sandbox 'plain'
     [void][System.IO.Directory]::CreateDirectory($notRepo)
     $plain = New-BridgeSessionWorktree -RepositoryPath $notRepo
-    Test-That 'a workspace that is not a repository runs where it was told to' {
-        -not $plain.Isolated -and $plain.Path -eq $notRepo
+    Test-That 'a non-repository cannot provide requested isolation or an executable fallback' {
+        -not $plain.Isolated -and [string]::IsNullOrWhiteSpace($plain.Path)
     }
     Test-That 'and says why' { $plain.Detail -match 'not a git repository' } "[$($plain.Detail)]"
 
     $capped = New-BridgeSessionWorktree -RepositoryPath $repo -Limit 1
-    Test-That 'hitting the worktree limit falls back to the repository rather than failing' {
-        -not $capped.Isolated -and $capped.Path -eq $repo
+    Test-That 'hitting the worktree limit refuses an executable fallback' {
+        -not $capped.Isolated -and [string]::IsNullOrWhiteSpace($capped.Path)
     }
     Test-That 'and says how to clear it' { $capped.Detail -match 'limit 1' } "[$($capped.Detail)]"
 
@@ -268,7 +283,7 @@ try {
     Test-That 'a worktree the bridge made is never offered as a workspace of its own' {
         @($withDiscovery | Where-Object { $_.Path -eq $first.Path }).Count -eq 0
     } "[$(@($withDiscovery | ForEach-Object { $_.Label }) -join ', ')]"
-    Test-That 'while an ordinary discovered folder still is' {
+    Test-That 'while an ordinary explicitly configured folder remains available' {
         @($withDiscovery | Where-Object { $_.Path -eq $notRepo }).Count -eq 1
     }
 }

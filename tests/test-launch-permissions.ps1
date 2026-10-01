@@ -173,7 +173,13 @@ try {
 
     Write-Host "`n--- the daemon opens the control on what the machine would have done ---"
     $env:AGENT_BRIDGE_DAEMON_NORUN = '1'
-    Set-TestConfig @{ homeAssistant = @{ token = 't' }; newSession = @{ allowAllTools = $true } }
+    Set-TestConfig @{
+        homeAssistant = @{ token = 't' }
+        newSession = @{
+            allowAllTools = $true
+            workspaces = @(@{ label = 'Bridge'; path = $scratch })
+        }
+    }
     . (Join-Path $PSScriptRoot '..\hooks\agent-bridge-daemon.ps1')
     $script:DaemonConfig.LogFile = Join-Path $scratch 'daemon.log'
 

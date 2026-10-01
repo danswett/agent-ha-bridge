@@ -226,7 +226,11 @@ function Get-DaemonResumableSessions {
         if (-not [string]::IsNullOrWhiteSpace($id)) { $live[[string]$id] = $true }
     }
 
-    @(@($script:DaemonResumeCache) | Where-Object { -not $live.ContainsKey([string]$_.SessionId) })
+    @(@($script:DaemonResumeCache) | Where-Object {
+        -not $live.ContainsKey([string]$_.SessionId) -and
+        $_.PSObject.Properties['Folder'] -and
+        (Test-BridgeWorkspacePathApproved -Path ([string]$_.Folder))
+    })
 }
 
 # Which daemon entity drives each tuning axis. Spelled out rather than derived from
@@ -749,6 +753,12 @@ function Resolve-DaemonLaunchRequest {
     }
     catch { }
     if ($null -ne $resumeSession) {
+        if (-not $resumeSession.PSObject.Properties['Folder'] -or
+            -not (Test-BridgeWorkspacePathApproved -Path ([string]$resumeSession.Folder))) {
+            Write-DaemonLog -Message 'resume refused: its working directory is missing or no longer approved'
+            Set-CopilotMqttNewSessionResult -Text 'Resume refused: the original directory must exist and be an approved workspace.' -Headers $Headers | Out-Null
+            return $null
+        }
         # Entries from before a list carried its agent came from Agency.
         $chosenLauncher = if ($resumeSession.PSObject.Properties['Launcher'] -and $resumeSession.Launcher) { [string]$resumeSession.Launcher } else { 'agency' }
         if ($launchers -notcontains $chosenLauncher) {
@@ -888,6 +898,13 @@ function Start-DaemonLaunch {
     $agencyProfile = $Request.AgencyProfile
     $resumeSession = $Request.ResumeSession
     $resumeLabel = $Request.ResumeLabel
+    $choice = Get-BridgeWorkspaceChoice -Label $label
+    if ($null -eq $choice -or [string]::IsNullOrWhiteSpace($directory) -or
+        -not (Test-BridgeInstallPath -Left $directory -Right $choice.Path)) {
+        Write-DaemonLog -Message 'launch refused: the selected workspace is no longer approved or does not match the request'
+        Set-CopilotMqttNewSessionResult -Text 'Launch refused: select a currently configured workspace.' -Headers $Headers | Out-Null
+        return
+    }
     # Absent on a request built by an older caller or a test, which then launches
     # with whatever the config asks for, exactly as before these existed.
     $prop = { param($Name) if ($Request.PSObject.Properties[$Name]) { [string]$Request.$Name } else { '' } }
@@ -905,146 +922,193 @@ function Start-DaemonLaunch {
     $tuningNote = (@($model, $effort, $context) | Where-Object { $_ }) -join ' / '
     if ($allowAllTools) { $tuningNote = (@($tuningNote, 'allow all') | Where-Object { $_ }) -join ' / ' }
 
-    if ($null -ne $resumeSession) {
-        $resumeDirectory = [string]$resumeSession.Folder
-        if ([string]::IsNullOrWhiteSpace($resumeDirectory) -or -not [System.IO.Directory]::Exists($resumeDirectory)) {
-            # The folder it ran in has gone. Falling back to the selected workspace
-            # keeps the resume possible rather than failing outright.
-            $resumeDirectory = $directory
+    $worktreeOperation = $null
+    $worktreeReservation = $null
+    $reservationPath = ''
+    try {
+        $candidate = if ($null -ne $resumeSession) { [string]$resumeSession.Folder } else { $directory }
+        if (-not [string]::IsNullOrWhiteSpace($candidate) -and [System.IO.Directory]::Exists($candidate)) {
+            $reservationPath = Get-BridgeWorkspaceManagedWorktree -Path $candidate
         }
-
-        $short = $resumeSession.SessionId.Substring(0, [Math]::Min(8, $resumeSession.SessionId.Length))
-        Write-DaemonLog -Message "resume requested for $short ($resumeDirectory)$(if ($agencyProfile) { " profile '$agencyProfile'" })$(if ($tuningNote) { " [$tuningNote]" })"
-        Set-CopilotMqttNewSessionResult -Text "Resuming $resumeLabel..." -Headers $Headers | Out-Null
-
-        $launchedAt = [DateTimeOffset]::Now
-        $launch = Start-BridgeCopilotSession -WorkingDirectory $resumeDirectory -Prompt $prompt `
-            -AgencyProfile $agencyProfile -SessionId ([string]$resumeSession.SessionId) -Launcher $chosenLauncher `
-            -Model $model -Effort $effort -Context $context -AllowAllTools:$allowAllTools -Resume
-    }
-    else {
-        $agentName = Get-BridgeLauncherLabel -Launcher $chosenLauncher
-
-        # A workspace marked `isolate` launches in a git worktree of its own, so two
-        # sessions in the same repository cannot move each other's HEAD - the failure
-        # this whole feature exists to remove. Only a fresh launch: a resume belongs
-        # in the directory it was already running in, above.
-        $launchDirectory = $directory
-        $choice = Get-BridgeWorkspaceChoice -Label $label
-        if ($null -ne $choice -and $choice.PSObject.Properties['Isolate'] -and $choice.Isolate) {
-            $worktree = [pscustomobject]@{ Path = $directory; Isolated = $false; Detail = '' }
-            try { $worktree = New-BridgeSessionWorktree -RepositoryPath $directory }
-            catch { $worktree.Detail = "worktree creation threw: $($_.Exception.Message)" }
-            if ($worktree.Isolated) { $launchDirectory = $worktree.Path }
-            if ($worktree.Detail) {
-                Write-DaemonLog -Message "$(if ($worktree.Isolated) { 'worktree' } else { 'no worktree' }): $($worktree.Detail)"
+        if (($null -eq $resumeSession -and $choice.Isolate) -or $reservationPath) {
+            try { $worktreeOperation = Enter-BridgeWorktreeOperation -RepositoryPath $candidate }
+            catch {
+                Write-DaemonLog -Message "launch refused: $($_.Exception.Message)"
+                Set-CopilotMqttNewSessionResult -Text "Launch refused: requested workspace protection failed. $($_.Exception.Message)" -Headers $Headers | Out-Null
+                return
             }
         }
 
-        Write-DaemonLog -Message "new $agentName session requested in '$label' ($launchDirectory)$(if ($agencyProfile) { " profile '$agencyProfile'" })$(if ($tuningNote) { " [$tuningNote]" })$(if ($prompt) { " with prompt: $prompt" })"
-        Set-CopilotMqttNewSessionResult -Headers $Headers `
-            -Text "Starting $agentName in $label$(if ($agencyProfile) { " ($agencyProfile)" })..." | Out-Null
+        if ($null -ne $resumeSession) {
+            $resumeDirectory = [string]$resumeSession.Folder
+            if (-not (Test-BridgeWorkspacePathApproved -Path $resumeDirectory)) {
+                Write-DaemonLog -Message 'resume refused: the original directory is missing or no longer approved'
+                Set-CopilotMqttNewSessionResult -Text 'Resume refused: the original directory must exist and be an approved workspace.' -Headers $Headers | Out-Null
+                return
+            }
+            if ($reservationPath) {
+                try { $worktreeReservation = New-BridgeWorktreeLaunchReservation -WorktreePath $reservationPath }
+                catch {
+                    Write-DaemonLog -Message "resume refused: $($_.Exception.Message)"
+                    Set-CopilotMqttNewSessionResult -Text "Resume refused: $($_.Exception.Message)" -Headers $Headers | Out-Null
+                    return
+                }
+            }
 
-        $launchedAt = [DateTimeOffset]::Now
-        $launch = Start-BridgeCopilotSession -WorkingDirectory $launchDirectory -Prompt $prompt `
-            -AgencyProfile $agencyProfile -Launcher $chosenLauncher `
-            -Model $model -Effort $effort -Context $context -AllowAllTools:$allowAllTools
+            $short = $resumeSession.SessionId.Substring(0, [Math]::Min(8, $resumeSession.SessionId.Length))
+            Write-DaemonLog -Message "resume requested for $short ($resumeDirectory)$(if ($agencyProfile) { " profile '$agencyProfile'" })$(if ($tuningNote) { " [$tuningNote]" })"
+            Set-CopilotMqttNewSessionResult -Text "Resuming $resumeLabel..." -Headers $Headers | Out-Null
+
+            $launchedAt = [DateTimeOffset]::Now
+            $launch = Start-BridgeCopilotSession -WorkingDirectory $resumeDirectory -Prompt $prompt `
+                -AgencyProfile $agencyProfile -SessionId ([string]$resumeSession.SessionId) -Launcher $chosenLauncher `
+                -Model $model -Effort $effort -Context $context -AllowAllTools:$allowAllTools -Resume
+        }
+        else {
+            $agentName = Get-BridgeLauncherLabel -Launcher $chosenLauncher
+
+            # A workspace marked `isolate` launches in a git worktree of its own, so two
+            # sessions in the same repository cannot move each other's HEAD - the failure
+            # this whole feature exists to remove. Only a fresh launch: a resume belongs
+            # in the directory it was already running in, above.
+            $launchDirectory = $directory
+            if ($null -ne $choice -and $choice.PSObject.Properties['Isolate'] -and $choice.Isolate) {
+                $worktree = [pscustomobject]@{ Path = ''; Isolated = $false; Detail = '' }
+                try { $worktree = New-BridgeSessionWorktree -RepositoryPath $directory }
+                catch { $worktree.Detail = "worktree creation threw: $($_.Exception.Message)" }
+                if (-not $worktree.Isolated -or [string]::IsNullOrWhiteSpace($worktree.Path) -or
+                    -not [System.IO.Directory]::Exists($worktree.Path) -or
+                    (Test-BridgeInstallPath -Left $worktree.Path -Right $directory)) {
+                    $detail = if ($worktree.Detail) { $worktree.Detail } else { 'No separate worktree was provided.' }
+                    Write-DaemonLog -Message "launch refused: requested isolation failed: $detail"
+                    Set-CopilotMqttNewSessionResult -Text "Launch refused: requested isolation failed. $detail" -Headers $Headers | Out-Null
+                    return
+                }
+                $launchDirectory = $worktree.Path
+                $reservationPath = Get-BridgeWorkspaceManagedWorktree -Path $worktree.Path
+                if ($worktree.Detail) {
+                    Write-DaemonLog -Message "$(if ($worktree.Isolated) { 'worktree' } else { 'no worktree' }): $($worktree.Detail)"
+                }
+            }
+            if ($reservationPath) {
+                try { $worktreeReservation = New-BridgeWorktreeLaunchReservation -WorktreePath $reservationPath }
+                catch {
+                    Write-DaemonLog -Message "launch refused: $($_.Exception.Message)"
+                    Set-CopilotMqttNewSessionResult -Text "Launch refused: $($_.Exception.Message)" -Headers $Headers | Out-Null
+                    return
+                }
+            }
+
+            Write-DaemonLog -Message "new $agentName session requested in '$label' ($launchDirectory)$(if ($agencyProfile) { " profile '$agencyProfile'" })$(if ($tuningNote) { " [$tuningNote]" })$(if ($prompt) { " with prompt: $prompt" })"
+            Set-CopilotMqttNewSessionResult -Headers $Headers `
+                -Text "Starting $agentName in $label$(if ($agencyProfile) { " ($agencyProfile)" })..." | Out-Null
+
+            $launchedAt = [DateTimeOffset]::Now
+            $launch = Start-BridgeCopilotSession -WorkingDirectory $launchDirectory -Prompt $prompt `
+                -AgencyProfile $agencyProfile -Launcher $chosenLauncher `
+                -Model $model -Effort $effort -Context $context -AllowAllTools:$allowAllTools
+        }
+
+        if (-not $launch.Launched) {
+            Write-DaemonLog -Message "new session launch failed: $($launch.Detail)"
+            $protectionNote = if ($null -ne $worktreeReservation) { ' The worktree remains reserved for inspection.' } else { '' }
+            Set-CopilotMqttNewSessionResult -Text "Launch failed: $($launch.Detail)$protectionNote" -Headers $Headers | Out-Null
+            return
+        }
+
+        Write-DaemonLog -Message "new session launched: $($launch.Detail) (session $(if ($launch.SessionId) { $launch.SessionId } else { 'id chosen by the agent' }))"
+
+        # Remember what this session was started with, so its card can say so. The
+        # command line is the only record of effort and context - neither appears in a
+        # transcript, and no agent reports them back - so if it is not kept here it is
+        # gone.
+        #
+        # Read defensively: what actually started the session is stubbed in tests and
+        # replaceable in principle, and a result without these three should cost the card
+        # its settings line, not fail a launch that has already happened.
+        $launched = { param($Name) if ($launch.PSObject.Properties[$Name]) { [string]$launch.$Name } else { '' } }
+        $launchTuning = [pscustomobject]@{
+            Model   = & $launched 'Model'
+            Effort  = & $launched 'Effort'
+            Context = & $launched 'Context'
+            At      = $launchedAt
+            # Whether this reopened an existing session rather than starting a new one.
+            # Adoption reads it to decide where in the transcript to start: a session
+            # starting from nothing has its whole transcript read, so a first answer that
+            # arrives before the daemon adopts it is still seen, while a resumed one is
+            # picked up at the end so its old conversation is not replayed onto the card.
+            Resumed = ($null -ne $resumeSession)
+        }
+        # Copilot, Agency and Claude register under the id the bridge invented, so the
+        # record is filed under it straight away. Codex picks its own, so its launch waits
+        # under the pending key until Update-DaemonPendingLaunch learns which session it
+        # actually produced and moves it across - the same answer, from the same place,
+        # that stamps the launch's driver.
+        $tuningKey = if ($launch.SessionId) { [string]$launch.SessionId } else { $script:DaemonPendingTuningKey }
+        $script:DaemonLaunchedTuning[$tuningKey] = $launchTuning
+
+        # Remember the process the bridge started, so End session can close the console
+        # window it opened rather than leaving an empty terminal behind. Codex picks its
+        # own id, so there is nothing to key it by.
+        if ($launch.ProcessId -gt 0 -and $launch.SessionId) {
+            $script:DaemonLaunchedPids[[string]$launch.SessionId] = [int]$launch.ProcessId
+        }
+
+        $verb = if ($null -ne $resumeSession) { 'Resumed' } else { 'Started' }
+        $where = if ($null -ne $resumeSession) {
+            if ($agencyProfile) { "$resumeLabel ($agencyProfile)" } else { [string]$resumeLabel }
+        }
+        elseif ($agencyProfile) { "$label ($agencyProfile)" }
+        else { $label }
+
+        # The process id only proves something started; the session registering proves
+        # it got far enough to be adopted. That is followed up on each pass of the loop
+        # (Update-DaemonPendingLaunch) rather than waited for here: waiting stalled the
+        # whole daemon - replies, streaming, everything - for up to 25 seconds per launch.
+        $script:DaemonPendingLaunch = [pscustomobject]@{
+            SessionId      = [string]$launch.SessionId
+            ProcessId      = [int]$launch.ProcessId
+            Launcher       = $chosenLauncher
+            Label          = [string]$where
+            Verb           = $verb
+            Since          = $launchedAt
+            LastCheck      = [DateTimeOffset]::MinValue
+            TrustAskedAt   = $null
+            # Allow all means "launch without permission prompts", and Claude's folder
+            # trust dialog is one - the one flag that cannot waive it, because Claude only
+            # skips that dialog in non-interactive mode and a bridge window is deliberately
+            # interactive. Left needing a second press, an unattended launch simply stops
+            # there with nobody at the keyboard, which is the deadlock the setting exists
+            # to avoid. The folder is one of the configured workspaces and the choice was
+            # made on the press, so the confirmation this stands in for has already
+            # happened; an ordinary launch still asks for its second press.
+            TrustConfirmed = $allowAllTools
+            TrustAnswers   = 0
+            # Who pressed Launch, carried from the press to whichever session it produces:
+            # a session an agent started should show as agent-driven from the moment it
+            # appears, not only once the agent first replies to it.
+            Driver         = [string]$script:DaemonNewSessionPressDriver
+            # Codex registers only on its first message, so one opened without a prompt
+            # waits for it rather than timing out (Update-DaemonPendingLaunch).
+            AwaitingFirstMessage = ((Get-BridgeLauncher -Launcher $chosenLauncher).NeedsFirstMessage -and -not $prompt)
+            FirstMessageAsked    = $false
+            WorktreeReservation  = $worktreeReservation
+        }
+
+        # A launch changes what is resumable - the session just started is now live, and
+        # a resumed one has to leave the list - so the cache is expired rather than left
+        # to age out, and the selector re-primed to "New session" on the next reconcile.
+        $script:DaemonResumeCacheAt = [DateTimeOffset]::MinValue
+        $script:DaemonNewSessionSignature = ''
+
+        # Clear the prompt box so the next launch starts from a blank field instead of
+        # silently reusing the previous prompt. Both boxes: the payload topic is retained,
+        # so a long prompt left there would start the next session too.
+        if ($prompt) { Clear-DaemonLaunchPrompt -Headers $Headers }
     }
-
-    if (-not $launch.Launched) {
-        Write-DaemonLog -Message "new session launch failed: $($launch.Detail)"
-        Set-CopilotMqttNewSessionResult -Text "Launch failed: $($launch.Detail)" -Headers $Headers | Out-Null
-        return
+    finally {
+        if ($null -ne $worktreeOperation) { $worktreeOperation.Mutex.ReleaseMutex(); $worktreeOperation.Mutex.Dispose() }
     }
-
-    Write-DaemonLog -Message "new session launched: $($launch.Detail) (session $(if ($launch.SessionId) { $launch.SessionId } else { 'id chosen by the agent' }))"
-
-    # Remember what this session was started with, so its card can say so. The
-    # command line is the only record of effort and context - neither appears in a
-    # transcript, and no agent reports them back - so if it is not kept here it is
-    # gone.
-    #
-    # Read defensively: what actually started the session is stubbed in tests and
-    # replaceable in principle, and a result without these three should cost the card
-    # its settings line, not fail a launch that has already happened.
-    $launched = { param($Name) if ($launch.PSObject.Properties[$Name]) { [string]$launch.$Name } else { '' } }
-    $launchTuning = [pscustomobject]@{
-        Model   = & $launched 'Model'
-        Effort  = & $launched 'Effort'
-        Context = & $launched 'Context'
-        At      = $launchedAt
-        # Whether this reopened an existing session rather than starting a new one.
-        # Adoption reads it to decide where in the transcript to start: a session
-        # starting from nothing has its whole transcript read, so a first answer that
-        # arrives before the daemon adopts it is still seen, while a resumed one is
-        # picked up at the end so its old conversation is not replayed onto the card.
-        Resumed = ($null -ne $resumeSession)
-    }
-    # Copilot, Agency and Claude register under the id the bridge invented, so the
-    # record is filed under it straight away. Codex picks its own, so its launch waits
-    # under the pending key until Update-DaemonPendingLaunch learns which session it
-    # actually produced and moves it across - the same answer, from the same place,
-    # that stamps the launch's driver.
-    $tuningKey = if ($launch.SessionId) { [string]$launch.SessionId } else { $script:DaemonPendingTuningKey }
-    $script:DaemonLaunchedTuning[$tuningKey] = $launchTuning
-
-    # Remember the process the bridge started, so End session can close the console
-    # window it opened rather than leaving an empty terminal behind. Codex picks its
-    # own id, so there is nothing to key it by.
-    if ($launch.ProcessId -gt 0 -and $launch.SessionId) {
-        $script:DaemonLaunchedPids[[string]$launch.SessionId] = [int]$launch.ProcessId
-    }
-
-    $verb = if ($null -ne $resumeSession) { 'Resumed' } else { 'Started' }
-    $where = if ($null -ne $resumeSession) {
-        if ($agencyProfile) { "$resumeLabel ($agencyProfile)" } else { [string]$resumeLabel }
-    }
-    elseif ($agencyProfile) { "$label ($agencyProfile)" }
-    else { $label }
-
-    # The process id only proves something started; the session registering proves
-    # it got far enough to be adopted. That is followed up on each pass of the loop
-    # (Update-DaemonPendingLaunch) rather than waited for here: waiting stalled the
-    # whole daemon - replies, streaming, everything - for up to 25 seconds per launch.
-    $script:DaemonPendingLaunch = [pscustomobject]@{
-        SessionId      = [string]$launch.SessionId
-        ProcessId      = [int]$launch.ProcessId
-        Launcher       = $chosenLauncher
-        Label          = [string]$where
-        Verb           = $verb
-        Since          = $launchedAt
-        LastCheck      = [DateTimeOffset]::MinValue
-        TrustAskedAt   = $null
-        # Allow all means "launch without permission prompts", and Claude's folder
-        # trust dialog is one - the one flag that cannot waive it, because Claude only
-        # skips that dialog in non-interactive mode and a bridge window is deliberately
-        # interactive. Left needing a second press, an unattended launch simply stops
-        # there with nobody at the keyboard, which is the deadlock the setting exists
-        # to avoid. The folder is one of the configured workspaces and the choice was
-        # made on the press, so the confirmation this stands in for has already
-        # happened; an ordinary launch still asks for its second press.
-        TrustConfirmed = $allowAllTools
-        TrustAnswers   = 0
-        # Who pressed Launch, carried from the press to whichever session it produces:
-        # a session an agent started should show as agent-driven from the moment it
-        # appears, not only once the agent first replies to it.
-        Driver         = [string]$script:DaemonNewSessionPressDriver
-        # Codex registers only on its first message, so one opened without a prompt
-        # waits for it rather than timing out (Update-DaemonPendingLaunch).
-        AwaitingFirstMessage = ((Get-BridgeLauncher -Launcher $chosenLauncher).NeedsFirstMessage -and -not $prompt)
-        FirstMessageAsked    = $false
-    }
-
-    # A launch changes what is resumable - the session just started is now live, and
-    # a resumed one has to leave the list - so the cache is expired rather than left
-    # to age out, and the selector re-primed to "New session" on the next reconcile.
-    $script:DaemonResumeCacheAt = [DateTimeOffset]::MinValue
-    $script:DaemonNewSessionSignature = ''
-
-    # Clear the prompt box so the next launch starts from a blank field instead of
-    # silently reusing the previous prompt. Both boxes: the payload topic is retained,
-    # so a long prompt left there would start the next session too.
-    if ($prompt) { Clear-DaemonLaunchPrompt -Headers $Headers }
 }
 
 function Resolve-DaemonLaunchTuning {
@@ -1178,6 +1242,9 @@ function Update-DaemonPendingLaunch {
     }
 
     if (Test-BridgeSessionRegistered -SessionId $p.SessionId -Launcher $p.Launcher -Since $p.Since) {
+        if ($p.PSObject.Properties['WorktreeReservation'] -and $null -ne $p.WorktreeReservation) {
+            [void](Remove-BridgeWorktreeLaunchReservation -Reservation $p.WorktreeReservation)
+        }
         # Stamp the launcher's driver on the session this launch produced, by the id it
         # actually registered under rather than the one it was offered - Codex picks
         # its own. Read from the same check that just said it had registered, so the

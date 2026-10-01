@@ -14,8 +14,8 @@ You should not normally have to do anything about this. **Bridge** is configured
 its own under `~/repos/wt`, created at launch and named for the moment it was made.
 Your session is already somewhere private; `git status` will tell you where.
 
-If you find yourself in the primary clone - launched by hand, or the isolation fell
-back because git was unavailable - make your own before doing anything else:
+If you find yourself in the primary clone after launching by hand, make your own
+before doing anything else. Requested bridge isolation fails closed:
 
 ```powershell
 $wt = "$HOME\repos\wt\agent-ha-bridge-manual"
@@ -37,12 +37,12 @@ still marks an install from one as `(dev)` (a worktree's `.git` is a file, and
 
 ### What happens to it afterwards
 
-Nothing you need to do. The bridge removes worktrees that hold nothing worth keeping
-before each launch, and the bar for that is deliberately high - all of: no uncommitted
-or untracked files, no branch checked out, no commit of its own on a detached HEAD,
-not a directory a session has worked in recently, and more than
-`newSession.worktreeIdleHours` (12) old. Anything unmerged or uncommitted stays until
-a person deals with it, however old it is.
+The bridge cleans only marked, unlocked worktrees with readable ownership, Git and
+all-adapter liveness: no uncommitted, untracked or ignored data, no checked-out branch,
+no detached commit ahead of the base, no live session at or below the directory, and
+at least `newSession.worktreeIdleHours` (12) old. Unknown state and linked/submodule
+trees are retained. Only clean tracked files and empty directories are removed;
+pending launches stay Git-locked until registration. Anything unmerged or uncommitted stays.
 
 So leaving a branch behind is safe, and is the right thing to do if the work is not
 finished. If it *is* finished, leave the worktree clean and detached and it will be
@@ -57,9 +57,9 @@ Do that *after* the merge. `gh pr merge --delete-branch` cannot delete a branch 
 checked out in a worktree: it warns and suggests `git worktree remove`. Following that
 is fine here - the worktree is disposable - but detaching is enough.
 
-`newSession.worktreeLimit` (10) caps how many can exist at once. At the cap a launch
-runs in the primary clone rather than failing, and says so in the daemon log and on the
-launch card.
+`newSession.worktreeLimit` (10) caps managed worktrees per repository. At the cap or
+on an isolation failure, the launch is refused with a diagnostic on the launch card
+and in the daemon log. There is no fallback to the primary checkout.
 
 The general rules - never touch a branch you did not create, never `git stash`, stage
 only files you changed, never `git add -A` - are in
