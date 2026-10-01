@@ -76,10 +76,31 @@ rather than the script contents — so you can update the adapter without re-app
   down the daemon's entire reconcile rather than just this adapter.
 - **Later lifecycle events retire approval locally first.** `PreToolUse`,
   `UserPromptSubmit`, `Stop` and `SessionEnd` remove an existing approval marker before
-  daemon fast paths or Home Assistant work. This does not change `PermissionRequest`
-  marker creation or the approval input path. A pending local marker owns the reply
+  daemon fast paths or Home Assistant work. `PermissionRequest` still creates a new
+  pending marker; the generation and attempt guards below govern input. A marker owns the reply
   box even if its card is empty or unavailable; an unreadable marker blocks
   continuation with a diagnostic rather than being mistaken for an absent owner.
+- **An approval generation gets at most one dashboard input attempt.** The card's
+  `decision_id` must match the pending local marker. Before typing `y` or `n`, the
+  daemon exclusively reads that marker, records `DeliveryAttempted` and the choice,
+  and flushes the file to disk. Missing, unreadable, mismatched or unwritable state
+  prevents input. Failed card clearing, another reconcile, or a new daemon process
+  cannot repeat an attempted generation. A replacement marker is not rewritten or
+  cleared by the older attempt.
+- **Attempted input is not confirmed approval.** A native-send failure or uncertain
+  outcome is not automatically retried. Finish that pending request in the terminal;
+  its normal lifecycle events retire ownership. A subsequent legitimate generation
+  can then be answered normally. These guards do not certify atomic terminal input
+  against a concurrent person or a changing native prompt.
+
+### Pending approvals during downgrade
+
+Older senders, including v1.24.0, do not understand `DeliveryAttempted`. Do not resume
+one against pending approval markers from this version: it could replay an uncertain
+attempt. Keep the compatible sender until pending requests are resolved in their
+terminals and normal lifecycle cleanup has retired their markers and cards, then
+perform any separately authorized downgrade. Do not delete or reset an unconfirmed
+marker to make it answerable again. This change does not install or run a migration.
 
 ## What works, and what does not yet
 
@@ -91,12 +112,14 @@ session(s)` followed by `retired session`.
 **Approving commands from Home Assistant works.** Codex runs `PermissionRequest`
 before showing its own approval UI, and a hook that writes nothing to stdout reads as
 "no decision", so the terminal prompt still appears. The dashboard is therefore a
-second way to answer rather than a replacement, and whichever is used first wins —
-the same arrangement Copilot's `ask_user` uses.
+second way to supply input rather than a replacement. The native prompt remains the
+source of truth; generation and durable-attempt checks do not make simultaneous
+terminal input atomic.
 
-Verified end to end: Codex asked to run a command outside its sandbox, the card armed
+Earlier adapter verification: Codex asked to run a command outside its sandbox, the card armed
 showing that exact command, approving on the dashboard delivered the answer into the
-session, and the command ran.
+session, and the command ran. The generation/restart guards described above are
+covered by isolated file/process regressions, not a new native-client certification.
 
 Note that `PermissionRequest` only fires in an interactive session. `codex exec`
 reports `approval: never` regardless of `approval_policy`, because it has no way to

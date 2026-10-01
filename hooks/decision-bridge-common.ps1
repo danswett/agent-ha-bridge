@@ -857,6 +857,69 @@ function ConvertFrom-DecisionRequestedSchema {
     @(Get-DecisionSchemaFieldOptions -Field $properties.($names[0]))
 }
 
+function ConvertFrom-DecisionJson {
+    <# Decision values are JSON values, not inferred dates. Keep container shape,
+       including null and singleton array entries, on supported PowerShell versions. #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Json)
+
+    $textReader = [IO.StringReader]::new($Json)
+    $reader = [Newtonsoft.Json.JsonTextReader]::new($textReader)
+    try {
+        $reader.DateParseHandling = [Newtonsoft.Json.DateParseHandling]::None
+        $reader.MaxDepth = 64
+        $settings = [Newtonsoft.Json.Linq.JsonLoadSettings]::new()
+        $settings.DuplicatePropertyNameHandling = [Newtonsoft.Json.Linq.DuplicatePropertyNameHandling]::Error
+        $token = [Newtonsoft.Json.Linq.JToken]::ReadFrom($reader, $settings)
+        while ($reader.Read()) {
+            if ($reader.TokenType -ne [Newtonsoft.Json.JsonToken]::Comment) {
+                throw [IO.InvalidDataException]::new('Unexpected trailing decision JSON.')
+            }
+        }
+        $convert = {
+            param([Newtonsoft.Json.Linq.JToken]$Item)
+            switch ($Item.get_Type().ToString()) {
+                'Object' {
+                    $properties = [ordered]@{}
+                    $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+                    foreach ($property in $Item.Properties()) {
+                        $name = $property.get_Name()
+                        if ([string]::IsNullOrEmpty($name) -or -not $names.Add($name)) {
+                            throw [IO.InvalidDataException]::new('Decision JSON has an ambiguous property name.')
+                        }
+                        $properties[$name] = & $convert ($property.get_Value())
+                    }
+                    return [pscustomobject]$properties
+                }
+                'Array' {
+                    $items = [object[]]::new($Item.get_Count())
+                    for ($index = 0; $index -lt $Item.get_Count(); $index++) {
+                        $items[$index] = & $convert ($Item.get_Item($index))
+                    }
+                    return ,$items
+                }
+                'String' { return [string]$Item.get_Value() }
+                'Boolean' { return [bool]$Item.get_Value() }
+                'Integer' { return $Item.get_Value() }
+                'Float' {
+                    $number = $Item.get_Value()
+                    if ([double]::IsNaN([double]$number) -or [double]::IsInfinity([double]$number)) {
+                        throw [IO.InvalidDataException]::new('Decision JSON has a non-finite number.')
+                    }
+                    return $number
+                }
+                'Null' { return $null }
+                default { throw [IO.InvalidDataException]::new('Unsupported decision JSON token.') }
+            }
+        }
+        $value = & $convert $token
+        return ,$value
+    }
+    finally {
+        $reader.Dispose()
+        $textReader.Dispose()
+    }
+}
+
 function ConvertFrom-DecisionSchemaText {
     <#
         Parses a `requestedSchema` payload that leaked into the question string as raw
@@ -912,7 +975,7 @@ function ConvertFrom-DecisionSchemaText {
 
     foreach ($candidate in $candidates) {
         try {
-            $parsed = $candidate | ConvertFrom-Json
+            $parsed = ConvertFrom-DecisionJson -Json $candidate
             if ($null -ne $parsed) { return $parsed }
         }
         catch {
@@ -940,7 +1003,8 @@ function Get-DecisionSchemaFieldChoices {
         label ("Cut the release now"). A checker that knows only labels calls every
         such answer a mismatch.
 
-        Returns an array of @{ Label; Value }.
+        Returns ordered Label/Value/Id records. Unrepresentable labels are rejected,
+        never shortened or removed: either would change native option identity.
     #>
     param(
         [AllowNull()]
@@ -950,53 +1014,43 @@ function Get-DecisionSchemaFieldChoices {
     if ($null -eq $Field) { return @() }
     $choices = [System.Collections.Generic.List[object]]::new()
 
-    # Every probe below goes through PSObject.Properties rather than reading the
-    # property directly. A schema is a ConvertFrom-Json object, and asking one for a
-    # property it does not have is a terminating error under Set-StrictMode. The
-    # Copilot ask_user handler is spooled non-strict for exactly that reason
-    # (daemon-hookspool.ps1), but this is the one piece of the parser reached from
-    # elsewhere - the tests run it strict - so it does not rely on that.
+    $labelsSeen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    $reserved = @('Idle', 'Awaiting answer...', 'Choose...', 'Cancel request', 'unknown', 'unavailable')
     $has = {
         param($Object, [string]$Name)
-        ($null -ne $Object) -and
-        $Object.PSObject.Properties[$Name] -and
-        ($null -ne $Object.$Name)
+        ($null -ne $Object) -and ($null -ne $Object.PSObject.Properties[$Name])
     }
-
-    # A `oneOf`/`anyOf` entry carries its display text in `title` and its schema value
-    # in `const`; either may be absent, and each stands in for the other.
+    $add = {
+        param([AllowNull()]$Value, [AllowEmptyString()][string]$Title)
+        if ($null -ne $Value -and [Type]::GetTypeCode($Value.GetType()).ToString() -notin
+            @('String', 'Boolean', 'SByte', 'Byte', 'Int16', 'UInt16', 'Int32', 'UInt32', 'Int64', 'UInt64', 'Single', 'Double', 'Decimal')) {
+            throw [IO.InvalidDataException]::new('A decision option must retain a supported JSON scalar value.')
+        }
+        $label = $Title
+        if ([string]::IsNullOrWhiteSpace($label)) {
+            $label = if ($Value -is [string]) { $Value } else { ConvertTo-Json -InputObject $Value -Compress }
+        }
+        if ([string]::IsNullOrWhiteSpace($label) -or $label.Length -gt 250 -or
+            $label -cne $label.Trim() -or $label -match '[\x00-\x1f\x7f]' -or
+            $label -in $reserved -or -not $labelsSeen.Add($label)) {
+            throw [IO.InvalidDataException]::new('Decision option labels must be distinct, non-reserved, and fit the selector without truncation.')
+        }
+        $choices.Add([pscustomobject]@{ Label = $label; Value = $Value; Id = "option-$($choices.Count)" })
+    }
     $addEntry = {
         param($Entry)
-        $title = ''
-        $const = ''
-        if ($null -ne $Entry) {
-            if ($Entry.PSObject.Properties['title']) { $title = [string]$Entry.title }
-            if ($Entry.PSObject.Properties['const']) { $const = [string]$Entry.const }
-        }
-        $label = if ([string]::IsNullOrWhiteSpace($title)) { $const } else { $title }
-        $value = if ([string]::IsNullOrWhiteSpace($const)) { $label } else { $const }
-        if (-not [string]::IsNullOrWhiteSpace($label)) {
-            $choices.Add([pscustomobject]@{ Label = $label; Value = $value })
-        }
+        $title = if (& $has $Entry 'title') { [string]$Entry.title } else { '' }
+        $value = if (& $has $Entry 'const') { $Entry.const } else { $title }
+        & $add $value $title
     }
 
     if (& $has $Field 'enum') {
-        $values = @($Field.enum | ForEach-Object { [string]$_ })
+        $values = @($Field.enum)
         $labels = @()
-        if (& $has $Field 'enumNames') {
-            $labels = @($Field.enumNames | ForEach-Object { [string]$_ })
-        }
+        if (& $has $Field 'enumNames') { $labels = @($Field.enumNames) }
         for ($index = 0; $index -lt $values.Count; $index++) {
-            $label = $values[$index]
-            if (
-                $index -lt $labels.Count -and
-                -not [string]::IsNullOrWhiteSpace($labels[$index])
-            ) {
-                $label = $labels[$index]
-            }
-            if (-not [string]::IsNullOrWhiteSpace($label)) {
-                $choices.Add([pscustomobject]@{ Label = $label; Value = $values[$index] })
-            }
+            $label = if ($index -lt $labels.Count) { [string]$labels[$index] } else { '' }
+            & $add $values[$index] $label
         }
         return @($choices.ToArray())
     }
@@ -1009,10 +1063,7 @@ function Get-DecisionSchemaFieldChoices {
     if (& $has $Field 'items') {
         if (& $has $Field.items 'enum') {
             foreach ($entry in @($Field.items.enum)) {
-                $value = [string]$entry
-                if (-not [string]::IsNullOrWhiteSpace($value)) {
-                    $choices.Add([pscustomobject]@{ Label = $value; Value = $value })
-                }
+                & $add $entry ''
             }
             return @($choices.ToArray())
         }
@@ -1025,10 +1076,9 @@ function Get-DecisionSchemaFieldChoices {
 
     # A checkbox is shown as Yes/No but recorded as the JSON literal.
     if ((& $has $Field 'type') -and [string]$Field.type -eq 'boolean') {
-        return @(
-            [pscustomobject]@{ Label = 'Yes'; Value = 'true' }
-            [pscustomobject]@{ Label = 'No';  Value = 'false' }
-        )
+        & $add $true 'Yes'
+        & $add $false 'No'
+        return @($choices.ToArray())
     }
 
     @()
@@ -1249,29 +1299,55 @@ function Get-DecisionSchemaFields {
         left the card with no options at all, and the resulting free-text answer was
         swallowed by the live prompt.
 
-        Returns an array of @{ Label; Options; Values; IsText }, where Options are the
-        labels shown on the card and Values the schema values the CLI records, in the
-        same order.
+        Names, typed values, option identities and defaults survive the marker.
+        DefaultIndex is the initial scalar focus, not the dashboard placeholder.
     #>
     param(
         [AllowNull()][psobject]$Schema
     )
 
-    if ($null -eq $Schema -or $null -eq $Schema.properties) { return @() }
+    if ($null -eq $Schema -or -not $Schema.PSObject.Properties['properties'] -or $null -eq $Schema.properties) { return @() }
     $names = @($Schema.properties.PSObject.Properties.Name)
     if ($names.Count -eq 0) { return @() }
 
     $fields = @()
+    $labelsSeen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     foreach ($name in $names) {
         $field = $Schema.properties.$name
-        $label = [string]$field.title
+        $label = if ($field.PSObject.Properties['title']) { [string]$field.title } else { '' }
         if ([string]::IsNullOrWhiteSpace($label)) { $label = $name }
+        if (-not $labelsSeen.Add($label)) {
+            throw [IO.InvalidDataException]::new('Decision field labels must identify distinct fields.')
+        }
         $choices = @(Get-DecisionSchemaFieldChoices -Field $field)
+        $values = [object[]]::new($choices.Count)
+        for ($index = 0; $index -lt $choices.Count; $index++) { $values[$index] = $choices[$index].Value }
+        $hasDefault = $null -ne $field.PSObject.Properties['default']
+        $default = if ($hasDefault) { ,$field.default } else { $null }
+        $defaultIndex = 0
+        $isArray = $field.PSObject.Properties['type'] -and [string]$field.type -eq 'array'
+        if ($hasDefault -and $choices.Count -gt 0 -and -not $isArray) {
+            $key = ConvertTo-Json -InputObject $default -Depth 32 -Compress
+            $matches = @(
+                for ($index = 0; $index -lt $values.Count; $index++) {
+                    if ([StringComparer]::Ordinal.Equals($key, (ConvertTo-Json -InputObject $values[$index] -Depth 32 -Compress))) { $index }
+                }
+            )
+            if ($matches.Count -ne 1) {
+                throw [IO.InvalidDataException]::new('A scalar decision default must identify exactly one option.')
+            }
+            $defaultIndex = $matches[0]
+        }
         $fields += [pscustomobject]@{
-            Label   = $label
-            Options = @($choices | ForEach-Object { [string]$_.Label })
-            Values  = @($choices | ForEach-Object { [string]$_.Value })
-            IsText  = ($choices.Count -eq 0)
+            Name         = $name
+            Label        = $label
+            Options      = @($choices | ForEach-Object { [string]$_.Label })
+            Values       = $values
+            OptionIds    = @($choices | ForEach-Object { [string]$_.Id })
+            HasDefault   = $hasDefault
+            Default      = $default
+            DefaultIndex = $defaultIndex
+            IsText       = ($choices.Count -eq 0)
         }
     }
     @($fields)
@@ -1993,7 +2069,7 @@ function Read-DecisionMarkerFile {
     try {
         $raw = [IO.File]::ReadAllText($Path)
         if ([string]::IsNullOrWhiteSpace($raw)) { throw [IO.InvalidDataException]::new('Empty marker.') }
-        $marker = $raw | ConvertFrom-Json
+        $marker = ConvertFrom-DecisionJson -Json $raw
         if ($marker -isnot [System.Management.Automation.PSCustomObject]) {
             throw [IO.InvalidDataException]::new('Marker is not a JSON object.')
         }
@@ -2166,87 +2242,195 @@ function Get-CopilotAskUserState {
 
 function Test-CopilotAnswerMatchesSelections {
     <#
-        Whether the answer the CLI recorded contains every option that was injected.
+        Verifies choice identities within their own fields, never by substring.
+        Structured JSON preserves scalar types. Known text encodings are supported
+        only when each observed label/value maps to one option unambiguously.
 
-        The injector drives an arrow-key list by index, so a single dropped keystroke
-        selects the neighbouring option and the prompt reports it as though the user
-        had chosen it. Nothing downstream can tell the difference, which makes it the
-        worst possible failure: a confident, wrong answer attributed to the user.
-
-        Comparing the recorded result against what was sent turns that into something
-        visible. Text fields are skipped - the CLI may reformat what was typed - so
-        this only asserts on the choice fields.
-
-        A choice is accepted by either of its two names. The card and the injector
-        work in labels; the CLI records the schema value - "release=cut_now", not
-        "Cut the release now" - so a label-only comparison called every richly
-        written form a mismatch, and then told the session to disregard an answer
-        that was right. Seen live on 2026-09-28. Matching either name keeps the
-        neighbour check intact, because a neighbouring option differs under both.
+        Detailed returns Matched, Mismatch or Unconfirmed. Missing/unsupported data
+        is not a match and is not evidence for overriding a terminal answer. Legacy
+        markers without field names retain unambiguous label-based addressing.
     #>
     param(
-        [AllowEmptyString()][string]$ResultContent,
+        [AllowNull()][AllowEmptyString()][object]$ResultContent,
         [AllowNull()][AllowEmptyCollection()][object[]]$Fields,
-        [AllowNull()][AllowEmptyCollection()][string[]]$Selections
+        [AllowNull()][AllowEmptyCollection()][string[]]$Selections,
+        [switch]$Detailed
     )
 
-    if ([string]::IsNullOrWhiteSpace($ResultContent)) { return $true }
+    $finish = {
+        param([string]$Status)
+        if ($Detailed) { [pscustomobject]@{ Status = $Status } }
+        else { $Status -ceq 'Matched' }
+    }
     $fieldList = @($Fields)
     $selectionList = @($Selections)
-    if ($fieldList.Count -eq 0 -or $selectionList.Count -ne $fieldList.Count) { return $true }
+    if ($fieldList.Count -eq 0 -or $selectionList.Count -ne $fieldList.Count -or $null -eq $ResultContent) {
+        return (& $finish 'Unconfirmed')
+    }
 
+    $answers = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $textMode = $false
+    $singleValue = $false
+    $content = $ResultContent
+    if ($content -is [string]) {
+        $text = $content.Trim()
+        if ([string]::IsNullOrWhiteSpace($text)) { return (& $finish 'Unconfirmed') }
+        if ($text.StartsWith('{', [StringComparison]::Ordinal)) {
+            try { $content = ConvertFrom-DecisionJson -Json $text }
+            catch { return (& $finish 'Unconfirmed') }
+        }
+        else {
+            $textMode = $true
+            $nativeSingle = $text.StartsWith('User responded: ', [StringComparison]::Ordinal)
+            if ($nativeSingle) { $text = $text.Substring('User responded: '.Length) }
+            elseif ($text.StartsWith('User has answered your questions: ', [StringComparison]::Ordinal)) {
+                $text = $text.Substring('User has answered your questions: '.Length)
+                $suffix = ". You can now continue with the user's answers in mind."
+                if ($text.EndsWith($suffix, [StringComparison]::Ordinal)) { $text = $text.Substring(0, $text.Length - $suffix.Length) }
+            }
+            if ($nativeSingle -and $fieldList.Count -eq 1 -and -not $text.Contains('=')) {
+                $singleValue = $true
+                $answers.Add('', $text)
+            }
+            else {
+                $pair = [regex]'\G\s*(?<key>"(?:[^"\\]|\\.)*"|[^=,"]+?)\s*=\s*(?<value>"(?:[^"\\]|\\.)*"|[^,"]*)\s*(?:,\s*|$)'
+                $offset = 0
+                while ($offset -lt $text.Length) {
+                    $match = $pair.Match($text, $offset)
+                    if (-not $match.Success -or $match.Length -eq 0) { return (& $finish 'Unconfirmed') }
+                    $key = $match.Groups['key'].Value.Trim()
+                    $value = $match.Groups['value'].Value.Trim()
+                    try {
+                        if ($key.StartsWith('"')) { $key = ConvertFrom-DecisionJson -Json $key }
+                        if ($value.StartsWith('"')) { $value = ConvertFrom-DecisionJson -Json $value }
+                    }
+                    catch { return (& $finish 'Unconfirmed') }
+                    if ($answers.ContainsKey($key)) { return (& $finish 'Unconfirmed') }
+                    $answers.Add($key, $value)
+                    $offset += $match.Length
+                }
+            }
+        }
+    }
+
+    if (-not $textMode) {
+        if ($content -is [Collections.IDictionary]) {
+            foreach ($key in $content.Keys) {
+                if ($key -isnot [string] -or $answers.ContainsKey($key)) { return (& $finish 'Unconfirmed') }
+                $answers.Add($key, $content[$key])
+            }
+        }
+        elseif ($content -is [pscustomobject]) {
+            foreach ($property in $content.PSObject.Properties) { $answers.Add($property.Name, $property.Value) }
+        }
+        else { return (& $finish 'Unconfirmed') }
+    }
+    if ($answers.Count -ne $fieldList.Count) { return (& $finish 'Unconfirmed') }
+
+    $scalarKey = {
+        param([AllowNull()]$Value)
+        if ($null -ne $Value -and [Type]::GetTypeCode($Value.GetType()).ToString() -notin
+            @('String', 'Boolean', 'SByte', 'Byte', 'Int16', 'UInt16', 'Int32', 'UInt32', 'Int64', 'UInt64', 'Single', 'Double', 'Decimal')) { return $null }
+        ConvertTo-Json -InputObject $Value -Compress
+    }
+    $consumed = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $verified = 0
+    $mismatch = $false
     for ($i = 0; $i -lt $fieldList.Count; $i++) {
         $field = $fieldList[$i]
-        if (Test-DecisionFieldIsText -Field $field) { continue }
-        $wanted = [string]$selectionList[$i]
-        if ([string]::IsNullOrWhiteSpace($wanted)) { continue }
-
-        # A multi-select answer is one card label standing for several options, and
-        # the CLI records them its own way ("Billing, Search"), so the combination
-        # label never appears verbatim. Each option it stands for has to be there.
-        if (Test-DecisionFieldIsMultiSelect -Field $field) {
-            $picked = @(Resolve-DecisionMultiSelectChoice -Field $field -Choice $wanted)
-            if ($picked.Count -eq 0) { continue }
-            foreach ($option in $picked) {
-                if ($ResultContent -like "*$option*") { continue }
-                $value = Get-DecisionFieldOptionValue -Field $field -Option $option
-                if (-not [string]::IsNullOrWhiteSpace($value) -and $ResultContent -like "*$value*") { continue }
-                return $false
-            }
-            continue
+        if ($null -eq $field) { return (& $finish 'Unconfirmed') }
+        $key = ''
+        if (-not $singleValue) {
+            $name = if ($field.PSObject.Properties['Name']) { [string]$field.Name }
+                    elseif ($field.PSObject.Properties['Title']) { [string]$field.Title }
+                    else { [string]$field.Label }
+            $comparer = if ($field.PSObject.Properties['Name'] -or $field.PSObject.Properties['Title']) {
+                [StringComparer]::Ordinal
+            } else { [StringComparer]::OrdinalIgnoreCase }
+            $keys = @($answers.Keys | Where-Object { $comparer.Equals($_, $name) })
+            if ($keys.Count -ne 1) { return (& $finish 'Unconfirmed') }
+            $key = $keys[0]
         }
+        if (-not $consumed.Add($key)) { return (& $finish 'Unconfirmed') }
+        if (Test-DecisionFieldIsText -Field $field) { continue }
 
-        if ($ResultContent -like "*$wanted*") { continue }
-
-        # Fall back to the schema value sitting behind the label that was picked.
-        # A marker written before this was carried has no Values, and then there is
-        # nothing better to compare than the label.
-        $value = Get-DecisionFieldOptionValue -Field $field -Option $wanted
-        if (-not [string]::IsNullOrWhiteSpace($value) -and $ResultContent -like "*$value*") { continue }
-        return $false
+        $multi = Test-DecisionFieldIsMultiSelect -Field $field
+        $options = @($field.Options)
+        $wanted = if ($multi) { @(Resolve-DecisionMultiSelectChoice -Field $field -Choice $selectionList[$i]) }
+                  else { @($selectionList[$i]) }
+        $expected = [Collections.Generic.HashSet[int]]::new()
+        foreach ($option in $wanted) {
+            $index = [Array]::IndexOf($options, $option)
+            if ($index -lt 0 -or -not $expected.Add($index)) { return (& $finish 'Unconfirmed') }
+        }
+        if ($expected.Count -eq 0) { return (& $finish 'Unconfirmed') }
+        $identities = [Collections.Generic.Dictionary[string, int]]::new([StringComparer]::Ordinal)
+        for ($index = 0; $index -lt $options.Count; $index++) {
+            try { $value = Get-DecisionFieldOptionValue -Field $field -Option $options[$index] }
+            catch { return (& $finish 'Unconfirmed') }
+            $valueKey = & $scalarKey $value
+            if ($null -eq $valueKey) { return (& $finish 'Unconfirmed') }
+            $encodings = @($valueKey)
+            if ($textMode) {
+                $spelling = if ($value -is [string]) { $value } else { $valueKey }
+                $encodings = @([string]$options[$index], $spelling)
+                # Delimiters, quoting and trimmed whitespace can encode two different
+                # answers identically. Only structured results can resolve these.
+                if (@($encodings | Where-Object { $_ -match '[,="]' -or $_ -cne $_.Trim() }).Count -gt 0) {
+                    return (& $finish 'Unconfirmed')
+                }
+            }
+            foreach ($encoding in $encodings) {
+                if ($identities.ContainsKey($encoding) -and $identities[$encoding] -ne $index) {
+                    $identities[$encoding] = -1
+                }
+                else { $identities[$encoding] = $index }
+            }
+        }
+        $actualValue = $answers[$key]
+        $parts = [object[]]::new(1)
+        if ($multi -and $textMode) { $parts = @(([string]$actualValue).Split(',') | ForEach-Object { $_.Trim() }) }
+        elseif ($multi -and $actualValue -is [array]) { $parts = @($actualValue) }
+        elseif (-not $multi) { $parts[0] = $actualValue }
+        else { return (& $finish 'Unconfirmed') }
+        $actual = [Collections.Generic.HashSet[int]]::new()
+        foreach ($part in $parts) {
+            $encoding = if ($textMode) { [string]$part } else { & $scalarKey $part }
+            if ($null -eq $encoding -or -not $identities.ContainsKey($encoding) -or
+                $identities[$encoding] -lt 0 -or -not $actual.Add($identities[$encoding])) { return (& $finish 'Unconfirmed') }
+        }
+        if (-not $actual.SetEquals($expected)) { $mismatch = $true }
+        $verified++
     }
-    $true
+    if ($verified -eq 0) { return (& $finish 'Unconfirmed') }
+    if ($mismatch) { return (& $finish 'Mismatch') }
+    & $finish 'Matched'
 }
 
 function Get-DecisionFieldOptionValue {
     <#
-        The schema value behind one of a field's option labels, or '' when the field
-        does not carry values - a marker written by an older build, say.
+        The typed value at an exact, unique option position. Older markers without
+        Values use their labels; an invalid mapping is never guessed.
     #>
     param(
         [AllowNull()][object]$Field,
         [AllowEmptyString()][string]$Option
     )
 
-    if ($null -eq $Field -or -not $Field.PSObject.Properties['Values']) { return '' }
+    if ($null -eq $Field) { throw [IO.InvalidDataException]::new('Missing decision field.') }
     $options = @($Field.Options)
-    $values = @($Field.Values)
+    $values = $options
+    if ($Field.PSObject.Properties['Values']) { $values = @($Field.Values) }
+    if ($options.Count -ne $values.Count) { throw [IO.InvalidDataException]::new('Decision option and value counts differ.') }
+    $found = -1
     for ($i = 0; $i -lt $options.Count; $i++) {
-        if ([string]$options[$i] -eq $Option -and $i -lt $values.Count) {
-            return [string]$values[$i]
+        if ([StringComparer]::Ordinal.Equals([string]$options[$i], $Option)) {
+            if ($found -ge 0) { throw [IO.InvalidDataException]::new('Ambiguous decision option.') }
+            $found = $i
         }
     }
-    ''
+    if ($found -lt 0) { throw [IO.InvalidDataException]::new('Unknown decision option.') }
+    return ,$values[$found]
 }
 
 function Get-CopilotTranscriptTailLines {

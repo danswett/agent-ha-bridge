@@ -13,10 +13,10 @@
 function Invoke-CopilotAskUserHook {
     <#
         preToolUse for ask_user - dual-input, non-blocking:
-          1. Ensures this session's Home Assistant entities exist.
-          2. Arms this session's MQTT decision card with the question and choices.
-          3. Sends an optional push notification.
-          4. Writes a pending-decision marker for the daemon.
+          1. Writes a pending-decision marker before any network work.
+          2. Ensures this session's Home Assistant entities exist.
+          3. Arms this session's MQTT decision card with the question and choices.
+          4. Sends an optional push notification.
         The caller then returns `allow` at once, so the native terminal prompt appears.
 
         Why non-blocking: the previous router blocked until Home Assistant returned an
@@ -40,17 +40,25 @@ function Invoke-CopilotAskUserHook {
 
     $toolArgs = & $field $HookEvent 'toolArgs'
     if ($null -eq $toolArgs) { $toolArgs = & $field $HookEvent 'tool_input' }
-    if ($toolArgs -is [string]) { $toolArgs = $toolArgs | ConvertFrom-Json }
+    if ($toolArgs -is [string]) { $toolArgs = ConvertFrom-DecisionJson -Json $toolArgs }
     if ($null -ne (& $field $toolArgs 'arguments')) {
         $toolArgs = $toolArgs.arguments
-        if ($toolArgs -is [string]) { $toolArgs = $toolArgs | ConvertFrom-Json }
+        if ($toolArgs -is [string]) { $toolArgs = ConvertFrom-DecisionJson -Json $toolArgs }
     }
 
+    $explicitChoices = @()
+    $rawChoices = & $field $toolArgs 'choices'
+    if ($rawChoices -is [array]) {
+        $explicitChoices = @(Get-DecisionSchemaFieldChoices -Field ([pscustomobject]@{ enum = $rawChoices }))
+    }
     $parsed = Repair-DecisionToolArguments -ToolArgs $toolArgs
     $question = $parsed.Question
     $choices = @($parsed.Choices)
     $combos = @($parsed.Combos)
     $fields = @($parsed.Fields)
+    if ($explicitChoices.Count -gt 0) { $choices = @($explicitChoices | ForEach-Object { $_.Label }) }
+    elseif ($fields.Count -eq 1 -and $choices.Count -gt 0) { $choices = @($fields[0].Options) }
+    [void](Get-DecisionSchemaFieldChoices -Field ([pscustomobject]@{ enum = $choices }))
     $terminalOnly = [bool]$parsed.TerminalOnly
     $mode = if ($choices.Count -gt 0 -or $fields.Count -gt 0) { 'multiple_choice' } else { 'freeform' }
 
@@ -83,14 +91,24 @@ function Invoke-CopilotAskUserHook {
     $workingDirectory = [string](& $field $HookEvent 'cwd')
     if ([string]::IsNullOrWhiteSpace($workingDirectory)) { $workingDirectory = 'Unknown folder' }
 
+    $node = Get-CopilotMqttNodeId -SessionId $sessionId
+    $decisionId = "$($node)-$(& $field $HookEvent 'timestamp')"
+
+    # The marker is the daemon's gate: while it exists and the transcript shows the
+    # ask_user still pending, the daemon injects a Home Assistant answer and clears the
+    # card on completion. It also carries the combo mapping so a multi-field choice can
+    # be reported field by field. Persist before even the reachability probe, so an
+    # outage leaves the daemon a request to re-arm.
+    Write-CopilotDecisionMarker -SessionId $sessionId -DecisionId $decisionId `
+        -Question $question -Choices $choices -Combos $combos -Fields $fields `
+        -TerminalOnly:$terminalOnly -Mode $mode | Out-Null
+
     # This hook runs before the native prompt appears; it must never wait on the
     # network. Enter-BridgeAdapterSession probes, sets the deadline and returns headers
     # when Home Assistant is reachable, or $null when it is not.
     $headers = Enter-BridgeAdapterSession
     if (-not $headers) { return }
     $display = Get-CopilotSessionDisplay -SessionId $sessionId -WorkingDirectory $workingDirectory
-    $node = Get-CopilotMqttNodeId -SessionId $sessionId
-    $decisionId = "$($node)-$(& $field $HookEvent 'timestamp')"
 
     # Ensure this session's entities exist. The daemon publishes them within a
     # reconcile interval of session start, but an ask_user in the first seconds of a
@@ -101,14 +119,6 @@ function Invoke-CopilotAskUserHook {
     Set-CopilotMqttDecision -SessionId $sessionId -SessionName $display.Name `
         -Machine $display.Machine -Question $question -Choices $choices `
         -Fields $fields -DecisionId $decisionId -Headers $headers | Out-Null
-
-    # The marker is the daemon's gate: while it exists and the transcript shows the
-    # ask_user still pending, the daemon injects a Home Assistant answer and clears the
-    # card on completion. It also carries the combo mapping so a multi-field choice can
-    # be reported field by field.
-    Write-CopilotDecisionMarker -SessionId $sessionId -DecisionId $decisionId `
-        -Question $question -Choices $choices -Combos $combos -Fields $fields `
-        -TerminalOnly:$terminalOnly -Mode $mode | Out-Null
 
     # Notify. Both paths (terminal and Home Assistant) are now open.
     if ($choices.Count -gt 0) {

@@ -111,12 +111,17 @@ Test-That 'options given as plain strings still work' {
     (ConvertFrom-ClaudeAskUserQuestion -ToolInput $input).Choices -join ',' -eq 'A,B'
 }
 
-Write-Host '--- truncation ---'
-Test-That 'an overlong option label is truncated' {
+Write-Host '--- lossless option identity ---'
+Test-That 'the parser preserves an overlong label for explicit presentation rejection, not clipping' {
     $long = 'x' * 900
     $input = [pscustomobject]@{ questions = @([pscustomobject]@{ question = 'Pick'; options = @([pscustomobject]@{ label = $long }) }) }
     $result = ConvertFrom-ClaudeAskUserQuestion -ToolInput $input
-    $result.Choices[0].Length -le 600 -and $result.Choices[0].EndsWith('...')
+    $result.Choices[0] -ceq $long -and $result.MarkerFields[0].Values[0] -ceq $long -and
+        $result.MarkerFields[0].OptionIds[0] -ceq 'option-0'
+}
+Test-That 'the full native question identifies a field separately from its short header' {
+    $parsedMulti.MarkerFields[0].Name -ceq $multi.tool_input.questions[0].question -and
+        $parsedMulti.MarkerFields[0].Label -ceq 'Database'
 }
 
 Write-Host '--- hook event reading ---'

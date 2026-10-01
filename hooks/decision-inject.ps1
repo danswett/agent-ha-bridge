@@ -506,13 +506,12 @@ function Get-BridgeFormPayloads {
         Turns a form's fields and chosen values into the exact sequence typed into the
         prompt, one entry per field.
 
-        A choice field becomes its option's index expressed as repeated Down escape
-        sequences; a free-text field becomes the text itself. Each is committed with
-        Enter by the caller.
+        A scalar choice moves from its captured default focus to the selected index;
+        a free-text field becomes the text itself. The caller commits with Enter.
 
         This is separated out because getting it wrong is silent: the prompt accepts
         whatever arrives and reports it as the user's own answer. An empty payload for
-        a choice field does not fail - it just leaves that field on its first option.
+        a choice field does not fail - it leaves that field on its current default.
 
         Returns objects with Payload and IsText, in field order. Throws if a selection
         is not one of its field's options.
@@ -527,6 +526,7 @@ function Get-BridgeFormPayloads {
         [Parameter(Mandatory)][AllowEmptyCollection()][AllowEmptyString()][string[]]$Selections
     )
 
+    if ($Fields.Count -ne $Selections.Count) { throw 'Every decision field needs one selection.' }
     $esc = [string][char]27
     for ($i = 0; $i -lt $Fields.Count; $i++) {
         if (Test-DecisionFieldIsText -Field $Fields[$i]) {
@@ -543,6 +543,7 @@ function Get-BridgeFormPayloads {
         }
 
         $options = @($Fields[$i].Options | ForEach-Object { [string]$_ })
+        [void](Get-DecisionSchemaFieldChoices -Field ([pscustomobject]@{ enum = $options }))
 
         # A multi-select field is a checkbox list, not a cursor. Its options are
         # numbered on screen and typing a number toggles that one, wherever the cursor
@@ -579,7 +580,15 @@ function Get-BridgeFormPayloads {
         $idx = [Array]::IndexOf($options, [string]$Selections[$i])
         if ($idx -lt 0) { throw "option '$($Selections[$i])' not found in field $i" }
 
-        $arrows = ($esc + '[B') * $idx
+        $start = 0
+        if ($Fields[$i].PSObject.Properties['DefaultIndex']) {
+            $start = $Fields[$i].DefaultIndex
+            if ($start -isnot [int] -and $start -isnot [long]) { throw "invalid initial focus in field $i" }
+            if ($start -lt 0 -or $start -ge $options.Count) { throw "initial focus outside field $i" }
+        }
+        $distance = $idx - $start
+        $arrow = if ($distance -lt 0) { $esc + '[A' } else { $esc + '[B' }
+        $arrows = $arrow * [Math]::Abs($distance)
         [pscustomobject]@{
             Payload = $arrows
             Keys    = @($arrows)

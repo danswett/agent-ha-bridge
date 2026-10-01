@@ -87,9 +87,8 @@ function Invoke-PendingDecisions {
 function Complete-DaemonAnsweredDecision {
     <#
         Tidies up after a question answered by either input: checks that an injected
-        selection is what the CLI recorded - and says so, to the card and the session,
-        when it is not - then clears the card, blanks the reply box and removes the
-        marker.
+        selection is what the CLI recorded, reports uncertainty or a mismatch without
+        overwriting the terminal answer, then clears the card and removes the marker.
     #>
     param(
         [Parameter(Mandatory)][string]$SessionId,
@@ -104,45 +103,28 @@ function Complete-DaemonAnsweredDecision {
     $askState = $AskState
     $node = Get-CopilotMqttNodeId -SessionId $sessionId
 
-    # Before tearing the card down, check that an injected selection is the one the
-    # CLI recorded.
-    #
-    # The injector drives an arrow-key list by index, so a dropped keystroke selects
-    # the neighbouring option and the prompt reports it as the user's choice. Nothing
-    # downstream can tell - it is a confident wrong answer in the user's name - so it
-    # has to be caught here and said out loud.
+    # A differing result can also be a competing terminal answer. Report it, but do
+    # not type a correction that turns an uncertain input attempt into user intent.
     try {
-        $injected = @($marker.injectedSelections)
-        if ($injected.Count -gt 0 -and -not (Test-CopilotAnswerMatchesSelections `
-                -ResultContent ([string]$askState.ResultContent) `
-                -Fields @($marker.fields) -Selections $injected)) {
-            Write-DaemonLog -Message "MISMATCH for $($sessionId.Substring(0,8)): sent [$($injected -join ' | ')] but the CLI recorded something else"
-            Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Answer may be wrong - check the terminal' `
-                -Extra @{ sent = ($injected -join ' | '); recorded = ([string]$askState.ResultContent) } -Headers $Headers | Out-Null
-
-            # Saying it on the card is not enough: the agent carries straight on from
-            # the wrong answer, and the warning is overwritten by its next activity
-            # update within seconds. So tell the session itself. Typed text is the one
-            # delivery path that is reliable here - it is how every reply is sent -
-            # which makes this correction land even though the keystrokes that caused
-            # the problem did not.
-            try {
-                $correction = Get-DaemonAnswerCorrection -Fields @($marker.fields) -Selections $injected
-                $fix = Send-CopilotSessionPrompt -SessionId $sessionId -Text $correction `
-                    -ProcessId (Get-DaemonSessionProcessId -SessionId $sessionId)
-                if ($fix.Delivered) {
-                    Write-DaemonLog -Message "sent a correction to $($sessionId.Substring(0,8)) with what was actually chosen"
-                }
-                else {
-                    Write-DaemonLog -Message "could not correct $($sessionId.Substring(0,8)): $($fix.Detail)"
-                }
+        $injected = @()
+        if ($marker.PSObject.Properties['injectedSelections']) { $injected = @($marker.injectedSelections) }
+        if ($injected.Count -gt 0) {
+            $content = if ($askState.PSObject.Properties['ResultContent']) { $askState.ResultContent } else { $null }
+            $verification = Test-CopilotAnswerMatchesSelections -ResultContent $content `
+                -Fields @($marker.fields) -Selections $injected -Detailed
+            if ($verification.Status -ceq 'Mismatch') {
+                Write-DaemonLog -Message "MISMATCH for $($sessionId.Substring(0,8)); terminal result retained"
+                Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Answer differs - check the terminal' `
+                    -Extra @{ sent = ($injected -join ' | '); verification = 'Mismatch' } -Headers $Headers | Out-Null
             }
-            catch {
-                Write-DaemonLog -Message "correction failed for $sessionId : $($_.Exception.Message)"
+            elseif ($verification.Status -ceq 'Unconfirmed') {
+                Write-DaemonLog -Message "answer unconfirmed for $($sessionId.Substring(0,8)); terminal result retained"
+                Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Answer unconfirmed - check the terminal' `
+                    -Extra @{ verification = 'Unconfirmed' } -Headers $Headers | Out-Null
             }
         }
     }
-    catch { }
+    catch { Write-DaemonLog -Message "decision verification unavailable for $sessionId : $($_.Exception.Message)" }
 
     try {
         Clear-CopilotMqttDecision -SessionId $sessionId `
@@ -542,42 +524,85 @@ function Invoke-PendingCodexApprovals {
         $readMarker = (Get-DaemonAgent -Kind ([string]$session.Kind)).ApprovalMarker
         if (-not $readMarker) { continue }
 
-        $marker = & $readMarker $sessionId
+        $short = $sessionId.Substring(0, [Math]::Min(8, $sessionId.Length))
+        try { $marker = & $readMarker $sessionId $true }
+        catch {
+            Write-DaemonLog -Message "codex approval state unavailable for $short; no input attempted: $($_.Exception.Message)"
+            continue
+        }
         if ($null -eq $marker) { continue }
+        $generation = if ($marker.PSObject.Properties['DecisionId'] -and $marker.DecisionId -is [string]) {
+            $marker.DecisionId
+        } else { '' }
+        if ([string]::IsNullOrWhiteSpace($generation)) {
+            Write-DaemonLog -Message "codex approval has no readable generation for $short; no input attempted"
+            continue
+        }
 
         $node = Get-CopilotMqttNodeId -SessionId $sessionId
         $choice = ''
         try {
             $selector = Get-HomeAssistantState -EntityId "select.${node}_decision" -Headers $Headers
             $choice = [string]$selector.state
+            $cardGeneration = if ($selector.PSObject.Properties['attributes'] -and
+                $selector.attributes.PSObject.Properties['decision_id'] -and
+                $selector.attributes.decision_id -is [string]) { $selector.attributes.decision_id } else { '' }
         }
-        catch { continue }
+        catch {
+            Write-DaemonLog -Message "codex approval card unavailable for $short; no input attempted: $($_.Exception.Message)"
+            continue
+        }
 
         if ($choice -notin @('Approve', 'Deny')) { continue }
+        if (-not [StringComparer]::Ordinal.Equals($generation, $cardGeneration)) {
+            Write-DaemonLog -Message "codex approval card generation does not match $short; no input attempted"
+            continue
+        }
+        try {
+            if (-not (Set-CodexApprovalAttempt -SessionId $sessionId -DecisionId $generation -Choice $choice)) {
+                Write-DaemonLog -Message "codex approval generation changed or was already attempted for $short; not replaying"
+                continue
+            }
+        }
+        catch {
+            Write-DaemonLog -Message "codex approval attempt could not be persisted for $short; no input attempted: $($_.Exception.Message)"
+            continue
+        }
 
         # Codex's approval prompt is a keyboard UI, so the answer is typed into the
         # session the same way a reply is. Approve sends y, deny sends n, which is
         # what its prompt accepts.
         $keystroke = if ($choice -eq 'Approve') { 'y' } else { 'n' }
-        $short = $sessionId.Substring(0, [Math]::Min(8, $sessionId.Length))
-        $delivery = Send-CopilotSessionPrompt -SessionId $sessionId -Text $keystroke `
-            -ProcessId ([int]$session.ProcessId)
-
-        if ($delivery.Delivered) {
-            Write-DaemonLog -Message "codex approval '$choice' delivered to $short (pid $($delivery.ProcessId))"
-        }
-        else {
-            Write-DaemonLog -Message "codex approval delivery FAILED for $short : $($delivery.Detail)"
-        }
-
-        # Clear either way, so a failed delivery is not resent on every reconcile.
-        # The hook clears the marker itself once the prompt is genuinely answered.
         try {
+            $delivery = Send-CopilotSessionPrompt -SessionId $sessionId -Text $keystroke `
+                -ProcessId ([int]$session.ProcessId)
+            if ($null -ne $delivery -and $delivery.Delivered) {
+                Write-DaemonLog -Message "codex approval input attempted for $short; native approval is not confirmed"
+            }
+            else {
+                Write-DaemonLog -Message "codex approval input attempt FAILED or uncertain for $short; not replaying"
+            }
+        }
+        catch {
+            Write-DaemonLog -Message "codex approval input attempt FAILED or uncertain for $short; not replaying: $($_.Exception.Message)"
+        }
+
+        # Clearing is cosmetic, not the replay barrier. Keep attempted ownership
+        # until native lifecycle evidence retires it, and never clear replacement B.
+        try {
+            $current = Get-CodexApprovalMarker -SessionId $sessionId -RequireReadable
+            if ($null -eq $current -or -not [StringComparer]::Ordinal.Equals([string]$current.DecisionId, $generation)) { continue }
+            $card = Get-HomeAssistantState -EntityId "select.${node}_decision" -Headers $Headers
+            if (-not $card.PSObject.Properties['attributes'] -or
+                -not $card.attributes.PSObject.Properties['decision_id'] -or
+                -not [StringComparer]::Ordinal.Equals([string]$card.attributes.decision_id, $generation)) { continue }
             Clear-CopilotMqttDecision -SessionId $sessionId `
                 -SessionName ([string]$State[$sessionId].Name) `
                 -Machine ([string]$State[$sessionId].Machine) -Headers $Headers
         }
-        catch { }
+        catch {
+            Write-DaemonLog -Message "codex approval card cleanup failed for $short; durable attempt remains: $($_.Exception.Message)"
+        }
     }
 }
 

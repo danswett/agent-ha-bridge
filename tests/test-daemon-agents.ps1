@@ -206,19 +206,27 @@ Test-That 'Claude alone confirms input from its transcript' {
 }
 
 $script:Approved = @()
-function Get-CodexApprovalMarker { param($SessionId) [pscustomobject]@{ id = $SessionId } }
-function Get-HomeAssistantState { param($EntityId, $Headers) [pscustomobject]@{ state = 'Approve' } }
+. (Join-Path $PSScriptRoot '..\codex\hooks\codex-session.ps1')
+$script:CodexStateRoot = Join-Path $env:TEMP ('agent-approval-' + [guid]::NewGuid().ToString('N'))
+function Get-HomeAssistantState {
+    param($EntityId, $Headers)
+    [pscustomobject]@{ state = 'Approve'; attributes = [pscustomobject]@{ decision_id = 'agent-fixture-generation' } }
+}
 function Send-CopilotSessionPrompt { param($SessionId, $Text, $ProcessId) $script:Approved += "${SessionId}:$Text"; [pscustomobject]@{ Delivered = $true; ProcessId = $ProcessId; Detail = '' } }
 function Clear-CopilotMqttDecision { param($SessionId, $SessionName, $Machine, $Headers) }
 $cx = '44444444-0000-4000-8000-000000000004'; $cl = '55555555-0000-4000-8000-000000000005'
 $approvalLive = @{ $cx = [pscustomobject]@{ Kind = 'codex'; ProcessId = 9 }; $cl = [pscustomobject]@{ Kind = 'claude'; ProcessId = 8 } }
 $approvalState = @{ $cx = [pscustomobject]@{ Name = 'Codex: x'; Machine = 'M' }; $cl = [pscustomobject]@{ Name = 'Claude: y'; Machine = 'M' } }
 $script:CodexAdapterLoaded = $true
+Write-CodexApprovalMarker -SessionId $cx -DecisionId 'agent-fixture-generation' -Question 'Synthetic approval'
 Invoke-PendingCodexApprovals -Headers @{} -State $approvalState -Live $approvalLive
 Test-That 'a Codex approval is answered, and nothing is typed into Claude' { ($script:Approved -join ',') -eq "${cx}:y" }
+Invoke-PendingCodexApprovals -Headers @{} -State $approvalState -Live $approvalLive
+Test-That 'the same approval generation cannot be delivered twice' { ($script:Approved -join ',') -eq "${cx}:y" }
 $script:Approved = @(); $script:CodexAdapterLoaded = $false
 Invoke-PendingCodexApprovals -Headers @{} -State $approvalState -Live $approvalLive
 Test-That 'without the Codex adapter, no approval is read' { $script:Approved.Count -eq 0 }
+Remove-Item -LiteralPath $script:CodexStateRoot -Recurse -Force
 
 Write-Host '--- a reply finds its process ---'
 $script:Sent = $null
