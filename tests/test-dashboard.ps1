@@ -1216,10 +1216,35 @@ Write-Host '--- explicit policy generations, rollback and real failure paths ---
             try { Read-BridgePublicationState | Out-Null; $false }
             catch { $_.Exception.Message -match 'protocol' -and @(Get-TestPublicationWrites).Count -eq 0 }
         }
+        Initialize-TestPublicationStore
+        $scopedSource = New-TestPublicationCard '2.0.0'
+        $badScope = New-TestPublicationPolicy $scopedSource
+        $badScope.dashboard = $true
+        Set-TestPublicationPolicy -Policy $badScope
+        Test-That 'a Boolean cannot stand in for the configured dashboard scope' {
+            try { Read-BridgePublicationState | Out-Null; $false }
+            catch { $_.Exception.Message -match 'dashboard' -and @(Get-TestPublicationWrites).Count -eq 0 }
+        }
+        Initialize-TestPublicationStore
+        $badResourceSource = New-TestPublicationCard '2.0.0'
+        Set-TestPublicationPolicy -Policy (New-TestPublicationPolicy $badResourceSource)
+        $badResource = Get-TestPublicationStore
+        $badResource.resources[0].type = $true
+        Set-TestPublicationStore $badResource
+        Test-That 'a Boolean cannot stand in for a module resource type' {
+            try { Read-BridgePublicationState | Out-Null; $false }
+            catch { $_.Exception.Message -match 'module' -and @(Get-TestPublicationWrites).Count -eq 0 }
+        }
 
         $script:BridgeDashboardRenderVersion = '1.0.0'
         Initialize-TestPublicationStore
         Initialize-TestPublicationAuthority
+        $receiptBeforeEquivalentOrigin = Get-BridgePublicationReceiptPath
+        $script:DecisionBridgeConfig.HomeAssistantBaseUrl = 'HTTP://PUBLICATION.INVALID:8123/'
+        Test-That 'equivalent HA URI spelling cannot abandon the established local receipt' {
+            (Get-BridgePublicationReceiptPath) -ceq $receiptBeforeEquivalentOrigin
+        }
+        $script:DecisionBridgeConfig.HomeAssistantBaseUrl = 'http://publication.invalid:8123'
         Save-CopilotSessionDashboard -Sessions @()
         $restarted = Invoke-TestPublicationRestart
         Test-That 'a genuinely fresh process verifies the intact policy and persisted receipt' {
