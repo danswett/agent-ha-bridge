@@ -924,8 +924,8 @@ function Assert-BridgePublicationPolicy {
     }
     if (($Policy.generation -isnot [int] -and $Policy.generation -isnot [long]) -or
         $Policy.generation -lt 1 -or $Policy.generation -gt [int]::MaxValue -or
-        $Policy.dashboard -cne $script:DecisionBridgeConfig.DashboardUrlPath -or
-        $Policy.mode -cnotin @('advance', 'pin') -or $Policy.legacyCard -isnot [string] -or
+        $Policy.dashboard -isnot [string] -or $Policy.dashboard -cne $script:DecisionBridgeConfig.DashboardUrlPath -or
+        $Policy.mode -isnot [string] -or $Policy.mode -cnotin @('advance', 'pin') -or $Policy.legacyCard -isnot [string] -or
         ($Policy.legacyCard -and $Policy.legacyCard -cnotmatch '^[a-f0-9]{64}$')) {
         throw 'Invalid publication generation, dashboard, mode or migration target.'
     }
@@ -963,7 +963,9 @@ function Get-BridgePublicationSettings {
 }
 
 function Get-BridgePublicationReceiptPath {
-    $key = "$($script:DecisionBridgeConfig.HomeAssistantBaseUrl.TrimEnd('/'))|$($script:DecisionBridgeConfig.DashboardUrlPath)"
+    $endpoint = [uri]$script:DecisionBridgeConfig.HomeAssistantBaseUrl
+    if (-not $endpoint.IsAbsoluteUri -or $endpoint.Scheme -notin @('http', 'https')) { throw 'Publication requires a valid configured HA HTTP authority.' }
+    $key = "$($endpoint.AbsoluteUri.TrimEnd('/'))|$($script:DecisionBridgeConfig.DashboardUrlPath)"
     Get-BridgeRuntimePath -Name ("publication-" + (Get-BridgePublicationHash $key).Substring(0, 24) + '.json')
 }
 
@@ -1049,7 +1051,9 @@ function Read-BridgePublicationState {
     if ($policyResources.Count -gt 1 -or $cardResources.Count -gt 1) { throw 'Multiple publication/card resources make writer ownership ambiguous.' }
     foreach ($owned in @($policyResources) + @($cardResources)) {
         if (-not $owned.PSObject.Properties['id'] -or $owned.id -isnot [string] -or -not $owned.id -or
-            -not $owned.PSObject.Properties['type'] -or $owned.type -cne 'module') { throw 'Bridge resources require unambiguous storage-mode module registrations.' }
+            -not $owned.PSObject.Properties['type'] -or $owned.type -isnot [string] -or $owned.type -cne 'module') {
+            throw 'Bridge resources require unambiguous storage-mode module registrations.'
+        }
     }
     foreach ($dashboard in $dashboards) {
         if (-not $dashboard -or -not $dashboard.PSObject.Properties['url_path'] -or
