@@ -999,7 +999,9 @@ function Get-BridgeUpdateStatus {
     foreach ($fixture in @(
         @{ Id = 910001; Context = $contextA; Role = 'supervisor' },
         @{ Id = 910002; Context = $contextA; Role = 'daemon' },
-        @{ Id = 910003; Context = $contextB; Role = 'daemon' }
+        @{ Id = 910003; Context = $contextB; Role = 'daemon' },
+        @{ Id = 910005; Context = $contextA; Role = 'devbox-keepawake' },
+        @{ Id = 910006; Context = $contextB; Role = 'devbox-keepawake' }
     )) {
         $scriptPath = Join-Path $fixture.Context.HooksDir "agent-bridge-$($fixture.Role).ps1"
         $script:OwnedProcessFixture[$fixture.Id] = [pscustomobject]@{
@@ -1065,12 +1067,14 @@ function Get-BridgeUpdateStatus {
         function Start-ScheduledTask { param($TaskName) $script:TaskActions += "start:$TaskName" }
         $savedSupervisor = $script:OwnedProcessFixture[910001]
         $savedDaemon = $script:OwnedProcessFixture[910002]
+        $savedKeepAwake = $script:OwnedProcessFixture[910005]
         try {
             Invoke-Restart
             Test-That 'the actual CLI restart stops and starts only its owned task and runtime' {
                 $script:TaskActions -join ',' -eq "stop:$($contextA.TaskName),start:$($contextA.TaskName)" -and
-                    $script:ShutdownOrder -join ',' -eq '910001,910002' -and
-                    $script:OwnedProcessFixture.ContainsKey(910003) -and $script:OwnedProcessFixture.ContainsKey(910004)
+                    $script:ShutdownOrder -join ',' -eq '910001,910002,910005' -and
+                    $script:OwnedProcessFixture.ContainsKey(910003) -and $script:OwnedProcessFixture.ContainsKey(910004) -and
+                    $script:OwnedProcessFixture.ContainsKey(910006)
             }
         }
         finally {
@@ -1078,6 +1082,7 @@ function Get-BridgeUpdateStatus {
             Remove-Item Function:\Get-ScheduledTask, Function:\Stop-ScheduledTask, Function:\Start-ScheduledTask
             $script:OwnedProcessFixture[910001] = $savedSupervisor
             $script:OwnedProcessFixture[910002] = $savedDaemon
+            $script:OwnedProcessFixture[910005] = $savedKeepAwake
             $script:ShutdownOrder = @()
         }
         $script:BridgeInstallContext = $contextA
@@ -1099,7 +1104,7 @@ function Get-BridgeUpdateStatus {
             $stub = @'
 param([string]$TargetHome, [string]$InstallRoot, [switch]$Uninstall, [switch]$KeepSelection)
 if (-not $Uninstall -or -not (Test-Path -LiteralPath (Join-Path $InstallRoot 'hooks\bridge-platform.ps1'))) { throw 'Adapter cleanup ran after its payload disappeared.' }
-if ($OwnedProcessFixture.ContainsKey(910001) -or $OwnedProcessFixture.ContainsKey(910002)) { throw 'Adapter cleanup ran before owned shutdown.' }
+if ($OwnedProcessFixture.ContainsKey(910001) -or $OwnedProcessFixture.ContainsKey(910002) -or $OwnedProcessFixture.ContainsKey(910005)) { throw 'Adapter cleanup ran before owned shutdown.' }
 Add-Content -LiteralPath (Join-Path $InstallRoot 'cleanup-order.txt') -Value '__CLIENT__'
 if (Test-Path -LiteralPath '__DIRECTORY__') { Remove-Item -LiteralPath '__DIRECTORY__' -Recurse -Force }
 '@
@@ -1126,11 +1131,12 @@ if (Test-Path -LiteralPath '__DIRECTORY__') { Remove-Item -LiteralPath '__DIRECT
         }
         Invoke-BridgeUninstall -AdapterPayloadRoot $payload
         Test-That 'real uninstall stops A before every adapter, including an MCP payload already missing' {
-            $script:ShutdownOrder -join ',' -eq '910001,910002' -and
+            $script:ShutdownOrder -join ',' -eq '910001,910002,910005' -and
                 ([IO.File]::ReadAllText((Join-Path $contextA.BridgeHome 'cleanup-order.txt')) -split '\s+' | Where-Object { $_ }) -join ',' -eq 'claude,codex,mcp'
         }
         Test-That 'uninstall preserves B and unrelated processes, hooks and files' {
             $script:OwnedProcessFixture.ContainsKey(910003) -and $script:OwnedProcessFixture.ContainsKey(910004) -and
+                $script:OwnedProcessFixture.ContainsKey(910006) -and
                 [IO.File]::ReadAllText($sentinelB) -eq 'B must survive' -and
                 [IO.File]::ReadAllText($unrelatedA) -eq 'not an installer payload' -and
                 (Get-Content -LiteralPath $hookFile -Raw | ConvertFrom-Json).hooks.agentStop[0].powershell -eq 'Write-Output unrelated-hook'

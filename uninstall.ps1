@@ -127,7 +127,6 @@ $hookConfigPath = Join-Path $copilotHome 'hooks\decision-notifier.json'
 $agentInstructionsPath = Join-Path $copilotHome 'instructions\agent-ha-bridge.instructions.md'
 $legacySkillDir = Join-Path $copilotHome 'skills\decision-notifier'
 $configPath = $installContext.ConfigPath
-$devBoxTaskName = 'AgentBridgeDevBoxKeepAwake'
 # Pre-rename artefacts, removed too so an upgrade-then-uninstall leaves nothing.
 $legacyHooksDir = Join-Path $copilotHome 'hooks'
 $legacyConfigPath = Join-Path $copilotHome 'copilot-ha-bridge.config.json'
@@ -393,14 +392,6 @@ function Invoke-BridgeUninstall {
             Write-Warning "Could not clear entities: $($_.Exception.Message)"
         }
     }
-    # Reported only when it exists: a machine that was never a Dev Box should not be
-    # told about a task it never had.
-    if (Get-ScheduledTask -TaskName $devBoxTaskName -ErrorAction SilentlyContinue) {
-        Stop-ScheduledTask -TaskName $devBoxTaskName -ErrorAction SilentlyContinue
-        Unregister-ScheduledTask -TaskName $devBoxTaskName -Confirm:$false
-        Write-Host "    removed $devBoxTaskName"
-    }
-
     Remove-BridgeInstalledAdapters -Context $installContext -Payload $adapterPayload
 
     if (-not $installContext.Legacy) {

@@ -369,9 +369,6 @@ Test-That 'the shipped config carries the setting so an upgrade can detect it is
     $example = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\config.example.json') -Raw | ConvertFrom-Json
     $example.devBox.PSObject.Properties['keepAwake'] -and $example.devBox.keepAwake -eq $false
 }
-Test-That 'the uninstaller removes the keep-awake task' {
-    (Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\uninstall.ps1') -Raw) -match 'AgentBridgeDevBoxKeepAwake'
-}
 
 # Building a trigger registers nothing - New-ScheduledTaskTrigger only returns a CIM
 # object - so this is safe to run anywhere the module exists. It does not exist on the
@@ -401,6 +398,289 @@ if ($IsWindows -and (Get-Command New-ScheduledTaskTrigger -ErrorAction SilentlyC
 }
 else {
     Write-Host '  SKIP  the trigger shape: no ScheduledTasks module on this platform'
+}
+
+Write-Host '--- installation-owned task and detached-runtime wiring ---'
+function Invoke-DevBoxOwnershipFixture {
+    param($Owner, [hashtable]$Tasks, [hashtable]$Processes, [bool]$OnWindows, [switch]$Install, [switch]$Enable)
+    $repository = Split-Path $PSScriptRoot -Parent
+    $savedPlatform = $script:BridgeIsWindows
+    $savedInstallNoRun = $env:BRIDGE_INSTALL_NORUN
+    $savedUninstallNoRun = $env:BRIDGE_UNINSTALL_NORUN
+    $env:BRIDGE_INSTALL_NORUN = '1'
+    $env:BRIDGE_UNINSTALL_NORUN = '1'
+    try {
+        . (Join-Path $repository 'install.ps1') -InstallRoot $Owner.BridgeHome
+        . (Join-Path $repository 'uninstall.ps1') -InstallRoot $Owner.BridgeHome
+        $script:BridgeIsWindows = $OnWindows
+        $script:OwnershipOperations = [Collections.Generic.List[string]]::new()
+        function Get-ScheduledTask { param($TaskName, $ErrorAction) $Tasks[$TaskName] }
+        function Stop-ScheduledTask { param($TaskName, $ErrorAction) $script:OwnershipOperations.Add("stop-task:$TaskName") }
+        function Unregister-ScheduledTask {
+            [CmdletBinding(SupportsShouldProcess)]
+            param($TaskName)
+            if ($PSCmdlet.ShouldProcess($TaskName, 'Remove fixture task')) {
+                $script:OwnershipOperations.Add("remove-task:$TaskName")
+                [void]$Tasks.Remove($TaskName)
+            }
+        }
+        function New-ScheduledTaskAction { param($Execute, $Argument) [pscustomobject]@{ Execute = $Execute; Arguments = $Argument } }
+        function New-ScheduledTaskTrigger { param([switch]$AtLogOn, $User, [switch]$Once, $At, $RepetitionInterval) [pscustomobject]@{ Interval = $RepetitionInterval } }
+        function New-ScheduledTaskSettingsSet { param([switch]$AllowStartIfOnBatteries, [switch]$DontStopIfGoingOnBatteries, [switch]$StartWhenAvailable, $ExecutionTimeLimit, [switch]$Hidden) [pscustomobject]@{} }
+        function New-ScheduledTaskPrincipal { param($UserId, $LogonType, $RunLevel) [pscustomobject]@{} }
+        function Register-ScheduledTask {
+            param($TaskName, $Action, $Trigger, $Settings, $Principal, $Description)
+            $script:OwnershipOperations.Add("register:$TaskName")
+            $Tasks[$TaskName] = [pscustomobject]@{ Actions = @($Action) }
+        }
+        function Set-ScheduledTask {
+            param($TaskName, $Action, $Trigger, $Settings, $Principal)
+            $script:OwnershipOperations.Add("set:$TaskName")
+            $Tasks[$TaskName] = [pscustomobject]@{ Actions = @($Action) }
+        }
+        function Start-ScheduledTask { param($TaskName) $script:OwnershipOperations.Add("start:$TaskName") }
+        function Get-BridgeProcessesNamed { param($Name, [switch]$WithCommandLine) @($Processes.Values) }
+        function Get-BridgeProcessInfo { param($ProcessId, [switch]$WithCommandLine) $Processes[[int]$ProcessId] }
+        function Stop-Process {
+            param($Id, [switch]$Force, $ErrorAction)
+            $script:OwnershipOperations.Add("stop-process:$Id")
+            [void]$Processes.Remove([int]$Id)
+        }
+        $failure = ''
+        try {
+            if ($Install) {
+                $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repository 'install.ps1'), [ref]$null, [ref]$null)
+                $shutdown = $ast.Find({
+                    param($node)
+                    $node -is [Management.Automation.Language.CommandAst] -and $node.GetCommandName() -eq 'Stop-BridgeOwnedService'
+                }, $true)
+                . ([scriptblock]::Create($shutdown.Extent.Text))
+                Stop-BridgeOwnedRuntime -Context $installContext
+                Set-Variable -Name devBoxDecision -Value (Get-BridgeDevBoxKeepAwakeDecision -IsDevBox $true -Requested ([bool]$Enable) `
+                    -OnWindows $OnWindows -Sandbox $installContext.Isolated -SkipTask ([bool]$SkipTask))
+                Set-Variable -Name devBoxIntervalHours -Value 4
+                $registration = $ast.EndBlock.Statements | Where-Object {
+                    $_ -is [Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -match 'devBoxDecision.Enabled'
+                } | Select-Object -First 1
+                if (-not $registration) { throw 'The actual keep-awake registration branch was not found.' }
+                . ([scriptblock]::Create($registration.Extent.Text))
+            }
+            else {
+                Set-Variable -Name ClearEntities -Value $false
+                Set-Variable -Name AdapterPayloadRoot -Value $repository
+                $ast = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repository 'uninstall.ps1'), [ref]$null, [ref]$null)
+                $entry = $ast.Find({
+                    param($node)
+                    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Invoke-BridgeUninstall'
+                }, $true)
+                $prefix = @(foreach ($statement in $entry.Body.EndBlock.Statements) {
+                    if ($statement.Extent.Text -match '^Remove-BridgeInstalledAdapters') { break }
+                    $statement.Extent.Text
+                })
+                . ([scriptblock]::Create($prefix -join "`n"))
+            }
+        }
+        catch { $failure = $_.Exception.Message }
+        [pscustomobject]@{ Operations = @($script:OwnershipOperations); Error = $failure }
+    }
+    finally {
+        $script:BridgeIsWindows = $savedPlatform
+        $env:BRIDGE_INSTALL_NORUN = $savedInstallNoRun
+        $env:BRIDGE_UNINSTALL_NORUN = $savedUninstallNoRun
+    }
+}
+
+$normalOwner = Initialize-BridgeInstallIdentity -Context (Resolve-BridgeInstallContext)
+if ($normalOwner.Isolated -or -not (Test-BridgeInstallDescendant $normalOwner.Home $env:AGENT_HA_BRIDGE_TEST_ROOT)) {
+    throw 'The ordinary-root fixture must remain within canonical synthetic HOME.'
+}
+$otherOwner = Initialize-BridgeInstallIdentity -Context (
+    Resolve-BridgeInstallContext -TargetHome (Join-Path $env:TEMP ('devbox-other-' + [guid]::NewGuid().ToString('N'))))
+foreach ($owner in @($normalOwner, $otherOwner)) {
+    Write-BridgeSecretFile -Path $owner.ConfigPath -Content '{"clients":[]}'
+    [void][IO.Directory]::CreateDirectory($owner.HooksDir)
+}
+$normalTaskName = "AgentBridgeDevBoxKeepAwake_$($normalOwner.Id)"
+$otherTaskName = "AgentBridgeDevBoxKeepAwake_$($otherOwner.Id)"
+$legacyTaskName = 'AgentBridgeDevBoxKeepAwake'
+$normalTask = [pscustomobject]@{ Actions = @([pscustomobject]@{
+    Execute = 'wscript.exe'; Arguments = '"' + (Join-Path $normalOwner.HooksDir 'agent-bridge-devbox-keepawake.vbs') + '"'
+}) }
+$otherTask = [pscustomobject]@{ Actions = @([pscustomobject]@{
+    Execute = 'wscript.exe'; Arguments = '"' + (Join-Path $otherOwner.HooksDir 'agent-bridge-devbox-keepawake.vbs') + '"'
+}) }
+Test-That 'recorded installations have distinct keep-awake task identities' {
+    $normalOwner.PSObject.Properties['DevBoxTaskName'] -and
+        $normalOwner.DevBoxTaskName -eq $normalTaskName -and $otherOwner.DevBoxTaskName -eq $otherTaskName
+}
+Test-That 'keep-awake task ownership requires its exact launcher and a single action' {
+    $extraArgument = [pscustomobject]@{ Actions = @([pscustomobject]@{
+        Execute = 'wscript.exe'; Arguments = $normalTask.Actions[0].Arguments + ' unrelated'
+    }) }
+    $extraAction = [pscustomobject]@{ Actions = @($normalTask.Actions[0], $otherTask.Actions[0]) }
+    (Test-BridgeTaskOwnership -Task $normalTask -Context $normalOwner -Role devbox-keepawake) -and
+        -not (Test-BridgeTaskOwnership -Task $otherTask -Context $normalOwner -Role devbox-keepawake) -and
+        -not (Test-BridgeTaskOwnership -Task $extraArgument -Context $normalOwner -Role devbox-keepawake) -and
+        -not (Test-BridgeTaskOwnership -Task $extraAction -Context $normalOwner -Role devbox-keepawake)
+}
+foreach ($operation in @('install', 'uninstall')) {
+    $tasks = @{ $legacyTaskName = $normalTask }
+    $outcome = Invoke-DevBoxOwnershipFixture -Owner $otherOwner -Tasks $tasks -Processes @{} -OnWindows $true -Install:($operation -eq 'install')
+    Test-That "isolated $operation leaves an unrelated legacy fixed task unchanged" {
+        -not $outcome.Error -and $outcome.Operations.Count -eq 0 -and $tasks.ContainsKey($legacyTaskName)
+    } $outcome.Error
+    $tasks = @{ $legacyTaskName = $normalTask }
+    $outcome = Invoke-DevBoxOwnershipFixture -Owner $normalOwner -Tasks $tasks -Processes @{} -OnWindows $false -Install:($operation -eq 'install')
+    Test-That "non-Windows $operation never calls Task Scheduler" { -not $outcome.Error -and $outcome.Operations.Count -eq 0 } $outcome.Error
+}
+$tasks = @{ $legacyTaskName = $otherTask }
+$outcome = Invoke-DevBoxOwnershipFixture -Owner $normalOwner -Tasks $tasks -Processes @{} -OnWindows $true
+Test-That 'a legacy name alone cannot authorize removal of another installations task' {
+    -not $outcome.Error -and $outcome.Operations.Count -eq 0 -and $tasks.ContainsKey($legacyTaskName)
+} $outcome.Error
+
+$pwshPath = (Get-Process -Id $PID).Path
+$started = [datetime]'2026-01-01T00:00:00Z'
+foreach ($operation in @('install', 'uninstall')) {
+    $tasks = @{ $legacyTaskName = $normalTask; $otherTaskName = $otherTask }
+    $processes = @{}
+    foreach ($row in @(@{ Id = 930001; Owner = $normalOwner }, @{ Id = 930002; Owner = $otherOwner })) {
+        $processes[$row.Id] = [pscustomobject]@{
+            ProcessId = $row.Id; Path = $pwshPath; CreationDate = $started
+            CommandLine = '"' + $pwshPath + '" -NoProfile -File "' + (Join-Path $row.Owner.HooksDir 'agent-bridge-devbox-keepawake.ps1') + '"'
+        }
+        @{ pid = $row.Id; installationId = $row.Owner.Id; executable = $pwshPath; startedUtcTicks = $started.ToUniversalTime().Ticks } |
+            ConvertTo-Json | Set-Content -LiteralPath (Get-BridgeRuntimePath -Name 'devbox-keepawake.process.json' -Context $row.Owner) -Encoding utf8
+    }
+    $outcome = Invoke-DevBoxOwnershipFixture -Owner $normalOwner -Tasks $tasks -Processes $processes -OnWindows $true `
+        -Install:($operation -eq 'install') -Enable
+    Test-That "$operation retires the verified legacy task and stops only its detached writer before payload work" {
+        -not $outcome.Error -and -not $tasks.ContainsKey($legacyTaskName) -and
+            -not $processes.ContainsKey(930001) -and $processes.ContainsKey(930002) -and $tasks.ContainsKey($otherTaskName)
+    } $outcome.Error
+    if ($operation -eq 'install') {
+        Test-That 'the selected feature is registered and started under its recorded installation identity' {
+            $tasks.ContainsKey($normalTaskName) -and $outcome.Operations -contains "start:$normalTaskName"
+        }
+    }
+}
+$tasks = @{ $normalTaskName = $otherTask }
+$outcome = Invoke-DevBoxOwnershipFixture -Owner $normalOwner -Tasks $tasks -Processes @{} -OnWindows $true -Install -Enable
+Test-That 'an installation-named task pointing elsewhere is refused without replacement' {
+    $outcome.Error -match 'elsewhere|another|ownership' -and $outcome.Operations.Count -eq 0 -and
+        $tasks[$normalTaskName].Actions[0].Arguments -eq $otherTask.Actions[0].Arguments
+}
+
+Write-Host '--- the actual detached entry owns its receipt and log ---'
+$ambientLog = Join-Path $env:TEMP 'agent-bridge-devbox-keepawake.log'
+[IO.File]::WriteAllText($ambientLog, 'unrelated ambient log')
+foreach ($owner in @($normalOwner, $otherOwner)) {
+    foreach ($name in @('agent-bridge-devbox-keepawake.ps1', 'bridge-platform.ps1', 'bridge-install-context.ps1')) {
+        Copy-Item -LiteralPath (Join-Path $PSScriptRoot "..\hooks\$name") -Destination $owner.HooksDir -Force
+    }
+    $observation = Join-Path $owner.BridgeHome 'entry-observation.json'
+    $scenarioPath = Join-Path $owner.BridgeHome 'entry-scenario.txt'
+    $receipt = Get-BridgeRuntimePath -Name 'devbox-keepawake.process.json' -Context $owner
+    if (Test-Path -LiteralPath $receipt) { Remove-Item -LiteralPath $receipt -Force }
+    $cloudBoundary = @'
+function Invoke-BridgeDevBoxKeepAwake {
+    param([scriptblock]$Logger, [switch]$DryRun)
+    $receipt = if ([IO.File]::Exists('__RECEIPT__')) { Get-Content -LiteralPath '__RECEIPT__' -Raw | ConvertFrom-Json } else { $null }
+    $calls = if ([IO.File]::Exists('__OBSERVATION__')) { (Get-Content -LiteralPath '__OBSERVATION__' -Raw | ConvertFrom-Json).calls + 1 } else { 1 }
+    @{ pid = $PID; dryRun = [bool]$DryRun; receipt = $receipt; calls = $calls } | ConvertTo-Json -Depth 5 |
+        Set-Content -LiteralPath '__OBSERVATION__' -Encoding utf8
+    & $Logger 'synthetic one-pass operation'
+    $scenario = [IO.File]::ReadAllText('__SCENARIO__')
+    if ($scenario -eq 'error') { throw 'synthetic cloud failure' }
+    [pscustomobject]@{ Status = $scenario; Detail = 'synthetic result' }
+}
+'@
+    $cloudBoundary.Replace('__RECEIPT__', $receipt.Replace("'", "''")).Replace('__OBSERVATION__', $observation.Replace("'", "''")).Replace('__SCENARIO__', $scenarioPath.Replace("'", "''")) |
+        Set-Content -LiteralPath (Join-Path $owner.HooksDir 'bridge-devbox.ps1') -Encoding utf8
+    foreach ($scenario in @('dry-run', 'blocked', 'error', 'unreadable', 'contended')) {
+        if (Test-Path -LiteralPath $observation) { Remove-Item -LiteralPath $observation -Force }
+        [IO.File]::WriteAllText($scenarioPath, $scenario)
+        if ($scenario -eq 'unreadable') { [IO.File]::WriteAllText($receipt, '{unreadable') }
+        $heldMutex = $null
+        if ($scenario -eq 'contended') {
+            $heldMutex = [Threading.Mutex]::new($false, ('Local\' + $owner.DevBoxTaskName))
+            if (-not $heldMutex.WaitOne([TimeSpan]::Zero)) { throw 'The synthetic owner could not hold its unique mutex.' }
+        }
+        $start = [Diagnostics.ProcessStartInfo]::new($pwshPath)
+        $start.UseShellExecute = $false
+        $start.RedirectStandardOutput = $true
+        $start.RedirectStandardError = $true
+        $start.Environment['AGENT_HA_BRIDGE_CONFIG'] = $otherOwner.ConfigPath
+        foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-File',
+            (Join-Path $owner.HooksDir 'agent-bridge-devbox-keepawake.ps1'))) { $start.ArgumentList.Add($argument) }
+        if ($scenario -eq 'dry-run') { $start.ArgumentList.Add('-DryRun') }
+        $child = $null
+        try {
+            $child = [Diagnostics.Process]::Start($start)
+            $stdout = $child.StandardOutput.ReadToEndAsync()
+            $stderr = $child.StandardError.ReadToEndAsync()
+            if (-not $child.WaitForExit(30000)) { $child.Kill($true); throw 'Synthetic keep-awake entry timed out.' }
+            $observed = if (Test-Path -LiteralPath $observation) { Get-Content -LiteralPath $observation -Raw | ConvertFrom-Json } else { $null }
+            $entryOutput = $stdout.Result + $stderr.Result
+            if ($scenario -in @('unreadable', 'contended')) {
+                Test-That "the actual $scenario entry fails before any cloud operation or receipt overwrite" {
+                    $child.ExitCode -eq 1 -and $null -eq $observed -and
+                        $(if ($scenario -eq 'unreadable') { [IO.File]::ReadAllText($receipt) -ceq '{unreadable' }
+                            else { -not (Test-Path -LiteralPath $receipt) })
+                } $entryOutput
+            }
+            else {
+                $expectedExit = switch ($scenario) { 'blocked' { 2 }; 'error' { 1 }; default { 0 } }
+                $expectedOutput = if ($scenario -eq 'error') { 'FAILED: synthetic cloud failure' } else { "${scenario}: synthetic result" }
+                Test-That "the actual $scenario entry preserves one-pass, receipt, DryRun, output and exit semantics" {
+                    $child.ExitCode -eq $expectedExit -and $observed.calls -eq 1 -and
+                        $observed.dryRun -eq ($scenario -eq 'dry-run') -and $observed.receipt -and
+                        $observed.receipt.pid -eq $observed.pid -and $observed.receipt.installationId -eq $owner.Id -and
+                        $entryOutput.Contains($expectedOutput)
+                } "exit=$($child.ExitCode); $entryOutput"
+                Test-That 'the completed detached pass clears only its own process receipt' { -not (Test-Path -LiteralPath $receipt) } $entryOutput
+            }
+            Test-That 'the actual entry log belongs to its installation rather than the ambient temporary directory' {
+                [IO.File]::Exists((Get-BridgeRuntimePath -Name 'agent-bridge-devbox-keepawake.log' -Context $owner)) -and
+                    [IO.File]::ReadAllText($ambientLog) -ceq 'unrelated ambient log'
+            }
+        }
+        finally {
+            if ($child) { $child.Dispose() }
+            if ($heldMutex) { $heldMutex.ReleaseMutex(); $heldMutex.Dispose() }
+            if ($scenario -eq 'unreadable' -and (Test-Path -LiteralPath $receipt)) { Remove-Item -LiteralPath $receipt -Force }
+        }
+    }
+}
+
+Write-Host '--- changed or unreadable runtime receipts are preserved ---'
+$receiptPath = Get-BridgeRuntimePath -Name 'devbox-keepawake.process.json' -Context $normalOwner
+Register-BridgeRuntimeProcess -Context $normalOwner -Role devbox-keepawake
+$ownedReceipt = [IO.File]::ReadAllText($receiptPath)
+try {
+    $changed = $ownedReceipt | ConvertFrom-Json
+    $changed.installationId = $otherOwner.Id
+    $replacement = $changed | ConvertTo-Json -Compress
+    [IO.File]::WriteAllText($receiptPath, $replacement)
+    Test-That 'receipt completion cannot delete a replacement owned by another installation' {
+        $refused = $false
+        try { Unregister-BridgeRuntimeProcess -Context $normalOwner -Role devbox-keepawake }
+        catch { $refused = $_.Exception.Message -match 'ownership changed' }
+        $refused -and [IO.File]::ReadAllText($receiptPath) -ceq $replacement
+    }
+    [IO.File]::WriteAllText($receiptPath, '{unreadable')
+    Test-That 'an unreadable receipt is an explicit failure rather than cleanup permission' {
+        $refused = $false
+        try { Unregister-BridgeRuntimeProcess -Context $normalOwner -Role devbox-keepawake }
+        catch { $refused = $_.Exception.Message -match 'unreadable' }
+        $refused -and [IO.File]::ReadAllText($receiptPath) -ceq '{unreadable'
+    }
+    [IO.File]::WriteAllText($receiptPath, $ownedReceipt)
+    Unregister-BridgeRuntimeProcess -Context $normalOwner -Role devbox-keepawake
+    Test-That 'the matching live process can remove its own receipt normally' { -not (Test-Path -LiteralPath $receiptPath) }
+}
+finally {
+    if (Test-Path -LiteralPath $receiptPath) { Remove-Item -LiteralPath $receiptPath -Force }
 }
 
 Write-Host ''

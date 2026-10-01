@@ -201,6 +201,7 @@ function Resolve-BridgeInstallContext {
         Isolated = $isolated; Legacy = $legacy; LegacyLayout = $legacyLayout
         Recorded = [bool]$record; ExplicitConfig = $explicitConfig
         TaskName = if ($id) { "AgentBridgeDaemon_$id" } else { 'AgentBridgeDaemon' }
+        DevBoxTaskName = if ($id) { "AgentBridgeDevBoxKeepAwake_$id" } else { 'AgentBridgeDevBoxKeepAwake' }
         LaunchAgentLabel = if ($id) { "com.agent-ha-bridge.daemon.$id" } else { 'com.agent-ha-bridge.daemon' }
         TestRegistryId = if ($record -and $record['testRegistryId']) { [string]$record['testRegistryId'] } else { '' }
     }

@@ -31,6 +31,13 @@ staging/outcomes and daemon state under `<install root>\runtime`. Task names and
 mutexes include the local installation identity. The default pre-metadata layout
 continues to understand its legacy temporary paths.
 
+The optional Dev Box timer uses `AgentBridgeDevBoxKeepAwake_<installation-id>`.
+Its detached worker writes an owned process receipt before its one-pass operation
+and removes that receipt on completion only when process identity still matches.
+An installation-scoped mutex prevents overlapping detached passes from replacing
+one another's receipt. Its log stays in the installation runtime directory. A verified legacy fixed task
+is retired before the scoped task is installed; unrelated task actions are preserved.
+
 When a verified legacy daemon owns the old heartbeat, installation stops that
 writer and copies its state and backup without rewriting their contents. Registry
 and pending-marker copies require a matching session and a transcript inside the
@@ -55,7 +62,7 @@ installer records a selection.
 
 ## Removal and degraded operation
 
-Removal stops the owned service, supervisor, daemon and background adapter setup
+Removal stops the owned service, supervisor, daemon, detached keep-awake worker and background adapter setup
 before clearing entities or removing registrations and payloads. A process name or
 heartbeat PID alone is insufficient: executable, start identity, script path and
 installation ownership are checked. Unrelated processes and registrations are not

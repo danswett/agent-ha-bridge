@@ -230,7 +230,7 @@ function Get-BridgeProcessesNamed {
 
 function Test-BridgeRuntimeProcess {
     param([Parameter(Mandatory)]$Process, [Parameter(Mandatory)]$Context,
-        [Parameter(Mandatory)][ValidateSet('daemon', 'supervisor', 'setup-copilot', 'setup-claude', 'setup-codex', 'setup-mcp')][string]$Role)
+        [Parameter(Mandatory)][ValidateSet('daemon', 'supervisor', 'devbox-keepawake', 'setup-copilot', 'setup-claude', 'setup-codex', 'setup-mcp')][string]$Role)
     if (-not $Process.ProcessId -or -not $Process.Path -or -not $Process.CreationDate -or
         [IO.Path]::GetFileNameWithoutExtension([string]$Process.Path) -notin @('pwsh', 'powershell')) { return $false }
     $targetSuffix = ''
@@ -240,6 +240,8 @@ function Test-BridgeRuntimeProcess {
         $targetSuffix = "\s+(?i:-InstallRoot)\s+(?:`"$target`"|'$target'|$target)(?=\s|$)"
         if ($client -eq 'copilot') { @(Join-Path $Context.BridgeHome 'installer\install.ps1') }
         else { @(Join-Path $Context.BridgeHome "installer\$client\install-$client.ps1") }
+    } elseif ($Role -eq 'devbox-keepawake') {
+        @(Join-Path $Context.HooksDir 'agent-bridge-devbox-keepawake.ps1')
     } else {
         @((Join-Path $Context.HooksDir "agent-bridge-$Role.ps1"),
             (Join-Path $Context.CopilotHome "hooks\copilot-bridge-$Role.ps1"))
@@ -260,7 +262,7 @@ function Test-BridgeRuntimeProcess {
 
 function Get-BridgeRuntimeProcess {
     param([Parameter(Mandatory)][int]$ProcessId, [Parameter(Mandatory)]$Context,
-        [Parameter(Mandatory)][ValidateSet('daemon', 'supervisor', 'setup-copilot', 'setup-claude', 'setup-codex', 'setup-mcp')][string]$Role,
+        [Parameter(Mandatory)][ValidateSet('daemon', 'supervisor', 'devbox-keepawake', 'setup-copilot', 'setup-claude', 'setup-codex', 'setup-mcp')][string]$Role,
         [switch]$RequireReadable)
     $process = Get-BridgeProcessInfo -ProcessId $ProcessId -WithCommandLine
     if (-not $process) {
@@ -300,8 +302,8 @@ function Get-BridgeRuntimeProcess {
 
 function Get-BridgeOwnedRuntimeProcesses {
     param([Parameter(Mandatory)]$Context,
-        [ValidateSet('daemon', 'supervisor', 'setup-copilot', 'setup-claude', 'setup-codex', 'setup-mcp')]
-        [string[]]$Roles = @('supervisor', 'daemon', 'setup-copilot', 'setup-claude', 'setup-codex', 'setup-mcp'),
+        [ValidateSet('daemon', 'supervisor', 'devbox-keepawake', 'setup-copilot', 'setup-claude', 'setup-codex', 'setup-mcp')]
+        [string[]]$Roles = @('supervisor', 'daemon', 'devbox-keepawake', 'setup-copilot', 'setup-claude', 'setup-codex', 'setup-mcp'),
         [switch]$RequireReadable)
     $candidates = @(Get-BridgeProcessesNamed -Name 'pwsh' -WithCommandLine)
     foreach ($role in $Roles) {
@@ -331,7 +333,18 @@ function Get-BridgeOwnedRuntimeProcesses {
 }
 
 function Register-BridgeRuntimeProcess {
-    param([Parameter(Mandatory)]$Context, [Parameter(Mandatory)][ValidateSet('daemon', 'supervisor')][string]$Role)
+    param([Parameter(Mandatory)]$Context, [Parameter(Mandatory)][ValidateSet('daemon', 'supervisor', 'devbox-keepawake')][string]$Role)
+    if ($Role -eq 'devbox-keepawake') {
+        $existing = Read-BridgeInstallRecord -Path (Get-BridgeRuntimePath -Name "$Role.process.json" -Context $Context)
+        if ($existing) {
+            if ([string]$existing['installationId'] -cne $Context.Id -or -not $existing['pid']) {
+                throw 'Existing keep-awake receipt ownership is invalid; it was preserved.'
+            }
+            if (Get-BridgeRuntimeProcess -ProcessId ([int]$existing['pid']) -Context $Context -Role $Role -RequireReadable) {
+                throw 'An owned keep-awake process is still running; its receipt was preserved.'
+            }
+        }
+    }
     $process = Get-Process -Id $PID -ErrorAction Stop
     $directory = Get-BridgeRuntimeRoot -Context $Context
     [void][IO.Directory]::CreateDirectory($directory)
@@ -341,10 +354,24 @@ function Register-BridgeRuntimeProcess {
     } | ConvertTo-Json -Compress | Set-Content -LiteralPath (Join-Path $directory "$Role.process.json") -Encoding utf8
 }
 
+function Unregister-BridgeRuntimeProcess {
+    param([Parameter(Mandatory)]$Context, [Parameter(Mandatory)][ValidateSet('daemon', 'supervisor', 'devbox-keepawake')][string]$Role)
+    $path = Get-BridgeRuntimePath -Name "$Role.process.json" -Context $Context
+    Assert-BridgeInstallPayload -Root (Get-BridgeRuntimeRoot -Context $Context) -RelativePaths @("$Role.process.json")
+    $record = Read-BridgeInstallRecord -Path $path
+    $process = Get-Process -Id $PID -ErrorAction Stop
+    if (-not $record -or [int]$record['pid'] -ne $PID -or [string]$record['installationId'] -cne $Context.Id -or
+        -not $record['executable'] -or -not (Test-BridgeInstallPath ([string]$record['executable']) $process.Path) -or
+        [long]$record['startedUtcTicks'] -ne $process.StartTime.ToUniversalTime().Ticks) {
+        throw 'Runtime receipt ownership changed; the replacement receipt was preserved.'
+    }
+    Remove-Item -LiteralPath $path -Force -ErrorAction Stop
+}
+
 function Stop-BridgeOwnedRuntime {
     param([Parameter(Mandatory)]$Context,
-        [ValidateSet('supervisor', 'daemon', 'setup-copilot', 'setup-claude', 'setup-codex', 'setup-mcp')]
-        [string[]]$Roles = @('supervisor', 'daemon', 'setup-copilot', 'setup-claude', 'setup-codex', 'setup-mcp'))
+        [ValidateSet('supervisor', 'daemon', 'devbox-keepawake', 'setup-copilot', 'setup-claude', 'setup-codex', 'setup-mcp')]
+        [string[]]$Roles = @('supervisor', 'daemon', 'devbox-keepawake', 'setup-copilot', 'setup-claude', 'setup-codex', 'setup-mcp'))
     foreach ($process in @(Get-BridgeOwnedRuntimeProcesses -Context $Context -Roles $Roles -RequireReadable)) {
         $role = $process.BridgeRuntimeRole
         $current = Get-BridgeRuntimeProcess -ProcessId ([int]$process.ProcessId) -Context $Context -Role $role -RequireReadable
@@ -372,12 +399,15 @@ function Stop-BridgeOwnedRuntime {
 }
 
 function Test-BridgeTaskOwnership {
-    param([Parameter(Mandatory)]$Task, [Parameter(Mandatory)]$Context)
+    param([Parameter(Mandatory)]$Task, [Parameter(Mandatory)]$Context,
+        [ValidateSet('daemon', 'devbox-keepawake')][string]$Role = 'daemon')
     if (@($Task.Actions).Count -ne 1) { return $false }
-    $launchers = @(
+    $launchers = if ($Role -eq 'devbox-keepawake') {
+        @(Join-Path $Context.HooksDir 'agent-bridge-devbox-keepawake.vbs')
+    } else { @(
         (Join-Path $Context.HooksDir 'agent-bridge-launch.vbs'),
         (Join-Path $Context.CopilotHome 'hooks\copilot-bridge-launch.vbs')
-    )
+    ) }
     foreach ($action in @($Task.Actions)) {
         if ([IO.Path]::GetFileName([string]$action.Execute) -ieq 'wscript.exe' -and
             $launchers -contains ([string]$action.Arguments).Trim().Trim('"')) { return $true }
@@ -419,21 +449,29 @@ function Test-BridgeLaunchAgentOwnership {
 }
 
 function Stop-BridgeOwnedService {
-    param([Parameter(Mandatory)]$Context, [switch]$Remove)
+    param([Parameter(Mandatory)]$Context, [switch]$Remove,
+        [ValidateSet('daemon', 'devbox-keepawake')][string[]]$Roles = @('daemon', 'devbox-keepawake'))
     if ($Context.Isolated) { return }
     if ($script:BridgeIsWindows) {
-        foreach ($name in @($Context.TaskName, 'AgentBridgeDaemon', 'CopilotBridgeDaemon') | Select-Object -Unique) {
-            $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
-            if (-not $task) { continue }
-            if (-not (Test-BridgeTaskOwnership -Task $task -Context $Context)) {
-                if ($name -eq $Context.TaskName) { throw 'The installation task points elsewhere; no cleanup was authorized.' }
-                continue
+        foreach ($role in $Roles) {
+            $currentName = if ($role -eq 'daemon') { $Context.TaskName } else { $Context.DevBoxTaskName }
+            $names = if ($role -eq 'daemon') { @($currentName, 'AgentBridgeDaemon', 'CopilotBridgeDaemon') }
+                else { @($currentName, 'AgentBridgeDevBoxKeepAwake') }
+            foreach ($name in $names | Select-Object -Unique) {
+                $task = Get-ScheduledTask -TaskName $name -ErrorAction SilentlyContinue
+                if (-not $task) { continue }
+                if (-not (Test-BridgeTaskOwnership -Task $task -Context $Context -Role $role)) {
+                    if ($name -eq $currentName) { throw 'The installation task points elsewhere; no cleanup was authorized.' }
+                    continue
+                }
+                Stop-ScheduledTask -TaskName $name -ErrorAction Stop
+                if ($Remove -or $name -ne $currentName -or $role -eq 'devbox-keepawake') {
+                    Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction Stop
+                }
             }
-            Stop-ScheduledTask -TaskName $name -ErrorAction Stop
-            if ($Remove -or $name -ne $Context.TaskName) { Unregister-ScheduledTask -TaskName $name -Confirm:$false -ErrorAction Stop }
         }
     }
-    else {
+    elseif ($Roles -contains 'daemon') {
         foreach ($label in @($Context.LaunchAgentLabel, 'com.agent-ha-bridge.daemon') | Select-Object -Unique) {
             $plist = Join-Path $Context.Home "Library\LaunchAgents\$label.plist"
             if (-not [IO.File]::Exists($plist)) { continue }

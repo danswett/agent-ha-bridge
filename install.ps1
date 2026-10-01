@@ -182,7 +182,7 @@ $agentInstructionsPath = Join-Path $copilotHome 'instructions\agent-ha-bridge.in
 $taskName = 'AgentBridgeDaemon'
 # Separate from the daemon task because it has a different life: it fires on a timer
 # rather than staying resident, and it exists only on a Dev Box that opted in.
-$devBoxTaskName = 'AgentBridgeDevBoxKeepAwake'
+$devBoxTaskName = if ($installContext) { $installContext.DevBoxTaskName } else { 'AgentBridgeDevBoxKeepAwake' }
 # The macOS counterpart of the scheduled task.
 $launchAgentLabel = 'com.agent-ha-bridge.daemon'
 $launchAgentPath = Join-Path $installHome "Library/LaunchAgents/$launchAgentLabel.plist"
@@ -2232,6 +2232,7 @@ $installContext = Initialize-BridgeInstallIdentity -Context $installContext -Tes
 Copy-BridgeLegacyRuntimeState -PreviousContext $previousInstallContext -Context $installContext -Claim $legacyRuntimeClaim
 $script:BridgeInstallContext = $installContext
 $taskName = $installContext.TaskName
+$devBoxTaskName = $installContext.DevBoxTaskName
 $launchAgentLabel = $installContext.LaunchAgentLabel
 $launchAgentPath = Join-Path $installHome "Library\LaunchAgents\$launchAgentLabel.plist"
 if (-not $TestRegistryId) { $arpKey = "HKCU:\Software\Microsoft\Windows\CurrentVersion\Uninstall\AgentHaBridge_$($installContext.Id)" }
@@ -2328,7 +2329,7 @@ if ($PSBoundParameters.ContainsKey('TickerCategory') -and $TickerCategory) {
 # a Dev Box running the daemon and several agent sessions is hibernated mid-task and
 # simply reads as offline on the dashboard. Detected rather than configured, so an
 # ordinary desktop never sees any of this.
-$isDevBox = Test-BridgeDevBox
+$isDevBox = $script:BridgeIsWindows -and -not $installContext.Isolated -and (Test-BridgeDevBox)
 if ($PSBoundParameters.ContainsKey('DevBoxKeepAwake')) {
     $config.devBox.keepAwake = [bool]$DevBoxKeepAwake
 }
@@ -2349,7 +2350,7 @@ if ($config.devBox.PSObject.Properties['intervalHours'] -and [int]$config.devBox
 }
 $devBoxDecision = Get-BridgeDevBoxKeepAwakeDecision -IsDevBox $isDevBox `
     -Requested ([bool]$config.devBox.keepAwake) -OnWindows ([bool]$script:BridgeIsWindows) `
-    -Sandbox ([bool]$TargetHome) -SkipTask ([bool]$SkipTask)
+    -Sandbox $installContext.Isolated -SkipTask ([bool]$SkipTask)
 
 # Pre-rename configs pinned the old slug explicitly, which would leave the daemon
 # writing to /copilot-decisions forever. Only the old default is rewritten - a slug
@@ -2853,9 +2854,13 @@ elseif (-not $SkipTask) {
 }
 
 # ------------------------------------------------- Dev Box keep-awake task
-if ($devBoxDecision.Enabled) {
+if ($devBoxDecision.Enabled -and $script:BridgeIsWindows -and -not $installContext.Isolated) {
     Write-Step "Registering the '$devBoxTaskName' scheduled task"
     try {
+        $existingKeepAwakeTask = Get-ScheduledTask -TaskName $devBoxTaskName -ErrorAction SilentlyContinue
+        if ($existingKeepAwakeTask -and -not (Test-BridgeTaskOwnership -Task $existingKeepAwakeTask -Context $installContext -Role devbox-keepawake)) {
+            throw 'The keep-awake task belongs to another installation; it was not replaced.'
+        }
         $keepAwakeLauncher = Join-Path $hooksDir 'agent-bridge-devbox-keepawake.vbs'
         $keepAwakeAction = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$keepAwakeLauncher`""
         $keepAwakeTriggers = New-BridgeDevBoxKeepAwakeTrigger -IntervalHours $devBoxIntervalHours
@@ -2866,7 +2871,7 @@ if ($devBoxDecision.Enabled) {
         $keepAwakePrincipal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
             -LogonType Interactive -RunLevel Limited
 
-        if (Get-ScheduledTask -TaskName $devBoxTaskName -ErrorAction SilentlyContinue) {
+        if ($existingKeepAwakeTask) {
             Set-ScheduledTask -TaskName $devBoxTaskName -Action $keepAwakeAction -Trigger $keepAwakeTriggers `
                 -Settings $keepAwakeSettings -Principal $keepAwakePrincipal | Out-Null
         }
@@ -2885,14 +2890,10 @@ if ($devBoxDecision.Enabled) {
                        '    The bridge still works; this Dev Box may hibernate while it is running.')
     }
 }
-elseif ($script:BridgeIsWindows -and -not $TargetHome) {
+elseif ($script:BridgeIsWindows -and -not $installContext.Isolated) {
     # Turned off, or never on: a task left by an earlier run would keep delaying the
     # stop forever with nothing in the config to explain why.
-    if (Get-ScheduledTask -TaskName $devBoxTaskName -ErrorAction SilentlyContinue) {
-        Write-Step "Removing the '$devBoxTaskName' scheduled task"
-        Unregister-ScheduledTask -TaskName $devBoxTaskName -Confirm:$false
-        Write-Host "    $($devBoxDecision.Reason)"
-    }
+    Stop-BridgeOwnedService -Context $installContext -Roles devbox-keepawake -Remove
 }
 
 # --------------------------------------------------------- configure adapters

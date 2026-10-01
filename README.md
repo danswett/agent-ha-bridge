@@ -379,7 +379,7 @@ nothing. The daemon stops mid-reconcile, its liveness beat stops, and the machin
 as offline on the dashboard with nothing anywhere saying why.
 
 The installer detects a Dev Box and offers to register a second scheduled task,
-`AgentBridgeDevBoxKeepAwake`, which clears the pending stop every few hours through
+`AgentBridgeDevBoxKeepAwake_<installation-id>`, which clears the pending stop every few hours through
 Dev Center's own API:
 
 ```powershell
@@ -398,7 +398,13 @@ a timer rather than once:
 - **neither lever works while the stop is more than 24 hours away** — which is the state
   worth reaching, so the task reports that as already safe and does nothing.
 
-Passes are logged to `$env:TEMP\agent-bridge-devbox-keepawake.log`. To see what it would
+The task and its detached PowerShell worker belong to the recorded installation.
+Removal stops that owned worker before deleting its payload; isolated/custom-root
+installs do not register or remove shared tasks. The installation ID is stored in
+`installation.json` beside the bridge config.
+
+Passes are logged to `~\.agent-ha-bridge\runtime\agent-bridge-devbox-keepawake.log`
+for the default installation. To see what it would
 do without changing anything:
 
 ```powershell
@@ -532,9 +538,9 @@ existing setup in one pass:
 | `~/.copilot/hooks/*.ps1` (shared scripts) | `~/.agent-ha-bridge/hooks/` |
 | `~/.copilot/copilot-ha-bridge.config.json` | `~/.agent-ha-bridge/config.json` |
 | `~/.copilot/mcp`, `~/.copilot/codex-bridge` | `~/.agent-ha-bridge/mcp`, `.../codex-bridge` |
-| Scheduled task `CopilotBridgeDaemon` | `AgentBridgeDaemon` |
+| Scheduled task `CopilotBridgeDaemon` | `AgentBridgeDaemon_<installation-id>` |
 | Dashboard `/copilot-decisions` | `/agent-decisions` |
-| `%TEMP%\copilot-decision-bridge.log` | `%TEMP%\agent-decision-bridge.log` |
+| `%TEMP%\copilot-decision-bridge.log` | `~\.agent-ha-bridge\runtime\agent-decision-bridge.log` |
 | `$env:COPILOT_HA_BRIDGE_CONFIG` | `$env:AGENT_HA_BRIDGE_CONFIG` |
 
 Your Home Assistant token is moved, not re-requested, so the upgrade never prompts for
@@ -546,6 +552,12 @@ and its session transcripts.
 Entity ids do not change, so automations built on `agent_bridge_*` keep working. The
 old `$env:COPILOT_HA_BRIDGE_CONFIG` and config path are still read as a fallback, so a
 machine that has not been upgraded yet keeps running.
+
+Current installations record their local identity and roots in `installation.json`.
+Verified legacy task registrations are retired during upgrade; an unrelated task
+with a historical name is not claimed by name alone. See
+[installation ownership](docs/installation-isolation.md) for custom-root and
+pre-metadata compatibility.
 
 ### There is no MQTT broker to configure
 
@@ -943,22 +955,28 @@ inside a disposable machine, not permission to exercise installation on a real o
 | Cards show `unknown` after a Home Assistant restart | Self-heals within one reconcile (~15 s); the entities are optimistic and have no state to restore. |
 | "Entity not found" on a card | The daemon provisions entities on its next pass; check the daemon log. |
 | Answers picked in Home Assistant do nothing | The session predates the install — `/restart` it. |
-| Nothing at all happens | Check `$env:TEMP\agent-bridge-daemon.log` and `agent-decision-bridge.log`. |
+| Nothing at all happens | Run `agent-ha-bridge logs`, or check `agent-bridge-daemon.log` and `agent-decision-bridge.log` under the installation's `runtime` directory. |
 | A Dev Box goes offline mid-session every evening | Its pool hibernates on disconnect. See [Running on a Microsoft Dev Box](#running-on-a-microsoft-dev-box). |
 
-The daemon runs as the hidden scheduled task `AgentBridgeDaemon`:
+On Windows the daemon runs under an installation-scoped hidden task. For the default
+installation (set `$bridgeRoot` to the intended root for a custom installation):
 
 ```powershell
-Get-ScheduledTask -TaskName AgentBridgeDaemon
-Get-Content $env:TEMP\agent-bridge-daemon.log -Tail 20
+$bridgeRoot = Join-Path $HOME '.agent-ha-bridge'
+$installation = Get-Content (Join-Path $bridgeRoot 'installation.json') -Raw | ConvertFrom-Json
+Get-ScheduledTask -TaskName "AgentBridgeDaemon_$($installation.id)"
+Get-Content (Join-Path $bridgeRoot 'runtime\agent-bridge-daemon.log') -Tail 20
 ```
 
 On a Dev Box with keep-awake enabled there is a second task beside it:
 
 ```powershell
-Get-ScheduledTask -TaskName AgentBridgeDevBoxKeepAwake
-Get-Content $env:TEMP\agent-bridge-devbox-keepawake.log -Tail 20
+Get-ScheduledTask -TaskName "AgentBridgeDevBoxKeepAwake_$($installation.id)"
+Get-Content (Join-Path $bridgeRoot 'runtime\agent-bridge-devbox-keepawake.log') -Tail 20
 ```
+
+Pre-metadata installations retain their historical task names and temporary log
+locations until upgraded. No shared scheduled task is created by an isolated install.
 
 ---
 
@@ -1055,8 +1073,10 @@ mid-write. Real arguments always win over recovered ones.
 | `route-ask-user-v3.ps1` | The non-blocking `ask_user` router |
 | `notify-agent-response.ps1` | Non-blocking response mirror + card |
 
-Logs: `%TEMP%\agent-decision-bridge.log` (hooks), `%TEMP%\agent-bridge-daemon.log`,
-`%TEMP%\agent-bridge-supervisor.log`. Hook config changes reach a running CLI only
+Logs are under the recorded installation's `runtime` directory:
+`agent-decision-bridge.log` (hooks), `agent-bridge-daemon.log`,
+`agent-bridge-supervisor.log`, and, when enabled, `agent-bridge-devbox-keepawake.log`.
+Pre-metadata installs retain their legacy temporary paths. Hook config changes reach a running CLI only
 after `/restart`; the daemon is shared and picks up new sessions on its own reconcile.
 
 ### Design constraints worth knowing
