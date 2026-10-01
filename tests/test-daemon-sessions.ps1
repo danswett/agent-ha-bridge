@@ -404,6 +404,59 @@ Test-That 'the actual void-or-throw save failure neither advances currentness no
     -not $failedSave -and $script:DaemonDashboardSignature -ceq $lastSignature -and $script:Retired.Count -eq 0
 }
 
+Write-Host '--- actual card pins also fence observer currentness and retirement ---'
+Initialize-TestPublicationStore
+$unpinnedSource = New-TestPublicationCard '1.21.0'
+$exactPinSource = New-TestPublicationCard '1.20.0'
+$sameVersionWrongSource = New-TestPublicationCard '1.20.0' 'export const wrongPinnedBody = true;'
+Initialize-TestPublicationAuthority -CardSource $unpinnedSource
+[void](Install-BridgeReplyCard -SourcePath $unpinnedSource)
+[void](Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers)
+$beforeCardPin = (Read-BridgePublicationState).Policy
+Set-TestPublicationIdentity -Generation 2
+Set-BridgePublicationPolicy -ExpectedGeneration 1 `
+    -ExpectedPolicyHash (Get-BridgePublicationHash (ConvertTo-BridgePublicationJson $beforeCardPin)) `
+    -Target (Get-BridgePublicationTarget -CardSourcePath $exactPinSource) -Mode pin | Out-Null
+[void](Install-BridgeReplyCard -SourcePath $exactPinSource)
+[void](Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers)
+$pinMachines = @(Get-DaemonMachineCards -Capabilities $publicationCapabilities -Peers @() `
+    -LocalSessionNodes @($publicationDescriptors | ForEach-Object { [string]$_.Node }))
+foreach ($mismatchingSource in @($unpinnedSource, $sameVersionWrongSource)) {
+    $mismatchingVersion = Get-BridgeReplyCardFileVersion -SourcePath $mismatchingSource
+    $mismatchingUrl = Get-BridgeInlineReplyCardUrl -SourcePath $mismatchingSource -Version $mismatchingVersion
+    $matchingSignature = Get-BridgeDashboardInputSignature -Sessions $publicationDescriptors -Machines $pinMachines `
+        -MachineSelector '' -ReplyCardUrl $mismatchingUrl
+    Set-TestPublicationReceiptForCard -CardUrl $mismatchingUrl -InputSignature $matchingSignature
+    $script:DaemonDashboardSignature = $matchingSignature
+    Set-TestPublicationIdentity -Participant 'observer-b' -Generation 2
+    $script:Retired = @()
+    $script:DaemonPendingRetire = @($retiringId)
+    $script:TestPublication.Commands.Clear()
+    $pinMismatchCurrent = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+    Complete-DaemonSessionRetirement -Gone @() -DashboardCurrent $pinMismatchCurrent -Headers $headers
+    Test-That "an observer refuses a self-consistent out-of-pin $mismatchingVersion view despite matching signatures" {
+        -not $pinMismatchCurrent -and @(Get-TestPublicationWrites).Count -eq 0
+    }
+    Test-That "out-of-pin $mismatchingVersion currentness does not authorize actual queued retirement" {
+        $script:Retired.Count -eq 0 -and $script:DaemonPendingRetire -contains $retiringId
+    }
+    Test-That "out-of-pin $mismatchingVersion reconciliation retains the repair-required reason" {
+        $script:Log[-1] -match 'pin.*repair|repair.*pin'
+    }
+    Set-TestPublicationIdentity -Generation 2
+    [void](Install-BridgeReplyCard -SourcePath $exactPinSource)
+    $restoredPin = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+    Set-TestPublicationIdentity -Participant 'observer-b' -Generation 2
+    $script:Retired = @()
+    $script:DaemonPendingRetire = @($retiringId)
+    $script:TestPublication.Commands.Clear()
+    $observedPin = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+    Complete-DaemonSessionRetirement -Gone @() -DashboardCurrent $observedPin -Headers $headers
+    Test-That "restoring the exact pin permits observer currentness and safe retirement after $mismatchingVersion interference" {
+        $restoredPin -and $observedPin -and $script:Retired -contains $retiringId -and @(Get-TestPublicationWrites).Count -eq 0
+    }
+}
+
 Write-Host '--- migration refusal leaves actual session and machine reporting available ---'
 Initialize-TestPublicationStore -Unconfigured
 $reportSource = New-TestPublicationCard '2.0.0'

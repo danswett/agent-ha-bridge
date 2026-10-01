@@ -189,6 +189,20 @@ function Set-TestPublicationCardUrl {
     Set-TestPublicationStore $store
 }
 
+function Set-TestPublicationReceiptForCard {
+    param([Parameter(Mandatory)][string]$CardUrl, [string]$InputSignature)
+    # Persist the internally consistent state an older participating writer could
+    # leave behind. The real reader must reject its pin mismatch, not merely a bad seal.
+    Set-TestPublicationCardUrl -Url $CardUrl
+    $store = Get-TestPublicationStore
+    $config = $store.configs['agent-decisions']
+    $config.agent_bridge_publication.cardUrlHash = Get-BridgePublicationHash $CardUrl
+    if ($PSBoundParameters.ContainsKey('InputSignature')) { $config.agent_bridge_publication.inputHash = $InputSignature }
+    [void]$config.agent_bridge_publication.Remove('contentHash')
+    $config.agent_bridge_publication.contentHash = Get-BridgePublicationHash (ConvertTo-BridgePublicationJson $config)
+    Set-TestPublicationStore $store
+}
+
 function Initialize-TestPublicationAuthority {
     param([string]$CardSource = (Join-Path $PSScriptRoot '..\frontend\agent-bridge-reply-card.js'),
         [AllowEmptyString()][string]$CardUrl = '', [switch]$ServeCard)
@@ -1293,6 +1307,108 @@ Write-Host '--- explicit policy generations, rollback and real failure paths ---
                 $_.ScriptStackTrace -match 'Save-BridgePublicationReceipt' -and
                     $_.Exception.Message -match 'directory|metadata' -and @(Get-TestPublicationWrites).Count -eq 0
             }
+        }
+
+        Write-Host '--- dashboard publication honors the actual exact card pin ---'
+        Initialize-TestPublicationStore
+        $script:BridgeDashboardRenderVersion = '1.0.0'
+        $advanceSource = New-TestPublicationCard '1.21.0'
+        $pinSource = New-TestPublicationCard '1.20.0'
+        $wrongContentSource = New-TestPublicationCard '1.20.0' 'export const differentContent = true;'
+        Initialize-TestPublicationAuthority -CardSource $advanceSource
+        [void](Install-BridgeReplyCard -SourcePath $advanceSource)
+        Save-CopilotSessionDashboard -Sessions @()
+        $advancePolicy = (Read-BridgePublicationState).Policy
+        Set-TestPublicationIdentity -Generation 2
+        Set-BridgePublicationPolicy -ExpectedGeneration 1 `
+            -ExpectedPolicyHash (Get-BridgePublicationHash (ConvertTo-BridgePublicationJson $advancePolicy)) `
+            -Target (Get-BridgePublicationTarget -CardSourcePath $pinSource) -Mode pin | Out-Null
+        $script:TestPublication.Commands.Clear()
+        $unappliedPinFailure = ''
+        try { Save-CopilotSessionDashboard -Sessions @() }
+        catch { $unappliedPinFailure = $_.Exception.Message }
+        $unappliedPin = Get-BridgeDashboardPublication
+        Test-That 'a not-yet-applied card rollback cannot be published as current' {
+            $unappliedPinFailure -match 'pin.*repair|repair.*pin' -and
+                -not $unappliedPin.Verified -and @(Get-TestPublicationWrites).Count -eq 0
+        }
+        Test-That 'an unapplied exact card pin keeps an actionable currentness reason' {
+            $unappliedPin.Reason -match 'pin.*repair|repair.*pin'
+        }
+        $appliedCardPin = Install-BridgeReplyCard -SourcePath $pinSource
+        Save-CopilotSessionDashboard -Sessions @()
+        Test-That 'an actually applied exact card and renderer pin remains verified' {
+            $appliedCardPin.Ok -and (Get-BridgeDashboardPublication).Verified
+        }
+
+        Invoke-TestPreFencePublication -CardSource $advanceSource -Sessions @()
+        Test-That 'a genuine pre-fence overwrite is still possible and initially detected' {
+            -not (Get-BridgeDashboardPublication).Verified -and
+                (Get-BridgeRegisteredCardArtifact -Url (Read-BridgePublicationState).CardUrl).version -ceq '1.21.0'
+        }
+        $script:TestPublication.Commands.Clear()
+        $legacyPinFailure = ''
+        try { Save-CopilotSessionDashboard -Sessions @() }
+        catch { $legacyPinFailure = $_.Exception.Message }
+        Test-That 'the new publisher cannot bless a pre-fence overwrite across the card pin' {
+            $legacyPinFailure -match 'pin.*repair|repair.*pin' -and
+                -not (Get-BridgeDashboardPublication).Verified -and @(Get-TestPublicationWrites).Count -eq 0
+        }
+        [void](Install-BridgeReplyCard -SourcePath $pinSource)
+        Save-CopilotSessionDashboard -Sessions @()
+
+        $wrongContentUrl = Get-BridgeInlineReplyCardUrl -SourcePath $wrongContentSource -Version '1.20.0'
+        Set-TestPublicationCardUrl -Url $wrongContentUrl
+        $script:TestPublication.Commands.Clear()
+        $wrongContentFailure = ''
+        try { Save-CopilotSessionDashboard -Sessions @() }
+        catch { $wrongContentFailure = $_.Exception.Message }
+        Test-That 'the right pinned version with wrong actual content is also refused by the publisher' {
+            $wrongContentFailure -match 'pin.*repair|repair.*pin' -and
+                -not (Get-BridgeDashboardPublication).Verified -and @(Get-TestPublicationWrites).Count -eq 0
+        }
+        Set-TestPublicationReceiptForCard -CardUrl $wrongContentUrl
+        $consistentWrongPin = Get-BridgeDashboardPublication
+        Test-That 'a self-consistent persisted receipt cannot make wrong pinned card content current' {
+            -not $consistentWrongPin.Verified -and $consistentWrongPin.Reason -match 'pin.*repair|repair.*pin'
+        }
+        Set-TestPublicationIdentity -Participant 'observer-b' -Generation 2
+        $script:TestPublication.Commands.Clear()
+        Test-That 'a non-writer observes the actual card-pin mismatch without claiming currentness' {
+            -not (Get-BridgeDashboardPublication).Verified -and @(Get-TestPublicationWrites).Count -eq 0
+        }
+        Set-TestPublicationIdentity -Generation 2
+        [void](Install-BridgeReplyCard -SourcePath $pinSource)
+        Save-CopilotSessionDashboard -Sessions @()
+        Set-TestPublicationIdentity -Participant 'observer-b' -Generation 2
+        Test-That 'a non-writer still verifies a genuinely restored exact pin' { (Get-BridgeDashboardPublication).Verified }
+
+        Set-TestPublicationIdentity -Generation 2
+        Set-TestPublicationCardUrl -Url ''
+        $script:TestPublication.Commands.Clear()
+        $missingPinFailure = ''
+        try { Save-CopilotSessionDashboard -Sessions @() }
+        catch { $missingPinFailure = $_.Exception.Message }
+        Test-That 'a missing required pinned artifact is repair-required, not a completed rollback' {
+            $missingPinFailure -match 'pin.*repair|repair.*pin' -and
+                -not (Get-BridgeDashboardPublication).Verified -and @(Get-TestPublicationWrites).Count -eq 0
+        }
+        Set-TestPublicationCardUrl -Url '/local/agent-bridge-reply-card.js?v=1.20.0'
+        $opaquePinFailure = ''
+        try { Save-CopilotSessionDashboard -Sessions @() }
+        catch { $opaquePinFailure = $_.Exception.Message }
+        Test-That 'a version-only file URL is not proof of exact pinned content' {
+            $opaquePinFailure -match 'pin.*repair|repair.*pin' -and -not (Get-BridgeDashboardPublication).Verified
+        }
+
+        Initialize-TestPublicationStore
+        Initialize-TestPublicationAuthority -CardSource $advanceSource
+        Save-CopilotSessionDashboard -Sessions @([pscustomobject]@{
+            Node = 'agent_bridge_fallback'; Name = 'Fallback remains supported'; Machine = 'SYNTHETIC'; Kind = 'copilot'
+        })
+        Test-That 'ordinary advance mode still supports a verified missing-card plain-reply fallback' {
+            (Get-BridgeDashboardPublication).Verified -and
+                ((Get-TestPublicationStore).configs['agent-decisions'] | ConvertTo-Json -Depth 100) -match 'text.agent_bridge_fallback_reply'
         }
     }
     finally { $script:BridgeDashboardRenderVersion = $originalRenderVersion }
