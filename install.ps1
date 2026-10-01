@@ -58,6 +58,15 @@
 .PARAMETER SkipPath
     Do not put the `agent-ha-bridge` command on your PATH.
 
+.PARAMETER DevBoxKeepAwake
+    On a Microsoft Dev Box, register a scheduled task that keeps the machine from
+    hibernating itself while the bridge is running. A pool with stop-on-disconnect
+    measures idleness by RDP sessions rather than by load, so a Dev Box busy running
+    the daemon and several agent sessions is hibernated anyway. The task clears the
+    pending stop through Dev Center's own user-scoped API. Use
+    -DevBoxKeepAwake:$false to turn it off; omit it to keep the current setting, or
+    to be asked once on a Dev Box that has not chosen yet. Ignored elsewhere.
+
 .PARAMETER TestRegistryId
     Unique registry namespace for disposable installer tests. Requires -TargetHome;
     it does not isolate other machine-wide effects.
@@ -91,6 +100,7 @@ param(
     [switch]$SkipPath,
     [switch]$NonInteractive,
     [switch]$SkipTask,
+    [switch]$DevBoxKeepAwake,
     [ValidatePattern('^[a-f0-9]{32}$')][string]$TestRegistryId
 )
 
@@ -105,6 +115,8 @@ $repoRoot = $PSScriptRoot
 . (Join-Path $repoRoot 'hooks/bridge-native-hook.ps1')
 . (Join-Path $repoRoot 'hooks/bridge-test-guard.ps1')
 . (Join-Path $repoRoot 'hooks/bridge-secrets.ps1')
+# No param block of its own, so dot-sourcing it cannot rebind anything here.
+. (Join-Path $repoRoot 'hooks/bridge-devbox.ps1')
 $installHome = if ($TargetHome) { $TargetHome } else { $HOME }
 
 # The VERSION file is the single source of truth, so the Apps & features entry, the
@@ -141,6 +153,9 @@ $hookConfigPath = Join-Path $copilotHome 'hooks\decision-notifier.json'
 # never sees this repository's AGENTS.md, which is where the rules used to live only.
 $agentInstructionsPath = Join-Path $copilotHome 'instructions\agent-ha-bridge.instructions.md'
 $taskName = 'AgentBridgeDaemon'
+# Separate from the daemon task because it has a different life: it fires on a timer
+# rather than staying resident, and it exists only on a Dev Box that opted in.
+$devBoxTaskName = 'AgentBridgeDevBoxKeepAwake'
 # The macOS counterpart of the scheduled task.
 $launchAgentLabel = 'com.agent-ha-bridge.daemon'
 $launchAgentPath = Join-Path $installHome "Library/LaunchAgents/$launchAgentLabel.plist"
@@ -1947,6 +1962,61 @@ function Get-BridgeNpmBinDir {
     ''
 }
 
+function Get-BridgeDevBoxKeepAwakeDecision {
+    <#
+        Whether the Dev Box keep-awake task should exist after this install, and the
+        one-line reason - which is what the summary prints and what a test asserts on.
+
+        Deliberately pure: no Task Scheduler, no file system, no network. The offline
+        suite runs on the macOS CI leg too, where the ScheduledTasks module does not
+        exist at all, so the decision has to be separable from carrying it out.
+    #>
+    param(
+        [bool]$IsDevBox,
+        [bool]$Requested,
+        [bool]$OnWindows = $true,
+        [bool]$Sandbox,
+        [bool]$SkipTask
+    )
+
+    if (-not $IsDevBox) { return [pscustomobject]@{ Enabled = $false; Reason = 'not a Dev Box' } }
+    if (-not $OnWindows) { return [pscustomobject]@{ Enabled = $false; Reason = 'Dev Box keep-awake is Windows-only' } }
+    if ($SkipTask) { return [pscustomobject]@{ Enabled = $false; Reason = 'scheduled tasks skipped' } }
+    # A -TargetHome run is a throwaway sandbox, and a scheduled task is machine-wide:
+    # registering one there would outlive the sandbox it was testing.
+    if ($Sandbox) { return [pscustomobject]@{ Enabled = $false; Reason = 'sandbox install registers no task' } }
+    if (-not $Requested) { return [pscustomobject]@{ Enabled = $false; Reason = 'not enabled' } }
+    [pscustomobject]@{ Enabled = $true; Reason = 'enabled' }
+}
+
+function Test-BridgeDevBoxKeepAwakePrompt {
+    <#
+        Whether to put the keep-awake question this run.
+
+        Asked once and then remembered, because it is a question about this machine's
+        power behaviour rather than about the bridge: re-asking on every upgrade would
+        be noise, and never asking would leave the feature undiscovered on exactly the
+        machines that need it.
+    #>
+    param(
+        [bool]$IsDevBox,
+        [bool]$Interactive,
+        [bool]$SwitchProvided,
+        [bool]$ConfigExisted,
+        [AllowEmptyCollection()][string[]]$FilledKeys = @()
+    )
+
+    if (-not $IsDevBox -or -not $Interactive) { return $false }
+    # An explicit -DevBoxKeepAwake has already answered it.
+    if ($SwitchProvided) { return $false }
+    if (-not $ConfigExisted) { return $true }
+    # Merge-BridgeConfigDefaults reports the keys it had to add, so the devBox section
+    # turning up there means this config predates the feature and has never been
+    # asked - which is how an upgrade gets the question exactly once.
+    $filled = @($FilledKeys)
+    ($filled -contains 'devBox') -or ($filled -contains 'devBox.keepAwake')
+}
+
 # Tests dot-source this script with BRIDGE_INSTALL_NORUN set to load its helper
 # functions without running the install; a real run never sets it.
 if ($env:BRIDGE_INSTALL_NORUN) { return }
@@ -2081,6 +2151,34 @@ if ($PSBoundParameters.ContainsKey('NotifyService') -and $NotifyService) {
 if ($PSBoundParameters.ContainsKey('TickerCategory') -and $TickerCategory) {
     $config.notifications.tickerCategory = $TickerCategory
 }
+
+# A Dev Box pool with stop-on-disconnect hibernates the machine an hour or so after
+# the last RDP session goes, measuring idleness by sessions rather than by load - so
+# a Dev Box running the daemon and several agent sessions is hibernated mid-task and
+# simply reads as offline on the dashboard. Detected rather than configured, so an
+# ordinary desktop never sees any of this.
+$isDevBox = Test-BridgeDevBox
+if ($PSBoundParameters.ContainsKey('DevBoxKeepAwake')) {
+    $config.devBox.keepAwake = [bool]$DevBoxKeepAwake
+}
+elseif (Test-BridgeDevBoxKeepAwakePrompt -IsDevBox $isDevBox `
+        -Interactive (-not $NonInteractive -and (Test-BridgeConsoleInteractive)) `
+        -SwitchProvided $false -ConfigExisted $configExisted -FilledKeys $filled) {
+    Write-Host ''
+    Write-Host '    This machine is a Microsoft Dev Box, and Dev Box pools commonly hibernate' -ForegroundColor DarkGray
+    Write-Host '    on disconnect. That stops the daemon and every running agent session, because' -ForegroundColor DarkGray
+    Write-Host '    the pool measures idleness by RDP sessions rather than by what is running.' -ForegroundColor DarkGray
+    $config.devBox.keepAwake = Read-BridgeYesNo -Prompt '    Keep this Dev Box awake while the bridge runs?' -Default $true
+}
+# Settled here rather than beside the task registration, because the summary is
+# printed before the task is registered and both have to agree.
+$devBoxIntervalHours = 4
+if ($config.devBox.PSObject.Properties['intervalHours'] -and [int]$config.devBox.intervalHours -ge 1) {
+    $devBoxIntervalHours = [int]$config.devBox.intervalHours
+}
+$devBoxDecision = Get-BridgeDevBoxKeepAwakeDecision -IsDevBox $isDevBox `
+    -Requested ([bool]$config.devBox.keepAwake) -OnWindows ([bool]$script:BridgeIsWindows) `
+    -Sandbox ([bool]$TargetHome) -SkipTask ([bool]$SkipTask)
 
 # Pre-rename configs pinned the old slug explicitly, which would leave the daemon
 # writing to /copilot-decisions forever. Only the old default is rewritten - a slug
@@ -2327,6 +2425,9 @@ Write-Host "    agent account: $(
     elseif ($config.homeAssistant.agentToken -or @($config.homeAssistant.agentUserIds).Count) { 'half set - see the warning below' }
     else { 'none - an agent drives the bridge as you' })"
 Write-Host "    notifications: $(if ($config.notifications.enabled) { $config.notifications.service } else { 'disabled' })"
+if ($isDevBox) {
+    Write-Host "    Dev Box      : $(if ($devBoxDecision.Enabled) { "keep-awake on - '$devBoxTaskName' every ${devBoxIntervalHours}h" } else { "keep-awake off ($($devBoxDecision.Reason))" })"
+}
 
 function Get-BridgeInstallAgentIdentityWarning {
     <#
@@ -2566,6 +2667,57 @@ elseif (-not $SkipTask) {
         Write-Warning ("Could not register the '$taskName' scheduled task: $($_.Exception.Message)`n" +
                        '    The bridge cannot run until it exists. Task Scheduler is often ' +
                        'restricted by policy; once that is sorted, run: agent-ha-bridge configure')
+    }
+}
+
+# ------------------------------------------------- Dev Box keep-awake task
+if ($devBoxDecision.Enabled) {
+    Write-Step "Registering the '$devBoxTaskName' scheduled task"
+    try {
+        $keepAwakeLauncher = Join-Path $hooksDir 'agent-bridge-devbox-keepawake.vbs'
+        $keepAwakeAction = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$keepAwakeLauncher`""
+        # Two triggers rather than one with its .Repetition reassigned: mutating the
+        # repetition of an AtLogOn trigger is fragile across Windows builds, and this
+        # says the same thing - run once the machine is usable, then keep running.
+        $keepAwakeTriggers = @(
+            (New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME),
+            (New-ScheduledTaskTrigger -Once -At (Get-Date) `
+                -RepetitionInterval (New-TimeSpan -Hours $devBoxIntervalHours) `
+                -RepetitionDuration ([TimeSpan]::MaxValue))
+        )
+        # No RestartCount: a pass that fails because the Azure CLI login expired will
+        # fail again immediately, and the next scheduled pass is the right retry.
+        $keepAwakeSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
+            -StartWhenAvailable -ExecutionTimeLimit (New-TimeSpan -Minutes 10) -Hidden
+        $keepAwakePrincipal = New-ScheduledTaskPrincipal -UserId "$env:USERDOMAIN\$env:USERNAME" `
+            -LogonType Interactive -RunLevel Limited
+
+        if (Get-ScheduledTask -TaskName $devBoxTaskName -ErrorAction SilentlyContinue) {
+            Set-ScheduledTask -TaskName $devBoxTaskName -Action $keepAwakeAction -Trigger $keepAwakeTriggers `
+                -Settings $keepAwakeSettings -Principal $keepAwakePrincipal | Out-Null
+        }
+        else {
+            Register-ScheduledTask -TaskName $devBoxTaskName -Action $keepAwakeAction -Trigger $keepAwakeTriggers `
+                -Settings $keepAwakeSettings -Principal $keepAwakePrincipal `
+                -Description 'Clears the pending Dev Box stop so the bridge is not hibernated mid-session.' | Out-Null
+        }
+        Start-ScheduledTask -TaskName $devBoxTaskName
+        Write-Host "    registered; runs at logon and every ${devBoxIntervalHours}h"
+    }
+    catch {
+        # Same reasoning as the daemon task: policy can forbid task creation, and the
+        # rest of the install is still worth finishing.
+        Write-Warning ("Could not register the '$devBoxTaskName' scheduled task: $($_.Exception.Message)`n" +
+                       '    The bridge still works; this Dev Box may hibernate while it is running.')
+    }
+}
+elseif ($script:BridgeIsWindows -and -not $TargetHome) {
+    # Turned off, or never on: a task left by an earlier run would keep delaying the
+    # stop forever with nothing in the config to explain why.
+    if (Get-ScheduledTask -TaskName $devBoxTaskName -ErrorAction SilentlyContinue) {
+        Write-Step "Removing the '$devBoxTaskName' scheduled task"
+        Unregister-ScheduledTask -TaskName $devBoxTaskName -Confirm:$false
+        Write-Host "    $($devBoxDecision.Reason)"
     }
 }
 

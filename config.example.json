@@ -35,6 +35,10 @@
     "copilotPath": "",
     "agencyPath": ""
   },
+  "devBox": {
+    "keepAwake": false,
+    "intervalHours": 4
+  },
   "updates": {
     "repository": "danswett/agent-ha-bridge",
     "installedVersion": "",
