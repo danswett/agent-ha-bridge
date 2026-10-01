@@ -250,6 +250,11 @@ Add-Content -LiteralPath $qFile -Value (New-Line 'user' @(@{ type = 'tool_result
 $q = Get-ClaudeAskUserState -TranscriptPath $qFile
 Test-That 'its answer ends the wait' { $q.Started -and -not $q.Pending }
 Test-That 'and carries the chosen label for the mismatch check' { $q.ResultContent -like '*"SQLite"*' }
+Test-That 'the established Claude result envelope verifies through the real transcript reader' {
+    $field = [pscustomobject]@{ Name = 'Which?'; Label = 'Database'; Options = @('PostgreSQL', 'SQLite'); IsText = $false }
+    (Test-CopilotAnswerMatchesSelections -ResultContent $q.ResultContent -Fields @($field) `
+        -Selections @('SQLite') -Detailed).Status -ceq 'Matched'
+}
 
 Add-Content -LiteralPath $qFile -Value (New-Line 'assistant' @(@{ type = 'tool_use'; id = 'ask2'; name = 'AskUserQuestion'; input = @{ questions = @() } }))
 $q = Get-ClaudeAskUserState -TranscriptPath $qFile
@@ -267,6 +272,29 @@ Test-That 'without an id, an older answered question does not count' { -not $q.S
 Add-Content -LiteralPath $qFile -Value (New-Line 'user' @(@{ type = 'tool_result'; tool_use_id = 'ask3-not-written-yet'; content = '"Q"="Banana"' }))
 $q = Get-ClaudeAskUserState -TranscriptPath $qFile -ToolCallId 'ask3-not-written-yet'
 Test-That 'and it is answered once its own result appears' { -not $q.Pending -and $q.ResultContent -like '*Banana*' }
+Test-That 'a supplied native ID remains pending before its transcript exists' {
+    $pending = Get-ClaudeAskUserState -TranscriptPath (Join-Path ([IO.Path]::GetTempPath()) 'not-written-yet.jsonl') -ToolCallId 'native-known'
+    $pending.Started -and $pending.Pending -and $pending.ToolCallId -ceq 'native-known' -and $null -eq $pending.StartedAt
+}
+Set-Content -LiteralPath $qFile -Value @(
+    '{"type":"assistant","timestamp":"2030-01-02T10:00:00Z","message":{"content":[{"type":"tool_use","id":"Ask-Sensitive","name":"AskUserQuestion"}]}}'
+    '{"type":"assistant","timestamp":"2030-01-02T11:00:00Z","message":{"content":[{"type":"tool_use","id":"unrelated-newer","name":"AskUserQuestion"}]}}'
+    (New-Line 'user' @(@{ type = 'tool_result'; tool_use_id = 'ask-sensitive'; content = 'wrong case' }))
+)
+$q = Get-ClaudeAskUserState -TranscriptPath $qFile -ToolCallId 'Ask-Sensitive' -Since '2030-01-03T10:00:00Z'
+Test-That 'a supplied ID is ordinal, not satisfied by a differently cased result' { $q.Started -and $q.Pending -and $q.ResultContent -ceq '' }
+Test-That 'an explicit ID uses its own start time rather than an unrelated latest question or Since filter' {
+    [DateTimeOffset]$q.StartedAt -eq [DateTimeOffset]'2030-01-02T10:00:00Z'
+}
+Add-Content -LiteralPath $qFile -Value (New-Line 'user' @(@{ type = 'tool_result'; tool_use_id = 'Ask-Sensitive'; content = '"Which?"="SQLite"' }))
+$q = Get-ClaudeAskUserState -TranscriptPath $qFile -ToolCallId 'Ask-Sensitive'
+Test-That 'only the matching supplied native ID completes that question' {
+    $q.Started -and -not $q.Pending -and $q.ResultContent -ceq '"Which?"="SQLite"'
+}
+$q = Get-ClaudeAskUserState -TranscriptPath $qFile
+Test-That 'without a native ID the established latest-question fallback still applies' {
+    $q.Started -and $q.Pending -and $q.ToolCallId -ceq 'unrelated-newer'
+}
 Remove-Item -LiteralPath $qFile -Force -ErrorAction SilentlyContinue
 
 $toolResult = New-Line 'user' @(@{ type = 'tool_result'; tool_use_id = 'x'; content = 'ok' })

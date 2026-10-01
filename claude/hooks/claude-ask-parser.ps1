@@ -33,7 +33,6 @@ Set-StrictMode -Version Latest
 
 $script:ClaudeMaxFields = 4
 $script:ClaudeMaxQuestionLength = 6000
-$script:ClaudeMaxChoiceLength = 600
 
 function ConvertFrom-ClaudeAskUserQuestion {
     <#
@@ -82,9 +81,6 @@ function ConvertFrom-ClaudeAskUserQuestion {
                         $option.description) {
                         $notes.Add("- **$label** - $([string]$option.description)")
                     }
-                    if ($label.Length -gt $script:ClaudeMaxChoiceLength) {
-                        $label = $label.Substring(0, $script:ClaudeMaxChoiceLength - 3) + '...'
-                    }
                     $label
                 }
             )
@@ -94,6 +90,7 @@ function ConvertFrom-ClaudeAskUserQuestion {
             # Label and Options are the contract Set-CopilotMqttDecision consumes for
             # per-field dropdowns; Title and MultiSelect are extra context for logging
             # and the freeform outline.
+            Name        = [string]$question.question
             Label       = if ($question.PSObject.Properties.Name -contains 'header' -and $question.header) {
                               [string]$question.header
                           } else {
@@ -101,6 +98,8 @@ function ConvertFrom-ClaudeAskUserQuestion {
                           }
             Title       = [string]$question.question
             Options     = $labels
+            Values      = $labels
+            OptionIds   = @(for ($index = 0; $index -lt $labels.Count; $index++) { "option-$index" })
             MultiSelect = [bool]($question.PSObject.Properties.Name -contains 'multiSelect' -and $question.multiSelect)
         }
     }

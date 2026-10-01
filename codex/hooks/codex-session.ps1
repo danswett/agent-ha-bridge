@@ -357,6 +357,55 @@ function Get-CodexApprovalMarker {
     Read-DecisionMarkerFile -Path (Get-CodexApprovalMarkerPath -SessionId $SessionId) -RequireReadable:$RequireReadable
 }
 
+function Set-CodexApprovalAttempt {
+    <# Claim the existing generation durably before touching native input. An
+       incomplete write is unreadable ownership, never permission to send. #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][string]$DecisionId,
+        [Parameter(Mandatory)][ValidateSet('Approve', 'Deny')][string]$Choice
+    )
+
+    $path = Get-CodexApprovalMarkerPath -SessionId $SessionId
+    $stream = $null
+    try {
+        $stream = [IO.FileStream]::new($path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite,
+            [IO.FileShare]::None, 4096, [IO.FileOptions]::WriteThrough)
+        $reader = [IO.StreamReader]::new($stream, [Text.UTF8Encoding]::new($false), $true, 4096, $true)
+        try { $raw = $reader.ReadToEnd() }
+        finally { $reader.Dispose() }
+        $marker = ConvertFrom-DecisionJson -Json $raw
+        if ($marker -isnot [pscustomobject] -or
+            -not $marker.PSObject.Properties['SessionId'] -or
+            $marker.SessionId -isnot [string] -or
+            -not [StringComparer]::Ordinal.Equals($marker.SessionId, $SessionId) -or
+            -not $marker.PSObject.Properties['DecisionId'] -or $marker.DecisionId -isnot [string]) {
+            throw [IO.InvalidDataException]::new('Invalid local approval identity.')
+        }
+        if (-not [StringComparer]::Ordinal.Equals($marker.DecisionId, $DecisionId)) { return $false }
+        if ($marker.PSObject.Properties['DeliveryAttempted']) {
+            if ($marker.DeliveryAttempted -isnot [bool] -or -not $marker.DeliveryAttempted) {
+                throw [IO.InvalidDataException]::new('Invalid local approval attempt state.')
+            }
+            return $false
+        }
+
+        $marker | Add-Member -NotePropertyName DeliveryAttempted -NotePropertyValue $true
+        $marker | Add-Member -NotePropertyName DeliveryChoice -NotePropertyValue $Choice
+        $marker | Add-Member -NotePropertyName DeliveryAttemptedAt -NotePropertyValue ([DateTimeOffset]::Now.ToString('o'))
+        $marker | Add-Member -NotePropertyName DeliveryOutcome -NotePropertyValue 'unconfirmed'
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($marker | ConvertTo-Json -Depth 8 -Compress))
+        $stream.Position = 0
+        $stream.Write($bytes, 0, $bytes.Length)
+        $stream.SetLength($bytes.Length)
+        $stream.Flush($true)
+        $true
+    }
+    catch [IO.FileNotFoundException] { $false }
+    catch [IO.DirectoryNotFoundException] { $false }
+    finally { if ($null -ne $stream) { $stream.Dispose() } }
+}
+
 function Remove-CodexApprovalMarker {
     <# Returns $true when a marker was actually removed, so callers can tell whether
        there was anything pending. #>

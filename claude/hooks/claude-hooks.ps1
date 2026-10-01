@@ -170,7 +170,9 @@ function Invoke-ClaudeAskHook {
         }
     }
     if ($tooManyCombinations) { $terminalOnly = $true }
-    $toolUseId = if ($HookEvent.PSObject.Properties['tool_use_id']) { [string]$HookEvent.tool_use_id } else { '' }
+    $toolUseId = if ($HookEvent.PSObject.Properties['tool_use_id'] -and $HookEvent.tool_use_id -is [string]) {
+        $HookEvent.tool_use_id
+    } else { '' }
 
     # A prompt the daemon refuses to drive must offer no control that pretends to
     # drive it. This published the full set of dropdowns regardless, so a multi-select
@@ -195,6 +197,10 @@ function Invoke-ClaudeAskHook {
         $choices = @(Get-DecisionMultiSelectChoices -Field $markerFields[0])
     }
 
+    [void](Get-DecisionSchemaFieldChoices -Field ([pscustomobject]@{ enum = $choices }))
+    foreach ($markerField in $markerFields) {
+        [void](Get-DecisionSchemaFieldChoices -Field ([pscustomobject]@{ enum = @($markerField.Options) }))
+    }
     Write-CopilotDecisionMarker -SessionId $sessionId -DecisionId $decisionId `
         -Question $question -Choices $choices -Combos @() -Fields $markerFields -Mode $mode `
         -TerminalOnly:$terminalOnly -ToolCallId $toolUseId | Out-Null

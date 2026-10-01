@@ -221,6 +221,12 @@ function Get-ClaudeAskUserState {
     )
 
     $result = [pscustomobject]@{ Started = $false; Pending = $false; ToolCallId = ''; StartedAt = $null; ResultContent = '' }
+    $hasId = -not [string]::IsNullOrWhiteSpace($ToolCallId)
+    if ($hasId) {
+        $result.Started = $true
+        $result.Pending = $true
+        $result.ToolCallId = $ToolCallId
+    }
     if ([string]::IsNullOrWhiteSpace($TranscriptPath) -or -not (Test-Path -LiteralPath $TranscriptPath)) { return $result }
 
     $length = (Get-Item -LiteralPath $TranscriptPath).Length
@@ -228,11 +234,12 @@ function Get-ClaudeAskUserState {
 
     $latestId = ''
     $latestAt = $null
-    $answers = @{}
+    $idComparer = if ($hasId) { [StringComparer]::Ordinal } else { [StringComparer]::OrdinalIgnoreCase }
+    $answers = [Collections.Generic.Dictionary[string, string]]::new($idComparer)
     # A little slack for the clock: the card is armed a moment before Claude stamps
     # the question it belongs to.
     $sinceAt = $null
-    if ($null -ne $Since -and -not [string]::IsNullOrWhiteSpace([string]$Since)) {
+    if (-not $hasId -and $null -ne $Since -and -not [string]::IsNullOrWhiteSpace([string]$Since)) {
         try { $sinceAt = ([DateTimeOffset]::Parse([string]$Since)).AddSeconds(-10) } catch { $sinceAt = $null }
     }
     foreach ($line in @($tail.Lines)) {
@@ -245,6 +252,7 @@ function Get-ClaudeAskUserState {
             if (-not $block.PSObject.Properties['type']) { continue }
             if ([string]$block.type -eq 'tool_use' -and $block.PSObject.Properties['name'] -and
                 [string]$block.name -eq 'AskUserQuestion' -and $block.PSObject.Properties['id']) {
+                if ($hasId -and -not [StringComparer]::Ordinal.Equals([string]$block.id, $ToolCallId)) { continue }
                 $at = if ($entry.PSObject.Properties['timestamp']) { $entry.timestamp } else { $null }
                 if ($null -ne $sinceAt) {
                     # Too old to be the question the card is for.
@@ -257,7 +265,8 @@ function Get-ClaudeAskUserState {
                 $latestAt = $at
             }
             elseif ([string]$block.type -eq 'tool_result' -and $block.PSObject.Properties['tool_use_id']) {
-                $content = if ($block.content -is [string]) { [string]$block.content }
+                $content = if (-not $block.PSObject.Properties['content']) { '' }
+                           elseif ($block.content -is [string]) { [string]$block.content }
                            else { (@($block.content) | ForEach-Object { [string]$_.text }) -join ' ' }
                 $answers[[string]$block.tool_use_id] = $content
             }
@@ -266,7 +275,7 @@ function Get-ClaudeAskUserState {
 
     # A named question exists from the moment its hook fired, whether or not it has
     # reached the transcript yet.
-    if (-not [string]::IsNullOrWhiteSpace($ToolCallId)) { $latestId = $ToolCallId }
+    if ($hasId) { $latestId = $ToolCallId }
 
     if ([string]::IsNullOrWhiteSpace($latestId)) { return $result }
     $result.Started = $true

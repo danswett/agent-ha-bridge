@@ -150,7 +150,7 @@ Assert-Case -Name 'a mixed choice + free-text form is answerable, not flattened 
   "requestedSchema": {
     "properties": {
       "scope": {
-        "type": "string", "title": "Scope", "default": "Patch only",
+        "type": "string", "title": "Scope", "default": "patch",
         "oneOf": [ { "const": "both", "title": "Both" }, { "const": "patch", "title": "Patch only" } ]
       },
       "notes": { "type": "string", "title": "Notes" }
@@ -295,11 +295,11 @@ Test-Case 'a reworded free-text field is not treated as a mismatch' {
         -ResultContent 'User responded: alignment=Closer, notes=trimmed differently' `
         -Fields $checkFields -Selections @('Closer', '  trimmed differently  ')
 }
-Test-Case 'no recorded result yet is not a mismatch' {
-    Test-CopilotAnswerMatchesSelections -ResultContent '' -Fields $checkFields -Selections @('Closer', 'x')
+Test-Case 'no recorded result is explicitly unconfirmed, not a match or mismatch' {
+    (Test-CopilotAnswerMatchesSelections -ResultContent '' -Fields $checkFields -Selections @('Closer', 'x') -Detailed).Status -ceq 'Unconfirmed'
 }
-Test-Case 'nothing injected is not a mismatch' {
-    Test-CopilotAnswerMatchesSelections -ResultContent 'anything' -Fields @() -Selections @()
+Test-Case 'nothing injected is explicitly unconfirmed, not a match or mismatch' {
+    (Test-CopilotAnswerMatchesSelections -ResultContent 'anything' -Fields @() -Selections @() -Detailed).Status -ceq 'Unconfirmed'
 }
 
 Write-Host "`n--- a failed tool call must not kill the reconcile loop ---"
@@ -384,7 +384,7 @@ Write-Host "`n--- a multi-select field is typed by number, then walked to Submit
 # wrong option. Down once per row - the options plus the "Type something" row - then
 # highlights Submit, which the caller's Enter presses.
 $msField = [pscustomobject]@{
-    Label = 'Features'; Options = @('Auth', 'Billing', 'Search'); IsText = $false; MultiSelect = $true
+    Name = 'Which features?'; Label = 'Features'; Options = @('Auth', 'Billing', 'Search'); IsText = $false; MultiSelect = $true
 }
 Test-Case 'every combination is offered, single picks first' {
     (@(Get-DecisionMultiSelectChoices -Field $msField) -join ' / ') -eq

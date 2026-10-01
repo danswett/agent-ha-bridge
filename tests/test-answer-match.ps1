@@ -16,7 +16,8 @@
     disregard an answer that was correct. Seen live on 2026-09-28 against a form whose
     answer had arrived perfectly.
 
-    The fix is to carry the schema value next to the label and accept either. The risk
+    Carry field identity and typed schema values next to labels. Structured results
+    compare the values; text may use labels only when their mapping is unambiguous. The risk
     in that is entirely in the middle: the value is read where the schema is parsed,
     but the check runs in the daemon, minutes later, on the far side of a marker file
     that is JSON on disk. Reading values correctly and checking them correctly is not
@@ -63,9 +64,9 @@ Test-That 'an enumNames label keeps the enum value behind it' {
 
 $boolChoices = @(Get-DecisionSchemaFieldChoices -Field (('{"type":"boolean"}') | ConvertFrom-Json))
 Test-That 'a yes/no field is shown as Yes but recorded as true' {
-    $boolChoices[0].Label -eq 'Yes' -and $boolChoices[0].Value -eq 'true'
+    $boolChoices[0].Label -ceq 'Yes' -and $boolChoices[0].Value -is [bool] -and $boolChoices[0].Value
 }
-Test-That 'and No as false' { $boolChoices[1].Label -eq 'No' -and $boolChoices[1].Value -eq 'false' }
+Test-That 'and No as false' { $boolChoices[1].Label -ceq 'No' -and $boolChoices[1].Value -is [bool] -and -not $boolChoices[1].Value }
 
 $plainChoices = @(Get-DecisionSchemaFieldChoices -Field (('{"type":"string","enum":["Closer","Aligned"]}') | ConvertFrom-Json))
 Test-That 'a plain enum is its own label and value' {
@@ -225,6 +226,45 @@ Test-That 'a marker from before the upgrade is compared on labels' {
 Test-That 'and a wrong one from before the upgrade is still caught' {
     -not (Test-CopilotAnswerMatchesSelections -ResultContent 'User responded: alignment=Aligned' `
         -Fields $legacyFields -Selections @('Closer'))
+}
+
+Write-Host "`n--- structured text is compared within its own field too ---"
+$structuredFields = @(
+    [pscustomobject]@{ Name = 'choice'; Label = 'Choice'; Options = @('Yes', 'No'); Values = @('yes', 'no'); IsText = $false }
+    [pscustomobject]@{ Name = 'notes'; Label = 'Notes'; Options = @(); IsText = $true }
+)
+Test-That 'matching structured choice and text fields are confirmed together' {
+    (Test-CopilotAnswerMatchesSelections -ResultContent '{"choice":"no","notes":"keep exactly"}' `
+        -Fields $structuredFields -Selections @('No', 'keep exactly') -Detailed).Status -ceq 'Matched'
+}
+Test-That 'a structured text mismatch cannot hide behind a matching choice' {
+    (Test-CopilotAnswerMatchesSelections -ResultContent '{"choice":"no","notes":"different"}' `
+        -Fields $structuredFields -Selections @('No', 'keep exactly') -Detailed).Status -ceq 'Mismatch'
+}
+Test-That 'a non-string structured text result remains unconfirmed rather than coerced' {
+    (Test-CopilotAnswerMatchesSelections -ResultContent '{"choice":"no","notes":false}' `
+        -Fields $structuredFields -Selections @('No', 'false') -Detailed).Status -ceq 'Unconfirmed'
+}
+Test-That 'an exact structured text-only answer can be confirmed' {
+    (Test-CopilotAnswerMatchesSelections -ResultContent '{"notes":"2030-01-02T03:04:05Z"}' `
+        -Fields @($structuredFields[1]) -Selections @('2030-01-02T03:04:05Z') -Detailed).Status -ceq 'Matched'
+}
+Test-That 'different date-looking text spellings remain a structured text mismatch' {
+    (Test-CopilotAnswerMatchesSelections -ResultContent '{"notes":"2030-01-02T03:04:05.000Z"}' `
+        -Fields @($structuredFields[1]) -Selections @('2030-01-02T03:04:05Z') -Detailed).Status -ceq 'Mismatch'
+}
+$claudeField = [pscustomobject]@{ Name = 'Which?'; Label = 'Database'; Options = @('No', 'Not now', 'SQLite.'); IsText = $false }
+Test-That 'the established Claude envelope still distinguishes No from Not now' {
+    (Test-CopilotAnswerMatchesSelections -ResultContent 'Your questions have been answered: "Which?"="Not now".' `
+        -Fields @($claudeField) -Selections @('No') -Detailed).Status -ceq 'Mismatch'
+}
+Test-That 'stripping the Claude envelope preserves punctuation inside the actual value' {
+    (Test-CopilotAnswerMatchesSelections -ResultContent 'Your questions have been answered: "Which?"="SQLite.".' `
+        -Fields @($claudeField) -Selections @('SQLite.') -Detailed).Status -ceq 'Matched'
+}
+Test-That 'an unknown trailing Claude sentence is not silently discarded' {
+    (Test-CopilotAnswerMatchesSelections -ResultContent 'Your questions have been answered: "Which?"="No". Something else.' `
+        -Fields @($claudeField) -Selections @('No') -Detailed).Status -ceq 'Unconfirmed'
 }
 
 if ($script:Failures -gt 0) {

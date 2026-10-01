@@ -1418,6 +1418,12 @@ function Publish-CopilotMqttDecisionFields {
         [Parameter(Mandatory)][hashtable]$Headers
     )
 
+    foreach ($field in $Fields) {
+        if (Test-DecisionFieldIsText -Field $field) { continue }
+        $listed = if (Test-DecisionFieldIsMultiSelect -Field $field) { @(Get-DecisionMultiSelectChoices -Field $field) }
+                  else { @($field.Options) }
+        [void](Get-DecisionSchemaFieldChoices -Field ([pscustomobject]@{ enum = @($listed) }))
+    }
     $topics = Get-CopilotMqttTopics -SessionId $SessionId
     $node = $topics.Node
     $device = New-CopilotMqttDeviceBlock -Node $node -SessionName $SessionName -Machine $Machine
@@ -1440,13 +1446,7 @@ function Publish-CopilotMqttDecisionFields {
                 @(Get-DecisionMultiSelectChoices -Field $field)
             }
             else { @($field.Options) }
-            $options = @('Choose...') + @(
-                $listed | ForEach-Object {
-                    $t = [string]$_
-                    if ($t.Length -gt 250) { $t = $t.Substring(0, 247) + '...' }
-                    $t
-                }
-            )
+            $options = @('Choose...') + @($listed)
         }
 
         $config = @{
@@ -1716,6 +1716,15 @@ function Set-CopilotMqttDecision {
         [hashtable]$Headers
     )
 
+    [void](Get-DecisionSchemaFieldChoices -Field ([pscustomobject]@{ enum = @($Choices) }))
+    $labelsSeen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    foreach ($field in @($Fields)) {
+        if (-not $labelsSeen.Add([string]$field.Label)) { throw 'Decision field labels are ambiguous.' }
+        if (Test-DecisionFieldIsText -Field $field) { continue }
+        $listed = if (Test-DecisionFieldIsMultiSelect -Field $field) { @(Get-DecisionMultiSelectChoices -Field $field) }
+                  else { @($field.Options) }
+        [void](Get-DecisionSchemaFieldChoices -Field ([pscustomobject]@{ enum = @($listed) }))
+    }
     $topics = Get-CopilotMqttTopics -SessionId $SessionId
     $node = $topics.Node
     $device = New-CopilotMqttDeviceBlock -Node $node -SessionName $SessionName -Machine $Machine
@@ -1731,13 +1740,7 @@ function Set-CopilotMqttDecision {
         $options = @('Awaiting answer...', 'Cancel request')
     }
     elseif ($Choices.Count -gt 0) {
-        $options = @('Awaiting answer...') +
-            @($Choices | ForEach-Object {
-                $text = [string]$_
-                if ($text.Length -gt 250) { $text = $text.Substring(0, 247) + '...' }
-                $text
-            }) +
-            @('Cancel request')
+        $options = @('Awaiting answer...') + @($Choices) + @('Cancel request')
     }
 
     $decision = @{

@@ -95,6 +95,7 @@ try {
         $script:PermissionTrace = [Collections.Generic.List[string]]::new()
         $script:ApprovalInputs = [Collections.Generic.List[string]]::new()
         $script:ApprovalChoice = 'Approve'
+        $script:ApprovalGeneration = ''
         function Get-CodexOwningProcessId { param($SessionId, $Ancestors) 0 }
         function Test-BridgeDaemonAlive { $true }
         function Enter-BridgeAdapterSession { if ($script:PermissionOnline) { @{} } }
@@ -114,7 +115,13 @@ try {
             param($Title, $Message, $Headers)
             $script:PermissionTrace.Add("notification:$((Get-CodexApprovalMarker -SessionId $script:PermissionId).DecisionId)")
         }
-        function Get-HomeAssistantState { param($EntityId, $Headers) [pscustomobject]@{ state = $script:ApprovalChoice } }
+        function Get-HomeAssistantState {
+            param($EntityId, $Headers)
+            [pscustomobject]@{
+                state = $script:ApprovalChoice
+                attributes = [pscustomobject]@{ decision_id = $script:ApprovalGeneration }
+            }
+        }
         function Send-CopilotSessionPrompt {
             param($SessionId, $Text, $ProcessId)
             $script:ApprovalInputs.Add([string]$Text)
@@ -142,6 +149,8 @@ try {
         $live = @{ $sid = [pscustomobject]@{ Kind = 'codex'; ProcessId = 123 } }
         foreach ($choice in @('Approve', 'Deny')) {
             $script:ApprovalChoice = $choice
+            $script:ApprovalGeneration = "legacy-$choice"
+            Write-CodexApprovalMarker -SessionId $sid -DecisionId $script:ApprovalGeneration -Question 'Synthetic approval'
             Invoke-PendingCodexApprovals -Headers $headers -State $state -Live $live
         }
         Test-That 'real legacy marker readers preserve both existing dashboard approval routes' {

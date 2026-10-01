@@ -21,7 +21,14 @@ try {
 
     $rawEvent = [Console]::In.ReadToEnd()
     if (-not [string]::IsNullOrWhiteSpace($rawEvent)) {
-        Invoke-CopilotAskUserHook -HookEvent ($rawEvent | ConvertFrom-Json) | Out-Null
+        $decisionEvent = ConvertFrom-DecisionJson -Json $rawEvent
+        $hookEvent = $rawEvent | ConvertFrom-Json
+        foreach ($name in @('toolArgs', 'tool_input')) {
+            if ($decisionEvent.PSObject.Properties[$name]) {
+                $hookEvent.$name = $decisionEvent.$name
+            }
+        }
+        Invoke-CopilotAskUserHook -HookEvent $hookEvent | Out-Null
     }
 }
 catch {

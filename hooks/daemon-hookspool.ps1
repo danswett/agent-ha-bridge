@@ -151,7 +151,16 @@ function Invoke-DaemonHookSpool {
         $name = [IO.Path]::GetFileName($path)
         $spooled = $null
         try {
-            $spooled = [IO.File]::ReadAllText($path) | ConvertFrom-Json
+            $raw = [IO.File]::ReadAllText($path)
+            $spooled = $raw | ConvertFrom-Json
+            if ([string]$spooled.agent -eq 'copilot' -and [string]$spooled.hook -eq 'ask_user') {
+                $decision = ConvertFrom-DecisionJson -Json $raw
+                foreach ($argument in @('toolArgs', 'tool_input')) {
+                    if ($decision.event.PSObject.Properties[$argument]) {
+                        $spooled.event.$argument = $decision.event.$argument
+                    }
+                }
+            }
             Invoke-DaemonHookEvent -Spooled $spooled
             $handled++
             $script:DaemonHookSpoolAttempts.Remove($name)
