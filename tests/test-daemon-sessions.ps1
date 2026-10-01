@@ -178,7 +178,6 @@ function Get-BridgeServedReplyCardUrl { '' }
 function Set-CopilotMqttGlobalEntityId { $true }
 function Clear-DaemonLaunchNoteOnRegistration { param($Headers) $script:NoteCleared = ($script:NoteCleared + 1) }
 function Initialize-BridgeMachineSelector { param($Machines) '' }
-function Save-CopilotSessionDashboard { param($Sessions, $Machines, $MachineSelector, $ReplyCardUrl) $script:DashboardSessions = @($Sessions); 'saved' }
 function Remove-CopilotMqttSession { param($SessionId, $Headers) $script:Retired += $SessionId }
 function Remove-CopilotDecisionMarker { param($SessionId) }
 function Update-DaemonSessionActivity { param($Id, $Entry, $Session, $Headers, $VerboseOn) $script:Streamed += $Id }
@@ -191,6 +190,21 @@ $script:DaemonDashboardSignature = $null
 $script:DaemonPendingRetire = @()
 $script:Streamed = @()
 $script:NoteCleared = 0
+. (Join-Path $PSScriptRoot 'test-dashboard.ps1') -PublicationFixturesOnly
+function Invoke-CopilotHaWebSocket {
+    param([hashtable[]]$Commands)
+    $responses = Invoke-TestPublicationCommands -Commands $Commands
+    foreach ($command in $Commands) {
+        if ($command.type -ne 'lovelace/config/save') { continue }
+        $script:DashboardSessions = @($command.config.views[0].cards |
+            Where-Object { $_.type -eq 'custom:agent-bridge-session-card' } | ForEach-Object {
+                [pscustomobject]@{ Node = ($_.status -replace '^sensor\.(.+)_status$', '$1'); Name = $_.cards[0].name }
+            })
+    }
+    Write-Output -NoEnumerate $responses
+}
+Initialize-TestPublicationStore
+Initialize-TestPublicationAuthority -ServeCard
 
 # Real ids are UUIDs, and the log lines take their first eight characters.
 $script:Ids = @{ s1 = '11111111-0000-4000-8000-000000000001'; s2 = '22222222-0000-4000-8000-000000000002'; s3 = '33333333-0000-4000-8000-000000000003'
@@ -269,6 +283,166 @@ $script:FakeLaunchers = @('copilot')
 Test-That 'and a machine without Agency never gets one' { -not (Get-DaemonLaunchCapabilities).profile }
 
 Remove-Item -LiteralPath $script:DaemonConfig.LogFile -Force -ErrorAction SilentlyContinue
+Write-Host '--- real publication, external deletion and retirement ---'
+. (Join-Path $PSScriptRoot 'test-dashboard.ps1') -PublicationFixturesOnly
+. (Join-Path $PSScriptRoot '..\hooks\decision-bridge-common.ps1')
+. (Join-Path $PSScriptRoot '..\hooks\decision-ha-websocket.ps1')
+$env:BRIDGE_FRONTEND_NORUN = '1'
+. (Join-Path $PSScriptRoot '..\hooks\bridge-frontend-cards.ps1')
+Remove-Item Env:\BRIDGE_FRONTEND_NORUN
+function Invoke-CopilotHaWebSocket {
+    param([hashtable[]]$Commands)
+    Invoke-TestPublicationCommands -Commands $Commands
+}
+function Set-CopilotMqttGlobalEntityId { $true }
+function Initialize-BridgeMachineSelector { param($Machines) '' }
+Initialize-TestPublicationStore
+$publicationCard = New-TestPublicationCard '2.0.0'
+$publicationUrl = Get-BridgeInlineReplyCardUrl -SourcePath $publicationCard -Version '2.0.0'
+Set-TestPublicationPolicy -Policy (New-TestPublicationPolicy $publicationCard) -CardUrl $publicationUrl
+$script:BridgeReplyCardUrlCache = ''
+$script:BridgeReplyCardUrlCachedAt = [datetime]::MinValue
+$script:DaemonDashboardSignature = $null
+$publicationDescriptors = @([pscustomobject]@{
+    Node = 'agent_bridge_active'; Name = 'Synthetic active session'; Machine = $script:DaemonMachineName; Kind = 'copilot'
+})
+$publicationCapabilities = @{ profile = $false; resume = $false; agent = $false }
+$firstPublication = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+Test-That 'the real save persists a dashboard before it becomes current' {
+    $firstPublication -and (Get-TestPublicationStore).configs.Contains('agent-decisions')
+} ($script:Log[-1])
+$unchangedSignature = $script:DaemonDashboardSignature
+$deletedStore = Get-TestPublicationStore
+$deletedStore.dashboards = @()
+$deletedStore.configs.Clear()
+Set-TestPublicationStore $deletedStore
+$script:TestPublication.Commands.Clear()
+$afterDeletion = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+Test-That 'external dashboard deletion is repaired despite an unchanged local signature' {
+    $afterDeletion -and (Get-TestPublicationStore).configs.Contains('agent-decisions') -and
+        @($script:TestPublication.Commands | Where-Object { $_.type -eq 'lovelace/config/save' }).Count -eq 1 -and
+        $script:DaemonDashboardSignature -ceq $unchangedSignature
+}
+
+# Establish an actual saved view again even on the unfixed baseline.
+$script:BridgeDashboardReady = $false
+$script:DaemonDashboardSignature = $null
+[void](Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers)
+$overwrittenStore = Get-TestPublicationStore
+$overwrittenStore.configs['agent-decisions'] = @{ title = 'External overwrite'; views = @(@{ cards = @(@{ type = 'entity'; entity = 'sensor.agent_bridge_old_status' }) }) }
+Set-TestPublicationStore $overwrittenStore
+$script:TestPublication.Commands.Clear()
+$afterOverwrite = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+Test-That 'external replacement is repaired rather than accepted from the cached signature' {
+    $afterOverwrite -and (Get-TestPublicationStore).configs['agent-decisions'].title -eq 'Agent Sessions' -and
+        @($script:TestPublication.Commands | Where-Object { $_.type -eq 'lovelace/config/save' }).Count -eq 1
+}
+
+$script:TestPublication.Reject['lovelace/config'] = '{"code":"unauthorized","message":"Denied"}'
+$script:TestPublication.Commands.Clear()
+$unreadable = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+$unreadablePlan = Update-DaemonRetireQueue -Queued @('old-session') -Gone @() -DashboardCurrent $unreadable
+Test-That 'a forbidden dashboard read cannot be called current from a remembered signature' { -not $unreadable }
+Test-That 'unreadable published state does not authorize queued entity retirement' {
+    @($unreadablePlan.Retire).Count -eq 0 -and @($unreadablePlan.Queue).Count -eq 1
+}
+Test-That 'an unreadable view is not overwritten as though it were missing' { @(Get-TestPublicationWrites).Count -eq 0 }
+
+$script:TestPublication.Reject.Clear()
+Set-TestPublicationIdentity -Participant 'observer-b'
+$script:TestPublication.Commands.Clear()
+$observedCurrent = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+Test-That 'a non-writer is current only by observing the actual accepted publication' {
+    $observedCurrent -and @(Get-TestPublicationWrites).Count -eq 0
+}
+
+Set-TestPublicationIdentity
+$retiringId = $script:Ids.s2
+$retiringNode = Get-CopilotMqttNodeId -SessionId $retiringId
+$mentionsOldNode = @([pscustomobject]@{
+    Node = 'agent_bridge_active'; Name = "Display text mentions $retiringNode"; Machine = $script:DaemonMachineName; Kind = 'copilot'
+})
+[void](Sync-DaemonDashboard -Descriptors $mentionsOldNode -Capabilities $publicationCapabilities -Headers $headers)
+Set-TestPublicationIdentity -Participant 'observer-b'
+$script:TestPublication.Commands.Clear()
+$script:DaemonPendingRetire = @($retiringId)
+$script:Retired = @()
+$differentInputs = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+Complete-DaemonSessionRetirement -Gone @() -DashboardCurrent $differentInputs -Headers $headers
+Test-That 'a skipped non-writer save does not claim its differing inputs were published' {
+    -not $differentInputs -and @(Get-TestPublicationWrites).Count -eq 0
+}
+Test-That 'a verified peer view can retire an absent node without waiting for a non-writer save' {
+    $script:Retired -contains $retiringId -and @($script:DaemonPendingRetire).Count -eq 0
+}
+Test-That 'mentioning an old node in display text does not strand its entities forever' {
+    (Get-TestPublicationStore).configs['agent-decisions'].agent_bridge_publication.renderedNodes -notcontains $retiringNode -and
+        $script:Retired -contains $retiringId
+}
+
+Set-TestPublicationIdentity
+$stillReferenced = @([pscustomobject]@{
+    Node = $retiringNode; Name = 'Still rendered'; Machine = $script:DaemonMachineName; Kind = 'copilot'
+})
+[void](Sync-DaemonDashboard -Descriptors $stillReferenced -Capabilities $publicationCapabilities -Headers $headers)
+Set-TestPublicationIdentity -Participant 'observer-b'
+$script:Retired = @()
+$script:DaemonPendingRetire = @($retiringId)
+$notYetRemoved = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+Complete-DaemonSessionRetirement -Gone @() -DashboardCurrent $notYetRemoved -Headers $headers
+Test-That 'a non-writer retains entities that the actual accepted view still renders' {
+    -not $notYetRemoved -and $script:Retired.Count -eq 0 -and $script:DaemonPendingRetire -contains $retiringId
+}
+
+Set-TestPublicationIdentity
+$lastSignature = $script:DaemonDashboardSignature
+$script:TestPublication.Reject['lovelace/config/save'] = '{"code":"unknown_error","message":"Save rejected"}'
+$failedSave = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+$script:Retired = @()
+Complete-DaemonSessionRetirement -Gone @() -DashboardCurrent $failedSave -Headers $headers
+Test-That 'the actual void-or-throw save failure neither advances currentness nor retires entities' {
+    -not $failedSave -and $script:DaemonDashboardSignature -ceq $lastSignature -and $script:Retired.Count -eq 0
+}
+
+Write-Host '--- migration refusal leaves actual session and machine reporting available ---'
+Initialize-TestPublicationStore -Unconfigured
+$reportSource = New-TestPublicationCard '2.0.0'
+Invoke-TestPreFencePublication -CardSource $reportSource
+$legacyReportingView = (Get-TestPublicationStore).configs['agent-decisions'] | ConvertTo-Json -Depth 100 -Compress
+$script:TestPublication.Commands.Clear()
+. (Join-Path $PSScriptRoot '..\hooks\decision-mqtt.ps1')
+$script:ReportingMessages = [Collections.Generic.List[object]]::new()
+function Publish-CopilotMqttMessage {
+    param($Topic, $Payload, $Headers, [switch]$Retain)
+    $script:ReportingMessages.Add([pscustomobject]@{ Topic = $Topic; Payload = $Payload })
+}
+function Get-DaemonLaunchCapabilities {
+    @{ newSession = $true; profile = $false; resume = $false; agent = $true; tuning = $false; detailed = $false; dev = $false }
+}
+$script:DaemonGlobalSignature = $null
+$script:DaemonGlobalLastPublish = [DateTimeOffset]::MinValue
+$script:DaemonOnlineLastPublish = [DateTimeOffset]::MinValue
+$script:DaemonPendingRetire = @()
+$reportSession = New-Session 's1'
+$reportSession.Transcript = Join-Path (Split-Path $script:TestPublication.Path -Parent) 'reporting.jsonl'
+[IO.File]::WriteAllText($reportSession.Transcript, '')
+$reportState = @{}
+Sync-DaemonSessions -Headers $headers -State $reportState -Live @{ $reportSession.SessionId = $reportSession }
+$reportTopics = Get-CopilotMqttTopics -SessionId $reportSession.SessionId
+$machineRoot = Get-CopilotMqttMachineTopicRoot -Slug $script:DaemonMachineSlug
+Test-That 'the actual reconcile and MQTT publisher still publish per-session status during migration' {
+    $reportState.ContainsKey($reportSession.SessionId) -and
+        @($script:ReportingMessages | Where-Object { $_.Topic -ceq $reportTopics.StatusState }).Count -gt 0
+} (($script:Log | Select-Object -Last 6) -join ' | ')
+Test-That 'the actual reconcile and MQTT publisher still report machine sessions during migration' {
+    @($script:ReportingMessages | Where-Object { $_.Topic -ceq "$machineRoot/global/state" -and $_.Payload -eq '1' }).Count -eq 1
+} (($script:Log | Select-Object -Last 6) -join ' | ')
+Test-That 'reporting does not silently migrate or overwrite the legacy shared view' {
+    @(Get-TestPublicationWrites).Count -eq 0 -and
+        ((Get-TestPublicationStore).configs['agent-decisions'] | ConvertTo-Json -Depth 100 -Compress) -ceq $legacyReportingView -and
+        @($script:Log | Where-Object { $_ -match 'migration required' }).Count -gt 0
+}
+
 Write-Host ''
 if ($script:Failures) {
     Write-Host "$($script:Failures) check(s) failed" -ForegroundColor Red

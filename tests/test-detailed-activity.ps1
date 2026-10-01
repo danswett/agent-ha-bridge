@@ -74,15 +74,18 @@ Write-Host "`n--- the dashboard draws the switch the daemon reads ---"
 
 # Capture what would be saved rather than sending it to Home Assistant.
 $script:SavedConfig = $null
+. (Join-Path $PSScriptRoot 'test-dashboard.ps1') -PublicationFixturesOnly
 function Invoke-CopilotHaWebSocket {
     param([Parameter(Mandatory)][object[]]$Commands)
-    $script:SavedConfig = $Commands[0].config
-    @()
+    Invoke-TestPublicationCommands -Commands $Commands
 }
+Initialize-TestPublicationStore
+Initialize-TestPublicationAuthority
 $sessions = @([pscustomobject]@{ Node = 'copilot_abc123def456'; Name = 'Copilot: a task'; Machine = 'BOX'; Kind = 'copilot' })
 $mine = [pscustomobject]@{ Slug = $slug; Machine = 'DSWETT-HOME'; Online = $true; IncludeProfile = $false; IncludeResume = $true; IncludeAgent = $true; IncludeDetailed = $true }
 $old  = [pscustomobject]@{ Slug = 'dans_mbp'; Machine = 'Dans-MBP'; Online = $true; IncludeProfile = $false; IncludeResume = $true; IncludeAgent = $false; IncludeDetailed = $false }
 
+Set-TestPublicationCardUrl -Url ''
 Save-CopilotSessionDashboard -Sessions $sessions -Machines @($mine, $old)
 $json = $script:SavedConfig | ConvertTo-Json -Depth 40 -Compress
 
@@ -105,6 +108,7 @@ Write-Host "`n--- a machine running from source is marked (dev) ---"
 # That is not hypothetical: it is why a peer looked up to date while missing the
 # Detailed activity switch entirely.
 $devMachine = [pscustomobject]@{ Slug = 'buildbox'; Machine = 'BUILDBOX'; Online = $true; IncludeProfile = $false; IncludeResume = $true; IncludeAgent = $false; IncludeDetailed = $true; IsDev = $true }
+Set-TestPublicationCardUrl -Url ''
 Save-CopilotSessionDashboard -Sessions $sessions -Machines @($devMachine, $old)
 $devJson = $script:SavedConfig | ConvertTo-Json -Depth 40 -Compress
 
@@ -118,6 +122,7 @@ Test-That 'a machine on a release is left unmarked' {
 # A peer that reports nothing at all is running a release - every machine that has
 # never seen a working copy does.
 $silent = [pscustomobject]@{ Slug = 'quiet'; Machine = 'QUIET'; Online = $true; IncludeProfile = $false; IncludeResume = $false; IncludeAgent = $false }
+Set-TestPublicationCardUrl -Url ''
 Save-CopilotSessionDashboard -Sessions $sessions -Machines @($silent)
 Test-That 'a peer that says nothing is not called dev' {
     ($script:SavedConfig | ConvertTo-Json -Depth 40 -Compress) -notmatch '\(dev\)'
@@ -125,6 +130,7 @@ Test-That 'a peer that says nothing is not called dev' {
 
 # One machine is where it matters most: there is no second version to compare with.
 $soloDev = [pscustomobject]@{ Slug = $slug; Machine = 'DSWETT-HOME'; Online = $true; IncludeProfile = $false; IncludeResume = $true; IncludeAgent = $true; IncludeDetailed = $true; IsDev = $true }
+Set-TestPublicationCardUrl -Url ''
 Save-CopilotSessionDashboard -Sessions $sessions -Machines @($soloDev)
 Test-That 'a single-machine install is marked too' {
     ($script:SavedConfig | ConvertTo-Json -Depth 40 -Compress) -match '\(dev\)'

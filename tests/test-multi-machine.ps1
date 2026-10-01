@@ -167,12 +167,13 @@ Test-That 'a sensor with no attributes at all does not throw' {
 Write-Host '--- one dashboard shows every machine ---'
 
 $script:SavedConfig = $null
+. (Join-Path $PSScriptRoot 'test-dashboard.ps1') -PublicationFixturesOnly
 function Invoke-CopilotHaWebSocket {
     param([Parameter(Mandatory)][object[]]$Commands)
-    if ($Commands[0].ContainsKey('config')) { $script:SavedConfig = $Commands[0].config }
-    @()
+    Invoke-TestPublicationCommands -Commands $Commands
 }
-$script:BridgeDashboardReady = $true
+Initialize-TestPublicationStore
+Initialize-TestPublicationAuthority
 
 $machines = @(
     [pscustomobject]@{ Slug = 'desktop'; Machine = 'DESKTOP'; IncludeProfile = $true; IncludeResume = $true }
@@ -182,6 +183,7 @@ $twoMachineSessions = @(
     [pscustomobject]@{ Node = 'agent_bridge_d1'; Name = 'Copilot: desk work'; Machine = 'DESKTOP'; Kind = 'copilot' }
     [pscustomobject]@{ Node = 'agent_bridge_l1'; Name = 'Claude: lap work'; Machine = 'LAPTOP'; Kind = 'claude' }
 )
+Set-TestPublicationCardUrl -Url ''
 Save-CopilotSessionDashboard -Sessions $twoMachineSessions -Machines $machines `
     -MachineSelector 'input_select.agent_bridge_target_machine'
 $cfg = $script:SavedConfig
@@ -350,9 +352,9 @@ Write-Host '--- an offline machine is listed, but cannot be launched on ---'
 $script:SavedConfig = $null
 function Invoke-CopilotHaWebSocket {
     param([Parameter(Mandatory)][object[]]$Commands)
-    if ($Commands[0].ContainsKey('config')) { $script:SavedConfig = $Commands[0].config }
-    @()
+    Invoke-TestPublicationCommands -Commands $Commands
 }
+Set-TestPublicationCardUrl -Url ''
 Save-CopilotSessionDashboard -Sessions $twoMachineSessions -Machines @(
     [pscustomobject]@{ Slug = 'desktop'; Machine = 'DESKTOP'; IncludeProfile = $true; IncludeResume = $true; Online = $true }
     [pscustomobject]@{ Slug = 'laptop'; Machine = 'LAPTOP'; IncludeProfile = $false; IncludeResume = $false; Online = $false }
@@ -395,6 +397,7 @@ Test-That 'its retained session counter is left out of the live total' {
 Test-That 'a caller that does not track liveness is treated as all-online' {
     # Keeps older callers and the single-machine path behaving exactly as before.
     $script:SavedConfig = $null
+    Set-TestPublicationCardUrl -Url ''
     Save-CopilotSessionDashboard -Sessions $twoMachineSessions -Machines @(
         [pscustomobject]@{ Slug = 'desktop'; Machine = 'DESKTOP'; IncludeProfile = $true; IncludeResume = $true }
         [pscustomobject]@{ Slug = 'laptop'; Machine = 'LAPTOP'; IncludeProfile = $false; IncludeResume = $false }
@@ -406,6 +409,7 @@ Test-That 'a caller that does not track liveness is treated as all-online' {
 Write-Host '--- a single machine still reads as it did ---'
 
 $script:SavedConfig = $null
+Set-TestPublicationCardUrl -Url ''
 Save-CopilotSessionDashboard -Sessions @(
     [pscustomobject]@{ Node = 'agent_bridge_d1'; Name = 'Copilot: solo'; Machine = 'SOLO'; Kind = 'copilot' }
 ) -Machines @([pscustomobject]@{ Slug = 'solo'; Machine = 'SOLO'; IncludeProfile = $true; IncludeResume = $true })
