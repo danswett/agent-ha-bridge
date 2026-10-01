@@ -2017,6 +2017,45 @@ function Test-BridgeDevBoxKeepAwakePrompt {
     ($filled -contains 'devBox') -or ($filled -contains 'devBox.keepAwake')
 }
 
+function New-BridgeDevBoxKeepAwakeTrigger {
+    <#
+        The triggers for the keep-awake task: once at logon, then every so many hours
+        for as long as the machine is up.
+
+        Two triggers rather than one with its .Repetition reassigned: mutating the
+        repetition of an AtLogOn trigger is fragile across Windows builds, and this
+        says the same thing - run once the machine is usable, then keep running.
+
+        -RepetitionDuration is deliberately not passed. The usual way to say "forever"
+        is [TimeSpan]::MaxValue, but it serialises to P99999999DT23H59M59S, which Task
+        Scheduler refuses:
+
+            The task XML contains a value which is incorrectly formatted or out of
+            range. (14,42):Duration:P99999999DT23H59M59S
+
+        [TimeSpan]::Zero is refused the same way. Omitting it leaves the duration
+        empty, which is itself "repeat indefinitely", and registers. Found on a real
+        Dev Box on 2026-10-01: 1.25.0 installed cleanly, warned once, and left the
+        task unregistered - the feature silently absent on exactly the machine that
+        had asked for it.
+
+        Separate from the registration so the shape can be asserted without
+        registering anything machine-wide. -User is a parameter for the same reason:
+        the test runner clears all but a small environment allowlist, which does not
+        include USERNAME, and -AtLogOn refuses an empty user.
+    #>
+    param(
+        [Parameter(Mandatory)][int]$IntervalHours,
+        [string]$User = $env:USERNAME
+    )
+
+    @(
+        (New-ScheduledTaskTrigger -AtLogOn -User $User),
+        (New-ScheduledTaskTrigger -Once -At (Get-Date) `
+            -RepetitionInterval (New-TimeSpan -Hours $IntervalHours))
+    )
+}
+
 # Tests dot-source this script with BRIDGE_INSTALL_NORUN set to load its helper
 # functions without running the install; a real run never sets it.
 if ($env:BRIDGE_INSTALL_NORUN) { return }
@@ -2676,15 +2715,7 @@ if ($devBoxDecision.Enabled) {
     try {
         $keepAwakeLauncher = Join-Path $hooksDir 'agent-bridge-devbox-keepawake.vbs'
         $keepAwakeAction = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$keepAwakeLauncher`""
-        # Two triggers rather than one with its .Repetition reassigned: mutating the
-        # repetition of an AtLogOn trigger is fragile across Windows builds, and this
-        # says the same thing - run once the machine is usable, then keep running.
-        $keepAwakeTriggers = @(
-            (New-ScheduledTaskTrigger -AtLogOn -User $env:USERNAME),
-            (New-ScheduledTaskTrigger -Once -At (Get-Date) `
-                -RepetitionInterval (New-TimeSpan -Hours $devBoxIntervalHours) `
-                -RepetitionDuration ([TimeSpan]::MaxValue))
-        )
+        $keepAwakeTriggers = New-BridgeDevBoxKeepAwakeTrigger -IntervalHours $devBoxIntervalHours
         # No RestartCount: a pass that fails because the Azure CLI login expired will
         # fail again immediately, and the next scheduled pass is the right retry.
         $keepAwakeSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
