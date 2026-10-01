@@ -874,11 +874,12 @@ function Resolve-DaemonPrimedCard {
     #>
     param(
         [Parameter(Mandatory)]$Entry,
-        [Parameter(Mandatory)][ValidateSet('working', 'waiting', 'idle')][string]$Status,
+        [Parameter(Mandatory)][ValidateSet('working', 'waiting', 'idle', 'error')][string]$Status,
         [bool]$VerboseOn
     )
 
-    $summary = if ($Entry.PSObject.Properties['LastSummary'] -and -not [string]::IsNullOrWhiteSpace([string]$Entry.LastSummary)) {
+    $summary = if ($Status -eq 'error') { 'Could not end session' }
+    elseif ($Entry.PSObject.Properties['LastSummary'] -and -not [string]::IsNullOrWhiteSpace([string]$Entry.LastSummary)) {
         [string]$Entry.LastSummary
     }
     elseif ($Status -eq 'working') { 'Working' } else { 'Idle' }

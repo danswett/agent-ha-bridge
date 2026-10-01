@@ -373,6 +373,207 @@ try {
     }
 
     & {
+        Write-Host '--- failed stop survives real state persistence and startup restoration ---'
+        . (Join-Path $repo 'codex\hooks\codex-transcript.ps1')
+        . (Join-Path $repo 'claude\hooks\claude-transcript.ps1')
+        $script:ClaudeAdapterLoaded = $true
+        $script:RestorePublished = [Collections.Generic.List[object]]::new()
+        $script:RestoreLive = @{}
+        $script:RestoreStopCalls = 0
+        $script:RestorePress = '2026-09-30T17:00:00-07:00'
+        $script:DaemonStartedAt = [DateTimeOffset]::Parse('2026-09-30T16:00:00-07:00')
+        $script:DaemonLaunchedPids = @{}
+        $script:DaemonReconcileStates = $null
+        $script:DaemonRegistrationStamps = @{}
+        $previousStateFile = $script:DaemonConfig.StateFile
+        $script:DaemonConfig.StateFile = Join-Path $root 'stop-restoration.json'
+        $script:DaemonStateLastWritten = $null
+
+        function Publish-CopilotMqttMessage {
+            param($Topic, $Payload, $Headers, [switch]$Retain)
+            $script:RestorePublished.Add([pscustomobject]@{ Topic = $Topic; Payload = $Payload })
+        }
+        function Get-HomeAssistantState {
+            param($EntityId, $Headers)
+            [pscustomobject]@{
+                state = $(if ($EntityId -like 'button.*_stop') { $script:RestorePress } else { 'off' })
+                attributes = [pscustomobject]@{}
+            }
+        }
+        function Invoke-HomeAssistantService { param($Domain, $Service, $Headers, $Data) }
+        function Stop-BridgeCopilotSession {
+            param($SessionId, $ProcessId)
+            $script:RestoreStopCalls++
+            [pscustomobject]@{ Stopped = $false; Detail = 'Synthetic process remains alive' }
+        }
+        function Get-LiveBridgeSessions { $script:RestoreLive }
+        function Get-LiveMcpSessions { param($Headers) @{} }
+        function Get-BridgeSessionDisplay { param($SessionId, $Kind, $WorkingDirectory) [pscustomobject]@{ Name = "$Kind`: synthetic"; Machine = 'TEST' } }
+        function Get-DaemonLaunchCapabilities { @{} }
+        function Publish-DaemonGlobalStatus { param($Descriptors, $Capabilities, $Headers) }
+        function Publish-DaemonOnlineHeartbeat { param($Headers) }
+        function Sync-DaemonDashboard { param($Descriptors, $Capabilities, $Headers) $true }
+        function Remove-CopilotMqttSession { param($SessionId, $Headers) }
+
+        function Set-RestorationCodexRegistration {
+            param([string]$SessionId, [string]$Status, [string]$At, [string]$Transcript)
+            $path = Write-CodexSessionRegistration -SessionId $SessionId -Status $Status `
+                -Activity 'Synthetic native activity' -TranscriptPath $Transcript -WorkingDirectory $root -ProcessId 0
+            $registration = Get-Content -LiteralPath $path -Raw | ConvertFrom-Json
+            $registration.Updated = $At
+            $registration | ConvertTo-Json -Depth 4 | Set-Content -LiteralPath $path -Encoding utf8
+            [IO.File]::SetLastWriteTimeUtc($path, [DateTimeOffset]::Parse($At).UtcDateTime)
+        }
+        function New-RestorationFixture {
+            param([string]$Kind)
+            $id = [guid]::NewGuid().ToString()
+            $sessionRoot = Join-Path $script:DecisionBridgeConfig.SessionStateRoot $id
+            [void][IO.Directory]::CreateDirectory($sessionRoot)
+            $transcript = Join-Path $sessionRoot 'events.jsonl'
+            $text = if ($Kind -eq 'copilot') { '{"type":"assistant.turn_start","timestamp":"2026-09-30T16:59:00-07:00"}' + "`n" } else { '' }
+            [IO.File]::WriteAllText($transcript, $text, [Text.UTF8Encoding]::new($false))
+            $session = [pscustomobject]@{
+                SessionId = $id; Kind = $Kind; ProcessId = 0; Transcript = $transcript
+                Status = 'working'; WorkingDirectory = $root
+            }
+            $entry = [pscustomobject]@{
+                Name = "$Kind`: synthetic"; Machine = 'TEST'; Kind = $Kind; Status = 'working'
+                Offset = [IO.FileInfo]::new($transcript).Length
+                LastSummary = 'Earlier native activity'; LastResponse = 'Retained synthetic response'
+            }
+            if ($Kind -eq 'claude') {
+                $session | Add-Member HookStatus 'idle'
+                $session | Add-Member HookStatusAt '2026-09-30T16:59:00-07:00'
+                $entry | Add-Member HookStatusAt '2026-09-30T16:59:00-07:00'
+            }
+            elseif ($Kind -eq 'codex') {
+                Set-RestorationCodexRegistration -SessionId $id -Status working -At '2026-09-30T16:59:00-07:00' -Transcript $transcript
+            }
+            @{ Id = $id; Session = $session; State = @{ $id = $entry }; Live = @{ $id = $session }; Transcript = $transcript }
+        }
+        function Invoke-RestorationRoundTrip {
+            param([hashtable]$Fixture)
+            Write-DaemonState -State $Fixture.State
+            $read = Read-DaemonState
+            $script:RestoreLive = $Fixture.Live
+            $script:RestorePublished.Clear()
+            Restore-DaemonSessionCards -Headers $headers -State $read -Live $Fixture.Live
+            $Fixture.State = $read
+        }
+        try {
+            foreach ($kind in @('copilot', 'claude', 'codex')) {
+                $fixture = New-RestorationFixture -Kind $kind
+                Invoke-PendingStops -Headers $headers -State $fixture.State -Live $fixture.Live
+                Test-That "the real $kind failed-stop producer records its error and consumed press" {
+                    $fixture.State[$fixture.Id].Status -ceq 'error' -and
+                    $fixture.State[$fixture.Id].LastStopAt -ceq $script:RestorePress
+                }
+                Test-That "a $kind failed stop survives write read full restore and actual publication" {
+                    Invoke-RestorationRoundTrip -Fixture $fixture
+                    $topic = (Get-CopilotMqttTopics -SessionId $fixture.Id).StatusState
+                    $published = @($script:RestorePublished | Where-Object Topic -CEQ $topic)
+                    $fixture.State[$fixture.Id].Status -ceq 'error' -and $published[-1].Payload -ceq 'error'
+                }
+                Test-That "the restored $kind error summary does not replay stale normal activity" {
+                    $topic = (Get-CopilotMqttTopics -SessionId $fixture.Id).ActivityState
+                    @($script:RestorePublished | Where-Object Topic -CEQ $topic)[-1].Payload -ceq 'Could not end session'
+                }
+                # Start from the actual persisted failure again even on the red baseline.
+                $fixture.State[$fixture.Id].Status = 'error'
+                if ($kind -eq 'claude') {
+                    $fixture.State[$fixture.Id].PSObject.Properties.Remove('HookStatusAt')
+                    [void](Sync-DaemonHookStatus -SessionId $fixture.Id -Entry $fixture.State[$fixture.Id] `
+                        -Session $fixture.Session -Headers $headers)
+                    Test-That 'a stale Claude hook first seen after restart cannot erase the failed stop' {
+                        $fixture.State[$fixture.Id].Status -ceq 'error'
+                    }
+                    foreach ($nativeStatus in @('working', 'waiting', 'idle')) {
+                        $fixture.State[$fixture.Id].Status = 'error'
+                        $fixture.Session.HookStatus = $nativeStatus
+                        $fixture.Session.HookStatusAt = [DateTimeOffset]::Parse($fixture.Session.HookStatusAt).AddMinutes(2).ToString('o')
+                        Test-That "a newer Claude $nativeStatus hook recovers normally through restore" {
+                            Invoke-RestorationRoundTrip -Fixture $fixture
+                            $fixture.State[$fixture.Id].Status -ceq $nativeStatus
+                        }
+                    }
+                }
+                elseif ($kind -eq 'codex') {
+                    $script:DaemonRegistrationStamps = @{}
+                    [void](Sync-DaemonCodexHookStatus -Id $fixture.Id -Entry $fixture.State[$fixture.Id] -Headers $headers)
+                    Test-That 'a stale Codex registration first seen after restart cannot erase the failed stop' {
+                        $fixture.State[$fixture.Id].Status -ceq 'error'
+                    }
+                    $minute = 1
+                    foreach ($nativeStatus in @('working', 'idle')) {
+                        $fixture.State[$fixture.Id].Status = 'error'
+                        Set-RestorationCodexRegistration -SessionId $fixture.Id -Status $nativeStatus `
+                            -At ([DateTimeOffset]::Parse($script:RestorePress).AddMinutes($minute).ToString('o')) -Transcript $fixture.Transcript
+                        $fixture.Session.Status = $nativeStatus
+                        [void](Sync-DaemonCodexHookStatus -Id $fixture.Id -Entry $fixture.State[$fixture.Id] -Headers $headers)
+                        Test-That "a newer Codex $nativeStatus registration recovers and restores normally" {
+                            Invoke-RestorationRoundTrip -Fixture $fixture
+                            $fixture.State[$fixture.Id].Status -ceq $nativeStatus
+                        }
+                        $minute++
+                    }
+                }
+                else {
+                    Add-Content -LiteralPath $fixture.Transcript -Encoding utf8 -Value @(
+                        '{"type":"user.message","timestamp":"2026-09-30T17:01:00-07:00","data":{"content":"Synthetic newer prompt"}}'
+                        '{"type":"assistant.turn_start","timestamp":"2026-09-30T17:01:00-07:00"}'
+                    )
+                    Test-That 'newer Copilot transcript activity recovers through the unchanged full restore path' {
+                        Invoke-RestorationRoundTrip -Fixture $fixture
+                        $fixture.State[$fixture.Id].Status -ceq 'working'
+                    }
+                    Add-Content -LiteralPath $fixture.Transcript -Encoding utf8 -Value '{"type":"assistant.turn_end","timestamp":"2026-09-30T17:02:00-07:00"}'
+                    Test-That 'a recovered Copilot turn can end idle without resurrecting the old stop error' {
+                        Invoke-RestorationRoundTrip -Fixture $fixture
+                        $fixture.State[$fixture.Id].Status -ceq 'idle'
+                    }
+                }
+                Test-That "another $kind restart does not resurrect an already recovered stop error" {
+                    Invoke-RestorationRoundTrip -Fixture $fixture
+                    $fixture.State[$fixture.Id].Status -ceq 'idle'
+                }
+                $fixture.State[$fixture.Id].Status = 'error'
+                $fixture.Live = @{}
+                Test-That "a retired $kind failed-stop session is still removed by the unchanged reconcile" {
+                    Invoke-RestorationRoundTrip -Fixture $fixture
+                    -not $fixture.State.ContainsKey($fixture.Id)
+                }
+            }
+
+            foreach ($savedSummary in @('', 'Working', 'Earlier native activity')) {
+                Test-That "error priming has a truthful label instead of the saved summary '$savedSummary'" {
+                    $entry = [pscustomobject]@{ Name = 'Synthetic'; Machine = 'TEST'; LastSummary = $savedSummary; LastResponse = 'Retained response' }
+                    $card = Resolve-DaemonPrimedCard -Entry $entry -Status error -VerboseOn $false
+                    $card.Summary -ceq 'Could not end session' -and $card.Detail.response -ceq 'Retained response'
+                }
+            }
+            foreach ($savedStatus in @('idle', 'working', 'waiting', 'ending', 'ended', 'nonsense', 'error')) {
+                $fixture = New-RestorationFixture -Kind copilot
+                $fixture.State[$fixture.Id].Status = $savedStatus
+                Test-That "startup does not stick to an unrelated saved '$savedStatus' status without a failed stop" {
+                    (Get-DaemonStartupStatus -Session $fixture.Session -Entry $fixture.State[$fixture.Id]) -ceq 'working'
+                }
+            }
+            $fixture = New-RestorationFixture -Kind copilot
+            $fixture.State[$fixture.Id].Status = 'error'
+            $fixture.State[$fixture.Id] | Add-Member LastStopAt 'not-a-time'
+            Test-That 'an invalid saved stop timestamp does not create a sticky error status' {
+                (Get-DaemonStartupStatus -Session $fixture.Session -Entry $fixture.State[$fixture.Id]) -ceq 'working'
+            }
+            $empty = @{ State = @{}; Live = @{} }
+            Test-That 'startup with no saved or live sessions still restores nothing' {
+                Invoke-RestorationRoundTrip -Fixture $empty
+                $empty.State.Count -eq 0
+            }
+        }
+        finally { $script:DaemonConfig.StateFile = $previousStateFile }
+    }
+
+    & {
         Write-Host '--- real stop producer, publisher validation and existing renderer ---'
         $sid = '50000000-0000-4000-8000-000000000005'
         $script:StatusMessages = [Collections.Generic.List[object]]::new()
