@@ -1146,6 +1146,48 @@ setTimeout(() => process.exit(3), 5 * 60 * 1000);
         }
     }
 
+    Invoke-P4Scenario 'the documented suggestion entry point remains read-only' {
+        $fixture = New-P4Fixture
+        $suggested = Join-Path $fixture.Root 'suggested'
+        [void][IO.Directory]::CreateDirectory($suggested)
+        $files = @(New-P4SessionFiles claude $suggested ([guid]::NewGuid().ToString()))
+        $contextPath = Join-Path $fixture.Root 'suggestion-context.json'
+        $scriptPath = Join-Path $fixture.Root 'suggestions.ps1'
+        $outputPath = Join-Path $fixture.Root 'suggestions.json'
+        @{ source = $checkout; output = $outputPath } | ConvertTo-Json | Set-Content -LiteralPath $contextPath
+        [IO.File]::WriteAllText($scriptPath, @'
+$ErrorActionPreference = 'Stop'
+$context = Get-Content -LiteralPath (Join-Path $PSScriptRoot 'suggestion-context.json') -Raw | ConvertFrom-Json
+$bridgeRoot = $context.source
+$hooks = Join-Path $bridgeRoot 'hooks'
+. (Join-Path $hooks 'decision-bridge-common.ps1')
+. (Join-Path $hooks 'session-launch.ps1')
+$suggestions = @(Get-BridgeDiscoveredWorkspaces)
+@{ suggestions = $suggestions; executableCount = @(Get-BridgeWorkspaceChoices).Count } |
+    ConvertTo-Json | Set-Content -LiteralPath $context.output
+'@)
+        try {
+            Set-P4Config $fixture @{ workspaces = @(); discoverWorkspaces = $true }
+            $before = (Get-FileHash -LiteralPath $env:AGENT_HA_BRIDGE_CONFIG).Hash
+            $start = New-BridgeTestProcessStartInfo -ScriptPath $scriptPath -Sandbox $env:AGENT_HA_BRIDGE_TEST_ROOT
+            $result = Invoke-BridgeTestProcess -StartInfo $start -TimeoutSeconds 30
+            if ($result.ExitCode -ne 0 -or $result.TimedOut) { throw 'The documented suggestion invocation did not complete.' }
+            $observed = Get-Content -LiteralPath $outputPath -Raw | ConvertFrom-Json
+            $expectedCount = if (Test-BridgeSystemDirectory $suggested) { 0 } else { 1 }
+            Test-P4 'the actual documented command reports eligible suggestions without granting execution' `
+                (@($observed.suggestions).Count -eq $expectedCount -and $observed.executableCount -eq 0)
+            Test-P4 'the documented helper leaves the actual configuration unchanged' `
+                ((Get-FileHash -LiteralPath $env:AGENT_HA_BRIDGE_CONFIG).Hash -eq $before)
+            Set-P4Config $fixture @{ workspaces = @(); discoverWorkspaces = $false }
+            $result = Invoke-BridgeTestProcess -StartInfo $start -TimeoutSeconds 30
+            if ($result.ExitCode -ne 0 -or $result.TimedOut) { throw 'The disabled suggestion invocation did not complete.' }
+            $observed = Get-Content -LiteralPath $outputPath -Raw | ConvertFrom-Json
+            Test-P4 'the documented discovery switch controls only the explicitly invoked helper' `
+                (@($observed.suggestions).Count -eq 0 -and $observed.executableCount -eq 0)
+        }
+        finally { Remove-P4SessionFiles $files }
+    }
+
     Invoke-P4Scenario 'stale and tampered workspace choices' {
         $fixture = New-P4Fixture
         $script:P4States[$script:DaemonEntity.NewWorkspace] = 'not an approved label'

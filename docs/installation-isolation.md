@@ -149,3 +149,23 @@ directories only if empty. New untracked or ignored data prevents that removal. 
 tracked files are restored without overwriting existing files or replacing the real
 index. Git retains the removed tree's administration for its normal maintenance;
 the bridge does not prune other owners' missing worktree records.
+
+### Listing workspace suggestions
+
+The launch card shows configured targets only; it does not automatically display
+discovered folders. `discoverWorkspaces` and `discoverCount` apply to the following
+explicit, read-only PowerShell helper invocation. Set `$bridgeRoot` to the actual
+installation root when it is not the default:
+
+```powershell
+$bridgeRoot = Join-Path $HOME '.agent-ha-bridge'
+$hooks = Join-Path $bridgeRoot 'hooks'
+. (Join-Path $hooks 'decision-bridge-common.ps1')
+. (Join-Path $hooks 'session-launch.ps1')
+Get-BridgeDiscoveredWorkspaces
+```
+
+This prints eligible local folder suggestions without starting a client, changing
+configuration or approving a target. Review the results, add only the desired paths
+to `newSession.workspaces`, and reload the bridge configuration before launching.
+Setting `discoverWorkspaces` to `false` makes this helper return no suggestions.

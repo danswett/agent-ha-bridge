@@ -329,8 +329,8 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `newSession.worktreeRoot` | Where isolated launches get their worktrees (default `~/repos/wt`). A private marker in Git's administration directory identifies managed worktrees; a directory name alone does not grant cleanup ownership |
 | `newSession.worktreeLimit` | Maximum bridge-managed worktrees per repository (default `10`). At the cap, requested isolation refuses the launch with a diagnostic; it never falls back to the primary checkout |
 | `newSession.worktreeIdleHours` | How old a finished worktree must be before it is removed (default `12`) |
-| `newSession.discoverWorkspaces` | Enable local folder suggestions (default `true`), not executable approval. Add a suggestion explicitly to `workspaces` before launching there. System folders such as `C:\Windows\System32` are excluded |
-| `newSession.discoverCount` | Maximum local folder suggestions (default `8`); never a limit on cleanup's liveness checks |
+| `newSession.discoverWorkspaces` | Controls the explicitly invoked `Get-BridgeDiscoveredWorkspaces` helper (default `true`), not the launch card. Use the [read-only suggestion command](docs/installation-isolation.md#listing-workspace-suggestions), then explicitly configure any chosen folder. System folders such as `C:\Windows\System32` are excluded |
+| `newSession.discoverCount` | Maximum suggestions returned by that helper (default `8`). It does not populate the launch card or limit cleanup's liveness checks |
 | `newSession.resumeCount` | How many recent sessions the Resume dropdown offers (default `12`) |
 | `newSession.model` | Model preselected on the card (default: **Agent default** — the CLI's own choice). Applies to Copilot and Agency; `newSession.model.claude` / `.codex` do the same per agent |
 | `newSession.effort.<agent>` / `.context.<agent>` | Reasoning effort and context window preselected on the card, per agent (`copilot`, `claude`, `codex`; Agency reads Copilot's) |
