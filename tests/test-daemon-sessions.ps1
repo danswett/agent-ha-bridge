@@ -32,6 +32,94 @@ function Test-That {
 
 $headers = @{ Authorization = 'Bearer test' }
 
+# Keep the real HTTP wrapper and its guard across common-helper reloads. Record
+# rejected calls too, because the stale-helper sweep catches transport failures.
+$script:DaemonHttpStates = @(
+    [pscustomobject]@{ entity_id = 'sensor.agent_bridge_fixture_sessions'; state = '0'
+        attributes = [pscustomobject]@{ machine = 'FIXTURE'; sessions = @() } }
+    [pscustomobject]@{ entity_id = 'light.fixture_unrelated'; state = 'off'; attributes = [pscustomobject]@{} }
+)
+$script:DaemonHttpRequests = [Collections.Generic.List[object]]::new()
+$script:DaemonHttpTemplateRefused = $false
+function Invoke-RestMethod {
+    param([string]$Method, [string]$Uri, [hashtable]$Headers, [object]$Body, [string]$ContentType, [int]$TimeoutSec)
+
+    $request = [pscustomobject]@{
+        Method = $Method; Uri = $Uri; HasHeaders = ($null -ne $Headers); TimeoutSeconds = $TimeoutSec; Unexpected = $true
+        BodyIsBytes = ($Body -is [byte[]]); ContentType = $ContentType; Data = $null
+    }
+    $script:DaemonHttpRequests.Add($request)
+    if ($args.Count -eq 0 -and $Method -eq 'Post' -and
+        $Uri -ceq 'http://publication.invalid:8123/api/template' -and $ContentType -ceq 'application/json' -and
+        $Body -is [string]) {
+        $payload = $Body | ConvertFrom-Json -AsHashtable
+        if ($payload -is [Collections.IDictionary] -and $payload.Count -eq 1 -and
+            $payload.Contains('template') -and $payload.template -is [string] -and
+            $payload.template -ceq $script:DaemonBridgeStatesTemplate) {
+            $request.Unexpected = $false
+            if ($script:DaemonHttpTemplateRefused) {
+                $response = [Net.Http.HttpResponseMessage]::new([Net.HttpStatusCode]::BadRequest)
+                throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('Synthetic template refusal', $response)
+            }
+            $filtered = @($script:DaemonHttpStates | Where-Object { $_.entity_id -cmatch '^[^.]+\.(agent_bridge_|mcp_)' })
+            return (ConvertTo-Json -InputObject $filtered -Depth 10 -Compress)
+        }
+    }
+    elseif ($args.Count -eq 0 -and $Method -eq 'Get' -and $Uri -ceq 'http://publication.invalid:8123/api/states' -and
+        -not $PSBoundParameters.ContainsKey('Body') -and -not $PSBoundParameters.ContainsKey('ContentType')) {
+        $request.Unexpected = $false
+        return ,$script:DaemonHttpStates
+    }
+    elseif ($args.Count -eq 0 -and $Method -eq 'Get' -and $Uri -cin @(
+        'http://publication.invalid:8123/api/states/select.agent_bridge_1111111100004000_decision'
+        'http://publication.invalid:8123/api/states/select.agent_bridge_1111111100004000_f1'
+        'http://publication.invalid:8123/api/states/button.agent_bridge_1111111100004000_submit'
+    ) -and -not $PSBoundParameters.ContainsKey('Body') -and -not $PSBoundParameters.ContainsKey('ContentType')) {
+        $request.Unexpected = $false
+        $response = [Net.Http.HttpResponseMessage]::new([Net.HttpStatusCode]::NotFound)
+        throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('Synthetic reporting entity not found', $response)
+    }
+    elseif ($args.Count -eq 0 -and $Method -eq 'Get' -and
+        -not [string]::IsNullOrWhiteSpace([string]$script:DaemonConfig.VerboseToggle) -and
+        $Uri -ceq "http://publication.invalid:8123/api/states/$($script:DaemonConfig.VerboseToggle)" -and
+        -not $PSBoundParameters.ContainsKey('Body') -and -not $PSBoundParameters.ContainsKey('ContentType')) {
+        $request.Unexpected = $false
+        return [pscustomobject]@{
+            entity_id = $script:DaemonConfig.VerboseToggle; state = 'off'; attributes = [pscustomobject]@{}
+        }
+    }
+    elseif ($args.Count -eq 0 -and $Method -eq 'Post' -and $Uri -cin @(
+        'http://publication.invalid:8123/api/services/select/select_option'
+        'http://publication.invalid:8123/api/services/text/set_value'
+    ) -and $ContentType -ceq 'application/json; charset=utf-8' -and $Body -is [byte[]]) {
+        $payload = [Text.UTF8Encoding]::new($false, $true).GetString($Body) | ConvertFrom-Json -AsHashtable
+        $request.Data = $payload
+        if ($payload -is [Collections.IDictionary] -and $payload.Count -eq 2 -and
+            $payload.Contains('entity_id') -and $payload.entity_id -is [string]) {
+            $valid = $false
+            if ($Uri -ceq 'http://publication.invalid:8123/api/services/select/select_option') {
+                $valid = $payload.Contains('option') -and $payload.option -is [string] -and $payload.option -ceq 'Idle' -and
+                    $payload.entity_id -cin @(
+                        'select.agent_bridge_1111111100004000_f1'
+                        'select.agent_bridge_1111111100004000_f2'
+                        'select.agent_bridge_1111111100004000_f3'
+                        'select.agent_bridge_1111111100004000_f4'
+                    )
+            }
+            else {
+                $valid = $payload.Contains('value') -and $payload.value -is [string] -and
+                    $payload.value -ceq $script:DaemonConfig.ReplyBlankValue -and
+                    $payload.entity_id -ceq 'text.agent_bridge_1111111100004000_reply'
+            }
+            if ($valid) {
+                $request.Unexpected = $false
+                return ,@()
+            }
+        }
+    }
+    throw "Unexpected synthetic daemon HTTP request: $Method $Uri"
+}
+
 Write-Host '--- what every machine is running ---'
 $local = @(
     [pscustomobject]@{ Node = 'agent_bridge_a'; Name = 'Claude: repo'; Machine = 'DESK'; Kind = 'claude' }
@@ -494,6 +582,88 @@ Test-That 'reporting does not silently migrate or overwrite the legacy shared vi
     @(Get-TestPublicationWrites).Count -eq 0 -and
         ((Get-TestPublicationStore).configs['agent-decisions'] | ConvertTo-Json -Depth 100 -Compress) -ceq $legacyReportingView -and
         @($script:Log | Where-Object { $_ -match 'migration required' }).Count -gt 0
+}
+
+Write-Host '--- synthetic state-read transport contracts ---'
+Test-That 'reconciliation reads through the exact synthetic template endpoint' {
+    @($script:DaemonHttpRequests | Where-Object {
+        -not $_.Unexpected -and $_.Method -eq 'Post' -and $_.Uri -ceq 'http://publication.invalid:8123/api/template'
+    }).Count -gt 0
+}
+$script:DaemonStatesTemplateRefused = $false
+$filteredStates = Get-DaemonHomeAssistantStates -Headers $headers -Fresh
+Test-That 'the real state reader parses the template text as a filtered state array' {
+    $filteredStates.Count -eq 1 -and $filteredStates[0].entity_id -ceq 'sensor.agent_bridge_fixture_sessions' -and
+        $filteredStates[0].state -ceq '0' -and $filteredStates[0].attributes.machine -ceq 'FIXTURE' -and
+        @($filteredStates[0].attributes.sessions).Count -eq 0 -and $script:DaemonHttpRequests[-1].Method -eq 'Post'
+}
+$savedHttpStates = $script:DaemonHttpStates
+$script:DaemonHttpStates = @()
+$beforeEmptyRead = $script:DaemonHttpRequests.Count
+$emptyStates = Get-DaemonHomeAssistantStates -Headers $headers -Fresh
+Test-That 'an empty filtered response stays an empty array without a fallback request' {
+    $emptyStates.Count -eq 0 -and $script:DaemonHttpRequests.Count -eq ($beforeEmptyRead + 1) -and
+        $script:DaemonHttpRequests[-1].Method -eq 'Post'
+}
+$script:DaemonHttpStates = $savedHttpStates
+$script:DaemonHttpTemplateRefused = $true
+$beforeFallbackRead = $script:DaemonHttpRequests.Count
+$fallbackStates = Get-DaemonHomeAssistantStates -Headers $headers -Fresh
+Test-That 'a synthetic template refusal makes the real reader request the full state array' {
+    $fallbackStates.Count -eq 2 -and $fallbackStates[0].entity_id -ceq 'sensor.agent_bridge_fixture_sessions' -and
+        $fallbackStates[1].entity_id -ceq 'light.fixture_unrelated' -and
+        $script:DaemonHttpRequests.Count -eq ($beforeFallbackRead + 2) -and
+        $script:DaemonHttpRequests[-2].Method -eq 'Post' -and $script:DaemonHttpRequests[-1].Method -eq 'Get' -and
+        $script:DaemonStatesTemplateRefused
+}
+$script:DaemonHttpTemplateRefused = $false
+$script:DaemonStatesTemplateRefused = $false
+Test-That 'unexpected HTTP routes remain observable even when a best-effort caller catches the error' {
+    @($script:DaemonHttpRequests | Where-Object Unexpected).Count -eq 0
+} (($script:DaemonHttpRequests | Where-Object Unexpected | ForEach-Object { "$($_.Method) $($_.Uri)" }) -join ' | ')
+Test-That 'the reporting node uses exactly its three synthetic missing-entity routes' {
+    $reportingNode = Get-CopilotMqttNodeId -SessionId $script:Ids.s1
+    $expected = @(
+        "http://publication.invalid:8123/api/states/select.${reportingNode}_decision"
+        "http://publication.invalid:8123/api/states/select.${reportingNode}_f1"
+        "http://publication.invalid:8123/api/states/button.${reportingNode}_submit"
+    )
+    $seen = @($script:DaemonHttpRequests | Where-Object {
+        -not $_.Unexpected -and $_.Method -eq 'Get' -and $_.Uri -cin $expected
+    } | ForEach-Object Uri)
+    $seen.Count -eq 3 -and (($seen | Sort-Object) -join ',') -ceq (($expected | Sort-Object) -join ',')
+}
+Test-That 'the real detail check reads only the derived fixture toggle and observes off' {
+    $toggleReads = @($script:DaemonHttpRequests | Where-Object {
+        -not $_.Unexpected -and $_.Method -eq 'Get' -and
+            $_.Uri -ceq "http://publication.invalid:8123/api/states/$($script:DaemonConfig.VerboseToggle)"
+    })
+    $toggleReads.Count -eq 1 -and $script:DaemonVerbose -eq $false
+}
+Test-That 'the actual field initializer sends exactly four byte-JSON Idle service actions' {
+    $actions = @($script:DaemonHttpRequests | Where-Object {
+        $_.Method -eq 'Post' -and $_.Uri -ceq 'http://publication.invalid:8123/api/services/select/select_option'
+    })
+    $reportingNode = Get-CopilotMqttNodeId -SessionId $script:Ids.s1
+    $expected = @(1..4 | ForEach-Object { Get-CopilotMqttFieldEntityId -Node $reportingNode -Index $_ })
+    $targets = @($actions | ForEach-Object { $_.Data.entity_id })
+    $actions.Count -eq 4 -and (($targets | Sort-Object) -join ',') -ceq (($expected | Sort-Object) -join ',') -and
+        @($actions | Where-Object {
+            -not $_.Unexpected -and $_.BodyIsBytes -and $_.ContentType -ceq 'application/json; charset=utf-8' -and
+                $_.Data.Count -eq 2 -and $_.Data.Contains('entity_id') -and $_.Data.Contains('option') -and
+                $_.Data.option -is [string] -and $_.Data.option -ceq 'Idle'
+        }).Count -eq 4
+}
+Test-That 'the actual reply initializer sends one exact blank byte-JSON service action' {
+    $actions = @($script:DaemonHttpRequests | Where-Object {
+        $_.Method -eq 'Post' -and $_.Uri -ceq 'http://publication.invalid:8123/api/services/text/set_value'
+    })
+    $reportingNode = Get-CopilotMqttNodeId -SessionId $script:Ids.s1
+    $actions.Count -eq 1 -and -not $actions[0].Unexpected -and $actions[0].BodyIsBytes -and
+        $actions[0].ContentType -ceq 'application/json; charset=utf-8' -and $actions[0].Data.Count -eq 2 -and
+        $actions[0].Data.Contains('entity_id') -and $actions[0].Data.Contains('value') -and
+        $actions[0].Data.entity_id -ceq "text.${reportingNode}_reply" -and
+        $actions[0].Data.value -is [string] -and $actions[0].Data.value -ceq $script:DaemonConfig.ReplyBlankValue
 }
 
 Write-Host ''
