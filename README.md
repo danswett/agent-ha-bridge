@@ -325,12 +325,12 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `newSession.profiles` | Restrict which Agency profiles the dashboard offers, and in what order (default: all of them, read from `agency config profiles`). Names this machine's Agency does not have are dropped |
 | `newSession.defaultProfile` | Profile preselected on the card (default: the first offered) |
 | `newSession.defaultWorkspace` | Workspace label preselected on the card (default: the first in `workspaces`) |
-| `newSession.workspaces` | Directories offered as launch targets — a path string, or `{ "label": …, "path": … }`. Add `"isolate": true` to give every launch there a git worktree of its own. Folders recent Claude/Codex sessions worked in are added after these, and the home folder is offered if the list would otherwise be empty |
-| `newSession.worktreeRoot` | Where isolated launches get their worktrees (default `~/repos/wt`). One directory, outside every repository: it is what marks a worktree as the bridge's to tidy up |
-| `newSession.worktreeLimit` | How many worktrees one repository may have at once (default `10`). At the cap a launch runs in the repository itself rather than failing |
+| `newSession.workspaces` | Explicitly approved launch directories: a path string, or `{ "label": …, "path": … }`. Add the Boolean `"isolate": true` for a separate git worktree on each fresh launch. Discovery and an empty list never implicitly approve another directory, including Home |
+| `newSession.worktreeRoot` | Where isolated launches get their worktrees (default `~/repos/wt`). A private marker in Git's administration directory identifies managed worktrees; a directory name alone does not grant cleanup ownership |
+| `newSession.worktreeLimit` | Maximum bridge-managed worktrees per repository (default `10`). At the cap, requested isolation refuses the launch with a diagnostic; it never falls back to the primary checkout |
 | `newSession.worktreeIdleHours` | How old a finished worktree must be before it is removed (default `12`) |
-| `newSession.discoverWorkspaces` | Set to `false` to offer only the configured workspaces (default `true`). System folders such as `C:\Windows\System32` are never discovered |
-| `newSession.discoverCount` | How many discovered folders to offer (default `8`) |
+| `newSession.discoverWorkspaces` | Controls the explicitly invoked `Get-BridgeDiscoveredWorkspaces` helper (default `true`), not the launch card. Use the [read-only suggestion command](docs/installation-isolation.md#listing-workspace-suggestions), then explicitly configure any chosen folder. System folders such as `C:\Windows\System32` are excluded |
+| `newSession.discoverCount` | Maximum suggestions returned by that helper (default `8`). It does not populate the launch card or limit cleanup's liveness checks |
 | `newSession.resumeCount` | How many recent sessions the Resume dropdown offers (default `12`) |
 | `newSession.model` | Model preselected on the card (default: **Agent default** — the CLI's own choice). Applies to Copilot and Agency; `newSession.model.claude` / `.codex` do the same per agent |
 | `newSession.effort.<agent>` / `.context.<agent>` | Reasoning effort and context window preselected on the card, per agent (`copilot`, `claude`, `codex`; Agency reads Copilot's) |
@@ -699,15 +699,18 @@ A few deliberate choices:
   list — a `git checkout` in one rewrites the files under all the others. With
   `"isolate": true` each fresh launch gets a git worktree of its own instead, made at
   launch from the remote's default branch. The dropdown still lists the repository, not
-  the worktrees: you pick **Bridge** and never see them. Resumes are unaffected, since a
-  resumed session belongs in the directory it was already running in.
+  the worktrees: you pick **Bridge** and never see them. Resumes stay in their existing
+  approved directory, including managed worktrees of an approved isolated repository;
+  missing or revoked targets are refused, not redirected.
 - **Nothing unmerged is ever cleaned up.** Finished worktrees are removed before each
-  launch, and a worktree counts as finished only if it has no uncommitted or untracked
-  files, no branch checked out, no commit of its own on a detached HEAD, has not been
-  worked in recently, and is older than `newSession.worktreeIdleHours`. Anything else
-  stays until you deal with it. If git is missing or the workspace is not a repository,
-  the session launches in the directory itself and the daemon log says why — isolation
-  is never worth a launch that does not happen.
+  launch only when ownership, Git state and all-adapter liveness are readable: no
+  uncommitted, untracked or ignored files, no checked-out branch or detached commits
+  ahead of the base, no live session at or below the directory, and sufficient
+  `newSession.worktreeIdleHours`. Locked, uncertain and linked/submodule trees remain.
+  Cleanup removes only clean tracked files and empty directories, never recursively
+  deleting ignored user data; Git retains prunable administration for normal maintenance.
+  Pending launches hold a Git lock until registration. If isolation cannot be provided,
+  the launch stops with a useful error instead of using the original checkout.
 - **Tools are not auto-approved.** Launched sessions get no `--allow-all` unless
   you set `newSession.allowAllTools`. Permission prompts already route to Home
   Assistant, so an unattended session still asks before it acts.

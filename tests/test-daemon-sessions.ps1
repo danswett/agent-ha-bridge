@@ -16,6 +16,10 @@ $ErrorActionPreference = 'Stop'
 $env:AGENT_BRIDGE_DAEMON_NORUN = '1'
 . (Join-Path $PSScriptRoot '..\hooks\agent-bridge-daemon.ps1')
 $script:DaemonConfig.LogFile = Join-Path ([IO.Path]::GetTempPath()) "test-daemon-sessions-$([guid]::NewGuid().ToString('N').Substring(0, 8)).log"
+$script:FakeLaunchers = @('agency', 'copilot')
+$script:FakeProfiles = @('work', 'home')
+function Get-BridgeAvailableLaunchers { @($script:FakeLaunchers) }
+function Get-BridgeAgencyProfiles { @($script:FakeProfiles) }
 
 $script:Failures = 0
 function Test-That {
@@ -248,10 +252,6 @@ Write-Host '--- what this machine''s launch card can offer ---'
 # machine whose Agency has none - a new one, before whatever syncs the Agency config
 # has run on it - used to get a row offering three that did not exist there, and
 # every launch from it died before Copilot started.
-$script:FakeLaunchers = @('agency', 'copilot')
-$script:FakeProfiles = @('work', 'home')
-function Get-BridgeAvailableLaunchers { @($script:FakeLaunchers) }
-function Get-BridgeAgencyProfiles { @($script:FakeProfiles) }
 function Get-BridgeSetting {
     param([Parameter(Mandatory)][string]$Path, $Default = $null)
     if ($Path -eq 'newSession.enabled') { return $true }

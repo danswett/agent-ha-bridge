@@ -38,6 +38,7 @@
         'tests\test-native-hook.ps1'
         'tests\test-new-session.ps1'
         'tests\test-p3b-contracts.ps1'
+        'tests\test-p4-worktree-safety.ps1'
         'tests\test-reliability.ps1'
         'tests\test-reply-card.ps1'
         'tests\test-restart-restore.ps1'

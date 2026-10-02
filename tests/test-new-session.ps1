@@ -168,8 +168,8 @@ Test-That 'the duplicate label is disambiguated' { ($choices | Select-Object -Ex
 
 $script:FakeSettings = @{ 'newSession.workspaces' = @() }
 $choices = @(Get-BridgeWorkspaceChoices)
-Test-That 'no configuration and nothing discovered falls back to home' {
-    $choices.Count -eq 1 -and $choices[0].Label -eq 'Home' -and $choices[0].Path -eq [IO.Path]::GetFullPath($HOME)
+Test-That 'no configured workspace grants no executable target, including home' {
+    $choices.Count -eq 0
 }
 
 Write-Host ''
@@ -180,11 +180,11 @@ New-Item -ItemType Directory -Path $gamma -Force | Out-Null
 $script:FakeDiscovered = @($gamma, $alpha)
 $script:FakeSettings = @{ 'newSession.workspaces' = @($alpha) }
 $choices = @(Get-BridgeWorkspaceChoices)
-Test-That 'discovered folders follow the configured ones' { ($choices.Label -join ',') -eq 'alpha,gamma' }
+Test-That 'discovered folders do not broaden the configured executable list' { ($choices.Label -join ',') -eq 'alpha' }
 Test-That 'a discovered folder already configured is not offered twice' { @($choices | Where-Object Path -eq $alpha).Count -eq 1 }
-Test-That 'a discovered folder resolves like a configured one' { (Resolve-BridgeWorkspacePath -Label 'gamma') -eq $gamma }
+Test-That 'a discovered folder cannot resolve without explicit approval' { $null -eq (Resolve-BridgeWorkspacePath -Label 'gamma') }
 $script:FakeSettings = @{}
-Test-That 'discovery alone is enough, with no config at all' { (Get-BridgeDefaultWorkspaceLabel) -eq 'gamma' }
+Test-That 'discovery alone does not supply an executable default' { (Get-BridgeDefaultWorkspaceLabel) -eq '' }
 $script:FakeDiscovered = @()
 
 if ($script:BridgeIsWindows) {
@@ -220,7 +220,7 @@ Test-That 'a default naming a missing workspace falls back to the first' {
     (Get-BridgeDefaultWorkspaceLabel) -eq 'alpha'
 }
 $script:FakeSettings = @{ 'newSession.workspaces' = @() }
-Test-That 'no workspaces means home is the default' { (Get-BridgeDefaultWorkspaceLabel) -eq 'Home' }
+Test-That 'no approved workspaces means there is no executable default' { (Get-BridgeDefaultWorkspaceLabel) -eq '' }
 
 $script:FakeSettings = @{ 'newSession.profiles' = @('work', 'home') }
 Test-That 'the first profile is the default when none is configured' { (Get-BridgeDefaultAgencyProfile) -eq 'work' }
@@ -1223,7 +1223,7 @@ Reset-ResumeCache
 # Agency is the launcher for these, so the profile path is exercised.
 $script:AgencyPresent = $true
 $script:FakeSettings = @{
-    'newSession.workspaces' = @($alpha)
+    'newSession.workspaces' = @($alpha, $beta)
     'newSession.launcher'   = 'agency'
     'newSession.profiles'   = @('work', 'home', 'local')
 }
@@ -1412,7 +1412,7 @@ Test-That 'and says which profile' { ($script:Results -join ' ') -match 'Unknown
 
 # Under the plain copilot launcher the profile is irrelevant and must not be passed.
 $script:FakeSettings = @{
-    'newSession.workspaces' = @($alpha)
+    'newSession.workspaces' = @($alpha, $beta)
     'newSession.launcher'   = 'copilot'
     'newSession.profiles'   = @('work', 'home', 'local')
 }
@@ -1424,7 +1424,7 @@ Test-That 'the copilot launcher ignores the profile entirely' {
 }
 
 $script:FakeSettings = @{
-    'newSession.workspaces' = @($alpha)
+    'newSession.workspaces' = @($alpha, $beta)
     'newSession.launcher'   = 'agency'
     'newSession.profiles'   = @('work', 'home', 'local')
 }
@@ -1556,8 +1556,8 @@ Reset-NewSessionTest -Press '2026-06-01T12:08:00+00:00' -Workspace 'unknown'
 $script:FakeSettings = @{ 'newSession.workspaces' = @() }
 $script:DaemonNewSessionSignature = ''
 Sync-DaemonNewSession -Headers $headers -Live $noLive
-Test-That 'no configured workspaces launches in the home folder' {
-    $script:Launches.Count -eq 1 -and $script:Launches[0].Directory -eq [IO.Path]::GetFullPath($HOME)
+Test-That 'no configured workspaces refuses launch and explains the missing approval' {
+    $script:Launches.Count -eq 0 -and ($script:Results -join ' ') -match 'No workspaces configured'
 }
 
 $script:FakeSettings = @{ 'newSession.enabled' = $false; 'newSession.workspaces' = @($alpha) }

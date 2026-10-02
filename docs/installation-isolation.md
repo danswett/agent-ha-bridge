@@ -104,3 +104,68 @@ Fleet MQTT/entity naming and transactional update/rollback policy are unchanged.
 An update whose installer cannot accept the bound installation root is refused
 before that installer runs. Restart existing clients after adapter changes so
 cached hooks use the current payload.
+
+## Approved workspaces and isolated launches
+
+`newSession.workspaces` is the executable directory allowlist. Its entries are path
+strings or objects containing `label`, `path`, and optionally the Boolean `isolate`.
+An empty, missing or unusable list does not authorize Home or a discovered folder.
+Local discovery produces suggestions for explicit configuration, not permission.
+Existing resume history is filtered against current approval; the actual launch
+consumer checks again. A missing resume directory is never replaced by another one.
+A managed worktree of an approved isolated repository may resume in place.
+An approved repository subdirectory remains that same relative subdirectory in the
+new checkout; it does not approve the generated parent root. A subdirectory missing
+from the selected base, or escaping the new tree through a link, refuses the launch.
+
+An entry with `"isolate": true` requests a separate worktree for a fresh launch.
+Missing Git, invalid repository/root, capacity or creation failures refuse the launch
+with a diagnostic. They never start the session in the original checkout. Offline
+fetch failure can still use a readable local base, and is reported in the worktree
+detail. These settings take effect when the bridge reloads its configuration.
+
+Creation and cleanup share a repository-scoped operation gate. A native Git lock
+protects an isolated launch while its client is starting or waiting to register,
+including when the configured idle age is zero. Registration releases only that
+launch's own lock; pre-existing operator locks are not removed. An unconfirmed launch,
+lost registration or daemon failure may leave the tree locked for inspection.
+Establish that no session still uses it before explicitly unlocking or removing it.
+This is a host-local safety change, not a shared dashboard or client-state migration.
+
+Cleanup reads uncapped current Copilot/Agency, Claude and Codex process/registration
+state independently of suggestion settings and caches. Descendant working directories
+and path aliases protect their containing tree. Unreadable, incomplete or unmapped
+live state blocks cleanup; age alone never proves a session ended. A standalone
+Agency launcher is conservatively treated as a potentially starting session.
+Relative working directories and registrations predating the current process
+generation are uncertain, not evidence that another worktree is unused.
+
+Only marked, unlocked, sufficiently old, clean and detached trees with no commits
+ahead of their readable base qualify. Dirty, untracked, ignored, unmerged,
+unowned, linked/submodule and uncertain trees are retained. Git's ordinary non-forced
+worktree removal can delete ignored files, so the bridge instead locks the Git
+metadata, removes only clean tracked paths through a private index, and removes
+directories only if empty. New untracked or ignored data prevents that removal. Missing
+tracked files are restored without overwriting existing files or replacing the real
+index. Git retains the removed tree's administration for its normal maintenance;
+the bridge does not prune other owners' missing worktree records.
+
+### Listing workspace suggestions
+
+The launch card shows configured targets only; it does not automatically display
+discovered folders. `discoverWorkspaces` and `discoverCount` apply to the following
+explicit, read-only PowerShell helper invocation. Set `$bridgeRoot` to the actual
+installation root when it is not the default:
+
+```powershell
+$bridgeRoot = Join-Path $HOME '.agent-ha-bridge'
+$hooks = Join-Path $bridgeRoot 'hooks'
+. (Join-Path $hooks 'decision-bridge-common.ps1')
+. (Join-Path $hooks 'session-launch.ps1')
+Get-BridgeDiscoveredWorkspaces
+```
+
+This prints eligible local folder suggestions without starting a client, changing
+configuration or approving a target. Review the results, add only the desired paths
+to `newSession.workspaces`, and reload the bridge configuration before launching.
+Setting `discoverWorkspaces` to `false` makes this helper return no suggestions.
