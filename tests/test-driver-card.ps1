@@ -74,8 +74,36 @@ try {
     Test-That 'the turn it starts is still the agent''s' { $script:LastDetail['driver'] -eq 'agent' } "driver=[$($script:LastDetail['driver'])]"
     Test-That 'and the pending flag is spent, not left to mark the next turn too' { -not $entry.DriverPending }
 
-    Write-Host '--- typing in the terminal hands it back ---'
+    Write-Host '--- an arm waits for its turn, not for the next card update ---'
+    # Measured on a live 1.28.0 install: a long reply is typed into the console a
+    # character at a time, so the card published "Reading your message" for about three
+    # minutes before the turn began. That update used to spend the arm, and the turn
+    # then read as typed in the terminal - so the card lost the agent's edge at exactly
+    # the moment the session got busy, which is when you are looking at it.
+    Set-DaemonDriverPending -Entry $entry -Driver 'agent'
+    Add-Roll ($assistantSays -replace '__TEXT__', 'reading your message')
+    Update-DaemonCodexActivity -Id 'cx' -Entry $entry -Session $session -Headers @{} -VerboseOn $true
+    Test-That 'an update carrying no turn leaves the arm alone' { $entry.DriverPending } "pending=[$($entry.DriverPending)]"
     Add-Roll $turnStarts
+    Add-Roll ($assistantSays -replace '__TEXT__', 'answering now')
+    Update-DaemonCodexActivity -Id 'cx' -Entry $entry -Session $session -Headers @{} -VerboseOn $true
+    Test-That 'so the turn it was armed for is still the agent''s' { $script:LastDetail['driver'] -eq 'agent' } "driver=[$($script:LastDetail['driver'])]"
+    Test-That 'and only that turn spends it' { -not $entry.DriverPending }
+
+    Write-Host '--- an arm whose turn never came cannot mark a later one ---'
+    # A reply can be delivered to a session that is already shutting down, so the turn
+    # it was armed for never arrives. Without an expiry the flag would sit there and
+    # put the agent's edge on whatever the person typed next, which is the one
+    # direction this must never fail in.
+    Set-DaemonDriverPending -Entry $entry -Driver 'agent'
+    Set-DaemonSessionProperty -Entry $entry -Name 'DriverPendingAt' `
+        -Value ([DateTimeOffset]::Now.AddSeconds(-($script:DaemonConfig.DriverArmSeconds + 60)).ToString('o'))
+    Add-Roll $turnStarts
+    Add-Roll ($assistantSays -replace '__TEXT__', 'you typed this one, much later')
+    Update-DaemonCodexActivity -Id 'cx' -Entry $entry -Session $session -Headers @{} -VerboseOn $true
+    Test-That 'a stale arm does not mark a turn the person typed' { $script:LastDetail['driver'] -eq 'human' } "driver=[$($script:LastDetail['driver'])]"
+
+    Write-Host '--- typing in the terminal hands it back ---'    Add-Roll $turnStarts
     Add-Roll ($assistantSays -replace '__TEXT__', 'you typed this one')
     Update-DaemonCodexActivity -Id 'cx' -Entry $entry -Session $session -Headers @{} -VerboseOn $true
     Test-That 'a turn starting with no reply behind it is yours again' { $script:LastDetail['driver'] -eq 'human' } "driver=[$($script:LastDetail['driver'])]"

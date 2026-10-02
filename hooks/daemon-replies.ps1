@@ -466,8 +466,7 @@ function Send-DaemonCardPayload {
     $payloadDriver = if ($payload.PSObject.Properties['Driver'] -and $payload.Driver) {
         [string]$payload.Driver
     } else { 'human' }
-    Set-DaemonSessionProperty -Entry $entry -Name 'Driver' -Value $payloadDriver
-    Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $true
+    Set-DaemonDriverPending -Entry $entry -Driver $payloadDriver
 
     try {
         Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Sending...' -Headers $Headers | Out-Null
@@ -571,8 +570,7 @@ function Send-DaemonReplyBoxText {
     # place that can tell: the press itself carries the account behind it. Pending,
     # because the turn this is about to start would otherwise be read as typed in the
     # terminal and hand the session straight back to the person.
-    Set-DaemonSessionProperty -Entry $entry -Name 'Driver' -Value (Get-BridgeDriverFromState -State $btn)
-    Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $true
+    Set-DaemonDriverPending -Entry $entry -Driver (Get-BridgeDriverFromState -State $btn)
 
     try {
         $replyState = Get-HomeAssistantState -EntityId $replyEntity -Headers $Headers

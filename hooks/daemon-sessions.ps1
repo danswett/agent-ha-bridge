@@ -585,12 +585,11 @@ function Add-DaemonSession {
     # launch registered, under the id it registered with. Taken rather than read, so
     # a later session that happens to reuse the id cannot inherit it.
     if ($script:DaemonLaunchDrivers.ContainsKey($id)) {
-        Set-DaemonSessionProperty -Entry $entry -Name 'Driver' -Value ([string]$script:DaemonLaunchDrivers[$id].Driver)
         # Pending for the same reason a Submit press is: the first turn of a launched
         # session is the launch itself, and Update-DaemonSessionActivity reads a
         # starting turn as somebody typing unless it is told one is expected. Without
         # this the glow would last until the session's first activity update - seconds.
-        Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $true
+        Set-DaemonDriverPending -Entry $entry -Driver ([string]$script:DaemonLaunchDrivers[$id].Driver)
         $script:DaemonLaunchDrivers.Remove($id)
         Write-DaemonLog -Message "session $($id.Substring(0,8)) was launched by an agent; showing it as agent-driven"
     }

@@ -146,6 +146,12 @@ $script:DaemonConfig = @{
     # is deliberate, so honouring it later is right; what must not happen is a reply
     # going out that Send was never pressed for at all.
     SubmitArmSeconds = 600
+    # How long a session stays armed as agent-driven while the turn it was armed for
+    # has not started. Delivery types a reply into the console a character at a time,
+    # so there are usually a few activity updates in between - the arm has to outlive
+    # those. Ten minutes for the same reason the Send arm is: honouring it late is
+    # right, attributing a turn nobody drove is not.
+    DriverArmSeconds = 600
     ResumeCacheSeconds = 180
     # How soon to retry after a fetch that failed or came back empty, rather than
     # waiting out the full interval with a list known to be wrong.
@@ -463,6 +469,42 @@ function Set-DaemonSessionProperty {
     )
     if ($Entry.PSObject.Properties[$Name]) { $Entry.$Name = $Value }
     else { $Entry | Add-Member -NotePropertyName $Name -NotePropertyValue $Value -Force }
+}
+
+function Set-DaemonDriverPending {
+    <#
+        Marks a session as about to take a turn on someone's behalf.
+
+        Stamped as well as flagged. The flag is consumed by the turn it was armed for,
+        and nothing guarantees that turn ever arrives - a reply can be delivered to a
+        session that is already shutting down. Left armed forever, the next thing the
+        person typed in the terminal would wear the agent's edge, which is the one
+        direction this is meant never to fail in.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Entry,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Driver
+    )
+    Set-DaemonSessionProperty -Entry $Entry -Name 'Driver' -Value $Driver
+    Set-DaemonSessionProperty -Entry $Entry -Name 'DriverPending' -Value $true
+    Set-DaemonSessionProperty -Entry $Entry -Name 'DriverPendingAt' -Value ([DateTimeOffset]::Now.ToString('o'))
+}
+
+function Test-DaemonDriverPending {
+    <#
+        Whether a session is still armed: flagged, and not so long ago that the turn
+        it was armed for is clearly never coming.
+    #>
+    param([Parameter(Mandatory)][object]$Entry)
+
+    if (-not ($Entry.PSObject.Properties['DriverPending'] -and $Entry.DriverPending)) { return $false }
+    # An arm from before this property existed has no stamp. Treating that as expired
+    # would silently drop the attribution of every session carried across the upgrade,
+    # so it is honoured once and cleared by the turn that consumes it.
+    if (-not ($Entry.PSObject.Properties['DriverPendingAt'] -and $Entry.DriverPendingAt)) { return $true }
+    try { $since = [DateTimeOffset]::Parse([string]$Entry.DriverPendingAt) }
+    catch { return $true }
+    ([DateTimeOffset]::Now - $since).TotalSeconds -lt $script:DaemonConfig.DriverArmSeconds
 }
 
 function Initialize-DaemonStartup {
