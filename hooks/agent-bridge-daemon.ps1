@@ -510,7 +510,35 @@ function Update-DaemonDriverPendingStamp {
     Set-DaemonSessionProperty -Entry $Entry -Name 'DriverPendingAt' -Value ([DateTimeOffset]::Now.ToString('o'))
 }
 
-function Test-DaemonDriverPending {    <#
+function Test-DaemonPayloadJustDelivered {
+    <#
+        Whether a reply payload went into this session recently enough that a Send
+        press arriving now could be that same message's redundant second half.
+
+        An agent publishes the payload and then presses Send, but the payload is
+        delivered on its own as soon as it lands, so the press finds an empty box.
+        Treating that as "nothing to send" and disarming threw away the attribution
+        for a message that had in fact just gone.
+
+        Necessary but NOT sufficient on its own: the caller must also establish that
+        the arm was outstanding before the press, or a payload already accounted for
+        by its own turn gets a fresh arm manufactured from this timestamp.
+
+        Measured against the arm's own window: past that, the turn the payload was for
+        is not coming, and keeping the arm would hand the edge to whoever types next.
+    #>
+    param([Parameter(Mandatory)][object]$Entry)
+
+    if (-not ($Entry.PSObject.Properties['LastPayloadDeliveredAt'] -and $Entry.LastPayloadDeliveredAt)) {
+        return $false
+    }
+    try { $since = [DateTimeOffset]::Parse([string]$Entry.LastPayloadDeliveredAt) }
+    catch { return $false }
+    ([DateTimeOffset]::Now - $since).TotalSeconds -lt $script:DaemonConfig.DriverArmSeconds
+}
+
+function Test-DaemonDriverPending {
+    <#
         Whether a session is still armed: flagged, and not so long ago that the turn
         it was armed for is clearly never coming.
     #>

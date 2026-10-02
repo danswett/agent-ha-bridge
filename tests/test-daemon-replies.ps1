@@ -283,6 +283,123 @@ Test-That 'an arm outlives a delivery that took longer than its own window' {
     Test-DaemonDriverPending -Entry $entry
 } "pendingAt=$($entry.DriverPendingAt)"
 
+Write-Host ''
+Write-Host '--- an agent''s Send press does not cancel the payload it just sent ---'
+# The pattern every agent follows is: publish the payload, then press Send. The payload
+# is delivered on its own the moment it lands, so the press that follows finds the box
+# empty - and that emptiness was read as "nothing was sent", which disarmed. Live on
+# 2026-10-02: a 2,234-character reply went in at 08:57:39, the press cleared the arm six
+# seconds later, and the turn it produced at 08:58:50 was published as the person's. An
+# idle session starts its turn before the press arrives and keeps the edge, which is why
+# this only shows when the session being written to is busy, and why it survived both
+# earlier attempts at the blue-instead-of-purple bug.
+$script:DaemonConfig.ReplyCommitAttempts = 0
+function Get-BridgeDriverFromState { param($State) 'agent' }
+function Invoke-HomeAssistantService { param($Domain, $Service, $Headers, $Data) 'emitted' }
+function Invoke-DaemonReply {
+    param($SessionId, $Text, $Headers, $DisplayText, [switch]$ClearReplyBox)
+    $script:Replies += [pscustomobject]@{ Text = $Text }
+    $true
+}
+function Set-PressFixture {
+    param([string]$Press, [string]$Box = ' ')
+    $script:Ha["button.${node}_submit"] = [pscustomobject]@{ state = $Press; attributes = [pscustomobject]@{} }
+    $script:Ha["text.${node}_reply"] = [pscustomobject]@{ state = $Box; attributes = [pscustomobject]@{} }
+}
+
+$pressEntry = [pscustomobject]@{ Name = 'Claude: x'; Machine = 'M' }
+$script:Replies = @()
+Set-Payload -Stamp 'p1' -Text 'a long one from an agent' -Driver 'agent'
+[void](Send-DaemonCardPayload -SessionId $sid -Entry $pressEntry -Headers $headers)
+Test-That 'the payload is delivered and the turn armed' {
+    $pressEntry.DriverPending -eq $true -and $script:Replies.Count -eq 1
+} "pending=$($pressEntry.DriverPending) replies=$($script:Replies.Count)"
+Test-That 'and the delivery is stamped, so a press arriving after it can be recognised' {
+    $pressEntry.PSObject.Properties['LastPayloadDeliveredAt'] -and $pressEntry.LastPayloadDeliveredAt
+}
+
+Set-PressFixture -Press '2026-10-02T15:57:45+00:00'
+[void](Send-DaemonReplyBoxText -SessionId $sid -Entry $pressEntry -Headers $headers)
+Test-That 'the redundant press sends nothing a second time' { $script:Replies.Count -eq 1 } "replies=$($script:Replies.Count)"
+Test-That 'the arm survives it, so the turn it produces is still the agent''s' {
+    $pressEntry.DriverPending -eq $true
+} "pending=$($pressEntry.DriverPending)"
+Test-That 'and the press is still recorded as spent, so it is not reprocessed' {
+    [string]$pressEntry.LastSubmitAt -eq '2026-10-02T15:57:45+00:00' -and [string]$pressEntry.PendingSubmitAt -eq ''
+}
+
+# Without a payload behind it the old behaviour has to stand: an arm nothing will ever
+# consume would put the agent's edge on whatever the person types next.
+$bare = [pscustomobject]@{ Name = 'Claude: x'; Machine = 'M' }
+Set-DaemonDriverPending -Entry $bare -Driver 'agent'
+Set-PressFixture -Press '2026-10-02T16:00:00+00:00'
+[void](Send-DaemonReplyBoxText -SessionId $sid -Entry $bare -Headers $headers)
+Test-That 'an empty press with no payload behind it still disarms' {
+    -not $bare.DriverPending
+} "pending=$($bare.DriverPending)"
+
+$stale = [pscustomobject]@{ Name = 'Claude: x'; Machine = 'M' }
+Set-DaemonDriverPending -Entry $stale -Driver 'agent'
+Set-DaemonSessionProperty -Entry $stale -Name 'LastPayloadDeliveredAt' `
+    -Value ([DateTimeOffset]::Now.AddSeconds(-($script:DaemonConfig.DriverArmSeconds + 60)).ToString('o'))
+Set-PressFixture -Press '2026-10-02T16:05:00+00:00'
+[void](Send-DaemonReplyBoxText -SessionId $sid -Entry $stale -Headers $headers)
+Test-That 'and a payload older than the arm''s own window cannot keep it alive' {
+    -not $stale.DriverPending
+} "pending=$($stale.DriverPending)"
+
+Test-That 'a session that has never had a payload reports none just delivered' {
+    -not (Test-DaemonPayloadJustDelivered -Entry ([pscustomobject]@{ Name = 'Claude: x' }))
+}
+
+# The hole a recency test leaves on its own, reproduced through the real handler: the
+# press arms BEFORE it reads the box, so a payload whose arm its turn had already
+# consumed came back as a fresh agent arm - false before the press, true after it -
+# for a message that was already accounted for. Nothing would then consume it except
+# the next thing the person typed, which is the one direction this must never fail in.
+$consumed = [pscustomobject]@{ Name = 'Claude: x'; Machine = 'M' }
+$script:Replies = @()
+Set-Payload -Stamp 'p2' -Text 'a long one from an agent' -Driver 'agent'
+[void](Send-DaemonCardPayload -SessionId $sid -Entry $consumed -Headers $headers)
+# The turn it was armed for arrives and spends it, exactly as daemon-activity does.
+Set-DaemonSessionProperty -Entry $consumed -Name 'DriverPending' -Value $false
+Test-That 'the arm really is spent before the press' { -not (Test-DaemonDriverPending -Entry $consumed) }
+Set-PressFixture -Press '2026-10-02T16:10:00+00:00'
+[void](Send-DaemonReplyBoxText -SessionId $sid -Entry $consumed -Headers $headers)
+Test-That 'a press after a payload whose turn already came does not re-arm it' {
+    -not $consumed.DriverPending
+} "pending=$($consumed.DriverPending)"
+
+# Same shape, but the recent payload was the person's. Preserving an arm here would
+# put the agent's edge on a turn the dashboard typed.
+$humanPayload = [pscustomobject]@{ Name = 'Claude: x'; Machine = 'M' }
+$script:Replies = @()
+Set-Payload -Stamp 'p3' -Text 'and one typed on the dashboard'
+[void](Send-DaemonCardPayload -SessionId $sid -Entry $humanPayload -Headers $headers)
+Test-That 'a human payload arms as the person' {
+    $humanPayload.DriverPending -eq $true -and $humanPayload.Driver -eq 'human'
+} "driver=$($humanPayload.Driver)"
+Set-PressFixture -Press '2026-10-02T16:15:00+00:00'
+[void](Send-DaemonReplyBoxText -SessionId $sid -Entry $humanPayload -Headers $headers)
+Test-That 'an agent''s empty press does not claim a payload the person sent' {
+    -not $humanPayload.DriverPending
+} "pending=$($humanPayload.DriverPending) driver=$($humanPayload.Driver)"
+
+# A press that arrives late must preserve the arm without extending it, or repeated
+# presses would keep an arm alive indefinitely past the window that bounds it.
+$late = [pscustomobject]@{ Name = 'Claude: x'; Machine = 'M' }
+$script:Replies = @()
+Set-Payload -Stamp 'p4' -Text 'a long one from an agent' -Driver 'agent'
+[void](Send-DaemonCardPayload -SessionId $sid -Entry $late -Headers $headers)
+$armedAt = ([DateTimeOffset]::Now.AddSeconds(-60)).ToString('o')
+Set-DaemonSessionProperty -Entry $late -Name 'DriverPendingAt' -Value $armedAt
+Set-PressFixture -Press '2026-10-02T16:20:00+00:00'
+[void](Send-DaemonReplyBoxText -SessionId $sid -Entry $late -Headers $headers)
+Test-That 'a late redundant press keeps the arm it found' { $late.DriverPending -eq $true }
+Test-That 'and does not restart its clock' {
+    [string]$late.DriverPendingAt -eq $armedAt
+} "at=$($late.DriverPendingAt) expected=$armedAt"
+
 Remove-Item -LiteralPath $script:DaemonConfig.LogFile -Force -ErrorAction SilentlyContinue
 Write-Host ''
 if ($script:Failures) {
