@@ -62,7 +62,7 @@ function Confirm-LifecycleStop {
         arm for any other process would not answer theirs.
     #>
     param([Parameter(Mandatory)][hashtable]$State)
-    foreach ($id in @($State.Keys)) { Set-DaemonStopArm -SessionId $id -Status 'working' -ProcessId $PID }
+    foreach ($id in @($State.Keys)) { [void](Set-DaemonStopArm -SessionId $id -Status 'working' -ProcessId $PID) }
 }
 
 try {

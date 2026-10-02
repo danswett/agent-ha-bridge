@@ -271,7 +271,7 @@ Test-That 'and asks once more' { $script:Activity[-1] -eq $script:CopilotEndSess
 
 # A session that has gone while armed must not be reported on; its card is already
 # being retired.
-Set-DaemonStopArm -SessionId $sid -Status 'working'
+[void](Set-DaemonStopArm -SessionId $sid -Status 'working')
 $script:DaemonStopArmed[$sid].At = [DateTimeOffset]::Now.AddMinutes(-5)
 $script:Activity = @()
 Clear-DaemonExpiredStopArms -Headers $headers -State @{}
@@ -284,7 +284,7 @@ Write-Host '--- the prompt stays up while the transcript keeps flowing ---'
 # otherwise wipe, which made the press look as though it had done nothing.
 
 $script:DaemonStopArmed = @{}
-Set-DaemonStopArm -SessionId $sid -Status 'waiting'
+[void](Set-DaemonStopArm -SessionId $sid -Status 'waiting')
 # Not $detail: Test-That declares a [string]$Detail parameter, and a script block it
 # runs resolves the name in *its* scope, so the hashtable would arrive as ''.
 $cardDetail = @{ response = 'half a sentence' }
@@ -314,7 +314,7 @@ function Set-CopilotMqttStatus {
     param([string]$SessionId, [string]$Status, [hashtable]$Headers, [hashtable]$Attributes)
 }
 $script:DaemonStopArmed = @{}
-Set-DaemonStopArm -SessionId $sid -Status 'working' -ProcessId 0
+[void](Set-DaemonStopArm -SessionId $sid -Status 'working' -ProcessId 0)
 $script:Activity = @()
 Publish-BridgeSessionStatus -SessionId $sid -SessionName 'S' -Machine 'M' -Status 'waiting' `
     -Activity 'Needs your permission' -Headers $headers
@@ -530,7 +530,7 @@ Test-That 'and recovery still replaces the question on its card' {
     $script:DaemonStopArmed.Count -eq 0 -and $script:Activity[-1] -eq $script:CopilotEndSessionLapsedNote
 }
 # The one event that does make the note pointless is the card going away.
-Set-DaemonStopArm -SessionId $sid -Status 'waiting' -ProcessId 41001
+[void](Set-DaemonStopArm -SessionId $sid -Status 'waiting' -ProcessId 41001)
 $script:DaemonStopArmed[$sid].At = [DateTimeOffset]::Now.AddSeconds(-($script:DaemonConfig.StopConfirmSeconds + 1))
 $script:Activity = @()
 Clear-DaemonExpiredStopArms -Headers $headers -State @{}
@@ -538,6 +538,120 @@ Test-That 'a retired card releases the arm with nothing published' {
     $script:DaemonStopArmed.Count -eq 0 -and $script:Activity.Count -eq 0
 }
 $script:ActivityThrows = $false
+
+Write-Host ''
+Write-Host '--- the shared prompt store fails closed ---'
+# The store is what stops a publisher in another process wiping a visible question.
+# Every case below drives the real store and the real callers; none substitutes a
+# store result.
+
+$promptPath = Get-BridgeStopPromptPath
+Remove-Item -LiteralPath $promptPath -Force -ErrorAction SilentlyContinue
+
+# An arm whose record cannot be written is consent nobody else can see. A directory
+# in the file's place is a real, unmockable write failure.
+$script:DaemonStopArmed = @{}
+[void][IO.Directory]::CreateDirectory($promptPath)
+Test-That 'a record that cannot be written refuses the arm' {
+    (Set-DaemonStopArm -SessionId $sid -Status 'working' -ProcessId 41001) -eq $false
+}
+Test-That 'and leaves nothing armed to confirm against' { $script:DaemonStopArmed.Count -eq 0 }
+$script:ProcStarts = @{ 41001 = $epoch }
+$ctx = Reset-PressTest -Press '2026-06-01T12:00:00+00:00' -Status 'working'
+Invoke-TargetPress -Press '2026-06-01T12:00:00+00:00' -ProcessId 41001 -Context $ctx
+Invoke-TargetPress -Press '2026-06-01T12:00:04+00:00' -ProcessId 41001 -Context $ctx
+Test-That 'so two presses through the real handler still stop nothing' { $script:Stopped.Count -eq 0 }
+Remove-Item -LiteralPath $promptPath -Recurse -Force -ErrorAction SilentlyContinue
+
+# A document that cannot be read is not a document that says nothing.
+Set-Content -LiteralPath $promptPath -Value '{"a":{"until":' -Encoding utf8
+Test-That 'a truncated document reads as a failure, not as empty' {
+    (Read-BridgeStopPromptStore).State -eq 'Failed'
+}
+Test-That 'and a lookup says it does not know' { (Get-BridgeStopPrompt -SessionId $sid).State -eq 'Unknown' }
+Test-That 'a record is refused rather than blindly overwriting the others' {
+    (Write-BridgeStopPrompt -SessionId $sid -Until ([datetimeoffset]::Now.AddSeconds(10))) -eq $false
+}
+foreach ($shape in @('null', '[1,2]', '"text"', '{"a":"notanobject"}', '{"a":{"until":"not-a-time"}}')) {
+    Set-Content -LiteralPath $promptPath -Value $shape -Encoding utf8
+    Test-That "a document holding $shape is rejected rather than throwing" {
+        (Read-BridgeStopPromptStore).State -eq 'Failed' -and
+        (Get-BridgeStopPrompt -SessionId $sid).State -eq 'Unknown'
+    }
+}
+Test-That 'clearing is still honoured, because that is what repairs it' {
+    (Write-BridgeStopPrompt -SessionId $sid -Until $null) -eq $true -and -not (Test-Path -LiteralPath $promptPath)
+}
+
+# A reader in another process must never see a half-written document.
+$script:DaemonStopArmed = @{}
+Test-That 'arming records the question' {
+    (Set-DaemonStopArm -SessionId $sid -Status 'working' -ProcessId 41001) -eq $true
+}
+Test-That 'a published record is complete and parseable to a competing reader' {
+    (Get-Content -LiteralPath $promptPath -Raw).Trim().EndsWith('}') -and
+    (Read-BridgeStopPromptStore).State -eq 'Ok'
+}
+Test-That 'no temporary file is left beside it' { -not (Test-Path -LiteralPath "$promptPath.pending") }
+Test-That 'and that reader sees the question' { (Get-BridgeStopPrompt -SessionId $sid).State -eq 'Prompt' }
+
+# What a hook in its own process does with each answer, through the real publisher.
+$childOut2 = Join-Path ([IO.Path]::GetTempPath()) "stop-store-$([guid]::NewGuid().ToString('N').Substring(0,8)).txt"
+$childScript2 = @"
+Set-StrictMode -Version Latest
+`$ErrorActionPreference = 'Stop'
+. '$((Join-Path $PSScriptRoot '..\hooks\decision-bridge-common.ps1'))'
+. '$((Join-Path $PSScriptRoot '..\hooks\decision-mqtt.ps1'))'
+. '$((Join-Path $PSScriptRoot '..\hooks\bridge-adapter.ps1'))'
+function Set-CopilotMqttStatus { param(`$SessionId, `$Status, `$Headers, `$Attributes) }
+function Set-CopilotMqttActivity {
+    param(`$SessionId, `$Summary, `$Detail, `$Headers)
+    Add-Content -LiteralPath '$childOut2' -Value `$Summary -Encoding utf8
+}
+Publish-BridgeSessionStatus -SessionId '$sid' -SessionName 'S' -Machine 'M' -Status 'waiting' ``
+    -Activity 'Needs your permission' -Headers @{}
+"@
+$childFile2 = Join-Path ([IO.Path]::GetTempPath()) "stop-store-child-$([guid]::NewGuid().ToString('N').Substring(0,8)).ps1"
+Set-Content -LiteralPath $childFile2 -Value $childScript2 -Encoding utf8
+Set-Content -LiteralPath $promptPath -Value '{"a":{"until":' -Encoding utf8
+& $pwshPath -NoProfile -File $childFile2 2>&1 | Out-Null
+Test-That 'an unreadable store makes a hook withhold the line rather than wipe it' {
+    -not (Test-Path -LiteralPath $childOut2)
+}
+Remove-Item -LiteralPath $promptPath -Force -ErrorAction SilentlyContinue
+& $pwshPath -NoProfile -File $childFile2 2>&1 | Out-Null
+Test-That 'while a genuinely absent store publishes normally' {
+    (Get-Content -LiteralPath $childOut2 -Raw).Trim() -eq 'Needs your permission'
+}
+Remove-Item -LiteralPath $childFile2, $childOut2 -Force -ErrorAction SilentlyContinue
+
+Write-Host ''
+Write-Host '--- loading the daemon for its functions leaves a running one alone ---'
+# The clearing loop used to sit where the shared state is declared, which runs on
+# every dot-source. A hook or a test loading the daemon under NORUN therefore unpinned
+# the questions of the daemon that was actually running.
+$script:DaemonStopArmed = @{}
+[void](Set-DaemonStopArm -SessionId $sid -Status 'working' -ProcessId 41001)
+$norunProbe = Join-Path ([IO.Path]::GetTempPath()) "stop-norun-$([guid]::NewGuid().ToString('N').Substring(0,8)).ps1"
+Set-Content -LiteralPath $norunProbe -Encoding utf8 -Value @"
+`$env:AGENT_BRIDGE_DAEMON_NORUN = '1'
+. '$((Join-Path $PSScriptRoot '..\hooks\agent-bridge-daemon.ps1'))'
+"@
+& $pwshPath -NoProfile -File $norunProbe 2>&1 | Out-Null
+Test-That 'a NORUN load preserves records it did not create' {
+    (Get-BridgeStopPrompt -SessionId $sid).State -eq 'Prompt'
+}
+Clear-DaemonStopPrompts
+Test-That 'and actual startup is what clears them' {
+    (Get-BridgeStopPrompt -SessionId $sid).State -eq 'None' -and -not (Test-Path -LiteralPath $promptPath)
+}
+Test-That 'an unreadable store is repaired at startup rather than left' {
+    Set-Content -LiteralPath $promptPath -Value '{"a":{"until":' -Encoding utf8
+    Clear-DaemonStopPrompts
+    -not (Test-Path -LiteralPath $promptPath)
+}
+Remove-Item -LiteralPath $norunProbe -Force -ErrorAction SilentlyContinue
+$script:DaemonStopArmed = @{}
 
 # --- discovery payloads ----------------------------------------------------------
 

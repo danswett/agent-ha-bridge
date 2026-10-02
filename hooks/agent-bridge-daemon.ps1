@@ -287,14 +287,12 @@ $script:DaemonPendingTuningKey = '(pending)'
 # press - made after a restart, possibly minutes later - into a confirmation of
 # something the user had long since given up on.
 #
-# The question those arms put on the card *is* recorded on disk, so that hook
-# processes publishing their own status line do not wipe it. That record cannot
-# confirm anything, and is cleared here for the same reason the arms are not
-# restored: nothing this daemon did not arm itself may be left showing.
+# The question those arms put on a card is recorded on disk so that hook processes
+# publishing their own status line do not wipe it. That record cannot confirm
+# anything, and is cleared by Clear-DaemonStopPrompts at actual startup - not here,
+# because this runs whenever the file is dot-sourced for its functions, and clearing
+# from there wiped a running daemon's records from under it.
 $script:DaemonStopArmed = @{}
-foreach ($stale in @((Read-BridgeStopPrompts).Keys)) {
-    Write-BridgeStopPrompt -SessionId $stale -Until $null
-}
 
 # Anything the dashboard reports as happening before this is a leftover from a
 # previous run rather than something the user just did.
@@ -895,6 +893,11 @@ function Invoke-DaemonReconcile {
 function Start-BridgeDaemon {
     $headers = Get-HomeAssistantHeaders
     $state = Read-DaemonState
+
+    # Questions recorded by a previous daemon. Cleared here rather than where the
+    # shared state is declared, so that loading this file for its functions cannot
+    # unpin a running daemon's prompts.
+    Clear-DaemonStopPrompts
 
     # Deliberately no pruning here. Sync-DaemonSessions retires anything that is no
     # longer live, which both removes its Home Assistant entities and drops it from

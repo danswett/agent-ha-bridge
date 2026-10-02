@@ -107,28 +107,70 @@ function Get-BridgeStopPromptPath {
     Get-BridgeRuntimePath 'agent-bridge-stop-prompt.json'
 }
 
-function Read-BridgeStopPrompts {
-    <# The recorded prompts, or an empty map. Never throws: this is display state. #>
-    $path = try { Get-BridgeStopPromptPath } catch { return @{} }
-    if (-not (Test-Path -LiteralPath $path)) { return @{} }
-    try { return (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable) }
-    catch { return @{} }
+function Read-BridgeStopPromptStore {
+    <#
+        The recorded prompts, as { State; Prompts }.
+
+        State is 'Empty' when there is definitively nothing recorded, 'Ok' when the
+        document was read and validated, and 'Failed' when it exists but could not be
+        read or did not hold what it should.
+
+        The three are kept apart deliberately. Collapsing a read failure into "nothing
+        recorded" is what let a publisher treat an unreadable store as an absent
+        question and write over one that was on screen - the same cross-writer defect
+        the store exists to close, arriving through the store itself.
+
+        The shape is validated rather than trusted: a document holding null, an array
+        or a string answers neither .Keys nor .ContainsKey, and reached the hook as an
+        exception on a path that must not throw.
+    #>
+    $path = try { Get-BridgeStopPromptPath } catch { return @{ State = 'Failed'; Prompts = @{} } }
+    if (-not (Test-Path -LiteralPath $path)) { return @{ State = 'Empty'; Prompts = @{} } }
+
+    $parsed = $null
+    try { $parsed = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -AsHashtable }
+    catch { return @{ State = 'Failed'; Prompts = @{} } }
+    if ($parsed -isnot [System.Collections.IDictionary]) { return @{ State = 'Failed'; Prompts = @{} } }
+
+    $prompts = @{}
+    foreach ($key in @($parsed.Keys)) {
+        if ($key -isnot [string] -or [string]::IsNullOrWhiteSpace($key)) { return @{ State = 'Failed'; Prompts = @{} } }
+        $entry = $parsed[$key]
+        if ($entry -isnot [System.Collections.IDictionary] -or -not $entry.Contains('until')) {
+            return @{ State = 'Failed'; Prompts = @{} }
+        }
+        $until = [datetimeoffset]::MinValue
+        if (-not [datetimeoffset]::TryParse([string]$entry['until'], [ref]$until)) {
+            return @{ State = 'Failed'; Prompts = @{} }
+        }
+        $hint = if ($entry.Contains('hint')) { [string]$entry['hint'] } else { '' }
+        $prompts[$key] = @{ Until = $until; Hint = $hint }
+    }
+    @{ State = 'Ok'; Prompts = $prompts }
 }
 
 function Write-BridgeStopPrompt {
     <#
         Records, or clears, that one session is showing the End session question.
+        Returns $true only when the store now says what it was asked to say.
+
+        The caller must honour that answer. An arm held in memory whose record could
+        not be written is consent that no other publisher can see, so the next hook to
+        publish wipes the question while a second press still confirms - which is
+        exactly the defect this store closes. Set-DaemonStopArm therefore refuses to
+        arm when this fails.
+
+        Published atomically, through a temporary file and a replacing move, because a
+        reader in another process can otherwise observe a half-written document. On an
+        unreadable store a record is refused rather than blindly rewritten - that would
+        drop other sessions' questions - while a clear is honoured by removing the
+        document, which is what repairs it.
 
         Deliberately display state and nothing more. The question is pinned by every
         process that publishes activity, but only the daemon holds the arm that can
         answer it, and this file is never consulted when deciding whether a press
-        confirms. So a stale file can at worst leave a prompt on a card for a few
-        seconds; it can never stop a session.
-
-        That separation is the point. Publish-BridgeSessionStatus also runs inside
-        standalone hook processes - a Claude Notification is the case that found this -
-        which have no daemon state at all, and were publishing their own status line
-        straight over the question while the session was still armed.
+        confirms. A record that outlives its daemon can at worst leave a prompt on a
+        card until its own expiry; it can never stop a session.
     #>
     param(
         [Parameter(Mandatory)][string]$SessionId,
@@ -136,39 +178,56 @@ function Write-BridgeStopPrompt {
         [AllowEmptyString()][string]$Hint = ''
     )
 
+    $tmp = $null
     try {
         $path = Get-BridgeStopPromptPath
-        $prompts = Read-BridgeStopPrompts
+        $tmp = "$path.pending"
+        $store = Read-BridgeStopPromptStore
+        if ($store.State -eq 'Failed' -and $null -ne $Until) { return $false }
+
+        $prompts = @{}
+        if ($store.State -eq 'Ok') {
+            foreach ($key in @($store.Prompts.Keys)) {
+                $prompts[$key] = @{ until = $store.Prompts[$key].Until.ToString('o'); hint = $store.Prompts[$key].Hint }
+            }
+        }
         if ($null -eq $Until) { [void]$prompts.Remove($SessionId) }
         else { $prompts[$SessionId] = @{ until = ([datetimeoffset]$Until).ToString('o'); hint = $Hint } }
+
         if ($prompts.Count -eq 0) {
-            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
-            return
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction Stop }
+            return $true
         }
         [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($path))
-        Set-Content -LiteralPath $path -Value ($prompts | ConvertTo-Json -Depth 4 -Compress) -Encoding utf8
+        Set-Content -LiteralPath $tmp -Value ($prompts | ConvertTo-Json -Depth 4 -Compress) -Encoding utf8 -ErrorAction Stop
+        [IO.File]::Move($tmp, $path, $true)
+        $true
     }
     catch {
-        # A card that misses the question is better than a hook that fails because of it.
+        if ($null -ne $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        $false
     }
 }
 
 function Get-BridgeStopPrompt {
     <#
-        The End session question one session is showing, or $null.
+        The End session question one session is showing, as { State; Hint }.
+
+        State is 'Prompt' when one is recorded and still live, 'None' when the store
+        definitively holds none, and 'Unknown' when it could not be read. A caller
+        that would overwrite the status line must not treat 'Unknown' as 'None'.
 
         Expiry is carried in the record rather than inferred, so a file left behind by
         a daemon that died stops pinning anything of its own accord.
     #>
     param([Parameter(Mandatory)][string]$SessionId)
 
-    $prompts = Read-BridgeStopPrompts
-    if (-not $prompts.ContainsKey($SessionId)) { return $null }
-    $entry = $prompts[$SessionId]
-    $until = [datetimeoffset]::MinValue
-    if (-not [datetimeoffset]::TryParse([string]$entry.until, [ref]$until)) { return $null }
-    if ([datetimeoffset]::Now -gt $until) { return $null }
-    $entry
+    $store = Read-BridgeStopPromptStore
+    if ($store.State -eq 'Failed') { return @{ State = 'Unknown'; Hint = '' } }
+    if (-not $store.Prompts.ContainsKey($SessionId)) { return @{ State = 'None'; Hint = '' } }
+    $entry = $store.Prompts[$SessionId]
+    if ([datetimeoffset]::Now -gt $entry.Until) { return @{ State = 'None'; Hint = '' } }
+    @{ State = 'Prompt'; Hint = $entry.Hint }
 }
 
 function Publish-BridgeSessionStatus {
@@ -239,15 +298,25 @@ function Publish-BridgeSessionStatus {
         # itself is in memory and authoritative. A standalone hook process has no
         # daemon state at all, so it reads the recorded prompt instead - display state
         # only, which cannot answer the question, only keep showing it.
+        #
+        # A store that cannot be read is not an absent question. Publishing over one
+        # that is on screen is how a user comes to press End a second time, so an
+        # unreadable store withholds this activity update entirely and leaves whatever
+        # the card is showing; the status above is published either way.
         $summary = $Activity
         if (Get-Command -Name Get-DaemonCardSummary -CommandType Function -ErrorAction Ignore) {
             $summary = Get-DaemonCardSummary -SessionId $SessionId -Summary $summary -Detail $detail
         }
         else {
             $prompt = Get-BridgeStopPrompt -SessionId $SessionId
-            if ($null -ne $prompt) {
+            if ($prompt.State -eq 'Unknown') {
+                Write-DecisionBridgeLog -Message ("stop prompt store unreadable; holding back the activity " +
+                    "line for $SessionId rather than risking writing over a confirmation")
+                return
+            }
+            if ($prompt.State -eq 'Prompt') {
                 $summary = $script:CopilotEndSessionConfirmNote
-                $detail['hint'] = [string]$prompt.hint
+                $detail['hint'] = [string]$prompt.Hint
             }
         }
         Set-CopilotMqttActivity -SessionId $SessionId -Summary $summary -Detail $detail -Headers $Headers

@@ -49,6 +49,8 @@ function Set-DaemonStopArm {
         The question is also recorded where other processes can see it, so a hook
         publishing its own status line cannot wipe it. That record is display state
         and cannot confirm anything; see Write-BridgeStopPrompt.
+
+        Returns $true only when both the arm and its record are in place.
     #>
     param(
         [Parameter(Mandatory)][string]$SessionId,
@@ -58,6 +60,16 @@ function Set-DaemonStopArm {
 
     $armedAt = [DateTimeOffset]::Now
     $hint = Get-DaemonStopConfirmHint -Status $Status
+    # The record first, and the arm only if it was written. An arm whose projection is
+    # missing is consent nothing else can see: the next hook to publish wipes the
+    # question from the card while a second press still confirms, which is the whole
+    # defect the record exists to close. Failing to arm costs an extra press; arming
+    # blind costs the turn.
+    if (-not (Write-BridgeStopPrompt -SessionId $SessionId -Hint $hint `
+            -Until $armedAt.AddSeconds($script:DaemonConfig.StopConfirmSeconds))) {
+        [void]$script:DaemonStopArmed.Remove($SessionId)
+        return $false
+    }
     $script:DaemonStopArmed[$SessionId] = [pscustomobject]@{
         At        = $armedAt
         Status    = $Status
@@ -68,16 +80,46 @@ function Set-DaemonStopArm {
         # so the ordinary path pays nothing for it.
         RetryAt   = [DateTimeOffset]::MinValue
     }
-    Write-BridgeStopPrompt -SessionId $SessionId -Hint $hint `
-        -Until $armedAt.AddSeconds($script:DaemonConfig.StopConfirmSeconds)
+    $true
 }
 
 function Remove-DaemonStopArm {
-    <# Drops an arm and the question other processes were pinning on its behalf. #>
+    <#
+        Drops an arm and the question other processes were pinning on its behalf.
+
+        The arm goes whether or not the record can be cleared. A record left behind
+        keeps a question on a card until its own expiry, seconds away; an arm left
+        behind could stop a session.
+    #>
     param([Parameter(Mandatory)][string]$SessionId)
 
     [void]$script:DaemonStopArmed.Remove($SessionId)
-    Write-BridgeStopPrompt -SessionId $SessionId -Until $null
+    if (-not (Write-BridgeStopPrompt -SessionId $SessionId -Until $null)) {
+        Write-DaemonLog -Message "could not clear the recorded end prompt for $SessionId; it expires on its own"
+    }
+}
+
+function Clear-DaemonStopPrompts {
+    <#
+        Drops every recorded question at daemon startup.
+
+        Kept out of this file's load path on purpose. Clearing where the shared state
+        is declared meant that merely dot-sourcing the daemon for its functions - which
+        hooks and tests do, under AGENT_BRIDGE_DAEMON_NORUN - wiped the records of a
+        daemon that was actually running, unpinning live questions on another process's
+        cards.
+
+        Nothing this daemon did not arm itself may be left showing, for the same reason
+        the in-memory arms are not restored: a question from before a restart has no
+        arm behind it and could never be answered.
+    #>
+    $store = Read-BridgeStopPromptStore
+    if ($store.State -eq 'Empty') { return }
+    foreach ($stale in @($store.Prompts.Keys)) {
+        [void](Write-BridgeStopPrompt -SessionId $stale -Until $null)
+    }
+    # An unreadable store answers no keys; clearing it outright is what repairs it.
+    if ($store.State -eq 'Failed') { [void](Write-BridgeStopPrompt -SessionId '*' -Until $null) }
 }
 
 function Test-DaemonStopConfirms {
@@ -309,10 +351,12 @@ function Invoke-PendingStops {
         if ($processId -gt 0 -and $status -ne 'idle' -and
             -not (Test-DaemonStopConfirms -SessionId $sessionId -ProcessId $processId)) {
             $rearmed = $script:DaemonStopArmed.ContainsKey($sessionId)
-            Set-DaemonStopArm -SessionId $sessionId -Status $status -ProcessId $processId
+            $armed = Set-DaemonStopArm -SessionId $sessionId -Status $status -ProcessId $processId
             Write-DaemonLog -Message ("end requested for $short (pid $processId) while " +
                 "$(if ($status) { $status } else { 'unclassified' })" +
-                "$(if ($rearmed) { '; target changed, arming again' } else { '; waiting for a second press' })")
+                "$(if (-not $armed) { '; could not record the question, so nothing is armed' }
+                   elseif ($rearmed) { '; target changed, arming again' }
+                   else { '; waiting for a second press' })")
             try {
                 Set-DaemonTransientActivity -SessionId $sessionId `
                     -Summary $script:CopilotEndSessionConfirmNote `
