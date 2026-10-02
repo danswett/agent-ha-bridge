@@ -161,10 +161,17 @@ function Write-BridgeStopPrompt {
         arm when this fails.
 
         Published atomically, through a temporary file and a replacing move, because a
-        reader in another process can otherwise observe a half-written document. On an
-        unreadable store a record is refused rather than blindly rewritten - that would
-        drop other sessions' questions - while a clear is honoured by removing the
-        document, which is what repairs it.
+        reader in another process can otherwise observe a half-written document.
+
+        On an unreadable store both a record and a clear are refused. Rewriting would
+        drop the entries that could not be parsed. Clearing used to be honoured, on the
+        grounds that removing the document repairs it - but a per-session clear fell
+        through to the whole-file delete below and took every other session's question
+        with it, while their arms stayed live in the daemon. A standalone publisher
+        then overwrote a question a second press could still confirm: the very
+        cross-writer defect this store exists to close, arriving through the repair.
+        Repair is Clear-BridgeStopPromptStore, and belongs to the daemon, which is the
+        only thing that can invalidate the consent such a repair would strand.
 
         Deliberately display state and nothing more. The question is pinned by every
         process that publishes activity, but only the daemon holds the arm that can
@@ -183,7 +190,7 @@ function Write-BridgeStopPrompt {
         $path = Get-BridgeStopPromptPath
         $tmp = "$path.pending"
         $store = Read-BridgeStopPromptStore
-        if ($store.State -eq 'Failed' -and $null -ne $Until) { return $false }
+        if ($store.State -eq 'Failed') { return $false }
 
         $prompts = @{}
         if ($store.State -eq 'Ok') {
@@ -207,6 +214,29 @@ function Write-BridgeStopPrompt {
         if ($null -ne $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
         $false
     }
+}
+
+function Clear-BridgeStopPromptStore {
+    <#
+        Removes the whole prompt store, and returns whether it is now gone.
+
+        The only way to repair a document that cannot be read: a per-session clear
+        refuses to touch it, because removing one key means rewriting entries it
+        cannot parse, and deleting it outright would unpin questions belonging to arms
+        that are still live.
+
+        So this invalidates every recorded question at once, and its callers must have
+        invalidated the matching consent first. Both do: daemon startup restores no
+        arms at all, and the repair path in Remove-DaemonStopArm drops every arm it
+        holds before calling this.
+    #>
+    try {
+        $path = Get-BridgeStopPromptPath
+        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction Stop }
+        Remove-Item -LiteralPath "$path.pending" -Force -ErrorAction SilentlyContinue
+        $true
+    }
+    catch { $false }
 }
 
 function Get-BridgeStopPrompt {

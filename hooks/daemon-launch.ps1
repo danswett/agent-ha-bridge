@@ -90,13 +90,29 @@ function Remove-DaemonStopArm {
         The arm goes whether or not the record can be cleared. A record left behind
         keeps a question on a card until its own expiry, seconds away; an arm left
         behind could stop a session.
+
+        An unreadable store is the awkward case. It cannot be repaired one session at
+        a time - see Write-BridgeStopPrompt - and leaving it would hold every session
+        at Unknown until the next restart. Clearing it wholesale is safe only once
+        nothing is left that could be confirmed against a record that no longer
+        exists, so every other arm is dropped first. Those sessions ask again on their
+        next press, which is the direction that cannot lose work.
     #>
     param([Parameter(Mandatory)][string]$SessionId)
 
     [void]$script:DaemonStopArmed.Remove($SessionId)
-    if (-not (Write-BridgeStopPrompt -SessionId $SessionId -Until $null)) {
-        Write-DaemonLog -Message "could not clear the recorded end prompt for $SessionId; it expires on its own"
+    if (Write-BridgeStopPrompt -SessionId $SessionId -Until $null) { return }
+
+    if ((Read-BridgeStopPromptStore).State -eq 'Failed') {
+        $stranded = @($script:DaemonStopArmed.Keys).Count
+        $script:DaemonStopArmed.Clear()
+        if (Clear-BridgeStopPromptStore) {
+            Write-DaemonLog -Message ("the end prompt store could not be read; cleared it whole and " +
+                "disarmed $stranded other session(s), which must be asked again")
+            return
+        }
     }
+    Write-DaemonLog -Message "could not clear the recorded end prompt for $SessionId; it expires on its own"
 }
 
 function Clear-DaemonStopPrompts {
@@ -111,15 +127,13 @@ function Clear-DaemonStopPrompts {
 
         Nothing this daemon did not arm itself may be left showing, for the same reason
         the in-memory arms are not restored: a question from before a restart has no
-        arm behind it and could never be answered.
+        arm behind it and could never be answered. That is what makes clearing the
+        whole store safe here and not on a per-session path - there is no consent left
+        for it to strand.
     #>
-    $store = Read-BridgeStopPromptStore
-    if ($store.State -eq 'Empty') { return }
-    foreach ($stale in @($store.Prompts.Keys)) {
-        [void](Write-BridgeStopPrompt -SessionId $stale -Until $null)
+    if (-not (Clear-BridgeStopPromptStore)) {
+        Write-DaemonLog -Message 'could not clear the recorded end prompts at startup'
     }
-    # An unreadable store answers no keys; clearing it outright is what repairs it.
-    if ($store.State -eq 'Failed') { [void](Write-BridgeStopPrompt -SessionId '*' -Until $null) }
 }
 
 function Test-DaemonStopConfirms {
@@ -357,20 +371,41 @@ function Invoke-PendingStops {
                 "$(if (-not $armed) { '; could not record the question, so nothing is armed' }
                    elseif ($rearmed) { '; target changed, arming again' }
                    else { '; waiting for a second press' })")
+            # Only ask when something can answer. A failed arm leaves no arm, and so no
+            # entry for the expiry sweep to lapse: the question would sit on a quiet
+            # session's card indefinitely, asking for a press that could confirm
+            # nothing. Say that the press could not be acted on instead.
+            $summary = $script:CopilotEndSessionConfirmNote
+            $extra = @{ hint = (Get-DaemonStopConfirmHint -Status $status) }
+            if (-not $armed) {
+                $summary = 'Could not end session'
+                $extra = @{
+                    error = 'the confirmation could not be recorded, so nothing was armed'
+                    hint  = 'Press End session again to try again.'
+                }
+            }
             try {
-                Set-DaemonTransientActivity -SessionId $sessionId `
-                    -Summary $script:CopilotEndSessionConfirmNote `
-                    -Extra @{ hint = (Get-DaemonStopConfirmHint -Status $status) } -Headers $Headers
+                Set-DaemonTransientActivity -SessionId $sessionId -Summary $summary `
+                    -Extra $extra -Headers $Headers
             }
             catch {
                 if ($_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
-                # The card never showed the question, so nothing can answer it. Left
-                # armed, the user's natural retry - pressing again because the first
-                # press looked dead - would be read as the confirmation and stop the
-                # session, which is precisely what this guard exists to prevent.
-                Remove-DaemonStopArm -SessionId $sessionId
-                Write-DaemonLog -Message ("end confirmation for $short could not be shown, " +
-                    "disarming: $($_.Exception.Message)")
+                if ($armed) {
+                    # The card never showed the question, so nothing can answer it. Left
+                    # armed, the user's natural retry - pressing again because the first
+                    # press looked dead - would be read as the confirmation and stop the
+                    # session, which is precisely what this guard exists to prevent.
+                    Remove-DaemonStopArm -SessionId $sessionId
+                    Write-DaemonLog -Message ("end confirmation for $short could not be shown, " +
+                        "disarming: $($_.Exception.Message)")
+                }
+                else {
+                    # Nothing was armed, so there is nothing to disarm; calling the
+                    # removal here would start the unreadable-store repair on a press
+                    # that never armed anything.
+                    Write-DaemonLog -Message ("end failure note for $short could not be shown: " +
+                        "$($_.Exception.Message)")
+                }
             }
             continue
         }

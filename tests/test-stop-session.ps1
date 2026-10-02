@@ -558,9 +558,22 @@ Test-That 'a record that cannot be written refuses the arm' {
 Test-That 'and leaves nothing armed to confirm against' { $script:DaemonStopArmed.Count -eq 0 }
 $script:ProcStarts = @{ 41001 = $epoch }
 $ctx = Reset-PressTest -Press '2026-06-01T12:00:00+00:00' -Status 'working'
+$script:Activity = @()
 Invoke-TargetPress -Press '2026-06-01T12:00:00+00:00' -ProcessId 41001 -Context $ctx
 Invoke-TargetPress -Press '2026-06-01T12:00:04+00:00' -ProcessId 41001 -Context $ctx
 Test-That 'so two presses through the real handler still stop nothing' { $script:Stopped.Count -eq 0 }
+# Asking would be worse than saying nothing. There is no arm, so no expiry sweep entry
+# and nothing that will ever lapse the question - on a quiet session it would sit there
+# asking for a press that could never be accepted.
+Test-That 'and the card is told the press could not be acted on' {
+    $script:Activity[-1] -eq 'Could not end session'
+}
+Test-That 'rather than being asked to confirm something that is not armed' {
+    $script:Activity -notcontains $script:CopilotEndSessionConfirmNote
+}
+$script:Activity = @()
+Clear-DaemonExpiredStopArms -Headers $headers -State $ctx.State
+Test-That 'a press that never armed leaves no lapse to publish' { $script:Activity.Count -eq 0 }
 Remove-Item -LiteralPath $promptPath -Recurse -Force -ErrorAction SilentlyContinue
 
 # A document that cannot be read is not a document that says nothing.
@@ -579,9 +592,53 @@ foreach ($shape in @('null', '[1,2]', '"text"', '{"a":"notanobject"}', '{"a":{"u
         (Get-BridgeStopPrompt -SessionId $sid).State -eq 'Unknown'
     }
 }
-Test-That 'clearing is still honoured, because that is what repairs it' {
-    (Write-BridgeStopPrompt -SessionId $sid -Until $null) -eq $true -and -not (Test-Path -LiteralPath $promptPath)
+Test-That 'a per-session clear is refused too, rather than deleting the whole store' {
+    # It used to be honoured, on the grounds that removing the document repairs it.
+    # But a per-session clear removes the whole file, and the other sessions recorded
+    # in it keep their arms - so their questions were unpinned while a second press
+    # could still confirm them.
+    (Write-BridgeStopPrompt -SessionId $sid -Until $null) -eq $false -and (Test-Path -LiteralPath $promptPath)
 }
+Test-That 'and whole-store repair is what removes it' {
+    (Clear-BridgeStopPromptStore) -eq $true -and -not (Test-Path -LiteralPath $promptPath)
+}
+
+# Two sessions, one store. Repair by deletion while another session's arm is still
+# live is the cross-writer defect arriving through the repair itself: that session can
+# still confirm a second press, but nothing is left pinning its question, so the next
+# standalone publisher writes straight over it.
+$sidB = 'cccccccc-1111-2222-3333-444444444444'
+$script:ProcStarts = @{ 41001 = $epoch; 41002 = $epoch }
+$script:DaemonStopArmed = @{}
+[void](Set-DaemonStopArm -SessionId $sid -Status 'working' -ProcessId 41001)
+[void](Set-DaemonStopArm -SessionId $sidB -Status 'working' -ProcessId 41002)
+Test-That 'two sessions can hold questions at the same time' {
+    (Get-BridgeStopPrompt -SessionId $sid).State -eq 'Prompt' -and
+    (Get-BridgeStopPrompt -SessionId $sidB).State -eq 'Prompt'
+}
+Remove-DaemonStopArm -SessionId $sid
+Test-That 'a healthy clear of one leaves the other asking' {
+    (Get-BridgeStopPrompt -SessionId $sid).State -eq 'None' -and
+    (Get-BridgeStopPrompt -SessionId $sidB).State -eq 'Prompt' -and
+    $script:DaemonStopArmed.ContainsKey($sidB)
+}
+
+# The same pair, with the document corrupted underneath them.
+[void](Set-DaemonStopArm -SessionId $sid -Status 'working' -ProcessId 41001)
+Set-Content -LiteralPath $promptPath -Value '{"a":{"until":' -Encoding utf8
+Remove-DaemonStopArm -SessionId $sid
+Test-That 'clearing one session never leaves another armed with no question recorded' {
+    -not ((Get-BridgeStopPrompt -SessionId $sidB).State -eq 'None' -and
+          $script:DaemonStopArmed.ContainsKey($sidB))
+}
+Test-That 'repairing an unreadable store disarms the consent it would strand' {
+    $script:DaemonStopArmed.Count -eq 0 -and -not (Test-Path -LiteralPath $promptPath)
+}
+Test-That 'so that session asks again rather than confirming' {
+    (Test-DaemonStopConfirms -SessionId $sidB -ProcessId 41002) -eq $false
+}
+$script:DaemonStopArmed = @{}
+$script:ProcStarts = @{ 41001 = $epoch }
 
 # A reader in another process must never see a half-written document.
 $script:DaemonStopArmed = @{}
