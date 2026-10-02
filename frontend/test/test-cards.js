@@ -32,7 +32,7 @@ function cmpVersion(a, b) {
 // --- the card itself, in a DOM small enough to run it (card-harness.js) --------
 
 const { FakeElement, loadCards } = require('./card-harness');
-const { AgentBridgeChoicesCard, AgentBridgeSessionCard, CARD_VERSION, sandbox, source } = loadCards();
+const { AgentBridgeChoicesCard, AgentBridgeSessionCard, AgentBridgeActivityCard, CARD_VERSION, sandbox, source } = loadCards();
 
 // --- the harness ------------------------------------------------------------------
 
@@ -280,8 +280,128 @@ check('a card served by an older daemon, with no driver at all, reads as yours',
   renderSession({ status: 'working' }).contains('agent') === false);
 check('the purple is a variable, so a theme can change it',
   /--agent-bridge-agent-color/.test(source));
-check('and the glow has its own keyframes rather than reusing the working one',
-  /@keyframes cpagent/.test(source));
+check('and the glow has a colour of its own rather than reusing the working one',
+  /\.frame\.agent\.working ~ \.glow[\s\S]{0,160}--agent-bridge-agent-color/.test(source));
+
+console.log('');
+console.log('--- the pulse is composited, never repainted ---');
+/*
+ * `box-shadow` is not a property the compositor can animate, so keyframes on it make
+ * every frame of the pulse a main-thread repaint of the whole card - for as long as a
+ * session is working, whether or not anything about it changed. Four sessions working
+ * at once was enough to make the Home Assistant tab stutter and the window hang.
+ *
+ * The glow is now a static shadow on a layer of its own whose `opacity` animates,
+ * which the GPU runs on its own. The look is the same; the cost is not. These guard
+ * the property, because it is the whole point and nothing about the rendered card
+ * would look wrong if someone put it back.
+ */
+function keyframeBlocks(css) {
+  const blocks = [];
+  const re = /@keyframes\s+([\w-]+)\s*\{/g;
+  let m;
+  while ((m = re.exec(css))) {
+    let depth = 1;
+    let i = re.lastIndex;
+    while (i < css.length && depth > 0) {
+      if (css[i] === '{') { depth++; } else if (css[i] === '}') { depth--; }
+      i++;
+    }
+    blocks.push({ name: m[1], body: css.slice(re.lastIndex, i - 1) });
+  }
+  return blocks;
+}
+
+const frames = keyframeBlocks(source);
+const repainting = frames.filter((f) => /box-shadow|border-|width|height|top|left|margin|padding/.test(f.body));
+check('the card still animates something', frames.length > 0);
+check('and no keyframe animates a property the compositor cannot run',
+  repainting.length === 0, repainting.map((f) => f.name).join(', '));
+check('the glow pulses on opacity, which it can',
+  frames.some((f) => /opacity/.test(f.body)));
+check('the glow is a sibling of the frame, whose overflow would otherwise clip it',
+  source.indexOf('class="glow"') > source.indexOf('class="frame"')
+  && /\.frame\.working ~ \.glow/.test(source));
+const baseGlow = (() => {
+  // The standalone `.glow` rule, not the `~ .glow` ones: a bare `\.glow \{` matches
+  // both, and the pulsing rule does carry will-change, so the check always passed.
+  const at = source.search(/\n\s*\.glow \{/);
+  return at < 0 ? '' : source.slice(at, source.indexOf('}', at));
+})();
+check('a layer is only promoted while it is actually pulsing',
+  /will-change: opacity/.test(source) && baseGlow !== '' && !/will-change/.test(baseGlow),
+  JSON.stringify(baseGlow.slice(0, 120)));
+// The glow covers the card exactly, and draws nothing inside it. Were it to take
+// pointer events it would swallow every tap meant for the reply box, the choices and
+// End session, while looking completely correct.
+check('and it never swallows a tap meant for the card underneath it',
+  /pointer-events: none/.test(baseGlow));
+check('nor shows up as an element to a screen reader',
+  /<div class="glow" aria-hidden="true">/.test(source));
+check('and a viewer who asked for less motion keeps the glow without the breathing',
+  /prefers-reduced-motion[\s\S]{0,200}animation: none/.test(source));
+
+console.log('');
+console.log('--- the elapsed-time spinner stops while nobody is looking ---');
+/*
+ * Home Assistant sits in a pinned tab for days, with one of these timers per working
+ * session. The first attempt returned early from the tick while `document.hidden`,
+ * which reads correctly and does nothing: the interval still fires on schedule and
+ * still wakes the main thread, it just finds nothing to do once it has.
+ *
+ * A source-text check passed on that version, which is the whole reason these exercise
+ * the real methods against a controllable timer and visibility state instead.
+ *
+ * The card must come from the sandbox whose timers are being counted: a second
+ * loadCards() builds a second sandbox with a timer map of its own, and every count
+ * then reads zero while the real one fills up.
+ */
+function spinnerCard() {
+  const card = Object.create(AgentBridgeActivityCard.prototype);
+  card._els = { glyph: new FakeElement('span'), elapsed: new FakeElement('span') };
+  card._since = Date.now();
+  return card;
+}
+
+const doc = sandbox.document;
+const timers = sandbox.intervals;
+
+doc.hidden = false;
+timers.clear();
+const spin = spinnerCard();
+spin._startSpinner();
+check('a visible tab gets a running interval', timers.size === 1, `size=${timers.size}`);
+check('and is drawn at once rather than after the first 120ms',
+  spin._els.glyph.textContent !== '' && spin._els.elapsed.textContent !== '');
+
+spin._startSpinner();
+check('starting twice does not stack a second interval', timers.size === 1, `size=${timers.size}`);
+
+doc.hidden = true;
+doc._fire('visibilitychange');
+check('hiding the tab clears the interval, rather than leaving it firing into nothing',
+  timers.size === 0, `size=${timers.size}`);
+
+const hiddenCard = spinnerCard();
+hiddenCard._startSpinner();
+check('and a card that starts while already hidden arms no interval at all',
+  timers.size === 0, `size=${timers.size}`);
+hiddenCard._stopSpinner();
+
+spin._els.elapsed.textContent = 'stale';
+doc.hidden = false;
+doc._fire('visibilitychange');
+check('showing it again starts a fresh interval', timers.size === 1, `size=${timers.size}`);
+check('and catches the elapsed time up immediately, not 120ms later',
+  spin._els.elapsed.textContent !== 'stale', spin._els.elapsed.textContent);
+
+spin._stopSpinner();
+check('stopping leaves no interval behind', timers.size === 0, `size=${timers.size}`);
+check('and unregisters its visibility listener',
+  (doc._listeners.visibilitychange || []).length === 0,
+  String((doc._listeners.visibilitychange || []).length));
+doc._fire('visibilitychange');
+check('so a later visibility change cannot revive it', timers.size === 0, `size=${timers.size}`);
 
 console.log('');
 console.log('--- the launch card carries model, effort and context ---');

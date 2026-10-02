@@ -134,10 +134,24 @@ function makeShadow() {
  */
 function loadCards() {
   const sandboxTimers = [];
+  const sandboxIntervals = new Map();
+  let intervalId = 0;
   const sandbox = {
     console: { info() {}, log() {} },
     window: { customCards: [] },
+    // The elapsed-time spinner is a real timer against a real visibility state. Both
+    // are controllable here, because the bug they guard against - a hidden tab whose
+    // interval keeps firing and doing nothing - is invisible to a source-text check.
     document: {
+      hidden: false,
+      _listeners: {},
+      addEventListener(type, fn) { (this._listeners[type] = this._listeners[type] || []).push(fn); },
+      removeEventListener(type, fn) {
+        const l = this._listeners[type] || [];
+        const i = l.indexOf(fn);
+        if (i >= 0) { l.splice(i, 1); }
+      },
+      _fire(type) { for (const fn of (this._listeners[type] || []).slice()) { fn(); } },
       createElement: (tag) => (String(tag).toLowerCase() === 'ha-card'
         ? seedReplyParts(new FakeElement(tag))
         : new FakeElement(tag)),
@@ -168,6 +182,12 @@ function loadCards() {
     // nothing here needs it to fire.
     setTimeout: (fn, ms) => { sandboxTimers.push({ fn, ms }); return sandboxTimers.length; },
     clearTimeout: (id) => { if (id) { sandboxTimers[id - 1] = null; } },
+    // Recorded, not run, for the same reason as setTimeout. `intervals` is what a test
+    // counts to see whether a timer is actually running. Closures rather than `this`,
+    // because the card calls these as bare globals.
+    intervals: sandboxIntervals,
+    setInterval: (fn, ms) => { sandboxIntervals.set(++intervalId, { fn, ms }); return intervalId; },
+    clearInterval: (id) => { sandboxIntervals.delete(id); },
   };
   sandbox.globalThis = sandbox;
 
@@ -175,7 +195,7 @@ function loadCards() {
   const source = fs.readFileSync(sourcePath, 'utf8');
   const context = vm.createContext(sandbox);
   vm.runInContext(
-    `${source}\n;globalThis.__cards = { AgentBridgeReplyCard, AgentBridgeChoicesCard, AgentBridgeSessionCard, AgentBridgeLaunchCard, AgentBridgeStatusCard, CARD_VERSION };`,
+    `${source}\n;globalThis.__cards = { AgentBridgeReplyCard, AgentBridgeChoicesCard, AgentBridgeSessionCard, AgentBridgeLaunchCard, AgentBridgeStatusCard, AgentBridgeActivityCard, CARD_VERSION };`,
     context,
     { filename: sourcePath });
   return Object.assign({ sandbox, source }, sandbox.__cards);
