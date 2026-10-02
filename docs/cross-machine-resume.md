@@ -217,6 +217,20 @@ what to draw for a peer. The resumable list rides the same way.
 Twelve entries per machine at roughly 150 bytes is a few KB, far inside what the
 attribute channel carries comfortably.
 
+**The metadata itself needs a privacy and retention contract, and does not have one.** An
+entry carries a `summary` - which is user prompt text - and a `folder`, which is an
+absolute path. Summaries already reach Home Assistant today as `select.*_new_resume`
+options for the local machine, but that does **not** authorise the expansion: today's
+option strings are one machine's, carry only a folder *leaf*, and are not retained
+attributes. Publishing full paths for every machine, retained, puts them in the recorder
+and in backups like any other attribute - the same retention problem as
+[chunk payloads](#what-the-recorder-keeps-which-is-the-real-cost), at smaller scale but
+indefinitely rather than for the length of a transfer.
+
+So before any of this is published: decide and record what may travel (truncated summary?
+folder leaf only?), what retention applies, and whether the user is told. Treating the
+existing local option strings as precedent would be assuming the answer.
+
 Two existing rules have to widen from "this machine" to "the fleet":
 
 * **A live session is never offered.** Two CLIs writing one transcript corrupts it. The
@@ -324,13 +338,15 @@ first.
   with a name that machine does not have;
 * progress and refusals reach the existing "Last launch" line, so no card version bump is
   needed and a peer on an older card still renders them;
-* a reservation is held for the **whole** transfer: a second request for the same session
-  is refused with a reason rather than queued, and a session going live at the keyboard
-  mid-transfer stops it;
+* a reservation is held for the **whole** transfer: a second request routed to the *same*
+  copy is refused with a reason rather than queued, and a session going live at the
+  keyboard on that machine stops it. Note what this does **not** cover - two requesters
+  reserving two different copies of the same session id, which needs the authoritative
+  exclusion that does not yet exist;
 * a reservation whose holder disappears **expires** rather than stranding the session,
   and the expiry is longer than the largest permitted bundle takes;
-* the reservation is re-checked immediately before launch, not only before the first
-  chunk;
+* the reservation is re-checked immediately before launch, and the test asserts the
+  remaining window is *narrowed*, not that a direct native launch is excluded - it is not;
 * **no chunk payload reaches `recorder`, `logbook` or backups** by any path - asserted by
   inspecting the database after a transfer, not by reasoning about topics;
 * staging is deleted on every exit path - success, refusal, digest mismatch, expiry,
@@ -341,7 +357,8 @@ first.
   authentication error, leaves the transferred files in place so a retry needs no second
   transfer, and changes nothing about the source copy;
 * clock skew, stale retained peer state and a direct local resume each leave the merged
-  list wrong without ever allowing two writers.
+  list wrong, and the test asserts the *display* degrades safely - it must not assert that
+  two writers are impossible, because with only source-local reservations they are not.
 
 ## Decisions
 
@@ -372,27 +389,54 @@ permission to write. Those come from the reservation below, which is a separate
 mechanism with separate failure behaviour. Where the two disagree, the reservation wins
 and the display is simply out of date.
 
-### One writer per session, for the whole transfer
+### Excluding a second writer is an unresolved gate, not something this design supplies
 
-Acknowledging each chunk makes the *stream* orderly; it does nothing about two transfers
-of the same session overlapping, or a transfer racing a direct resume at the keyboard.
-The unit that needs excluding is the whole operation - from the moment a bundle is
-requested to the moment the target has launched or given up - not the individual chunk.
+Acknowledging each chunk makes the *stream* orderly; it does nothing about two transfers of
+the same session overlapping, or a transfer racing a resume at the keyboard. The unit that
+needs excluding is the whole operation - from bundle request to launch-or-give-up - not the
+individual chunk.
 
-A transfer therefore takes a **reservation on the session id** before any bytes move, and
-holds it across the entire operation:
+A transfer therefore takes a **reservation on the session id** before any bytes move: claimed
+on the machine holding the copy being read, carrying a holder and an **expiry** so a dead
+target cannot strand a session, re-checked immediately before launch, and refusing a second
+request with a reason rather than queueing it.
 
-* The reservation is claimed on the **source**, which is the only machine that can see
-  the session's own lock files and local processes, and so the only one that can refuse
-  a transfer because the session just went live at the keyboard.
-* It carries a holder and an **expiry**, so a target that dies mid-transfer cannot strand
-  a session permanently. Expiry must be long enough for the largest permitted bundle.
-* It is checked again immediately before the target launches, because a reservation that
-  was valid when the first chunk was sent proves nothing by the last one.
-* A second request for a reserved session is refused with a reason, not queued.
+**That is necessary and it is not sufficient, and the difference matters more than the
+mechanism.** An earlier draft presented it as though it closed the question. It does not, for
+two reasons:
 
-The reservation is **not** an authentication or ownership mechanism and must not be used
-as one - see [Identity is not ours to invent](#identity-is-not-ours-to-invent).
+* **"The source" is not unique.** Because a move leaves the original in place, one session id
+  can exist on several machines. Two requesters reading different lists - stale retained state
+  from a machine that is switched off, or lists ordered by skewed clocks - can each pick a
+  *different* apparent source and each obtain a perfectly valid **source-local** reservation
+  for the same session id. Two local locks on two machines are not mutual exclusion. Nothing
+  in this design arbitrates between them.
+* **A pre-launch recheck cannot fence a direct native launch.** Someone typing
+  `claude --resume <id>` or `copilot --session-id <id>` at a keyboard participates in no
+  bridge protocol, holds no reservation, and consults nothing. A recheck narrows the window
+  between the last check and the launch; it cannot close it. Claiming a poll closes that race
+  would be false.
+
+So this is stated as a **required contract that does not yet exist**, not a solved problem:
+
+1. **One authoritative exclusion per session id, across every retained copy** - a single
+   arbiter, not a lock per machine. Which machine or service holds it is exactly the question
+   to be answered, and it belongs with the command identity/target/expiry/ack contract owned
+   elsewhere rather than being invented here. See
+   [Identity is not ours to invent](#identity-is-not-ours-to-invent).
+2. **Every launch path must participate** and be enumerated: the dashboard resume on the
+   owning machine, a cross-machine resume, launches made through the MCP server, and the
+   daemon's adoption of a session started at the keyboard. A path that does not consult the
+   arbiter silently defeats it.
+3. **Direct native launches cannot be made to participate** and are therefore an accepted
+   limitation, not a case to be handled. The honest consequence is that resuming a
+   transferred copy directly, outside the bridge, is **unsupported** - it can corrupt a
+   transcript, and no amount of polling prevents it.
+
+Until (1) and (2) exist, the correct behaviour is to **refuse or defer**, not to proceed on the
+strength of a source-local lock. Concretely: cross-machine transfer stays specified and
+unauthorised on a live fleet, and nothing in this document should be read as evidence that two
+writers cannot occur.
 
 ### Agency sessions transfer as Agency
 
@@ -441,9 +485,13 @@ system, not the live fleet.
 
 Two dependencies are outside this document. The authenticated command contract the
 transfer protocol needs is owned elsewhere and does not yet exist; until it does, any
-publisher on the broker could request a transcript. And the shared daemon files this
-would touch - `hooks/daemon-sessions.ps1`, `hooks/decision-mqtt.ps1`,
-`hooks/daemon-launch.ps1`, `hooks/agent-bridge-daemon.ps1` - are reserved to other
-owners, so implementation needs explicit handoffs that have not been granted.
+publisher on the broker could request a transcript, and there is no authoritative
+cross-copy exclusion to stop two machines reserving two copies of one session - see
+[Excluding a second writer](#excluding-a-second-writer-is-an-unresolved-gate-not-something-this-design-supplies).
+Resuming a transferred copy directly, outside the bridge, is unsupported and cannot be
+fenced. And the shared daemon files this would touch - `hooks/daemon-sessions.ps1`,
+`hooks/decision-mqtt.ps1`, `hooks/daemon-launch.ps1`, `hooks/agent-bridge-daemon.ps1` -
+are reserved to other owners, so implementation needs explicit handoffs that have not been
+granted.
 
 Merging this document would record the design. It would not grant any of the above.
