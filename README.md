@@ -748,10 +748,12 @@ a stray tap landing mid-turn throws away the turn in flight. So the first press 
 arms: the card's status line changes to *Press End session again to end it*, naming
 what the second press would interrupt, and the session carries on untouched. A second
 press within ten seconds ends it; without one the confirmation lapses, the card says
-*End session NOT confirmed*, and the next press starts over. An idle session has
-nothing in flight to lose and still ends on a single press, as does a session whose
-status the daemon has not yet worked out — that one is guarded too, since it may well
-be mid-turn.
+*End session NOT confirmed*, and the next press starts over. Only an idle session ends
+on a single press, having nothing in flight to lose. A session whose status the daemon
+has not yet worked out is guarded like any other, precisely because it may well be
+mid-turn. A press with no process behind it is not guarded, since there is nothing a
+second press could protect: such a session cannot be stopped at all, and the card
+reports that rather than appearing to have worked.
 
 The guard lives in the daemon rather than in the dashboard card, deliberately. The
 same button is pressed from a phone, from an automation and by other agents, and only
