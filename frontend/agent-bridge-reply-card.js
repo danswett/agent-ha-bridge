@@ -23,7 +23,7 @@
  * uploaded image these sit in the sensor's attributes.
  */
 
-const CARD_VERSION = '1.21.0';
+const CARD_VERSION = '1.21.1';
 
 /*
  * How large a non-image attachment may be.
@@ -669,17 +669,31 @@ class AgentBridgeActivityCard extends HTMLElement {
     if (this._spinner) { return; }
     let frame = 0;
     const tick = () => {
+      // Home Assistant sits in a pinned tab for days. Nothing of this is presented
+      // while that tab is hidden, so a tick then buys nothing and only wakes the main
+      // thread - eight times a second, for every session that is working.
+      if (typeof document !== 'undefined' && document.hidden) { return; }
       this._els.glyph.textContent = SPINNER_GLYPHS[frame++ % SPINNER_GLYPHS.length];
       const secs = Math.max(0, Math.floor((Date.now() - this._since) / 1000));
       const text = secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`;
       if (this._els.elapsed.textContent !== ` (${text})`) { this._els.elapsed.textContent = ` (${text})`; }
     };
     tick();
+    // Skipping those ticks would otherwise leave a stale elapsed time on screen for
+    // up to 120ms after the tab comes back, so catch up the moment it does.
+    if (typeof document !== 'undefined' && document.addEventListener) {
+      this._onVisible = () => tick();
+      document.addEventListener('visibilitychange', this._onVisible);
+    }
     this._spinner = setInterval(tick, 120);
   }
 
   _stopSpinner() {
     if (this._spinner) { clearInterval(this._spinner); this._spinner = null; }
+    if (this._onVisible) {
+      document.removeEventListener('visibilitychange', this._onVisible);
+      this._onVisible = null;
+    }
   }
 
   connectedCallback() {
@@ -1090,15 +1104,17 @@ class AgentBridgeSessionCard extends HTMLElement {
           padding: 4px 12px 10px 12px;
           box-sizing: border-box;
           border: 1px solid var(--divider-color);
-          transition: border-color 0.4s ease;
+          transition: border-color 0.4s ease, box-shadow 0.4s ease;
           /* Children draw no surface of their own. */
           --ha-card-background: transparent;
           --ha-card-box-shadow: none;
           --ha-card-border-width: 0;
           --ha-card-border-color: transparent;
         }
-        .frame.working { border-color: var(--primary-color); animation: cpwork 1.6s ease-in-out infinite; }
-        .frame.waiting { border-color: var(--warning-color); animation: cpwait 1.6s ease-in-out infinite; }
+        /* The steady core of the glow. Static, so it is painted once when the state
+           changes; the breathing halo on top of it is .glow, below. */
+        .frame.working { border-color: var(--primary-color); box-shadow: 0 0 6px 0 var(--primary-color); }
+        .frame.waiting { border-color: var(--warning-color); box-shadow: 0 0 6px 0 var(--warning-color); }
         /* Driven through Home Assistant by an agent rather than by you. The pulse is
            the same shape so "something is happening" still reads at a glance; only
            the colour changes, and it holds a steady purple edge while idle so a
@@ -1107,22 +1123,52 @@ class AgentBridgeSessionCard extends HTMLElement {
         .frame.agent.working,
         .frame.agent.waiting {
           border-color: var(--agent-bridge-agent-color, #a855f7);
-          animation: cpagent 1.6s ease-in-out infinite;
+          box-shadow: 0 0 6px 0 var(--agent-bridge-agent-color, #a855f7);
         }
-        @keyframes cpagent {
-          0%   { box-shadow: 0 0 6px 0px var(--agent-bridge-agent-color, #a855f7); }
-          50%  { box-shadow: 0 0 18px 3px var(--agent-bridge-agent-color, #a855f7); }
-          100% { box-shadow: 0 0 6px 0px var(--agent-bridge-agent-color, #a855f7); }
+        /*
+         * The halo is a layer of its own holding a shadow that never changes, faded
+         * in and out by its opacity - not a box-shadow animated on the frame.
+         *
+         * box-shadow is not a property the compositor can animate, so the old
+         * keyframes repainted the entire card on the main thread on every frame, for
+         * as long as the session was working. Four sessions working at once meant
+         * four full-card repaints 60 times a second that no state change had asked
+         * for, and Home Assistant - a tab that stays open for days - stuttered and
+         * hung. Opacity is composited on the GPU: the card is rastered once and the
+         * main thread does nothing for the rest of the pulse.
+         *
+         * It has to be a sibling of the frame rather than a child. The frame's
+         * overflow: hidden - which keeps the children's square corners inside the
+         * rounded edge - would clip a glow drawn inside it to nothing.
+         */
+        .shell { position: relative; }
+        .glow {
+          position: absolute;
+          inset: 0;
+          border-radius: var(--ha-card-border-radius, 12px);
+          opacity: 0;
+          pointer-events: none;
         }
-        @keyframes cpwork {
-          0%   { box-shadow: 0 0 6px 0px var(--primary-color); }
-          50%  { box-shadow: 0 0 16px 2px var(--primary-color); }
-          100% { box-shadow: 0 0 6px 0px var(--primary-color); }
+        .frame.working ~ .glow,
+        .frame.waiting ~ .glow {
+          animation: cpglow 1.6s ease-in-out infinite;
+          /* Only while it is actually pulsing. A promoted layer costs texture memory
+             whether or not it moves, and most sessions on the dashboard are idle. */
+          will-change: opacity;
         }
-        @keyframes cpwait {
-          0%   { box-shadow: 0 0 6px 0px var(--warning-color); }
-          50%  { box-shadow: 0 0 18px 3px var(--warning-color); }
-          100% { box-shadow: 0 0 6px 0px var(--warning-color); }
+        .frame.working ~ .glow { box-shadow: 0 0 16px 2px var(--primary-color); }
+        .frame.waiting ~ .glow { box-shadow: 0 0 18px 3px var(--warning-color); }
+        .frame.agent.working ~ .glow,
+        .frame.agent.waiting ~ .glow { box-shadow: 0 0 18px 3px var(--agent-bridge-agent-color, #a855f7); }
+        @keyframes cpglow {
+          0%, 100% { opacity: 0; }
+          50%      { opacity: 1; }
+        }
+        /* The breathing is decoration. A viewer who asked for less motion keeps the
+           colour and the glow, held at the middle of the pulse. */
+        @media (prefers-reduced-motion: reduce) {
+          .frame.working ~ .glow,
+          .frame.waiting ~ .glow { animation: none; opacity: 0.6; will-change: auto; }
         }
         .fold {
           position: absolute; top: 14px; right: 10px; z-index: 1;
@@ -1137,9 +1183,12 @@ class AgentBridgeSessionCard extends HTMLElement {
         .collapsed .body > :not(:first-child) { display: none; }
         .collapsed { padding-bottom: 4px; }
       </style>
-      <div class="frame">
-        <button class="fold" aria-expanded="true" title="Collapse"><ha-icon icon="mdi:chevron-down"></ha-icon></button>
-        <div class="body"></div>
+      <div class="shell">
+        <div class="frame">
+          <button class="fold" aria-expanded="true" title="Collapse"><ha-icon icon="mdi:chevron-down"></ha-icon></button>
+          <div class="body"></div>
+        </div>
+        <div class="glow" aria-hidden="true"></div>
       </div>`;
     this._frame = this.shadowRoot.querySelector('.frame');
     this._body = this.shadowRoot.querySelector('.body');
