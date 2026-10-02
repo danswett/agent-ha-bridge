@@ -497,6 +497,13 @@ function Send-DaemonCardPayload {
 
     $prompt = New-BridgeAttachmentPrompt -Text $payload.Text -Paths $paths.ToArray()
     if ([string]::IsNullOrWhiteSpace($prompt)) {
+        # Disarmed: no turn is coming, so leaving it armed would hand the glow to
+        # whatever the person types next in the terminal - the same reason an agent
+        # press on an empty box disarms rather than waiting.
+        # Disarmed: no turn is coming, so leaving it armed would hand the glow to
+        # whatever the person types next in the terminal - the same reason an agent
+        # press on an empty box disarms rather than waiting.
+        Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $false
         Write-DaemonLog -Message "reply card payload for $($sessionId.Substring(0,8)) had nothing deliverable"
         return $true
     }
@@ -505,8 +512,17 @@ function Send-DaemonCardPayload {
     Write-DaemonLog -Message "reply card payload for $($sessionId.Substring(0,8))$attachmentNote"
 
     Set-DaemonSessionProperty -Entry $entry -Name 'LastReply' -Value $payload.Text
-    [void](Invoke-DaemonReply -SessionId $sessionId -Text $prompt -Headers $Headers `
-        -DisplayText $payload.Text -ClearReplyBox:$false)
+    # Taken as the last thing emitted rather than assigned straight across: the call
+    # writes to the card on its way through, and that output would otherwise join the
+    # result and make a failed delivery look like a successful one.
+    $delivered = @(Invoke-DaemonReply -SessionId $sessionId -Text $prompt -Headers $Headers `
+        -DisplayText $payload.Text -ClearReplyBox:$false) | Select-Object -Last 1
+    if (-not $delivered) {
+        # Nothing was sent, so no agent turn is coming and the arming above has to go
+        # back. Left armed, the next thing typed in the terminal would consume it and
+        # show a person's turn with the agent's edge.
+        Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $false
+    }
 
     # Only once it is delivered, so a failed send leaves the image in place to be
     # retried by hand.

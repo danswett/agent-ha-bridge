@@ -198,8 +198,9 @@ async function main() {
         description:
           'Send a message to a session - yours or one on another machine. Any length. ' +
           'Returns since, to pass to read_agent_session, and attributed: a reply of 255 ' +
-          'characters or fewer is recorded as the agent, while a longer one is sent whole ' +
-          'over a path that carries no account and so is not marked.',
+          'characters or fewer is recorded as the agent by Home Assistant itself, while a ' +
+          'longer one is sent whole over a path that carries no account and marks itself ' +
+          'as the agent instead. Both are marked; the shorter path is the stronger proof.',
         inputSchema: {
           type: 'object',
           properties: {

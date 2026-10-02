@@ -183,7 +183,12 @@ Remove-Item -LiteralPath $script:AttachRoot -Recurse -Force -ErrorAction Silentl
 
 Write-Host '--- a payload from the reply card ---'
 $script:Replies = @(); $script:Removed = @(); $script:Saved = @(); $script:Wrote = @()
-function Invoke-DaemonReply { param($SessionId, $Text, $Headers, $DisplayText, [switch]$ClearReplyBox) $script:Replies += [pscustomobject]@{ Text = $Text; StampAtDelivery = $state[$sid].LastReplyPayloadAt }; $true }
+$script:DeliverResult = $true
+function Invoke-DaemonReply { param($SessionId, $Text, $Headers, $DisplayText, [switch]$ClearReplyBox)
+    $script:Replies += [pscustomobject]@{ Text = $Text; StampAtDelivery = $state[$sid].LastReplyPayloadAt }
+    # The real one writes to the card on its way through, so it emits before returning.
+    'emitted'
+    $script:DeliverResult }
 function Save-BridgeReplyAttachment { param($ImageId, $Name, $Headers) $script:Saved += $ImageId; "C:\att\$ImageId.png" }
 function Save-BridgeReplyFile { param($Name, $Base64, $MaxBytes) $script:Wrote += $Name; "C:\att\$Name" }
 function Remove-BridgeHomeAssistantImage { param($ImageId) $script:Removed += $ImageId; 'emitted' }
@@ -241,6 +246,23 @@ Test-That 'and arms the turn it is about to start, so it is not handed straight 
 Set-Payload -Stamp 'd11' -Text 'and one typed on the dashboard'
 [void](Send-DaemonCardPayload -SessionId $sid -Entry $entry -Headers $headers)
 Test-That 'a reply typed on the card hands it back to the person' { $entry.Driver -eq 'human' } $(if ($entry.PSObject.Properties['Driver']) { $entry.Driver })
+
+# Armed but nothing sent is the case that would show a person's turn with the agent's
+# edge: no agent turn is coming, so the next thing typed in the terminal consumes it.
+$script:Replies = @(); $script:DeliverResult = $false
+Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $true
+Set-Payload -Stamp 'd12' -Text 'this one does not land' -Driver 'agent'
+[void](Send-DaemonCardPayload -SessionId $sid -Entry $entry -Headers $headers)
+Test-That 'a delivery that fails disarms it again' { $entry.DriverPending -eq $false } "pending=$($entry.DriverPending)"
+
+$script:DeliverResult = $true
+$script:Replies = @()
+Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $true
+Set-Payload -Stamp 'd13' -Text '' -Driver 'agent'
+[void](Send-DaemonCardPayload -SessionId $sid -Entry $entry -Headers $headers)
+Test-That 'and a payload with nothing deliverable disarms it too' {
+    $entry.DriverPending -eq $false -and $script:Replies.Count -eq 0
+} "pending=$($entry.DriverPending) replies=$($script:Replies.Count)"
 
 Remove-Item -LiteralPath $script:DaemonConfig.LogFile -Force -ErrorAction SilentlyContinue
 Write-Host ''

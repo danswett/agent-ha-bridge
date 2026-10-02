@@ -155,11 +155,15 @@ box. So exactly one path is used, and which one is not a free choice:
 | | Carries an account | Length |
 |---|---|---|
 | Text box + Submit | **yes** — the press is a service call, so Home Assistant records who made it | 255 characters |
-| Payload topic | no — it arrives over MQTT, and an MQTT-published state has no context at all | unlimited |
+| Payload topic | not by itself — it arrives over MQTT, and an MQTT-published state has no context at all, so the payload carries a `driver` field saying who sent it | unlimited |
 
-A reply that fits is therefore sent the attributed way; a longer one is sent whole and
-unmarked rather than silently truncated. `reply_to_agent_session` returns `attributed`
-so the caller knows which happened.
+A reply that fits is therefore sent the way Home Assistant can vouch for; a longer one
+is sent whole and marks itself rather than being silently truncated or arriving as
+though a person had typed it. The reply card omits that field, so a reply typed on the
+dashboard still reads as the person's. `reply_to_agent_session` returns `attributed`
+for both, since both are marked — the difference is that the short path is attested by
+Home Assistant and the long one is asserted by the sender, which is sound because the
+mark decides how the card looks rather than what anyone is allowed to do.
 
 ## Remote clients (HTTP transport)
 
