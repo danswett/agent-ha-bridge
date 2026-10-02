@@ -102,6 +102,164 @@ function Confirm-BridgeSessionEntities {
     $exists
 }
 
+function Get-BridgeStopPromptPath {
+    <# Where the daemon records which sessions are currently showing the End session question. #>
+    Get-BridgeRuntimePath 'agent-bridge-stop-prompt.json'
+}
+
+function Read-BridgeStopPromptStore {
+    <#
+        The recorded prompts, as { State; Prompts }.
+
+        State is 'Empty' when there is definitively nothing recorded, 'Ok' when the
+        document was read and validated, and 'Failed' when it exists but could not be
+        read or did not hold what it should.
+
+        The three are kept apart deliberately. Collapsing a read failure into "nothing
+        recorded" is what let a publisher treat an unreadable store as an absent
+        question and write over one that was on screen - the same cross-writer defect
+        the store exists to close, arriving through the store itself.
+
+        The shape is validated rather than trusted: a document holding null, an array
+        or a string answers neither .Keys nor .ContainsKey, and reached the hook as an
+        exception on a path that must not throw.
+    #>
+    $path = try { Get-BridgeStopPromptPath } catch { return @{ State = 'Failed'; Prompts = @{} } }
+    if (-not (Test-Path -LiteralPath $path)) { return @{ State = 'Empty'; Prompts = @{} } }
+
+    $parsed = $null
+    try { $parsed = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -AsHashtable }
+    catch { return @{ State = 'Failed'; Prompts = @{} } }
+    if ($parsed -isnot [System.Collections.IDictionary]) { return @{ State = 'Failed'; Prompts = @{} } }
+
+    $prompts = @{}
+    foreach ($key in @($parsed.Keys)) {
+        if ($key -isnot [string] -or [string]::IsNullOrWhiteSpace($key)) { return @{ State = 'Failed'; Prompts = @{} } }
+        $entry = $parsed[$key]
+        if ($entry -isnot [System.Collections.IDictionary] -or -not $entry.Contains('until')) {
+            return @{ State = 'Failed'; Prompts = @{} }
+        }
+        $until = [datetimeoffset]::MinValue
+        if (-not [datetimeoffset]::TryParse([string]$entry['until'], [ref]$until)) {
+            return @{ State = 'Failed'; Prompts = @{} }
+        }
+        $hint = if ($entry.Contains('hint')) { [string]$entry['hint'] } else { '' }
+        $prompts[$key] = @{ Until = $until; Hint = $hint }
+    }
+    @{ State = 'Ok'; Prompts = $prompts }
+}
+
+function Write-BridgeStopPrompt {
+    <#
+        Records, or clears, that one session is showing the End session question.
+        Returns $true only when the store now says what it was asked to say.
+
+        The caller must honour that answer. An arm held in memory whose record could
+        not be written is consent that no other publisher can see, so the next hook to
+        publish wipes the question while a second press still confirms - which is
+        exactly the defect this store closes. Set-DaemonStopArm therefore refuses to
+        arm when this fails.
+
+        Published atomically, through a temporary file and a replacing move, because a
+        reader in another process can otherwise observe a half-written document.
+
+        On an unreadable store both a record and a clear are refused. Rewriting would
+        drop the entries that could not be parsed. Clearing used to be honoured, on the
+        grounds that removing the document repairs it - but a per-session clear fell
+        through to the whole-file delete below and took every other session's question
+        with it, while their arms stayed live in the daemon. A standalone publisher
+        then overwrote a question a second press could still confirm: the very
+        cross-writer defect this store exists to close, arriving through the repair.
+        Repair is Clear-BridgeStopPromptStore, and belongs to the daemon, which is the
+        only thing that can invalidate the consent such a repair would strand.
+
+        Deliberately display state and nothing more. The question is pinned by every
+        process that publishes activity, but only the daemon holds the arm that can
+        answer it, and this file is never consulted when deciding whether a press
+        confirms. A record that outlives its daemon can at worst leave a prompt on a
+        card until its own expiry; it can never stop a session.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [AllowNull()][object]$Until = $null,
+        [AllowEmptyString()][string]$Hint = ''
+    )
+
+    $tmp = $null
+    try {
+        $path = Get-BridgeStopPromptPath
+        $tmp = "$path.pending"
+        $store = Read-BridgeStopPromptStore
+        if ($store.State -eq 'Failed') { return $false }
+
+        $prompts = @{}
+        if ($store.State -eq 'Ok') {
+            foreach ($key in @($store.Prompts.Keys)) {
+                $prompts[$key] = @{ until = $store.Prompts[$key].Until.ToString('o'); hint = $store.Prompts[$key].Hint }
+            }
+        }
+        if ($null -eq $Until) { [void]$prompts.Remove($SessionId) }
+        else { $prompts[$SessionId] = @{ until = ([datetimeoffset]$Until).ToString('o'); hint = $Hint } }
+
+        if ($prompts.Count -eq 0) {
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction Stop }
+            return $true
+        }
+        [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($path))
+        Set-Content -LiteralPath $tmp -Value ($prompts | ConvertTo-Json -Depth 4 -Compress) -Encoding utf8 -ErrorAction Stop
+        [IO.File]::Move($tmp, $path, $true)
+        $true
+    }
+    catch {
+        if ($null -ne $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        $false
+    }
+}
+
+function Clear-BridgeStopPromptStore {
+    <#
+        Removes the whole prompt store, and returns whether it is now gone.
+
+        The only way to repair a document that cannot be read: a per-session clear
+        refuses to touch it, because removing one key means rewriting entries it
+        cannot parse, and deleting it outright would unpin questions belonging to arms
+        that are still live.
+
+        So this invalidates every recorded question at once, and its callers must have
+        invalidated the matching consent first. Both do: daemon startup restores no
+        arms at all, and the repair path in Remove-DaemonStopArm drops every arm it
+        holds before calling this.
+    #>
+    try {
+        $path = Get-BridgeStopPromptPath
+        if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction Stop }
+        Remove-Item -LiteralPath "$path.pending" -Force -ErrorAction SilentlyContinue
+        $true
+    }
+    catch { $false }
+}
+
+function Get-BridgeStopPrompt {
+    <#
+        The End session question one session is showing, as { State; Hint }.
+
+        State is 'Prompt' when one is recorded and still live, 'None' when the store
+        definitively holds none, and 'Unknown' when it could not be read. A caller
+        that would overwrite the status line must not treat 'Unknown' as 'None'.
+
+        Expiry is carried in the record rather than inferred, so a file left behind by
+        a daemon that died stops pinning anything of its own accord.
+    #>
+    param([Parameter(Mandatory)][string]$SessionId)
+
+    $store = Read-BridgeStopPromptStore
+    if ($store.State -eq 'Failed') { return @{ State = 'Unknown'; Hint = '' } }
+    if (-not $store.Prompts.ContainsKey($SessionId)) { return @{ State = 'None'; Hint = '' } }
+    $entry = $store.Prompts[$SessionId]
+    if ([datetimeoffset]::Now -gt $entry.Until) { return @{ State = 'None'; Hint = '' } }
+    @{ State = 'Prompt'; Hint = $entry.Hint }
+}
+
 function Publish-BridgeSessionStatus {
     <#
         Publishes a session's status and, when given, its activity, with the standard
@@ -159,7 +317,39 @@ function Publish-BridgeSessionStatus {
         }
         $detail['session'] = $SessionName
         $detail['machine'] = $Machine
-        Set-CopilotMqttActivity -SessionId $SessionId -Summary $Activity -Detail $detail -Headers $Headers
+        # Every activity writer goes through the arm guard, not just the daemon's
+        # transcript streamers. A Claude Notification publishes its own status line
+        # straight through here, and arriving inside the confirmation window it
+        # replaced the End session question while the session was still armed -
+        # leaving a user who read the vanished prompt as a dead tap to press again and
+        # end the turn.
+        #
+        # Two routes because there are two kinds of caller. Inside the daemon the arm
+        # itself is in memory and authoritative. A standalone hook process has no
+        # daemon state at all, so it reads the recorded prompt instead - display state
+        # only, which cannot answer the question, only keep showing it.
+        #
+        # A store that cannot be read is not an absent question. Publishing over one
+        # that is on screen is how a user comes to press End a second time, so an
+        # unreadable store withholds this activity update entirely and leaves whatever
+        # the card is showing; the status above is published either way.
+        $summary = $Activity
+        if (Get-Command -Name Get-DaemonCardSummary -CommandType Function -ErrorAction Ignore) {
+            $summary = Get-DaemonCardSummary -SessionId $SessionId -Summary $summary -Detail $detail
+        }
+        else {
+            $prompt = Get-BridgeStopPrompt -SessionId $SessionId
+            if ($prompt.State -eq 'Unknown') {
+                Write-DecisionBridgeLog -Message ("stop prompt store unreadable; holding back the activity " +
+                    "line for $SessionId rather than risking writing over a confirmation")
+                return
+            }
+            if ($prompt.State -eq 'Prompt') {
+                $summary = $script:CopilotEndSessionConfirmNote
+                $detail['hint'] = [string]$prompt.Hint
+            }
+        }
+        Set-CopilotMqttActivity -SessionId $SessionId -Summary $summary -Detail $detail -Headers $Headers
     }
 }
 

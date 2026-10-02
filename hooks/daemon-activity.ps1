@@ -684,7 +684,9 @@ function Update-DaemonSessionActivity {
     Add-DaemonCardText -Entry $entry -Detail $detail -VerboseOn $verbose
 
     try {
-        Set-CopilotMqttActivity -SessionId $id -Summary $summary -Detail $detail -Headers $Headers
+        Set-CopilotMqttActivity -SessionId $id `
+            -Summary (Get-DaemonCardSummary -SessionId $id -Summary $summary -Detail $detail) `
+            -Detail $detail -Headers $Headers
     }
     catch {
         Write-DaemonLog -Message "activity publish failed for $id : $($_.Exception.Message)"
@@ -848,7 +850,9 @@ function Update-DaemonCodexActivity {
         if ($fresh) { $summary = $fresh }
     }
     catch { }
-    try { Set-CopilotMqttActivity -SessionId $Id -Summary $summary -Detail $detail -Headers $Headers }
+    try { Set-CopilotMqttActivity -SessionId $Id `
+            -Summary (Get-DaemonCardSummary -SessionId $Id -Summary $summary -Detail $detail) `
+            -Detail $detail -Headers $Headers }
     catch { Write-DaemonLog -Message "codex activity publish failed for $Id : $($_.Exception.Message)" }
 }
 
@@ -930,6 +934,18 @@ function Invoke-DaemonFastActivity {
     # A session launched from the dashboard is followed up here too, so its
     # registration - or its trust question - is noticed within a second.
     try { Update-DaemonPendingLaunch -Headers $Headers } catch { }
+
+    # An End session confirmation nobody made in time, so the card stops asking for a
+    # second press within a tick rather than at the next reconcile. Gated on the
+    # count: this runs every 100 ms, where even an empty loop over every session costs
+    # more than the work it would find.
+    if ($script:DaemonStopArmed.Count -gt 0) {
+        try { Clear-DaemonExpiredStopArms -Headers $Headers -State $State }
+        catch {
+            if ($_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+            Write-DaemonLog -Message "end confirmation sweep failed: $($_.Exception.Message)"
+        }
+    }
 
     # Hook events the native hook handed over, before streaming, so a registration it
     # carries is in place when the session's activity is read (daemon-hookspool.ps1).

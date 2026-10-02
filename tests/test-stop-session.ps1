@@ -14,6 +14,12 @@
       * Invoke-PendingStops - the press-timestamp contract shared with the Submit and
         Launch buttons: one press acts once, a retained press from a previous run is
         ignored, and a session that is not live is never touched.
+      * The confirmation a session that is not idle asks for: one press arms and says
+        so, a second within the window ends it, and a confirmation nobody makes in
+        time lapses rather than leaving the card asking.
+      * That the confirmation is bound to the process it was armed against, that a
+        question the card never showed cannot be answered, and that no other activity
+        writer can wipe it while it stands.
       * The stop button is published, cleared with the rest of the session, and
         carries a deterministic entity id.
 #>
@@ -138,27 +144,35 @@ function Stop-BridgeCopilotSession {
 function Set-CopilotMqttActivity {
     param([string]$SessionId, [string]$Summary, $Detail, [hashtable]$Headers)
     $script:Activity += $Summary
+    $script:ActivityDetail = $Detail
 }
 
 $node = Get-CopilotMqttNodeId -SessionId 'aaaaaaaa-1111-2222-3333-444444444444'
+$sid = 'aaaaaaaa-1111-2222-3333-444444444444'
 
 function Reset-PressTest {
-    param([string]$Press, [bool]$Live = $true)
+    # Status defaults to idle: the press-timestamp checks below are about the press,
+    # not about the confirmation a session that is still working asks for.
+    param([string]$Press, [bool]$Live = $true, [string]$Status = 'idle')
     $script:Stopped = @()
     $script:Activity = @()
+    $script:ActivityDetail = $null
+    $script:DaemonStopArmed = @{}
     $script:DaemonStartedAt = [DateTimeOffset]::Parse('2026-01-01T00:00:00Z')
     $script:HaStates = @{ "button.${node}_stop" = $Press }
-    $state = @{ 'aaaaaaaa-1111-2222-3333-444444444444' = [pscustomobject]@{ Name = 'S'; Offset = 0 } }
+    $entry = [pscustomobject]@{ Name = 'S'; Offset = 0 }
+    if ($Status) { $entry | Add-Member -NotePropertyName Status -NotePropertyValue $Status }
+    $state = @{ $sid = $entry }
     $liveSet = @{}
     if ($Live) {
-        $liveSet['aaaaaaaa-1111-2222-3333-444444444444'] = [pscustomobject]@{ SessionId = 'aaaaaaaa-1111-2222-3333-444444444444'; ProcessId = 999 }
+        $liveSet[$sid] = [pscustomobject]@{ SessionId = $sid; ProcessId = 999 }
     }
     @{ State = $state; Live = $liveSet }
 }
 
 $ctx = Reset-PressTest -Press '2026-06-01T12:00:00+00:00'
 Invoke-PendingStops -Headers $headers -State $ctx.State -Live $ctx.Live
-Test-That 'a fresh press ends the session' { $script:Stopped.Count -eq 1 }
+Test-That 'a fresh press ends an idle session' { $script:Stopped.Count -eq 1 }
 Test-That 'it passes the live process id' { $script:Stopped[0].ProcessId -eq 999 }
 Test-That 'it shows progress on the card' { ($script:Activity -join ' ') -match 'Ending' }
 
@@ -183,6 +197,518 @@ $ctx = Reset-PressTest -Press '2026-06-01T12:00:00+00:00'
 $script:HaStates = @{}
 Invoke-PendingStops -Headers $headers -State $ctx.State -Live $ctx.Live
 Test-That 'a missing stop button is survived' { $script:Stopped.Count -eq 0 }
+
+# --- the confirmation ------------------------------------------------------------
+
+# From here on the process behind a session has a readable identity, because that is
+# what an ordinary live session has. Get-Process is replaced rather than extended:
+# the earlier mock models liveness for Stop-BridgeCopilotSession and carries no start
+# time, and a target that cannot be vouched for is now deliberately unconfirmable.
+$epoch = [datetime]::Parse('2026-06-01T00:00:00Z')
+$script:ProcStarts = @{ 999 = $epoch }
+function Get-Process {
+    param([int]$Id, [string]$Name, [switch]$ErrorAction)
+    if (-not $script:ProcStarts.ContainsKey($Id)) { throw "no process $Id" }
+    [pscustomobject]@{ Id = $Id; StartTime = $script:ProcStarts[$Id] }
+}
+
+Write-Host ''
+Write-Host '--- a session that is not idle takes two presses ---'
+# End sits a tap away from Send on the card, and a stray tap mid-turn throws away the
+# turn in flight. The transcript survives and the session resumes, but what it was
+# doing does not come back.
+
+$ctx = Reset-PressTest -Press '2026-06-01T12:00:00+00:00' -Status 'working'
+Invoke-PendingStops -Headers $headers -State $ctx.State -Live $ctx.Live
+Test-That 'one press does not end a working session' { $script:Stopped.Count -eq 0 }
+Test-That 'the card asks for a second press' {
+    $script:Activity[-1] -eq $script:CopilotEndSessionConfirmNote
+}
+Test-That 'and says what the second press would interrupt' {
+    "$($script:ActivityDetail.hint)" -match 'still working'
+}
+Test-That 'the session is left alone, not marked ending' { [string]$ctx.State[$sid].Status -eq 'working' }
+
+# The second press is a different press, so the press-stamp contract sees it.
+$script:HaStates["button.${node}_stop"] = '2026-06-01T12:00:04+00:00'
+Invoke-PendingStops -Headers $headers -State $ctx.State -Live $ctx.Live
+Test-That 'a second press within the window ends it' { $script:Stopped.Count -eq 1 }
+Test-That 'and the confirmation is spent, not left armed' { $script:DaemonStopArmed.Count -eq 0 }
+
+# A session the daemon has not classified yet may well be mid-turn, so it is guarded
+# too: asking for a second press is the direction that cannot lose work.
+$ctx = Reset-PressTest -Press '2026-06-01T12:00:00+00:00' -Status ''
+Invoke-PendingStops -Headers $headers -State $ctx.State -Live $ctx.Live
+Test-That 'a session with no status yet is guarded as well' { $script:Stopped.Count -eq 0 }
+Test-That 'and is described honestly rather than guessed at' {
+    "$($script:ActivityDetail.hint)" -match 'still working'
+}
+
+Write-Host ''
+Write-Host '--- a confirmation nobody makes in time lapses ---'
+
+$ctx = Reset-PressTest -Press '2026-06-01T12:00:00+00:00' -Status 'waiting'
+Invoke-PendingStops -Headers $headers -State $ctx.State -Live $ctx.Live
+Test-That 'a waiting session is guarded too' { $script:Stopped.Count -eq 0 }
+Test-That 'and the prompt names what it is waiting on' {
+    "$($script:ActivityDetail.hint)" -match 'waiting on you'
+}
+
+# Backdated rather than slept through: the window is the daemon's own clock.
+$script:DaemonStopArmed[$sid].At = [DateTimeOffset]::Now.AddSeconds(-($script:DaemonConfig.StopConfirmSeconds + 1))
+Test-That 'it no longer reads as armed' { -not (Test-DaemonStopArmed -SessionId $sid) }
+Clear-DaemonExpiredStopArms -Headers $headers -State $ctx.State
+Test-That 'the sweep disarms it' { $script:DaemonStopArmed.Count -eq 0 }
+Test-That 'and the card says so rather than going on asking' {
+    $script:Activity[-1] -eq $script:CopilotEndSessionLapsedNote
+}
+# A card left asking for a second press would be asking for something that had
+# quietly stopped confirming anything and become a fresh first press.
+$script:HaStates["button.${node}_stop"] = '2026-06-01T12:00:30+00:00'
+Invoke-PendingStops -Headers $headers -State $ctx.State -Live $ctx.Live
+Test-That 'a press after it lapsed arms again rather than ending' { $script:Stopped.Count -eq 0 }
+Test-That 'and asks once more' { $script:Activity[-1] -eq $script:CopilotEndSessionConfirmNote }
+
+# A session that has gone while armed must not be reported on; its card is already
+# being retired.
+[void](Set-DaemonStopArm -SessionId $sid -Status 'working')
+$script:DaemonStopArmed[$sid].At = [DateTimeOffset]::Now.AddMinutes(-5)
+$script:Activity = @()
+Clear-DaemonExpiredStopArms -Headers $headers -State @{}
+Test-That 'a session that has gone is still disarmed' { $script:DaemonStopArmed.Count -eq 0 }
+Test-That 'but nothing is published to its retired card' { $script:Activity.Count -eq 0 }
+
+Write-Host ''
+Write-Host '--- the prompt stays up while the transcript keeps flowing ---'
+# Ten seconds is not long to notice a line that the next batch of tool output would
+# otherwise wipe, which made the press look as though it had done nothing.
+
+$script:DaemonStopArmed = @{}
+[void](Set-DaemonStopArm -SessionId $sid -Status 'waiting')
+# Not $detail: Test-That declares a [string]$Detail parameter, and a script block it
+# runs resolves the name in *its* scope, so the hashtable would arrive as ''.
+$cardDetail = @{ response = 'half a sentence' }
+Test-That 'the status line is taken over while armed' {
+    (Get-DaemonCardSummary -SessionId $sid -Summary 'Running: grep' -Detail $cardDetail) -eq $script:CopilotEndSessionConfirmNote
+}
+Test-That 'the rest of the card stays live underneath' { $cardDetail.response -eq 'half a sentence' }
+Test-That 'and the prompt carries its own hint' { "$($cardDetail.hint)" -match 'lapses in' }
+# The status the user was told about at the press, not whatever the session has moved
+# on to since: rewriting the question underneath them would be worse than slightly
+# stale.
+Test-That 'the hint keeps saying what the press was answered about' {
+    "$($cardDetail.hint)" -match 'waiting on you'
+}
+
+$script:DaemonStopArmed = @{}
+Test-That 'an unarmed session reports what it is doing, as before' {
+    (Get-DaemonCardSummary -SessionId $sid -Summary 'Running: grep' -Detail @{}) -eq 'Running: grep'
+}
+
+# Every activity writer has to go through that guard, not only the daemon's
+# transcript streamers. A Claude Notification publishes its own status line straight
+# through Publish-BridgeSessionStatus, and arriving inside the window it replaced the
+# question while the session was still armed - so a user who read the vanished prompt
+# as a dead tap pressed again and ended the turn.
+function Set-CopilotMqttStatus {
+    param([string]$SessionId, [string]$Status, [hashtable]$Headers, [hashtable]$Attributes)
+}
+$script:DaemonStopArmed = @{}
+[void](Set-DaemonStopArm -SessionId $sid -Status 'working' -ProcessId 0)
+$script:Activity = @()
+Publish-BridgeSessionStatus -SessionId $sid -SessionName 'S' -Machine 'M' -Status 'waiting' `
+    -Activity 'Needs your permission' -Headers $headers
+Test-That 'an adapter publication cannot wipe the question either' {
+    $script:Activity[-1] -eq $script:CopilotEndSessionConfirmNote
+}
+
+# The case the in-process check cannot reach: a standalone Claude hook has neither
+# Get-DaemonCardSummary nor the daemon's in-memory arm, and was publishing its raw
+# activity straight over the question. Run in a real child process with only the
+# adapter loaded, so the daemon-free route is the one actually exercised.
+$childOut = Join-Path ([IO.Path]::GetTempPath()) "stop-prompt-$([guid]::NewGuid().ToString('N').Substring(0,8)).txt"
+$childScript = @"
+Set-StrictMode -Version Latest
+`$ErrorActionPreference = 'Stop'
+. '$((Join-Path $PSScriptRoot '..\hooks\decision-bridge-common.ps1'))'
+. '$((Join-Path $PSScriptRoot '..\hooks\decision-mqtt.ps1'))'
+. '$((Join-Path $PSScriptRoot '..\hooks\bridge-adapter.ps1'))'
+function Set-CopilotMqttStatus { param(`$SessionId, `$Status, `$Headers, `$Attributes) }
+function Set-CopilotMqttActivity {
+    param(`$SessionId, `$Summary, `$Detail, `$Headers)
+    Set-Content -LiteralPath '$childOut' -Value `$Summary -Encoding utf8
+}
+`$daemonLoaded = [bool](Get-Command -Name Get-DaemonCardSummary -CommandType Function -ErrorAction Ignore)
+if (`$daemonLoaded) { throw 'the child must not have daemon state' }
+Publish-BridgeSessionStatus -SessionId '$sid' -SessionName 'S' -Machine 'M' -Status 'waiting' ``
+    -Activity 'Needs your permission' -Headers @{}
+"@
+$childFile = Join-Path ([IO.Path]::GetTempPath()) "stop-prompt-child-$([guid]::NewGuid().ToString('N').Substring(0,8)).ps1"
+Set-Content -LiteralPath $childFile -Value $childScript -Encoding utf8
+# Not Get-Process: it is mocked above, and this needs the real executable.
+$pwshPath = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
+& $pwshPath -NoProfile -File $childFile 2>&1 | Out-Null
+Test-That 'a separate hook process cannot wipe it either' {
+    (Get-Content -LiteralPath $childOut -Raw).Trim() -eq $script:CopilotEndSessionConfirmNote
+}
+# And without a recorded question it publishes exactly what it always did.
+Remove-DaemonStopArm -SessionId $sid
+& $pwshPath -NoProfile -File $childFile 2>&1 | Out-Null
+Test-That 'and with none recorded it publishes what it always did' {
+    (Get-Content -LiteralPath $childOut -Raw).Trim() -eq 'Needs your permission'
+}
+Remove-Item -LiteralPath $childFile, $childOut -Force -ErrorAction SilentlyContinue
+
+$script:DaemonStopArmed = @{}
+$script:Activity = @()
+Publish-BridgeSessionStatus -SessionId $sid -SessionName 'S' -Machine 'M' -Status 'waiting' `
+    -Activity 'Needs your permission' -Headers $headers
+Test-That 'and an unarmed session publishes exactly what it used to' {
+    $script:Activity[-1] -eq 'Needs your permission'
+}
+
+Write-Host ''
+Write-Host '--- a confirmation is bound to the process it was armed against ---'
+# A session id outlives the process behind it: a session that exits and is resumed
+# keeps its id. Armed on the id alone, a second press confirmed against a process the
+# first press never saw - reproduced as one stop of the replacement pid.
+
+$script:ProcStarts = @{}
+function Invoke-TargetPress {
+    param([string]$Press, [int]$ProcessId, [hashtable]$Context)
+    $script:HaStates["button.${node}_stop"] = $Press
+    $Context.Live[$sid].ProcessId = $ProcessId
+    Invoke-PendingStops -Headers $headers -State $Context.State -Live $Context.Live
+}
+
+# Control: the same process throughout really does confirm.
+$script:ProcStarts = @{ 41001 = $epoch }
+$ctx = Reset-PressTest -Press '2026-06-01T12:00:00+00:00' -Status 'working'
+$ctx.Live[$sid] | Add-Member -NotePropertyName ProcessId -NotePropertyValue 41001 -Force
+Invoke-TargetPress -Press '2026-06-01T12:00:00+00:00' -ProcessId 41001 -Context $ctx
+Invoke-TargetPress -Press '2026-06-01T12:00:04+00:00' -ProcessId 41001 -Context $ctx
+Test-That 'an unchanged target confirms and stops exactly that process' {
+    $script:Stopped.Count -eq 1 -and $script:Stopped[0].ProcessId -eq 41001
+}
+
+# The reported failure: the session is replaced between the two presses.
+$script:ProcStarts = @{ 41001 = $epoch; 41002 = $epoch.AddMinutes(1) }
+$ctx = Reset-PressTest -Press '2026-06-01T12:00:00+00:00' -Status 'working'
+Invoke-TargetPress -Press '2026-06-01T12:00:00+00:00' -ProcessId 41001 -Context $ctx
+Invoke-TargetPress -Press '2026-06-01T12:00:04+00:00' -ProcessId 41002 -Context $ctx
+Test-That 'a replaced process is never stopped by the first press_s confirmation' { $script:Stopped.Count -eq 0 }
+Test-That 'it asks again, against the new target' {
+    $script:Activity[-1] -eq $script:CopilotEndSessionConfirmNote -and
+    [int]$script:DaemonStopArmed[$sid].ProcessId -eq 41002
+}
+# And the re-armed question is answerable, so the guard does not become a trap.
+Invoke-TargetPress -Press '2026-06-01T12:00:08+00:00' -ProcessId 41002 -Context $ctx
+Test-That 'a second press against the new target confirms normally' {
+    $script:Stopped.Count -eq 1 -and $script:Stopped[0].ProcessId -eq 41002
+}
+
+# Windows reuses process ids, so the number alone is not an identity.
+$script:ProcStarts = @{ 41001 = $epoch }
+$ctx = Reset-PressTest -Press '2026-06-01T12:00:00+00:00' -Status 'working'
+Invoke-TargetPress -Press '2026-06-01T12:00:00+00:00' -ProcessId 41001 -Context $ctx
+$script:ProcStarts = @{ 41001 = $epoch.AddMinutes(5) }
+Invoke-TargetPress -Press '2026-06-01T12:00:04+00:00' -ProcessId 41001 -Context $ctx
+Test-That 'a reused process id is not the process that was armed' { $script:Stopped.Count -eq 0 }
+
+# Armed before the daemon knew the pid, confirmed after it learned one. There is no
+# arm to inherit now - a press with no process never takes one - so what must hold is
+# that the press which does have a target still has to ask.
+$script:ProcStarts = @{ 41002 = $epoch }
+$ctx = Reset-PressTest -Press '2026-06-01T12:00:00+00:00' -Status 'working'
+Invoke-TargetPress -Press '2026-06-01T12:00:00+00:00' -ProcessId 0 -Context $ctx
+$stoppedWithNoTarget = $script:Stopped.Count
+Invoke-TargetPress -Press '2026-06-01T12:00:04+00:00' -ProcessId 41002 -Context $ctx
+Test-That 'a press with no target leaves nothing for a real one to inherit' {
+    $script:Stopped.Count -eq $stoppedWithNoTarget -and
+    $script:Activity[-1] -eq $script:CopilotEndSessionConfirmNote
+}
+
+# Readable when armed, unreadable when confirmed: unverifiable is not consent.
+$script:ProcStarts = @{ 41001 = $epoch }
+$ctx = Reset-PressTest -Press '2026-06-01T12:00:00+00:00' -Status 'working'
+Invoke-TargetPress -Press '2026-06-01T12:00:00+00:00' -ProcessId 41001 -Context $ctx
+$script:ProcStarts = @{}
+Invoke-TargetPress -Press '2026-06-01T12:00:04+00:00' -ProcessId 41001 -Context $ctx
+Test-That 'an identity that can no longer be read is not consent' { $script:Stopped.Count -eq 0 }
+
+# Unreadable on BOTH presses. Treating that as a match would confirm against exactly
+# the targets nothing can vouch for - the same positive pid can be a different
+# process each time - so there is no success-shaped exception for it.
+$script:ProcStarts = @{}
+$ctx = Reset-PressTest -Press '2026-06-01T12:00:00+00:00' -Status 'working'
+Invoke-TargetPress -Press '2026-06-01T12:00:00+00:00' -ProcessId 41001 -Context $ctx
+Invoke-TargetPress -Press '2026-06-01T12:00:04+00:00' -ProcessId 41001 -Context $ctx
+Test-That 'an identity unreadable on both presses never confirms' { $script:Stopped.Count -eq 0 }
+Test-That 'and it is the real handler refusing, not a stubbed comparison' {
+    $null -eq $script:DaemonStopArmed[$sid].Identity -and $script:Activity[-1] -eq $script:CopilotEndSessionConfirmNote
+}
+
+# No process at all is a different thing from an unverifiable one. Nothing can be
+# lost - the stop reports 'no process id' and touches nothing - and arming would post
+# a question no second press could ever answer, then leave it on the card.
+$script:ProcStarts = @{}
+$ctx = Reset-PressTest -Press '2026-06-01T12:00:00+00:00' -Status 'working'
+Invoke-TargetPress -Press '2026-06-01T12:00:00+00:00' -ProcessId 0 -Context $ctx
+Test-That 'a press with no process arms nothing' { $script:DaemonStopArmed.Count -eq 0 }
+Test-That 'and is answered honestly rather than silently' {
+    $script:Stopped.Count -eq 1 -and $script:Stopped[0].ProcessId -eq 0
+}
+Invoke-TargetPress -Press '2026-06-01T12:00:04+00:00' -ProcessId 0 -Context $ctx
+Test-That 'so a second such press cannot inherit a confirmation' {
+    $script:Stopped.Count -eq 2 -and $script:DaemonStopArmed.Count -eq 0
+}
+
+Write-Host ''
+Write-Host '--- a question the card never showed cannot be answered ---'
+# Left armed after a failed publish, the user_s natural retry - pressing again
+# because the first press looked dead - was read as the confirmation.
+
+$script:ActivityThrows = $false
+function Set-CopilotMqttActivity {
+    param([string]$SessionId, [string]$Summary, $Detail, [hashtable]$Headers)
+    if ($script:ActivityThrows) { throw 'Home Assistant is unreachable' }
+    $script:Activity += $Summary
+    $script:ActivityDetail = $Detail
+}
+
+$script:ProcStarts = @{ 41001 = $epoch }
+$ctx = Reset-PressTest -Press '2026-06-01T12:00:00+00:00' -Status 'working'
+$script:ActivityThrows = $true
+Invoke-TargetPress -Press '2026-06-01T12:00:00+00:00' -ProcessId 41001 -Context $ctx
+Test-That 'a prompt that could not be published disarms' { $script:DaemonStopArmed.Count -eq 0 }
+$script:ActivityThrows = $false
+Invoke-TargetPress -Press '2026-06-01T12:00:04+00:00' -ProcessId 41001 -Context $ctx
+Test-That 'so the retry asks rather than ending the session' { $script:Stopped.Count -eq 0 }
+Test-That 'and the question is shown this time' {
+    $script:Activity[-1] -eq $script:CopilotEndSessionConfirmNote
+}
+
+Write-Host ''
+Write-Host '--- the lapse note is not lost to an outage ---'
+# The arm is released only once the card has been told, or a session would be left
+# asking for a press that no longer confirms anything with nothing left to retry.
+
+$ctx = Reset-PressTest -Press '2026-06-01T12:00:00+00:00' -Status 'waiting'
+Invoke-TargetPress -Press '2026-06-01T12:00:00+00:00' -ProcessId 41001 -Context $ctx
+$script:DaemonStopArmed[$sid].At = [DateTimeOffset]::Now.AddSeconds(-($script:DaemonConfig.StopConfirmSeconds + 1))
+$script:ActivityThrows = $true
+Clear-DaemonExpiredStopArms -Headers $headers -State $ctx.State
+Test-That 'a lapse that could not be published keeps the arm to retry from' {
+    $script:DaemonStopArmed.Count -eq 1
+}
+$script:ActivityThrows = $false
+$script:DaemonStopArmed[$sid].RetryAt = [DateTimeOffset]::Now.AddSeconds(-1)
+Clear-DaemonExpiredStopArms -Headers $headers -State $ctx.State
+Test-That 'the retry publishes it and releases the arm' {
+    $script:DaemonStopArmed.Count -eq 0 -and $script:Activity[-1] -eq $script:CopilotEndSessionLapsedNote
+}
+
+# A quiet session - waiting, writing no transcript - produces nothing that would
+# replace the question on its own, so giving up on the note after a while would leave
+# the card asking for a press that confirms nothing, with no retry state left and
+# recovery unable to fix it. The arm is held until the note actually lands.
+$ctx = Reset-PressTest -Press '2026-06-01T12:00:00+00:00' -Status 'waiting'
+Invoke-TargetPress -Press '2026-06-01T12:00:00+00:00' -ProcessId 41001 -Context $ctx
+$script:DaemonStopArmed[$sid].At = [DateTimeOffset]::Now.AddSeconds(-($script:DaemonConfig.StopConfirmSeconds + 1))
+$script:ActivityThrows = $true
+foreach ($sweep in 1..6) {
+    $script:DaemonStopArmed[$sid].RetryAt = [DateTimeOffset]::Now.AddSeconds(-1)
+    Clear-DaemonExpiredStopArms -Headers $headers -State $ctx.State
+}
+Test-That 'a long outage never abandons a quiet session_s lapse note' {
+    $script:DaemonStopArmed.Count -eq 1
+}
+$script:ActivityThrows = $false
+$script:DaemonStopArmed[$sid].RetryAt = [DateTimeOffset]::Now.AddSeconds(-1)
+Clear-DaemonExpiredStopArms -Headers $headers -State $ctx.State
+Test-That 'and recovery still replaces the question on its card' {
+    $script:DaemonStopArmed.Count -eq 0 -and $script:Activity[-1] -eq $script:CopilotEndSessionLapsedNote
+}
+# The one event that does make the note pointless is the card going away.
+[void](Set-DaemonStopArm -SessionId $sid -Status 'waiting' -ProcessId 41001)
+$script:DaemonStopArmed[$sid].At = [DateTimeOffset]::Now.AddSeconds(-($script:DaemonConfig.StopConfirmSeconds + 1))
+$script:Activity = @()
+Clear-DaemonExpiredStopArms -Headers $headers -State @{}
+Test-That 'a retired card releases the arm with nothing published' {
+    $script:DaemonStopArmed.Count -eq 0 -and $script:Activity.Count -eq 0
+}
+$script:ActivityThrows = $false
+
+Write-Host ''
+Write-Host '--- the shared prompt store fails closed ---'
+# The store is what stops a publisher in another process wiping a visible question.
+# Every case below drives the real store and the real callers; none substitutes a
+# store result.
+
+$promptPath = Get-BridgeStopPromptPath
+Remove-Item -LiteralPath $promptPath -Force -ErrorAction SilentlyContinue
+
+# An arm whose record cannot be written is consent nobody else can see. A directory
+# in the file's place is a real, unmockable write failure.
+$script:DaemonStopArmed = @{}
+[void][IO.Directory]::CreateDirectory($promptPath)
+Test-That 'a record that cannot be written refuses the arm' {
+    (Set-DaemonStopArm -SessionId $sid -Status 'working' -ProcessId 41001) -eq $false
+}
+Test-That 'and leaves nothing armed to confirm against' { $script:DaemonStopArmed.Count -eq 0 }
+$script:ProcStarts = @{ 41001 = $epoch }
+$ctx = Reset-PressTest -Press '2026-06-01T12:00:00+00:00' -Status 'working'
+$script:Activity = @()
+Invoke-TargetPress -Press '2026-06-01T12:00:00+00:00' -ProcessId 41001 -Context $ctx
+Invoke-TargetPress -Press '2026-06-01T12:00:04+00:00' -ProcessId 41001 -Context $ctx
+Test-That 'so two presses through the real handler still stop nothing' { $script:Stopped.Count -eq 0 }
+# Asking would be worse than saying nothing. There is no arm, so no expiry sweep entry
+# and nothing that will ever lapse the question - on a quiet session it would sit there
+# asking for a press that could never be accepted.
+Test-That 'and the card is told the press could not be acted on' {
+    $script:Activity[-1] -eq 'Could not end session'
+}
+Test-That 'rather than being asked to confirm something that is not armed' {
+    $script:Activity -notcontains $script:CopilotEndSessionConfirmNote
+}
+$script:Activity = @()
+Clear-DaemonExpiredStopArms -Headers $headers -State $ctx.State
+Test-That 'a press that never armed leaves no lapse to publish' { $script:Activity.Count -eq 0 }
+Remove-Item -LiteralPath $promptPath -Recurse -Force -ErrorAction SilentlyContinue
+
+# A document that cannot be read is not a document that says nothing.
+Set-Content -LiteralPath $promptPath -Value '{"a":{"until":' -Encoding utf8
+Test-That 'a truncated document reads as a failure, not as empty' {
+    (Read-BridgeStopPromptStore).State -eq 'Failed'
+}
+Test-That 'and a lookup says it does not know' { (Get-BridgeStopPrompt -SessionId $sid).State -eq 'Unknown' }
+Test-That 'a record is refused rather than blindly overwriting the others' {
+    (Write-BridgeStopPrompt -SessionId $sid -Until ([datetimeoffset]::Now.AddSeconds(10))) -eq $false
+}
+foreach ($shape in @('null', '[1,2]', '"text"', '{"a":"notanobject"}', '{"a":{"until":"not-a-time"}}')) {
+    Set-Content -LiteralPath $promptPath -Value $shape -Encoding utf8
+    Test-That "a document holding $shape is rejected rather than throwing" {
+        (Read-BridgeStopPromptStore).State -eq 'Failed' -and
+        (Get-BridgeStopPrompt -SessionId $sid).State -eq 'Unknown'
+    }
+}
+Test-That 'a per-session clear is refused too, rather than deleting the whole store' {
+    # It used to be honoured, on the grounds that removing the document repairs it.
+    # But a per-session clear removes the whole file, and the other sessions recorded
+    # in it keep their arms - so their questions were unpinned while a second press
+    # could still confirm them.
+    (Write-BridgeStopPrompt -SessionId $sid -Until $null) -eq $false -and (Test-Path -LiteralPath $promptPath)
+}
+Test-That 'and whole-store repair is what removes it' {
+    (Clear-BridgeStopPromptStore) -eq $true -and -not (Test-Path -LiteralPath $promptPath)
+}
+
+# Two sessions, one store. Repair by deletion while another session's arm is still
+# live is the cross-writer defect arriving through the repair itself: that session can
+# still confirm a second press, but nothing is left pinning its question, so the next
+# standalone publisher writes straight over it.
+$sidB = 'cccccccc-1111-2222-3333-444444444444'
+$script:ProcStarts = @{ 41001 = $epoch; 41002 = $epoch }
+$script:DaemonStopArmed = @{}
+[void](Set-DaemonStopArm -SessionId $sid -Status 'working' -ProcessId 41001)
+[void](Set-DaemonStopArm -SessionId $sidB -Status 'working' -ProcessId 41002)
+Test-That 'two sessions can hold questions at the same time' {
+    (Get-BridgeStopPrompt -SessionId $sid).State -eq 'Prompt' -and
+    (Get-BridgeStopPrompt -SessionId $sidB).State -eq 'Prompt'
+}
+Remove-DaemonStopArm -SessionId $sid
+Test-That 'a healthy clear of one leaves the other asking' {
+    (Get-BridgeStopPrompt -SessionId $sid).State -eq 'None' -and
+    (Get-BridgeStopPrompt -SessionId $sidB).State -eq 'Prompt' -and
+    $script:DaemonStopArmed.ContainsKey($sidB)
+}
+
+# The same pair, with the document corrupted underneath them.
+[void](Set-DaemonStopArm -SessionId $sid -Status 'working' -ProcessId 41001)
+Set-Content -LiteralPath $promptPath -Value '{"a":{"until":' -Encoding utf8
+Remove-DaemonStopArm -SessionId $sid
+Test-That 'clearing one session never leaves another armed with no question recorded' {
+    -not ((Get-BridgeStopPrompt -SessionId $sidB).State -eq 'None' -and
+          $script:DaemonStopArmed.ContainsKey($sidB))
+}
+Test-That 'repairing an unreadable store disarms the consent it would strand' {
+    $script:DaemonStopArmed.Count -eq 0 -and -not (Test-Path -LiteralPath $promptPath)
+}
+Test-That 'so that session asks again rather than confirming' {
+    (Test-DaemonStopConfirms -SessionId $sidB -ProcessId 41002) -eq $false
+}
+$script:DaemonStopArmed = @{}
+$script:ProcStarts = @{ 41001 = $epoch }
+
+# A reader in another process must never see a half-written document.
+$script:DaemonStopArmed = @{}
+Test-That 'arming records the question' {
+    (Set-DaemonStopArm -SessionId $sid -Status 'working' -ProcessId 41001) -eq $true
+}
+Test-That 'a published record is complete and parseable to a competing reader' {
+    (Get-Content -LiteralPath $promptPath -Raw).Trim().EndsWith('}') -and
+    (Read-BridgeStopPromptStore).State -eq 'Ok'
+}
+Test-That 'no temporary file is left beside it' { -not (Test-Path -LiteralPath "$promptPath.pending") }
+Test-That 'and that reader sees the question' { (Get-BridgeStopPrompt -SessionId $sid).State -eq 'Prompt' }
+
+# What a hook in its own process does with each answer, through the real publisher.
+$childOut2 = Join-Path ([IO.Path]::GetTempPath()) "stop-store-$([guid]::NewGuid().ToString('N').Substring(0,8)).txt"
+$childScript2 = @"
+Set-StrictMode -Version Latest
+`$ErrorActionPreference = 'Stop'
+. '$((Join-Path $PSScriptRoot '..\hooks\decision-bridge-common.ps1'))'
+. '$((Join-Path $PSScriptRoot '..\hooks\decision-mqtt.ps1'))'
+. '$((Join-Path $PSScriptRoot '..\hooks\bridge-adapter.ps1'))'
+function Set-CopilotMqttStatus { param(`$SessionId, `$Status, `$Headers, `$Attributes) }
+function Set-CopilotMqttActivity {
+    param(`$SessionId, `$Summary, `$Detail, `$Headers)
+    Add-Content -LiteralPath '$childOut2' -Value `$Summary -Encoding utf8
+}
+Publish-BridgeSessionStatus -SessionId '$sid' -SessionName 'S' -Machine 'M' -Status 'waiting' ``
+    -Activity 'Needs your permission' -Headers @{}
+"@
+$childFile2 = Join-Path ([IO.Path]::GetTempPath()) "stop-store-child-$([guid]::NewGuid().ToString('N').Substring(0,8)).ps1"
+Set-Content -LiteralPath $childFile2 -Value $childScript2 -Encoding utf8
+Set-Content -LiteralPath $promptPath -Value '{"a":{"until":' -Encoding utf8
+& $pwshPath -NoProfile -File $childFile2 2>&1 | Out-Null
+Test-That 'an unreadable store makes a hook withhold the line rather than wipe it' {
+    -not (Test-Path -LiteralPath $childOut2)
+}
+Remove-Item -LiteralPath $promptPath -Force -ErrorAction SilentlyContinue
+& $pwshPath -NoProfile -File $childFile2 2>&1 | Out-Null
+Test-That 'while a genuinely absent store publishes normally' {
+    (Get-Content -LiteralPath $childOut2 -Raw).Trim() -eq 'Needs your permission'
+}
+Remove-Item -LiteralPath $childFile2, $childOut2 -Force -ErrorAction SilentlyContinue
+
+Write-Host ''
+Write-Host '--- loading the daemon for its functions leaves a running one alone ---'
+# The clearing loop used to sit where the shared state is declared, which runs on
+# every dot-source. A hook or a test loading the daemon under NORUN therefore unpinned
+# the questions of the daemon that was actually running.
+$script:DaemonStopArmed = @{}
+[void](Set-DaemonStopArm -SessionId $sid -Status 'working' -ProcessId 41001)
+$norunProbe = Join-Path ([IO.Path]::GetTempPath()) "stop-norun-$([guid]::NewGuid().ToString('N').Substring(0,8)).ps1"
+Set-Content -LiteralPath $norunProbe -Encoding utf8 -Value @"
+`$env:AGENT_BRIDGE_DAEMON_NORUN = '1'
+. '$((Join-Path $PSScriptRoot '..\hooks\agent-bridge-daemon.ps1'))'
+"@
+& $pwshPath -NoProfile -File $norunProbe 2>&1 | Out-Null
+Test-That 'a NORUN load preserves records it did not create' {
+    (Get-BridgeStopPrompt -SessionId $sid).State -eq 'Prompt'
+}
+Clear-DaemonStopPrompts
+Test-That 'and actual startup is what clears them' {
+    (Get-BridgeStopPrompt -SessionId $sid).State -eq 'None' -and -not (Test-Path -LiteralPath $promptPath)
+}
+Test-That 'an unreadable store is repaired at startup rather than left' {
+    Set-Content -LiteralPath $promptPath -Value '{"a":{"until":' -Encoding utf8
+    Clear-DaemonStopPrompts
+    -not (Test-Path -LiteralPath $promptPath)
+}
+Remove-Item -LiteralPath $norunProbe -Force -ErrorAction SilentlyContinue
+$script:DaemonStopArmed = @{}
 
 # --- discovery payloads ----------------------------------------------------------
 

@@ -8,8 +8,273 @@
     declaring the shared $script: state; see docs/daemon-split.md.
     Shared state it changes: DaemonDefaultAgent, DaemonLaunchedTuning,
     DaemonNewSessionLastPress, DaemonNewSessionPublished, DaemonNewSessionSignature,
-    DaemonPendingLaunch, DaemonReconcileNow, DaemonResumeCache, DaemonResumeCacheAt.
+    DaemonPendingLaunch, DaemonReconcileNow, DaemonResumeCache, DaemonResumeCacheAt,
+    DaemonStopArmed.
 #>
+
+function Get-DaemonProcessIdentity {
+    <#
+        What identifies the process a confirmation was armed against, beyond its id.
+
+        A process id alone is not an identity: Windows reuses them, so a session that
+        exits and is replaced within the window can present the same number attached
+        to a different process. The start time pins it. Returns $null when there is
+        nothing to pin - no id, or a process this daemon cannot read - and a $null on
+        either side is treated as unverifiable rather than as a match.
+    #>
+    param([int]$ProcessId = 0)
+
+    if ($ProcessId -le 0) { return $null }
+    try {
+        $process = Get-Process -Id $ProcessId -ErrorAction Stop
+        return $process.StartTime.ToUniversalTime().Ticks
+    }
+    catch { return $null }
+}
+
+function Set-DaemonStopArm {
+    <#
+        Arms End session for one session, remembering when, what a second press would
+        interrupt, and which process it would interrupt.
+
+        The status is kept here rather than read again when the prompt is republished:
+        it is what the user was told the first time, and a session that moved on in
+        the meantime would otherwise rewrite the question underneath them.
+
+        The target is kept for a harder reason. A session id outlives the process
+        behind it - a session that exits and is resumed keeps its id - so an arm keyed
+        on the id alone would let a second press end a process the first press never
+        saw. Recorded here and checked before confirming (Test-DaemonStopConfirms).
+
+        The question is also recorded where other processes can see it, so a hook
+        publishing its own status line cannot wipe it. That record is display state
+        and cannot confirm anything; see Write-BridgeStopPrompt.
+
+        Returns $true only when both the arm and its record are in place.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [AllowEmptyString()][string]$Status = '',
+        [int]$ProcessId = 0
+    )
+
+    $armedAt = [DateTimeOffset]::Now
+    $hint = Get-DaemonStopConfirmHint -Status $Status
+    # The record first, and the arm only if it was written. An arm whose projection is
+    # missing is consent nothing else can see: the next hook to publish wipes the
+    # question from the card while a second press still confirms, which is the whole
+    # defect the record exists to close. Failing to arm costs an extra press; arming
+    # blind costs the turn.
+    if (-not (Write-BridgeStopPrompt -SessionId $SessionId -Hint $hint `
+            -Until $armedAt.AddSeconds($script:DaemonConfig.StopConfirmSeconds))) {
+        [void]$script:DaemonStopArmed.Remove($SessionId)
+        return $false
+    }
+    $script:DaemonStopArmed[$SessionId] = [pscustomobject]@{
+        At        = $armedAt
+        Status    = $Status
+        Hint      = $hint
+        ProcessId = $ProcessId
+        Identity  = Get-DaemonProcessIdentity -ProcessId $ProcessId
+        # When the lapse note may next be attempted. Only moves when a publish fails,
+        # so the ordinary path pays nothing for it.
+        RetryAt   = [DateTimeOffset]::MinValue
+    }
+    $true
+}
+
+function Remove-DaemonStopArm {
+    <#
+        Drops an arm and the question other processes were pinning on its behalf.
+
+        The arm goes whether or not the record can be cleared. A record left behind
+        keeps a question on a card until its own expiry, seconds away; an arm left
+        behind could stop a session.
+
+        An unreadable store is the awkward case. It cannot be repaired one session at
+        a time - see Write-BridgeStopPrompt - and leaving it would hold every session
+        at Unknown until the next restart. Clearing it wholesale is safe only once
+        nothing is left that could be confirmed against a record that no longer
+        exists, so every other arm is dropped first. Those sessions ask again on their
+        next press, which is the direction that cannot lose work.
+    #>
+    param([Parameter(Mandatory)][string]$SessionId)
+
+    [void]$script:DaemonStopArmed.Remove($SessionId)
+    if (Write-BridgeStopPrompt -SessionId $SessionId -Until $null) { return }
+
+    if ((Read-BridgeStopPromptStore).State -eq 'Failed') {
+        $stranded = @($script:DaemonStopArmed.Keys).Count
+        $script:DaemonStopArmed.Clear()
+        if (Clear-BridgeStopPromptStore) {
+            Write-DaemonLog -Message ("the end prompt store could not be read; cleared it whole and " +
+                "disarmed $stranded other session(s), which must be asked again")
+            return
+        }
+    }
+    Write-DaemonLog -Message "could not clear the recorded end prompt for $SessionId; it expires on its own"
+}
+
+function Clear-DaemonStopPrompts {
+    <#
+        Drops every recorded question at daemon startup.
+
+        Kept out of this file's load path on purpose. Clearing where the shared state
+        is declared meant that merely dot-sourcing the daemon for its functions - which
+        hooks and tests do, under AGENT_BRIDGE_DAEMON_NORUN - wiped the records of a
+        daemon that was actually running, unpinning live questions on another process's
+        cards.
+
+        Nothing this daemon did not arm itself may be left showing, for the same reason
+        the in-memory arms are not restored: a question from before a restart has no
+        arm behind it and could never be answered. That is what makes clearing the
+        whole store safe here and not on a per-session path - there is no consent left
+        for it to strand.
+    #>
+    if (-not (Clear-BridgeStopPromptStore)) {
+        Write-DaemonLog -Message 'could not clear the recorded end prompts at startup'
+    }
+}
+
+function Test-DaemonStopConfirms {
+    <#
+        Whether this press confirms the arm already held for the session, rather than
+        being a first press against a different target.
+
+        Confirms only on positive proof: the arm is inside its window, the process now
+        behind the session carries the same id, and that id carries the same process it
+        carried when the arm was taken. Anything short of that - a replaced process, a
+        reused id, an identity unreadable on either side - is not consent.
+
+        There is deliberately no success-shaped exception for the unverifiable case.
+        Treating "unreadable then, unreadable now" as a match would confirm against
+        exactly the targets nothing can vouch for, which is the opposite of what the
+        comparison is for. A press with no target at all never reaches here; see
+        Invoke-PendingStops.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [int]$ProcessId = 0
+    )
+
+    if ($ProcessId -le 0) { return $false }
+    if (-not (Test-DaemonStopArmed -SessionId $SessionId)) { return $false }
+    $arm = $script:DaemonStopArmed[$SessionId]
+    if ([int]$arm.ProcessId -ne $ProcessId) { return $false }
+    if ($null -eq $arm.Identity) { return $false }
+    $now = Get-DaemonProcessIdentity -ProcessId $ProcessId
+    if ($null -eq $now) { return $false }
+    [long]$arm.Identity -eq [long]$now
+}
+
+function Test-DaemonStopArmed {
+    <#
+        True while a first press of End session is still waiting for the second press
+        that confirms it.
+
+        Deliberately does not remove an arm that has run out of time; only
+        Clear-DaemonExpiredStopArms does that, and it says so on the card as it goes.
+        Removing it here as well would mean whichever of the two looked first
+        swallowed the lapse silently, leaving the card asking for a press that no
+        longer confirms anything.
+    #>
+    param([Parameter(Mandatory)][string]$SessionId)
+
+    if (-not $script:DaemonStopArmed.ContainsKey($SessionId)) { return $false }
+    $armedAt = ConvertTo-DaemonActivityInstant -Value $script:DaemonStopArmed[$SessionId].At
+    if ($null -eq $armedAt) { return $false }
+    ([DateTimeOffset]::Now - $armedAt).TotalSeconds -le $script:DaemonConfig.StopConfirmSeconds
+}
+
+function Get-DaemonStopConfirmHint {
+    <# The line under the confirmation prompt, naming what a second press interrupts. #>
+    param([AllowEmptyString()][string]$Status = '')
+
+    $doing = if ([string]::IsNullOrWhiteSpace($Status) -or $Status -eq 'working') { 'this session is still working' }
+        elseif ($Status -eq 'waiting') { 'this session is waiting on you' }
+        else { "this session is $Status" }
+    "$doing - the confirmation lapses in $($script:DaemonConfig.StopConfirmSeconds)s"
+}
+
+function Get-DaemonCardSummary {
+    <#
+        The status line to publish for a session: what it is doing, unless End session
+        is armed, in which case the question it is waiting on.
+
+        Pinned rather than published once at the press, because the transcript keeps
+        flowing underneath. A batch of tool output arriving a second later replaces the
+        activity summary wholesale, which wiped the prompt and left the press looking
+        as though it had done nothing - with only ten seconds to notice.
+
+        Only the summary is taken over; the response, the reasoning and the history in
+        $Detail stay live, so the card still shows what the session is up to while it
+        asks.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Summary,
+        [hashtable]$Detail
+    )
+
+    if (-not (Test-DaemonStopArmed -SessionId $SessionId)) { return $Summary }
+    if ($null -ne $Detail) {
+        $Detail['hint'] = Get-DaemonStopConfirmHint -Status ([string]$script:DaemonStopArmed[$SessionId].Status)
+    }
+    $script:CopilotEndSessionConfirmNote
+}
+
+function Clear-DaemonExpiredStopArms {
+    <#
+        Disarms an End session confirmation nobody made in time, and says so on the
+        card.
+
+        The note matters as much as the disarming. A session parked on 'waiting'
+        writes no transcript, so nothing else would ever replace the pinned prompt:
+        the card would go on asking for a second press that had quietly stopped being
+        a confirmation and become a fresh first press.
+
+        So the arm is released only once that note has actually been published. If
+        Home Assistant is unreachable at the moment the window expires, dropping the
+        arm first would leave the card asking forever with nothing left to retry from
+        - and a quiet session produces no later activity to replace it, so recovery
+        alone would not fix it. Retried on a backoff rather than every tick, and given
+        up only when the session's card goes, which is the one event that makes the
+        note pointless.
+
+        Called from the fast lane, so the lapse shows within a tick rather than at the
+        next reconcile - a fifteen-second wait on a ten-second window.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [Parameter(Mandatory)][hashtable]$State
+    )
+
+    $now = [DateTimeOffset]::Now
+    foreach ($sessionId in @($script:DaemonStopArmed.Keys)) {
+        if (Test-DaemonStopArmed -SessionId $sessionId) { continue }
+        $arm = $script:DaemonStopArmed[$sessionId]
+
+        # Nothing left to tell: the session's card has already gone.
+        if (-not $State.ContainsKey($sessionId)) {
+            Remove-DaemonStopArm -SessionId $sessionId
+            continue
+        }
+        if ($now -lt (ConvertTo-DaemonActivityInstant -Value $arm.RetryAt)) { continue }
+
+        $short = $sessionId.Substring(0, [Math]::Min(8, $sessionId.Length))
+        try {
+            Set-DaemonTransientActivity -SessionId $sessionId -Summary $script:CopilotEndSessionLapsedNote `
+                -Extra @{ hint = "no second press within $($script:DaemonConfig.StopConfirmSeconds)s" } `
+                -Headers $Headers
+            Remove-DaemonStopArm -SessionId $sessionId
+            Write-DaemonLog -Message "end confirmation for $short lapsed; the session is still running"
+        }
+        catch {
+            if ($_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+            $arm.RetryAt = $now.AddSeconds($script:DaemonConfig.StopLapseRetrySeconds)
+        }
+    }
+}
 
 function Invoke-PendingStops {
     <#
@@ -19,6 +284,18 @@ function Invoke-PendingStops {
         press from before this daemon started is a retained value from an earlier
         run, and a press already acted on is recorded per session so one press can
         never end two sessions or the same session twice.
+
+        A session that is not idle takes two presses. End sits on the card a tap away
+        from Send, and a stray tap that lands mid-turn throws away the turn in flight
+        - the transcript survives and the session can be resumed, but what it was
+        doing does not come back. So the first press only arms and says so; the second
+        press, within StopConfirmSeconds, is the one that ends it. An idle session has
+        nothing in flight to lose and still ends on a single press.
+
+        Deliberately enforced here and not as a confirmation dialog on the dashboard
+        card. The same button is pressed from a phone, from an automation and by other
+        agents, and only the daemon sees all of those; a dialog would guard the one
+        surface and leave the rest ending a working session on a single press.
 
         Ending is graceful - `/exit` typed into the console - so the CLI writes its
         transcript and releases its lock. The session therefore stays resumable, and
@@ -64,6 +341,76 @@ function Invoke-PendingStops {
         if ($session.PSObject.Properties['ProcessId'] -and $session.ProcessId) { $processId = [int]$session.ProcessId }
 
         $short = $sessionId.Substring(0, [Math]::Min(8, $sessionId.Length))
+
+        # The guard. A session with no status yet is treated as not idle: the daemon
+        # has not classified it, so it may well be mid-turn, and asking for a second
+        # press is the direction that cannot lose work.
+        #
+        # A press with no process behind it is let through unguarded, which sounds
+        # wrong and is not. Stop-BridgeCopilotSession cannot touch anything without a
+        # process id and says so, so nothing can be lost; arming instead would post a
+        # question that no second press could ever answer, and leave it on the card.
+        #
+        # Test-DaemonStopConfirms, not merely "is it armed": a session id outlives the
+        # process behind it, so an arm keyed on the id alone let a press confirm
+        # against a process the first press never saw. A replaced target, a reused
+        # process id or an identity that cannot be vouched for all arm again here
+        # rather than stopping.
+        #
+        # The window is measured from this machine's clock rather than the press
+        # timestamp, which is Home Assistant's; the two are usually within
+        # milliseconds, but nothing guarantees it and a skewed pair would either arm
+        # for no time at all or stay armed long after the card said it had lapsed.
+        $status = if ($entry.PSObject.Properties['Status']) { [string]$entry.Status } else { '' }
+        if ($processId -gt 0 -and $status -ne 'idle' -and
+            -not (Test-DaemonStopConfirms -SessionId $sessionId -ProcessId $processId)) {
+            $rearmed = $script:DaemonStopArmed.ContainsKey($sessionId)
+            $armed = Set-DaemonStopArm -SessionId $sessionId -Status $status -ProcessId $processId
+            Write-DaemonLog -Message ("end requested for $short (pid $processId) while " +
+                "$(if ($status) { $status } else { 'unclassified' })" +
+                "$(if (-not $armed) { '; could not record the question, so nothing is armed' }
+                   elseif ($rearmed) { '; target changed, arming again' }
+                   else { '; waiting for a second press' })")
+            # Only ask when something can answer. A failed arm leaves no arm, and so no
+            # entry for the expiry sweep to lapse: the question would sit on a quiet
+            # session's card indefinitely, asking for a press that could confirm
+            # nothing. Say that the press could not be acted on instead.
+            $summary = $script:CopilotEndSessionConfirmNote
+            $extra = @{ hint = (Get-DaemonStopConfirmHint -Status $status) }
+            if (-not $armed) {
+                $summary = 'Could not end session'
+                $extra = @{
+                    error = 'the confirmation could not be recorded, so nothing was armed'
+                    hint  = 'Press End session again to try again.'
+                }
+            }
+            try {
+                Set-DaemonTransientActivity -SessionId $sessionId -Summary $summary `
+                    -Extra $extra -Headers $Headers
+            }
+            catch {
+                if ($_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+                if ($armed) {
+                    # The card never showed the question, so nothing can answer it. Left
+                    # armed, the user's natural retry - pressing again because the first
+                    # press looked dead - would be read as the confirmation and stop the
+                    # session, which is precisely what this guard exists to prevent.
+                    Remove-DaemonStopArm -SessionId $sessionId
+                    Write-DaemonLog -Message ("end confirmation for $short could not be shown, " +
+                        "disarming: $($_.Exception.Message)")
+                }
+                else {
+                    # Nothing was armed, so there is nothing to disarm; calling the
+                    # removal here would start the unreadable-store repair on a press
+                    # that never armed anything.
+                    Write-DaemonLog -Message ("end failure note for $short could not be shown: " +
+                        "$($_.Exception.Message)")
+                }
+            }
+            continue
+        }
+        Remove-DaemonStopArm -SessionId $sessionId
+
         Write-DaemonLog -Message "end requested for $short (pid $processId)"
 
         # Say so on the card straight away: the status reads "ending" while the

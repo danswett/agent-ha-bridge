@@ -152,6 +152,16 @@ $script:DaemonConfig = @{
     # those. Ten minutes for the same reason the Send arm is: honouring it late is
     # right, attributing a turn nobody drove is not.
     DriverArmSeconds = 600
+    # How long a first press of End session stays armed, waiting for the second press
+    # that confirms it. Only a session that is not idle is guarded this way; see
+    # Invoke-PendingStops for why one press is not enough.
+    StopConfirmSeconds = 10
+    # How long to wait before retrying the note that says the confirmation lapsed,
+    # when Home Assistant could not be reached at the moment it did. The arm is only
+    # released once that note lands: a quiet session produces no later activity, so
+    # giving up would leave the card asking for a press that confirms nothing, and
+    # recovery alone would never clear it.
+    StopLapseRetrySeconds = 2
     ResumeCacheSeconds = 180
     # How soon to retry after a fetch that failed or came back empty, rather than
     # waiting out the full interval with a list known to be wrong.
@@ -268,6 +278,21 @@ $script:DaemonLaunchedPids = @{}
 # card without the line, rather than showing settings from the wrong launch.
 $script:DaemonLaunchedTuning = @{}
 $script:DaemonPendingTuningKey = '(pending)'
+
+# Sessions whose End button has been pressed once and is waiting for the second
+# press that confirms it, keyed by session id, holding the moment it was armed.
+#
+# In memory and never persisted, deliberately: a daemon that restarts between the
+# two presses must come back disarmed. Coming back still armed would turn the next
+# press - made after a restart, possibly minutes later - into a confirmation of
+# something the user had long since given up on.
+#
+# The question those arms put on a card is recorded on disk so that hook processes
+# publishing their own status line do not wipe it. That record cannot confirm
+# anything, and is cleared by Clear-DaemonStopPrompts at actual startup - not here,
+# because this runs whenever the file is dot-sourced for its functions, and clearing
+# from there wiped a running daemon's records from under it.
+$script:DaemonStopArmed = @{}
 
 # Anything the dashboard reports as happening before this is a leftover from a
 # previous run rather than something the user just did.
@@ -868,6 +893,11 @@ function Invoke-DaemonReconcile {
 function Start-BridgeDaemon {
     $headers = Get-HomeAssistantHeaders
     $state = Read-DaemonState
+
+    # Questions recorded by a previous daemon. Cleared here rather than where the
+    # shared state is declared, so that loading this file for its functions cannot
+    # unpin a running daemon's prompts.
+    Clear-DaemonStopPrompts
 
     # Deliberately no pruning here. Sync-DaemonSessions retires anything that is no
     # longer live, which both removes its Home Assistant entities and drops it from
