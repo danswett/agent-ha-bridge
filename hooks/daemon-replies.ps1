@@ -466,8 +466,7 @@ function Send-DaemonCardPayload {
     $payloadDriver = if ($payload.PSObject.Properties['Driver'] -and $payload.Driver) {
         [string]$payload.Driver
     } else { 'human' }
-    Set-DaemonSessionProperty -Entry $entry -Name 'Driver' -Value $payloadDriver
-    Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $true
+    Set-DaemonDriverPending -Entry $entry -Driver $payloadDriver
 
     try {
         Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Sending...' -Headers $Headers | Out-Null
@@ -523,6 +522,11 @@ function Send-DaemonCardPayload {
         # show a person's turn with the agent's edge.
         Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $false
     }
+    else {
+        # The window starts now, not when the payload was picked up, so a slow delivery
+        # cannot expire the arm for the turn it is about to produce.
+        Update-DaemonDriverPendingStamp -Entry $entry
+    }
 
     # Only once it is delivered, so a failed send leaves the image in place to be
     # retried by hand.
@@ -571,8 +575,7 @@ function Send-DaemonReplyBoxText {
     # place that can tell: the press itself carries the account behind it. Pending,
     # because the turn this is about to start would otherwise be read as typed in the
     # terminal and hand the session straight back to the person.
-    Set-DaemonSessionProperty -Entry $entry -Name 'Driver' -Value (Get-BridgeDriverFromState -State $btn)
-    Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $true
+    Set-DaemonDriverPending -Entry $entry -Driver (Get-BridgeDriverFromState -State $btn)
 
     try {
         $replyState = Get-HomeAssistantState -EntityId $replyEntity -Headers $Headers
@@ -682,7 +685,12 @@ function Send-DaemonReplyBoxText {
     }
     catch { }
 
-    [void](Invoke-DaemonReply -SessionId $sessionId -Text $value -Headers $Headers)
+    # Same as the payload path: the window starts when the text has actually gone in,
+    # and a send that did not land gives the arm back rather than leaving it to mark
+    # whatever is typed next.
+    $sent = @(Invoke-DaemonReply -SessionId $sessionId -Text $value -Headers $Headers) | Select-Object -Last 1
+    if ($sent) { Update-DaemonDriverPendingStamp -Entry $entry }
+    else { Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $false }
 }
 
 function Invoke-DaemonReply {

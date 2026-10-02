@@ -625,11 +625,26 @@ function Update-DaemonSessionActivity {
     # driven remotely by an agent rather than by the person looking at it. A turn that
     # starts without a reply coming through Home Assistant was typed in the terminal,
     # which is the person - so a new turn hands it back to them unless the reply path
-    # said otherwise a moment ago.
-    if ($turnStarted -and -not ($entry.PSObject.Properties['DriverPending'] -and $entry.DriverPending)) {
-        Set-DaemonSessionProperty -Entry $entry -Name 'Driver' -Value 'human'
+    # said otherwise.
+    #
+    # Consumed by the turn it was armed for, not by the next publish of any kind. It
+    # used to be cleared unconditionally here, which held only for a Submit press,
+    # where the turn starts as the very next thing the daemon sees. A reply delivered
+    # through the payload topic is typed in a character at a time, and the activity
+    # updates published while that happens ate the arm before the turn arrived - so
+    # the turn then read as the person's and the card lost the agent's edge.
+    if ($turnStarted) {
+        if (-not (Test-DaemonDriverPending -Entry $entry)) {
+            Set-DaemonSessionProperty -Entry $entry -Name 'Driver' -Value 'human'
+        }
+        Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $false
     }
-    Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $false
+    elseif (($entry.PSObject.Properties['DriverPending'] -and $entry.DriverPending) -and
+            -not (Test-DaemonDriverPending -Entry $entry)) {
+        # Armed so long ago the turn is clearly not coming. Dropped here rather than
+        # left for a turn to consume, so it cannot mark one the person typed.
+        Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $false
+    }
     $detail['driver'] = if ($entry.PSObject.Properties['Driver'] -and $entry.Driver) { [string]$entry.Driver } else { 'human' }
     # The history is a rolling trail across batches, not just this batch: the
     # daemon reads the transcript every few seconds, so a single batch usually
@@ -796,10 +811,21 @@ function Update-DaemonCodexActivity {
     # glow never worked. Same rule as the shared path: a turn that starts without a
     # reply having just come through Home Assistant was typed in the terminal, which is
     # the person, so it hands the session back to them.
-    if ($activity.TurnStarted -and -not ($Entry.PSObject.Properties['DriverPending'] -and $Entry.DriverPending)) {
-        Set-DaemonSessionProperty -Entry $Entry -Name 'Driver' -Value 'human'
+    # Who last drove this session. Codex publishes its own card rather than going
+    # through the shared path, so without this its detail carried no driver at all and
+    # every Codex card read as yours however it had been driven - the one agent whose
+    # glow never worked. Same rule as the shared path, including that the arm belongs
+    # to the turn it was armed for rather than to the next publish of any kind.
+    if ($activity.TurnStarted) {
+        if (-not (Test-DaemonDriverPending -Entry $Entry)) {
+            Set-DaemonSessionProperty -Entry $Entry -Name 'Driver' -Value 'human'
+        }
+        Set-DaemonSessionProperty -Entry $Entry -Name 'DriverPending' -Value $false
     }
-    Set-DaemonSessionProperty -Entry $Entry -Name 'DriverPending' -Value $false
+    elseif (($Entry.PSObject.Properties['DriverPending'] -and $Entry.DriverPending) -and
+            -not (Test-DaemonDriverPending -Entry $Entry)) {
+        Set-DaemonSessionProperty -Entry $Entry -Name 'DriverPending' -Value $false
+    }
     $detail['driver'] = if ($Entry.PSObject.Properties['Driver'] -and $Entry.Driver) { [string]$Entry.Driver } else { 'human' }
     if ($history.Count) { $detail['history'] = $history }
     $message = if ($Entry.PSObject.Properties['LastMessage']) { [string]$Entry.LastMessage } else { '' }

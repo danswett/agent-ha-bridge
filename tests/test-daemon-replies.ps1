@@ -264,6 +264,25 @@ Test-That 'and a payload with nothing deliverable disarms it too' {
     $entry.DriverPending -eq $false -and $script:Replies.Count -eq 0
 } "pending=$($entry.DriverPending) replies=$($script:Replies.Count)"
 
+# A delivery is normally instant - 0.3s for every reply on one machine across a day,
+# including one of 5,914 characters - but it is not guaranteed to be: one that day took
+# 721 seconds while injection was failing and retrying. Timing the arm from before that
+# would expire it while the reply was still going in.
+$script:Replies = @()
+Set-Payload -Stamp 'd14' -Text 'a slow one' -Driver 'agent'
+$script:DeliverStamp = $null
+function Invoke-DaemonReply { param($SessionId, $Text, $Headers, $DisplayText, [switch]$ClearReplyBox)
+    # Stand in for a delivery that took longer than the arm's whole window.
+    Set-DaemonSessionProperty -Entry $state[$sid] -Name 'DriverPendingAt' `
+        -Value ([DateTimeOffset]::Now.AddSeconds(-($script:DaemonConfig.DriverArmSeconds + 120)).ToString('o'))
+    $script:Replies += [pscustomobject]@{ Text = $Text; StampAtDelivery = $state[$sid].LastReplyPayloadAt }
+    'emitted'
+    $true }
+[void](Send-DaemonCardPayload -SessionId $sid -Entry $entry -Headers $headers)
+Test-That 'an arm outlives a delivery that took longer than its own window' {
+    Test-DaemonDriverPending -Entry $entry
+} "pendingAt=$($entry.DriverPendingAt)"
+
 Remove-Item -LiteralPath $script:DaemonConfig.LogFile -Force -ErrorAction SilentlyContinue
 Write-Host ''
 if ($script:Failures) {
