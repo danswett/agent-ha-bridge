@@ -573,6 +573,16 @@ function Send-DaemonReplyBoxText {
     $lastSubmit = if ($entry.PSObject.Properties['LastSubmitAt']) { [string]$entry.LastSubmitAt } else { '' }
     if ($press -eq $lastSubmit) { return }
 
+    # Snapshot the arm before the press overwrites it. Set-DaemonDriverPending below
+    # replaces the flag, the driver and the stamp, so by the time an empty box is seen
+    # there is nothing left to tell an arm a payload is still waiting on from one this
+    # very press manufactured a few lines earlier.
+    $armBefore = [pscustomobject]@{
+        Outstanding = [bool](Test-DaemonDriverPending -Entry $entry)
+        Driver      = if ($entry.PSObject.Properties['Driver']) { [string]$entry.Driver } else { '' }
+        At          = if ($entry.PSObject.Properties['DriverPendingAt']) { [string]$entry.DriverPendingAt } else { '' }
+    }
+
     # Who pressed it. The card glows while an agent is driving, and this is the only
     # place that can tell: the press itself carries the account behind it. Pending,
     # because the turn this is about to start would otherwise be read as typed in the
@@ -634,9 +644,26 @@ function Send-DaemonReplyBoxText {
             # 08:58:50 was published as the person's. It only shows when the session is
             # busy - an idle one starts its turn before the press arrives and keeps the
             # edge - which is why it survived both earlier attempts at this bug.
-            if (Test-DaemonPayloadJustDelivered -Entry $entry) {
+            #
+            # All three conditions are load-bearing, and the arm is restored to exactly
+            # what it was rather than to what this press set. A recency test on its own
+            # re-armed a session whose payload arm had ALREADY been consumed by its
+            # turn, because the arming above runs first: the flag read false before the
+            # press and true after it, manufacturing an agent arm from a timestamp for
+            # a message that had already been accounted for, and the next thing the
+            # person typed would have worn the agent's edge.
+            if ($armBefore.Outstanding -and $armBefore.Driver -eq 'agent' -and
+                (Test-DaemonPayloadJustDelivered -Entry $entry)) {
+                Set-DaemonSessionProperty -Entry $entry -Name 'Driver' -Value $armBefore.Driver
+                Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $true
+                # The original stamp, so a press arriving late cannot extend the window
+                # of the arm it is preserving. Left alone when there was none, which is
+                # an arm carried across an upgrade from before the stamp existed.
+                if ($armBefore.At) {
+                    Set-DaemonSessionProperty -Entry $entry -Name 'DriverPendingAt' -Value $armBefore.At
+                }
                 Write-DaemonLog -Message ("send for $($sessionId.Substring(0, 8)) had an empty box because its " +
-                    'payload had already gone; arm kept')
+                    'payload had already gone; its arm kept as it was')
                 return
             }
             # Nothing was sent, so no agent turn is coming. Leaving this armed would
