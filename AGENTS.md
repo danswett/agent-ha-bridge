@@ -72,10 +72,19 @@ Including one-line and documentation changes.
 1. Rebase onto freshly fetched `origin/main`; never merge `main` into the branch.
 2. Re-run the tests *after* the rebase.
 3. `gh pr create`, saying what changed, why, and what was run to verify it.
-4. Wait for CI to be green. If it fails on something you did not touch, check whether
-   `main` is already failing the same way and say so rather than merging into red.
+4. Wait for green CI on the final head and read all submitted reviews, inline threads
+   and general/bot comments. Fix or record a reasoned disposition for every
+   substantive finding, verify the result, resolve accepted threads, and recheck
+   feedback immediately before merge. Green CI or an outdated thread is not
+   acceptance; never resolve a thread merely to bypass protection. If CI fails on
+   something you did not touch, check whether `main` is already failing the same way
+   and say so rather than merging into red.
 5. `gh pr merge <n> --squash --delete-branch`.
-6. Leave the worktree clean and detached; the bridge tidies it up later.
+6. Do not end a session while it still owns an open PR. Remain responsible through
+   merge or deliberate closure; an ownership transfer counts only when a named
+   successor explicitly accepts the recorded handoff. Then perform only the normal
+   cleanup of your own branch/worktree. Leave completed worktrees clean and detached;
+   the bridge tidies them up later.
 
 ## Tests
 
