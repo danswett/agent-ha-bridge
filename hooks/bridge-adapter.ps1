@@ -159,7 +159,19 @@ function Publish-BridgeSessionStatus {
         }
         $detail['session'] = $SessionName
         $detail['machine'] = $Machine
-        Set-CopilotMqttActivity -SessionId $SessionId -Summary $Activity -Detail $detail -Headers $Headers
+        # Every activity writer goes through the arm guard, not just the daemon's
+        # transcript streamers. A Claude Notification publishes its own status line
+        # straight through here, and arriving inside the ten-second window it replaced
+        # the End session question while the session was still armed - leaving a user
+        # who read the vanished prompt as a dead tap to press again and end the turn.
+        #
+        # Resolved rather than called outright because this file is also loaded by
+        # hook processes, which have no daemon state and never hold an arm.
+        $summary = $Activity
+        if (Get-Command -Name Get-DaemonCardSummary -CommandType Function -ErrorAction Ignore) {
+            $summary = Get-DaemonCardSummary -SessionId $SessionId -Summary $summary -Detail $detail
+        }
+        Set-CopilotMqttActivity -SessionId $SessionId -Summary $summary -Detail $detail -Headers $Headers
     }
 }
 

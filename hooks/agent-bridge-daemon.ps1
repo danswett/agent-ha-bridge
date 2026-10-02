@@ -156,6 +156,11 @@ $script:DaemonConfig = @{
     # that confirms it. Only a session that is not idle is guarded this way; see
     # Invoke-PendingStops for why one press is not enough.
     StopConfirmSeconds = 10
+    # How long to keep retrying the note that says the confirmation lapsed, when Home
+    # Assistant could not be reached at the moment it did. The arm is only released
+    # once that note lands, so without a ceiling an outage would keep the entry alive
+    # for the life of the daemon.
+    StopLapseRetrySeconds = 120
     ResumeCacheSeconds = 180
     # How soon to retry after a fetch that failed or came back empty, rather than
     # waiting out the full interval with a list known to be wrong.
