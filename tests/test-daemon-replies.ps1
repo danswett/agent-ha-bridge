@@ -283,6 +283,75 @@ Test-That 'an arm outlives a delivery that took longer than its own window' {
     Test-DaemonDriverPending -Entry $entry
 } "pendingAt=$($entry.DriverPendingAt)"
 
+Write-Host ''
+Write-Host '--- an agent''s Send press does not cancel the payload it just sent ---'
+# The pattern every agent follows is: publish the payload, then press Send. The payload
+# is delivered on its own the moment it lands, so the press that follows finds the box
+# empty - and that emptiness was read as "nothing was sent", which disarmed. Live on
+# 2026-10-02: a 2,234-character reply went in at 08:57:39, the press cleared the arm six
+# seconds later, and the turn it produced at 08:58:50 was published as the person's. An
+# idle session starts its turn before the press arrives and keeps the edge, which is why
+# this only shows when the session being written to is busy, and why it survived both
+# earlier attempts at the blue-instead-of-purple bug.
+$script:DaemonConfig.ReplyCommitAttempts = 0
+function Get-BridgeDriverFromState { param($State) 'agent' }
+function Invoke-HomeAssistantService { param($Domain, $Service, $Headers, $Data) 'emitted' }
+function Invoke-DaemonReply {
+    param($SessionId, $Text, $Headers, $DisplayText, [switch]$ClearReplyBox)
+    $script:Replies += [pscustomobject]@{ Text = $Text }
+    $true
+}
+function Set-PressFixture {
+    param([string]$Press, [string]$Box = ' ')
+    $script:Ha["button.${node}_submit"] = [pscustomobject]@{ state = $Press; attributes = [pscustomobject]@{} }
+    $script:Ha["text.${node}_reply"] = [pscustomobject]@{ state = $Box; attributes = [pscustomobject]@{} }
+}
+
+$pressEntry = [pscustomobject]@{ Name = 'Claude: x'; Machine = 'M' }
+$script:Replies = @()
+Set-Payload -Stamp 'p1' -Text 'a long one from an agent' -Driver 'agent'
+[void](Send-DaemonCardPayload -SessionId $sid -Entry $pressEntry -Headers $headers)
+Test-That 'the payload is delivered and the turn armed' {
+    $pressEntry.DriverPending -eq $true -and $script:Replies.Count -eq 1
+} "pending=$($pressEntry.DriverPending) replies=$($script:Replies.Count)"
+Test-That 'and the delivery is stamped, so a press arriving after it can be recognised' {
+    $pressEntry.PSObject.Properties['LastPayloadDeliveredAt'] -and $pressEntry.LastPayloadDeliveredAt
+}
+
+Set-PressFixture -Press '2026-10-02T15:57:45+00:00'
+[void](Send-DaemonReplyBoxText -SessionId $sid -Entry $pressEntry -Headers $headers)
+Test-That 'the redundant press sends nothing a second time' { $script:Replies.Count -eq 1 } "replies=$($script:Replies.Count)"
+Test-That 'the arm survives it, so the turn it produces is still the agent''s' {
+    $pressEntry.DriverPending -eq $true
+} "pending=$($pressEntry.DriverPending)"
+Test-That 'and the press is still recorded as spent, so it is not reprocessed' {
+    [string]$pressEntry.LastSubmitAt -eq '2026-10-02T15:57:45+00:00' -and [string]$pressEntry.PendingSubmitAt -eq ''
+}
+
+# Without a payload behind it the old behaviour has to stand: an arm nothing will ever
+# consume would put the agent's edge on whatever the person types next.
+$bare = [pscustomobject]@{ Name = 'Claude: x'; Machine = 'M' }
+Set-DaemonDriverPending -Entry $bare -Driver 'agent'
+Set-PressFixture -Press '2026-10-02T16:00:00+00:00'
+[void](Send-DaemonReplyBoxText -SessionId $sid -Entry $bare -Headers $headers)
+Test-That 'an empty press with no payload behind it still disarms' {
+    -not $bare.DriverPending
+} "pending=$($bare.DriverPending)"
+
+$stale = [pscustomobject]@{ Name = 'Claude: x'; Machine = 'M' }
+Set-DaemonDriverPending -Entry $stale -Driver 'agent'
+Set-DaemonSessionProperty -Entry $stale -Name 'LastPayloadDeliveredAt' `
+    -Value ([DateTimeOffset]::Now.AddSeconds(-($script:DaemonConfig.DriverArmSeconds + 60)).ToString('o'))
+Set-PressFixture -Press '2026-10-02T16:05:00+00:00'
+[void](Send-DaemonReplyBoxText -SessionId $sid -Entry $stale -Headers $headers)
+Test-That 'and a payload older than the arm''s own window cannot keep it alive' {
+    -not $stale.DriverPending
+} "pending=$($stale.DriverPending)"
+
+Test-That 'a session that has never had a payload reports none just delivered' {
+    -not (Test-DaemonPayloadJustDelivered -Entry ([pscustomobject]@{ Name = 'Claude: x' }))
+}
+
 Remove-Item -LiteralPath $script:DaemonConfig.LogFile -Force -ErrorAction SilentlyContinue
 Write-Host ''
 if ($script:Failures) {

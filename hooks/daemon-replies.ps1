@@ -499,9 +499,6 @@ function Send-DaemonCardPayload {
         # Disarmed: no turn is coming, so leaving it armed would hand the glow to
         # whatever the person types next in the terminal - the same reason an agent
         # press on an empty box disarms rather than waiting.
-        # Disarmed: no turn is coming, so leaving it armed would hand the glow to
-        # whatever the person types next in the terminal - the same reason an agent
-        # press on an empty box disarms rather than waiting.
         Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $false
         Write-DaemonLog -Message "reply card payload for $($sessionId.Substring(0,8)) had nothing deliverable"
         return $true
@@ -526,6 +523,11 @@ function Send-DaemonCardPayload {
         # The window starts now, not when the payload was picked up, so a slow delivery
         # cannot expire the arm for the turn it is about to produce.
         Update-DaemonDriverPendingStamp -Entry $entry
+        # Recorded separately from the arm because the press that follows re-arms and
+        # re-stamps before it reads the box, so by then the arm's own stamp can no
+        # longer tell "a payload just went in" from "somebody just pressed Send".
+        Set-DaemonSessionProperty -Entry $entry -Name 'LastPayloadDeliveredAt' `
+            -Value ([DateTimeOffset]::Now.ToString('o'))
     }
 
     # Only once it is delivered, so a failed send leaves the image in place to be
@@ -623,6 +625,20 @@ function Send-DaemonReplyBoxText {
         if ($pressedBy -eq 'agent') {
             Set-DaemonSessionProperty -Entry $entry -Name 'LastSubmitAt' -Value $press
             Set-DaemonSessionProperty -Entry $entry -Name 'PendingSubmitAt' -Value ''
+            # An agent publishes a payload and then presses Send. The payload is
+            # delivered on its own the moment it lands, so the press that follows finds
+            # the box empty because the message has already gone - not because there
+            # was nothing to say. Disarming here cost exactly the attribution the arm
+            # exists for: on 2026-10-02 a 2,234-character reply went in at 08:57:39,
+            # this press cleared the arm six seconds later, and the turn it produced at
+            # 08:58:50 was published as the person's. It only shows when the session is
+            # busy - an idle one starts its turn before the press arrives and keeps the
+            # edge - which is why it survived both earlier attempts at this bug.
+            if (Test-DaemonPayloadJustDelivered -Entry $entry) {
+                Write-DaemonLog -Message ("send for $($sessionId.Substring(0, 8)) had an empty box because its " +
+                    'payload had already gone; arm kept')
+                return
+            }
             # Nothing was sent, so no agent turn is coming. Leaving this armed would
             # hand the glow to whatever the person types next in the terminal.
             Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $false
