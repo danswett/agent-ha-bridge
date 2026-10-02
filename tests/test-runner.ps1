@@ -3,6 +3,7 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 if (-not $env:AGENT_HA_BRIDGE_TEST_ROOT) { throw 'Run this suite through tests\run-tests.ps1.' }
 . (Join-Path $PSScriptRoot 'runner-support.ps1')
+Assert-BridgeTestEnvironment -Required
 
 $script:Failures = 0
 function Test-That {
@@ -54,6 +55,7 @@ Test-That 'an opt-in alone never permits a developer or self-hosted machine' {
 }
 
 $scratch = Join-Path $env:TEMP ("runner-fixtures-" + [guid]::NewGuid().ToString('N'))
+Assert-BridgeTestPath -Path $scratch
 [void][IO.Directory]::CreateDirectory($scratch)
 $sandboxes = @()
 $inventoryLinks = @()
@@ -220,7 +222,7 @@ $roundTrip = $text | & node -e "process.stdout.write(require('fs').readFileSync(
 if ($LASTEXITCODE) { throw 'Node encoding probe failed.' }
 $descendant = & pwsh -NoProfile -NonInteractive -Command '@{ Home = $HOME; Temp = [IO.Path]::GetTempPath(); Config = $env:AGENT_HA_BRIDGE_CONFIG; Offline = $env:AGENT_HA_BRIDGE_OFFLINE_TEST; Leaked = [bool]$env:CUSTOM_HOUSE_CREDENTIAL } | ConvertTo-Json -Compress'
 if ($LASTEXITCODE) { throw 'Descendant probe failed.' }
-@{
+[ordered]@{
     Home = $HOME
     Temp = [IO.Path]::GetTempPath()
     Config = $env:AGENT_HA_BRIDGE_CONFIG
@@ -251,6 +253,7 @@ if ($LASTEXITCODE) { throw 'Descendant probe failed.' }
     $start = New-BridgeTestProcessStartInfo -ScriptPath $probe -Sandbox $box
     $result = Invoke-BridgeTestProcess -StartInfo $start
     Test-That 'the isolated child completes' { $result.ExitCode -eq 0 -and -not $result.TimedOut } $result.Output
+    if ($result.ExitCode -ne 0 -or $result.TimedOut) { throw 'The initial isolated fixture failed; stopping.' }
     if ($result.ExitCode -eq 0) {
         $observed = $result.Output | ConvertFrom-Json
         Test-That 'HOME is the suite home, not the caller home' {
@@ -288,6 +291,7 @@ if ($LASTEXITCODE) { throw 'Descendant probe failed.' }
         $other = New-BridgeTestProcessStartInfo -ScriptPath $probe -Sandbox $secondBox
         $other.Environment['HOME'] -ne $start.Environment['HOME'] -and $other.Environment['TEMP'] -ne $start.Environment['TEMP']
     }
+
 
     Write-Host '--- checkout code wins even when an installed copy exists ---'
     $installedHooks = Join-Path (Join-Path (Join-Path $box 'home') '.agent-ha-bridge') 'hooks'
@@ -426,7 +430,7 @@ finally {
             }
         }
     }
-    Remove-Item -LiteralPath $scratch -Recurse -Force
+    Remove-BridgeTestSandbox -Sandbox $env:AGENT_HA_BRIDGE_TEST_ROOT -Directory $scratch
 }
 if ($script:Failures) { throw "$script:Failures runner check(s) failed." }
 Write-Host 'All runner checks passed'

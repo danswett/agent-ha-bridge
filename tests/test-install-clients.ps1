@@ -19,6 +19,8 @@
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'runner-support.ps1')
+Assert-BridgeTestEnvironment -Required
 
 $env:BRIDGE_INSTALL_NORUN = '1'
 . (Join-Path $PSScriptRoot '..\install.ps1')
@@ -709,30 +711,28 @@ function Get-BridgeUpdateStatus {
 '@
         }
     }
-    $ambientHooks = Join-Path $HOME '.agent-ha-bridge\hooks'
-    [void][IO.Directory]::CreateDirectory($ambientHooks)
-    Set-Content -LiteralPath (Join-Path $ambientHooks 'decision-bridge-common.ps1') -Value '# inert ambient dependency' -Encoding utf8
-    Set-Content -LiteralPath (Join-Path $ambientHooks 'bridge-update.ps1') -Encoding utf8 -Value @'
-function Get-BridgeUpdateRepository { 'other-install' }
-function Get-BridgeUpdateStatus {
-    param([switch]$Force)
-    [pscustomobject]@{ Installed = '1'; Latest = '1'; Available = $false }
-}
-'@
+    $fixtureAmbientHome = (Get-BridgeTestSandbox -Root $env:AGENT_HA_BRIDGE_TEST_ROOT)['home']
+    [void](New-BridgeTestAmbientInstall -HomeDirectory $fixtureAmbientHome)
     $pwshFixture = Join-Path $PSHOME $(if ($IsWindows) { 'pwsh.exe' } else { 'pwsh' })
     foreach ($homeRoot in $homes) {
         $cli = Join-Path $homeRoot '.agent-ha-bridge\bin\agent-ha-bridge.ps1'
         foreach ($operation in @('configure', 'uninstall')) {
-            $output = @(& $pwshFixture -NoProfile -File $cli $operation 2>&1)
-            $exit = $LASTEXITCODE
+            $child = Invoke-BridgeTestProcess -StartInfo (New-BridgeTestProcessStartInfo `
+                -ScriptPath $cli -Sandbox $env:AGENT_HA_BRIDGE_TEST_ROOT -ScriptArguments @($operation))
+            if ($child.TimedOut) { throw 'The synthetic installation child timed out.' }
+            $output = @($child.Output -split '\r?\n')
+            $exit = $child.ExitCode
             $record = $output | Where-Object { [string]$_ -like '{"TargetHome"*' } | Select-Object -Last 1 | ConvertFrom-Json
             Test-That "$operation carries the owning home for $(Split-Path $homeRoot -Leaf)" {
                 $exit -eq 0 -and $record.TargetHome -eq $homeRoot
             }
         }
-        $output = & $pwshFixture -NoProfile -File $cli update -Check -Yes 2>&1 | Out-String
+        $child = Invoke-BridgeTestProcess -StartInfo (New-BridgeTestProcessStartInfo `
+            -ScriptPath $cli -Sandbox $env:AGENT_HA_BRIDGE_TEST_ROOT -ScriptArguments @('update', '-Check', '-Yes'))
+        if ($child.TimedOut) { throw 'The synthetic update-check child timed out.' }
+        $output = $child.Output
         Test-That "the real update entry point uses $(Split-Path $homeRoot -Leaf), not ambient HOME" {
-            $LASTEXITCODE -eq 0 -and $output -match 'selected-install' -and $output -notmatch 'other-install'
+            $child.ExitCode -eq 0 -and $output -match 'selected-install' -and $output -notmatch 'other-install'
         }
     }
 
@@ -1330,7 +1330,7 @@ function Invoke-AdapterEntityCleanupFixture {
 $savedEntityConfig = $env:AGENT_HA_BRIDGE_CONFIG
 $savedEntityNoRun = $env:BRIDGE_UNINSTALL_NORUN
 $savedEntityContext = $script:BridgeInstallContext
-$env:AGENT_HA_BRIDGE_CONFIG = Join-Path $HOME '.agent-ha-bridge\config.json'
+$env:AGENT_HA_BRIDGE_CONFIG = Join-Path (Get-BridgeTestSandbox -Root $env:AGENT_HA_BRIDGE_TEST_ROOT)['home'] '.agent-ha-bridge\config.json'
 $env:BRIDGE_UNINSTALL_NORUN = '1'
 try { Invoke-AdapterEntityCleanupFixture }
 finally {

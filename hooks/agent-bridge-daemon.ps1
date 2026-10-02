@@ -881,6 +881,7 @@ function Invoke-DaemonReconcile {
         Set-BridgeDaemonAlive
     }
     catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked']) { throw }
         Write-DaemonLog -Message "reconcile failed: $($_.Exception.Message)"
     }
     finally {

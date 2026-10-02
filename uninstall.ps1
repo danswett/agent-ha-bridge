@@ -389,6 +389,7 @@ function Invoke-BridgeUninstall {
             }
         }
         catch {
+            if ($_.Exception.Data['BridgeTestWriteBlocked']) { throw }
             Write-Warning "Could not clear entities: $($_.Exception.Message)"
         }
     }
