@@ -490,8 +490,27 @@ function Set-DaemonDriverPending {
     Set-DaemonSessionProperty -Entry $Entry -Name 'DriverPendingAt' -Value ([DateTimeOffset]::Now.ToString('o'))
 }
 
-function Test-DaemonDriverPending {
+function Update-DaemonDriverPendingStamp {
     <#
+        Restarts an arm's clock, for when the text it was armed for has only just gone
+        in.
+
+        A session is armed before delivery, because the turn must not be able to start
+        between the two. Delivery is normally instant - measured at 0.3s across every
+        reply on one machine for a day, including one of 5,914 characters - but it is
+        not guaranteed to be: one delivery that day took 721 seconds while injection
+        was failing and retrying. Timing the arm from before that would have expired it
+        while the reply was still going in, and the turn it produced would then have
+        read as typed in the terminal. So the window measures from when the text landed
+        rather than from when it was picked up.
+    #>
+    param([Parameter(Mandatory)][object]$Entry)
+
+    if (-not ($Entry.PSObject.Properties['DriverPending'] -and $Entry.DriverPending)) { return }
+    Set-DaemonSessionProperty -Entry $Entry -Name 'DriverPendingAt' -Value ([DateTimeOffset]::Now.ToString('o'))
+}
+
+function Test-DaemonDriverPending {    <#
         Whether a session is still armed: flagged, and not so long ago that the turn
         it was armed for is clearly never coming.
     #>

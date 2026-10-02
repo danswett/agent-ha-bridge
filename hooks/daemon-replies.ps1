@@ -522,6 +522,11 @@ function Send-DaemonCardPayload {
         # show a person's turn with the agent's edge.
         Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $false
     }
+    else {
+        # The window starts now, not when the payload was picked up, so a slow delivery
+        # cannot expire the arm for the turn it is about to produce.
+        Update-DaemonDriverPendingStamp -Entry $entry
+    }
 
     # Only once it is delivered, so a failed send leaves the image in place to be
     # retried by hand.
@@ -680,7 +685,12 @@ function Send-DaemonReplyBoxText {
     }
     catch { }
 
-    [void](Invoke-DaemonReply -SessionId $sessionId -Text $value -Headers $Headers)
+    # Same as the payload path: the window starts when the text has actually gone in,
+    # and a send that did not land gives the arm back rather than leaving it to mark
+    # whatever is typed next.
+    $sent = @(Invoke-DaemonReply -SessionId $sessionId -Text $value -Headers $Headers) | Select-Object -Last 1
+    if ($sent) { Update-DaemonDriverPendingStamp -Entry $entry }
+    else { Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $false }
 }
 
 function Invoke-DaemonReply {
