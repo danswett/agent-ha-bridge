@@ -730,6 +730,22 @@ function Get-BridgeManagedWorktree {
         Where-Object { Test-BridgeManagedWorktree -Path $_ })
 }
 
+function Get-BridgeWorktreeTrackedPath {
+    param([Parameter(Mandatory)][string]$WorktreePath)
+
+    $entries = Invoke-BridgeGit -Directory $WorktreePath -Arguments @('ls-files', '--stage', '-z')
+    if (-not $entries.Ok) { throw "Cannot read the tracked-file inventory: $($entries.Output)" }
+    foreach ($entry in ($entries.Output -split "`0" | Where-Object { $_ })) {
+        if ($entry -notmatch '(?s)^100(?:644|755) [a-f0-9]+ 0\t(.+)$') {
+            throw 'Linked, conflicted or unsupported tracked entries require explicit worktree cleanup.'
+        }
+        $relative = $Matches[1]
+        $file = [System.IO.Path]::GetFullPath($relative, $WorktreePath)
+        if (-not (Test-BridgeInstallDescendant -Path $file -Root $WorktreePath)) { throw 'A tracked path escaped its worktree.' }
+        $relative
+    }
+}
+
 function Test-BridgeWorktreeFinished {
     <#
         Whether a managed worktree holds nothing worth keeping.
@@ -753,6 +769,20 @@ function Test-BridgeWorktreeFinished {
     )
 
     if (-not [System.IO.Directory]::Exists($WorktreePath)) { return $false }
+
+    # Git can report clean ordinary entries while a physical ancestor is a junction,
+    # or while assume-unchanged hides a missing file. Neither authorizes cleanup.
+    try {
+        Assert-BridgeInstallPayload -Root $WorktreePath -RelativePaths @('.git')
+        $paths = @(Get-BridgeWorktreeTrackedPath -WorktreePath $WorktreePath)
+        Assert-BridgeInstallPayload -Root $WorktreePath -RelativePaths $paths
+        foreach ($path in $paths) {
+            if (-not [System.IO.File]::Exists((Join-Path $WorktreePath $path))) {
+                throw "A tracked path is missing, unreadable or not a regular file: $path"
+            }
+        }
+    }
+    catch { Write-Warning "Worktree physical paths could not be authorized: $($_.Exception.Message)"; return $false }
 
     # --no-optional-locks so asking the question cannot itself write to the index.
     $status = Invoke-BridgeGit -Directory $WorktreePath -Arguments @('--no-optional-locks', 'status', '--porcelain', '--untracked-files=all', '--ignored=matching')
@@ -784,6 +814,7 @@ function Remove-BridgeWorktreeFiles {
     $admin = Split-Path $marker -Parent
     if ([System.IO.File]::Exists((Join-Path $admin 'locked'))) { return $false }
     $ownedLocks = [System.Collections.Generic.List[object]]::new()
+    $trackedPaths = @()
     $temporaryIndex = Join-Path $admin ("agent-bridge-cleanup-" + [guid]::NewGuid().ToString('N') + '.index')
     $dotGit = Join-Path $WorktreePath '.git'
     $stagedPointer = Join-Path (Split-Path $WorktreePath -Parent) ('.agent-bridge-cleanup-' + [guid]::NewGuid().ToString('N'))
@@ -801,28 +832,21 @@ function Remove-BridgeWorktreeFiles {
         if (-not $usage.Known) { throw "Workspace usage is unknown: $($usage.Detail)" }
         if (Test-BridgeWorktreeInUse -WorktreePath $WorktreePath -Usage $usage) { return $false }
 
-        $entries = Invoke-BridgeGit -Directory $WorktreePath -Arguments @('ls-files', '--stage', '-z')
-        if (-not $entries.Ok) { throw "Cannot read the tracked-file inventory: $($entries.Output)" }
+        $trackedPaths = @(Get-BridgeWorktreeTrackedPath -WorktreePath $WorktreePath)
         $directories = [System.Collections.Generic.HashSet[string]]::new(
             $(if ($script:BridgeIsWindows) { [StringComparer]::OrdinalIgnoreCase } else { [StringComparer]::Ordinal }))
-        $count = 0
-        foreach ($entry in ($entries.Output -split "`0" | Where-Object { $_ })) {
-            # Submodules and symlinks require operator cleanup, not traversal here.
-            if ($entry -notmatch '(?s)^100(?:644|755) [a-f0-9]+ 0\t(.+)$') {
-                throw 'Linked, conflicted or unsupported tracked entries require explicit worktree cleanup.'
-            }
-            $file = [System.IO.Path]::GetFullPath($Matches[1], $WorktreePath)
-            if (-not (Test-BridgeInstallDescendant -Path $file -Root $WorktreePath)) { throw 'A tracked path escaped its worktree.' }
+        foreach ($relative in $trackedPaths) {
+            $file = [System.IO.Path]::GetFullPath($relative, $WorktreePath)
             $parent = Split-Path $file -Parent
             while (Test-BridgeInstallDescendant -Path $parent -Root $WorktreePath) {
                 [void]$directories.Add($parent)
                 $parent = Split-Path $parent -Parent
             }
-            $count++
         }
         $prepared = Invoke-BridgeGit -Directory $WorktreePath -Arguments @('read-tree', 'HEAD') -IndexFile $temporaryIndex
         if (-not $prepared.Ok) { throw "Cannot prepare safe tracked-file cleanup: $($prepared.Output)" }
-        if ($count -gt 0) {
+        if ($trackedPaths.Count -gt 0) {
+            Assert-BridgeInstallPayload -Root $WorktreePath -RelativePaths (@('.git') + $trackedPaths)
             $removedTracked = $true
             $files = Invoke-BridgeGit -Directory $WorktreePath -Arguments @('rm', '-r', '--quiet', '--', '.') -IndexFile $temporaryIndex
             if (-not $files.Ok) { throw "Tracked-file cleanup was refused: $($files.Output)" }
@@ -844,8 +868,12 @@ function Remove-BridgeWorktreeFiles {
             if ($removedTracked -and [System.IO.File]::Exists($dotGit)) {
                 # Without --force, checkout-index restores missing files only. A new
                 # user file is never overwritten to make an aborted cleanup look clean.
-                $restore = Invoke-BridgeGit -Directory $WorktreePath -Arguments @('checkout-index', '--all')
-                if (-not $restore.Ok) { Write-Warning "Existing files were preserved; inspect the stopped worktree cleanup: $($restore.Output)" }
+                try {
+                    Assert-BridgeInstallPayload -Root $WorktreePath -RelativePaths (@('.git') + $trackedPaths)
+                    $restore = Invoke-BridgeGit -Directory $WorktreePath -Arguments @('checkout-index', '--all')
+                    if (-not $restore.Ok) { Write-Warning "Existing files were preserved; inspect the stopped worktree cleanup: $($restore.Output)" }
+                }
+                catch { Write-Warning "Worktree restoration refused uncertain physical paths: $($_.Exception.Message)" }
             }
         }
         foreach ($temporary in @($temporaryIndex) + $(if ($removedDirectory) { @($stagedPointer) } else { @() })) {

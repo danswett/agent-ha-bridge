@@ -711,6 +711,102 @@ setTimeout(() => process.exit(3), 5 * 60 * 1000);
         }
     }
 
+    foreach ($mode in @('ordinary-control', 'ancestor-link', 'nested-link', 'missing-tracked')) {
+        Invoke-P4Scenario "physical tracked-file boundary $mode" {
+            $fixture = New-P4Fixture
+            $worktree = New-P4Worktree $fixture
+            Set-P4OldWorktree $worktree
+            $relativeDirectory = if ($mode -eq 'nested-link') { 'src\child' } else { 'src' }
+            $directory = Join-Path $worktree $relativeDirectory
+            $relativeFile = if ($mode -eq 'nested-link') { 'tracked.txt' } else { 'child\tracked.txt' }
+            $foreign = Join-Path $fixture.Root 'foreign'
+            Assert-P4Path $foreign
+            Copy-Item -LiteralPath $directory -Destination $foreign -Recurse -ErrorAction Stop
+            $foreignFile = Join-Path $foreign $relativeFile
+            if ([IO.File]::ReadAllText($foreignFile) -cne 'P4 descendant content') {
+                throw 'The foreign fixture does not contain identical tracked bytes.'
+            }
+            # Validate every repository/target boundary before adding the deliberate
+            # fixture link; the ordinary fixture wrapper correctly rejects such links.
+            Assert-P4Repository $fixture
+            Assert-P4Path $foreign
+            $admin = Split-Path (Get-BridgeWorktreeMarkerPath $worktree) -Parent
+            if ($mode -eq 'missing-tracked') {
+                $null = Invoke-P4Git $worktree @('update-index', '--assume-unchanged', '--', 'src/child/tracked.txt')
+            }
+            $indexHash = (Get-FileHash -LiteralPath (Join-Path $admin 'index')).Hash
+            $linked = $mode -in @('ancestor-link', 'nested-link')
+            $trace = Join-Path $fixture.Root 'physical-cleanup-trace.jsonl'
+            [IO.File]::WriteAllText($trace, '')
+            $originalTrace = $env:GIT_TRACE2_EVENT
+            try {
+                if ($mode -ne 'ordinary-control') {
+                    [IO.File]::Delete((Join-Path $directory $relativeFile))
+                }
+                if ($linked) {
+                    if ($mode -eq 'ancestor-link') { [IO.Directory]::Delete((Join-Path $directory 'child'), $false) }
+                    [IO.Directory]::Delete($directory, $false)
+                    $linkType = if ($IsWindows) { 'Junction' } else { 'SymbolicLink' }
+                    New-Item -ItemType $linkType -Path $directory -Target $foreign -ErrorAction Stop | Out-Null
+                    if (-not ((Get-Item -LiteralPath $directory -Force -ErrorAction Stop).Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                        throw 'The actual directory-link fixture was not created.'
+                    }
+                }
+                $status = Invoke-BridgeGit -Directory $worktree `
+                    -Arguments @('--no-optional-locks', 'status', '--porcelain', '--untracked-files=all', '--ignored=matching')
+                $entries = Invoke-BridgeGit -Directory $worktree -Arguments @('ls-files', '--stage', '--', 'src/child/tracked.txt')
+                if (-not $status.Ok -or -not $entries.Ok -or $entries.Output -notmatch '^100644 [a-f0-9]+ 0\t') {
+                    throw 'The physical-path fixture did not retain its ordinary tracked-file index entry.'
+                }
+                if (($IsWindows -or -not $linked) -and $status.Output) {
+                    throw "The intended clean-status physical fixture was dirty: $($status.Output)"
+                }
+                $env:GIT_TRACE2_EVENT = $trace
+                $warnings = @()
+                $finished = Test-BridgeWorktreeFinished -WorktreePath $worktree -BaseRef 'origin/main' `
+                    -IdleHours 12 -WarningVariable warnings
+                $removed = Remove-BridgeFinishedWorktree -RepositoryPath $fixture.Repository `
+                    -IdleHours 12 -WarningVariable +warnings
+                $foreignIntact = [IO.File]::Exists($foreignFile) -and
+                    [IO.File]::ReadAllText($foreignFile) -ceq 'P4 descendant content'
+                $observed = @{
+                    mode = $mode; gitStatus = $status.Output; indexEntry = $entries.Output
+                    actualLink = $linked; finished = $finished; removed = $removed
+                    treePresent = [IO.Directory]::Exists($worktree); foreignBytesPreserved = $foreignIntact
+                    warnings = @($warnings | ForEach-Object { $_.Message })
+                }
+                if ($mode -eq 'ordinary-control') {
+                    Test-P4 'an ordinary physical-directory control remains eligible' $finished
+                    Test-P4 'ordinary physical cleanup removes only its candidate tree' `
+                        ($removed -eq 1 -and -not [IO.Directory]::Exists($worktree)) $observed
+                }
+                else {
+                    Test-P4 "${mode}: linked or uncertain physical content is not finished" (-not $finished) $observed
+                    Test-P4 "${mode}: the actual consumer preserves its candidate tree" `
+                        ($removed -eq 0 -and (Test-P4TreePreserved $worktree)) $observed
+                    Test-P4 "${mode}: refusal happens before actual tracked-file removal" `
+                        (-not [IO.File]::ReadAllText($trace).Contains('"rm","-r","--quiet","--","."'))
+                    Test-P4 "${mode}: physical-path refusal has a useful diagnostic" ($warnings.Count -gt 0)
+                    Test-P4 "${mode}: physical-path refusal preserves the real index" `
+                        ((Get-FileHash -LiteralPath (Join-Path $admin 'index')).Hash -eq $indexHash)
+                }
+                Test-P4 "${mode}: foreign fixture bytes remain untouched" $foreignIntact
+            }
+            finally {
+                $env:GIT_TRACE2_EVENT = $originalTrace
+                if ($linked) {
+                    try {
+                        $entry = Get-Item -LiteralPath $directory -Force -ErrorAction Stop
+                        if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+                            [IO.Directory]::Delete($directory, $false)
+                        }
+                    }
+                    catch [Management.Automation.ItemNotFoundException] { }
+                }
+            }
+        }
+    }
+
     Invoke-P4Scenario 'native non-forced Git removal preserves ignored bytes' {
         $fixture = New-P4Fixture
         $worktree = New-P4Worktree $fixture
