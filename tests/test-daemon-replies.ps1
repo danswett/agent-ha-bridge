@@ -125,6 +125,23 @@ Test-That 'and a payload from a card too old to send files still reads' {
     $null -ne $p -and $p.Files.Count -eq 0
 }
 
+Write-Host '--- who sent a payload, which MQTT cannot say for itself ---'
+# A Submit press commits through a service call and Home Assistant records the account
+# on it. This arrives over MQTT, where a published state carries no context at all, so
+# the only thing that can say is the payload.
+Test-That 'a payload that marks itself as the agent is read as the agent' {
+    $p = Get-BridgeReplyPayload -State ([pscustomobject]@{ state = 'd1'; attributes = [pscustomobject]@{ text = 'hi'; driver = 'agent' } })
+    $p.Driver -eq 'agent'
+}
+Test-That 'the reply card marks nothing, and a person is what that means' {
+    $p = Get-BridgeReplyPayload -State ([pscustomobject]@{ state = 'd2'; attributes = [pscustomobject]@{ text = 'hi' } })
+    $p.Driver -eq 'human'
+}
+Test-That 'and anything other than the one word it knows is a person too' {
+    $p = Get-BridgeReplyPayload -State ([pscustomobject]@{ state = 'd3'; attributes = [pscustomobject]@{ text = 'hi'; driver = 'AGENT ' } })
+    $p.Driver -eq 'human'
+}
+
 Write-Host '--- a file name that has to be safe to hand the CLI ---'
 # The CLI references an attachment as `@<path>`, which has no quoting, so a space
 # would split one attachment into two broken words. The name comes from a browser, so
@@ -166,17 +183,26 @@ Remove-Item -LiteralPath $script:AttachRoot -Recurse -Force -ErrorAction Silentl
 
 Write-Host '--- a payload from the reply card ---'
 $script:Replies = @(); $script:Removed = @(); $script:Saved = @(); $script:Wrote = @()
-function Invoke-DaemonReply { param($SessionId, $Text, $Headers, $DisplayText, [switch]$ClearReplyBox) $script:Replies += [pscustomobject]@{ Text = $Text; StampAtDelivery = $state[$sid].LastReplyPayloadAt }; $true }
+$script:DeliverResult = $true
+function Invoke-DaemonReply { param($SessionId, $Text, $Headers, $DisplayText, [switch]$ClearReplyBox)
+    $script:Replies += [pscustomobject]@{ Text = $Text; StampAtDelivery = $state[$sid].LastReplyPayloadAt }
+    # The real one writes to the card on its way through, so it emits before returning.
+    'emitted'
+    $script:DeliverResult }
 function Save-BridgeReplyAttachment { param($ImageId, $Name, $Headers) $script:Saved += $ImageId; "C:\att\$ImageId.png" }
 function Save-BridgeReplyFile { param($Name, $Base64, $MaxBytes) $script:Wrote += $Name; "C:\att\$Name" }
 function Remove-BridgeHomeAssistantImage { param($ImageId) $script:Removed += $ImageId; 'emitted' }
 function Remove-BridgeStaleAttachment { 'emitted' }
-function Set-Payload { param([string]$Stamp, [string]$Text, [object[]]$Images = @(), [object[]]$Files = @())
-    $script:Ha = @{ "sensor.${node}_reply_payload" = [pscustomobject]@{ state = $Stamp; attributes = [pscustomobject]@{ text = $Text; images = $Images; files = $Files } } }
+function Set-Payload { param([string]$Stamp, [string]$Text, [object[]]$Images = @(), [object[]]$Files = @(), [string]$Driver = '')
+    $attrs = [pscustomobject]@{ text = $Text; images = $Images; files = $Files }
+    if ($Driver) { $attrs | Add-Member -NotePropertyName driver -NotePropertyValue $Driver }
+    $script:Ha = @{ "sensor.${node}_reply_payload" = [pscustomobject]@{ state = $Stamp; attributes = $attrs } }
 }
 function Get-BridgeReplyPayload { param($State)
     if ($null -eq $State -or -not $State.state) { return $null }
-    [pscustomobject]@{ Stamp = [string]$State.state; Text = [string]$State.attributes.text
+    $drv = 'human'
+    if ($State.attributes.PSObject.Properties['driver'] -and $State.attributes.driver) { $drv = [string]$State.attributes.driver }
+    [pscustomobject]@{ Stamp = [string]$State.state; Text = [string]$State.attributes.text; Driver = $drv
         Images = @($State.attributes.images | ForEach-Object { [pscustomobject]@{ Id = $_; Name = "$_.png" } })
         Files = @($State.attributes.files | ForEach-Object { [pscustomobject]@{ Name = $_; Base64 = 'Yg==' } }) }
 }
@@ -205,6 +231,38 @@ Test-That 'the file is written out rather than fetched from Home Assistant' {
 
 $script:Ha = @{}
 Test-That 'no payload sensor leaves the text box to do its job' { (Send-DaemonCardPayload -SessionId $sid -Entry $entry -Headers $headers) -eq $false }
+
+Write-Host '--- a payload hands the session to whoever sent it ---'
+# A reply longer than the text box's 255 characters is the only kind that comes this
+# way, and agents send long replies. Delivering one without saying who sent it left the
+# next turn to be read as somebody typing in the terminal, so a session an agent was
+# driving went back to showing as the person's the moment it started answering.
+$script:Replies = @()
+Set-Payload -Stamp 'd10' -Text 'a long one from an agent' -Driver 'agent'
+[void](Send-DaemonCardPayload -SessionId $sid -Entry $entry -Headers $headers)
+Test-That 'an agent payload marks the session as the agent' { $entry.Driver -eq 'agent' } $(if ($entry.PSObject.Properties['Driver']) { $entry.Driver })
+Test-That 'and arms the turn it is about to start, so it is not handed straight back' { $entry.DriverPending -eq $true }
+
+Set-Payload -Stamp 'd11' -Text 'and one typed on the dashboard'
+[void](Send-DaemonCardPayload -SessionId $sid -Entry $entry -Headers $headers)
+Test-That 'a reply typed on the card hands it back to the person' { $entry.Driver -eq 'human' } $(if ($entry.PSObject.Properties['Driver']) { $entry.Driver })
+
+# Armed but nothing sent is the case that would show a person's turn with the agent's
+# edge: no agent turn is coming, so the next thing typed in the terminal consumes it.
+$script:Replies = @(); $script:DeliverResult = $false
+Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $true
+Set-Payload -Stamp 'd12' -Text 'this one does not land' -Driver 'agent'
+[void](Send-DaemonCardPayload -SessionId $sid -Entry $entry -Headers $headers)
+Test-That 'a delivery that fails disarms it again' { $entry.DriverPending -eq $false } "pending=$($entry.DriverPending)"
+
+$script:DeliverResult = $true
+$script:Replies = @()
+Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $true
+Set-Payload -Stamp 'd13' -Text '' -Driver 'agent'
+[void](Send-DaemonCardPayload -SessionId $sid -Entry $entry -Headers $headers)
+Test-That 'and a payload with nothing deliverable disarms it too' {
+    $entry.DriverPending -eq $false -and $script:Replies.Count -eq 0
+} "pending=$($entry.DriverPending) replies=$($script:Replies.Count)"
 
 Remove-Item -LiteralPath $script:DaemonConfig.LogFile -Force -ErrorAction SilentlyContinue
 Write-Host ''

@@ -183,10 +183,13 @@ export async function readSession(ha, sessionId, { since = '' } = {}) {
  *     That is what marks the turn as the agent's. It is capped at 255 characters.
  *   - The payload topic has no cap, but arrives over MQTT, and an MQTT-published state
  *     carries no context at all - measured: context.user_id comes back empty. Nothing
- *     downstream can tell who sent it, so the turn is not marked.
+ *     downstream can read who sent it, so the payload says so itself: `driver`, which
+ *     the reply card omits because a reply typed on the dashboard is the person's.
  *
- * So a reply that fits is sent the attributed way, and a longer one is sent whole and
- * unmarked rather than silently truncated. The returned `attributed` says which.
+ * Both paths are therefore marked. The long one is marked by assertion rather than by
+ * Home Assistant's own record, which is sound here because the glow is presentation
+ * and publishing at all already needs a token - but it is the weaker of the two, so
+ * the press stays the way a reply that fits is sent.
  */
 export async function replyToSession(ha, sessionId, text) {
   const body = String(text ?? '');
@@ -211,8 +214,12 @@ export async function replyToSession(ha, sessionId, text) {
   // Not retained, matching the reply card: the daemon's guard against re-delivering a
   // payload is in memory, so a retained one restored by the broker after a restart
   // would be read as a new submission and injected again.
-  await ha.publishMqtt(replyPayloadTopic(sessionId), { at: new Date().toISOString(), text: body }, false);
-  return { sessionId, sent: body.length, attributed: false, since };
+  await ha.publishMqtt(
+    replyPayloadTopic(sessionId),
+    { at: new Date().toISOString(), text: body, driver: 'agent' },
+    false,
+  );
+  return { sessionId, sent: body.length, attributed: true, since };
 }
 
 /**

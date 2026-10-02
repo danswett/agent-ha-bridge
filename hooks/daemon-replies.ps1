@@ -102,9 +102,21 @@ function Get-BridgeReplyPayload {
     # An empty submission is not an error, it is just nothing to do.
     if ([string]::IsNullOrWhiteSpace($text) -and $images.Count -eq 0 -and $files.Count -eq 0) { return $null }
 
+    # Who sent it. A Submit press commits through a service call and Home Assistant
+    # records the account on it, but this arrives over MQTT and an MQTT-published
+    # state carries no context at all - measured: context.user_id comes back empty.
+    # So there is nothing authenticated to read here and the publisher has to say.
+    # Saying nothing means a person, which is what the reply card does: a reply typed
+    # on the dashboard stays the person's, and only a client that marks itself gets
+    # treated as an agent. This is presentation - which colour the card glows - not a
+    # permission, and publishing here already requires a Home Assistant token.
+    $driver = 'human'
+    if ($attrs.PSObject.Properties['driver'] -and ([string]$attrs.driver) -eq 'agent') { $driver = 'agent' }
+
     [pscustomobject]@{
         Stamp  = $stamp
         Text   = $text
+        Driver = $driver
         Images = $images.ToArray()
         Files  = $files.ToArray()
     }
@@ -445,6 +457,18 @@ function Send-DaemonCardPayload {
     # see the same payload still sitting there and send it a second time.
     Set-DaemonSessionProperty -Entry $entry -Name 'LastReplyPayloadAt' -Value $payload.Stamp
 
+    # Who is driving from here, and armed so the turn this is about to start is not
+    # read as somebody typing in the terminal - the same reason a Submit press arms it.
+    # Without this the only replies that come this way, the ones too long for the text
+    # box's 255 characters, left an agent-driven session showing as the person's the
+    # moment it began answering. Guarded because a payload built by an older card - or
+    # by a test - has no Driver, and reading a missing property throws under StrictMode.
+    $payloadDriver = if ($payload.PSObject.Properties['Driver'] -and $payload.Driver) {
+        [string]$payload.Driver
+    } else { 'human' }
+    Set-DaemonSessionProperty -Entry $entry -Name 'Driver' -Value $payloadDriver
+    Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $true
+
     try {
         Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Sending...' -Headers $Headers | Out-Null
     }
@@ -473,6 +497,13 @@ function Send-DaemonCardPayload {
 
     $prompt = New-BridgeAttachmentPrompt -Text $payload.Text -Paths $paths.ToArray()
     if ([string]::IsNullOrWhiteSpace($prompt)) {
+        # Disarmed: no turn is coming, so leaving it armed would hand the glow to
+        # whatever the person types next in the terminal - the same reason an agent
+        # press on an empty box disarms rather than waiting.
+        # Disarmed: no turn is coming, so leaving it armed would hand the glow to
+        # whatever the person types next in the terminal - the same reason an agent
+        # press on an empty box disarms rather than waiting.
+        Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $false
         Write-DaemonLog -Message "reply card payload for $($sessionId.Substring(0,8)) had nothing deliverable"
         return $true
     }
@@ -481,8 +512,17 @@ function Send-DaemonCardPayload {
     Write-DaemonLog -Message "reply card payload for $($sessionId.Substring(0,8))$attachmentNote"
 
     Set-DaemonSessionProperty -Entry $entry -Name 'LastReply' -Value $payload.Text
-    [void](Invoke-DaemonReply -SessionId $sessionId -Text $prompt -Headers $Headers `
-        -DisplayText $payload.Text -ClearReplyBox:$false)
+    # Taken as the last thing emitted rather than assigned straight across: the call
+    # writes to the card on its way through, and that output would otherwise join the
+    # result and make a failed delivery look like a successful one.
+    $delivered = @(Invoke-DaemonReply -SessionId $sessionId -Text $prompt -Headers $Headers `
+        -DisplayText $payload.Text -ClearReplyBox:$false) | Select-Object -Last 1
+    if (-not $delivered) {
+        # Nothing was sent, so no agent turn is coming and the arming above has to go
+        # back. Left armed, the next thing typed in the terminal would consume it and
+        # show a person's turn with the agent's edge.
+        Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $false
+    }
 
     # Only once it is delivered, so a failed send leaves the image in place to be
     # retried by hand.

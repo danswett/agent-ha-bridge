@@ -144,8 +144,8 @@ console.log('\n--- replying, by one path only ---');
   check('and the stamp to poll against comes back', short.since === '09/29/2026 17:39:32');
 
   // Too long for the text box. The payload has no cap but arrives over MQTT, which
-  // carries no context, so the turn cannot be marked - sent whole and unmarked beats
-  // silently truncated.
+  // carries no context, so the payload marks itself instead - sent whole and marked
+  // beats silently truncated, and beats arriving as though the person had typed it.
   const long = 'x'.repeat(400);
   const ha2 = stubHa(states);
   const big = await replyToSession(ha2, SESSION, long);
@@ -157,7 +157,12 @@ console.log('\n--- replying, by one path only ---');
     sent?.retain === false,
     "the daemon's guard against re-delivery is in memory, so a restored payload is injected again",
   );
-  check('it says it could not be attributed', big.attributed === false);
+  check(
+    'it marks itself as the agent, which MQTT cannot do for it',
+    sent?.payload?.driver === 'agent',
+    'without this the session turns blue the moment it starts answering',
+  );
+  check('so a long reply is attributed too', big.attributed === true);
   check(
     'and neither the box nor Submit is touched, so it arrives once',
     ha2.calls.length === 0,
@@ -205,7 +210,7 @@ console.log('\n--- a session whose card carries no update stamp ---');
 console.log('\n--- measuring a reply the way Home Assistant does ---');
 {
   // .length counts UTF-16 units, so 128 emoji would read as 256 and be pushed down the
-  // unattributed path despite fitting Home Assistant's 255 characters.
+  // payload path despite fitting Home Assistant's 255 characters.
   const emoji = '\u{1F600}'.repeat(200);
   check('the test string really is non-BMP', emoji.length === 400 && [...emoji].length === 200);
   const ha = stubHa(states);
@@ -217,7 +222,11 @@ console.log('\n--- measuring a reply the way Home Assistant does ---');
   const tooMany = '\u{1F600}'.repeat(300);
   const ha2 = stubHa(states);
   const big = await replyToSession(ha2, SESSION, tooMany);
-  check('but 300 really is too many', big.attributed === false && ha2.published.length === 1);
+  check(
+    'but 300 really is too many, so it takes the payload path',
+    ha2.published.length === 1 && ha2.calls.length === 0,
+  );
+  check('still marked, by the payload saying so', big.attributed === true);
 }
 
 console.log('\n--- launching ---');
