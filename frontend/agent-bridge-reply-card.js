@@ -666,29 +666,41 @@ class AgentBridgeActivityCard extends HTMLElement {
   // Only two small spans change on each frame, so the animation never re-renders the
   // card or moves anything around it.
   _startSpinner() {
-    if (this._spinner) { return; }
+    // Not `this._spinner`: while the page is hidden there is deliberately no interval,
+    // and keying the guard on it would register a second listener on every call.
+    if (this._spinning) { return; }
+    this._spinning = true;
     let frame = 0;
     const tick = () => {
-      // Home Assistant sits in a pinned tab for days. Nothing of this is presented
-      // while that tab is hidden, so a tick then buys nothing and only wakes the main
-      // thread - eight times a second, for every session that is working.
-      if (typeof document !== 'undefined' && document.hidden) { return; }
       this._els.glyph.textContent = SPINNER_GLYPHS[frame++ % SPINNER_GLYPHS.length];
       const secs = Math.max(0, Math.floor((Date.now() - this._since) / 1000));
       const text = secs >= 60 ? `${Math.floor(secs / 60)}m ${secs % 60}s` : `${secs}s`;
       if (this._els.elapsed.textContent !== ` (${text})`) { this._els.elapsed.textContent = ` (${text})`; }
     };
-    tick();
-    // Skipping those ticks would otherwise leave a stale elapsed time on screen for
-    // up to 120ms after the tab comes back, so catch up the moment it does.
+    const hidden = () => typeof document !== 'undefined' && !!document.hidden;
+    const resume = () => {
+      if (this._spinner || hidden()) { return; }
+      // At once, so the elapsed time is right the instant the tab is looked at rather
+      // than up to 120ms later.
+      tick();
+      this._spinner = setInterval(tick, 120);
+    };
+    // Home Assistant sits in a pinned tab for days, with one of these per working
+    // session. Returning early from the tick is not enough - the timer still fires and
+    // still wakes the main thread, it just does nothing once it has - so the interval
+    // is stopped outright while the page is hidden and started again when it is not.
+    this._onVisible = () => {
+      if (!hidden()) { resume(); return; }
+      if (this._spinner) { clearInterval(this._spinner); this._spinner = null; }
+    };
     if (typeof document !== 'undefined' && document.addEventListener) {
-      this._onVisible = () => tick();
       document.addEventListener('visibilitychange', this._onVisible);
     }
-    this._spinner = setInterval(tick, 120);
+    resume();
   }
 
   _stopSpinner() {
+    this._spinning = false;
     if (this._spinner) { clearInterval(this._spinner); this._spinner = null; }
     if (this._onVisible) {
       document.removeEventListener('visibilitychange', this._onVisible);
