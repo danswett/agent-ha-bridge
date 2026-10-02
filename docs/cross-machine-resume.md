@@ -124,8 +124,9 @@ Two existing rules have to widen from "this machine" to "the fleet":
 * **A live session is never offered.** Two CLIs writing one transcript corrupts it. The
   global status attribute already lists each machine's live sessions, so the check has
   the data it needs.
-* **A session is listed once.** After a transfer the transcript exists in two places; the
-  merged list must dedupe by session id so it cannot be resumed from both.
+* **A session is listed once.** After a transfer the transcript exists in two places, so
+  the merged list dedupes by session id, keeping the most recently updated copy - see
+  [Decisions](#the-source-copy-stays).
 
 ## Moving a session
 
@@ -203,15 +204,63 @@ first.
 * a peer running an older bridge, publishing no resumable list, contributes nothing and
   breaks nothing;
 * chunk topics are cleared after both success and failure;
-* a transferred session is offered exactly once in the merged list, not twice.
+* a session present on two machines is offered once, as the copy that was updated most
+  recently, and the older copy disappears from the list once the newer one is written;
+* an Agency session offered to a machine without Agency installed is refused, and one
+  offered to a machine whose Agency has no profiles launches with no profile rather than
+  with a name that machine does not have;
+* progress and refusals reach the existing "Last launch" line, so no card version bump is
+  needed and a peer on an older card still renders them.
 
-## Open questions
+## Decisions
 
-* **Does the source copy stay?** Leaving it means the transcript exists twice and could
-  diverge if someone resumes the old one. Deleting it makes the feature destructive.
-  Suggested: keep it, and have the merged list stop offering a session that has been
-  moved, recording where it went.
-* **Should Agency sessions transfer as Agency or Copilot?** They share Copilot's store,
-  but Agency applies a profile the target may not have.
-* **Should the card show transfer progress?** One or two chunks is fast enough that it
-  may not be worth an entity; a 14-chunk transfer probably is.
+### The source copy stays
+
+A move is not destructive: nothing is deleted from the machine the session came from.
+That leaves the transcript in two places, so the merged list has to make sure only one
+of them is ever offered.
+
+It already has what it needs to do that without any new bookkeeping. Each entry carries
+`Updated`, so **dedupe by session id, keeping the most recently updated copy**. Resuming
+on the target makes the target's copy the newer one, so the session simply follows the
+machine it was last used on, and the stale copy stops being offered the moment the new
+one is written.
+
+This is deliberately not a "moved to" marker. A marker is state that has to be published,
+kept in step and cleaned up, and it would be wrong the moment someone resumed the
+original at the keyboard rather than through the dashboard. A timestamp comparison cannot
+drift out of step with reality, because it *is* reality.
+
+### Agency sessions transfer as Agency
+
+They share Copilot's store, so the files that move are identical; only the launcher that
+reopens them differs. A session that ran under Agency reopens under Agency.
+
+That adds one precondition and reuses one existing row:
+
+* Agency must be installed on the target, or the resume is refused on the card like any
+  other missing launcher.
+* The **Profile** row already applies to resumes and already offers only the profiles
+  that target machine actually has, so the profile is chosen there rather than carried
+  across. This matters because `agency copilot --profile-only <name>` on a machine
+  without that profile exits before Copilot starts - the window closes too fast to read,
+  which is exactly the failure the existing per-machine profile list was built to avoid.
+
+A machine whose Agency has no profiles gets no Profile row and passes none, falling back
+to Agency's base configuration - unchanged behaviour.
+
+### The card shows transfer progress
+
+A one-chunk transfer finishes in about a second, but a fourteen-chunk one does not, and a
+card that sits silent through it looks broken.
+
+Progress goes in the **existing `new_session_result` sensor** - the "Last launch" line -
+as `Transferring 3/14...`, then the usual outcome text. Deliberately not a new entity:
+the dashboard gates card shape on `CARD_VERSION`, so a new row would mean bumping the
+card, gating the generator on that exact version and keeping the old output as a
+fallback. Reusing a field the card already renders means a fleet on mixed versions shows
+this correctly with no card change at all.
+
+The same line carries the refusals, which is where most of them will be seen: the source
+being offline, the agent not being signed in on the target, the bundle being over the
+cap.
