@@ -156,11 +156,12 @@ $script:DaemonConfig = @{
     # that confirms it. Only a session that is not idle is guarded this way; see
     # Invoke-PendingStops for why one press is not enough.
     StopConfirmSeconds = 10
-    # How long to keep retrying the note that says the confirmation lapsed, when Home
-    # Assistant could not be reached at the moment it did. The arm is only released
-    # once that note lands, so without a ceiling an outage would keep the entry alive
-    # for the life of the daemon.
-    StopLapseRetrySeconds = 120
+    # How long to wait before retrying the note that says the confirmation lapsed,
+    # when Home Assistant could not be reached at the moment it did. The arm is only
+    # released once that note lands: a quiet session produces no later activity, so
+    # giving up would leave the card asking for a press that confirms nothing, and
+    # recovery alone would never clear it.
+    StopLapseRetrySeconds = 2
     ResumeCacheSeconds = 180
     # How soon to retry after a fetch that failed or came back empty, rather than
     # waiting out the full interval with a list known to be wrong.
@@ -285,7 +286,15 @@ $script:DaemonPendingTuningKey = '(pending)'
 # two presses must come back disarmed. Coming back still armed would turn the next
 # press - made after a restart, possibly minutes later - into a confirmation of
 # something the user had long since given up on.
+#
+# The question those arms put on the card *is* recorded on disk, so that hook
+# processes publishing their own status line do not wipe it. That record cannot
+# confirm anything, and is cleared here for the same reason the arms are not
+# restored: nothing this daemon did not arm itself may be left showing.
 $script:DaemonStopArmed = @{}
+foreach ($stale in @((Read-BridgeStopPrompts).Keys)) {
+    Write-BridgeStopPrompt -SessionId $stale -Until $null
+}
 
 # Anything the dashboard reports as happening before this is a leftover from a
 # previous run rather than something the user just did.

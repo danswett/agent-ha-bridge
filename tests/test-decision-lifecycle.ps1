@@ -56,9 +56,13 @@ function Confirm-LifecycleStop {
         fixed at 'working'. Without this they would only ever arm, and the failures
         these assert on would never happen. The confirmation itself is covered where it
         belongs, in tests/test-stop-session.ps1.
+
+        Armed against this process, which the fixtures also carry as their live
+        process id: a confirmation is bound to the target it was taken against, so an
+        arm for any other process would not answer theirs.
     #>
     param([Parameter(Mandatory)][hashtable]$State)
-    foreach ($id in @($State.Keys)) { Set-DaemonStopArm -SessionId $id -Status 'working' }
+    foreach ($id in @($State.Keys)) { Set-DaemonStopArm -SessionId $id -Status 'working' -ProcessId $PID }
 }
 
 try {
@@ -457,7 +461,7 @@ try {
             $text = if ($Kind -eq 'copilot') { '{"type":"assistant.turn_start","timestamp":"2026-09-30T16:59:00-07:00"}' + "`n" } else { '' }
             [IO.File]::WriteAllText($transcript, $text, [Text.UTF8Encoding]::new($false))
             $session = [pscustomobject]@{
-                SessionId = $id; Kind = $Kind; ProcessId = 0; Transcript = $transcript
+                SessionId = $id; Kind = $Kind; ProcessId = $PID; Transcript = $transcript
                 Status = 'working'; WorkingDirectory = $root
             }
             $entry = [pscustomobject]@{
@@ -743,7 +747,7 @@ try {
             $script:DaemonLaunchedPids = @{}
             $script:DaemonReconcileNow = $false
             $state = @{ $sid = [pscustomobject]@{ Name = 'Synthetic'; Machine = 'TEST'; Status = 'working' } }
-            $live = @{ $sid = [pscustomobject]@{ ProcessId = 0 } }
+            $live = @{ $sid = [pscustomobject]@{ ProcessId = $PID } }
             Confirm-LifecycleStop -State $state
             Invoke-PendingStops -Headers $headers -State $state -Live $live
             $outcome = if ($stopped) { 'ended' } else { 'error' }

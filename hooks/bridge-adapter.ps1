@@ -102,6 +102,75 @@ function Confirm-BridgeSessionEntities {
     $exists
 }
 
+function Get-BridgeStopPromptPath {
+    <# Where the daemon records which sessions are currently showing the End session question. #>
+    Get-BridgeRuntimePath 'agent-bridge-stop-prompt.json'
+}
+
+function Read-BridgeStopPrompts {
+    <# The recorded prompts, or an empty map. Never throws: this is display state. #>
+    $path = try { Get-BridgeStopPromptPath } catch { return @{} }
+    if (-not (Test-Path -LiteralPath $path)) { return @{} }
+    try { return (Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable) }
+    catch { return @{} }
+}
+
+function Write-BridgeStopPrompt {
+    <#
+        Records, or clears, that one session is showing the End session question.
+
+        Deliberately display state and nothing more. The question is pinned by every
+        process that publishes activity, but only the daemon holds the arm that can
+        answer it, and this file is never consulted when deciding whether a press
+        confirms. So a stale file can at worst leave a prompt on a card for a few
+        seconds; it can never stop a session.
+
+        That separation is the point. Publish-BridgeSessionStatus also runs inside
+        standalone hook processes - a Claude Notification is the case that found this -
+        which have no daemon state at all, and were publishing their own status line
+        straight over the question while the session was still armed.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [AllowNull()][object]$Until = $null,
+        [AllowEmptyString()][string]$Hint = ''
+    )
+
+    try {
+        $path = Get-BridgeStopPromptPath
+        $prompts = Read-BridgeStopPrompts
+        if ($null -eq $Until) { [void]$prompts.Remove($SessionId) }
+        else { $prompts[$SessionId] = @{ until = ([datetimeoffset]$Until).ToString('o'); hint = $Hint } }
+        if ($prompts.Count -eq 0) {
+            if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue }
+            return
+        }
+        [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($path))
+        Set-Content -LiteralPath $path -Value ($prompts | ConvertTo-Json -Depth 4 -Compress) -Encoding utf8
+    }
+    catch {
+        # A card that misses the question is better than a hook that fails because of it.
+    }
+}
+
+function Get-BridgeStopPrompt {
+    <#
+        The End session question one session is showing, or $null.
+
+        Expiry is carried in the record rather than inferred, so a file left behind by
+        a daemon that died stops pinning anything of its own accord.
+    #>
+    param([Parameter(Mandatory)][string]$SessionId)
+
+    $prompts = Read-BridgeStopPrompts
+    if (-not $prompts.ContainsKey($SessionId)) { return $null }
+    $entry = $prompts[$SessionId]
+    $until = [datetimeoffset]::MinValue
+    if (-not [datetimeoffset]::TryParse([string]$entry.until, [ref]$until)) { return $null }
+    if ([datetimeoffset]::Now -gt $until) { return $null }
+    $entry
+}
+
 function Publish-BridgeSessionStatus {
     <#
         Publishes a session's status and, when given, its activity, with the standard
@@ -161,15 +230,25 @@ function Publish-BridgeSessionStatus {
         $detail['machine'] = $Machine
         # Every activity writer goes through the arm guard, not just the daemon's
         # transcript streamers. A Claude Notification publishes its own status line
-        # straight through here, and arriving inside the ten-second window it replaced
-        # the End session question while the session was still armed - leaving a user
-        # who read the vanished prompt as a dead tap to press again and end the turn.
+        # straight through here, and arriving inside the confirmation window it
+        # replaced the End session question while the session was still armed -
+        # leaving a user who read the vanished prompt as a dead tap to press again and
+        # end the turn.
         #
-        # Resolved rather than called outright because this file is also loaded by
-        # hook processes, which have no daemon state and never hold an arm.
+        # Two routes because there are two kinds of caller. Inside the daemon the arm
+        # itself is in memory and authoritative. A standalone hook process has no
+        # daemon state at all, so it reads the recorded prompt instead - display state
+        # only, which cannot answer the question, only keep showing it.
         $summary = $Activity
         if (Get-Command -Name Get-DaemonCardSummary -CommandType Function -ErrorAction Ignore) {
             $summary = Get-DaemonCardSummary -SessionId $SessionId -Summary $summary -Detail $detail
+        }
+        else {
+            $prompt = Get-BridgeStopPrompt -SessionId $SessionId
+            if ($null -ne $prompt) {
+                $summary = $script:CopilotEndSessionConfirmNote
+                $detail['hint'] = [string]$prompt.hint
+            }
         }
         Set-CopilotMqttActivity -SessionId $SessionId -Summary $summary -Detail $detail -Headers $Headers
     }
