@@ -1853,11 +1853,17 @@ function Assert-HomeAssistantServiceTarget {
         be sent.
 
         Nothing in this repository legitimately targets more than one entity - every
-        caller passes a scalar id - so the safe shape is made the only allowed shape,
-        and a collapsed selection throws here instead of becoming a house-wide side
-        effect. 'all' is rejected by name because Home Assistant still honours it as
-        "every entity in the domain", and device/area/label/floor ids are checked too:
-        each of those fans out further than an entity id does.
+        caller passes a scalar entity id, or no target at all - so the safe shape is
+        made the only allowed shape, and a collapsed selection throws here instead of
+        becoming a house-wide side effect.
+
+        entity_id is the only selector accepted, and only ever one of them. 'all' is
+        rejected by name because Home Assistant still honours it as "every entity in
+        the domain". device_id, area_id, label_id and floor_id are refused outright
+        rather than counted: Home Assistant expands each of them to *every* matching
+        entity, so a single scalar area_id presses every button in that area. Counting
+        selector values would wave that straight through. An entity_id in both the body
+        and target is refused for the same reason - the two are a union, not a choice.
     #>
     param(
         [Parameter(Mandatory)]
@@ -1874,41 +1880,53 @@ function Assert-HomeAssistantServiceTarget {
         }
     }
 
+    $named = 0
     foreach ($container in $containers) {
-        foreach ($key in @('entity_id', 'device_id', 'area_id', 'label_id', 'floor_id')) {
-            if (-not $container.ContainsKey($key)) { continue }
-            $value = $container[$key]
-
-            # A one-element array is how a caller spells "just this one", so unwrap it
-            # rather than failing a selection that is already safe.
-            if ($value -isnot [string] -and $null -ne $value) {
-                $items = @($value)
-                if ($items.Count -eq 1) { $value = $items[0] }
-                else {
-                    throw ("Home Assistant service call selects $($items.Count) values as $key. " +
-                        'Name exactly one; a service call is not a way to fan out. ' +
-                        'A collapsed pipeline filter is the usual cause.')
-                }
-            }
-
-            if ($null -eq $value -or $value -isnot [string]) {
-                throw "Home Assistant service call has a $key that is not a single string."
-            }
-
-            $id = $value.Trim()
-            if ($id -eq '') { throw "Home Assistant service call has an empty $key." }
-            if ($id -eq 'all') {
-                throw ("Home Assistant service call uses $key 'all', which targets every " +
-                    'entity in the domain. Name the one entity instead.')
-            }
-            if ($id -match '[,\s]') {
-                throw ("Home Assistant service call passes a list as $key ('$id'). " +
-                    'Name exactly one entity.')
-            }
-            if ($key -eq 'entity_id' -and $id -notmatch '^[^.\s,]+\.[^.\s,]+$') {
-                throw "Home Assistant service call has a malformed entity_id ('$id')."
+        foreach ($key in @('device_id', 'area_id', 'label_id', 'floor_id')) {
+            if ($container.ContainsKey($key)) {
+                throw ("Home Assistant service call selects by $key, which Home Assistant " +
+                    'expands to every matching entity. Name a single entity_id instead.')
             }
         }
+
+        if (-not $container.ContainsKey('entity_id')) { continue }
+        $named++
+        $value = $container['entity_id']
+
+        # A one-element array is how a caller spells "just this one", so unwrap it
+        # rather than failing a selection that is already safe.
+        if ($value -isnot [string] -and $null -ne $value) {
+            $items = @($value)
+            if ($items.Count -eq 1) { $value = $items[0] }
+            else {
+                throw ("Home Assistant service call selects $($items.Count) values as entity_id. " +
+                    'Name exactly one; a service call is not a way to fan out. ' +
+                    'A collapsed pipeline filter is the usual cause.')
+            }
+        }
+
+        if ($null -eq $value -or $value -isnot [string]) {
+            throw 'Home Assistant service call has an entity_id that is not a single string.'
+        }
+
+        $id = $value.Trim()
+        if ($id -eq '') { throw 'Home Assistant service call has an empty entity_id.' }
+        if ($id -eq 'all') {
+            throw ("Home Assistant service call uses entity_id 'all', which targets every " +
+                'entity in the domain. Name the one entity instead.')
+        }
+        if ($id -match '[,\s]') {
+            throw ("Home Assistant service call passes a list as entity_id ('$id'). " +
+                'Name exactly one entity.')
+        }
+        if ($id -notmatch '^[^.\s,]+\.[^.\s,]+$') {
+            throw "Home Assistant service call has a malformed entity_id ('$id')."
+        }
+    }
+
+    if ($named -gt 1) {
+        throw ('Home Assistant service call names an entity_id in both the body and ' +
+            'target, which selects both. Name exactly one entity.')
     }
 }
 

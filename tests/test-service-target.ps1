@@ -112,9 +112,37 @@ Test-That 'a comma-separated list in one string is refused' {
     $r = Test-Refusal -Data @{ entity_id = 'button.a,button.b' }
     $r.Refused -and $r.Sent -eq 0
 }
-Test-That 'an area_id selecting everything in a room is refused' {
-    $r = Test-Refusal -Data @{ target = @{ area_id = 'all' } }
+Write-Host ''
+Write-Host '--- a selector that expands is refused however few values it has ---'
+
+Test-That 'one area id is still every button in that area' {
+    # Codex caught this on PR #62: counting selector values waved it straight through.
+    $r = Test-Refusal -Data @{ target = @{ area_id = 'living_room' } }
+    $r.Refused -and $r.Sent -eq 0 -and $r.Message -match 'every matching entity'
+}
+Test-That 'one device id is still every entity on that device' {
+    $r = Test-Refusal -Data @{ target = @{ device_id = 'abc123' } }
     $r.Refused -and $r.Sent -eq 0
+}
+Test-That 'a label selects everything wearing it' {
+    $r = Test-Refusal -Data @{ target = @{ label_id = 'lights' } }
+    $r.Refused -and $r.Sent -eq 0
+}
+Test-That 'a floor selects everything on it' {
+    $r = Test-Refusal -Data @{ target = @{ floor_id = 'upstairs' } }
+    $r.Refused -and $r.Sent -eq 0
+}
+Test-That 'an expanding selector in the body is refused too, not just in target' {
+    $r = Test-Refusal -Data @{ area_id = 'living_room' }
+    $r.Refused -and $r.Sent -eq 0
+}
+Test-That 'a valid entity id does not excuse an area id beside it' {
+    $r = Test-Refusal -Data @{ entity_id = 'button.a_b'; target = @{ area_id = 'living_room' } }
+    $r.Refused -and $r.Sent -eq 0
+}
+Test-That 'naming an entity in both the body and target selects both, so it is refused' {
+    $r = Test-Refusal -Data @{ entity_id = 'button.a_b'; target = @{ entity_id = 'button.c_d' } }
+    $r.Refused -and $r.Sent -eq 0 -and $r.Message -match 'both the body and target'
 }
 Test-That 'several device ids are refused too' {
     $r = Test-Refusal -Data @{ target = @{ device_id = @('d1', 'd2') } }

@@ -301,7 +301,10 @@ reply, a launch.
 ### Press one thing, not everything
 
 `Invoke-HomeAssistantService` refuses a call that names more than one entity, and
-`Assert-HomeAssistantServiceTarget` is where that is enforced. **A direct
+`Assert-HomeAssistantServiceTarget` is where that is enforced. It takes a single
+scalar `entity_id` and nothing else: `area_id`, `device_id`, `label_id` and `floor_id`
+are refused outright, because Home Assistant expands each of them to *every* matching
+entity, so one scalar `area_id` presses every button in the area. **A direct
 `Invoke-RestMethod` to `/api/services/...` goes nowhere near it**, so when you press
 something yourself, the shape of the target is entirely your problem.
 
