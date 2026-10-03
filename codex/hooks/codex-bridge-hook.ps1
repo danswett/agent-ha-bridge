@@ -32,6 +32,7 @@ try {
     if ($null -ne $hookEvent) { Invoke-CodexHook -HookEvent $hookEvent | Out-Null }
 }
 catch {
+    if ($_.Exception.Data['BridgeTestWriteBlocked']) { throw }
     try { Write-DecisionBridgeLog -Message "codex hook failed: $($_.Exception.Message)" } catch { }
 }
 exit 0

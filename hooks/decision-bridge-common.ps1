@@ -413,7 +413,9 @@ function Test-HomeAssistantReachable {    <#
         $age = ([DateTime]::UtcNow - [IO.File]::GetLastWriteTimeUtc((Get-BridgeReachableMarker))).TotalSeconds
         if ($age -ge 0 -and $age -lt $script:BridgeReachableFreshSeconds) { return $true }
     }
-    catch { }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked']) { throw }
+    }
 
     $uri = "$($script:DecisionBridgeConfig.HomeAssistantBaseUrl)/api/"
     Assert-BridgeHttpAllowed -Uri $uri
@@ -424,6 +426,7 @@ function Test-HomeAssistantReachable {    <#
         return $true
     }
     catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked']) { throw }
         return $false
     }
 }
@@ -437,7 +440,10 @@ function Get-BridgeReachableMarker { Get-BridgeRuntimePath 'agent-bridge-ha-reac
 
 function Set-BridgeHomeAssistantReachable {
     <# Records that Home Assistant just answered. Best effort. #>
-    try { [IO.File]::WriteAllText((Get-BridgeReachableMarker), [DateTimeOffset]::Now.ToString('o')) } catch { }
+    try { [IO.File]::WriteAllText((Get-BridgeReachableMarker), [DateTimeOffset]::Now.ToString('o')) }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked']) { throw }
+    }
 }
 
 function Get-BridgeDaemonHeartbeat { Get-BridgeRuntimePath 'agent-bridge-daemon.heartbeat' }
@@ -447,7 +453,10 @@ function Set-BridgeDaemonAlive {
     try {
         [void][IO.Directory]::CreateDirectory((Get-BridgeRuntimeRoot))
         [IO.File]::WriteAllText((Get-BridgeDaemonHeartbeat), [string]$PID)
-    } catch { }
+    }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked']) { throw }
+    }
 }
 
 function Get-BridgeDaemonPid {
@@ -472,7 +481,10 @@ function Get-BridgeDaemonPid {
         if ($null -eq $proc) { return 0 }
         $id
     }
-    catch { 0 }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked']) { throw }
+        0
+    }
 }
 
 function Test-BridgeDaemonAlive {
@@ -485,7 +497,10 @@ function Test-BridgeDaemonAlive {
     # them against Home Assistant beside a running daemon.
     if ($env:AGENT_BRIDGE_HOOKS_PUBLISH) { return $false }
     try { ([DateTime]::UtcNow - [IO.File]::GetLastWriteTimeUtc((Get-BridgeDaemonHeartbeat))).TotalSeconds -lt 60 }
-    catch { $false }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked']) { throw }
+        $false
+    }
 }
 
 function Set-DecisionBridgeDeadline {

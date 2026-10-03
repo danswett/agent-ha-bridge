@@ -6,6 +6,16 @@
     Host and platform groups are explicit disposable-CI gates. Integration suites
     are inventoried but never run here. This isolates reviewed regression tests;
     it is not an OS sandbox for untrusted scripts.
+
+    Fixture writes require the allocated sandbox identity, matching synthetic homes,
+    confined effective context paths and unlinked path components. A marker or HOME
+    assignment alone does not authorize a write. Direct suites without that boundary
+    fail before reading configuration or mutating an installation. Descendants retain
+    the same checks; tests must propagate marked boundary failures through real callers.
+    Filesystem checks do not promise atomic protection against adversarial link swaps.
+
+    The existing platform-default temporary base is physically resolved before
+    allocating results. Explicit results paths are never resolved through links.
 #>
 [CmdletBinding()]
 param(
@@ -29,13 +39,14 @@ if ($List) {
 if ($Group -eq 'Integration') { throw 'Integration suites require an explicitly configured disposable Home Assistant. This runner never enables them.' }
 if ($Group -ne 'Offline') { Assert-BridgeHostedTest -AllowHostTests:$AllowHostTests }
 
-if (-not $ResultsDirectory) {
-    $ResultsDirectory = Join-Path ([IO.Path]::GetTempPath()) ("bridge-tests-" + [guid]::NewGuid().ToString('N'))
+if ($ResultsDirectory) {
+    $ResultsDirectory = New-BridgeTestResultsDirectory -Directory $ResultsDirectory
 }
-$ResultsDirectory = [IO.Path]::GetFullPath($ResultsDirectory)
-if (Test-Path -LiteralPath $ResultsDirectory) { throw "Use a new results directory; refusing to overwrite $ResultsDirectory" }
-[void][IO.Directory]::CreateDirectory($ResultsDirectory)
-[IO.File]::WriteAllText((Join-Path $ResultsDirectory '.bridge-test-results'), '')
+else {
+    $defaultResults = New-BridgeTestDefaultResultsDirectory
+    $ResultsDirectory = $defaultResults.Directory
+    Write-Host "Default temporary base: $($defaultResults.PlatformBase) -> $($defaultResults.PhysicalBase) ($($defaultResults.LinksResolved) link resolution(s))."
+}
 
 Write-Host "$Group suites: $($suites.Count). Logs: $ResultsDirectory"
 if ($Group -eq 'Offline') { Write-Host 'Excluded by design: Host (installer), Platform (terminal delivery), Integration (live Home Assistant).' }
@@ -68,9 +79,11 @@ foreach ($entry in $suites) {
         if ($failed) { Write-Host $result.Output }
     }
     finally {
-        Remove-Item -LiteralPath $sandbox -Recurse -Force
-        $results.ToArray() | ConvertTo-Json -Depth 5 -AsArray |
-            Set-Content -LiteralPath (Join-Path $ResultsDirectory 'summary.json') -Encoding utf8
+        try { Remove-BridgeTestSandbox -Sandbox $sandbox }
+        finally {
+            $results.ToArray() | ConvertTo-Json -Depth 5 -AsArray |
+                Set-Content -LiteralPath (Join-Path $ResultsDirectory 'summary.json') -Encoding utf8
+        }
     }
 }
 $failures = @($results | Where-Object { $_.TimedOut -or $_.ExitCode -ne 0 })

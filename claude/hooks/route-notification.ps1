@@ -27,6 +27,7 @@ try {
     if ($null -ne $hookEvent) { Invoke-ClaudeNotificationHook -HookEvent $hookEvent | Out-Null }
 }
 catch {
+    if ($_.Exception.Data['BridgeTestWriteBlocked']) { throw }
     try { Write-DecisionBridgeLog -Message "claude notification hook failed: $($_.Exception.Message)" } catch { }
 }
 exit 0

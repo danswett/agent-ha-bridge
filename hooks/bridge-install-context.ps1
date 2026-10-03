@@ -18,7 +18,24 @@ function Test-BridgeInstallDescendant {
 }
 
 function Assert-BridgeInstallPayload {
-    param([Parameter(Mandatory)][string]$Root, [string[]]$RelativePaths = @())
+    param(
+        [Parameter(Mandatory)][string]$Root, [string[]]$RelativePaths = @(),
+        [switch]$CheckAncestors, [switch]$PathComponentsOnly
+    )
+    if ($CheckAncestors) {
+        $ancestors = [Collections.Generic.Stack[string]]::new()
+        $ancestor = Split-Path -Parent (ConvertTo-BridgeInstallPath $Root)
+        while ($ancestor) {
+            $ancestors.Push($ancestor)
+            $ancestor = Split-Path -Parent $ancestor
+        }
+        while ($ancestors.Count) { Assert-BridgeInstallPayload -Root $ancestors.Pop() }
+    }
+    $inspected = $null
+    if ($PathComponentsOnly) {
+        $inspected = [Collections.Generic.HashSet[string]]::new(
+            $(if ($IsWindows) { [StringComparer]::OrdinalIgnoreCase } else { [StringComparer]::Ordinal }))
+    }
     foreach ($relative in @('') + $RelativePaths) {
         if ([IO.Path]::IsPathRooted($relative) -or $relative -match '(^|[\\/])\.\.([\\/]|$)') {
             throw 'A payload boundary must remain within its installation root.'
@@ -28,6 +45,7 @@ function Assert-BridgeInstallPayload {
         $item = $null
         foreach ($component in $components) {
             if ($component) { $path = Join-Path $path $component }
+            if ($PathComponentsOnly -and -not $inspected.Add($path)) { continue }
             $item = $null
             try { $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop }
             catch [Management.Automation.ItemNotFoundException] { continue }
@@ -35,7 +53,7 @@ function Assert-BridgeInstallPayload {
                 throw "A linked installation payload was preserved before access: $path"
             }
         }
-        if ($relative -and $item -and $item.PSIsContainer) {
+        if (-not $PathComponentsOnly -and $relative -and $item -and $item.PSIsContainer) {
             foreach ($child in Get-ChildItem -LiteralPath $item.FullName -Force -ErrorAction Stop) {
                 if ($child.Attributes -band [IO.FileAttributes]::ReparsePoint) {
                     throw "A linked installation payload was preserved before access: $($child.FullName)"
@@ -45,8 +63,184 @@ function Assert-BridgeInstallPayload {
     }
 }
 
+function Test-BridgeTestExecution {
+    if ($env:AGENT_HA_BRIDGE_OFFLINE_TEST -eq '1' -or $env:AGENT_HA_BRIDGE_TEST_ROOT -or
+        $env:AGENT_HA_BRIDGE_TEST_ID) { return $true }
+    foreach ($frame in Get-PSCallStack) {
+        if ([string]$frame.ScriptName -match '[\\/]test-[^\\/]+\.ps1$') { return $true }
+    }
+    $false
+}
+
+function Stop-BridgeTestWrite {
+    param([Parameter(Mandatory)][string]$Reason, [Exception]$Cause)
+    $errorMessage = "Test fixture boundary rejected access: $Reason Run tests through tests\run-tests.ps1."
+    $exception = if ($Cause) { [InvalidOperationException]::new($errorMessage, $Cause) }
+        else { [InvalidOperationException]::new($errorMessage) }
+    $exception.Data['BridgeTestWriteBlocked'] = $true
+    throw $exception
+}
+
+function Get-BridgeTestSandbox {
+    param([AllowNull()][AllowEmptyString()][string]$Root)
+    try {
+        if ([string]::IsNullOrWhiteSpace($Root) -or $Root -match '^(\\\\|//)|(^|[\\/])\.\.?([\\/]|$)') {
+            throw 'The fixture root is missing or is not a local canonical path.'
+        }
+        $fullRoot = ConvertTo-BridgeInstallPath $Root
+        $leaf = Split-Path $fullRoot -Leaf
+        if ($leaf -cmatch '^sandbox-([a-f0-9]{32})$') { $sandboxId = $Matches[1] }
+        else { throw 'The root was not allocated as a test sandbox.' }
+        Assert-BridgeInstallPayload -Root $fullRoot -CheckAncestors
+        if (-not (Test-Path -LiteralPath $fullRoot -PathType Container)) { throw 'The sandbox directory is missing.' }
+        $marker = Join-Path $fullRoot '.bridge-test-sandbox.json'
+        Assert-BridgeInstallPayload -Root $marker
+        if ((Get-Item -LiteralPath $marker -Force -ErrorAction Stop).Length -gt 16384) {
+            throw 'The sandbox identity is not a bounded runner record.'
+        }
+        $record = [IO.File]::ReadAllText($marker) | ConvertFrom-Json -AsHashtable
+        if ($record -isnot [Collections.IDictionary] -or $record['schemaVersion'] -ne 1 -or
+            [string]$record['id'] -cne $sandboxId -or
+            -not (Test-BridgeInstallPath ([string]$record['root']) $fullRoot) -or
+            -not (Test-BridgeInstallPath ([string]$record['parent']) (Split-Path $fullRoot -Parent)) -or
+            -not (Test-BridgeInstallPath ([string]$record['home']) (Join-Path $fullRoot 'home'))) {
+            throw 'The sandbox identity does not describe this directory.'
+        }
+        $repository = ConvertTo-BridgeInstallPath ([string]$record['repository'])
+        Assert-BridgeInstallPayload -Root $repository -CheckAncestors
+        if (-not (Test-Path -LiteralPath $repository -PathType Container)) { throw 'The source checkout is missing.' }
+        return $record
+    }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked']) { throw }
+        Stop-BridgeTestWrite -Reason 'The disposable root could not be verified.' -Cause $_.Exception
+    }
+}
+
+function Assert-BridgeTestPath {
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string[]]$Path,
+        [switch]$AllowRoot,
+        [switch]$SourceEntry
+    )
+    $boundary = Get-BridgeTestSandbox -Root $env:AGENT_HA_BRIDGE_TEST_ROOT
+    if ([string]$boundary['id'] -cne [string]$env:AGENT_HA_BRIDGE_TEST_ID) {
+        Stop-BridgeTestWrite -Reason 'The child does not carry this sandbox identity.'
+    }
+    try {
+        $fixturePaths = [Collections.Generic.List[string]]::new()
+        $sourcePaths = [Collections.Generic.List[string]]::new()
+        foreach ($candidate in $Path) {
+            if ([string]::IsNullOrWhiteSpace($candidate) -or
+                $candidate -match '^(\\\\|//)|(^|[\\/])\.\.?([\\/]|$)|[\x00*?]') {
+                throw 'A fixture destination is missing or is not a local canonical path.'
+            }
+            $fullPath = ConvertTo-BridgeInstallPath $candidate
+            if ($IsWindows) {
+                $tail = $fullPath.Substring([IO.Path]::GetPathRoot($fullPath).Length)
+                if ($tail.Contains(':')) { throw 'A fixture destination cannot address an alternate data stream.' }
+                foreach ($component in $tail -split '[\\/]') {
+                    if ($component -match '[. ]$|^(CON(IN\$|OUT\$)?|PRN|AUX|NUL|COM[0-9\u00b9\u00b2\u00b3]|LPT[0-9\u00b9\u00b2\u00b3])(\.|$)') {
+                        throw 'A fixture destination cannot use a Windows path alias or device name.'
+                    }
+                }
+            }
+            $inside = (Test-BridgeInstallDescendant $fullPath $boundary['root']) -or
+                ($AllowRoot -and (Test-BridgeInstallPath $fullPath $boundary['root']))
+            if ($inside) {
+                $relative = [IO.Path]::GetRelativePath($boundary['root'], $fullPath)
+                $fixturePaths.Add($(if ($relative -eq '.') { '' } else { $relative }))
+            }
+            elseif ($SourceEntry -and ((Test-BridgeInstallPath $fullPath $boundary['repository']) -or
+                (Test-BridgeInstallDescendant $fullPath $boundary['repository']))) {
+                $relative = [IO.Path]::GetRelativePath($boundary['repository'], $fullPath)
+                $sourcePaths.Add($(if ($relative -eq '.') { '' } else { $relative }))
+            }
+            else { throw 'A fixture destination escapes its allocated root.' }
+        }
+        if ($fixturePaths.Count) {
+            Assert-BridgeInstallPayload -Root $boundary['root'] -RelativePaths $fixturePaths.ToArray() -PathComponentsOnly
+        }
+        if ($sourcePaths.Count) {
+            Assert-BridgeInstallPayload -Root $boundary['repository'] -RelativePaths $sourcePaths.ToArray() -PathComponentsOnly
+        }
+    }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked']) { throw }
+        Stop-BridgeTestWrite -Reason 'A fixture path is outside the verified, unlinked boundary.' -Cause $_.Exception
+    }
+}
+
+function Assert-BridgeTestEnvironment {
+    param([switch]$Required)
+    if (-not $Required -and -not (Test-BridgeTestExecution)) { return }
+    $boundary = Get-BridgeTestSandbox -Root $env:AGENT_HA_BRIDGE_TEST_ROOT
+    $paths = [Collections.Generic.List[string]]::new()
+    try {
+        foreach ($homePath in @($HOME, $env:HOME, $env:USERPROFILE)) {
+            if (-not (Test-BridgeInstallPath $homePath $boundary['home'])) {
+                throw 'PowerShell HOME, environment HOME and USERPROFILE must identify the synthetic home.'
+            }
+        }
+        foreach ($name in @(
+            'HOME', 'USERPROFILE', 'TEMP', 'TMP', 'TMPDIR', 'PUBLIC', 'APPDATA', 'LOCALAPPDATA',
+            'XDG_CONFIG_HOME', 'XDG_CACHE_HOME', 'XDG_DATA_HOME', 'XDG_STATE_HOME', 'XDG_RUNTIME_DIR',
+            'CLAUDE_CONFIG_DIR', 'CODEX_HOME', 'COPILOT_HOME', 'DOTNET_CLI_HOME', 'GIT_CONFIG_GLOBAL',
+            'AGENT_HA_BRIDGE_CONFIG'
+        )) {
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if ([string]::IsNullOrWhiteSpace($value)) { throw "The synthetic $name path is missing." }
+            $paths.Add($value)
+        }
+        foreach ($name in @('COPILOT_HA_BRIDGE_CONFIG', 'BRIDGE_CLAUDE_DESKTOP_CONFIG')) {
+            $value = [Environment]::GetEnvironmentVariable($name)
+            if ($value) { $paths.Add($value) }
+        }
+        $paths.Add([IO.Path]::GetTempPath())
+        if ($IsWindows -and -not (Test-BridgeInstallPath ($env:HOMEDRIVE + $env:HOMEPATH) $boundary['home'])) {
+            throw 'The Windows home drive/path do not identify the synthetic home.'
+        }
+    }
+    catch {
+        Stop-BridgeTestWrite -Reason 'The effective child environment is not contained.' -Cause $_.Exception
+    }
+    Assert-BridgeTestPath -Path $paths.ToArray()
+}
+
+function Assert-BridgeTestInstallContext {
+    param([Parameter(Mandatory)]$Context)
+    if (-not (Test-BridgeTestExecution)) { return }
+    Assert-BridgeTestEnvironment
+    foreach ($name in @('Legacy', 'Isolated', 'Recorded', 'ExplicitConfig', 'LegacyLayout')) {
+        $value = if ($Context -is [Collections.IDictionary]) { $Context[$name] }
+            elseif ($Context.PSObject.Properties[$name]) { $Context.$name }
+            else { $null }
+        if ($value -isnot [bool]) { Stop-BridgeTestWrite -Reason "The effective installation context has no verified $name flag." }
+    }
+    $paths = [Collections.Generic.List[string]]::new()
+    foreach ($name in @(
+        'Home', 'BridgeHome', 'ConfigPath', 'HooksDir', 'MetadataPath', 'RuntimeRoot',
+        'CopilotHome', 'ClaudeHome', 'CodexHome', 'DesktopConfig', 'LocalAppData', 'PublicRoot'
+    )) {
+        $value = if ($Context -is [Collections.IDictionary]) { $Context[$name] }
+            elseif ($Context.PSObject.Properties[$name]) { $Context.$name }
+            else { $null }
+        if ($value -isnot [string] -or [string]::IsNullOrWhiteSpace($value)) {
+            Stop-BridgeTestWrite -Reason "The effective installation context has no verified $name."
+        }
+        $paths.Add($value)
+    }
+    Assert-BridgeTestPath -Path $paths.ToArray()
+}
+
 function Read-BridgeInstallRecord {
-    param([Parameter(Mandatory)][string]$Path)
+    param([Parameter(Mandatory)][string]$Path, [switch]$SourceEntry)
+    if (Test-BridgeTestExecution) {
+        if ($SourceEntry -and (Split-Path $Path -Leaf) -notin @('bridge-root.json', 'installation.json')) {
+            Stop-BridgeTestWrite -Reason 'Only a source entry pointer may be read outside the fixture.'
+        }
+        Assert-BridgeTestPath -Path $Path -SourceEntry:$SourceEntry
+    }
     try {
         $record = [IO.File]::ReadAllText($Path) | ConvertFrom-Json -AsHashtable
         if ($record -isnot [Collections.IDictionary]) { throw 'Not an object.' }
@@ -54,7 +248,12 @@ function Read-BridgeInstallRecord {
     }
     catch [IO.FileNotFoundException] { return $null }
     catch [IO.DirectoryNotFoundException] { return $null }
-    catch { throw "Installation metadata is unreadable: $Path" }
+    catch {
+        if (Test-BridgeTestExecution) {
+            Stop-BridgeTestWrite -Reason "Installation metadata is unreadable: $Path" -Cause $_.Exception
+        }
+        throw "Installation metadata is unreadable: $Path"
+    }
 }
 
 function Resolve-BridgeInstallContext {
@@ -66,6 +265,13 @@ function Resolve-BridgeInstallContext {
         [string]$ConfigPath,
         [string]$EntryDirectory
     )
+    Assert-BridgeTestEnvironment
+    if (Test-BridgeTestExecution) {
+        foreach ($explicitPath in @($TargetHome, $BridgeHome, $ConfigPath)) {
+            if ($explicitPath) { Assert-BridgeTestPath -Path $explicitPath }
+        }
+        if ($EntryDirectory) { Assert-BridgeTestPath -Path $EntryDirectory -SourceEntry }
+    }
     $defaultHome = ConvertTo-BridgeInstallPath $HOME
     $defaultBridge = Join-Path $defaultHome '.agent-ha-bridge'
     $explicitConfig = -not [string]::IsNullOrWhiteSpace($ConfigPath)
@@ -79,9 +285,12 @@ function Resolve-BridgeInstallContext {
         if (-not $ConfigPath) { $ConfigPath = Join-Path $BridgeHome 'config.json' }
     }
     elseif (-not $BridgeHome -and $EntryDirectory) {
-        $pointer = Read-BridgeInstallRecord -Path (Join-Path $EntryDirectory 'bridge-root.json')
+        $pointer = Read-BridgeInstallRecord -Path (Join-Path $EntryDirectory 'bridge-root.json') -SourceEntry
         if ($pointer) {
-            if (-not $pointer['bridgeHome']) { throw 'The adapter installation pointer has no bridgeHome.' }
+            if (-not $pointer['bridgeHome']) {
+                if (Test-BridgeTestExecution) { Stop-BridgeTestWrite -Reason 'The adapter installation pointer has no bridgeHome.' }
+                throw 'The adapter installation pointer has no bridgeHome.'
+            }
             $BridgeHome = ConvertTo-BridgeInstallPath ([string]$pointer['bridgeHome'])
         }
         elseif ([IO.File]::Exists((Join-Path $EntryDirectory 'installation.json'))) {
@@ -127,6 +336,9 @@ function Resolve-BridgeInstallContext {
     if (-not $ConfigPath) { $ConfigPath = Join-Path $BridgeHome 'config.json' }
     $ConfigPath = ConvertTo-BridgeInstallPath $ConfigPath
     $metadataPath = Join-Path $BridgeHome 'installation.json'
+    if (Test-BridgeTestExecution) {
+        Assert-BridgeTestPath -Path @($homeRoot, $BridgeHome, $ConfigPath, $metadataPath)
+    }
     Assert-BridgeInstallPayload -Root $BridgeHome -RelativePaths @('installation.json')
     $record = Read-BridgeInstallRecord -Path $metadataPath
     $isolated = [bool]$TargetHome -or -not (Test-BridgeInstallPath $homeRoot $defaultHome) -or
@@ -136,12 +348,21 @@ function Resolve-BridgeInstallContext {
          (Test-BridgeInstallPath $ConfigPath (Join-Path $defaultHome '.copilot\copilot-ha-bridge.config.json')))
     $id = ''
     if ($record) {
+        if (Test-BridgeTestExecution) {
+            foreach ($key in @('home', 'bridgeHome', 'configPath', 'copilotHome', 'claudeHome', 'codexHome', 'desktopConfig', 'legacyCopilotHome')) {
+                if ($record[$key]) { Assert-BridgeTestPath -Path ([string]$record[$key]) }
+            }
+        }
         if ($record['schemaVersion'] -ne 1 -or [string]$record['id'] -cnotmatch '^[a-f0-9]{32}$' -or
             -not $record['bridgeHome'] -or -not (Test-BridgeInstallPath ([string]$record['bridgeHome']) $BridgeHome)) {
+            if (Test-BridgeTestExecution) { Stop-BridgeTestWrite -Reason "Installation metadata does not identify this root: $metadataPath" }
             throw "Installation metadata does not identify this root: $metadataPath"
         }
         $id = [string]$record['id']
-        if (-not $record['home'] -or $record['isolated'] -isnot [bool]) { throw "Installation metadata has invalid roots: $metadataPath" }
+        if (-not $record['home'] -or $record['isolated'] -isnot [bool]) {
+            if (Test-BridgeTestExecution) { Stop-BridgeTestWrite -Reason "Installation metadata has invalid roots: $metadataPath" }
+            throw "Installation metadata has invalid roots: $metadataPath"
+        }
         if ($TargetHome -and -not (Test-BridgeInstallPath $TargetHome ([string]$record['home']))) {
             throw 'TargetHome does not match the recorded installation.'
         }
@@ -192,7 +413,7 @@ function Resolve-BridgeInstallContext {
     if ($isolated -and -not (Test-BridgeInstallDescendant $desktop $homeRoot)) {
         throw 'An isolated installation cannot use an external Desktop configuration.'
     }
-    [pscustomobject]@{
+    $resolvedContext = [pscustomobject]@{
         Id = $id; Home = $homeRoot; BridgeHome = $BridgeHome; ConfigPath = $ConfigPath
         HooksDir = Join-Path $BridgeHome 'hooks'; MetadataPath = $metadataPath
         RuntimeRoot = if ($legacy) { $env:TEMP } else { Join-Path $BridgeHome 'runtime' }
@@ -205,16 +426,22 @@ function Resolve-BridgeInstallContext {
         LaunchAgentLabel = if ($id) { "com.agent-ha-bridge.daemon.$id" } else { 'com.agent-ha-bridge.daemon' }
         TestRegistryId = if ($record -and $record['testRegistryId']) { [string]$record['testRegistryId'] } else { '' }
     }
+    Assert-BridgeTestInstallContext -Context $resolvedContext
+    $resolvedContext
 }
 
 function Get-BridgeInstallContext {
     $current = Get-Variable -Name BridgeInstallContext -Scope Script -ErrorAction SilentlyContinue
-    if ($current -and $current.Value) { return $current.Value }
+    if ($current -and $current.Value) {
+        Assert-BridgeTestInstallContext -Context $current.Value
+        return $current.Value
+    }
     Resolve-BridgeInstallContext
 }
 
 function Get-BridgeRuntimeRoot {
     param($Context = (Get-BridgeInstallContext))
+    Assert-BridgeTestInstallContext -Context $Context
     if ($Context.Legacy) { return $env:TEMP }
     $Context.RuntimeRoot
 }
@@ -222,13 +449,17 @@ function Get-BridgeRuntimeRoot {
 function Get-BridgeRuntimePath {
     param([Parameter(Mandatory)][string]$Name, $Context = (Get-BridgeInstallContext))
     if ([IO.Path]::IsPathRooted($Name) -or $Name -match '(^|[\\/])\.\.([\\/]|$)') {
+        if (Test-BridgeTestExecution) { Stop-BridgeTestWrite -Reason 'A runtime filename escapes its installation.' }
         throw 'A runtime filename must stay within its installation.'
     }
-    Join-Path (Get-BridgeRuntimeRoot -Context $Context) $Name
+    $runtimePath = Join-Path (Get-BridgeRuntimeRoot -Context $Context) $Name
+    if (Test-BridgeTestExecution) { Assert-BridgeTestPath -Path $runtimePath }
+    $runtimePath
 }
 
 function Initialize-BridgeInstallIdentity {
     param([Parameter(Mandatory)]$Context, [string]$TestRegistryId, [switch]$LegacyLayout)
+    Assert-BridgeTestInstallContext -Context $Context
     if ($Context.Recorded) {
         if ($TestRegistryId -and $Context.TestRegistryId -ne $TestRegistryId) {
             throw 'The test registry namespace does not match this installation.'
@@ -256,7 +487,9 @@ function Initialize-BridgeInstallIdentity {
 
 function Set-BridgeAdapterRoot {
     param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)]$Context)
+    Assert-BridgeTestInstallContext -Context $Context
     $path = Join-Path $Directory 'bridge-root.json'
+    if (Test-BridgeTestExecution) { Assert-BridgeTestPath -Path @($Directory, $path) }
     $existing = Read-BridgeInstallRecord -Path $path
     if ($existing -and (-not $existing['bridgeHome'] -or
         -not (Test-BridgeInstallPath ([string]$existing['bridgeHome']) $Context.BridgeHome))) {
@@ -268,6 +501,7 @@ function Set-BridgeAdapterRoot {
 
 function Test-BridgeAdapterRoot {
     param([Parameter(Mandatory)][string]$Directory, [Parameter(Mandatory)]$Context)
+    Assert-BridgeTestInstallContext -Context $Context
     $pointer = Read-BridgeInstallRecord -Path (Join-Path $Directory 'bridge-root.json')
     if (-not $pointer) { return $true }
     $pointer['bridgeHome'] -and (Test-BridgeInstallPath ([string]$pointer['bridgeHome']) $Context.BridgeHome)
@@ -337,6 +571,7 @@ function Set-BridgeAdapterEnrollment {
         [Parameter(Mandatory)][ValidateSet('claude', 'codex', 'mcp')][string]$Client,
         [Parameter(Mandatory)][bool]$Installed, [switch]$RepairOnly, [switch]$KeepSelection,
         [switch]$KeepAdapterRecord)
+    Assert-BridgeTestInstallContext -Context $Context
     if (-not $KeepSelection) {
         $config = Read-BridgeInstallRecord -Path $Context.ConfigPath
         if (-not $config -and $Installed) { throw 'The selected bridge configuration is missing; the adapter cannot be enrolled.' }
@@ -365,6 +600,7 @@ function Set-BridgeAdapterEnrollment {
 function Assert-BridgeAdapterSelection {
     param([Parameter(Mandatory)]$Context,
         [Parameter(Mandatory)][ValidateSet('claude', 'codex', 'mcp')][string]$Client)
+    Assert-BridgeTestInstallContext -Context $Context
     $config = Read-BridgeInstallRecord -Path $Context.ConfigPath
     if (-not $config -or -not $config.Contains('clients') -or @($config['clients']) -notcontains $Client) {
         throw "The $Client client is not selected; automatic repair did not change its adapter."

@@ -8,12 +8,15 @@
     matter: a failing or unreachable GitHub must never break the daemon, and a
     repository with no releases must not look like an available update.
 
-    Touches the network only in the tests that say so, and restores any cache it
-    moves aside.
+    Uses only the canonical runner's verified synthetic roots. The real generator
+    and staging writer run, but the external launch/download boundary never does.
+    Generated scripts and every embedded destination must remain in the fixture.
 #>
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'runner-support.ps1')
+Assert-BridgeTestEnvironment -Required
 
 . (Join-Path $PSScriptRoot '..\hooks\decision-bridge-common.ps1')
 . (Join-Path $PSScriptRoot '..\hooks\bridge-update.ps1')
@@ -263,7 +266,7 @@ try {
 finally {
     Remove-Item -LiteralPath $quoteDir -Recurse -Force -ErrorAction SilentlyContinue
 }
-$bogus = Invoke-BridgeSelfUpdate -TargetHome 'Z:\definitely\not\here\at\all'
+$bogus = Invoke-BridgeSelfUpdate -TargetHome (Join-Path $env:TEMP ('missing-update-home-' + [guid]::NewGuid().ToString('N')))
 Test-That 'a non-existent TargetHome is refused, never interpolated' {
     ($bogus.Started -eq $false) -and ($bogus.Detail -match 'not an existing directory')
 }
@@ -283,10 +286,27 @@ Test-That 'and really launched pwsh with the generated script' {
     $script:LaunchedWith.FilePath -match 'pwsh' -and
     (($script:LaunchedWith.ArgumentList) -join ' ') -match 'run-update\.ps1'
 } "$(if ($script:LaunchedWith) { $script:LaunchedWith.FilePath } else { 'nothing launched' })"
-# The detached updater removes its own staging folder; nothing actually ran here.
-Get-ChildItem ([IO.Path]::GetTempPath()) -Directory -Filter 'agent-ha-bridge-update-*' -ErrorAction SilentlyContinue |
-    Where-Object { $_.CreationTime -gt (Get-Date).AddMinutes(-2) } |
-    Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+$stagedScript = [string]$script:LaunchedWith.ArgumentList[-1]
+$stagedScript = $stagedScript.Trim('"')
+Assert-BridgeTestPath -Path $stagedScript
+Test-That 'the actual staged file is confined to the selected runtime' {
+    (Test-BridgeInstallDescendant $stagedScript (Get-BridgeRuntimeRoot)) -and
+        (Test-Path -LiteralPath $stagedScript -PathType Leaf)
+}
+$stagedText = Get-Content -LiteralPath $stagedScript -Raw
+foreach ($expectedPath in @(
+    (Get-BridgeInstallContext).ConfigPath,
+    (Get-BridgeInstallContext).BridgeHome,
+    (Get-BridgeRuntimePath 'agent-bridge-update.log'),
+    (Get-BridgeRuntimePath 'agent-bridge-update-outcome.json'),
+    (Split-Path $stagedScript -Parent)
+)) {
+    Assert-BridgeTestPath -Path $expectedPath
+    Test-That "the staged updater retains its verified destination $expectedPath" {
+        $stagedText.Contains($expectedPath.Replace("'", "''"))
+    }
+}
+Remove-BridgeTestSandbox -Sandbox $env:AGENT_HA_BRIDGE_TEST_ROOT -Directory (Split-Path $stagedScript -Parent)
 
 Write-Host '--- an updater that cannot be launched fails cleanly and leaves nothing behind ---'
 Test-That 'pwsh is resolvable here' { [bool](Get-BridgePwshPath) } "$(Get-BridgePwshPath)"
@@ -296,16 +316,20 @@ Test-That 'pwsh is resolvable here' { [bool](Get-BridgePwshPath) } "$(Get-Bridge
 # folder was orphaned, and the caller's empty catch meant the card sat on "Installing"
 # with not one line in the log to say why.
 $stagingPattern = 'agent-ha-bridge-update-*'
-$stagingBefore = @(Get-ChildItem ([IO.Path]::GetTempPath()) -Directory -Filter $stagingPattern -ErrorAction SilentlyContinue).Count
+$fixtureRuntime = Get-BridgeRuntimeRoot
+Assert-BridgeTestPath -Path $fixtureRuntime
+$stagingBefore = @(Get-ChildItem -LiteralPath $fixtureRuntime -Directory -Filter $stagingPattern -ErrorAction Stop |
+    Sort-Object FullName | ForEach-Object { $_.FullName })
 function Get-BridgePwshPath { $null }
 $noPwsh = Invoke-BridgeSelfUpdate -Detached
 Test-That 'a pwsh that cannot be found is reported, not thrown' {
     ($noPwsh.Started -eq $false) -and ($noPwsh.Detail -match 'could not find pwsh')
 } "$($noPwsh.Detail)"
-$stagingAfter = @(Get-ChildItem ([IO.Path]::GetTempPath()) -Directory -Filter $stagingPattern -ErrorAction SilentlyContinue).Count
+$stagingAfter = @(Get-ChildItem -LiteralPath $fixtureRuntime -Directory -Filter $stagingPattern -ErrorAction Stop |
+    Sort-Object FullName | ForEach-Object { $_.FullName })
 Test-That 'and no half-written staging folder is left behind' {
-    $stagingAfter -eq $stagingBefore
-} "before=$stagingBefore after=$stagingAfter"
+    ($stagingAfter -join "`n") -ceq ($stagingBefore -join "`n")
+} "before=$(@($stagingBefore).Count) after=$(@($stagingAfter).Count)"
 
 Write-Host ''
 if ($script:Failures) {
