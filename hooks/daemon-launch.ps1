@@ -746,6 +746,21 @@ function Invoke-DaemonTransferRequest {
     $session = [string]$request.session
     $correlation = [string]$request.correlation
     if ([string]::IsNullOrWhiteSpace($session) -or [string]::IsNullOrWhiteSpace($correlation)) { return }
+    # The correlation is a peer's string and it names a directory: it is interpolated
+    # into the staging path below and into the topic the reply goes to. A value like
+    # 'x/../../target' put New-Item - and, worse, the Remove-Item -Recurse in the
+    # finally - outside the temp area entirely, so an existing writable directory could
+    # be deleted by asking. Only the generated eight-hex form is accepted.
+    # Case-sensitive: Guid.ToString('N') is lowercase, so that is the whole accepted
+    # alphabet. -notmatch would have let 'CC000001' through, which is harmless as a
+    # directory name but is not the generated form and aliases it on a case-insensitive
+    # filesystem.
+    if ($correlation -cnotmatch '^[0-9a-f]{8}$') {
+        Write-DaemonLog -Message 'transfer refused: the request carried a malformed correlation'
+        $script:DaemonTransferServed = $correlation
+        try { Clear-CopilotMqttTransferRequest -Slug $script:DaemonMachineSlug -Headers $Headers } catch { }
+        return
+    }
     # Retained, so a request already served would be served again every pass.
     if ($correlation -eq $script:DaemonTransferServed) { return }
 
@@ -762,7 +777,17 @@ function Invoke-DaemonTransferRequest {
 
     $launcher = if ($request.PSObject.Properties['launcher']) { [string]$request.launcher } else { 'copilot' }
     $requester = if ($request.PSObject.Properties['requester']) { [string]$request.requester } else { '' }
-    if ($requester -notmatch '^[a-z0-9_]+$') { return }
+    # Case-sensitive for the same reason as the correlation: a slug is lowercase by
+    # construction, and this one names the topic the transcript is published to.
+    if ($requester -cnotmatch '^[a-z0-9_]+$') { return }
+
+    # Deferred, not refused, and deliberately before the try: during startup
+    # Restore-DaemonSessionCards reaches Sync-DaemonSessions while this list is still the
+    # empty array it was initialised to - Sync-DaemonNewSession fills it moments later.
+    # Treating that as "we do not offer it" would burn the correlation and clear the
+    # request in the finally, leaving the asking machine waiting out its timeout for a
+    # session this one was about to offer.
+    if (@($script:DaemonResumeOffered).Count -eq 0) { return }
 
     try {
         # Only what this machine actually offered. The approved-workspace filter that
@@ -848,9 +873,7 @@ function Receive-DaemonSessionTransfer {
             } `
             -Until {
                 param($all)
-                $m = @($all) | Where-Object { $_.PSObject.Properties['sha256'] } | Select-Object -First 1
-                if ($null -eq $m) { return $false }
-                @(@($all) | Where-Object { $_.PSObject.Properties['d'] }).Count -ge [int]$m.chunks
+                Test-BridgeTransferComplete -Messages @($all)
             })
 
         $manifest = @($messages) | Where-Object { $_.PSObject.Properties['sha256'] } | Select-Object -First 1

@@ -142,6 +142,39 @@ Test-That 'and it is scoped to the machine and the one transfer' {
     $t -like '*dswett_home*' -and $t -like '*abcd1234*'
 }
 
+Write-Host '--- knowing when every chunk has arrived ---'
+
+$manifestMsg = [pscustomobject]@{ sha256 = ('a' * 64); bytes = 300; chunks = 3; session = 'x'; kind = 'copilot' }
+$c0 = [pscustomobject]@{ s = 0; o = 0;   d = 'AA==' }
+$c1 = [pscustomobject]@{ s = 1; o = 100; d = 'AA==' }
+$c2 = [pscustomobject]@{ s = 2; o = 200; d = 'AA==' }
+
+Test-That 'nothing is complete before the manifest arrives' {
+    -not (Test-BridgeTransferComplete -Messages @($c0, $c1, $c2))
+}
+Test-That 'a partial set is not complete' {
+    -not (Test-BridgeTransferComplete -Messages @($manifestMsg, $c0, $c1))
+}
+Test-That 'the full set is complete' {
+    Test-BridgeTransferComplete -Messages @($manifestMsg, $c0, $c1, $c2)
+}
+Test-That 'a chunk redelivered at QoS 1 does not stand in for one still missing' {
+    # The bug this replaced: three payloads carrying d, so the raw count reached the
+    # manifest's chunk total, the socket closed and reassembly failed as incomplete
+    # while the sender was still publishing chunk 2 quite happily.
+    -not (Test-BridgeTransferComplete -Messages @($manifestMsg, $c0, $c1, $c1))
+}
+Test-That 'and the duplicate does no harm once the last one lands' {
+    Test-BridgeTransferComplete -Messages @($manifestMsg, $c0, $c1, $c1, $c2)
+}
+Test-That 'a duplicate chunk rebuilds the same bytes rather than corrupting them' {
+    $src = New-Bytes -N 600
+    $pieces = @(Get-BridgeBundleChunk -Bytes $src -Topic 'copilot/cli/x' -Budget 400)
+    $wire = @($pieces | ForEach-Object { $_.Payload | ConvertFrom-Json })
+    $rebuilt = Join-BridgeBundleChunk -Chunks @($wire + $wire[0]) -TotalBytes $src.Length
+    (-join ($rebuilt | ForEach-Object { $_.ToString('x2') })) -eq (-join ($src | ForEach-Object { $_.ToString('x2') }))
+}
+
 Write-Host ''
 if ($script:Failures -gt 0) { Write-Host "$($script:Failures) failed" -ForegroundColor Red; exit 1 }
 Write-Host 'all passed' -ForegroundColor Green

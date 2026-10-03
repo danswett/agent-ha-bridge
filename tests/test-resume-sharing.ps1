@@ -275,38 +275,82 @@ function Get-HomeAssistantState { param($EntityId, $Headers)
 
 $script:FakeSettings = @{}
 $script:Served = @(); $script:DaemonTransferServed = ''
-Set-Request -Session $offeredId -Correlation 'c1'
+Set-Request -Session $offeredId -Correlation 'cc000001'
 Invoke-DaemonTransferRequest -LiveSessionIds @() -Headers $headers
 Test-That 'with sharing off, a request is not served at all' { $script:Served.Count -eq 0 }
 
 $script:FakeSettings = @{ 'newSession.shareResumable' = 'false' }
 $script:Served = @(); $script:DaemonTransferServed = ''
-Set-Request -Session $offeredId -Correlation 'c2'
+Set-Request -Session $offeredId -Correlation 'cc000002'
 Invoke-DaemonTransferRequest -LiveSessionIds @() -Headers $headers
 Test-That 'and the string "false" is not consent to serve either' { $script:Served.Count -eq 0 }
 
 $script:FakeSettings = @{ 'newSession.shareResumable' = $true }
 $script:Served = @(); $script:DaemonTransferServed = ''
-Set-Request -Session $secretId -Correlation 'c3'
+Set-Request -Session $secretId -Correlation 'cc000003'
 Invoke-DaemonTransferRequest -LiveSessionIds @() -Headers $headers
 Test-That 'a session this machine never offered is refused, however it is named' { $script:Served.Count -eq 0 }
 
 $script:Served = @(); $script:DaemonTransferServed = ''
-Set-Request -Session $offeredId -Correlation 'c4'
+Set-Request -Session $offeredId -Correlation 'cc000004'
 Invoke-DaemonTransferRequest -LiveSessionIds @($offeredId) -Headers $headers
 Test-That 'a session live here is refused rather than bundled mid-sentence' { $script:Served.Count -eq 0 }
 
 $script:Served = @(); $script:DaemonTransferServed = ''
-Set-Request -Session $offeredId -Correlation 'c5' -At ([DateTimeOffset]::Now.AddHours(-2))
+Set-Request -Session $offeredId -Correlation 'cc000005' -At ([DateTimeOffset]::Now.AddHours(-2))
 Invoke-DaemonTransferRequest -LiveSessionIds @() -Headers $headers
 Test-That 'a stale retained request is not re-served after a restart' { $script:Served.Count -eq 0 }
 
 $script:Served = @(); $script:DaemonTransferServed = ''
-Set-Request -Session $offeredId -Correlation 'c6'
+Set-Request -Session $offeredId -Correlation 'cc000006'
 Invoke-DaemonTransferRequest -LiveSessionIds @() -Headers $headers
 Test-That 'an offered session, not live, freshly asked for, IS served' { $script:Served -contains $offeredId }
 Invoke-DaemonTransferRequest -LiveSessionIds @() -Headers $headers
 Test-That 'and is not served twice for the same request' { @($script:Served).Count -eq 1 }
+
+# The correlation names a staging directory and the reply topic. It was taken straight
+# from the peer's retained JSON, so 'x/../../target' put New-Item - and the
+# Remove-Item -Recurse that cleans up after it - outside the temp area entirely.
+$script:TransferCleared = 0
+function Clear-CopilotMqttTransferRequest { param($Slug, $Headers) $script:TransferCleared++ }
+foreach ($bad in @('x/../../target', '../../etc', 'ab*cd', 'CC000001', 'c1', 'cc0000011')) {
+    $script:Served = @(); $script:DaemonTransferServed = ''
+    Set-Request -Session $offeredId -Correlation $bad
+    Invoke-DaemonTransferRequest -LiveSessionIds @() -Headers $headers
+    Test-That "a correlation of '$bad' is refused before it can name a directory" {
+        $script:Served.Count -eq 0
+    }
+}
+foreach ($bad in @('PEER', 'peer/../x', 'peer-1')) {
+    $script:Served = @(); $script:DaemonTransferServed = ''
+    Set-Request -Session $offeredId -Correlation 'aaaa0001' -Requester $bad
+    Invoke-DaemonTransferRequest -LiveSessionIds @() -Headers $headers
+    Test-That "a requester of '$bad' is refused before it can name a topic" {
+        $script:Served.Count -eq 0
+    }
+}
+$script:Served = @(); $script:DaemonTransferServed = ''
+Set-Request -Session $offeredId -Correlation 'abcdef01'
+Invoke-DaemonTransferRequest -LiveSessionIds @() -Headers $headers
+Test-That 'and a well-formed one still serves, so the guard is not refusing everything' {
+    $script:Served -contains $offeredId
+}
+
+# During startup Restore-DaemonSessionCards reaches Sync-DaemonSessions before
+# Sync-DaemonNewSession has filled the offered list. Treating that moment as "we do not
+# offer it" burned the correlation and cleared the request, leaving the asking machine
+# waiting out its timeout for a session this one was about to offer seconds later.
+$remembered = $script:DaemonResumeOffered
+$script:DaemonResumeOffered = @()
+$script:Served = @(); $script:DaemonTransferServed = ''; $script:TransferCleared = 0
+Set-Request -Session $offeredId -Correlation 'beef0001'
+Invoke-DaemonTransferRequest -LiveSessionIds @() -Headers $headers
+Test-That 'a request arriving before the offered list is built is deferred, not refused' {
+    $script:Served.Count -eq 0 -and $script:TransferCleared -eq 0 -and $script:DaemonTransferServed -eq ''
+}
+$script:DaemonResumeOffered = $remembered
+Invoke-DaemonTransferRequest -LiveSessionIds @() -Headers $headers
+Test-That 'and is served on the next pass once the list exists' { $script:Served -contains $offeredId }
 
 Write-Host '--- the transfer request entity has to be renamed, and removed on uninstall ---'
 # Found the hard way against a live Home Assistant: publishing the discovery config is

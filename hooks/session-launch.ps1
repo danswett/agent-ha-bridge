@@ -2582,6 +2582,41 @@ function Get-BridgeResumableSessions {
     @($results)
 }
 
+function Get-BridgeUnlinkedDescendantFile {
+    <#
+        Every file under a directory, without ever stepping through a link.
+
+        Directory.EnumerateFiles with AllDirectories follows symlinks and Windows
+        junctions. A session directory is not a trusted tree - its files\ is where a
+        session puts whatever it was working on - so a single junction called `files\x`
+        pointing at a repository, or at the user's profile, would have put that
+        directory's contents into a bundle and sent them to another machine. A link
+        cycle would not have terminated at all.
+
+        So the walk is explicit and refuses reparse points on both files and
+        directories, rather than trying to decide whether a particular target is
+        acceptable.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    $out = [System.Collections.Generic.List[string]]::new()
+    if (-not [System.IO.Directory]::Exists($Path)) { return $out.ToArray() }
+
+    $pending = [System.Collections.Generic.Queue[string]]::new()
+    $pending.Enqueue($Path)
+    while ($pending.Count -gt 0) {
+        $current = $pending.Dequeue()
+        foreach ($entry in [System.IO.Directory]::EnumerateFileSystemEntries($current)) {
+            $info = [System.IO.FileInfo]::new($entry)
+            if ($info.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }
+            if ($info.Attributes -band [System.IO.FileAttributes]::Directory) { $pending.Enqueue($entry) }
+            else { $out.Add($entry) }
+        }
+    }
+    # Unwrapped would make an empty result $null under StrictMode rather than nothing.
+    $out.ToArray()
+}
+
 function Get-BridgeSessionBundleSpec {
     <#
         Where a session's transcript lives and what identifies it, per agent.
@@ -2639,14 +2674,16 @@ function Get-BridgeSessionBundleSpec {
             $files = [System.Collections.Generic.List[string]]::new()
             foreach ($name in @('events.jsonl', 'workspace.yaml')) {
                 $path = Join-Path $dir $name
-                if ([System.IO.File]::Exists($path)) { $files.Add($path) }
+                if (-not [System.IO.File]::Exists($path)) { continue }
+                # A symlinked transcript resolves somewhere this session does not own.
+                if ([System.IO.FileInfo]::new($path).Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }
+                $files.Add($path)
             }
             foreach ($sub in @('checkpoints', 'files')) {
                 $subPath = Join-Path $dir $sub
                 if (-not [System.IO.Directory]::Exists($subPath)) { continue }
-                foreach ($f in [System.IO.Directory]::EnumerateFiles($subPath, '*', [System.IO.SearchOption]::AllDirectories)) {
-                    $files.Add($f)
-                }
+                if ([System.IO.DirectoryInfo]::new($subPath).Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }
+                foreach ($f in (Get-BridgeUnlinkedDescendantFile -Path $subPath)) { $files.Add($f) }
             }
             if ($files.Count -eq 0) { return $null }
             [pscustomobject]@{
@@ -2705,6 +2742,20 @@ function New-BridgeSessionBundle {
     $stage = Join-Path $Destination "stage-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
     New-Item -ItemType Directory -Path $stage -Force | Out-Null
     try {
+        # What the files looked like before the copy started. A session is only checked
+        # for being live once, in the snapshot the caller took at the start of its
+        # reconcile, and sending can take tens of seconds - so someone resuming the
+        # source in between would have the agent appending while this reads, producing a
+        # fork that is digest-valid and truncated. That cannot be prevented from here:
+        # there is no lock an agent CLI would honour. It can be *detected*, and a refusal
+        # is the right answer, because a silently half-copied conversation is worse than
+        # no transfer at all.
+        $witness = @{}
+        foreach ($f in @($spec.Files)) {
+            $info = [System.IO.FileInfo]::new($f)
+            $witness[$f] = "$($info.Length):$($info.LastWriteTimeUtc.Ticks)"
+        }
+
         $entries = foreach ($f in @($spec.Files)) {
             # Relative to the session root, not the leaf: a Copilot session keeps content
             # in checkpoints\ and files\, and flattening those collides the moment two
@@ -2724,6 +2775,15 @@ function New-BridgeSessionBundle {
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         [System.IO.Compression.ZipFile]::CreateFromDirectory($stage, $zip,
             [System.IO.Compression.CompressionLevel]::Optimal, $false)
+
+        # Re-read after the copy, not before: a file that grew or was rewritten while it
+        # was being read makes the archive a snapshot of no single moment.
+        foreach ($f in @($spec.Files)) {
+            $info = [System.IO.FileInfo]::new($f)
+            if (-not $info.Exists -or $witness[$f] -ne "$($info.Length):$($info.LastWriteTimeUtc.Ticks)") {
+                throw "that session changed while it was being packed - it is probably open somewhere"
+            }
+        }
 
         [pscustomobject]@{
             SessionId = $SessionId
@@ -2937,6 +2997,26 @@ function Set-BridgeCopilotWorkspaceCwd {
         if ($line -match '^cwd:\s') { "cwd: $Cwd" } else { $line }
     }
     [System.IO.File]::WriteAllLines($Path, @($lines))
+}
+
+function Test-BridgeTransferComplete {
+    <#
+        Whether every chunk of a bundle has arrived.
+
+        Counts distinct sequence numbers rather than messages. Chunks are published at
+        QoS 1, which permits redelivery, so a raw message count let one chunk arriving
+        twice stand in for one that had not arrived at all: the subscription closed
+        early and reassembly failed as incomplete while the sender was still publishing
+        perfectly good chunks.
+    #>
+    param([AllowEmptyCollection()][AllowNull()][object[]]$Messages)
+
+    $manifest = @($Messages) | Where-Object { $null -ne $_ -and $_.PSObject.Properties['sha256'] } | Select-Object -First 1
+    if ($null -eq $manifest) { return $false }
+    $seen = @(@($Messages) |
+        Where-Object { $null -ne $_ -and $_.PSObject.Properties['d'] -and $_.PSObject.Properties['s'] } |
+        ForEach-Object { [int]$_.s } | Sort-Object -Unique)
+    @($seen).Count -ge [int]$manifest.chunks
 }
 
 function Get-BridgeBundleChunk {

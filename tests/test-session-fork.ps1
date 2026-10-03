@@ -106,6 +106,30 @@ try {
     Test-That 'nor this machine''s rewind snapshots, which mean nothing elsewhere' {
         @($spec.Files | Where-Object { $_ -like '*rewind-file-snapshots*' }).Count -eq 0
     }
+
+    # A junction needs no elevation on Windows; a symlink does. Where neither can be
+    # made, the check is skipped rather than silently passing.
+    $secretDir = Join-Path $root 'not-the-session'
+    New-Item -ItemType Directory -Path $secretDir -Force | Out-Null
+    Set-Content -Path (Join-Path $secretDir 'secrets.env') -Value 'TOKEN=should-never-travel'
+    $linkPath = Join-Path (Join-Path $dir 'files') 'escape'
+    $linked = $false
+    try {
+        $type = if ($IsWindows) { 'Junction' } else { 'SymbolicLink' }
+        [void](New-Item -ItemType $type -Path $linkPath -Value $secretDir -ErrorAction Stop)
+        $linked = $true
+    }
+    catch { Write-Host "  SKIP  no link could be created here: $($_.Exception.Message)" }
+    if ($linked) {
+        $linkSpec = Get-BridgeSessionBundleSpec -SessionId $oldId -Launcher 'copilot'
+        Test-That 'a junction under files\ is not followed out of the session directory' {
+            @($linkSpec.Files | Where-Object { $_ -like '*secrets.env*' }).Count -eq 0
+        }
+        Test-That 'and the session''s own files are still collected, so the walk did not just stop' {
+            @($linkSpec.Files | Where-Object { $_ -like '*notes.md' }).Count -eq 2
+        }
+        Remove-Item -LiteralPath $linkPath -Force -Recurse -ErrorAction SilentlyContinue
+    }
     Test-That 'a session that is not there yields nothing rather than a guess' {
         $null -eq (Get-BridgeSessionBundleSpec -SessionId 'ffffffff-0000-0000-0000-000000000000' -Launcher 'copilot')
     }
@@ -132,9 +156,38 @@ try {
         $null -ne (Get-BridgeSessionBundleSpec -SessionId $oldId -Launcher 'copilot')
     }
     Test-That 'the bundle carries a digest' { $manifest.Sha256 -and $manifest.Sha256.Length -eq 64 }
-    Test-That 'and no staging directory is left behind' {
-        @(Get-ChildItem -LiteralPath $out -Directory -Filter 'stage-*').Count -eq 0
+    Test-That 'and no staging directory is left behind' {        @(Get-ChildItem -LiteralPath $out -Directory -Filter 'stage-*').Count -eq 0
     }
+
+    # A session can be resumed at the source *after* the caller's live-session snapshot
+    # was taken, and sending takes tens of seconds, so the agent can be appending while
+    # the bundle is read - producing a fork that is digest-valid and truncated. Nothing
+    # here can prevent that; no agent CLI takes a lock this could wait on. It can be
+    # detected, which is what the witness around the copy does. Driven through a
+    # shadowed Copy-Item so the write lands mid-bundle deterministically rather than by
+    # racing a real agent.
+    $script:CopiedOnce = $false
+    function Copy-Item {
+        param([string]$LiteralPath, [string]$Destination, [switch]$Force, [switch]$Recurse)
+        Microsoft.PowerShell.Management\Copy-Item -LiteralPath $LiteralPath -Destination $Destination -Force:$Force -Recurse:$Recurse
+        if (-not $script:CopiedOnce) {
+            $script:CopiedOnce = $true
+            Add-Content -LiteralPath (Join-Path $dir 'events.jsonl') -Value '{"type":"user.message","data":{"content":"written while packing"}}'
+        }
+    }
+    $env:COPILOT_HOME = $srcCopilot
+    $raced = ''
+    try { New-BridgeSessionBundle -SessionId $oldId -Launcher 'copilot' -Destination $out | Out-Null }
+    catch { $raced = $_.Exception.Message }
+    Remove-Item -Path Function:\Copy-Item -ErrorAction SilentlyContinue
+
+    Test-That 'a session written to while it is being packed is refused, not sent truncated' {
+        $raced -like '*changed while it was being packed*'
+    }
+    Test-That 'and an unchanged session still bundles, so the witness is not refusing everything' {
+        $null -ne (New-BridgeSessionBundle -SessionId $oldId -Launcher 'copilot' -Destination $out)
+    }
+    $manifest = New-BridgeSessionBundle -SessionId $oldId -Launcher 'copilot' -Destination $out
 
     Write-Host '--- a damaged bundle is refused before anything is written ---'
 
