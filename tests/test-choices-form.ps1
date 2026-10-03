@@ -58,12 +58,14 @@ function Set-DaemonTransientActivity { param($SessionId, $Summary, $Extra, $Head
 # WebSocket connections to the live instance - which is how a machine gets itself
 # IP-banned by its own tests.
 $script:SavedConfig = $null
+. (Join-Path $PSScriptRoot 'test-dashboard.ps1') -PublicationFixturesOnly
 function Invoke-CopilotHaWebSocket {
     param([Parameter(Mandatory)][object[]]$Commands)
-    if ($Commands[0].type -eq 'lovelace/config/save') { $script:SavedConfig = $Commands[0].config }
-    @()
+    Invoke-TestPublicationCommands -Commands $Commands
 }
 function Invoke-HomeAssistantApi { param($Path, $Method, $Body, $Headers) throw 'no network in this suite' }
+Initialize-TestPublicationStore
+Initialize-TestPublicationAuthority
 
 # --- 1. what the bridge publishes for a real two-field question -------------------
 
@@ -74,6 +76,12 @@ $headers = @{ Authorization = '******' }
 # Entity states as Home Assistant would hold them, filled in from the discovery
 # payloads and the starting values the bridge publishes. Nothing is invented here.
 $script:HaStates = @{}
+function Get-HomeAssistantState {
+    param([string]$EntityId, [hashtable]$Headers)
+    if (-not $script:HaStates.Contains($EntityId)) { throw "no such entity: $EntityId" }
+    $entry = $script:HaStates[$EntityId]
+    [pscustomobject]@{ entity_id = $EntityId; state = [string]$entry.state; attributes = $entry.attributes }
+}
 function Publish-CopilotMqttMessage {
     param([string]$Topic, [string]$Payload, [hashtable]$Headers, [switch]$Retain)
     if ($Topic -match '/select/[^/]+/(decision|f\d)/config$') {
@@ -138,6 +146,7 @@ Test-That 'and the headings ride on the decision attributes' {
 # what this asks for too, rather than a number written down again here.
 $cardVersion = Get-BridgeReplyCardFileVersion -SourcePath (Join-Path $PSScriptRoot '..\frontend\agent-bridge-reply-card.js')
 
+Set-TestPublicationCardUrl -Url "/local/agent-bridge-reply-card.js?v=$cardVersion"
 Save-CopilotSessionDashboard `
     -Sessions @([pscustomobject]@{ Node = $node; Name = 'Copilot: a task'; Machine = 'BOX'; Kind = 'copilot' }) `
     -ReplyCardUrl "/local/agent-bridge-reply-card.js?v=$cardVersion"
@@ -222,13 +231,6 @@ foreach ($call in @($rendered.calls)) {
 }
 $script:HaStates["text.${node}_reply"] = [ordered]@{ state = 'nothing to add'; attributes = @{} }
 $script:HaStates["button.${node}_submit"] = [ordered]@{ state = [DateTimeOffset]::Now.ToString('o'); attributes = @{} }
-
-function Get-HomeAssistantState {
-    param([string]$EntityId, [hashtable]$Headers)
-    if (-not $script:HaStates.Contains($EntityId)) { throw "no such entity: $EntityId" }
-    $entry = $script:HaStates[$EntityId]
-    [pscustomobject]@{ entity_id = $EntityId; state = [string]$entry.state; attributes = $entry.attributes }
-}
 
 $marker = [pscustomobject]@{
     decisionId = 'd1'

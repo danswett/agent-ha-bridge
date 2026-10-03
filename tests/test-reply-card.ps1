@@ -230,18 +230,32 @@ Write-Host '--- installing the card ---'
 
 Test-That 'the card source ships with the bridge' { Test-Path -LiteralPath $script:CardSource }
 
+. (Join-Path $PSScriptRoot 'test-dashboard.ps1') -PublicationFixturesOnly
+function Invoke-CopilotHaWebSocket {
+    param([hashtable[]]$Commands)
+    Invoke-TestPublicationCommands -Commands $Commands
+}
+Initialize-TestPublicationStore
+$script:InstallCardSource = Join-Path (Split-Path $script:TestPublication.Path -Parent) 'release-card.js'
+$fixtureCardText = (Get-Content -LiteralPath $script:CardSource -Raw) -replace "CARD_VERSION\s*=\s*'[^']+'", "CARD_VERSION = '1.9.0'"
+[IO.File]::WriteAllText($script:InstallCardSource, $fixtureCardText, [Text.UTF8Encoding]::new($false))
+$script:InstallInlineUrl = Get-BridgeInlineReplyCardUrl -SourcePath $script:InstallCardSource -Version '1.9.0'
 $script:Sent = @()
-$script:Invoker = { param($commands) $script:Sent += $commands; @(@()) }
+$script:Invoker = {
+    param($commands)
+    $script:Sent += @($commands | Where-Object {
+        $_.type -match 'lovelace/resources/(create|update)' -and $_.url -match '#agent-bridge-reply-card\.js'
+    })
+    Invoke-TestPublicationCommands -Commands $commands
+}
 
-# The case that used to leave the card missing for good: a first install, with
-# nothing in Home Assistant yet and no file share to write to.
-$script:First = Install-BridgeReplyCard -SourcePath $script:CardSource -Version '1.9.0' `
-    -Invoker $script:Invoker -Resources { @() }
-Test-That 'a first install registers the card' { $script:First.Ok -and $script:First.Action -eq 'deployed' }
+Initialize-TestPublicationAuthority -CardSource $script:InstallCardSource
+$script:First = Install-BridgeReplyCard -SourcePath $script:InstallCardSource -Version '1.9.0' -Invoker $script:Invoker
+Test-That 'an explicitly bootstrapped first install registers the card' { $script:First.Ok -and $script:First.Action -eq 'deployed' }
 Test-That 'as one module resource' {
     $script:Sent.Count -eq 1 -and $script:Sent[0].type -eq 'lovelace/resources/create' -and $script:Sent[0].res_type -eq 'module'
 }
-Test-That 'pointing at the inline card' { $script:Sent[0].url -eq $script:InlineUrl }
+Test-That 'pointing at the inline card' { $script:Sent[0].url -eq $script:InstallInlineUrl }
 
 Test-That 'the card version is read from the card itself' {
     (Get-BridgeReplyCardFileVersion -SourcePath $script:CardSource) -match '^\d+\.\d+\.\d+$'
@@ -250,84 +264,92 @@ Test-That 'a missing card file yields no version rather than throwing' {
     (Get-BridgeReplyCardFileVersion -SourcePath (Join-Path $PSScriptRoot 'nope.js')) -eq ''
 }
 $script:Sent = @()
-$script:Auto = Install-BridgeReplyCard -SourcePath $script:CardSource -Invoker $script:Invoker -Resources { @() }
+Initialize-TestPublicationStore
+Initialize-TestPublicationAuthority -CardSource $script:CardSource
+$script:Auto = Install-BridgeReplyCard -SourcePath $script:CardSource -Invoker $script:Invoker
 Test-That 'with no version passed it uses the card file version' {
     $script:Auto.Url.EndsWith("?v=$(Get-BridgeReplyCardFileVersion -SourcePath $script:CardSource)")
 }
 
 # Home Assistant is shared, so on the second machine the card is already there.
 $script:Sent = @()
-$script:Current = @([pscustomobject]@{ id = 'res-1'; url = $script:InlineUrl })
-$script:Again = Install-BridgeReplyCard -SourcePath $script:CardSource -Version '1.9.0' `
-    -Invoker $script:Invoker -Resources { $script:Current } -FileProbe { throw 'an inline card has no file to probe' }
+Initialize-TestPublicationStore
+Initialize-TestPublicationAuthority -CardSource $script:InstallCardSource -CardUrl $script:InstallInlineUrl
+$script:Again = Install-BridgeReplyCard -SourcePath $script:InstallCardSource -Version '1.9.0' `
+    -Invoker $script:Invoker -FileProbe { throw 'an inline card has no file to probe' }
 Test-That 're-running with nothing to change sends no resource command' { $script:Sent.Count -eq 0 }
 Test-That 'it reports the card as already current' { $script:Again.Ok -and $script:Again.Action -eq 'current' }
 
-# The same CARD_VERSION does not mean the same card. Two sessions can each build one
-# at 1.9.0 - one of them from a branch installed from source before it merged - and
-# whichever registered first used to win permanently, because the version matched and
-# nothing looked any further. Every machine then held the newer card and none could
-# replace the older one that Home Assistant was actually serving.
+# Equal-version content changes now require a version bump or an explicit pin.
 $script:Sent = @()
-$script:Impostor = @([pscustomobject]@{
-    id  = 'res-1'
-    url = ('data:text/javascript;base64,' +
-        [Convert]::ToBase64String([Text.Encoding]::UTF8.GetBytes("// a different card that also calls itself 1.9.0`nconst CARD_VERSION = '1.9.0';")) +
-        '#agent-bridge-reply-card.js?v=1.9.0')
-})
-$script:Collision = Install-BridgeReplyCard -SourcePath $script:CardSource -Version '1.9.0' `
-    -Invoker $script:Invoker -Resources { $script:Impostor } -FileProbe { throw 'an inline card has no file to probe' }
-Test-That 'a different card wearing the same version is replaced, not left serving' {
-    $script:Collision.Action -eq 'updated' -and $script:Sent.Count -eq 1 -and
-    $script:Sent[0].type -eq 'lovelace/resources/update' -and $script:Sent[0].resource_id -eq 'res-1'
+Initialize-TestPublicationStore
+$impostorFile = New-TestPublicationCard '1.9.0'
+$impostorUrl = Get-BridgeInlineReplyCardUrl -SourcePath $impostorFile -Version '1.9.0'
+Set-TestPublicationPolicy -Policy (New-TestPublicationPolicy $impostorFile) -CardUrl $impostorUrl
+$script:Collision = Install-BridgeReplyCard -SourcePath $script:InstallCardSource -Version '1.9.0' `
+    -Invoker $script:Invoker -FileProbe { throw 'an inline card has no file to probe' }
+Test-That 'a different card wearing the same version is reported as a content conflict' {
+    $script:Collision.Action -eq 'blocked' -and $script:Collision.Detail -match 'conflict' -and $script:Sent.Count -eq 0
 }
-Test-That 'and what replaces it is the card this bridge actually ships' {
-    $script:Sent[0].url -eq $script:InlineUrl
+Test-That 'and its existing resource is not silently replaced' {
+    @((Get-TestPublicationStore).resources | Where-Object { $_.id -eq 'reply-card' })[0].url -ceq $impostorUrl
 }
 
 # An upgrade must not leave two resources pointing at the same card.
 $script:Sent = @()
-$script:Older = @([pscustomobject]@{ id = 'res-1'; url = (Get-BridgeInlineReplyCardUrl -SourcePath $script:CardSource -Version '1.8.0') })
-$script:Upgrade = Install-BridgeReplyCard -SourcePath $script:CardSource -Version '1.9.0' `
-    -Invoker $script:Invoker -Resources { $script:Older }
+Initialize-TestPublicationStore
+$oldInstallSource = New-TestPublicationCard '1.8.0'
+Initialize-TestPublicationAuthority -CardSource $oldInstallSource `
+    -CardUrl (Get-BridgeInlineReplyCardUrl -SourcePath $oldInstallSource -Version '1.8.0')
+$script:Upgrade = Install-BridgeReplyCard -SourcePath $script:InstallCardSource -Version '1.9.0' -Invoker $script:Invoker
 Test-That 'an upgrade updates the existing resource instead of adding another' {
     $script:Upgrade.Action -eq 'updated' -and $script:Sent.Count -eq 1 -and
-    $script:Sent[0].type -eq 'lovelace/resources/update' -and $script:Sent[0].resource_id -eq 'res-1'
+    $script:Sent[0].type -eq 'lovelace/resources/update' -and $script:Sent[0].resource_id -eq 'reply-card'
 }
-Test-That 'the update carries the new version' { $script:Sent[0].url -eq $script:InlineUrl }
+Test-That 'the update carries the new version' { $script:Sent[0].url -eq $script:InstallInlineUrl }
 
 # Earlier versions served the card as a file from `www`. Even at the same version it
 # moves to the inline copy, so every install ends up on the one route.
 $script:Sent = @()
-$script:FileServed = @([pscustomobject]@{ id = 'res-7'; url = '/local/agent-bridge-reply-card.js?v=1.9.0' })
-$script:Migrated = Install-BridgeReplyCard -SourcePath $script:CardSource -Version '1.9.0' `
-    -Invoker $script:Invoker -Resources { $script:FileServed } -FileProbe { $true }
+Initialize-TestPublicationStore
+$fileServedUrl = '/local/agent-bridge-reply-card.js?v=1.9.0'
+Initialize-TestPublicationAuthority -CardSource $script:InstallCardSource -CardUrl $fileServedUrl
+$script:Migrated = Install-BridgeReplyCard -SourcePath $script:InstallCardSource -Version '1.9.0' `
+    -Invoker $script:Invoker -FileProbe { $true }
 Test-That 'a file-served card is re-pointed at the inline copy' {
-    $script:Migrated.Action -eq 'updated' -and $script:Sent[0].resource_id -eq 'res-7' -and $script:Sent[0].url -eq $script:InlineUrl
+    $script:Migrated.Action -eq 'updated' -and $script:Sent[0].resource_id -eq 'reply-card' -and $script:Sent[0].url -eq $script:InstallInlineUrl
 }
 
-# A bridge that cannot deliver the card is still a working bridge, so none of these
-# may throw.
-$script:Kept = Install-BridgeReplyCard -SourcePath $script:CardSource -Version '1.9.0' `
-    -Invoker { param($c) throw 'websocket down' } -Resources { $script:FileServed } -FileProbe { $true }
-Test-That 'an older card that cannot be replaced is kept, not failed' {
-    $script:Kept.Ok -and $script:Kept.Action -eq 'kept'
+Initialize-TestPublicationStore
+Initialize-TestPublicationAuthority -CardSource $script:InstallCardSource -CardUrl $fileServedUrl
+$script:TestPublication.Reject['lovelace/resources/update'] = '{"code":"unknown_error","message":"Write rejected"}'
+$script:Kept = Install-BridgeReplyCard -SourcePath $script:InstallCardSource -Version '1.9.0' -Invoker $script:Invoker -FileProbe { $true }
+Test-That 'a rejected card write is unconfirmed rather than reported as publication success' {
+    -not $script:Kept.Ok -and $script:Kept.Action -eq 'unconfirmed'
+}
+Test-That 'the rejected write leaves the real synthetic registered card untouched' {
+    @((Get-TestPublicationStore).resources | Where-Object { $_.id -eq 'reply-card' })[0].url -ceq $fileServedUrl
 }
 
+Initialize-TestPublicationStore
+Initialize-TestPublicationAuthority -CardSource $script:InstallCardSource
 $script:Missing = Install-BridgeReplyCard -SourcePath (Join-Path $PSScriptRoot 'nope.js') -Version '1.9.0' `
-    -Invoker $script:Invoker -Resources { @() }
+    -Invoker $script:Invoker
 Test-That 'a missing card source is reported, not thrown' {
     (-not $script:Missing.Ok) -and $script:Missing.Detail -match 'not readable'
 }
 
-$script:NoWebsocket = Install-BridgeReplyCard -SourcePath $script:CardSource -Version '1.9.0' `
-    -Invoker { param($c) throw 'websocket down' } -Resources { @() }
+Initialize-TestPublicationStore
+Initialize-TestPublicationAuthority -CardSource $script:InstallCardSource
+$script:TestPublication.Reject['lovelace/resources/create'] = '{"code":"unknown_error","message":"Write rejected"}'
+$script:NoWebsocket = Install-BridgeReplyCard -SourcePath $script:InstallCardSource -Version '1.9.0' -Invoker $script:Invoker
 Test-That 'a failed registration is reported, not thrown' {
     (-not $script:NoWebsocket.Ok) -and $script:NoWebsocket.Detail -match 'could not register'
 }
 
-$script:Unreadable = Install-BridgeReplyCard -SourcePath $script:CardSource -Version '1.9.0' `
-    -Invoker $script:Invoker -Resources { throw 'no websocket' }
+Initialize-TestPublicationStore
+$script:TestPublication.Reject['lovelace/resources'] = '{"code":"unauthorized","message":"Read rejected"}'
+$script:Unreadable = Install-BridgeReplyCard -SourcePath $script:InstallCardSource -Version '1.9.0' -Invoker $script:Invoker
 Test-That 'an unreadable resource list is reported, not thrown' {
     (-not $script:Unreadable.Ok) -and $script:Unreadable.Detail -match 'could not read'
 }
@@ -406,15 +428,17 @@ Write-Host '--- how the reply box is rendered on the dashboard ---'
 $script:SavedConfig = $null
 function Invoke-CopilotHaWebSocket {
     param([Parameter(Mandatory)][object[]]$Commands)
-    $script:SavedConfig = $Commands[0].config
-    @()
+    Invoke-TestPublicationCommands -Commands $Commands
 }
+Initialize-TestPublicationStore
+Initialize-TestPublicationAuthority
 
 $script:DashSessions = @([pscustomobject]@{
     Node = 'copilot_abc123def456'; Name = 'Copilot: a task'
     Machine = [Environment]::MachineName; Kind = 'copilot'
 })
 
+Set-TestPublicationCardUrl -Url '/local/agent-bridge-reply-card.js?v=1.9.0'
 Save-CopilotSessionDashboard -Sessions $script:DashSessions `
     -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.9.0'
 $script:WithCard = $script:SavedConfig | ConvertTo-Json -Depth 40
@@ -426,6 +450,7 @@ Test-That 'the card is pointed at that session own payload topic' {
     $script:WithCard -match 'copilot/cli/copilot_abc123def456/replypayload/set'
 }
 
+Set-TestPublicationCardUrl -Url ''
 Save-CopilotSessionDashboard -Sessions $script:DashSessions -ReplyCardUrl ''
 $script:NoCard = $script:SavedConfig | ConvertTo-Json -Depth 40
 
@@ -489,6 +514,183 @@ Test-That 'some other inline resource is not mistaken for the card' {
     (Get-BridgeServedReplyCardUrl -CacheSeconds 0 -Resources {
         @([pscustomobject]@{ url = 'data:text/javascript;base64,YWdlbnQtYnJpZGdlLXJlcGx5LWNhcmQuanM=' })
     }) -eq ''
+}
+
+Write-Host '--- shared publication requires explicit authority ---'
+. (Join-Path $PSScriptRoot 'test-dashboard.ps1') -PublicationFixturesOnly
+. (Join-Path $PSScriptRoot '..\hooks\decision-ha-websocket.ps1')
+function Invoke-CopilotHaWebSocket {
+    param([hashtable[]]$Commands)
+    Invoke-TestPublicationCommands -Commands $Commands
+}
+
+Initialize-TestPublicationStore -Unconfigured
+$unconfiguredCard = New-TestPublicationCard '2.0.0'
+$unconfigured = Install-BridgeReplyCard -SourcePath $unconfiguredCard
+Test-That 'a genuine first install does not silently choose its own publisher' {
+    @(Get-TestPublicationWrites).Count -eq 0 -and $unconfigured.Detail -match 'configur|bootstrap'
+}
+
+Initialize-TestPublicationStore
+$unbootstrappedCard = New-TestPublicationCard '2.0.0'
+$unbootstrapped = Install-BridgeReplyCard -SourcePath $unbootstrappedCard
+Test-That 'configured identity alone is not the one-shot bootstrap action' {
+    @(Get-TestPublicationWrites).Count -eq 0 -and $unbootstrapped.Detail -match 'bootstrap'
+}
+
+Initialize-TestPublicationStore
+$currentCard = New-TestPublicationCard '3.0.0'
+$olderCard = New-TestPublicationCard '2.0.0'
+$currentUrl = Get-BridgeInlineReplyCardUrl -SourcePath $currentCard -Version '3.0.0'
+Set-TestPublicationPolicy -Policy (New-TestPublicationPolicy $currentCard) -CardUrl $currentUrl
+$older = Install-BridgeReplyCard -SourcePath $olderCard
+Test-That 'an older participating writer cannot downgrade the registered card' {
+    @(Get-TestPublicationWrites).Count -eq 0 -and $older.Detail -match 'older|downgrade|fence'
+}
+Test-That 'a refused downgrade preserves the actual registered bytes' {
+    @((Get-TestPublicationStore).resources | Where-Object { $_.id -eq 'reply-card' })[0].url -ceq $currentUrl
+}
+
+Initialize-TestPublicationStore
+$versionedCard = New-TestPublicationCard '2.0.0' 'export const changed = true;'
+$conflictingCard = New-TestPublicationCard '2.0.0' 'export const changed = false;'
+$versionedUrl = Get-BridgeInlineReplyCardUrl -SourcePath $versionedCard -Version '2.0.0'
+Set-TestPublicationPolicy -Policy (New-TestPublicationPolicy $versionedCard) -CardUrl $versionedUrl
+$conflict = Install-BridgeReplyCard -SourcePath $conflictingCard
+Test-That 'equal versions with different real file content are a conflict, not an upgrade' {
+    @(Get-TestPublicationWrites).Count -eq 0 -and $conflict.Detail -match 'conflict|content'
+}
+
+Initialize-TestPublicationStore
+$rollbackCard = New-TestPublicationCard '2.0.0'
+$newerCard = New-TestPublicationCard '3.0.0'
+$rollbackUrl = Get-BridgeInlineReplyCardUrl -SourcePath $rollbackCard -Version '2.0.0'
+Set-TestPublicationIdentity -Generation 2
+$rollbackPolicy = New-TestPublicationPolicy $rollbackCard -Mode pin -Generation 2
+$rollbackPolicy.highCard = (New-TestPublicationPolicy $newerCard).card
+Set-TestPublicationPolicy -Policy $rollbackPolicy -CardUrl $rollbackUrl
+$undo = Install-BridgeReplyCard -SourcePath $newerCard
+Test-That 'a newer automatic writer cannot undo an explicitly targeted rollback generation' {
+    @(Get-TestPublicationWrites).Count -eq 0 -and $undo.Detail -match 'pin|rollback'
+}
+
+Initialize-TestPublicationStore
+$writerCard = New-TestPublicationCard '2.0.0'
+$incomingCard = New-TestPublicationCard '3.0.0'
+Set-TestPublicationPolicy -Policy (New-TestPublicationPolicy $writerCard) `
+    -CardUrl (Get-BridgeInlineReplyCardUrl -SourcePath $writerCard -Version '2.0.0')
+Set-TestPublicationIdentity -Participant 'observer-b'
+$nonWriter = Install-BridgeReplyCard -SourcePath $incomingCard
+Test-That 'a configured non-writer does not publish a newer card' {
+    @(Get-TestPublicationWrites).Count -eq 0 -and $nonWriter.Detail -match 'writer'
+}
+Test-That 'the generic third-party registrar cannot bypass the bridge card publisher' {
+    $registered = Register-BridgeFrontendCard -Url (Get-BridgeInlineReplyCardUrl -SourcePath $incomingCard -Version '3.0.0') `
+        -Invoker { param($commands) Invoke-TestPublicationCommands -Commands $commands } -WarningAction SilentlyContinue
+    -not $registered -and @(Get-TestPublicationWrites).Count -eq 0
+}
+
+Initialize-TestPublicationStore
+$ambiguousCard = New-TestPublicationCard '2.0.0'
+Set-TestPublicationPolicy -Policy (New-TestPublicationPolicy $ambiguousCard)
+$ambiguousStore = Get-TestPublicationStore
+$duplicate = $ambiguousStore.resources[0].Clone()
+$duplicate.id = 'other-policy'
+$ambiguousStore.resources += $duplicate
+Set-TestPublicationStore $ambiguousStore
+$ambiguous = Install-BridgeReplyCard -SourcePath $ambiguousCard
+Test-That 'competing publication records are refused rather than choosing the first' {
+    @(Get-TestPublicationWrites).Count -eq 0 -and $ambiguous.Detail -match 'ambiguous|multiple|conflict'
+}
+
+Initialize-TestPublicationStore
+$deniedCard = New-TestPublicationCard '2.0.0'
+$script:TestPublication.Reject['lovelace/resources'] = '{"code":"unauthorized","message":"Denied"}'
+$denied = Install-BridgeReplyCard -SourcePath $deniedCard
+Test-That 'a forbidden resource read is not a first install' {
+    @(Get-TestPublicationWrites).Count -eq 0 -and -not $denied.Ok
+}
+
+Initialize-TestPublicationStore
+$rollingOldCard = New-TestPublicationCard '2.0.0'
+$rollingNewCard = New-TestPublicationCard '3.0.0'
+Set-TestPublicationPolicy -Policy (New-TestPublicationPolicy $rollingOldCard) `
+    -CardUrl (Get-BridgeInlineReplyCardUrl -SourcePath $rollingOldCard -Version '2.0.0')
+$rollingUpgrade = Install-BridgeReplyCard -SourcePath $rollingNewCard
+Test-That 'a configured writer can roll forward to a newer real card file' { $rollingUpgrade.Ok -and $rollingUpgrade.Action -eq 'updated' }
+$policyResource = @((Get-TestPublicationStore).resources | Where-Object { $_.url -like '*#agent-bridge-publication-policy.js?policy=*' })[0]
+$encodedPolicy = ([string]$policyResource.url -split '\?policy=', 2)[1]
+$advancedPolicy = [Text.Encoding]::UTF8.GetString([Convert]::FromBase64String($encodedPolicy)) | ConvertFrom-Json
+Test-That 'a rolling upgrade persists its version fence independently of the dashboard' {
+    $advancedPolicy.card.version -eq '3.0.0' -and $advancedPolicy.highCard.version -eq '3.0.0'
+}
+
+foreach ($clock in @([datetime]'2020-01-01', [datetime]'2040-01-01')) {
+    Initialize-TestPublicationStore
+    $clockCard = New-TestPublicationCard '2.0.0'
+    Set-TestPublicationPolicy -Policy (New-TestPublicationPolicy $clockCard)
+    Set-TestPublicationIdentity -Participant 'observer-b'
+    $clockOutcome = & {
+        function Get-Date { param($Format) if ($Format) { $clock.ToString($Format) } else { $clock } }
+        Install-BridgeReplyCard -SourcePath $clockCard
+    }
+    Test-That "a non-writer does not gain authority when its clock reads $($clock.Year)" {
+        @(Get-TestPublicationWrites).Count -eq 0 -and $clockOutcome.Detail -match 'writer'
+    }
+}
+
+Write-Host '--- an actual pinned pre-fence publisher, not a new helper with an old version ---'
+Initialize-TestPublicationStore -Unconfigured
+$legacySource = New-TestPublicationCard '2.0.0'
+$legacySessions = @([pscustomobject]@{ Node = 'agent_bridge_legacy'; Name = 'Legacy view'; Machine = 'LEGACY'; Kind = 'copilot' })
+Invoke-TestPreFencePublication -CardSource $legacySource -Sessions $legacySessions
+$legacyEstablished = Get-TestPublicationStore
+Test-That 'the pinned unmodified publisher establishes a real resource and dashboard' {
+    $legacyEstablished.resources.Count -eq 1 -and $legacyEstablished.configs.Contains('agent-decisions')
+}
+$legacyBytes = [IO.File]::ReadAllText($script:TestPublication.Path)
+$script:TestPublication.Commands.Clear()
+$upgradedWithoutPolicy = Install-BridgeReplyCard -SourcePath $legacySource
+$migrationRefused = $false
+try { Save-CopilotSessionDashboard -Sessions @() }
+catch { $migrationRefused = $_.Exception.Message -match 'migration|bootstrap|configur|policy' }
+Test-That 'a no-policy upgrade visibly requires migration despite identical installed card bytes' {
+    $upgradedWithoutPolicy.Detail -match 'migration' -and $migrationRefused
+}
+Test-That 'a no-policy upgrade preserves the immediate pre-fence resource and dashboard' {
+    @(Get-TestPublicationWrites).Count -eq 0 -and [IO.File]::ReadAllText($script:TestPublication.Path) -ceq $legacyBytes
+}
+
+Set-TestPublicationIdentity
+$fencedSource = New-TestPublicationCard '3.0.0'
+Set-BridgePublicationPolicy -ExpectedGeneration 0 -ExpectedPolicyHash absent `
+    -Target (Get-BridgePublicationTarget -CardSourcePath $fencedSource) | Out-Null
+$migratedWriter = Install-BridgeReplyCard -SourcePath $fencedSource
+Save-CopilotSessionDashboard -Sessions $legacySessions
+Test-That 'the separately explicit writer bootstrap migrates the real pre-fence installation' {
+    $migratedWriter.Ok -and (Get-BridgeDashboardPublication).Verified -and
+        (Read-BridgePublicationState).Policy.generation -eq 1
+}
+$participatingUpgradeSource = New-TestPublicationCard '4.0.0'
+$participatingUpgrade = Install-BridgeReplyCard -SourcePath $participatingUpgradeSource
+Save-CopilotSessionDashboard -Sessions $legacySessions
+Test-That 'a later participating upgrade continues the established migration authority' {
+    $participatingUpgrade.Ok -and (Get-BridgeDashboardPublication).Verified -and
+        (Read-BridgePublicationState).Policy.highCard.version -eq '4.0.0'
+}
+Invoke-TestPreFencePublication -CardSource $legacySource -Sessions $legacySessions
+Test-That 'the unmodified pre-fence peer still bypasses cooperative fences on the same HA paths' {
+    @((Get-TestPublicationStore).resources | Where-Object { $_.url -match '#agent-bridge-reply-card\.js' })[0].url -match '\?v=2\.0\.0$' -and
+        ((Get-TestPublicationStore).configs['agent-decisions'] | ConvertTo-Json -Depth 100) -match 'Legacy view'
+}
+Test-That 'a returning legacy writer is detected without accepting its view or erasing the fence' {
+    -not (Get-BridgeDashboardPublication).Verified -and (Read-BridgePublicationState).Policy.highCard.version -eq '4.0.0'
+}
+$repairedCard = Install-BridgeReplyCard -SourcePath $participatingUpgradeSource
+Save-CopilotSessionDashboard -Sessions $legacySessions
+Test-That 'the designated writer can repair the observed overwrite without claiming it was prevented' {
+    $repairedCard.Ok -and (Get-BridgeDashboardPublication).Verified -and
+        (Read-BridgePublicationState).Policy.highCard.version -eq '4.0.0'
 }
 
 Write-Host ''

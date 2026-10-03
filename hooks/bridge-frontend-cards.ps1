@@ -192,6 +192,12 @@ function Register-BridgeFrontendCard {
         [Parameter(Mandatory)][string]$Url,
         [scriptblock]$Invoker
     )
+    foreach ($owned in @('agent-bridge-reply-card.js', 'agent-bridge-publication-policy.js')) {
+        if (Test-BridgeCardResourceMatch -ResourceUrl $Url -FileName $owned) {
+            Write-Warning 'Bridge-owned resources require Install-BridgeReplyCard or the explicit Set-BridgePublicationPolicy operation.'
+            return $false
+        }
+    }
     if (-not $Invoker) { $Invoker = { param($commands) Invoke-CopilotHaWebSocket -Commands $commands } }
     try {
         [void](& $Invoker @(@{ type = 'lovelace/resources/create'; res_type = 'module'; url = $Url }))
@@ -337,10 +343,9 @@ function Install-BridgeReplyCard {
         and machines without the share could never upgrade it. The resource API needs
         nothing the installer does not already have.
 
-        Home Assistant is shared between machines, so on the second and later machines
-        the card is already there and there is nothing to do. An older card, or one
-        still served as a file from `www` by an earlier version, is re-pointed at the
-        inline copy rather than duplicated.
+        Shared publication requires an explicitly established policy and writer.
+        Older/equal-conflicting artifacts cannot replace newer shared content, and
+        rollback pins can only be changed by a new explicit operator generation.
 
         Returns a record rather than throwing. A bridge that cannot deliver the card
         is still a working bridge - the dashboard falls back to the plain text box -
@@ -353,6 +358,8 @@ function Install-BridgeReplyCard {
           kept      - an older card is in place and could not be replaced, so the
                       card that is there carries on being used
           missing   - not installed and cannot be delivered
+          blocked   - publication authority, migration or version policy refused it
+          unconfirmed - a write/read-back failed; no publication success is claimed
     #>
     param(
         [string]$SourcePath,
@@ -400,22 +407,43 @@ function Install-BridgeReplyCard {
         return $result
     }
 
-    # Compared by what is registered, not by the version inside its URL. Two machines
-    # can hold different cards carrying the same CARD_VERSION - one of them built from
-    # a branch that was installed from source before it merged - and comparing the
-    # versions alone called that 'current' and left the older body serving for good.
-    # It happened: every machine held a card with a fix in it, Home Assistant served
-    # one without, and no install could ever replace it because the two numbers
-    # matched. An inline card carries its whole body in the URL, so comparing the
-    # thing itself costs nothing and cannot be fooled.
-    if ($present -and $inlineNow -and $state.Url -eq $result.Url) {
+    try {
+        if (-not (Get-Command Read-BridgePublicationState -ErrorAction SilentlyContinue)) {
+            . (Join-Path $PSScriptRoot 'decision-ha-websocket.ps1')
+        }
+        $fileVersion = Get-BridgeReplyCardFileVersion -SourcePath $SourcePath
+        if ($Version -cne $fileVersion) { throw 'The publication version must match the actual card file CARD_VERSION.' }
+        $artifact = @{ version = $fileVersion; hash = (Get-FileHash -LiteralPath $SourcePath -Algorithm SHA256 -ErrorAction Stop).Hash.ToLowerInvariant() }
+        $publication = Read-BridgePublicationState -Invoker $Invoker -Resources $Resources
+        Assert-BridgePublicationWriter -State $publication -Component card -Artifact $artifact
+        if ($publication.CardUrl -cne $state.Url) { throw 'The registered card changed during inspection; retry rather than overwriting an unobserved version.' }
+        if ($state.Registered -and $publication.Policy.mode -ceq 'advance') {
+            $registeredArtifact = Get-BridgeRegisteredCardArtifact -Url $state.Url
+            $servedVersion = [version]$registeredArtifact.version
+            if ($servedVersion -gt [version]$artifact.version) { throw 'An older card cannot downgrade the actual registered version.' }
+            if ($servedVersion -eq [version]$artifact.version -and $registeredArtifact.hash -cne $artifact.hash -and
+                $publication.Policy.legacyCard -cne (Get-BridgePublicationHash $state.Url)) {
+                throw 'Equal registered card versions have different content; explicit conflict resolution is required.'
+            }
+        }
+        $publication = Update-BridgePublicationFence -Component card -Artifact $artifact -Invoker $Invoker
+        if ($publication.CardUrl -cne $state.Url) { throw 'The card changed while advancing its fence; no card write was sent.' }
+    }
+    catch {
+        if ($_.Exception.Data['BridgeTestNetworkBlocked'] -or $_.Exception.Data['BridgeTestWriteBlocked']) { throw }
+        $result.Action = 'blocked'
+        $result.Ok = $present
+        $result.Registered = $state.Registered
+        $result.Url = $state.Url
+        $result.Detail = $_.Exception.Message
+        return $result
+    }
+    if ($present -and $inlineNow -and $state.Url -ceq $result.Url) {
         $result.Registered = $true
         $result.Ok = $true
         $result.Action = 'current'
         return $result
     }
-    # An existing registration is updated in place rather than joined by a second
-    # one, which would load the card twice and leave a stale entry behind.
     try {
         if ($state.Registered -and -not [string]::IsNullOrWhiteSpace($state.ResourceId)) {
             [void](& $Invoker @(@{
@@ -430,13 +458,17 @@ function Install-BridgeReplyCard {
             [void](& $Invoker @(@{ type = 'lovelace/resources/create'; res_type = 'module'; url = $result.Url }))
             $result.Action = 'deployed'
         }
+        $confirmed = Read-BridgePublicationState -Invoker $Invoker
+        Assert-BridgePublicationWriter -State $confirmed -Component card -Artifact $artifact
+        if ($confirmed.CardUrl -cne $result.Url) { throw 'The actual registered card does not match the attempted publication.' }
         $result.Registered = $true
         $result.Ok = $true
     }
     catch {
-        if ($_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        if ($_.Exception.Data['BridgeTestNetworkBlocked'] -or $_.Exception.Data['BridgeTestWriteBlocked']) { throw }
         $result.Detail = "could not register the resource: $($_.Exception.Message)"
-        if ($present) { $result.Ok = $true; $result.Action = 'kept' }
+        $result.Ok = $false
+        $result.Action = 'unconfirmed'
     }
 
     $result
@@ -490,6 +522,12 @@ if ($Register) {
         # Not a problem: the card is installed and working; a newer copy could not
         # be registered this time and will be on the next install or update.
         Write-Host "    reply card: kept the installed card ($($replyCard.Detail))" -ForegroundColor DarkGray
+    }
+    elseif ($replyCard.Action -eq 'blocked') {
+        Write-Host "    reply card publication paused ($($replyCard.Detail))" -ForegroundColor Yellow
+    }
+    elseif ($replyCard.Action -eq 'unconfirmed') {
+        Write-Host "    reply card publication could not be confirmed ($($replyCard.Detail))" -ForegroundColor Yellow
     }
     else {
         Write-Host "    reply card not installed ($($replyCard.Detail))" -ForegroundColor Yellow

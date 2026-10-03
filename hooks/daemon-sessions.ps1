@@ -1034,8 +1034,8 @@ function Repair-DaemonMachinePicker {
 
 function Sync-DaemonDashboard {
     <#
-        Rebuilds the shared dashboard when what it shows has changed, and returns
-        whether it is now current.
+        Observes accepted shared output on every pass, publishing changes or repairs
+        only as the configured writer. A cached local signature is not HA evidence.
 
         Only then, because a rebuild replaces the whole Lovelace config and is far
         heavier than a state publish; turn-by-turn activity rides on the per-session
@@ -1058,39 +1058,48 @@ function Sync-DaemonDashboard {
     $machineCards = @(Get-DaemonMachineCards -Capabilities $Capabilities -Peers $peers `
         -LocalSessionNodes @($Descriptors | ForEach-Object { [string]$_.Node }))
 
-    # A machine removed from the dashboard leaves its Detailed activity switch behind,
-    # because that one is a helper rather than a retained topic. Cheap unless something
-    # is actually stale, and self-healing however the machine went.
-    try { [void](Clear-DaemonStaleMachineHelper -Machines $machineCards -Headers $Headers) }
-    catch { Write-DaemonLog -Message "stale switch sweep failed: $($_.Exception.Message)" }
-
     # Only machines that are actually running can start a session, so the picker lists
     # those. Every registered machine still appears in the machines card, online or
     # not, because a machine you expected to see and cannot is information too.
     $onlineNames = @($machineCards | Where-Object { $_.Online } | ForEach-Object { [string]$_.Machine })
     Repair-DaemonMachinePicker -OnlineNames $onlineNames
 
-    $replyCardUrl = Get-BridgeServedReplyCardUrl
-    $signature = (@($allDescriptors | Sort-Object -Property Node | ForEach-Object { "$($_.Node)=$($_.Name)" }) -join '|') +
-        '#' + (@($machineCards | ForEach-Object { "$($_.Slug):$($_.IncludeProfile)$($_.IncludeResume)$($_.IncludeAgent)$($_.IncludeTuning)$($_.IncludePermissions)$($_.IncludeDetailed)$($_.IsDev):$($_.Online)" }) -join ',') +
-        '#' + $replyCardUrl
-    if ($signature -ne $script:DaemonDashboardSignature) {
-        try {
+    $script:BridgeDashboardObservation = $null
+    try {
+        $publication = Get-BridgeDashboardPublication
+        $script:BridgeDashboardObservation = $publication
+        $replyCardUrl = $publication.State.CardUrl
+        $selector = if ($onlineNames.Count -gt 1) { "input_select.$($script:BridgeMachineSelectorId)" } else { '' }
+        $signature = Get-BridgeDashboardInputSignature -Sessions $allDescriptors -Machines $machineCards `
+            -MachineSelector $selector -ReplyCardUrl $replyCardUrl
+        if (-not $publication.Verified -or $publication.InputSignature -cne $signature) {
+            Assert-BridgePublicationWriter -State $publication.State -Component render -Artifact (Get-BridgeRenderArtifact)
             [void](Set-CopilotMqttGlobalEntityId)
             $selector = Initialize-BridgeMachineSelector -Machines $onlineNames
-            # Discarded: this function returns whether the dashboard is current.
             Save-CopilotSessionDashboard -Sessions @($allDescriptors | Sort-Object -Property Node) `
                 -Machines $machineCards -MachineSelector $selector `
                 -ReplyCardUrl $replyCardUrl | Out-Null
-            $script:DaemonDashboardSignature = $signature
+            $publication = Get-BridgeDashboardPublication
+            $script:BridgeDashboardObservation = $publication
+            $signature = Get-BridgeDashboardInputSignature -Sessions $allDescriptors -Machines $machineCards `
+                -MachineSelector $selector -ReplyCardUrl $replyCardUrl
+            if (-not $publication.Verified -or $publication.InputSignature -cne $signature) {
+                throw 'The accepted shared dashboard does not match this reconciliation.'
+            }
             Write-DaemonLog -Message ("dashboard rebuilt for $($allDescriptors.Count) session(s) across " +
                 "$($machineCards.Count) machine(s), $($onlineNames.Count) online")
         }
-        catch {
-            Write-DaemonLog -Message "dashboard rebuild failed: $($_.Exception.Message)"
-        }
+        $script:DaemonDashboardSignature = $signature
+        try { [void](Clear-DaemonStaleMachineHelper -Machines $machineCards -Headers $Headers) }
+        catch { Write-DaemonLog -Message "stale switch sweep failed: $($_.Exception.Message)" }
+        return $true
     }
-    $signature -eq $script:DaemonDashboardSignature
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked']) { throw }
+        if (-not $_.Exception.Data['BridgePublicationRefused']) { $script:BridgeDashboardObservation = $null }
+        Write-DaemonLog -Message "dashboard publication not current: $($_.Exception.Message)"
+        return $false
+    }
 }
 
 function Complete-DaemonSessionRetirement {
@@ -1114,8 +1123,21 @@ function Complete-DaemonSessionRetirement {
         [Parameter(Mandatory)][hashtable]$Headers
     )
 
-    $retirePlan = Update-DaemonRetireQueue -Queued $script:DaemonPendingRetire -Gone $Gone `
-        -DashboardCurrent $DashboardCurrent
+    # A non-writer can observe a valid newer renderer with different inputs. Retire
+    # only nodes absent from that actual view, rather than waiting for its own save.
+    [void]$DashboardCurrent
+    $observation = Get-Variable -Name BridgeDashboardObservation -Scope Script -ErrorAction SilentlyContinue
+    $verified = $observation -and $observation.Value -and $observation.Value.Verified
+    $safe = @()
+    $held = @()
+    foreach ($queued in @($script:DaemonPendingRetire)) {
+        if (-not $queued) { continue }
+        $node = Get-CopilotMqttNodeId -SessionId $queued
+        if ($verified -and $observation.Value.ReferencedNodes -cnotcontains $node) { $safe += $queued }
+        else { $held += $queued }
+    }
+    $retirePlan = Update-DaemonRetireQueue -Queued $safe -Gone $Gone -DashboardCurrent ([bool]$verified)
+    $retirePlan.Queue = @(@($retirePlan.Queue) + $held | Select-Object -Unique)
     $script:DaemonPendingRetire = @($retirePlan.Queue)
     foreach ($known in @($retirePlan.Retire)) {
         try {

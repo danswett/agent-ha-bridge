@@ -32,6 +32,94 @@ function Test-That {
 
 $headers = @{ Authorization = 'Bearer test' }
 
+# Keep the real HTTP wrapper and its guard across common-helper reloads. Record
+# rejected calls too, because the stale-helper sweep catches transport failures.
+$script:DaemonHttpStates = @(
+    [pscustomobject]@{ entity_id = 'sensor.agent_bridge_fixture_sessions'; state = '0'
+        attributes = [pscustomobject]@{ machine = 'FIXTURE'; sessions = @() } }
+    [pscustomobject]@{ entity_id = 'light.fixture_unrelated'; state = 'off'; attributes = [pscustomobject]@{} }
+)
+$script:DaemonHttpRequests = [Collections.Generic.List[object]]::new()
+$script:DaemonHttpTemplateRefused = $false
+function Invoke-RestMethod {
+    param([string]$Method, [string]$Uri, [hashtable]$Headers, [object]$Body, [string]$ContentType, [int]$TimeoutSec)
+
+    $request = [pscustomobject]@{
+        Method = $Method; Uri = $Uri; HasHeaders = ($null -ne $Headers); TimeoutSeconds = $TimeoutSec; Unexpected = $true
+        BodyIsBytes = ($Body -is [byte[]]); ContentType = $ContentType; Data = $null
+    }
+    $script:DaemonHttpRequests.Add($request)
+    if ($args.Count -eq 0 -and $Method -eq 'Post' -and
+        $Uri -ceq 'http://publication.invalid:8123/api/template' -and $ContentType -ceq 'application/json' -and
+        $Body -is [string]) {
+        $payload = $Body | ConvertFrom-Json -AsHashtable
+        if ($payload -is [Collections.IDictionary] -and $payload.Count -eq 1 -and
+            $payload.Contains('template') -and $payload.template -is [string] -and
+            $payload.template -ceq $script:DaemonBridgeStatesTemplate) {
+            $request.Unexpected = $false
+            if ($script:DaemonHttpTemplateRefused) {
+                $response = [Net.Http.HttpResponseMessage]::new([Net.HttpStatusCode]::BadRequest)
+                throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('Synthetic template refusal', $response)
+            }
+            $filtered = @($script:DaemonHttpStates | Where-Object { $_.entity_id -cmatch '^[^.]+\.(agent_bridge_|mcp_)' })
+            return (ConvertTo-Json -InputObject $filtered -Depth 10 -Compress)
+        }
+    }
+    elseif ($args.Count -eq 0 -and $Method -eq 'Get' -and $Uri -ceq 'http://publication.invalid:8123/api/states' -and
+        -not $PSBoundParameters.ContainsKey('Body') -and -not $PSBoundParameters.ContainsKey('ContentType')) {
+        $request.Unexpected = $false
+        return ,$script:DaemonHttpStates
+    }
+    elseif ($args.Count -eq 0 -and $Method -eq 'Get' -and $Uri -cin @(
+        'http://publication.invalid:8123/api/states/select.agent_bridge_1111111100004000_decision'
+        'http://publication.invalid:8123/api/states/select.agent_bridge_1111111100004000_f1'
+        'http://publication.invalid:8123/api/states/button.agent_bridge_1111111100004000_submit'
+    ) -and -not $PSBoundParameters.ContainsKey('Body') -and -not $PSBoundParameters.ContainsKey('ContentType')) {
+        $request.Unexpected = $false
+        $response = [Net.Http.HttpResponseMessage]::new([Net.HttpStatusCode]::NotFound)
+        throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('Synthetic reporting entity not found', $response)
+    }
+    elseif ($args.Count -eq 0 -and $Method -eq 'Get' -and
+        -not [string]::IsNullOrWhiteSpace([string]$script:DaemonConfig.VerboseToggle) -and
+        $Uri -ceq "http://publication.invalid:8123/api/states/$($script:DaemonConfig.VerboseToggle)" -and
+        -not $PSBoundParameters.ContainsKey('Body') -and -not $PSBoundParameters.ContainsKey('ContentType')) {
+        $request.Unexpected = $false
+        return [pscustomobject]@{
+            entity_id = $script:DaemonConfig.VerboseToggle; state = 'off'; attributes = [pscustomobject]@{}
+        }
+    }
+    elseif ($args.Count -eq 0 -and $Method -eq 'Post' -and $Uri -cin @(
+        'http://publication.invalid:8123/api/services/select/select_option'
+        'http://publication.invalid:8123/api/services/text/set_value'
+    ) -and $ContentType -ceq 'application/json; charset=utf-8' -and $Body -is [byte[]]) {
+        $payload = [Text.UTF8Encoding]::new($false, $true).GetString($Body) | ConvertFrom-Json -AsHashtable
+        $request.Data = $payload
+        if ($payload -is [Collections.IDictionary] -and $payload.Count -eq 2 -and
+            $payload.Contains('entity_id') -and $payload.entity_id -is [string]) {
+            $valid = $false
+            if ($Uri -ceq 'http://publication.invalid:8123/api/services/select/select_option') {
+                $valid = $payload.Contains('option') -and $payload.option -is [string] -and $payload.option -ceq 'Idle' -and
+                    $payload.entity_id -cin @(
+                        'select.agent_bridge_1111111100004000_f1'
+                        'select.agent_bridge_1111111100004000_f2'
+                        'select.agent_bridge_1111111100004000_f3'
+                        'select.agent_bridge_1111111100004000_f4'
+                    )
+            }
+            else {
+                $valid = $payload.Contains('value') -and $payload.value -is [string] -and
+                    $payload.value -ceq $script:DaemonConfig.ReplyBlankValue -and
+                    $payload.entity_id -ceq 'text.agent_bridge_1111111100004000_reply'
+            }
+            if ($valid) {
+                $request.Unexpected = $false
+                return ,@()
+            }
+        }
+    }
+    throw "Unexpected synthetic daemon HTTP request: $Method $Uri"
+}
+
 Write-Host '--- what every machine is running ---'
 $local = @(
     [pscustomobject]@{ Node = 'agent_bridge_a'; Name = 'Claude: repo'; Machine = 'DESK'; Kind = 'claude' }
@@ -178,7 +266,6 @@ function Get-BridgeServedReplyCardUrl { '' }
 function Set-CopilotMqttGlobalEntityId { $true }
 function Clear-DaemonLaunchNoteOnRegistration { param($Headers) $script:NoteCleared = ($script:NoteCleared + 1) }
 function Initialize-BridgeMachineSelector { param($Machines) '' }
-function Save-CopilotSessionDashboard { param($Sessions, $Machines, $MachineSelector, $ReplyCardUrl) $script:DashboardSessions = @($Sessions); 'saved' }
 function Remove-CopilotMqttSession { param($SessionId, $Headers) $script:Retired += $SessionId }
 function Remove-CopilotDecisionMarker { param($SessionId) }
 function Update-DaemonSessionActivity { param($Id, $Entry, $Session, $Headers, $VerboseOn) $script:Streamed += $Id }
@@ -191,6 +278,21 @@ $script:DaemonDashboardSignature = $null
 $script:DaemonPendingRetire = @()
 $script:Streamed = @()
 $script:NoteCleared = 0
+. (Join-Path $PSScriptRoot 'test-dashboard.ps1') -PublicationFixturesOnly
+function Invoke-CopilotHaWebSocket {
+    param([hashtable[]]$Commands)
+    $responses = Invoke-TestPublicationCommands -Commands $Commands
+    foreach ($command in $Commands) {
+        if ($command.type -ne 'lovelace/config/save') { continue }
+        $script:DashboardSessions = @($command.config.views[0].cards |
+            Where-Object { $_.type -eq 'custom:agent-bridge-session-card' } | ForEach-Object {
+                [pscustomobject]@{ Node = ($_.status -replace '^sensor\.(.+)_status$', '$1'); Name = $_.cards[0].name }
+            })
+    }
+    Write-Output -NoEnumerate $responses
+}
+Initialize-TestPublicationStore
+Initialize-TestPublicationAuthority -ServeCard
 
 # Real ids are UUIDs, and the log lines take their first eight characters.
 $script:Ids = @{ s1 = '11111111-0000-4000-8000-000000000001'; s2 = '22222222-0000-4000-8000-000000000002'; s3 = '33333333-0000-4000-8000-000000000003'
@@ -269,6 +371,320 @@ $script:FakeLaunchers = @('copilot')
 Test-That 'and a machine without Agency never gets one' { -not (Get-DaemonLaunchCapabilities).profile }
 
 Remove-Item -LiteralPath $script:DaemonConfig.LogFile -Force -ErrorAction SilentlyContinue
+Write-Host '--- real publication, external deletion and retirement ---'
+. (Join-Path $PSScriptRoot 'test-dashboard.ps1') -PublicationFixturesOnly
+. (Join-Path $PSScriptRoot '..\hooks\decision-bridge-common.ps1')
+. (Join-Path $PSScriptRoot '..\hooks\decision-ha-websocket.ps1')
+$env:BRIDGE_FRONTEND_NORUN = '1'
+. (Join-Path $PSScriptRoot '..\hooks\bridge-frontend-cards.ps1')
+Remove-Item Env:\BRIDGE_FRONTEND_NORUN
+function Invoke-CopilotHaWebSocket {
+    param([hashtable[]]$Commands)
+    Invoke-TestPublicationCommands -Commands $Commands
+}
+function Set-CopilotMqttGlobalEntityId { $true }
+function Initialize-BridgeMachineSelector { param($Machines) '' }
+Initialize-TestPublicationStore
+$publicationCard = New-TestPublicationCard '2.0.0'
+$publicationUrl = Get-BridgeInlineReplyCardUrl -SourcePath $publicationCard -Version '2.0.0'
+Set-TestPublicationPolicy -Policy (New-TestPublicationPolicy $publicationCard) -CardUrl $publicationUrl
+$script:BridgeReplyCardUrlCache = ''
+$script:BridgeReplyCardUrlCachedAt = [datetime]::MinValue
+$script:DaemonDashboardSignature = $null
+$publicationDescriptors = @([pscustomobject]@{
+    Node = 'agent_bridge_active'; Name = 'Synthetic active session'; Machine = $script:DaemonMachineName; Kind = 'copilot'
+})
+$publicationCapabilities = @{ profile = $false; resume = $false; agent = $false }
+$firstPublication = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+Test-That 'the real save persists a dashboard before it becomes current' {
+    $firstPublication -and (Get-TestPublicationStore).configs.Contains('agent-decisions')
+} ($script:Log[-1])
+$boundaryReceiptPath = Get-BridgePublicationReceiptPath
+$boundaryReceiptBytes = [IO.File]::ReadAllBytes($boundaryReceiptPath)
+$boundarySignature = $script:DaemonDashboardSignature
+try {
+    [IO.File]::WriteAllText($boundaryReceiptPath, '{"protocol":', [Text.UTF8Encoding]::new($false))
+    $script:TestPublication.Commands.Clear()
+    Test-That 'reconciliation propagates a marked receipt error without publication or signature advance' {
+        try {
+            Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers | Out-Null
+            $false
+        }
+        catch {
+            $_.Exception.Data['BridgeTestWriteBlocked'] -eq $true -and
+                @(Get-TestPublicationWrites).Count -eq 0 -and
+                $script:DaemonDashboardSignature -ceq $boundarySignature
+        }
+    }
+}
+finally { [IO.File]::WriteAllBytes($boundaryReceiptPath, $boundaryReceiptBytes) }
+$unchangedSignature = $script:DaemonDashboardSignature
+$deletedStore = Get-TestPublicationStore
+$deletedStore.dashboards = @()
+$deletedStore.configs.Clear()
+Set-TestPublicationStore $deletedStore
+$script:TestPublication.Commands.Clear()
+$afterDeletion = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+Test-That 'external dashboard deletion is repaired despite an unchanged local signature' {
+    $afterDeletion -and (Get-TestPublicationStore).configs.Contains('agent-decisions') -and
+        @($script:TestPublication.Commands | Where-Object { $_.type -eq 'lovelace/config/save' }).Count -eq 1 -and
+        $script:DaemonDashboardSignature -ceq $unchangedSignature
+}
+
+# Establish an actual saved view again even on the unfixed baseline.
+$script:BridgeDashboardReady = $false
+$script:DaemonDashboardSignature = $null
+[void](Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers)
+$overwrittenStore = Get-TestPublicationStore
+$overwrittenStore.configs['agent-decisions'] = @{ title = 'External overwrite'; views = @(@{ cards = @(@{ type = 'entity'; entity = 'sensor.agent_bridge_old_status' }) }) }
+Set-TestPublicationStore $overwrittenStore
+$script:TestPublication.Commands.Clear()
+$afterOverwrite = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+Test-That 'external replacement is repaired rather than accepted from the cached signature' {
+    $afterOverwrite -and (Get-TestPublicationStore).configs['agent-decisions'].title -eq 'Agent Sessions' -and
+        @($script:TestPublication.Commands | Where-Object { $_.type -eq 'lovelace/config/save' }).Count -eq 1
+}
+
+$script:TestPublication.Reject['lovelace/config'] = '{"code":"unauthorized","message":"Denied"}'
+$script:TestPublication.Commands.Clear()
+$unreadable = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+$unreadablePlan = Update-DaemonRetireQueue -Queued @('old-session') -Gone @() -DashboardCurrent $unreadable
+Test-That 'a forbidden dashboard read cannot be called current from a remembered signature' { -not $unreadable }
+Test-That 'unreadable published state does not authorize queued entity retirement' {
+    @($unreadablePlan.Retire).Count -eq 0 -and @($unreadablePlan.Queue).Count -eq 1
+}
+Test-That 'an unreadable view is not overwritten as though it were missing' { @(Get-TestPublicationWrites).Count -eq 0 }
+
+$script:TestPublication.Reject.Clear()
+Set-TestPublicationIdentity -Participant 'observer-b'
+$script:TestPublication.Commands.Clear()
+$observedCurrent = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+Test-That 'a non-writer is current only by observing the actual accepted publication' {
+    $observedCurrent -and @(Get-TestPublicationWrites).Count -eq 0
+}
+
+Set-TestPublicationIdentity
+$retiringId = $script:Ids.s2
+$retiringNode = Get-CopilotMqttNodeId -SessionId $retiringId
+$mentionsOldNode = @([pscustomobject]@{
+    Node = 'agent_bridge_active'; Name = "Display text mentions $retiringNode"; Machine = $script:DaemonMachineName; Kind = 'copilot'
+})
+[void](Sync-DaemonDashboard -Descriptors $mentionsOldNode -Capabilities $publicationCapabilities -Headers $headers)
+Set-TestPublicationIdentity -Participant 'observer-b'
+$script:TestPublication.Commands.Clear()
+$script:DaemonPendingRetire = @($retiringId)
+$script:Retired = @()
+$differentInputs = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+Complete-DaemonSessionRetirement -Gone @() -DashboardCurrent $differentInputs -Headers $headers
+Test-That 'a skipped non-writer save does not claim its differing inputs were published' {
+    -not $differentInputs -and @(Get-TestPublicationWrites).Count -eq 0
+}
+Test-That 'a verified peer view can retire an absent node without waiting for a non-writer save' {
+    $script:Retired -contains $retiringId -and @($script:DaemonPendingRetire).Count -eq 0
+}
+Test-That 'mentioning an old node in display text does not strand its entities forever' {
+    (Get-TestPublicationStore).configs['agent-decisions'].agent_bridge_publication.renderedNodes -notcontains $retiringNode -and
+        $script:Retired -contains $retiringId
+}
+
+Set-TestPublicationIdentity
+$stillReferenced = @([pscustomobject]@{
+    Node = $retiringNode; Name = 'Still rendered'; Machine = $script:DaemonMachineName; Kind = 'copilot'
+})
+[void](Sync-DaemonDashboard -Descriptors $stillReferenced -Capabilities $publicationCapabilities -Headers $headers)
+Set-TestPublicationIdentity -Participant 'observer-b'
+$script:Retired = @()
+$script:DaemonPendingRetire = @($retiringId)
+$notYetRemoved = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+Complete-DaemonSessionRetirement -Gone @() -DashboardCurrent $notYetRemoved -Headers $headers
+Test-That 'a non-writer retains entities that the actual accepted view still renders' {
+    -not $notYetRemoved -and $script:Retired.Count -eq 0 -and $script:DaemonPendingRetire -contains $retiringId
+}
+
+Set-TestPublicationIdentity
+$lastSignature = $script:DaemonDashboardSignature
+$script:TestPublication.Reject['lovelace/config/save'] = '{"code":"unknown_error","message":"Save rejected"}'
+$failedSave = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+$script:Retired = @()
+Complete-DaemonSessionRetirement -Gone @() -DashboardCurrent $failedSave -Headers $headers
+Test-That 'the actual void-or-throw save failure neither advances currentness nor retires entities' {
+    -not $failedSave -and $script:DaemonDashboardSignature -ceq $lastSignature -and $script:Retired.Count -eq 0
+}
+
+Write-Host '--- actual card pins also fence observer currentness and retirement ---'
+Initialize-TestPublicationStore
+$unpinnedSource = New-TestPublicationCard '1.21.0'
+$exactPinSource = New-TestPublicationCard '1.20.0'
+$sameVersionWrongSource = New-TestPublicationCard '1.20.0' 'export const wrongPinnedBody = true;'
+Initialize-TestPublicationAuthority -CardSource $unpinnedSource
+[void](Install-BridgeReplyCard -SourcePath $unpinnedSource)
+[void](Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers)
+$beforeCardPin = (Read-BridgePublicationState).Policy
+Set-TestPublicationIdentity -Generation 2
+Set-BridgePublicationPolicy -ExpectedGeneration 1 `
+    -ExpectedPolicyHash (Get-BridgePublicationHash (ConvertTo-BridgePublicationJson $beforeCardPin)) `
+    -Target (Get-BridgePublicationTarget -CardSourcePath $exactPinSource) -Mode pin | Out-Null
+[void](Install-BridgeReplyCard -SourcePath $exactPinSource)
+[void](Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers)
+$pinMachines = @(Get-DaemonMachineCards -Capabilities $publicationCapabilities -Peers @() `
+    -LocalSessionNodes @($publicationDescriptors | ForEach-Object { [string]$_.Node }))
+foreach ($mismatchingSource in @($unpinnedSource, $sameVersionWrongSource)) {
+    $mismatchingVersion = Get-BridgeReplyCardFileVersion -SourcePath $mismatchingSource
+    $mismatchingUrl = Get-BridgeInlineReplyCardUrl -SourcePath $mismatchingSource -Version $mismatchingVersion
+    $matchingSignature = Get-BridgeDashboardInputSignature -Sessions $publicationDescriptors -Machines $pinMachines `
+        -MachineSelector '' -ReplyCardUrl $mismatchingUrl
+    Set-TestPublicationReceiptForCard -CardUrl $mismatchingUrl -InputSignature $matchingSignature
+    $script:DaemonDashboardSignature = $matchingSignature
+    Set-TestPublicationIdentity -Participant 'observer-b' -Generation 2
+    $script:Retired = @()
+    $script:DaemonPendingRetire = @($retiringId)
+    $script:TestPublication.Commands.Clear()
+    $pinMismatchCurrent = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+    Complete-DaemonSessionRetirement -Gone @() -DashboardCurrent $pinMismatchCurrent -Headers $headers
+    Test-That "an observer refuses a self-consistent out-of-pin $mismatchingVersion view despite matching signatures" {
+        -not $pinMismatchCurrent -and @(Get-TestPublicationWrites).Count -eq 0
+    }
+    Test-That "out-of-pin $mismatchingVersion currentness does not authorize actual queued retirement" {
+        $script:Retired.Count -eq 0 -and $script:DaemonPendingRetire -contains $retiringId
+    }
+    Test-That "out-of-pin $mismatchingVersion reconciliation retains the repair-required reason" {
+        $script:Log[-1] -match 'pin.*repair|repair.*pin'
+    }
+    Set-TestPublicationIdentity -Generation 2
+    [void](Install-BridgeReplyCard -SourcePath $exactPinSource)
+    $restoredPin = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+    Set-TestPublicationIdentity -Participant 'observer-b' -Generation 2
+    $script:Retired = @()
+    $script:DaemonPendingRetire = @($retiringId)
+    $script:TestPublication.Commands.Clear()
+    $observedPin = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+    Complete-DaemonSessionRetirement -Gone @() -DashboardCurrent $observedPin -Headers $headers
+    Test-That "restoring the exact pin permits observer currentness and safe retirement after $mismatchingVersion interference" {
+        $restoredPin -and $observedPin -and $script:Retired -contains $retiringId -and @(Get-TestPublicationWrites).Count -eq 0
+    }
+}
+
+Write-Host '--- migration refusal leaves actual session and machine reporting available ---'
+Initialize-TestPublicationStore -Unconfigured
+$reportSource = New-TestPublicationCard '2.0.0'
+Invoke-TestPreFencePublication -CardSource $reportSource
+$legacyReportingView = (Get-TestPublicationStore).configs['agent-decisions'] | ConvertTo-Json -Depth 100 -Compress
+$script:TestPublication.Commands.Clear()
+. (Join-Path $PSScriptRoot '..\hooks\decision-mqtt.ps1')
+$script:ReportingMessages = [Collections.Generic.List[object]]::new()
+function Publish-CopilotMqttMessage {
+    param($Topic, $Payload, $Headers, [switch]$Retain)
+    $script:ReportingMessages.Add([pscustomobject]@{ Topic = $Topic; Payload = $Payload })
+}
+function Get-DaemonLaunchCapabilities {
+    @{ newSession = $true; profile = $false; resume = $false; agent = $true; tuning = $false; detailed = $false; dev = $false }
+}
+$script:DaemonGlobalSignature = $null
+$script:DaemonGlobalLastPublish = [DateTimeOffset]::MinValue
+$script:DaemonOnlineLastPublish = [DateTimeOffset]::MinValue
+$script:DaemonPendingRetire = @()
+$reportSession = New-Session 's1'
+$reportSession.Transcript = Join-Path (Split-Path $script:TestPublication.Path -Parent) 'reporting.jsonl'
+[IO.File]::WriteAllText($reportSession.Transcript, '')
+$reportState = @{}
+Sync-DaemonSessions -Headers $headers -State $reportState -Live @{ $reportSession.SessionId = $reportSession }
+$reportTopics = Get-CopilotMqttTopics -SessionId $reportSession.SessionId
+$machineRoot = Get-CopilotMqttMachineTopicRoot -Slug $script:DaemonMachineSlug
+Test-That 'the actual reconcile and MQTT publisher still publish per-session status during migration' {
+    $reportState.ContainsKey($reportSession.SessionId) -and
+        @($script:ReportingMessages | Where-Object { $_.Topic -ceq $reportTopics.StatusState }).Count -gt 0
+} (($script:Log | Select-Object -Last 6) -join ' | ')
+Test-That 'the actual reconcile and MQTT publisher still report machine sessions during migration' {
+    @($script:ReportingMessages | Where-Object { $_.Topic -ceq "$machineRoot/global/state" -and $_.Payload -eq '1' }).Count -eq 1
+} (($script:Log | Select-Object -Last 6) -join ' | ')
+Test-That 'reporting does not silently migrate or overwrite the legacy shared view' {
+    @(Get-TestPublicationWrites).Count -eq 0 -and
+        ((Get-TestPublicationStore).configs['agent-decisions'] | ConvertTo-Json -Depth 100 -Compress) -ceq $legacyReportingView -and
+        @($script:Log | Where-Object { $_ -match 'migration required' }).Count -gt 0
+}
+
+Write-Host '--- synthetic state-read transport contracts ---'
+Test-That 'reconciliation reads through the exact synthetic template endpoint' {
+    @($script:DaemonHttpRequests | Where-Object {
+        -not $_.Unexpected -and $_.Method -eq 'Post' -and $_.Uri -ceq 'http://publication.invalid:8123/api/template'
+    }).Count -gt 0
+}
+$script:DaemonStatesTemplateRefused = $false
+$filteredStates = Get-DaemonHomeAssistantStates -Headers $headers -Fresh
+Test-That 'the real state reader parses the template text as a filtered state array' {
+    $filteredStates.Count -eq 1 -and $filteredStates[0].entity_id -ceq 'sensor.agent_bridge_fixture_sessions' -and
+        $filteredStates[0].state -ceq '0' -and $filteredStates[0].attributes.machine -ceq 'FIXTURE' -and
+        @($filteredStates[0].attributes.sessions).Count -eq 0 -and $script:DaemonHttpRequests[-1].Method -eq 'Post'
+}
+$savedHttpStates = $script:DaemonHttpStates
+$script:DaemonHttpStates = @()
+$beforeEmptyRead = $script:DaemonHttpRequests.Count
+$emptyStates = Get-DaemonHomeAssistantStates -Headers $headers -Fresh
+Test-That 'an empty filtered response stays an empty array without a fallback request' {
+    $emptyStates.Count -eq 0 -and $script:DaemonHttpRequests.Count -eq ($beforeEmptyRead + 1) -and
+        $script:DaemonHttpRequests[-1].Method -eq 'Post'
+}
+$script:DaemonHttpStates = $savedHttpStates
+$script:DaemonHttpTemplateRefused = $true
+$beforeFallbackRead = $script:DaemonHttpRequests.Count
+$fallbackStates = Get-DaemonHomeAssistantStates -Headers $headers -Fresh
+Test-That 'a synthetic template refusal makes the real reader request the full state array' {
+    $fallbackStates.Count -eq 2 -and $fallbackStates[0].entity_id -ceq 'sensor.agent_bridge_fixture_sessions' -and
+        $fallbackStates[1].entity_id -ceq 'light.fixture_unrelated' -and
+        $script:DaemonHttpRequests.Count -eq ($beforeFallbackRead + 2) -and
+        $script:DaemonHttpRequests[-2].Method -eq 'Post' -and $script:DaemonHttpRequests[-1].Method -eq 'Get' -and
+        $script:DaemonStatesTemplateRefused
+}
+$script:DaemonHttpTemplateRefused = $false
+$script:DaemonStatesTemplateRefused = $false
+Test-That 'unexpected HTTP routes remain observable even when a best-effort caller catches the error' {
+    @($script:DaemonHttpRequests | Where-Object Unexpected).Count -eq 0
+} (($script:DaemonHttpRequests | Where-Object Unexpected | ForEach-Object { "$($_.Method) $($_.Uri)" }) -join ' | ')
+Test-That 'the reporting node uses exactly its three synthetic missing-entity routes' {
+    $reportingNode = Get-CopilotMqttNodeId -SessionId $script:Ids.s1
+    $expected = @(
+        "http://publication.invalid:8123/api/states/select.${reportingNode}_decision"
+        "http://publication.invalid:8123/api/states/select.${reportingNode}_f1"
+        "http://publication.invalid:8123/api/states/button.${reportingNode}_submit"
+    )
+    $seen = @($script:DaemonHttpRequests | Where-Object {
+        -not $_.Unexpected -and $_.Method -eq 'Get' -and $_.Uri -cin $expected
+    } | ForEach-Object Uri)
+    $seen.Count -eq 3 -and (($seen | Sort-Object) -join ',') -ceq (($expected | Sort-Object) -join ',')
+}
+Test-That 'the real detail check reads only the derived fixture toggle and observes off' {
+    $toggleReads = @($script:DaemonHttpRequests | Where-Object {
+        -not $_.Unexpected -and $_.Method -eq 'Get' -and
+            $_.Uri -ceq "http://publication.invalid:8123/api/states/$($script:DaemonConfig.VerboseToggle)"
+    })
+    $toggleReads.Count -eq 1 -and $script:DaemonVerbose -eq $false
+}
+Test-That 'the actual field initializer sends exactly four byte-JSON Idle service actions' {
+    $actions = @($script:DaemonHttpRequests | Where-Object {
+        $_.Method -eq 'Post' -and $_.Uri -ceq 'http://publication.invalid:8123/api/services/select/select_option'
+    })
+    $reportingNode = Get-CopilotMqttNodeId -SessionId $script:Ids.s1
+    $expected = @(1..4 | ForEach-Object { Get-CopilotMqttFieldEntityId -Node $reportingNode -Index $_ })
+    $targets = @($actions | ForEach-Object { $_.Data.entity_id })
+    $actions.Count -eq 4 -and (($targets | Sort-Object) -join ',') -ceq (($expected | Sort-Object) -join ',') -and
+        @($actions | Where-Object {
+            -not $_.Unexpected -and $_.BodyIsBytes -and $_.ContentType -ceq 'application/json; charset=utf-8' -and
+                $_.Data.Count -eq 2 -and $_.Data.Contains('entity_id') -and $_.Data.Contains('option') -and
+                $_.Data.option -is [string] -and $_.Data.option -ceq 'Idle'
+        }).Count -eq 4
+}
+Test-That 'the actual reply initializer sends one exact blank byte-JSON service action' {
+    $actions = @($script:DaemonHttpRequests | Where-Object {
+        $_.Method -eq 'Post' -and $_.Uri -ceq 'http://publication.invalid:8123/api/services/text/set_value'
+    })
+    $reportingNode = Get-CopilotMqttNodeId -SessionId $script:Ids.s1
+    $actions.Count -eq 1 -and -not $actions[0].Unexpected -and $actions[0].BodyIsBytes -and
+        $actions[0].ContentType -ceq 'application/json; charset=utf-8' -and $actions[0].Data.Count -eq 2 -and
+        $actions[0].Data.Contains('entity_id') -and $actions[0].Data.Contains('value') -and
+        $actions[0].Data.entity_id -ceq "text.${reportingNode}_reply" -and
+        $actions[0].Data.value -is [string] -and $actions[0].Data.value -ceq $script:DaemonConfig.ReplyBlankValue
+}
+
 Write-Host ''
 if ($script:Failures) {
     Write-Host "$($script:Failures) check(s) failed" -ForegroundColor Red

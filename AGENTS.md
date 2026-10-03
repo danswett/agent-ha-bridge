@@ -173,7 +173,59 @@ When adding a feature that needs a new or changed custom card:
    looks like it worked while the rows never appear.
 3. Cover both sides: the new shape at the new version, the old shape below it.
 
-This is what keeps a fleet on mixed versions working.
+This preserves supported card-version fallbacks. It is not, by itself, a barrier
+against another machine overwriting shared resources.
+
+### Publication authority, versions and rollback
+
+The writer is explicitly configured in `dashboard.publication`; never derive it from
+hostnames, root-derived installation IDs, matching bundles, presence or clocks.
+Bootstrap/migration is a one-shot operator action, not installer/daemon self-election.
+Keep first install, existing unfenced artifacts, established authority and failed or
+lost state distinct. Only the designated writer bootstraps; other machines continue
+reporting and can observe accepted shared output without acquiring write authority.
+
+Keep the version axes separate:
+
+| Axis | Contributor contract |
+|---|---|
+| Bridge `VERSION` | Release identity, not card/render compatibility or publication authority |
+| Card `CARD_VERSION` and bytes hash | Bump for changed card content; never relabel an old file with a publication argument |
+| `$script:BridgeDashboardRenderVersion` and renderer fingerprint | Bump when changing the generating helpers fingerprinted by `Get-BridgeRenderArtifact`; equal-version/different-content artifacts are conflicts |
+| Publication fencing protocol | Change deliberately when policy/receipt interpretation changes; unsupported formats must refuse rather than reset or guess |
+| Operator generation | Explicit expected generation/content and exactly the next configured generation for policy changes; no timestamp election |
+
+Guard actual publication entry points, including manual/installer callers, not only
+the daemon. The reserved card/policy resources must not bypass those guards through
+the generic third-party registrar. Use HA-supported resource fields; policy is in the
+resource URL, not arbitrary wire metadata accepted only by a permissive fixture.
+
+An exact rollback pin is a version **and content** contract for both artifacts.
+Renderer publication and read-only verification must independently check the actual
+pinned card. A matching receipt/URL hash alone is insufficient: do not bless a legacy
+overwrite, an unapplied pin or same-version wrong content as current. Missing or
+unverifiable pinned content stays repair-required; legitimate advance-mode fallback
+and non-writer observation must remain supported. A new automatic publisher cannot
+leave a pin without another explicit operator generation.
+
+Currentness comes from the actual accepted view on every reconcile, not a remembered
+local signature or a skipped save. Keep the receipt's input signature, resource,
+content and rendered session-node set bound together. Retirement can proceed only
+when verified shared output no longer renders that node, including for non-writers;
+display text mentioning an ID is not a rendered entity reference. If a generator
+adds new session-entity surfaces, preserve that rendered-node invariant and its tests.
+
+Preserve the independent shared policy and protected local high-water receipts when
+repairing a missing dashboard. Unreadable, corrupt or lost policy is not absence.
+The local receipt mutex and check-then-write HA calls are **not a distributed lease**.
+See the README's operator procedures for explicit bootstrap, pins and policy recovery.
+
+Exercise real publishers, readers and reconciliation/retirement callers against
+stateful, schema-faithful HA boundaries and real isolated config/files. Keep
+red/green cases for upgrades, exact pins, same-version conflicts, deletion, denied
+reads, lost policy, restart, non-writers and clock skew; a false/throwing replacement
+for the helper under test does not prove its failure path. The pinned unmodified
+pre-fence publisher fixture demonstrates an accepted limitation, not containment.
 
 ## Releases
 
@@ -192,19 +244,26 @@ build and silently keeps its old hooks.
 
 ## One dashboard, several machines
 
-Every machine renders the *whole* picture from retained per-machine sensors, and every
-machine rebuilds the same shared Lovelace dashboard. Two consequences worth knowing
-before debugging something that "keeps reverting":
+Every machine can read the whole picture from retained per-machine sensors, but only
+the configured writer publishes the shared card and Lovelace dashboard. Observers
+verify actual accepted output; they do not take over when the writer is unavailable.
 
-- A machine running an older bridge will rewrite the dashboard in its own older shape.
-  A layout change is not fully live until every online machine has the release.
-- A daemon only rebuilds when its signature changes, so after installing from source
-  run `agent-ha-bridge restart` - an installer that does not restart the daemon leaves
-  the old generator in memory.
+Unmodified pre-fence writers still ignore the policy and can overwrite the same HA
+paths, even when their card version matches. Installing the guards on one host does
+not contain them; repair after an overwrite is not prevention. First introduction
+therefore needs an operator-approved migration and offline-host rejoin plan before
+release/cutover, not an assumed transparent per-machine rollout.
+
+Reconciliation checks shared state even when the local signature is unchanged.
+After approved source/configuration changes, restart the selected daemon so it uses
+the intended renderer and configuration; a healthy old process is not proof that new
+publication code or authority is active.
 
 Peers can be updated from Home Assistant without a shell on them: press that machine's
 `button.agent_bridge_<slug>_install_update`. The press forces a fresh release check, so
-it works even when the machine's own cached check still reads as up to date.
+it works even when the machine's own cached check still reads as up to date. This is
+not a fleet migration, publication bootstrap, rollback authorization or permission
+to bypass the release owner's coordinated cutover.
 
 ## Driving the bridge as an agent
 
