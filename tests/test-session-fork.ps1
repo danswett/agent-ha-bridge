@@ -59,15 +59,21 @@ try {
     Set-Content -Path (Join-Path $dir 'huge-working-file.bin') -Value ('x' * 5000)
     # The session's own persistent content, which a transfer has to bring: a checkpoint
     # summary and an artifact, each naming the session so the id rewrite is exercised
-    # below the top level too.
-    New-Item -ItemType Directory -Path (Join-Path $dir 'checkpoints') -Force | Out-Null
-    Set-Content -Path (Join-Path $dir 'checkpoints\001-first.md') -Value "# checkpoint for $oldId`n$marker"
-    New-Item -ItemType Directory -Path (Join-Path $dir 'files\nested') -Force | Out-Null
-    Set-Content -Path (Join-Path $dir 'files\notes.md') -Value "artifact of $oldId"
-    Set-Content -Path (Join-Path $dir 'files\nested\notes.md') -Value 'same leaf, different folder'
+    # below the top level too. Built with nested Join-Path rather than 'files\nested',
+    # because a backslash is an ordinary filename character on macOS - the literal form
+    # makes one oddly named file instead of the subdirectory the collector looks for.
+    $checkpointDir = Join-Path $dir 'checkpoints'
+    New-Item -ItemType Directory -Path $checkpointDir -Force | Out-Null
+    Set-Content -Path (Join-Path $checkpointDir '001-first.md') -Value "# checkpoint for $oldId`n$marker"
+    $filesDir = Join-Path $dir 'files'
+    $nestedDir = Join-Path $filesDir 'nested'
+    New-Item -ItemType Directory -Path $nestedDir -Force | Out-Null
+    Set-Content -Path (Join-Path $filesDir 'notes.md') -Value "artifact of $oldId"
+    Set-Content -Path (Join-Path $nestedDir 'notes.md') -Value 'same leaf, different folder'
     # Undo state for files on this machine's disks; meaningless once the session moves.
-    New-Item -ItemType Directory -Path (Join-Path $dir 'rewind-file-snapshots') -Force | Out-Null
-    Set-Content -Path (Join-Path $dir 'rewind-file-snapshots\snap.bin') -Value ('y' * 4000)
+    $rewindDir = Join-Path $dir 'rewind-file-snapshots'
+    New-Item -ItemType Directory -Path $rewindDir -Force | Out-Null
+    Set-Content -Path (Join-Path $rewindDir 'snap.bin') -Value ('y' * 4000)
 
     $srcClaude = Join-Path $root 'src-claude'
     $cdir = Join-Path $srcClaude 'projects\-Users-someone-else-repo'
@@ -89,8 +95,10 @@ try {
     $env:COPILOT_HOME = $srcCopilot
     $spec = Get-BridgeSessionBundleSpec -SessionId $oldId -Launcher 'copilot'
     Test-That 'a Copilot session is its transcript, workspace record and own content' {
-        @($spec.Files | ForEach-Object { [IO.Path]::GetRelativePath($spec.Root, $_) } | Sort-Object) -join ',' -eq
-            'checkpoints\001-first.md,events.jsonl,files\nested\notes.md,files\notes.md,workspace.yaml'
+        # Separators normalised: GetRelativePath returns the platform's, and this suite
+        # runs on both.
+        @($spec.Files | ForEach-Object { [IO.Path]::GetRelativePath($spec.Root, $_) -replace '\\', '/' } | Sort-Object) -join ',' -eq
+            'checkpoints/001-first.md,events.jsonl,files/nested/notes.md,files/notes.md,workspace.yaml'
     }
     Test-That 'and not its working files, which can run to hundreds of megabytes' {
         @($spec.Files | Where-Object { $_ -like '*huge-working-file*' }).Count -eq 0
@@ -201,16 +209,16 @@ try {
         @(Get-Content (Join-Path $newDir 'workspace.yaml')) -contains 'cwd: C:\here\now'
     }
     Test-That 'the checkpoints and artifacts came too, in the folders they were in' {
-        (Test-Path (Join-Path $newDir 'checkpoints\001-first.md')) -and
-        (Test-Path (Join-Path $newDir 'files\notes.md')) -and
-        (Test-Path (Join-Path $newDir 'files\nested\notes.md'))
+        (Test-Path (Join-Path (Join-Path $newDir 'checkpoints') '001-first.md')) -and
+        (Test-Path (Join-Path (Join-Path $newDir 'files') 'notes.md')) -and
+        (Test-Path (Join-Path (Join-Path (Join-Path $newDir 'files') 'nested') 'notes.md'))
     }
     Test-That 'two artifacts sharing a leaf name stayed distinct rather than colliding' {
-        (Get-Content (Join-Path $newDir 'files\notes.md') -Raw).Contains('artifact of') -and
-        (Get-Content (Join-Path $newDir 'files\nested\notes.md') -Raw).Contains('same leaf, different folder')
+        (Get-Content (Join-Path (Join-Path $newDir 'files') 'notes.md') -Raw).Contains('artifact of') -and
+        (Get-Content (Join-Path (Join-Path (Join-Path $newDir 'files') 'nested') 'notes.md') -Raw).Contains('same leaf, different folder')
     }
     Test-That 'the id was rewritten below the top level as well' {
-        $cp = Get-Content (Join-Path $newDir 'checkpoints\001-first.md') -Raw
+        $cp = Get-Content (Join-Path (Join-Path $newDir 'checkpoints') '001-first.md') -Raw
         $cp.Contains($newId) -and -not $cp.Contains($oldId)
     }
     Test-That 'the rewind snapshots did not travel' {
