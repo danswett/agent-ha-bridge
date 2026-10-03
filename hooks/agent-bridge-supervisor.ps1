@@ -64,7 +64,25 @@ try {
             $start = [Diagnostics.ProcessStartInfo]::new((Get-BridgePwshPath))
             $start.UseShellExecute = $false
             foreach ($argument in @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $daemon)) { $start.ArgumentList.Add($argument) }
-            if ($script:BridgeIsWindows) { $start.WindowStyle = [Diagnostics.ProcessWindowStyle]::Hidden }
+            # CreateNoWindow, not merely a hidden window. WindowStyle is ignored when
+            # UseShellExecute is false, so without this the daemon gets a console - either
+            # a new one or, when a hook starts it, whatever short-lived process was running
+            # at the time. That console is tied to the interactive session, and when the
+            # session is disconnected or its owner exits the daemon keeps running with a
+            # handle that no longer resolves.
+            #
+            # Nothing announces that. The daemon goes on logging and publishing, and the
+            # only symptom is that anything reaching PowerShell's console plumbing throws
+            # 'The Win32 internal error "The handle is invalid." 0x6 occurred while getting
+            # the console mode'. The first thing to hit it in practice was launching into
+            # an `isolate` workspace: New-BridgeSessionWorktree's catch turned it into
+            # "Launch refused: requested isolation failed", which says nothing about a
+            # console and sends you looking at git. Observed on two machines, one of them
+            # running a release with no local changes at all, and cleared on both by
+            # restarting the daemon - which is what made a stale console the explanation.
+            #
+            # A daemon has no business owning a console, so it is given none.
+            if ($script:BridgeIsWindows) { $start.CreateNoWindow = $true }
             $process = [Diagnostics.Process]::Start($start)
             try { $process.WaitForExit() } finally { $process.Dispose() }
         }
