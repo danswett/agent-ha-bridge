@@ -480,6 +480,134 @@ Test-That 'a local resume still resolves' {
 }
 Test-That 'and fetches nothing from anywhere' { $script:Transfers -eq 0 }
 
+Write-Host '--- the remote half of the list is bounded by this machine, not by its peers ---'
+# Everything bounding the producing side - resumeCount, shareResumableMaxBytes - is a
+# setting on a different machine. Without a bound here, a peer decides how large this
+# machine's retained new_resume payload is, and that payload is the shape of message
+# that took this fleet's MQTT down.
+$flood = [pscustomobject]@{
+    IsSelf = $false; Online = $true; Machine = 'LOUD'; Slug = 'loud'
+    Capabilities = [pscustomobject]@{ resumeShare = $true }
+    Resumable = @(1..500 | ForEach-Object {
+        [pscustomobject]@{ id = "ffff0000-0000-0000-0000-$('{0:D12}' -f $_)"; launcher = 'copilot'; updated = '2026-01-01T00:00:00+00:00' }
+    })
+}
+$flooded = @(Get-DaemonRemoteResumable -Peers @($flood))
+Test-That 'one peer cannot contribute an unbounded number of entries' { $flooded.Count -le 25 }
+
+$many = @(1..12 | ForEach-Object {
+    [pscustomobject]@{
+        IsSelf = $false; Online = $true; Machine = "M$_"; Slug = "m$_"
+        Capabilities = [pscustomobject]@{ resumeShare = $true }
+        Resumable = @(1..40 | ForEach-Object {
+            [pscustomobject]@{ id = [guid]::NewGuid().ToString(); launcher = 'copilot'; updated = '2026-01-01T00:00:00+00:00' }
+        })
+    }
+})
+$all = @(Get-DaemonRemoteResumable -Peers $many)
+Test-That 'and the whole fleet together is bounded too' { $all.Count -le 100 }
+Test-That 'while an ordinary peer is still listed in full' {
+    $ordinary = [pscustomobject]@{
+        IsSelf = $false; Online = $true; Machine = 'CALM'; Slug = 'calm'
+        Capabilities = [pscustomobject]@{ resumeShare = $true }
+        Resumable = @(1..3 | ForEach-Object { [pscustomobject]@{ id = [guid]::NewGuid().ToString(); launcher = 'copilot'; updated = '2026-01-01T00:00:00+00:00' } })
+    }
+    @(Get-DaemonRemoteResumable -Peers @($ordinary)).Count -eq 3
+}
+
+Write-Host '--- what the global status actually publishes, through the real publisher call ---'
+# This was the gap: every existing suite stubs Publish-DaemonGlobalStatus itself or
+# records only -Sessions, so deleting `-Resumable $export` - which silently stops this
+# machine sharing anything at all - left the whole suite green.
+$script:PublishedResumable = $null
+$script:PublishCount = 0
+function Publish-CopilotMqttGlobalStatus {
+    param($Headers, $Capabilities, $Sessions, $Resumable)
+    $script:PublishCount++
+    $script:PublishedResumable = @($Resumable)
+}
+$script:DaemonGlobalSignature = ''
+$script:DaemonGlobalLastPublish = [DateTimeOffset]::MinValue
+$script:DaemonConfig = @{ GlobalReassertSeconds = 3600 }
+$caps = @{ newSession = $true; profile = $false; resume = $true; agent = $true; tuning = $true; detailed = $true; dev = $false; resumeShare = $true }
+$descriptors = @([pscustomobject]@{ Node = 'n1'; Name = 'One'; Machine = 'ME'; Kind = 'copilot' })
+$offered = @(
+    [pscustomobject]@{ SessionId = 'aaaa1111-0000-0000-0000-000000000001'; Launcher = 'copilot'; Summary = 'secret prompt text'; Folder = 'C:\work\customer'; Updated = [DateTimeOffset]::Now }
+)
+
+$script:FakeSettings = @{ 'newSession.shareResumable' = $true }
+Publish-DaemonGlobalStatus -Descriptors $descriptors -Capabilities $caps -Resumable $offered -Headers $headers
+Test-That 'the offered sessions actually reach the publisher' {
+    $e = @($script:PublishedResumable)
+    $e.Count -eq 1 -and $null -ne $e[0] -and $e[0].ContainsKey('id') -and
+        [string]$e[0]['id'] -eq 'aaaa1111-0000-0000-0000-000000000001'
+}
+Test-That 'and carry no prompt text or path by default' {
+    $e = @($script:PublishedResumable)
+    $e.Count -eq 1 -and $null -ne $e[0] -and -not $e[0].ContainsKey('title') -and -not $e[0].ContainsKey('leaf')
+}
+
+# The signature has to cover the exported content, or a privacy change sits unpublished
+# behind a retained message until the re-assert interval happens to come round.
+$before = $script:PublishCount
+$script:FakeSettings = @{ 'newSession.shareResumable' = $false }
+Publish-DaemonGlobalStatus -Descriptors $descriptors -Capabilities $caps -Resumable $offered -Headers $headers
+Test-That 'turning sharing off republishes immediately rather than waiting out the interval' {
+    $script:PublishCount -eq $before + 1
+}
+Test-That 'and replaces the retained list with an empty one' {
+    @($script:PublishedResumable).Count -eq 0
+}
+
+Write-Host '--- a reply has to be for the session that was actually asked for ---'
+# The transfer topic is not authenticated and the correlation is published in the
+# retained request, so anything subscribed to the broker can answer first. An honest
+# sender cannot mismatch - it derives the kind from the launcher the request carried -
+# but nothing compared the two until now. A bundle declaring 'claude' installs into
+# .claude and verifies there happily, and then the launcher that actually runs is
+# Copilot, pointed at a session-state directory with no such session: the empty-session
+# fail-open this whole design exists to prevent.
+# The resolver tests above replaced this function with a stub, so the real one has to
+# come back before it can be exercised. Safe to re-source: daemon-launch.ps1 declares no
+# script-level parameters (which would rebind here) and its only non-function statement
+# is a constant table.
+. (Join-Path $PSScriptRoot '..\hooks\daemon-launch.ps1')
+
+$script:Installed = @()
+$script:ReplyManifest = $null
+function Get-BridgeTransferTopic { param($Slug, $Correlation) "copilot/cli/transfer/$Slug/$Correlation/c" }
+function Set-CopilotMqttTransferRequest { param($Slug, $SessionId, $Launcher, $Requester, $Correlation, $Headers) }
+function Join-BridgeBundleChunk { param($Chunks, $TotalBytes, $Sha256) [byte[]]::new(4) }
+function Install-BridgeSessionBundle { param($BundlePath, $Manifest, $NewSessionId, $WorkingDirectory)
+    $script:Installed += [string]$Manifest.Kind; 'cccccccc-1111-1111-1111-111111111111' }
+function Read-BridgeHaMqttSubscription { param($Topic, $TimeoutSeconds, $OnReady, $Until)
+    if ($OnReady) { & $OnReady }
+    @($script:ReplyManifest, [pscustomobject]@{ s = 0; o = 0; d = 'AAAA' })
+}
+$wanted = 'ffffffff-1111-2222-3333-444444444444'
+$entry = [pscustomobject]@{ SessionId = $wanted; Slug = 'other'; Machine = 'OTHER'; Launcher = 'copilot'; Remote = $true }
+
+$script:Installed = @()
+$script:ReplyManifest = [pscustomobject]@{ sha256 = ('a'*64); bytes = 4; chunks = 1; session = $wanted; kind = 'claude' }
+$got = Receive-DaemonSessionTransfer -Entry $entry -WorkingDirectory 'C:\Users\dswett\repos' -Headers $headers -TimeoutSeconds 1
+Test-That 'a reply claiming a different agent is refused rather than installed elsewhere' {
+    $null -eq $got -and $script:Installed.Count -eq 0
+}
+
+$script:Installed = @()
+$script:ReplyManifest = [pscustomobject]@{ sha256 = ('a'*64); bytes = 4; chunks = 1; session = 'dddddddd-0000-0000-0000-000000000000'; kind = 'copilot' }
+$got = Receive-DaemonSessionTransfer -Entry $entry -WorkingDirectory 'C:\Users\dswett\repos' -Headers $headers -TimeoutSeconds 1
+Test-That 'a reply for a different session is refused too' {
+    $null -eq $got -and $script:Installed.Count -eq 0
+}
+
+$script:Installed = @()
+$script:ReplyManifest = [pscustomobject]@{ sha256 = ('a'*64); bytes = 4; chunks = 1; session = $wanted; kind = 'copilot' }
+$got = Receive-DaemonSessionTransfer -Entry $entry -WorkingDirectory 'C:\Users\dswett\repos' -Headers $headers -TimeoutSeconds 1
+Test-That 'and the matching reply still installs, so the check is not refusing everything' {
+    $got -eq 'cccccccc-1111-1111-1111-111111111111' -and $script:Installed -contains 'copilot'
+}
+
 Write-Host ''
 if ($script:Failures -gt 0) { Write-Host "$($script:Failures) failed" -ForegroundColor Red; exit 1 }
 Write-Host 'all passed' -ForegroundColor Green

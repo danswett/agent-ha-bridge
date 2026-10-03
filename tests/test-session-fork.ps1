@@ -187,6 +187,25 @@ try {
     Test-That 'and an unchanged session still bundles, so the witness is not refusing everything' {
         $null -ne (New-BridgeSessionBundle -SessionId $oldId -Launcher 'copilot' -Destination $out)
     }
+
+    # The wire cap is measured on the zip, which is only known after the whole tree has
+    # been copied and compressed - so on its own it bounds the message and not the work.
+    # files\ is a session's own artifact store and nothing upstream bounds it, so one
+    # request could have this machine copy an arbitrarily large tree into temp, inside
+    # the single-threaded reconcile, answering nothing else while it did.
+    $tooBig = ''
+    try { New-BridgeSessionBundle -SessionId $oldId -Launcher 'copilot' -Destination $out -MaxSourceBytes 64 | Out-Null }
+    catch { $tooBig = $_.Exception.Message }
+    Test-That 'a session larger than the read budget is refused before anything is copied' {
+        $tooBig -like '*over the*a transfer will read*'
+    }
+    Test-That 'and nothing was staged for it' {
+        @(Get-ChildItem -LiteralPath $out -Directory -Filter 'stage-*').Count -eq 0
+    }
+    Test-That 'a generous budget still bundles, and zero means no budget at all' {
+        $null -ne (New-BridgeSessionBundle -SessionId $oldId -Launcher 'copilot' -Destination $out -MaxSourceBytes 10485760) -and
+        $null -ne (New-BridgeSessionBundle -SessionId $oldId -Launcher 'copilot' -Destination $out -MaxSourceBytes 0)
+    }
     $manifest = New-BridgeSessionBundle -SessionId $oldId -Launcher 'copilot' -Destination $out
 
     Write-Host '--- a damaged bundle is refused before anything is written ---'

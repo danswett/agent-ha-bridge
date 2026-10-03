@@ -2731,13 +2731,33 @@ function New-BridgeSessionBundle {
     param(
         [Parameter(Mandatory)][string]$SessionId,
         [Parameter(Mandatory)][string]$Launcher,
-        [Parameter(Mandatory)][string]$Destination
+        [Parameter(Mandatory)][string]$Destination,
+        # A bound on what is read, checked before a byte is copied. Distinct from the
+        # cap on what goes on the wire, which is measured on the zip afterwards: a
+        # session observed in testing was 62.6 MB on disk and well under a 25 MB wire
+        # cap once compressed, so refusing on raw size against the wire cap would have
+        # turned away a transfer that works. This exists only to stop the work itself
+        # being unbounded. 0 disables it.
+        [long]$MaxSourceBytes = 0
     )
 
     $spec = Get-BridgeSessionBundleSpec -SessionId $SessionId -Launcher $Launcher
     if ($null -eq $spec) { throw "no $Launcher session files found for $SessionId" }
     # Sanitised above; used again here because it names the archive.
     $safeId = Get-CopilotSafeSessionKey -SessionId $SessionId
+
+    # Before the staging directory exists, let alone a copy. The file list is fully
+    # known from the spec, and `files\` is a session's own artifact store with nothing
+    # upstream bounding it - so without this one request could have the owning machine
+    # copy and compress an arbitrarily large tree into temp, inside the single-threaded
+    # reconcile, answering nothing else while it did.
+    if ($MaxSourceBytes -gt 0) {
+        $total = 0L
+        foreach ($f in @($spec.Files)) { $total += [System.IO.FileInfo]::new($f).Length }
+        if ($total -gt $MaxSourceBytes) {
+            throw "that session is $([int]($total / 1MB)) MB on disk, over the $([int]($MaxSourceBytes / 1MB)) MB a transfer will read"
+        }
+    }
 
     $stage = Join-Path $Destination "stage-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
     New-Item -ItemType Directory -Path $stage -Force | Out-Null

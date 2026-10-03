@@ -390,8 +390,15 @@ function Sync-DaemonSessions {
         -Resumable @($script:DaemonResumeOffered) -Headers $Headers
     # $live, not $State.Keys: a session whose adoption returned $null is running but
     # absent from state, and bundling one mid-sentence is exactly what this guards.
+    # The marked test-boundary throws are re-raised rather than logged, the convention
+    # #59 established: a suite that reaches the real transfer without stubbing it would
+    # otherwise see a tidy refusal and pass, which is the exact failure that change
+    # exists to close.
     try { Invoke-DaemonTransferRequest -LiveSessionIds @($live.Keys) -Headers $Headers }
-    catch { Write-DaemonLog -Message "transfer request check failed: $($_.Exception.Message)" }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        Write-DaemonLog -Message "transfer request check failed: $($_.Exception.Message)"
+    }
     Publish-DaemonOnlineHeartbeat -Headers $Headers
     $dashboardCurrent = Sync-DaemonDashboard -Descriptors $descriptors -Capabilities $capabilities -Headers $Headers
     Complete-DaemonSessionRetirement -Gone $goneSessions -DashboardCurrent $dashboardCurrent -Headers $Headers
