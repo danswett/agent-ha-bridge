@@ -1,7 +1,7 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-    PROPOSED tests for sharing resumable sessions between machines
+    Tests for sharing resumable sessions between machines
     (hooks/daemon-launch.ps1, hooks/daemon-sessions.ps1, hooks/decision-mqtt.ps1).
 
 .DESCRIPTION
