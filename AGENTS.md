@@ -298,6 +298,42 @@ already sitting in its own environment. Reading state is different - for a read
 `homeAssistant.token` is correct and simpler. The rule is about writes: a press, a
 reply, a launch.
 
+### Press one thing, not everything
+
+`Invoke-HomeAssistantService` refuses a call that names more than one entity, and
+`Assert-HomeAssistantServiceTarget` is where that is enforced. It takes a single
+scalar `entity_id` and nothing else: `area_id`, `device_id`, `label_id` and `floor_id`
+are refused outright, because Home Assistant expands each of them to *every* matching
+entity, so one scalar `area_id` presses every button in the area. **A direct
+`Invoke-RestMethod` to `/api/services/...` goes nowhere near it**, so when you press
+something yourself, the shape of the target is entirely your problem.
+
+On 2026-10-02 a session ending one test session filtered `GET /api/states` down to
+that session's stop button and sent an entity id from the result. The selection
+collapsed, the POST carried thousands of ids instead of one, and Home Assistant
+pressed every button among them: 166 of them at 22:45:23 PT. The UniFi fleet rebooted
+mid-request, PoE camera ports power-cycled, and vacuum consumables, ERV totals and
+bed-presence calibrations were reset. The call returned 502, which read as a transient
+blip, so the identical command ran again three minutes later.
+
+Worth knowing: the tempting explanation - that `Invoke-RestMethod` hands a JSON array
+to the pipeline as one object, so `Where-Object` tests the whole array - **does not
+reproduce here**. It enumerates under both PowerShell 7.6.6 and Windows PowerShell
+5.1, checked against the live state list. Do not rely on that story; rely on the
+habit below.
+
+Never send a selection you have not proved is exactly one thing:
+
+```powershell
+$ids = @($states | Where-Object { $_.entity_id -like "*${sid}*_stop" } |
+    ForEach-Object entity_id)
+if ($ids.Count -ne 1) { throw "expected one stop button, got $($ids.Count)" }
+# only now is it safe to POST $ids[0]
+```
+
+`$x[0].entity_id` on something you have not counted is the bug. If a selection can
+ever be empty or plural, say so out loud *before* the POST, not after.
+
 ### Reading the answer back
 
 A session on another machine reports through its own entities, and the one that

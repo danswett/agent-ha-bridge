@@ -1830,6 +1830,106 @@ function Get-HomeAssistantHeaders {
     @{ Authorization = "Bearer $token" }
 }
 
+function Assert-HomeAssistantServiceTarget {
+    <#
+        Refuses a service call that selects anything other than one named entity.
+
+        On 2026-10-02 a script meant to press a single session's stop button built its
+        target by filtering GET /api/states down to that one button and then taking an
+        entity id out of the result. The selection collapsed: the POST that followed
+        carried thousands of entity ids instead of one, and Home Assistant pressed
+        every button among them. 166 buttons fired at 22:45:23 PT - the whole UniFi
+        fleet rebooted mid-request, PoE camera ports power-cycled, and vacuum
+        consumable counters, ERV totals and bed-presence calibrations were reset. The
+        call then returned 502, which read as a transient failure, so the identical
+        command ran again three minutes later and did it a second time.
+
+        The exact reason that filter collapsed is NOT established: the obvious
+        candidate - Invoke-RestMethod handing a JSON array to the pipeline as a single
+        object - does not reproduce, because it enumerates under both PowerShell 7.6.6
+        and Windows PowerShell 5.1 (checked against the live state list, 5,068
+        entities, both shells). So this guard deliberately does not encode one idiom.
+        It checks the only thing that actually mattered: the shape of what was about to
+        be sent.
+
+        Nothing in this repository legitimately targets more than one entity - every
+        caller passes a scalar entity id, or no target at all - so the safe shape is
+        made the only allowed shape, and a collapsed selection throws here instead of
+        becoming a house-wide side effect.
+
+        entity_id is the only selector accepted, and only ever one of them. 'all' is
+        rejected by name because Home Assistant still honours it as "every entity in
+        the domain". device_id, area_id, label_id and floor_id are refused outright
+        rather than counted: Home Assistant expands each of them to *every* matching
+        entity, so a single scalar area_id presses every button in that area. Counting
+        selector values would wave that straight through. An entity_id in both the body
+        and target is refused for the same reason - the two are a union, not a choice.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [hashtable]$Data
+    )
+
+    $containers = @($Data)
+    if ($Data.ContainsKey('target')) {
+        $target = $Data['target']
+        if ($target -is [hashtable]) { $containers += $target }
+        elseif ($null -ne $target) {
+            throw ('Home Assistant service call has a target that is not a hashtable, ' +
+                'so what it selects cannot be checked. Pass target as a hashtable.')
+        }
+    }
+
+    $named = 0
+    foreach ($container in $containers) {
+        foreach ($key in @('device_id', 'area_id', 'label_id', 'floor_id')) {
+            if ($container.ContainsKey($key)) {
+                throw ("Home Assistant service call selects by $key, which Home Assistant " +
+                    'expands to every matching entity. Name a single entity_id instead.')
+            }
+        }
+
+        if (-not $container.ContainsKey('entity_id')) { continue }
+        $named++
+        $value = $container['entity_id']
+
+        # A one-element array is how a caller spells "just this one", so unwrap it
+        # rather than failing a selection that is already safe.
+        if ($value -isnot [string] -and $null -ne $value) {
+            $items = @($value)
+            if ($items.Count -eq 1) { $value = $items[0] }
+            else {
+                throw ("Home Assistant service call selects $($items.Count) values as entity_id. " +
+                    'Name exactly one; a service call is not a way to fan out. ' +
+                    'A collapsed pipeline filter is the usual cause.')
+            }
+        }
+
+        if ($null -eq $value -or $value -isnot [string]) {
+            throw 'Home Assistant service call has an entity_id that is not a single string.'
+        }
+
+        $id = $value.Trim()
+        if ($id -eq '') { throw 'Home Assistant service call has an empty entity_id.' }
+        if ($id -eq 'all') {
+            throw ("Home Assistant service call uses entity_id 'all', which targets every " +
+                'entity in the domain. Name the one entity instead.')
+        }
+        if ($id -match '[,\s]') {
+            throw ("Home Assistant service call passes a list as entity_id ('$id'). " +
+                'Name exactly one entity.')
+        }
+        if ($id -notmatch '^[^.\s,]+\.[^.\s,]+$') {
+            throw "Home Assistant service call has a malformed entity_id ('$id')."
+        }
+    }
+
+    if ($named -gt 1) {
+        throw ('Home Assistant service call names an entity_id in both the body and ' +
+            'target, which selects both. Name exactly one entity.')
+    }
+}
+
 function Invoke-HomeAssistantService {
     param(
         [Parameter(Mandatory)]
@@ -1847,6 +1947,9 @@ function Invoke-HomeAssistantService {
         [ValidateRange(1, 60)]
         [int]$TimeoutSec = 15
     )
+
+    # Checked before the request is built, so a fan-out never reaches the wire.
+    Assert-HomeAssistantServiceTarget -Data $Data
 
     $uri = "$($script:DecisionBridgeConfig.HomeAssistantBaseUrl)/api/services/$Domain/$Service"
     # Send raw UTF-8 bytes: Windows PowerShell 5.1 encodes a string body with the
