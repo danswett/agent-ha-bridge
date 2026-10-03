@@ -59,6 +59,8 @@ Assert-BridgeTestPath -Path $scratch
 [void][IO.Directory]::CreateDirectory($scratch)
 $sandboxes = @()
 $inventoryLinks = @()
+$defaultFixture = Join-Path $env:TEMP 'd'
+$defaultFixtureCreated = $false
 $saved = @{}
 $poison = @{
     AGENT_HA_TOKEN = 'synthetic-parent-token'
@@ -72,6 +74,146 @@ $poison = @{
     GIT_CONFIG_COUNT = '1'
 }
 try {
+    Write-Host '--- only the platform default base is physically resolved before allocation ---'
+    Assert-BridgeTestPath -Path $defaultFixture
+    if (Test-Path -LiteralPath $defaultFixture) { throw 'The default-temp fixture already exists; nothing was overwritten.' }
+    [void][IO.Directory]::CreateDirectory($defaultFixture)
+    $defaultFixtureCreated = $true
+    $physicalParent = Join-Path $defaultFixture 'b'
+    $physicalBase = Join-Path $physicalParent 't'
+    $protectedDefault = Join-Path $defaultFixture 'p'
+    foreach ($directory in @($physicalBase, $protectedDefault)) {
+        [void][IO.Directory]::CreateDirectory($directory)
+    }
+    $protectedDefaultFile = Join-Path $protectedDefault 'sentinel.txt'
+    Set-Content -LiteralPath $protectedDefaultFile -Value 'default-temp protected stand-in' -Encoding utf8
+    $protectedDefaultBefore = (Get-FileHash -LiteralPath $protectedDefaultFile -Algorithm SHA256).Hash
+    $defaultAlias = Join-Path $defaultFixture 'a'
+    $defaultLinkType = if ($IsWindows) { 'Junction' } else { 'SymbolicLink' }
+    [void](New-Item -ItemType $defaultLinkType -Path $defaultAlias -Value $physicalParent)
+    $platformBase = Join-Path $defaultAlias 't'
+    $defaultAllocation = New-BridgeTestDefaultResultsDirectory -PlatformTempBase $platformBase
+    Test-That 'default allocation preserves the caller spelling and uses the physical existing base' {
+        $defaultAllocation.PlatformBase -ceq $platformBase -and
+        (Test-BridgeInstallPath $defaultAllocation.PhysicalBase $physicalBase) -and
+        (Test-BridgeInstallDescendant $defaultAllocation.Directory $physicalBase) -and
+        (Split-Path $defaultAllocation.Directory -Leaf) -match '^bridge-tests-[a-f0-9]{32}$' -and
+        $defaultAllocation.LinksResolved -eq 1
+    }
+    $defaultMarker = Get-Content -LiteralPath (Join-Path $defaultAllocation.Directory '.bridge-test-results') -Raw |
+        ConvertFrom-Json
+    Test-That 'the default results marker records the physical directory rather than its alias' {
+        $defaultMarker.schemaVersion -eq 1 -and
+        (Test-BridgeInstallPath $defaultMarker.root $defaultAllocation.Directory)
+    }
+    $defaultBox = New-BridgeTestSandbox -ParentDirectory $defaultAllocation.Directory
+    $sandboxes += $defaultBox
+    $defaultBoundary = Get-BridgeTestSandbox -Root $defaultBox
+    Test-That 'a sandbox allocated under default results records the same physical parent and root' {
+        (Test-BridgeInstallPath $defaultBoundary['parent'] $defaultAllocation.Directory) -and
+        (Test-BridgeInstallPath $defaultBoundary['root'] $defaultBox) -and
+        (Test-BridgeInstallDescendant $defaultBox $physicalBase)
+    }
+    $defaultProbe = Join-Path $defaultFixture 'default-child.ps1'
+    @'
+$boundary = Get-BridgeTestSandbox -Root $env:AGENT_HA_BRIDGE_TEST_ROOT
+$written = Join-Path $env:TEMP 'default-temp-child.txt'
+Assert-BridgeTestPath -Path $written
+Set-Content -LiteralPath $written -Value 'owned child write' -Encoding utf8
+[ordered]@{
+    Root = $boundary['root']
+    Parent = $boundary['parent']
+    Home = $HOME
+    Temp = [IO.Path]::GetTempPath()
+    Config = $env:AGENT_HA_BRIDGE_CONFIG
+    Written = $written
+} | ConvertTo-Json -Compress
+'@ | Set-Content -LiteralPath $defaultProbe -Encoding utf8
+    $defaultChild = Invoke-BridgeTestProcess -StartInfo (
+        New-BridgeTestProcessStartInfo -ScriptPath $defaultProbe -Sandbox $defaultBox)
+    Test-That 'a real sanitized child of default allocation completes without a timeout' {
+        $defaultChild.ExitCode -eq 0 -and -not $defaultChild.TimedOut
+    } $defaultChild.Output
+    if ($defaultChild.ExitCode -ne 0 -or $defaultChild.TimedOut) { throw 'The default-temp child failed; stopping.' }
+    $defaultObserved = $defaultChild.Output | ConvertFrom-Json
+    Test-That 'the child roots and actual write use the physical sandbox identity' {
+        (Test-BridgeInstallPath $defaultObserved.Root $defaultBox) -and
+        (Test-BridgeInstallPath $defaultObserved.Parent $defaultAllocation.Directory) -and
+        (Test-BridgeInstallPath $defaultObserved.Home (Join-Path $defaultBox 'home')) -and
+        (Test-BridgeInstallPath $defaultObserved.Temp (Join-Path $defaultBox 'temp')) -and
+        (Test-BridgeInstallDescendant $defaultObserved.Config $defaultBox) -and
+        (Test-BridgeInstallDescendant $defaultObserved.Written (Join-Path $defaultBox 'temp')) -and
+        (Get-Content -LiteralPath $defaultObserved.Written -Raw).Trim() -ceq 'owned child write'
+    }
+
+    $explicitAliasResult = Join-Path $platformBase 'explicit-refused'
+    Test-That 'an explicit results path through the same alias is still rejected before writing' {
+        $refused = $false
+        try { $null = New-BridgeTestResultsDirectory -Directory $explicitAliasResult }
+        catch { $refused = $_.Exception.Message -match 'linked|boundary rejected' }
+        $refused -and -not (Test-Path -LiteralPath (Join-Path $physicalBase 'explicit-refused'))
+    }
+    $nestedAlias = Join-Path $defaultAllocation.Directory 'n'
+    [void](New-Item -ItemType $defaultLinkType -Path $nestedAlias -Value $protectedDefault)
+    Test-That 'a link nested under physical default results does not authorize another results directory' {
+        $refused = $false
+        try { $null = New-BridgeTestResultsDirectory -Directory (Join-Path $nestedAlias 'escape') }
+        catch { $refused = $_.Exception.Message -match 'linked|boundary rejected' }
+        $refused -and -not (Test-Path -LiteralPath (Join-Path $protectedDefault 'escape'))
+    }
+    Test-That 'a nested linked parent is still refused by the real sandbox allocator' {
+        try { $null = New-BridgeTestSandbox -ParentDirectory $nestedAlias; $false }
+        catch { $_.Exception.Message -match 'linked|boundary rejected' }
+    }
+    foreach ($invalidBase in @(
+        @{ Name = 'missing'; Path = (Join-Path $defaultFixture 'missing') },
+        @{ Name = 'non-directory'; Path = $protectedDefaultFile },
+        @{ Name = 'relative'; Path = 'not-an-absolute-base' }
+    )) {
+        Test-That "a $($invalidBase.Name) default base fails before allocation" {
+            try { $null = New-BridgeTestDefaultResultsDirectory -PlatformTempBase $invalidBase.Path; $false }
+            catch { $_.Exception.Message -match 'platform default temporary base' }
+        }
+    }
+    $brokenTarget = Join-Path $defaultFixture 'gone'
+    [void][IO.Directory]::CreateDirectory($brokenTarget)
+    $brokenAlias = Join-Path $defaultFixture 'broken'
+    [void](New-Item -ItemType $defaultLinkType -Path $brokenAlias -Value $brokenTarget)
+    [IO.Directory]::Delete($brokenTarget)
+    Test-That 'a broken default-base alias fails instead of creating its missing target' {
+        $refused = $false
+        try { $null = New-BridgeTestDefaultResultsDirectory -PlatformTempBase $brokenAlias }
+        catch { $refused = $_.Exception.Message -match 'platform default temporary base' }
+        $refused -and -not (Test-Path -LiteralPath $brokenTarget)
+    }
+    $loopAlias = Join-Path $physicalBase 'l'
+    [void](New-Item -ItemType $defaultLinkType -Path $loopAlias -Value $physicalBase)
+    $overLimitBase = $physicalBase
+    for ($hop = 0; $hop -lt 41; $hop++) { $overLimitBase = Join-Path $overLimitBase 'l' }
+    Test-That 'real back-edge traversal is bounded before default results can be allocated' {
+        try { $null = New-BridgeTestDefaultResultsDirectory -PlatformTempBase $overLimitBase; $false }
+        catch { $_.Exception.Message -match 'exceeds 40 link resolutions' }
+    }
+    $protectedDefaultAfter = (Get-FileHash -LiteralPath $protectedDefaultFile -Algorithm SHA256).Hash
+    Test-That 'default-base failures and nested links leave protected data unchanged' {
+        $protectedDefaultAfter -ceq $protectedDefaultBefore -and
+        @(Get-ChildItem -LiteralPath $protectedDefault -Force).Count -eq 1
+    }
+    $defaultRecord = [ordered]@{
+        PlatformBase = $defaultAllocation.PlatformBase
+        PhysicalBase = $defaultAllocation.PhysicalBase
+        Directory = $defaultAllocation.Directory
+        LinksResolved = $defaultAllocation.LinksResolved
+        Sandbox = $defaultBox
+        Child = $defaultObserved
+        ProtectedBefore = $protectedDefaultBefore
+        ProtectedAfter = $protectedDefaultAfter
+        ExplicitResultAbsent = -not (Test-Path -LiteralPath (Join-Path $physicalBase 'explicit-refused'))
+        NestedResultAbsent = -not (Test-Path -LiteralPath (Join-Path $protectedDefault 'escape'))
+    }
+    Write-Host ('S1-DEFAULT-TEMP-RESULT ' + ($defaultRecord | ConvertTo-Json -Depth 5 -Compress))
+    [Console]::Out.Flush()
+
     Write-Host '--- repository-wide inventory, including new components and nested suites ---'
     $inventoryRoot = Join-Path $scratch 'inventory'
     $inventoryManifest = @{
@@ -431,6 +573,12 @@ finally {
         }
     }
     Remove-BridgeTestSandbox -Sandbox $env:AGENT_HA_BRIDGE_TEST_ROOT -Directory $scratch
+    if ($defaultFixtureCreated) {
+        Remove-BridgeTestSandbox -Sandbox $env:AGENT_HA_BRIDGE_TEST_ROOT -Directory $defaultFixture
+    }
+}
+Test-That 'default temporary-base fixtures are removed through the owned sandbox cleanup' {
+    -not (Test-Path -LiteralPath $defaultFixture)
 }
 if ($script:Failures) { throw "$script:Failures runner check(s) failed." }
 Write-Host 'All runner checks passed'

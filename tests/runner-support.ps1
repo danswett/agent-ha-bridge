@@ -91,6 +91,82 @@ function Assert-BridgeHostedTest {
     }
 }
 
+function New-BridgeTestDefaultResultsDirectory {
+    param([string]$PlatformTempBase = [IO.Path]::GetTempPath())
+
+    if (Test-BridgeTestExecution) { Assert-BridgeTestEnvironment }
+    if ([string]::IsNullOrWhiteSpace($PlatformTempBase) -or
+        -not [IO.Path]::IsPathFullyQualified($PlatformTempBase) -or $PlatformTempBase -match '^(\\\\|//)') {
+        throw 'The platform default temporary base must be an existing local absolute directory.'
+    }
+
+    # /var can be an ancestor alias on macOS. Resolve only the existing default
+    # base; explicit results paths still reach the original link-refusing guard.
+    $resolved = [IO.Path]::GetPathRoot($PlatformTempBase)
+    $pending = [Collections.Generic.Queue[string]]::new(
+        [string[]]@($PlatformTempBase.Substring($resolved.Length) -split '[\\/]' | Where-Object { $_ }))
+    $links = 0
+    while ($pending.Count) {
+        $part = $pending.Dequeue()
+        if ($part -eq '.') { continue }
+        if ($part -eq '..') {
+            $parent = Split-Path -Parent $resolved
+            if (-not $parent) { throw 'The platform default temporary base traverses above its filesystem root.' }
+            $resolved = $parent
+            continue
+        }
+
+        try { $entry = Get-Item -LiteralPath (Join-Path $resolved $part) -Force -ErrorAction Stop }
+        catch [Management.Automation.ItemNotFoundException] {
+            throw "The platform default temporary base is missing or unreadable: $PlatformTempBase"
+        }
+        if ($entry.Attributes -band [IO.FileAttributes]::ReparsePoint) {
+            $kind = $entry.PSObject.Properties['LinkType']
+            $targetProperty = $entry.PSObject.Properties['Target']
+            if (-not $entry.PSIsContainer -or -not $kind -or
+                $kind.Value -notin @('SymbolicLink', 'Junction') -or -not $targetProperty) {
+                throw 'The platform default temporary base has an unsupported directory link.'
+            }
+            $targets = @($targetProperty.Value)
+            if ($targets.Count -ne 1) { throw 'The platform default temporary base has an ambiguous link target.' }
+            $target = [string]$targets[0]
+            $links++
+            if ($links -gt 40) { throw 'The platform default temporary base has a cycle or exceeds 40 link resolutions.' }
+            if ([string]::IsNullOrWhiteSpace($target) -or $target -match '^(\\\\|//)') {
+                throw 'The platform default temporary base has an unsafe link target.'
+            }
+            if ([IO.Path]::IsPathRooted($target)) {
+                if (-not [IO.Path]::IsPathFullyQualified($target)) {
+                    throw 'The platform default temporary base has an ambiguous rooted link target.'
+                }
+                $resolved = [IO.Path]::GetPathRoot($target)
+                $target = $target.Substring($resolved.Length)
+            }
+            $parts = [string[]]@($target -split '[\\/]' | Where-Object { $_ })
+            $pending = [Collections.Generic.Queue[string]]::new([string[]]($parts + @($pending.ToArray())))
+            continue
+        }
+        if (-not $entry.PSIsContainer) {
+            throw "The platform default temporary base is not a directory: $PlatformTempBase"
+        }
+        $resolved = $entry.FullName
+    }
+
+    $physicalBase = [IO.Path]::TrimEndingDirectorySeparator($resolved)
+    if (-not [IO.Directory]::Exists($physicalBase)) {
+        throw "The platform default temporary base is not an existing directory: $PlatformTempBase"
+    }
+    Assert-BridgeInstallPayload -Root $physicalBase -CheckAncestors
+    $directory = New-BridgeTestResultsDirectory -Directory (
+        Join-Path $physicalBase ("bridge-tests-" + [guid]::NewGuid().ToString('N')))
+    [pscustomobject]@{
+        PlatformBase = $PlatformTempBase
+        PhysicalBase = $physicalBase
+        Directory = $directory
+        LinksResolved = $links
+    }
+}
+
 function New-BridgeTestResultsDirectory {
     param([Parameter(Mandatory)][string]$Directory)
     $resultsRoot = [IO.Path]::GetFullPath($Directory)

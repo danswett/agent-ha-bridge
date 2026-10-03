@@ -13,6 +13,9 @@
     fail before reading configuration or mutating an installation. Descendants retain
     the same checks; tests must propagate marked boundary failures through real callers.
     Filesystem checks do not promise atomic protection against adversarial link swaps.
+
+    The existing platform-default temporary base is physically resolved before
+    allocating results. Explicit results paths are never resolved through links.
 #>
 [CmdletBinding()]
 param(
@@ -36,10 +39,14 @@ if ($List) {
 if ($Group -eq 'Integration') { throw 'Integration suites require an explicitly configured disposable Home Assistant. This runner never enables them.' }
 if ($Group -ne 'Offline') { Assert-BridgeHostedTest -AllowHostTests:$AllowHostTests }
 
-if (-not $ResultsDirectory) {
-    $ResultsDirectory = Join-Path ([IO.Path]::GetTempPath()) ("bridge-tests-" + [guid]::NewGuid().ToString('N'))
+if ($ResultsDirectory) {
+    $ResultsDirectory = New-BridgeTestResultsDirectory -Directory $ResultsDirectory
 }
-$ResultsDirectory = New-BridgeTestResultsDirectory -Directory $ResultsDirectory
+else {
+    $defaultResults = New-BridgeTestDefaultResultsDirectory
+    $ResultsDirectory = $defaultResults.Directory
+    Write-Host "Default temporary base: $($defaultResults.PlatformBase) -> $($defaultResults.PhysicalBase) ($($defaultResults.LinksResolved) link resolution(s))."
+}
 
 Write-Host "$Group suites: $($suites.Count). Logs: $ResultsDirectory"
 if ($Group -eq 'Offline') { Write-Host 'Excluded by design: Host (installer), Platform (terminal delivery), Integration (live Home Assistant).' }
