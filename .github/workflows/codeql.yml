@@ -1,10 +1,14 @@
 name: CodeQL
 
+# release/** matches ci.yml. Analyze JavaScript is a required check on main, so a
+# release branch that never ran it could not satisfy the same protection - six of
+# seven checks would arrive and the seventh would simply never appear. The weekly
+# schedule is unchanged and still only covers the default branch.
 on:
   push:
-    branches: [main]
+    branches: [main, 'release/**']
   pull_request:
-    branches: [main]
+    branches: [main, 'release/**']
   schedule:
     - cron: '30 4 * * 1'
 
