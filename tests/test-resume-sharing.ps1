@@ -244,6 +244,26 @@ Test-That 'a live session is still excluded from the controls' {
         Where-Object { $_.SessionId -eq 'a1111111-1111-1111-1111-111111111111' }).Count -eq 0
 }
 
+Write-Host '--- the transfer request entity has to be renamed, and removed on uninstall ---'
+# Found the hard way against a live Home Assistant: publishing the discovery config is
+# not enough. HA builds an MQTT entity id from device name plus entity name and ignores
+# object_id, so this one appeared as
+# sensor.ai_agent_bridge_<slug>_session_transfer_request while the daemon looked for
+# sensor.agent_bridge_<slug>_transfer_request - and every transfer timed out, silently,
+# because the request was published somewhere nothing was reading.
+
+$src = Get-Content (Join-Path $PSScriptRoot '..\hooks\decision-ha-websocket.ps1') -Raw
+Test-That 'the transfer request is on the list of entities forced onto a known id' {
+    $src -match "@\('sensor',\s*'transfer_request'\)"
+}
+$topics = @(Get-CopilotMqttMachineTopic -Slug 'laptop')
+Test-That 'its discovery config is removed when a machine is forgotten' {
+    $topics -contains 'homeassistant/sensor/agent_bridge_laptop/transfer_request/config'
+}
+Test-That 'and its retained request is cleared too, so a stale one cannot be served' {
+    $topics -contains 'copilot/cli/machine/laptop/transfer/request'
+}
+
 Write-Host '--- a remote session is refused unless everything lines up ---'
 # Driven through the real resolver. The remote entry is given an approved local path on
 # purpose: C:\Users\dswett\repos is approved on more than one machine in this fleet, so

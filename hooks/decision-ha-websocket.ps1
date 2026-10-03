@@ -669,6 +669,7 @@ function Set-CopilotMqttNewSessionEntityIds {
         @('select', 'new_context'),
         @('select', 'new_resume'),
         @('select', 'new_permissions'),
+        @('sensor', 'transfer_request'),
         @('button', 'new_session'),
         @('sensor', 'new_session_result')
     )) {
