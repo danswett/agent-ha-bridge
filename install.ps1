@@ -2130,7 +2130,7 @@ function Test-BridgeDevBoxKeepAwakePrompt {
 
 function New-BridgeDevBoxKeepAwakeTrigger {
     <#
-        The triggers for the keep-awake task: once at logon, then every so many hours
+        The triggers for the keep-awake task: once at logon, then every so many minutes
         for as long as the machine is up.
 
         Two triggers rather than one with its .Repetition reassigned: mutating the
@@ -2156,14 +2156,14 @@ function New-BridgeDevBoxKeepAwakeTrigger {
         include USERNAME, and -AtLogOn refuses an empty user.
     #>
     param(
-        [Parameter(Mandatory)][int]$IntervalHours,
+        [Parameter(Mandatory)][int]$IntervalMinutes,
         [string]$User = $env:USERNAME
     )
 
     @(
         (New-ScheduledTaskTrigger -AtLogOn -User $User),
         (New-ScheduledTaskTrigger -Once -At (Get-Date) `
-            -RepetitionInterval (New-TimeSpan -Hours $IntervalHours))
+            -RepetitionInterval (New-TimeSpan -Minutes $IntervalMinutes))
     )
 }
 
@@ -2344,9 +2344,13 @@ elseif (Test-BridgeDevBoxKeepAwakePrompt -IsDevBox $isDevBox `
 }
 # Settled here rather than beside the task registration, because the summary is
 # printed before the task is registered and both have to agree.
-$devBoxIntervalHours = 4
-if ($config.devBox.PSObject.Properties['intervalHours'] -and [int]$config.devBox.intervalHours -ge 1) {
-    $devBoxIntervalHours = [int]$config.devBox.intervalHours
+$devBoxIntervalMinutes = Get-BridgeDevBoxIntervalMinutes -DevBox $config.devBox
+# Dropped rather than left sitting beside the new key: hours could not express an
+# interval short enough to beat the pool's grace period, so every value it could hold
+# was already wrong, and a stale setting that no longer changes anything reads as
+# though it still does.
+if ($config.devBox.PSObject.Properties['intervalHours']) {
+    $config.devBox.PSObject.Properties.Remove('intervalHours')
 }
 $devBoxDecision = Get-BridgeDevBoxKeepAwakeDecision -IsDevBox $isDevBox `
     -Requested ([bool]$config.devBox.keepAwake) -OnWindows ([bool]$script:BridgeIsWindows) `
@@ -2599,7 +2603,7 @@ Write-Host "    agent account: $(
     else { 'none - an agent drives the bridge as you' })"
 Write-Host "    notifications: $(if ($config.notifications.enabled) { $config.notifications.service } else { 'disabled' })"
 if ($isDevBox) {
-    Write-Host "    Dev Box      : $(if ($devBoxDecision.Enabled) { "keep-awake on - '$devBoxTaskName' every ${devBoxIntervalHours}h" } else { "keep-awake off ($($devBoxDecision.Reason))" })"
+    Write-Host "    Dev Box      : $(if ($devBoxDecision.Enabled) { "keep-awake on - '$devBoxTaskName' every ${devBoxIntervalMinutes}m" } else { "keep-awake off ($($devBoxDecision.Reason))" })"
 }
 
 function Get-BridgeInstallAgentIdentityWarning {
@@ -2863,7 +2867,7 @@ if ($devBoxDecision.Enabled -and $script:BridgeIsWindows -and -not $installConte
         }
         $keepAwakeLauncher = Join-Path $hooksDir 'agent-bridge-devbox-keepawake.vbs'
         $keepAwakeAction = New-ScheduledTaskAction -Execute 'wscript.exe' -Argument "`"$keepAwakeLauncher`""
-        $keepAwakeTriggers = New-BridgeDevBoxKeepAwakeTrigger -IntervalHours $devBoxIntervalHours
+        $keepAwakeTriggers = New-BridgeDevBoxKeepAwakeTrigger -IntervalMinutes $devBoxIntervalMinutes
         # No RestartCount: a pass that fails because the Azure CLI login expired will
         # fail again immediately, and the next scheduled pass is the right retry.
         $keepAwakeSettings = New-ScheduledTaskSettingsSet -AllowStartIfOnBatteries -DontStopIfGoingOnBatteries `
@@ -2881,7 +2885,7 @@ if ($devBoxDecision.Enabled -and $script:BridgeIsWindows -and -not $installConte
                 -Description 'Clears the pending Dev Box stop so the bridge is not hibernated mid-session.' | Out-Null
         }
         Start-ScheduledTask -TaskName $devBoxTaskName
-        Write-Host "    registered; runs at logon and every ${devBoxIntervalHours}h"
+        Write-Host "    registered; runs at logon and every ${devBoxIntervalMinutes}m"
     }
     catch {
         # Same reasoning as the daemon task: policy can forbid task creation, and the

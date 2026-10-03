@@ -38,7 +38,7 @@
   },
   "devBox": {
     "keepAwake": false,
-    "intervalHours": 4
+    "intervalMinutes": 15
   },
   "updates": {
     "repository": "danswett/agent-ha-bridge",
