@@ -1,10 +1,19 @@
 name: CI
 
+# release/** is here so a release branch cut from an older tag - the way a fix ships
+# without the unreleased work stacked above it on main - is checked by the same jobs
+# as main, on both the push and the pull request. Both filters are needed: push alone
+# gives no pre-merge checks, and a branch protected on those checks could never merge.
+#
+# Note the bootstrap. A workflow runs from the commit being tested, so a release
+# branch cut from a tag that predates this change carries the old filters and is not
+# checked at all. This file therefore has to be the first thing placed on such a
+# branch; adding it to main does not reach backwards into one already cut.
 on:
   push:
-    branches: [main]
+    branches: [main, 'release/**']
   pull_request:
-    branches: [main]
+    branches: [main, 'release/**']
 
 permissions:
   contents: read
