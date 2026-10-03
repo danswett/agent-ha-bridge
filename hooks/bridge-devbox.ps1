@@ -40,6 +40,47 @@ $script:BridgeDevBoxApiVersion = '2024-02-01'
 # originally landed, which the API never reports back, so the only way to find the
 # remaining headroom is to ask for progressively less.
 $script:BridgeDevBoxDelayLadder = @(8, 6, 4, 2, 1)
+# What a pass is racing is the pool's `stopOnDisconnect.gracePeriodMinutes`. The
+# occurrence does not exist while anyone is connected: it is created when the last
+# session goes and fires one grace period later, so an interval longer than the grace
+# can miss it entirely. 1.25.0 polled every 4 hours against a 60-minute grace, and on
+# 2026-10-02/03 that Dev Box hibernated at 01:49, 03:03 and 09:26 while every pass that
+# ran reported success - it was simply never looking during the hour that mattered.
+# Dev Box does not offer a grace below 60 minutes, so 15 leaves four passes inside the
+# narrowest window the service can present, and 30 is the most that still leaves two.
+$script:BridgeDevBoxDefaultIntervalMinutes = 15
+$script:BridgeDevBoxMaxIntervalMinutes = 30
+
+function Get-BridgeDevBoxIntervalMinutes {
+    <#
+        How often the keep-awake task should run, given the `devBox` config section.
+
+        Clamped rather than taken at face value, because an interval at or above the
+        grace period cannot work at all, and quietly doing nothing a few times a day
+        looks far more like success than it should.
+    #>
+    param($DevBox)
+
+    $configured = $null
+    if ($DevBox) {
+        if ($DevBox.PSObject.Properties['intervalMinutes']) {
+            $configured = $DevBox.intervalMinutes -as [int]
+        }
+        # 1.25.0 wrote this in hours. Honoured only when the new key is genuinely
+        # absent - the installer fills missing keys from config.example.json before it
+        # asks, so on upgrade `intervalMinutes` is already there and wins. This branch
+        # is for a config read outside that path. Clamped like everything else: every
+        # value the old key could hold was too coarse to catch an occurrence.
+        elseif ($DevBox.PSObject.Properties['intervalHours']) {
+            $hours = $DevBox.intervalHours -as [int]
+            if ($null -ne $hours) { $configured = $hours * 60 }
+        }
+    }
+    if ($null -eq $configured -or $configured -lt 1) {
+        $configured = $script:BridgeDevBoxDefaultIntervalMinutes
+    }
+    [math]::Min($configured, $script:BridgeDevBoxMaxIntervalMinutes)
+}
 
 function Get-BridgeDevBoxAgentSettingsPath {
     <#
@@ -169,6 +210,33 @@ function Get-BridgeDevBoxErrorCode {
     [string]$ErrorRecord.Exception.Message
 }
 
+function Get-BridgeDevBoxActionSchedule {
+    <#
+        When a Stop action is next due, in UTC, or $null when nothing is pending.
+
+        A Stop action is a standing definition owned by the pool, so the service lists
+        it whether or not anything is scheduled; `next` appears only once an occurrence
+        exists, which for stop-on-disconnect means only after the last session has gone.
+        Reading it unconditionally threw "The property 'next' cannot be found on this
+        object" under Set-StrictMode, which aborted the whole pass - so a Dev Box that
+        was simply still connected logged FAILED on 15 of 24 passes on 2026-10-02/03,
+        and a genuinely expired az login looked exactly like having nothing to do.
+    #>
+    param([Parameter(Mandatory)]$Action)
+
+    if (-not $Action.PSObject.Properties['next'] -or -not $Action.next) { return $null }
+    if (-not $Action.next.PSObject.Properties['scheduledTime']) { return $null }
+
+    $raw = [string]$Action.next.scheduledTime
+    if ([string]::IsNullOrWhiteSpace($raw)) { return $null }
+
+    # TryParse rather than Parse: a value the service changes the shape of should drop
+    # this action, not take the pass down with it.
+    $parsed = [datetimeoffset]::MinValue
+    if (-not [datetimeoffset]::TryParse($raw, [ref]$parsed)) { return $null }
+    $parsed.ToUniversalTime()
+}
+
 function Invoke-BridgeDevBoxReprieve {
     <#
         Clears one pending stop, and says which lever worked.
@@ -198,7 +266,15 @@ function Invoke-BridgeDevBoxReprieve {
         & $Logger "skip refused for '$($Action.name)' ($(Get-BridgeDevBoxErrorCode $_)); trying delay"
     }
 
-    $scheduled = [datetimeoffset]::Parse([string]$Action.next.scheduledTime).ToUniversalTime()
+    # Read again rather than passed down: a refused skip does not move the occurrence,
+    # and the caller has already established there is one.
+    $scheduled = Get-BridgeDevBoxActionSchedule -Action $Action
+    if ($null -eq $scheduled) {
+        return [pscustomobject]@{
+            Status = 'blocked'
+            Detail = "'$($Action.name)' refused the skip and has no scheduled time to delay from"
+        }
+    }
     foreach ($hours in $script:BridgeDevBoxDelayLadder) {
         $until = $scheduled.AddHours($hours).ToString('yyyy-MM-ddTHH:mm:ssZ')
         try {
@@ -257,7 +333,12 @@ function Invoke-BridgeDevBoxKeepAwake {
 
     $outcomes = @()
     foreach ($action in $actions) {
-        $scheduled = [datetimeoffset]::Parse([string]$action.next.scheduledTime).ToUniversalTime()
+        $scheduled = Get-BridgeDevBoxActionSchedule -Action $action
+        if ($null -eq $scheduled) {
+            # The ordinary state while someone is connected: the action is defined, but
+            # the pool has not scheduled an occurrence of it. Nothing to push away.
+            continue
+        }
         $hoursAway = [math]::Round(($scheduled - $Now).TotalHours, 2)
 
         if ($hoursAway -gt 24) {
@@ -277,6 +358,17 @@ function Invoke-BridgeDevBoxKeepAwake {
         }
         $outcomes += (Invoke-BridgeDevBoxReprieve -Identity $identity -Headers $headers `
             -Action $action -Invoke $Invoke -Logger $Logger)
+    }
+
+    # Reached whenever every Stop action is defined but unscheduled, which is what a
+    # connected Dev Box looks like for most of the day. $outcomes[0] on an empty array
+    # would be the same StrictMode failure in a different place.
+    if ($outcomes.Count -eq 0) {
+        return [pscustomobject]@{
+            Status  = 'no-action'
+            Detail  = "no pending stop on $($identity.DevBox)"
+            Actions = @()
+        }
     }
 
     # 'blocked' is the only outcome a person needs to act on, so it wins the summary
