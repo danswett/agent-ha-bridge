@@ -1033,7 +1033,18 @@ function New-BridgeSessionWorktree {
         [pscustomobject]@{ Path = $launchPath; Isolated = $true; Detail = $detail }
     }
     catch {
-        $refused.Detail = "Could not provide requested isolation: $($_.Exception.Message)"
+        # Named rather than passed through raw. The console-handle failure described in
+        # agent-bridge-supervisor.ps1 surfaces here as a Win32 message about console mode
+        # with no hint that git, the worktree and the repository are all perfectly fine,
+        # which cost a long diagnosis the first time. If that is what this is, say so and
+        # say what fixes it.
+        $message = $_.Exception.Message
+        if ($message -match 'console mode|handle is invalid') {
+            $refused.Detail = 'This machine''s bridge daemon has lost its console handle, so it cannot start an isolated worktree. Nothing is wrong with the repository. Restart the daemon (agent-ha-bridge restart) and try again.'
+        }
+        else {
+            $refused.Detail = "Could not provide requested isolation: $message"
+        }
         $refused
     }
     finally {
