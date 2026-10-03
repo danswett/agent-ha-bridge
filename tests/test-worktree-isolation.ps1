@@ -286,6 +286,43 @@ try {
     Test-That 'while an ordinary explicitly configured folder remains available' {
         @($withDiscovery | Where-Object { $_.Path -eq $notRepo }).Count -eq 1
     }
+
+    Write-Host '--- the daemon is given no console to lose ---'
+    # A console inherited from an interactive session outlives nothing: when the session
+    # is disconnected, or the short-lived process that started the daemon exits, the
+    # handle stops resolving and PowerShell throws on anything reaching console plumbing.
+    # The first thing to hit it was this very feature - launching into an isolate
+    # workspace - and the message named git rather than the console. Seen on two
+    # machines, one running an unmodified release.
+    $supervisorAst = [Management.Automation.Language.Parser]::ParseFile(
+        (Join-Path $PSScriptRoot '..\hooks\agent-bridge-supervisor.ps1'), [ref]$null, [ref]$null)
+    $supervisorAssignments = @($supervisorAst.FindAll({
+        param($node) $node -is [Management.Automation.Language.AssignmentStatementAst]
+    }, $true) | ForEach-Object { $_.Extent.Text })
+
+    Test-That 'the supervisor starts the daemon with CreateNoWindow' {
+        @($supervisorAssignments | Where-Object { $_ -match '\$start\.CreateNoWindow\s*=\s*\$true' }).Count -eq 1
+    }
+    Test-That 'and not WindowStyle, which is ignored when UseShellExecute is false' {
+        @($supervisorAssignments | Where-Object { $_ -match '\$start\.WindowStyle' }).Count -eq 0
+    }
+    Test-That 'while still avoiding ShellExecute, which would make a window of its own' {
+        @($supervisorAssignments | Where-Object { $_ -match '\$start\.UseShellExecute\s*=\s*\$false' }).Count -eq 1
+    }
+
+    Test-That 'a lost console handle is reported as that, not as a repository problem' {
+        # Thrown from `fetch` rather than the first `rev-parse`: that one runs before the
+        # try, so a failure there escapes to the daemon's own catch and is reported
+        # differently. The case being pinned here is the one actually observed.
+        function Invoke-BridgeGit { param($Directory, $Arguments, $IndexFile)
+            if (@($Arguments)[0] -eq 'rev-parse') { return [pscustomobject]@{ Ok = $true; Output = $repo; Code = 0 } }
+            throw 'The Win32 internal error "The handle is invalid." 0x6 occurred while getting the console mode. Contact Microsoft Customer Support Services.' }
+        try { $consoleRefusal = New-BridgeSessionWorktree -RepositoryPath $repo }
+        finally { Remove-Item -Path Function:\Invoke-BridgeGit -ErrorAction SilentlyContinue }
+        -not $consoleRefusal.Isolated -and
+            $consoleRefusal.Detail -like '*lost its console handle*' -and
+            $consoleRefusal.Detail -like '*agent-ha-bridge restart*'
+    }
 }
 finally {
     function Get-BridgeDiscoveredWorkspaces { @() }
