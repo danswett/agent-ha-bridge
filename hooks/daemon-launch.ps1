@@ -574,11 +574,198 @@ function Get-DaemonResumableSessions {
         if (-not [string]::IsNullOrWhiteSpace($id)) { $live[[string]$id] = $true }
     }
 
-    @(@($script:DaemonResumeCache) | Where-Object {
+    $offered = @(@($script:DaemonResumeCache) | Where-Object {
         -not $live.ContainsKey([string]$_.SessionId) -and
         $_.PSObject.Properties['Folder'] -and
         (Test-BridgeWorkspacePathApproved -Path ([string]$_.Folder))
     })
+    # Remembered so the global status publishes exactly what this dropdown offers,
+    # rather than recomputing and risking the two drifting apart.
+    $script:DaemonResumeOffered = $offered
+    $offered
+}
+
+function Get-DaemonMergedResumable {
+    <#
+        The whole resume list this machine offers: its own sessions, then any a peer is
+        sharing, each carrying the Label the selector shows.
+
+        This is the only place the two are joined, and it is joined before the list is
+        used for anything. The selector is published from it and a press is resolved
+        against it, so a merged display and a local-only resolution would produce options
+        that match nothing - reported on the card as "no longer resumable", which is both
+        wrong and unhelpful.
+
+        A peer being unreadable is not a failure: it means no remote entries this pass.
+        The local list is never withheld because a peer scan failed.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Live,
+        [hashtable]$Headers = @{}
+    )
+
+    $local = @(Get-DaemonResumableSessions -LiveSessionIds @($Live.Keys))
+
+    $remote = @()
+    try {
+        $peers = @(Get-DaemonPeerMachines -Headers $Headers)
+        if ($peers.Count -gt 0) {
+            $remote = @(Get-DaemonRemoteResumable -Peers $peers `
+                -ExcludeIds @(@($local | ForEach-Object { [string]$_.SessionId }) + @($Live.Keys)))
+        }
+    }
+    catch {
+        Write-DaemonLog -Message "peer resumable scan failed: $($_.Exception.Message)"
+    }
+
+    # Labels have to be unique: Home Assistant matches a selector's state against its
+    # options by exact string, so two identical labels are two sessions that cannot be
+    # told apart, and the second would silently resolve to the first.
+    $seen = @{}
+    foreach ($entry in @($local)) {
+        if ($entry.PSObject.Properties['Label']) { $seen[[string]$entry.Label] = $true }
+    }
+    $labelled = foreach ($entry in @($remote)) {
+        $label = Get-DaemonRemoteResumeLabel -Entry $entry
+        if ($seen.ContainsKey($label)) { continue }
+        $seen[$label] = $true
+        $entry | Add-Member -NotePropertyName 'Label' -NotePropertyValue $label -Force -PassThru
+    }
+
+    @($local) + @($labelled)
+}
+
+function Get-DaemonRemoteResumable {
+    <#
+        Sessions on other machines, as display-only entries for this machine's resume
+        list.
+
+        Every entry is marked Remote, and nothing here is launchable: moving a transcript
+        between machines is not implemented, so choosing one of these has to refuse. They
+        are listed anyway because knowing a session exists elsewhere is most of the value
+        - it answers "where did I leave that?" without walking to the other desk.
+
+        Only online peers contribute. A machine that is switched off keeps publishing its
+        last list by retention, and offering sessions from a machine that cannot answer
+        would be showing a list that nothing can correct.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Peers,
+        [AllowEmptyCollection()][string[]]$ExcludeIds = @()
+    )
+
+    $seen = @{}
+    foreach ($id in @($ExcludeIds)) {
+        if (-not [string]::IsNullOrWhiteSpace($id)) { $seen[[string]$id] = $true }
+    }
+
+    $out = foreach ($peer in @($Peers)) {
+        if ($null -eq $peer) { continue }
+        # Every field here arrives from another machine via JSON, so each is checked
+        # rather than assumed. A malformed or truncated peer payload must contribute
+        # nothing, not throw inside the reconcile that reads it.
+        if (-not $peer.PSObject.Properties['IsSelf'] -or $peer.IsSelf) { continue }
+        if (-not $peer.PSObject.Properties['Online'] -or -not $peer.Online) { continue }
+
+        $caps = if ($peer.PSObject.Properties['Capabilities']) { $peer.Capabilities } else { $null }
+        # Explicitly $true, not merely truthy: a non-empty string or a non-zero number
+        # arriving where a boolean was expected should not read as consent to share.
+        $shares = $false
+        if ($null -ne $caps -and $caps.PSObject.Properties['resumeShare']) {
+            $shares = ($caps.resumeShare -is [bool] -and $caps.resumeShare)
+        }
+        if (-not $shares) { continue }
+        if (-not $peer.PSObject.Properties['Resumable']) { continue }
+
+        foreach ($entry in @($peer.Resumable)) {
+            if ($null -eq $entry -or -not $entry.PSObject.Properties['id']) { continue }
+            $id = [string]$entry.id
+            if ([string]::IsNullOrWhiteSpace($id) -or $seen.ContainsKey($id)) { continue }
+            $seen[$id] = $true
+
+            $launcher = ''
+            if ($entry.PSObject.Properties['launcher']) { $launcher = [string]$entry.launcher }
+            $updated = [DateTimeOffset]::MinValue
+            if ($entry.PSObject.Properties['updated']) {
+                $parsed = [DateTimeOffset]::MinValue
+                if ([DateTimeOffset]::TryParse([string]$entry.updated, [ref]$parsed)) { $updated = $parsed }
+            }
+            # Present only when that machine opted into sharing detail; absent is the
+            # default and must render sensibly rather than as an empty gap.
+            $title = ''
+            if ($entry.PSObject.Properties['title']) { $title = [string]$entry.title }
+            $leaf = ''
+            if ($entry.PSObject.Properties['leaf']) { $leaf = [string]$entry.leaf }
+
+            [pscustomobject]@{
+                SessionId = $id
+                Launcher  = $launcher
+                Summary   = $title
+                Folder    = ''          # never published, and never guessed from a leaf
+                Leaf      = $leaf
+                Updated   = $updated
+                Remote    = $true
+                Machine   = if ($peer.PSObject.Properties['Machine']) { [string]$peer.Machine } else { '' }
+                Slug      = if ($peer.PSObject.Properties['Slug']) { [string]$peer.Slug } else { '' }
+            }
+        }
+    }
+    @($out)
+}
+
+function Test-DaemonRemoteResumeRefused {
+    <#
+        True when a chosen resume entry belongs to another machine, having refused it on
+        the card. The whole guard, in one testable place.
+
+        It must run before the workspace check and outside the try that reads the
+        selector, because neither would stop it. Two machines can have the same approved
+        path - C:\Users\dswett\repos exists on more than one here - so a remote entry can
+        pass the folder check on its own merits, and that try's catch is empty.
+
+        What makes this safety-critical rather than tidy: if a remote entry reaches the
+        launcher, it arrives as `--session-id <id>` with no transcript on disk, and
+        Copilot answers that by silently starting a *new, empty* session under that id
+        and exiting 0. The daemon then adopts it as though the resume had worked, and the
+        fleet has two different conversations sharing one identity with nothing logged
+        anywhere. Claude and Codex fail outright - `No conversation found` and
+        `no rollout found for thread id` - so this exists for the one that does not.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Entry,
+        [AllowEmptyString()][string]$Label = '',
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    if (-not $Entry.PSObject.Properties['Remote'] -or -not $Entry.Remote) { return $false }
+
+    $where = if ($Entry.PSObject.Properties['Machine'] -and $Entry.Machine) { [string]$Entry.Machine } else { 'another machine' }
+    Write-DaemonLog -Message "resume refused: '$Label' belongs to $where and cannot be opened here"
+    Set-CopilotMqttNewSessionResult -Headers $Headers `
+        -Text "That session is on $where. Resuming it here isn't supported yet - open it there, or start a new session." | Out-Null
+    $true
+}
+
+function Get-DaemonRemoteResumeLabel {
+    <#
+        The dropdown label for a session on another machine.
+
+        It says where the session is and that it cannot be opened from here, because the
+        alternative is an option that looks ordinary, is chosen, and then refuses - which
+        reads as a bug rather than as a limit. The short id is always present: without
+        shared detail it is the only thing distinguishing two entries.
+    #>
+    param([Parameter(Mandatory)][object]$Entry)
+
+    $short = [string]$Entry.SessionId
+    if ($short.Length -gt 8) { $short = $short.Substring(0, 8) }
+    $agent = if ($Entry.Launcher) { Get-BridgeLauncherLabel -Launcher ([string]$Entry.Launcher) } else { 'Session' }
+
+    $what = if ($Entry.Summary) { [string]$Entry.Summary } elseif ($Entry.Leaf) { [string]$Entry.Leaf } else { $short }
+    $label = "$agent on $($Entry.Machine): $what"
+    if ($Entry.Summary -or $Entry.Leaf) { $label = "$label ($short)" }
+    if ($label.Length -gt 110) { $label = $label.Substring(0, 107) + '...' }
+    "$label - not available here"
 }
 
 # Which daemon entity drives each tuning axis. Spelled out rather than derived from
@@ -821,7 +1008,7 @@ function Get-DaemonNewSessionControls {
         Profiles   = $profiles
         TuningFor  = $tuningFor
         Tuning     = $tuning
-        Resumable  = @(Get-DaemonResumableSessions -LiveSessionIds @($Live.Keys))
+        Resumable  = @(Get-DaemonMergedResumable -Live $Live -Headers $Headers)
     }
 }
 
@@ -1101,6 +1288,9 @@ function Resolve-DaemonLaunchRequest {
     }
     catch { }
     if ($null -ne $resumeSession) {
+        # A session on another machine, offered so it can be seen, never so it can be
+        # launched: its transcript is not here.
+        if (Test-DaemonRemoteResumeRefused -Entry $resumeSession -Label $resumeLabel -Headers $Headers) { return $null }
         if (-not $resumeSession.PSObject.Properties['Folder'] -or
             -not (Test-BridgeWorkspacePathApproved -Path ([string]$resumeSession.Folder))) {
             Write-DaemonLog -Message 'resume refused: its working directory is missing or no longer approved'

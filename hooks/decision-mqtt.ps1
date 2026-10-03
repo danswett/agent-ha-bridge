@@ -1044,6 +1044,13 @@ function Publish-CopilotMqttGlobalStatus {
         # it correctly without knowing anything about how it is configured.
         [hashtable]$Capabilities = @{},
 
+        # Sessions this machine could reopen, so another machine can show them. Already
+        # reduced and bounded by the caller: this publishes what it is given and makes
+        # no judgement about what may travel, because deciding that belongs with the
+        # machine that owns the sessions rather than with the transport.
+        [AllowEmptyCollection()]
+        [object[]]$Resumable = @(),
+
         [string]$Slug,
 
         [string]$MachineName,
@@ -1080,6 +1087,7 @@ function Publish-CopilotMqttGlobalStatus {
         machine = $MachineName
         machine_slug = $Slug
         capabilities = $Capabilities
+        resumable = @($Resumable)
         updated = [DateTimeOffset]::Now.ToString('o')
     } | ConvertTo-Json -Depth 6 -Compress) -Headers $Headers -Retain
 }
@@ -1205,11 +1213,18 @@ function Get-BridgePeerMachine {
         $machine = ''
         $sessions = @()
         $capabilities = @{}
+        $resumable = @()
         if ($null -ne $attributes) {
             if ($attributes.PSObject.Properties.Name -contains 'machine') { $machine = [string]$attributes.machine }
             if ($attributes.PSObject.Properties.Name -contains 'sessions') { $sessions = @($attributes.sessions) }
             if ($attributes.PSObject.Properties.Name -contains 'capabilities' -and $null -ne $attributes.capabilities) {
                 $capabilities = $attributes.capabilities
+            }
+            # Absent on a machine running a bridge from before sessions were shared,
+            # which simply means it offers none - the same shape as a machine that has
+            # chosen not to share any.
+            if ($attributes.PSObject.Properties.Name -contains 'resumable' -and $null -ne $attributes.resumable) {
+                $resumable = @($attributes.resumable)
             }
         }
         # An older machine's sensor predates the machine attribute, so fall back to the
@@ -1221,6 +1236,7 @@ function Get-BridgePeerMachine {
             Machine = $machine
             Sessions = @($sessions)
             Capabilities = $capabilities
+            Resumable = @($resumable)
             Online = [bool]$online[$slug]
             IsSelf = ($slug -eq $self)
             EntityId = $entityId

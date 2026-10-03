@@ -260,7 +260,7 @@ function Invoke-HomeAssistantService { param($Domain, $Service, $Headers, $Data)
 function Start-Sleep { param($Milliseconds, $Seconds) }
 function Get-LiveMcpSessions { param($Headers) @{} }
 function Get-DaemonPeerMachines { param($Headers) @() }
-function Publish-CopilotMqttGlobalStatus { param($Headers, $Capabilities, $Sessions) $script:GlobalSessions = @($Sessions) }
+function Publish-CopilotMqttGlobalStatus { param($Headers, $Capabilities, $Sessions, $Resumable) $script:GlobalSessions = @($Sessions) }
 function Publish-CopilotMqttMachineHeartbeat { param($Slug, $Headers) }
 function Get-BridgeServedReplyCardUrl { '' }
 function Set-CopilotMqttGlobalEntityId { $true }

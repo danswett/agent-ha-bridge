@@ -386,7 +386,8 @@ function Sync-DaemonSessions {
 
     $descriptors = @(Get-DaemonSessionDescriptors -State $State -Headers $Headers)
     $capabilities = Get-DaemonLaunchCapabilities
-    Publish-DaemonGlobalStatus -Descriptors $descriptors -Capabilities $capabilities -Headers $Headers
+    Publish-DaemonGlobalStatus -Descriptors $descriptors -Capabilities $capabilities `
+        -Resumable @($script:DaemonResumeOffered) -Headers $Headers
     Publish-DaemonOnlineHeartbeat -Headers $Headers
     $dashboardCurrent = Sync-DaemonDashboard -Descriptors $descriptors -Capabilities $capabilities -Headers $Headers
     Complete-DaemonSessionRetirement -Gone $goneSessions -DashboardCurrent $dashboardCurrent -Headers $Headers
@@ -792,6 +793,11 @@ function Get-DaemonLaunchCapabilities {
         # report it gets no toggle rather than a row pointing at a helper that does
         # not exist.
         detailed   = $true
+        # Sessions this machine is willing to let other machines see in their own resume
+        # list. Default OFF pending an explicit consent and retention decision: a peer
+        # that does not report it publishes nothing, which is also exactly what an older
+        # bridge looks like, so neither needs a special case.
+        resumeShare = [bool]($newSessionEnabled -and (Test-DaemonSharingEnabled -Name 'newSession.shareResumable'))
         # Installed from a working copy rather than a release. VERSION only moves when
         # a release is cut, so without this a machine running the source and one
         # running the release show the same number while being days apart.
@@ -813,15 +819,34 @@ function Publish-DaemonGlobalStatus {
         read to learn what it is running, which is why the capability flags travel
         with it: a peer has no other way to know whether to draw a profile or resume
         row on this machine's launch card.
+
+        The resumable list rides here for the same reason, and joins the signature so
+        that a session ending or being reopened republishes rather than waiting out the
+        re-assert interval.
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Descriptors,
         [Parameter(Mandatory)][hashtable]$Capabilities,
+        [AllowEmptyCollection()][object[]]$Resumable = @(),
         [Parameter(Mandatory)][hashtable]$Headers
     )
 
+    $export = @(Get-DaemonResumableExport -Resumable $Resumable)
+
+    # The exported content itself, plus the flags that shape it. An earlier draft bound
+    # only id@updated, which meant turning detail off - or sharing off entirely - left
+    # the previously published titles and leaves sitting in a retained message until the
+    # re-assert interval happened to come round. A privacy change has to take effect when
+    # it is made, so what is actually published is what is signed.
+    $shareOn = Test-DaemonSharingEnabled -Name 'newSession.shareResumable'
+    $detailOn = Test-DaemonSharingEnabled -Name 'newSession.shareResumableDetail'
+    $resumeSignature = "share=$shareOn;detail=$detailOn;" + (@($export | ForEach-Object {
+        (ConvertTo-Json $_ -Depth 4 -Compress)
+    }) -join '|')
+
     $globalSignature = (($Descriptors | ForEach-Object { "$($_.Node)=$($_.Name)=$($_.Machine)" }) -join '|') +
-        "#$($Capabilities.newSession)$($Capabilities.profile)$($Capabilities.resume)$($Capabilities.agent)$($Capabilities.tuning)$($Capabilities.detailed)$($Capabilities.dev)"
+        "#$($Capabilities.newSession)$($Capabilities.profile)$($Capabilities.resume)$($Capabilities.agent)$($Capabilities.tuning)$($Capabilities.detailed)$($Capabilities.dev)" +
+        "#$resumeSignature"
     $globalStale = ([DateTimeOffset]::Now - $script:DaemonGlobalLastPublish).TotalSeconds -ge $script:DaemonConfig.GlobalReassertSeconds
     if ($globalSignature -ne $script:DaemonGlobalSignature -or $globalStale) {
         try {
@@ -829,7 +854,7 @@ function Publish-DaemonGlobalStatus {
                 $Descriptors | ForEach-Object {
                     @{ name = $_.Name; machine = $_.Machine; node = $_.Node; kind = [string]$_.Kind }
                 }
-            )
+            ) -Resumable $export
             $script:DaemonGlobalSignature = $globalSignature
             $script:DaemonGlobalLastPublish = [DateTimeOffset]::Now
         }
@@ -837,6 +862,120 @@ function Publish-DaemonGlobalStatus {
             Write-DaemonLog -Message "global status publish failed: $($_.Exception.Message)"
         }
     }
+}
+
+function Test-DaemonSharingEnabled {
+    <#
+        Whether a sharing flag is actually set, from a configuration file that can hold
+        anything.
+
+        `[bool]` is the wrong tool and was the bug here: in PowerShell every non-empty
+        string is true, so `[bool]'false'` is $true and a config holding the *string*
+        "false" switched sharing on. The peer side already refused a non-boolean
+        resumeShare as "not consent"; the producer was reading its own settings the loose
+        way, which is the same mistake pointing outward.
+
+        So: a real boolean is taken as given, a string is parsed as a boolean and only a
+        genuine "true" counts, and anything else - a number, a list, a typo - is not
+        consent. A consent flag has to fail closed on anything it does not understand.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Name,
+        [bool]$Default = $false
+    )
+
+    $raw = Get-BridgeSetting $Name $Default
+    if ($raw -is [bool]) { return $raw }
+    if ($raw -is [string]) {
+        $parsed = $false
+        if ([bool]::TryParse($raw.Trim(), [ref]$parsed)) { return $parsed }
+    }
+    $false
+}
+
+function Get-DaemonResumableExport {
+    <#
+        The resumable entries as they travel to other machines, reduced to the least
+        that still identifies a session - and nothing at all when sharing is off.
+
+        Sharing off is a *producer* decision, not a consumer one. An earlier draft only
+        withheld the capability flag, which told well-behaved peers to ignore the array
+        while still publishing it, retained, for anything else to read. Opting out has to
+        stop the data leaving, so this returns empty and the caller publishes that empty
+        array, replacing whatever was retained before.
+
+        Deliberately not the local entry even when sharing is on. A summary is the user's
+        own prompt text and a folder is an absolute path; publishing either, retained,
+        puts it in every peer's reach and in the recorder and backups for as long as those
+        are kept. The local dropdown already shows them on the machine they belong to,
+        which is not the same decision as broadcasting them to the fleet.
+
+        So the default payload carries no prompt text and no path at all: an id, which is
+        needed to resume anything, the agent that owns it, and when it last changed. A
+        peer renders "Copilot on DASDESK - 4252da87", enough to choose between sessions
+        without describing what they were about.
+
+        'newSession.shareResumableDetail' opts in to a bounded title and the folder's last
+        segment - never the path. Both flags default OFF pending an explicit consent and
+        retention decision; nothing here is an assertion that publishing even the minimal
+        payload has been agreed.
+
+        The whole array is bounded as well as each entry, because this rides a retained
+        attribute: a machine with hundreds of sessions must not publish hundreds.
+    #>
+    param([AllowEmptyCollection()][object[]]$Resumable = @())
+
+    if (-not (Test-DaemonSharingEnabled -Name 'newSession.shareResumable')) { return @() }
+
+    $detail = Test-DaemonSharingEnabled -Name 'newSession.shareResumableDetail'
+    # Settings arrive from a config file and may be anything. A non-numeric or negative
+    # count must mean "none", not an exception inside the publish path.
+    $max = 0
+    if (-not [int]::TryParse([string](Get-BridgeSetting 'newSession.resumeCount' 12), [ref]$max)) { $max = 12 }
+    if ($max -le 0) { return @() }
+
+    $out = [System.Collections.Generic.List[object]]::new()
+    foreach ($entry in @($Resumable)) {
+        if ($null -eq $entry) { continue }
+        if ($out.Count -ge $max) { break }
+        if (-not $entry.PSObject.Properties['SessionId']) { continue }
+        $id = [string]$entry.SessionId
+        if ([string]::IsNullOrWhiteSpace($id)) { continue }
+
+        $updated = [DateTimeOffset]::MinValue
+        if ($entry.PSObject.Properties['Updated'] -and $entry.Updated -is [DateTimeOffset]) { $updated = $entry.Updated }
+
+        $item = @{
+            id       = $id
+            launcher = if ($entry.PSObject.Properties['Launcher']) { [string]$entry.Launcher } else { '' }
+            updated  = $updated.ToString('o')
+        }
+        if ($detail) {
+            $title = ''
+            if ($entry.PSObject.Properties['Summary']) { $title = ([string]$entry.Summary -replace '\s+', ' ').Trim() }
+            if ($title.Length -gt 48) { $title = $title.Substring(0, 45) + '...' }
+            if ($title) { $item['title'] = $title }
+            # The leaf only. A full path names a user, a tree and often a customer.
+            $folder = ''
+            if ($entry.PSObject.Properties['Folder']) { $folder = [string]$entry.Folder }
+            if (-not [string]::IsNullOrWhiteSpace($folder)) {
+                $item['leaf'] = @($folder.TrimEnd('\', '/') -split '[\\/]')[-1]
+            }
+        }
+        $out.Add($item)
+    }
+
+    # Encoded size is what the broker and the recorder actually see, so it is what is
+    # measured - not the entry count, which says nothing about the bytes.
+    $budget = 0
+    if (-not [int]::TryParse([string](Get-BridgeSetting 'newSession.shareResumableMaxBytes' 4096), [ref]$budget)) { $budget = 4096 }
+    if ($budget -le 0) { return @() }
+    while ($out.Count -gt 0) {
+        $encoded = [Text.Encoding]::UTF8.GetByteCount((ConvertTo-Json @($out) -Depth 4 -Compress))
+        if ($encoded -le $budget) { break }
+        $out.RemoveAt($out.Count - 1)
+    }
+    @($out)
 }
 
 function Publish-DaemonOnlineHeartbeat {

@@ -256,6 +256,12 @@ $script:DaemonNewSessionLastPress = ''
 $script:DaemonResumeCache = @()
 $script:DaemonResumeCacheAt = [DateTimeOffset]::MinValue
 
+# What the resume dropdown last actually offered - the cache above after the live and
+# approved-workspace filters. Published so other machines can show these sessions too,
+# and kept here rather than recomputed so the list a peer sees is exactly the list this
+# machine's own dropdown shows. Initialised for StrictMode, as above.
+$script:DaemonResumeOffered = @()
+
 # Decisions already reported as terminal-only, so the daemon says it once per
 # question instead of on every reconcile. Initialised for StrictMode.
 $script:DaemonTerminalOnlyWarned = @{}
