@@ -1190,7 +1190,7 @@ actually used: a REST stub does not authorize a WebSocket or discovery request.
 Logs and a machine-readable `summary.json` are kept in the printed results directory
 (or a new `-ResultsDirectory` you supply). Failures and per-suite timeouts fail the
 run; missing prerequisites are reported as explicit skips, not hidden passes.
-The default timeout is 180 seconds per suite. This is a test harness for reviewed
+The default timeout is 300 seconds per suite. This is a test harness for reviewed
 fixtures, not a general OS sandbox.
 
 Installer-command tests are in the separate **Host** group. They run on disposable
