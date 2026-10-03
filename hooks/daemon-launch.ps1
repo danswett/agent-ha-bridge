@@ -637,17 +637,16 @@ function Get-DaemonMergedResumable {
 
 function Get-DaemonRemoteResumable {
     <#
-        Sessions on other machines, as display-only entries for this machine's resume
-        list.
+        Sessions on other machines, as entries for this machine's resume list.
 
-        Every entry is marked Remote, and nothing here is launchable: moving a transcript
-        between machines is not implemented, so choosing one of these has to refuse. They
-        are listed anyway because knowing a session exists elsewhere is most of the value
-        - it answers "where did I leave that?" without walking to the other desk.
+        Every entry is marked Remote. Choosing one brings its transcript across and
+        opens it here under an id of its own; the machine it came from keeps its copy
+        untouched. Listing them is most of the value even before that - it answers
+        "where did I leave that?" without walking to the other desk.
 
-        Only online peers contribute. A machine that is switched off keeps publishing its
-        last list by retention, and offering sessions from a machine that cannot answer
-        would be showing a list that nothing can correct.
+        Only online peers contribute. A machine that is switched off keeps publishing
+        its last list by retention, and offering sessions from a machine that cannot
+        answer a request would be showing a list nothing can correct.
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Peers,
@@ -731,6 +730,14 @@ function Invoke-DaemonTransferRequest {
         [Parameter(Mandatory)][hashtable]$Headers
     )
 
+    # Serving is sharing, and it was not gated at all: this ran on every reconcile
+    # regardless of newSession.enabled or either sharing flag, so a machine that had
+    # opted out entirely would still hand over a transcript to anything able to publish
+    # one retained message. Checked with the strict reader, because [bool]'false' is
+    # $true and a config saying "false" must not read as consent.
+    if (-not (Test-DaemonSharingEnabled -Name 'newSession.enabled' -Default $true)) { return }
+    if (-not (Test-DaemonSharingEnabled -Name 'newSession.shareResumable')) { return }
+
     $entity = Get-BridgeMachineEntityId -Domain 'sensor' -Key 'transfer_request' -Slug $script:DaemonMachineSlug
     $request = $null
     try { $request = (Get-HomeAssistantState -EntityId $entity -Headers $Headers).attributes } catch { return }
@@ -742,10 +749,30 @@ function Invoke-DaemonTransferRequest {
     # Retained, so a request already served would be served again every pass.
     if ($correlation -eq $script:DaemonTransferServed) { return }
 
+    # A retained request outlives the daemon that served it: the served-correlation is
+    # process-local, so without a freshness window every restart re-sends whatever was
+    # last asked for - and an update restarts the daemon.
+    $at = [DateTimeOffset]::MinValue
+    if ($request.PSObject.Properties['at']) { [void][DateTimeOffset]::TryParse([string]$request.at, [ref]$at) }
+    if (([DateTimeOffset]::Now - $at).TotalMinutes -gt 10) {
+        $script:DaemonTransferServed = $correlation
+        try { Clear-CopilotMqttTransferRequest -Slug $script:DaemonMachineSlug -Headers $Headers } catch { }
+        return
+    }
+
     $launcher = if ($request.PSObject.Properties['launcher']) { [string]$request.launcher } else { 'copilot' }
     $requester = if ($request.PSObject.Properties['requester']) { [string]$request.requester } else { '' }
+    if ($requester -notmatch '^[a-z0-9_]+$') { return }
 
     try {
+        # Only what this machine actually offered. The approved-workspace filter that
+        # decides what is *listed* was not a filter on what could be *taken*: without
+        # this, any id present in the agent home could be asked for by name, including
+        # sessions from directories deliberately left out of the resume list.
+        if (@($script:DaemonResumeOffered | ForEach-Object { [string]$_.SessionId }) -notcontains $session) {
+            Write-DaemonLog -Message "transfer refused: $session is not one this machine offers"
+            return
+        }
         # A session being written to right now would be bundled mid-sentence.
         if (@($LiveSessionIds) -contains $session) {
             Write-DaemonLog -Message "transfer refused: $session is live here"
@@ -810,15 +837,21 @@ function Receive-DaemonSessionTransfer {
     try {
         New-Item -ItemType Directory -Path $staging -Force | Out-Null
 
-        Set-CopilotMqttTransferRequest -Slug $owner -SessionId $session -Launcher ([string]$Entry.Launcher) `
-            -Requester $script:DaemonMachineSlug -Correlation $correlation -Headers $Headers
-
-        $messages = @(Read-BridgeHaMqttSubscription -Topic "$root/#" -TimeoutSeconds $TimeoutSeconds -Until {
-            param($all)
-            $m = @($all) | Where-Object { $_.PSObject.Properties['sha256'] } | Select-Object -First 1
-            if ($null -eq $m) { return $false }
-            @(@($all) | Where-Object { $_.PSObject.Properties['d'] }).Count -ge [int]$m.chunks
-        })
+        # Asked for only once the subscription is actually live. Nothing in a transfer
+        # is retained, so a request published first can be answered into a socket that
+        # does not exist yet - and the owner would have burned the correlation and
+        # cleared the request by the time this started listening.
+        $messages = @(Read-BridgeHaMqttSubscription -Topic "$root/#" -TimeoutSeconds $TimeoutSeconds `
+            -OnReady {
+                Set-CopilotMqttTransferRequest -Slug $owner -SessionId $session -Launcher ([string]$Entry.Launcher) `
+                    -Requester $script:DaemonMachineSlug -Correlation $correlation -Headers $Headers
+            } `
+            -Until {
+                param($all)
+                $m = @($all) | Where-Object { $_.PSObject.Properties['sha256'] } | Select-Object -First 1
+                if ($null -eq $m) { return $false }
+                @(@($all) | Where-Object { $_.PSObject.Properties['d'] }).Count -ge [int]$m.chunks
+            })
 
         $manifest = @($messages) | Where-Object { $_.PSObject.Properties['sha256'] } | Select-Object -First 1
         if ($null -eq $manifest) {
@@ -828,8 +861,19 @@ function Receive-DaemonSessionTransfer {
             return $null
         }
 
+        $declared = [int]$manifest.bytes
+        # The sender's arithmetic is not trusted - the digest is re-checked for exactly
+        # that reason, so the size should not get a free pass. A manifest claiming two
+        # gigabytes would otherwise allocate two gigabytes before the incomplete-bundle
+        # throw, on nothing more than a peer's say-so.
+        $cap = 0
+        if (-not [int]::TryParse([string](Get-BridgeSetting 'newSession.transferMaxBytes' 26214400), [ref]$cap)) { $cap = 26214400 }
+        if ($declared -le 0 -or $declared -gt $cap) {
+            throw "that session is $([int]($declared / 1MB)) MB, which is over the limit for a transfer"
+        }
+
         $bytes = Join-BridgeBundleChunk -Chunks @(@($messages) | Where-Object { $_.PSObject.Properties['d'] }) `
-            -TotalBytes ([int]$manifest.bytes) -Sha256 ([string]$manifest.sha256)
+            -TotalBytes $declared -Sha256 ([string]$manifest.sha256)
         $zip = Join-Path $staging 'bundle.zip'
         [IO.File]::WriteAllBytes($zip, $bytes)
 
@@ -876,7 +920,7 @@ function Resolve-DaemonRemoteResume {
 
     $where = if ($Entry.PSObject.Properties['Machine'] -and $Entry.Machine) { [string]$Entry.Machine } else { 'another machine' }
 
-    if (-not [bool](Get-BridgeSetting 'newSession.transferResumable' $false)) {
+    if (-not (Test-DaemonSharingEnabled -Name 'newSession.transferResumable')) {
         Write-DaemonLog -Message "resume refused: bringing sessions between machines is off"
         Set-CopilotMqttNewSessionResult -Headers $Headers `
             -Text "That session is on $where. Set newSession.transferResumable to bring it here." | Out-Null
@@ -942,16 +986,24 @@ function Resolve-DaemonRemoteResume {
 }
 
 function Get-DaemonRemoteResumeWorkspace {
-    <# The approved directory a transferred session should open in, or '' when none is chosen. #>
+    <#
+        The approved directory a transferred session should open in, or '' when the
+        selector does not name one.
+
+        No silent fallback to the first workspace. A transfer writes a transcript into
+        this machine's agent home and opens it somewhere; which directory that is should
+        be what the person chose, not whatever happens to sort first because a state read
+        failed or the row was never touched.
+    #>
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Workspaces,
         [Parameter(Mandatory)][hashtable]$Headers
     )
 
     $label = ''
-    try { $label = [string](Get-HomeAssistantState -EntityId $script:DaemonEntity.NewWorkspace -Headers $Headers).state } catch { }
+    try { $label = [string](Get-HomeAssistantState -EntityId $script:DaemonEntity.NewWorkspace -Headers $Headers).state } catch { return '' }
+    if ([string]::IsNullOrWhiteSpace($label) -or $label -in @('unknown', 'unavailable')) { return '' }
     $choice = @($Workspaces) | Where-Object { [string]$_.Label -eq $label } | Select-Object -First 1
-    if ($null -eq $choice) { $choice = @($Workspaces) | Select-Object -First 1 }
     if ($null -eq $choice) { return '' }
     if (-not (Test-BridgeWorkspacePathApproved -Path ([string]$choice.Path))) { return '' }
     [string]$choice.Path
@@ -961,10 +1013,10 @@ function Get-DaemonRemoteResumeLabel {
     <#
         The dropdown label for a session on another machine.
 
-        It says where the session is and that it cannot be opened from here, because the
-        alternative is an option that looks ordinary, is chosen, and then refuses - which
-        reads as a bug rather than as a limit. The short id is always present: without
-        shared detail it is the only thing distinguishing two entries.
+        It names the machine because that is the useful fact: the session can be opened
+        here, but doing so brings its transcript across, and someone choosing between
+        two similar entries should be able to see which is which. The short id is always
+        present - without shared detail it is the only thing distinguishing two entries.
     #>
     param([Parameter(Mandatory)][object]$Entry)
 
@@ -976,7 +1028,7 @@ function Get-DaemonRemoteResumeLabel {
     $label = "$agent on $($Entry.Machine): $what"
     if ($Entry.Summary -or $Entry.Leaf) { $label = "$label ($short)" }
     if ($label.Length -gt 110) { $label = $label.Substring(0, 107) + '...' }
-    "$label - not available here"
+    $label
 }
 
 # Which daemon entity drives each tuning axis. Spelled out rather than derived from

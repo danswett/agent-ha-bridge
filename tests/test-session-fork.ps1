@@ -22,6 +22,10 @@ Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
 $env:AGENT_BRIDGE_DAEMON_NORUN = '1'
+# decision-bridge-common too: the bundle spec sanitises the session id with
+# Get-CopilotSafeSessionKey, which lives there. The daemon loads them together, and a
+# test loading only one would pass on a function that cannot run in production.
+. (Join-Path $PSScriptRoot '..\hooks\decision-bridge-common.ps1')
 . (Join-Path $PSScriptRoot '..\hooks\session-launch.ps1')
 
 $script:Failures = 0
@@ -127,6 +131,42 @@ try {
     $threw = $false
     try { Install-BridgeSessionBundle -BundlePath (Join-Path $out 'does-not-exist.zip') -Manifest $manifest | Out-Null } catch { $threw = $true }
     Test-That 'a missing bundle refuses too' { $threw }
+
+    # The reviewer's case: a digest proves the archive arrived intact, not that there
+    # was a session in it. An empty-but-valid archive used to create the directory and
+    # hand back an id - and Copilot against an empty directory starts a new empty
+    # session and exits 0, which is the fail-open this whole design exists to avoid.
+    $emptyStage = Join-Path $root 'empty-stage'
+    New-Item -ItemType Directory -Path $emptyStage -Force | Out-Null
+    $emptyZip = Join-Path $out 'empty.zip'
+    [IO.Compression.ZipFile]::CreateFromDirectory($emptyStage, $emptyZip, [IO.Compression.CompressionLevel]::Optimal, $false)
+    $emptyManifest = [pscustomobject]@{
+        SessionId = $oldId; Kind = 'copilot'
+        Sha256 = (Get-FileHash -LiteralPath $emptyZip -Algorithm SHA256).Hash
+    }
+    $before = @(Get-ChildItem -LiteralPath (Join-Path $target 'session-state') -Directory -ErrorAction SilentlyContinue).Count
+    $threw = $false
+    try { Install-BridgeSessionBundle -BundlePath $emptyZip -Manifest $emptyManifest | Out-Null } catch { $threw = $true }
+    Test-That 'an empty but digest-valid bundle is refused, not installed' { $threw }
+    Test-That 'and leaves no session behind for the launcher to find' {
+        @(Get-ChildItem -LiteralPath (Join-Path $target 'session-state') -Directory -ErrorAction SilentlyContinue).Count -eq $before
+    }
+
+    Write-Host '--- a crafted session id cannot reach outside the session store ---'
+    # Session ids arrive from another machine's payload and build paths and a -Filter.
+    foreach ($bad in @('..\..\secret', '*', 'a/../../b', '....//etc')) {
+        Test-That "a crafted id '$bad' finds nothing rather than walking out" {
+            $null -eq (Get-BridgeSessionBundleSpec -SessionId $bad -Launcher 'copilot') -and
+            $null -eq (Get-BridgeSessionBundleSpec -SessionId $bad -Launcher 'claude') -and
+            $null -eq (Get-BridgeSessionBundleSpec -SessionId $bad -Launcher 'codex')
+        }
+    }
+    Test-That 'and a real UUID still resolves, so the guard is not simply refusing everything' {
+        $env:COPILOT_HOME = $srcCopilot
+        $ok = $null -ne (Get-BridgeSessionBundleSpec -SessionId $oldId -Launcher 'copilot')
+        $env:COPILOT_HOME = $target
+        $ok
+    }
 
     Write-Host '--- installing is a fork, so no two machines hold one id ---'
 

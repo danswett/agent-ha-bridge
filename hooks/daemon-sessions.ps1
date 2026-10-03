@@ -388,9 +388,9 @@ function Sync-DaemonSessions {
     $capabilities = Get-DaemonLaunchCapabilities
     Publish-DaemonGlobalStatus -Descriptors $descriptors -Capabilities $capabilities `
         -Resumable @($script:DaemonResumeOffered) -Headers $Headers
-    # Another machine may be waiting on a session this one holds. After the status
-    # publish, so the list a requester chose from is the one this pass just asserted.
-    try { Invoke-DaemonTransferRequest -LiveSessionIds @($State.Keys) -Headers $Headers }
+    # $live, not $State.Keys: a session whose adoption returned $null is running but
+    # absent from state, and bundling one mid-sentence is exactly what this guards.
+    try { Invoke-DaemonTransferRequest -LiveSessionIds @($live.Keys) -Headers $Headers }
     catch { Write-DaemonLog -Message "transfer request check failed: $($_.Exception.Message)" }
     Publish-DaemonOnlineHeartbeat -Headers $Headers
     $dashboardCurrent = Sync-DaemonDashboard -Descriptors $descriptors -Capabilities $capabilities -Headers $Headers

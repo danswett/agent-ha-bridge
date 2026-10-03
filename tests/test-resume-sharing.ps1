@@ -5,13 +5,11 @@
     (hooks/daemon-launch.ps1, hooks/daemon-sessions.ps1, hooks/decision-mqtt.ps1).
 
 .DESCRIPTION
-    UNAPPLIED PROPOSAL - never executed. Accompanies the unapplied discovery diff; for
-    the owner who applies it to run, not for me.
-
-    Everything is stood in for: no Home Assistant, no broker, no agent CLI, no network
-    and no session files. Boundaries stubbed: HA state reads, peer discovery, workspace
-    approval, installed launchers, settings, the card's result line, and the launcher
-    itself - counted, so a test can assert it was never called.
+    Runs in CI as part of the offline suite. Everything is stood in for: no Home
+    Assistant, no broker, no agent CLI, no network and no session files. Boundaries
+    stubbed: HA state reads, peer discovery, workspace approval, installed launchers,
+    settings, the card's result line, and the launcher itself - counted, so a test can
+    assert it was never called.
 
     Two things an earlier draft got wrong and this does not:
 
@@ -160,10 +158,10 @@ Test-That 'a remote entry never carries a folder path, even when a leaf was shar
     $e = @(Get-DaemonRemoteResumable -Peers @(New-Peer -Slug 'd' -Machine 'D' -Entries @((New-RemoteEntry -Id 'f1111111-1111-1111-1111-111111111111' -Leaf 'repos'))))[0]
     $e.Folder -eq '' -and $e.Leaf -eq 'repos'
 }
-Test-That 'the label says where it is and that it cannot be opened here' {
+Test-That 'the label names the machine it is on' {
     $e = @(Get-DaemonRemoteResumable -Peers @(New-Peer -Slug 'dasdesk' -Machine 'DASDESK' -Entries @($remote)))[0]
     $l = Get-DaemonRemoteResumeLabel -Entry $e
-    $l -like '*DASDESK*' -and $l -like '*not available here*'
+    $l -like '*DASDESK*' -and $l -notlike '*not available here*'
 }
 
 Write-Host '--- the merged list the selector is actually built from ---'
@@ -243,6 +241,72 @@ Test-That 'a live session is still excluded from the controls' {
     @((Get-DaemonNewSessionControls -Live @{ 'a1111111-1111-1111-1111-111111111111' = $true } -Headers $headers).Resumable |
         Where-Object { $_.SessionId -eq 'a1111111-1111-1111-1111-111111111111' }).Count -eq 0
 }
+
+Write-Host '--- serving a transfer is itself gated, and bounded to what was offered ---'
+# Both of these were missing entirely: Invoke-DaemonTransferRequest consulted no flag and
+# ran on every reconcile, and it looked the requested id up in the agent home rather than
+# in what this machine had offered. Anything able to publish one retained message could
+# take an arbitrary transcript off a machine that had opted out.
+
+$script:Served = @()
+function New-BridgeSessionBundle { param($SessionId, $Launcher, $Destination)
+    $script:Served += $SessionId
+    [pscustomobject]@{ SessionId = $SessionId; Launcher = $Launcher; Kind = 'copilot'; Path = 'C:\nope.zip'; Bytes = 10; Sha256 = 'X'; Version = '' } }
+function Send-BridgeSessionBundle { param($Manifest, $Slug, $Correlation, $Headers, $Budget, $OnProgress) 1 }
+function Clear-CopilotMqttTransferRequest { param($Slug, $Headers) }
+$script:DaemonMachineSlug = 'me'
+function Get-BridgeMachineEntityId { param($Domain, $Key, $Slug) "sensor.agent_bridge_${Slug}_$Key" }
+
+$offeredId = 'cafe0000-0000-0000-0000-000000000001'
+$secretId  = 'dead0000-0000-0000-0000-000000000002'
+$script:DaemonResumeOffered = @([pscustomobject]@{ SessionId = $offeredId })
+
+function Set-Request {
+    param($Session, $Correlation, $Requester = 'peer', $At = [DateTimeOffset]::Now)
+    $script:HaStates = @{}
+    $script:RequestAttrs = [pscustomobject]@{
+        at = $At.ToString('o'); session = $Session; launcher = 'copilot'
+        requester = $Requester; correlation = $Correlation
+    }
+}
+function Get-HomeAssistantState { param($EntityId, $Headers)
+    if ($EntityId -like '*transfer_request*') { return [pscustomobject]@{ state = 'x'; attributes = $script:RequestAttrs } }
+    [pscustomobject]@{ state = [string]$script:HaStates[$EntityId] } }
+
+$script:FakeSettings = @{}
+$script:Served = @(); $script:DaemonTransferServed = ''
+Set-Request -Session $offeredId -Correlation 'c1'
+Invoke-DaemonTransferRequest -LiveSessionIds @() -Headers $headers
+Test-That 'with sharing off, a request is not served at all' { $script:Served.Count -eq 0 }
+
+$script:FakeSettings = @{ 'newSession.shareResumable' = 'false' }
+$script:Served = @(); $script:DaemonTransferServed = ''
+Set-Request -Session $offeredId -Correlation 'c2'
+Invoke-DaemonTransferRequest -LiveSessionIds @() -Headers $headers
+Test-That 'and the string "false" is not consent to serve either' { $script:Served.Count -eq 0 }
+
+$script:FakeSettings = @{ 'newSession.shareResumable' = $true }
+$script:Served = @(); $script:DaemonTransferServed = ''
+Set-Request -Session $secretId -Correlation 'c3'
+Invoke-DaemonTransferRequest -LiveSessionIds @() -Headers $headers
+Test-That 'a session this machine never offered is refused, however it is named' { $script:Served.Count -eq 0 }
+
+$script:Served = @(); $script:DaemonTransferServed = ''
+Set-Request -Session $offeredId -Correlation 'c4'
+Invoke-DaemonTransferRequest -LiveSessionIds @($offeredId) -Headers $headers
+Test-That 'a session live here is refused rather than bundled mid-sentence' { $script:Served.Count -eq 0 }
+
+$script:Served = @(); $script:DaemonTransferServed = ''
+Set-Request -Session $offeredId -Correlation 'c5' -At ([DateTimeOffset]::Now.AddHours(-2))
+Invoke-DaemonTransferRequest -LiveSessionIds @() -Headers $headers
+Test-That 'a stale retained request is not re-served after a restart' { $script:Served.Count -eq 0 }
+
+$script:Served = @(); $script:DaemonTransferServed = ''
+Set-Request -Session $offeredId -Correlation 'c6'
+Invoke-DaemonTransferRequest -LiveSessionIds @() -Headers $headers
+Test-That 'an offered session, not live, freshly asked for, IS served' { $script:Served -contains $offeredId }
+Invoke-DaemonTransferRequest -LiveSessionIds @() -Headers $headers
+Test-That 'and is not served twice for the same request' { @($script:Served).Count -eq 1 }
 
 Write-Host '--- the transfer request entity has to be renamed, and removed on uninstall ---'
 # Found the hard way against a live Home Assistant: publishing the discovery config is

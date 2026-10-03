@@ -2571,6 +2571,11 @@ function Get-BridgeResumableSessions {
             Launcher  = $entry.Launcher
             Folder    = $entry.Folder
             Updated   = $entry.Updated
+            # Carried through rather than dropped here. Without it the opt-in detail
+            # setting could never share a title: the per-agent readers produce a
+            # Summary, this projection discarded it, and everything downstream saw an
+            # object that had never had one.
+            Summary   = $entry.Summary
         }
     }
 
@@ -2599,6 +2604,16 @@ function Get-BridgeSessionBundleSpec {
         [Parameter(Mandatory)][string]$Launcher
     )
 
+    # The id reaches here from another machine's MQTT payload and is about to build
+    # paths and a -Filter. Unsanitised it is three separate primitives: `..\..\x` walks
+    # out of the session-state root, `*` is a glob that -Recurse will happily resolve to
+    # somebody else's transcript, and either one reaches the archive name too. Real ids
+    # are UUIDs and pass through this untouched.
+    $SessionId = Get-CopilotSafeSessionKey -SessionId $SessionId
+    if ($SessionId -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+        return $null
+    }
+
     $kind = (Get-BridgeLauncher -Launcher $Launcher).Kind
     switch ($kind) {
         'copilot' {
@@ -2608,7 +2623,13 @@ function Get-BridgeSessionBundleSpec {
             # The conversation and its workspace record. Not the whole directory: a
             # session's own working files can run to hundreds of megabytes, and none of
             # it is needed to continue the conversation.
-            $files = @('events.jsonl', 'workspace.yaml', 'session.db') |
+            #
+            # session.db is deliberately left out. It is binary, so the id rewrite that
+            # makes the copy its own session cannot touch it, and a database still
+            # naming the original would disagree with the directory it sits in. Nothing
+            # establishes it is needed - the sessions proven to resume after a move did
+            # not have one - so it stays out until something does.
+            $files = @('events.jsonl', 'workspace.yaml') |
                 ForEach-Object { Join-Path $dir $_ } | Where-Object { [System.IO.File]::Exists($_) }
             if (@($files).Count -eq 0) { return $null }
             [pscustomobject]@{
@@ -2661,6 +2682,8 @@ function New-BridgeSessionBundle {
 
     $spec = Get-BridgeSessionBundleSpec -SessionId $SessionId -Launcher $Launcher
     if ($null -eq $spec) { throw "no $Launcher session files found for $SessionId" }
+    # Sanitised above; used again here because it names the archive.
+    $safeId = Get-CopilotSafeSessionKey -SessionId $SessionId
 
     $stage = Join-Path $Destination "stage-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
     New-Item -ItemType Directory -Path $stage -Force | Out-Null
@@ -2671,7 +2694,7 @@ function New-BridgeSessionBundle {
             $leaf
         }
 
-        $zip = Join-Path $Destination "$SessionId.zip"
+        $zip = Join-Path $Destination "$safeId.zip"
         if ([System.IO.File]::Exists($zip)) { Remove-Item -LiteralPath $zip -Force }
         Add-Type -AssemblyName System.IO.Compression.FileSystem
         [System.IO.Compression.ZipFile]::CreateFromDirectory($stage, $zip,
@@ -2697,13 +2720,27 @@ function New-BridgeSessionBundle {
 }
 
 function Get-BridgeLauncherVersion {
-    <# The agent's version string, or '' when it cannot be asked. Never throws. #>
+    <#
+        The agent's version string, or '' when it cannot be asked. Never throws, and
+        never waits.
+
+        The timeout is the point. This runs inside the daemon's reconcile, on a path a
+        *peer machine* can trigger by asking for a session, so a CLI that sits there
+        instead of answering would stop this machine reconciling at all - no activity,
+        no decisions, no replies - until it gave up. An agent not answering `--version`
+        is a case this codebase has already hit: "it may be waiting to be signed in".
+        The field is only a cosmetic warning about version skew, so it is never worth a
+        stalled daemon.
+    #>
     param([Parameter(Mandatory)][string]$Launcher)
     try {
         $path = Get-BridgeLauncherPath -Launcher $Launcher
         if (-not $path) { return '' }
-        $out = & $path --version 2>&1 | Select-Object -First 1
-        ([string]$out).Trim()
+        $probe = Invoke-BridgeCommandProbe -Executable $path -Arguments @('--version') -TimeoutMs 5000
+        if (-not $probe.Ran -or $probe.TimedOut) { return '' }
+        $out = [string]$probe.StandardOutput
+        if ([string]::IsNullOrWhiteSpace($out)) { $out = [string]$probe.Output }
+        (@($out -split "`n") | Where-Object { $_.Trim() } | Select-Object -First 1).Trim()
     }
     catch { '' }
 }
@@ -2798,10 +2835,54 @@ function Install-BridgeSessionBundle {
             }
             default { throw "unknown session kind '$($Manifest.Kind)'" }
         }
+
+        # A digest proves the archive arrived intact. It does not prove there was a
+        # session in it: an empty-but-valid archive would create the directory, write
+        # nothing, and hand back an id. For Copilot that is the exact fail-open this
+        # whole design exists to avoid, because `--session-id` against an empty
+        # directory starts a new empty session and exits 0. So the result is checked for
+        # what it is supposed to be, and withdrawn if it is not.
+        # Kind doubles as a launcher name here ('copilot', 'claude', 'codex' are both),
+        # so this works whether or not the manifest carried a Launcher.
+        $installed = Get-BridgeSessionBundleSpec -SessionId $NewSessionId -Launcher ([string]$Manifest.Kind)
+        if ($null -eq $installed) {
+            Remove-BridgeInstalledSession -SessionId $NewSessionId -Kind ([string]$Manifest.Kind)
+            throw 'bundle contained no usable session files'
+        }
         $NewSessionId
     }
     finally {
         Remove-Item -LiteralPath $unpack -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Remove-BridgeInstalledSession {
+    <#
+        Withdraws a session this machine just installed, when it turned out not to be
+        one. Only ever called on a freshly created id, so there is nothing of anyone
+        else's to delete.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][string]$Kind
+    )
+
+    $safe = Get-CopilotSafeSessionKey -SessionId $SessionId
+    switch ($Kind) {
+        'copilot' {
+            $agentHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { Join-Path $HOME '.copilot' }
+            Remove-Item -LiteralPath (Join-Path (Join-Path $agentHome 'session-state') $safe) -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        'claude' {
+            $agentHome = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $HOME '.claude' }
+            Get-ChildItem -LiteralPath (Join-Path $agentHome 'projects') -Filter "$safe.jsonl" -File -Recurse -Force -ErrorAction SilentlyContinue |
+                ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+        }
+        'codex' {
+            $agentHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+            Get-ChildItem -LiteralPath (Join-Path $agentHome 'sessions') -Filter "rollout-*$safe.jsonl" -File -Recurse -Force -ErrorAction SilentlyContinue |
+                ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+        }
     }
 }
 
@@ -3047,7 +3128,10 @@ function Read-BridgeHaMqttSubscription {
         if ($OnReady) { & $OnReady }
 
         while (-not $cancel.IsCancellationRequested) {
-            $msg = & $recv
+            # A cancelled receive throws rather than returning, so without this the
+            # timeout escapes as "A task was canceled" and the caller's own "that
+            # machine did not send it" message is unreachable.
+            try { $msg = & $recv } catch { break }
             if ([string]$msg.type -ne 'event') { continue }
             $payload = $msg.event.payload
             if ($null -eq $payload) { continue }
