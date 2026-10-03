@@ -254,7 +254,9 @@ function Wait-CopilotHaStateChange {
                         $ticked = @(& $OnTick)
                         if ($ticked.Count -gt 0) { $last = $ticked[-1]; $stop = ($last -is [bool] -and $last) }
                     }
-                    catch { }
+                    catch {
+                        if ($_.Exception.Data['BridgeTestWriteBlocked']) { throw }
+                    }
                     if ($stop) { return $null }
                 }
                 continue

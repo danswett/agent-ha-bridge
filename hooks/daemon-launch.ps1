@@ -270,6 +270,7 @@ function Clear-DaemonExpiredStopArms {
             Write-DaemonLog -Message "end confirmation for $short lapsed; the session is still running"
         }
         catch {
+            if ($_.Exception.Data['BridgeTestWriteBlocked']) { throw }
             if ($_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
             $arm.RetryAt = $now.AddSeconds($script:DaemonConfig.StopLapseRetrySeconds)
         }

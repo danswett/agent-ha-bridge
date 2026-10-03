@@ -942,6 +942,7 @@ function Invoke-DaemonFastActivity {
     if ($script:DaemonStopArmed.Count -gt 0) {
         try { Clear-DaemonExpiredStopArms -Headers $Headers -State $State }
         catch {
+            if ($_.Exception.Data['BridgeTestWriteBlocked']) { throw }
             if ($_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
             Write-DaemonLog -Message "end confirmation sweep failed: $($_.Exception.Message)"
         }

@@ -58,6 +58,7 @@
         'tests\test-worktree-isolation.ps1'
         'tests\test-write-boundary-callers.ps1'
         'tests\test-write-boundary-context.ps1'
+        'tests\test-write-boundary-stop.ps1'
         'claude\tests\test-claude-ask-parser.ps1'
         'claude\tests\test-claude-install.ps1'
         'claude\tests\test-claude-transcript.ps1'

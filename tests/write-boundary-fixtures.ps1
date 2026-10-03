@@ -61,7 +61,7 @@ function Get-ProtectedFixtureSnapshot {
 function New-BoundaryFixture {
     param(
         [Parameter(Mandatory)]
-        [ValidateSet('test-write-boundary-context.ps1', 'test-write-boundary-callers.ps1')]
+        [ValidateSet('test-write-boundary-context.ps1', 'test-write-boundary-callers.ps1', 'test-write-boundary-stop.ps1')]
         [string]$Suite
     )
     Assert-BridgeTestEnvironment -Required

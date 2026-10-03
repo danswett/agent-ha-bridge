@@ -124,12 +124,19 @@ function Read-BridgeStopPromptStore {
         or a string answers neither .Keys nor .ContainsKey, and reached the hook as an
         exception on a path that must not throw.
     #>
-    $path = try { Get-BridgeStopPromptPath } catch { return @{ State = 'Failed'; Prompts = @{} } }
+    $path = try { Get-BridgeStopPromptPath }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked']) { throw }
+        return @{ State = 'Failed'; Prompts = @{} }
+    }
     if (-not (Test-Path -LiteralPath $path)) { return @{ State = 'Empty'; Prompts = @{} } }
 
     $parsed = $null
     try { $parsed = Get-Content -LiteralPath $path -Raw -ErrorAction Stop | ConvertFrom-Json -AsHashtable }
-    catch { return @{ State = 'Failed'; Prompts = @{} } }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked']) { throw }
+        return @{ State = 'Failed'; Prompts = @{} }
+    }
     if ($parsed -isnot [System.Collections.IDictionary]) { return @{ State = 'Failed'; Prompts = @{} } }
 
     $prompts = @{}
@@ -211,6 +218,7 @@ function Write-BridgeStopPrompt {
         $true
     }
     catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked']) { throw }
         if ($null -ne $tmp) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
         $false
     }
@@ -236,7 +244,10 @@ function Clear-BridgeStopPromptStore {
         Remove-Item -LiteralPath "$path.pending" -Force -ErrorAction SilentlyContinue
         $true
     }
-    catch { $false }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked']) { throw }
+        $false
+    }
 }
 
 function Get-BridgeStopPrompt {

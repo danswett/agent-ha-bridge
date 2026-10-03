@@ -784,6 +784,7 @@ function Wait-DaemonChange {
         $script:DaemonWatchFailures = 0
     }
     catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked']) { throw }
         # A normal timeout returns $null and is not an error; only a genuine
         # connection failure lands here. Back off exponentially (capped) so a
         # Home Assistant outage does not spin a tight reconnect loop.
@@ -825,6 +826,7 @@ function Invoke-DaemonHit {
             Invoke-PendingStops -Headers $headers -State $state -Live $script:DaemonLive
         }
         catch {
+            if ($_.Exception.Data['BridgeTestWriteBlocked']) { throw }
             Write-DaemonLog -Message "end session failed: $($_.Exception.Message)"
         }
     }
@@ -990,5 +992,4 @@ if (-not $env:AGENT_BRIDGE_DAEMON_NORUN) {
         $mutex.Dispose()
     }
 }
-
 
