@@ -351,7 +351,7 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `newSession.agencyPath` | Full path to `agency.exe` if it is not on the daemon's PATH |
 | `newSession.claudePath` / `.codexPath` | Full path to `claude.exe` / the Codex CLI if not on the daemon's PATH |
 | `devBox.keepAwake` | On a Microsoft Dev Box, keep the machine from hibernating itself while the bridge runs (default `false`; you are asked once on a Dev Box). See [Running on a Microsoft Dev Box](#running-on-a-microsoft-dev-box) |
-| `devBox.intervalHours` | How often the keep-awake task runs (default `4`) |
+| `devBox.intervalMinutes` | How often the keep-awake task runs (default `15`, capped at `30`). It has to be shorter than the pool's stop-on-disconnect grace period, since the pending stop only exists inside that window |
 | `updates.repository` | Repository to check for releases (default `danswett/agent-ha-bridge`) |
 | `updates.checkForUpdates` | Set to `false` to disable the update check |
 | `updates.checkHours` | How often to check GitHub for a release (default `6`, i.e. 4×/day) |
@@ -389,7 +389,7 @@ nothing. The daemon stops mid-reconcile, its liveness beat stops, and the machin
 as offline on the dashboard with nothing anywhere saying why.
 
 The installer detects a Dev Box and offers to register a second scheduled task,
-`AgentBridgeDevBoxKeepAwake_<installation-id>`, which clears the pending stop every few hours through
+`AgentBridgeDevBoxKeepAwake_<installation-id>`, which clears the pending stop every 15 minutes through
 Dev Center's own API:
 
 ```powershell
@@ -407,6 +407,14 @@ a timer rather than once:
   do not stack;
 - **neither lever works while the stop is more than 24 hours away** — which is the state
   worth reaching, so the task reports that as already safe and does nothing.
+
+The cadence matters more than it looks. A stop-on-disconnect occurrence does not exist
+while you are connected: the pool creates it when your last session goes and fires it
+one grace period later, so a pass that runs less often than that grace can miss the
+window entirely and never see anything to clear. The grace is never shorter than 60
+minutes, hence the 15-minute default and the 30-minute cap on `devBox.intervalMinutes`.
+A pass with nothing scheduled logs `no-action`; that is the normal state while you are
+connected, not a failure.
 
 The task and its detached PowerShell worker belong to the recorded installation.
 Removal stops that owned worker before deleting its payload; isolated/custom-root

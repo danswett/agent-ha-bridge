@@ -296,6 +296,113 @@ Test-That 'a Dev Box with no pending stop is reported, not treated as a failure'
     $result.Status -eq 'no-action'
 }
 
+Write-Host ''
+Write-Host '--- a Stop action that is defined but not scheduled ---'
+
+# The case that made the feature look like it worked while the machine kept
+# hibernating. A pool's Stop action is listed permanently, but it carries 'next' only
+# once an occurrence exists - which, for stop-on-disconnect, is only after the last
+# session has gone. Reading it unconditionally threw under Set-StrictMode and took the
+# whole pass down: on 2026-10-02/03 this Dev Box logged FAILED on 15 of 24 passes and
+# hibernated three times regardless.
+
+Test-That 'a Stop action with no occurrence at all reports no-action rather than failing' {
+    # Built here rather than once above because GetNewClosure copies only the
+    # scriptblock's own locals; a fixture held at script scope arrives as $null.
+    $unscheduled = [pscustomobject]@{
+        value = @([pscustomobject]@{ name = 'idle-stopondisconnect'; actionType = 'Stop'; sourceType = 'Pool' })
+    }
+    $result = Invoke-BridgeDevBoxKeepAwake -IdentityProvider $asIdentity -TokenProvider $noToken `
+        -Invoke { param($m, $u, $h) $unscheduled }.GetNewClosure() -Now $fixedNow
+    $result.Status -eq 'no-action'
+}
+
+Test-That 'and neither lever is reached for it' {
+    $unscheduled = [pscustomobject]@{
+        value = @([pscustomobject]@{ name = 'idle-stopondisconnect'; actionType = 'Stop'; sourceType = 'Pool' })
+    }
+    $calls = [System.Collections.ArrayList]::new()
+    $invoke = {
+        param($Method, $Uri, $Head)
+        [void]$calls.Add("$Method $Uri")
+        $unscheduled
+    }.GetNewClosure()
+    Invoke-BridgeDevBoxKeepAwake -IdentityProvider $asIdentity -TokenProvider $noToken `
+        -Invoke $invoke -Now $fixedNow | Out-Null
+    $calls.Count -eq 1 -and $calls[0].StartsWith('GET ')
+}
+
+Test-That 'an occurrence whose scheduled time is blank is treated the same way' {
+    $blank = [pscustomobject]@{ value = @([pscustomobject]@{
+        name = 'idle-stopondisconnect'; actionType = 'Stop'
+        next = [pscustomobject]@{ scheduledTime = '' }
+    }) }
+    $result = Invoke-BridgeDevBoxKeepAwake -IdentityProvider $asIdentity -TokenProvider $noToken `
+        -Invoke { param($m, $u, $h) $blank }.GetNewClosure() -Now $fixedNow
+    $result.Status -eq 'no-action'
+}
+
+Test-That 'a time the service renders in some other shape drops that action instead of the pass' {
+    $odd = [pscustomobject]@{ value = @([pscustomobject]@{
+        name = 'idle-stopondisconnect'; actionType = 'Stop'
+        next = [pscustomobject]@{ scheduledTime = 'whenever' }
+    }) }
+    $result = Invoke-BridgeDevBoxKeepAwake -IdentityProvider $asIdentity -TokenProvider $noToken `
+        -Invoke { param($m, $u, $h) $odd }.GetNewClosure() -Now $fixedNow
+    $result.Status -eq 'no-action'
+}
+
+Test-That 'an unscheduled action does not hide a scheduled one later in the list' {
+    $mixed = [pscustomobject]@{ value = @(
+        [pscustomobject]@{ name = 'idle-stopondisconnect'; actionType = 'Stop' },
+        [pscustomobject]@{ name = 'scheduled-stop'; actionType = 'Stop'
+            next = [pscustomobject]@{ scheduledTime = '2026-09-30T23:00:00Z' } }
+    ) }
+    $skipped = [System.Collections.ArrayList]::new()
+    $invoke = {
+        param($Method, $Uri, $Head)
+        if ($Method -eq 'GET') { return $mixed }
+        if ($Uri -match ':skip\?') { [void]$skipped.Add($Uri) }
+        $null
+    }.GetNewClosure()
+    $result = Invoke-BridgeDevBoxKeepAwake -IdentityProvider $asIdentity -TokenProvider $noToken `
+        -Invoke $invoke -Now $fixedNow
+    $result.Status -eq 'skipped' -and $skipped.Count -eq 1 -and $skipped[0] -match '/scheduled-stop:skip'
+}
+
+Write-Host ''
+Write-Host '--- how often a pass runs ---'
+
+# 1.25.0 polled every 4 hours against a pool granting a 60-minute grace, so the
+# occurrence was routinely created and fired between two passes. No value the old
+# hours-based key could hold was short enough, which is why it is replaced rather
+# than re-defaulted.
+Test-That 'an unconfigured Dev Box polls every 15 minutes' {
+    (Get-BridgeDevBoxIntervalMinutes -DevBox ([pscustomobject]@{ keepAwake = $true })) -eq 15
+}
+
+Test-That 'a configured interval is honoured' {
+    (Get-BridgeDevBoxIntervalMinutes -DevBox ([pscustomobject]@{ intervalMinutes = 5 })) -eq 5
+}
+
+Test-That 'an interval that could outlast the shortest grace Dev Box offers is capped at 30' {
+    (Get-BridgeDevBoxIntervalMinutes -DevBox ([pscustomobject]@{ intervalMinutes = 240 })) -eq 30
+}
+
+Test-That '1.25.0 configs written in hours are carried over and capped, not obeyed' {
+    (Get-BridgeDevBoxIntervalMinutes -DevBox ([pscustomobject]@{ intervalHours = 4 })) -eq 30
+}
+
+Test-That 'the new key wins when an upgrade has left both behind' {
+    (Get-BridgeDevBoxIntervalMinutes -DevBox ([pscustomobject]@{ intervalMinutes = 15; intervalHours = 4 })) -eq 15
+}
+
+Test-That 'a nonsense or missing interval falls back to the default instead of throwing' {
+    (Get-BridgeDevBoxIntervalMinutes -DevBox ([pscustomobject]@{ intervalMinutes = 'soon' })) -eq 15 -and
+    (Get-BridgeDevBoxIntervalMinutes -DevBox ([pscustomobject]@{ intervalMinutes = 0 })) -eq 15 -and
+    (Get-BridgeDevBoxIntervalMinutes -DevBox $null) -eq 15
+}
+
 Test-That 'a missing Azure CLI login is a clear error, not a silent no-op' {
     $threw = $false
     try { Get-BridgeDevBoxAccessToken -TokenCommand { param($Resource) '' } }
@@ -369,6 +476,12 @@ Test-That 'the shipped config carries the setting so an upgrade can detect it is
     $example = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\config.example.json') -Raw | ConvertFrom-Json
     $example.devBox.PSObject.Properties['keepAwake'] -and $example.devBox.keepAwake -eq $false
 }
+Test-That 'and states the cadence in minutes, which is the only unit that can be short enough' {
+    $example = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\config.example.json') -Raw | ConvertFrom-Json
+    $example.devBox.PSObject.Properties['intervalMinutes'] -and
+    $example.devBox.intervalMinutes -eq 15 -and
+    -not $example.devBox.PSObject.Properties['intervalHours']
+}
 
 # Building a trigger registers nothing - New-ScheduledTaskTrigger only returns a CIM
 # object - so this is safe to run anywhere the module exists. It does not exist on the
@@ -377,7 +490,7 @@ if ($IsWindows -and (Get-Command New-ScheduledTaskTrigger -ErrorAction SilentlyC
     # An explicit user: the runner clears USERNAME, and -AtLogOn refuses an empty one.
     $script:Triggers = @()
     Test-That 'the triggers build at all' {
-        $script:Triggers = @(New-BridgeDevBoxKeepAwakeTrigger -IntervalHours 4 -User 'someone')
+        $script:Triggers = @(New-BridgeDevBoxKeepAwakeTrigger -IntervalMinutes 15 -User 'someone')
         $script:Triggers.Count -eq 2
     }
 
@@ -386,7 +499,7 @@ if ($IsWindows -and (Get-Command New-ScheduledTaskTrigger -ErrorAction SilentlyC
     })
 
     Test-That 'the task repeats on the interval it was given' {
-        $repeating.Count -eq 1 -and $repeating[0].Repetition.Interval -eq 'PT4H'
+        $repeating.Count -eq 1 -and $repeating[0].Repetition.Interval -eq 'PT15M'
     } "intervals: $(@($script:Triggers | ForEach-Object { if ($_.Repetition) { $_.Repetition.Interval } }) -join ',')"
 
     # P99999999DT23H59M59S - what [TimeSpan]::MaxValue serialises to - is rejected by
@@ -458,7 +571,7 @@ function Invoke-DevBoxOwnershipFixture {
                 Stop-BridgeOwnedRuntime -Context $installContext
                 Set-Variable -Name devBoxDecision -Value (Get-BridgeDevBoxKeepAwakeDecision -IsDevBox $true -Requested ([bool]$Enable) `
                     -OnWindows $OnWindows -Sandbox $installContext.Isolated -SkipTask ([bool]$SkipTask))
-                Set-Variable -Name devBoxIntervalHours -Value 4
+                Set-Variable -Name devBoxIntervalMinutes -Value 15
                 $registration = $ast.EndBlock.Statements | Where-Object {
                     $_ -is [Management.Automation.Language.IfStatementAst] -and $_.Clauses[0].Item1.Extent.Text -match 'devBoxDecision.Enabled'
                 } | Select-Object -First 1
