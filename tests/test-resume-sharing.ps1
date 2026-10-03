@@ -244,11 +244,18 @@ Test-That 'a live session is still excluded from the controls' {
         Where-Object { $_.SessionId -eq 'a1111111-1111-1111-1111-111111111111' }).Count -eq 0
 }
 
-Write-Host '--- a remote session must never reach a native launch ---'
+Write-Host '--- a remote session is refused unless everything lines up ---'
 # Driven through the real resolver. The remote entry is given an approved local path on
 # purpose: C:\Users\dswett\repos is approved on more than one machine in this fleet, so
 # the workspace check cannot be what stops it. If the guard is missing, placed after that
 # check, or swallowed by the empty catch, this is where it shows.
+
+$script:Transfers = 0
+function Receive-DaemonSessionTransfer { param($Entry, $WorkingDirectory, $Headers, $TimeoutSeconds) $script:Transfers++; $null }
+function Get-BridgeLauncherUsage { param($Launcher) [pscustomobject]@{ SignedIn = $script:SignedIn; LastUsed = [DateTimeOffset]::Now } }
+$script:SignedIn = $true
+function Get-DaemonPeerMachines { param($Headers) @([pscustomobject]@{ Slug = 'dasdesk'; Machine = 'DASDESK'; Online = $script:PeerOnline; IsSelf = $false }) }
+$script:PeerOnline = $true
 
 $remoteEntry = [pscustomobject]@{
     SessionId = 'ffffffff-1111-2222-3333-444444444444'; Launcher = 'copilot'
@@ -267,14 +274,69 @@ $script:HaStates = @{
     "$($script:DaemonEntity.NewAgent)"     = 'Copilot'
     "$($script:DaemonEntity.NewWorkspace)" = 'Repos'
 }
-$script:LaunchCalls = 0
-$script:Notes = @()
-$request = Resolve-DaemonLaunchRequest -Controls $controls -Headers $headers
 
-Test-That 'the real resolver refuses a remote entry whose folder is approved here' { $null -eq $request }
-Test-That 'and no launcher was started' { $script:LaunchCalls -eq 0 }
-Test-That 'and the refusal names the machine it is actually on' { ($script:Notes -join ' ') -like '*DASDESK*' }
-Test-That 'and it does not claim the session is gone' { ($script:Notes -join ' ') -notlike '*no longer resumable*' }
+function Reset-Attempt { $script:LaunchCalls = 0; $script:Notes = @(); $script:Transfers = 0 }
+
+# Off by default: moving a transcript between machines is not something to start doing
+# because an entry happened to be selected.
+Reset-Attempt
+$script:FakeSettings = @{}
+$r = Resolve-DaemonLaunchRequest -Controls $controls -Headers $headers
+Test-That 'with transfers off it is refused, and nothing is fetched' { $null -eq $r -and $script:Transfers -eq 0 }
+Test-That 'and no launcher is started' { $script:LaunchCalls -eq 0 }
+Test-That 'and the refusal says where the session actually is' { ($script:Notes -join ' ') -like '*DASDESK*' }
+Test-That 'and does not claim the session is gone' { ($script:Notes -join ' ') -notlike '*no longer resumable*' }
+
+$script:FakeSettings = @{ 'newSession.transferResumable' = $true }
+
+Reset-Attempt
+$script:PeerOnline = $false
+$r = Resolve-DaemonLaunchRequest -Controls $controls -Headers $headers
+Test-That 'an offline owner is refused before any bytes move' { $null -eq $r -and $script:Transfers -eq 0 }
+Test-That 'and the refusal says it is offline' { ($script:Notes -join ' ') -like '*offline*' }
+$script:PeerOnline = $true
+
+Reset-Attempt
+$script:SignedIn = $false
+$r = Resolve-DaemonLaunchRequest -Controls $controls -Headers $headers
+Test-That 'not being signed in is refused before any bytes move' { $null -eq $r -and $script:Transfers -eq 0 }
+Test-That 'and the refusal names signing in' { ($script:Notes -join ' ') -like '*sign*' }
+$script:SignedIn = $true
+
+Reset-Attempt
+$missing = $remoteEntry.PSObject.Copy(); $missing.Launcher = 'codex'   # not installed here
+$controls.Resumable = @($missing)
+$script:HaStates["$($script:DaemonEntity.NewResume)"] = $missing.Label
+$r = Resolve-DaemonLaunchRequest -Controls $controls -Headers $headers
+Test-That 'an agent that is not installed here is refused before any bytes move' { $null -eq $r -and $script:Transfers -eq 0 }
+$controls.Resumable = @($remoteEntry)
+$script:HaStates["$($script:DaemonEntity.NewResume)"] = $remoteEntry.Label
+
+Reset-Attempt
+$r = Resolve-DaemonLaunchRequest -Controls $controls -Headers $headers
+Test-That 'with everything in order it attempts the transfer' { $script:Transfers -eq 1 }
+Test-That 'and a transfer that fails still starts no launcher' { $null -eq $r -and $script:LaunchCalls -eq 0 }
+
+Write-Host '--- a transfer that succeeds resumes the copy, not the original ---'
+
+Reset-Attempt
+function Receive-DaemonSessionTransfer { param($Entry, $WorkingDirectory, $Headers, $TimeoutSeconds)
+    $script:Transfers++; $script:GotDirectory = $WorkingDirectory; 'bbbbbbbb-9999-9999-9999-999999999999' }
+$r = Resolve-DaemonLaunchRequest -Controls $controls -Headers $headers
+Test-That 'the request carries the NEW id, so the original is never touched' {
+    $null -ne $r -and [string]$r.ResumeSession.SessionId -eq 'bbbbbbbb-9999-9999-9999-999999999999'
+}
+Test-That 'and not the id it had on the other machine' {
+    [string]$r.ResumeSession.SessionId -ne 'ffffffff-1111-2222-3333-444444444444'
+}
+Test-That 'it opens in the approved workspace chosen here, not the folder it came from' {
+    $script:GotDirectory -eq 'C:\Users\dswett\repos' -and [string]$r.ResumeSession.Folder -eq 'C:\Users\dswett\repos'
+}
+Test-That 'and the entry is no longer remote, so it resumes like any local session' {
+    -not ($r.ResumeSession.PSObject.Properties['Remote'] -and $r.ResumeSession.Remote)
+}
+
+Write-Host '--- a local resume is completely unaffected ---'
 
 $localEntry = [pscustomobject]@{
     SessionId = 'a1111111-1111-1111-1111-111111111111'; Launcher = 'copilot'
@@ -283,11 +345,12 @@ $localEntry = [pscustomobject]@{
 }
 $controls.Resumable = @($localEntry)
 $script:HaStates["$($script:DaemonEntity.NewResume)"] = $localEntry.Label
-$script:LaunchCalls = 0
+Reset-Attempt
 $local = Resolve-DaemonLaunchRequest -Controls $controls -Headers $headers
-Test-That 'a local resume with the same folder is still resolved, not refused' {
+Test-That 'a local resume still resolves' {
     $null -ne $local -and [string]$local.ResumeSession.SessionId -eq $localEntry.SessionId
 }
+Test-That 'and fetches nothing from anywhere' { $script:Transfers -eq 0 }
 
 Write-Host ''
 if ($script:Failures -gt 0) { Write-Host "$($script:Failures) failed" -ForegroundColor Red; exit 1 }

@@ -388,6 +388,10 @@ function Sync-DaemonSessions {
     $capabilities = Get-DaemonLaunchCapabilities
     Publish-DaemonGlobalStatus -Descriptors $descriptors -Capabilities $capabilities `
         -Resumable @($script:DaemonResumeOffered) -Headers $Headers
+    # Another machine may be waiting on a session this one holds. After the status
+    # publish, so the list a requester chose from is the one this pass just asserted.
+    try { Invoke-DaemonTransferRequest -LiveSessionIds @($State.Keys) -Headers $Headers }
+    catch { Write-DaemonLog -Message "transfer request check failed: $($_.Exception.Message)" }
     Publish-DaemonOnlineHeartbeat -Headers $Headers
     $dashboardCurrent = Sync-DaemonDashboard -Descriptors $descriptors -Capabilities $capabilities -Headers $Headers
     Complete-DaemonSessionRetirement -Gone $goneSessions -DashboardCurrent $dashboardCurrent -Headers $Headers

@@ -262,6 +262,11 @@ $script:DaemonResumeCacheAt = [DateTimeOffset]::MinValue
 # machine's own dropdown shows. Initialised for StrictMode, as above.
 $script:DaemonResumeOffered = @()
 
+# The last transfer request this machine served. The request is retained so the owning
+# machine finds it whenever its next pass comes round, which also means it is still there
+# on the pass after that - without this it would be served again every reconcile.
+$script:DaemonTransferServed = ''
+
 # Decisions already reported as terminal-only, so the daemon says it once per
 # question instead of on every reconcile. Initialised for StrictMode.
 $script:DaemonTerminalOnlyWarned = @{}

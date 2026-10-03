@@ -713,37 +713,248 @@ function Get-DaemonRemoteResumable {
     @($out)
 }
 
-function Test-DaemonRemoteResumeRefused {
+function Invoke-DaemonTransferRequest {
     <#
-        True when a chosen resume entry belongs to another machine, having refused it on
-        the card. The whole guard, in one testable place.
+        Serves a request from another machine for a session this one holds: bundles the
+        transcript, publishes it, and clears the request.
 
-        It must run before the workspace check and outside the try that reads the
-        selector, because neither would stop it. Two machines can have the same approved
-        path - C:\Users\dswett\repos exists on more than one here - so a remote entry can
-        pass the folder check on its own merits, and that try's catch is empty.
+        Read-only with respect to the session. Nothing is renamed, locked or removed, and
+        the copy here stays exactly as resumable as it was - the machine asking installs
+        what arrives under an id of its own, so the two never contend.
 
-        What makes this safety-critical rather than tidy: if a remote entry reaches the
-        launcher, it arrives as `--session-id <id>` with no transcript on disk, and
-        Copilot answers that by silently starting a *new, empty* session under that id
-        and exiting 0. The daemon then adopts it as though the resume had worked, and the
-        fleet has two different conversations sharing one identity with nothing logged
-        anywhere. Claude and Codex fail outright - `No conversation found` and
-        `no rollout found for thread id` - so this exists for the one that does not.
+        Refusals are silent on this side on purpose. The requester is the one watching a
+        card, and it already fails on its own timeout; logging here and saying nothing
+        there is the right split.
     #>
     param(
-        [Parameter(Mandatory)][object]$Entry,
-        [AllowEmptyString()][string]$Label = '',
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$LiveSessionIds,
         [Parameter(Mandatory)][hashtable]$Headers
     )
 
-    if (-not $Entry.PSObject.Properties['Remote'] -or -not $Entry.Remote) { return $false }
+    $entity = Get-BridgeMachineEntityId -Domain 'sensor' -Key 'transfer_request' -Slug $script:DaemonMachineSlug
+    $request = $null
+    try { $request = (Get-HomeAssistantState -EntityId $entity -Headers $Headers).attributes } catch { return }
+    if ($null -eq $request -or -not $request.PSObject.Properties['session']) { return }
+
+    $session = [string]$request.session
+    $correlation = [string]$request.correlation
+    if ([string]::IsNullOrWhiteSpace($session) -or [string]::IsNullOrWhiteSpace($correlation)) { return }
+    # Retained, so a request already served would be served again every pass.
+    if ($correlation -eq $script:DaemonTransferServed) { return }
+
+    $launcher = if ($request.PSObject.Properties['launcher']) { [string]$request.launcher } else { 'copilot' }
+    $requester = if ($request.PSObject.Properties['requester']) { [string]$request.requester } else { '' }
+
+    try {
+        # A session being written to right now would be bundled mid-sentence.
+        if (@($LiveSessionIds) -contains $session) {
+            Write-DaemonLog -Message "transfer refused: $session is live here"
+            return
+        }
+        $staging = Join-Path ([IO.Path]::GetTempPath()) "bridge-send-$correlation"
+        New-Item -ItemType Directory -Path $staging -Force | Out-Null
+        try {
+            $manifest = New-BridgeSessionBundle -SessionId $session -Launcher $launcher -Destination $staging
+            $cap = [int](Get-BridgeSetting 'newSession.transferMaxBytes' 26214400)
+            if ($manifest.Bytes -gt $cap) {
+                Write-DaemonLog -Message "transfer refused: $session is $([int]($manifest.Bytes / 1MB)) MB, over the cap"
+                return
+            }
+            $sent = Send-BridgeSessionBundle -Manifest $manifest -Slug $requester -Correlation $correlation -Headers $Headers
+            Write-DaemonLog -Message "sent $session to $requester in $sent chunk(s)"
+        }
+        finally {
+            Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
+        }
+    }
+    catch {
+        Write-DaemonLog -Message "transfer failed for ${session}: $($_.Exception.Message)"
+    }
+    finally {
+        $script:DaemonTransferServed = $correlation
+        try { Clear-CopilotMqttTransferRequest -Slug $script:DaemonMachineSlug -Headers $Headers } catch { }
+    }
+}
+
+function Receive-DaemonSessionTransfer {
+    <#
+        Fetches a session from the machine that holds it and installs it here as a session
+        of its own, returning the new id - or $null, having said why on the card.
+
+        Subscribes before asking. Nothing in a transfer is published retained, because a
+        retained chunk is redelivered to every reconnecting subscriber and at these sizes
+        that is precisely the message that took this fleet's MQTT down; so a sender that
+        publishes before anyone is listening is publishing into nothing.
+
+        The digest is checked before a single byte reaches the agent's home. That is the
+        guard against the worst outcome available here: Copilot handed `--session-id` for
+        a session whose files are absent does not fail, it starts a new empty session
+        under that id and exits 0, which the daemon would adopt as a successful resume.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Entry,
+        [Parameter(Mandatory)][string]$WorkingDirectory,
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [int]$TimeoutSeconds = 120
+    )
+
+    $session = [string]$Entry.SessionId
+    $owner = [string]$Entry.Slug
+    $correlation = [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $root = Get-BridgeTransferTopic -Slug $script:DaemonMachineSlug -Correlation $correlation
+    $staging = Join-Path ([IO.Path]::GetTempPath()) "bridge-recv-$correlation"
+
+    Set-CopilotMqttNewSessionResult -Headers $Headers `
+        -Text "Fetching that session from $($Entry.Machine)..." | Out-Null
+
+    try {
+        New-Item -ItemType Directory -Path $staging -Force | Out-Null
+
+        Set-CopilotMqttTransferRequest -Slug $owner -SessionId $session -Launcher ([string]$Entry.Launcher) `
+            -Requester $script:DaemonMachineSlug -Correlation $correlation -Headers $Headers
+
+        $messages = @(Read-BridgeHaMqttSubscription -Topic "$root/#" -TimeoutSeconds $TimeoutSeconds -Until {
+            param($all)
+            $m = @($all) | Where-Object { $_.PSObject.Properties['sha256'] } | Select-Object -First 1
+            if ($null -eq $m) { return $false }
+            @(@($all) | Where-Object { $_.PSObject.Properties['d'] }).Count -ge [int]$m.chunks
+        })
+
+        $manifest = @($messages) | Where-Object { $_.PSObject.Properties['sha256'] } | Select-Object -First 1
+        if ($null -eq $manifest) {
+            Write-DaemonLog -Message "transfer timed out waiting for $session from $owner"
+            Set-CopilotMqttNewSessionResult -Headers $Headers `
+                -Text "$($Entry.Machine) did not send that session. It may be busy or offline." | Out-Null
+            return $null
+        }
+
+        $bytes = Join-BridgeBundleChunk -Chunks @(@($messages) | Where-Object { $_.PSObject.Properties['d'] }) `
+            -TotalBytes ([int]$manifest.bytes) -Sha256 ([string]$manifest.sha256)
+        $zip = Join-Path $staging 'bundle.zip'
+        [IO.File]::WriteAllBytes($zip, $bytes)
+
+        $newId = Install-BridgeSessionBundle -BundlePath $zip -WorkingDirectory $WorkingDirectory -Manifest ([pscustomobject]@{
+            SessionId = [string]$manifest.session; Kind = [string]$manifest.kind; Sha256 = [string]$manifest.sha256
+        })
+        Write-DaemonLog -Message "received $session from $owner and installed it as $newId"
+        $newId
+    }
+    catch {
+        Write-DaemonLog -Message "transfer of $session from ${owner} failed: $($_.Exception.Message)"
+        Set-CopilotMqttNewSessionResult -Headers $Headers `
+            -Text "Could not bring that session over: $($_.Exception.Message)" | Out-Null
+        $null
+    }
+    finally {
+        Remove-Item -LiteralPath $staging -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Resolve-DaemonRemoteResume {
+    <#
+        Turns a chosen remote entry into a local session that can actually be launched,
+        or $null having refused on the card.
+
+        Every refusal happens before any bytes move, so a request that was never going to
+        work does not cost a transfer: the owning machine has to be reachable, the agent
+        has to be installed here, and a workspace has to be chosen for it to open in.
+
+        That last one is a departure worth being explicit about. A resume normally reopens
+        in its own folder and ignores the Workspace row - but the original folder belongs
+        to another machine and usually does not exist here; this fleet alone has sessions
+        under rezna, danswett and dswett. So for a session coming from elsewhere the
+        Workspace row applies, and the same approved-path check governs it: Home Assistant
+        still cannot name a directory the configuration has not approved.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Entry,
+        [AllowEmptyString()][string]$Label,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Workspaces,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Launchers,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
 
     $where = if ($Entry.PSObject.Properties['Machine'] -and $Entry.Machine) { [string]$Entry.Machine } else { 'another machine' }
-    Write-DaemonLog -Message "resume refused: '$Label' belongs to $where and cannot be opened here"
-    Set-CopilotMqttNewSessionResult -Headers $Headers `
-        -Text "That session is on $where. Resuming it here isn't supported yet - open it there, or start a new session." | Out-Null
-    $true
+
+    if (-not [bool](Get-BridgeSetting 'newSession.transferResumable' $false)) {
+        Write-DaemonLog -Message "resume refused: bringing sessions between machines is off"
+        Set-CopilotMqttNewSessionResult -Headers $Headers `
+            -Text "That session is on $where. Set newSession.transferResumable to bring it here." | Out-Null
+        return $null
+    }
+
+    $launcher = [string]$Entry.Launcher
+    if ($Launchers -notcontains $launcher) {
+        $agent = Get-BridgeLauncherLabel -Launcher $launcher
+        Write-DaemonLog -Message "resume refused: $agent is not installed here"
+        Set-CopilotMqttNewSessionResult -Headers $Headers `
+            -Text "$agent is not installed here, so that session cannot be opened." | Out-Null
+        return $null
+    }
+
+    # Presence of a credential file, which is all the bridge can cheaply know - not proof
+    # the token still works. A launch can still fail on authentication afterwards, and
+    # says so rather than pretending the resume was at fault.
+    $usage = $null
+    try { $usage = Get-BridgeLauncherUsage -Launcher $launcher } catch { }
+    if ($null -ne $usage -and $usage.PSObject.Properties['SignedIn'] -and -not $usage.SignedIn) {
+        $agent = Get-BridgeLauncherLabel -Launcher $launcher
+        Write-DaemonLog -Message "resume refused: not signed in to $agent here"
+        Set-CopilotMqttNewSessionResult -Headers $Headers `
+            -Text "Not signed in to $agent on this machine - sign in, then try again." | Out-Null
+        return $null
+    }
+
+    # Presence can change between the list being drawn and the button being pressed; a
+    # laptop went to sleep in the two minutes between the two while this was being built.
+    $online = $false
+    try {
+        $peer = @(Get-DaemonPeerMachines -Headers $Headers) | Where-Object { [string]$_.Slug -eq [string]$Entry.Slug } | Select-Object -First 1
+        $online = ($null -ne $peer -and $peer.Online)
+    }
+    catch { }
+    if (-not $online) {
+        Write-DaemonLog -Message "resume refused: $where is not online"
+        Set-CopilotMqttNewSessionResult -Headers $Headers `
+            -Text "$where is offline, so that session cannot be fetched right now." | Out-Null
+        return $null
+    }
+
+    $target = Get-DaemonRemoteResumeWorkspace -Workspaces $Workspaces -Headers $Headers
+    if (-not $target) {
+        Write-DaemonLog -Message 'resume refused: no workspace selected for a transferred session'
+        Set-CopilotMqttNewSessionResult -Headers $Headers `
+            -Text 'Pick a Workspace for it to open in - a session from another machine has no folder here.' | Out-Null
+        return $null
+    }
+
+    $newId = Receive-DaemonSessionTransfer -Entry $Entry -WorkingDirectory $target -Headers $Headers
+    if (-not $newId) { return $null }
+
+    # A session of its own now, so it resumes exactly like any local one.
+    [pscustomobject]@{
+        SessionId = $newId
+        Launcher  = $launcher
+        Summary   = [string]$Entry.Summary
+        Folder    = $target
+        Updated   = [DateTimeOffset]::Now
+    }
+}
+
+function Get-DaemonRemoteResumeWorkspace {
+    <# The approved directory a transferred session should open in, or '' when none is chosen. #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Workspaces,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $label = ''
+    try { $label = [string](Get-HomeAssistantState -EntityId $script:DaemonEntity.NewWorkspace -Headers $Headers).state } catch { }
+    $choice = @($Workspaces) | Where-Object { [string]$_.Label -eq $label } | Select-Object -First 1
+    if ($null -eq $choice) { $choice = @($Workspaces) | Select-Object -First 1 }
+    if ($null -eq $choice) { return '' }
+    if (-not (Test-BridgeWorkspacePathApproved -Path ([string]$choice.Path))) { return '' }
+    [string]$choice.Path
 }
 
 function Get-DaemonRemoteResumeLabel {
@@ -1288,9 +1499,20 @@ function Resolve-DaemonLaunchRequest {
     }
     catch { }
     if ($null -ne $resumeSession) {
-        # A session on another machine, offered so it can be seen, never so it can be
-        # launched: its transcript is not here.
-        if (Test-DaemonRemoteResumeRefused -Entry $resumeSession -Label $resumeLabel -Headers $Headers) { return $null }
+        # A session on another machine. Bring it over if we can, and refuse plainly if we
+        # cannot - but never fall through to a launch. That matters more than it reads:
+        # a remote entry reaching the launcher arrives as `--session-id` with no
+        # transcript, and Copilot answers that by silently starting a new empty session
+        # under that id and exiting 0, which the daemon then adopts as a resume that
+        # worked. The workspace check below cannot be relied on to stop it either, since
+        # the same approved path can exist on both machines.
+        if ($resumeSession.PSObject.Properties['Remote'] -and $resumeSession.Remote) {
+            $transferred = Resolve-DaemonRemoteResume -Entry $resumeSession -Label $resumeLabel `
+                -Workspaces $workspaces -Launchers $launchers -Headers $Headers
+            if ($null -eq $transferred) { return $null }
+            $resumeSession = $transferred
+            $resumeLabel = "$resumeLabel (brought over)"
+        }
         if (-not $resumeSession.PSObject.Properties['Folder'] -or
             -not (Test-BridgeWorkspacePathApproved -Path ([string]$resumeSession.Folder))) {
             Write-DaemonLog -Message 'resume refused: its working directory is missing or no longer approved'
