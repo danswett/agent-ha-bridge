@@ -23,7 +23,15 @@ param(
     [string[]]$Suite = @(),
     [switch]$List,
     [switch]$AllowHostTests,
-    [ValidateRange(1, 3600)][int]$TimeoutSeconds = 180,
+    # 300, not 180. test-dashboard needs about 168 seconds once the publication
+    # fixtures exist: 48 scenarios that each build a synthetic install, three that
+    # launch a real child process to prove behaviour survives a restart. Measured
+    # 19.4s inside the assertions and 148.3s between them, in setup. At 180 the
+    # margin was smaller than the difference between two machines - one host
+    # recorded 172.9s and passed while another was killed at the wall on every
+    # run, so whether main's CI went green depended on which runner it landed on.
+    # The installer group already passes 300 explicitly for the same reason.
+    [ValidateRange(1, 3600)][int]$TimeoutSeconds = 300,
     [string]$ResultsDirectory
 )
 
