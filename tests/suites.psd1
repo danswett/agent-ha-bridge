@@ -45,6 +45,7 @@
         'tests\test-restart-restore.ps1'
         'tests\test-resume-discovery.ps1'
         'tests\test-resume-sharing.ps1'
+        'tests\test-session-fork.ps1'
         'tests\test-runner.ps1'
         'tests\test-security.ps1'
         'tests\test-state-read.ps1'

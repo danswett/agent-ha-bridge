@@ -2577,6 +2577,254 @@ function Get-BridgeResumableSessions {
     @($results)
 }
 
+function Get-BridgeSessionBundleSpec {
+    <#
+        Where a session's transcript lives and what identifies it, per agent.
+
+        One place, because three things need the same answer and had better agree: what
+        to collect when a session is sent somewhere, where to put it when it arrives, and
+        what has to be renamed for the copy to be a session in its own right.
+
+        Each agent resolves a session by *name*, which was established by moving real
+        sessions and watching them fail: a Claude transcript not called `<id>.jsonl`
+        gives "No conversation found", and a Codex rollout whose filename loses its id
+        gives "no rollout found for thread id". So the name is the identity, and a copy
+        installed under a new name is a new session - which is exactly what makes a
+        transfer safe.
+
+        Returns $null for a session that cannot be found, rather than guessing.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][string]$Launcher
+    )
+
+    $kind = (Get-BridgeLauncher -Launcher $Launcher).Kind
+    switch ($kind) {
+        'copilot' {
+            $agentHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { Join-Path $HOME '.copilot' }
+            $dir = Join-Path (Join-Path $agentHome 'session-state') $SessionId
+            if (-not [System.IO.Directory]::Exists($dir)) { return $null }
+            # The conversation and its workspace record. Not the whole directory: a
+            # session's own working files can run to hundreds of megabytes, and none of
+            # it is needed to continue the conversation.
+            $files = @('events.jsonl', 'workspace.yaml', 'session.db') |
+                ForEach-Object { Join-Path $dir $_ } | Where-Object { [System.IO.File]::Exists($_) }
+            if (@($files).Count -eq 0) { return $null }
+            [pscustomobject]@{
+                Kind = 'copilot'; Root = $dir; Files = @($files)
+                # A directory named for the session; the copy gets a directory of its own.
+                Layout = 'directory'
+            }
+        }
+        'claude' {
+            $agentHome = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $HOME '.claude' }
+            $projects = Join-Path $agentHome 'projects'
+            if (-not [System.IO.Directory]::Exists($projects)) { return $null }
+            $file = Get-ChildItem -LiteralPath $projects -Filter "$SessionId.jsonl" -File -Recurse -Force -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            if (-not $file) { return $null }
+            [pscustomobject]@{ Kind = 'claude'; Root = $file.Directory.FullName; Files = @($file.FullName); Layout = 'file' }
+        }
+        'codex' {
+            $agentHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+            $sessions = Join-Path $agentHome 'sessions'
+            if (-not [System.IO.Directory]::Exists($sessions)) { return $null }
+            $file = Get-ChildItem -LiteralPath $sessions -Filter "rollout-*$SessionId.jsonl" -File -Recurse -Force -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            if (-not $file) { return $null }
+            [pscustomobject]@{ Kind = 'codex'; Root = $file.Directory.FullName; Files = @($file.FullName); Layout = 'file' }
+        }
+        default { $null }
+    }
+}
+
+function New-BridgeSessionBundle {
+    <#
+        Packs a session's transcript into a zip beside a manifest describing it.
+
+        Read-only with respect to the session: nothing is renamed, moved, locked or
+        marked. The copy that stays behind remains a perfectly good session, which is the
+        whole reason this is safe to do while the fleet is in any state at all.
+
+        The manifest carries a SHA256 of the archive because the receiving side must be
+        able to refuse a damaged one *before* it writes anything into an agent's home.
+        That matters most for Copilot: handed `--session-id` for a session whose files are
+        absent or unreadable, it does not fail - it silently starts a new, empty session
+        under that id and exits 0.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][string]$Launcher,
+        [Parameter(Mandatory)][string]$Destination
+    )
+
+    $spec = Get-BridgeSessionBundleSpec -SessionId $SessionId -Launcher $Launcher
+    if ($null -eq $spec) { throw "no $Launcher session files found for $SessionId" }
+
+    $stage = Join-Path $Destination "stage-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    New-Item -ItemType Directory -Path $stage -Force | Out-Null
+    try {
+        $entries = foreach ($f in @($spec.Files)) {
+            $leaf = [System.IO.Path]::GetFileName($f)
+            Copy-Item -LiteralPath $f -Destination (Join-Path $stage $leaf) -Force
+            $leaf
+        }
+
+        $zip = Join-Path $Destination "$SessionId.zip"
+        if ([System.IO.File]::Exists($zip)) { Remove-Item -LiteralPath $zip -Force }
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::CreateFromDirectory($stage, $zip,
+            [System.IO.Compression.CompressionLevel]::Optimal, $false)
+
+        [pscustomobject]@{
+            SessionId = $SessionId
+            Launcher  = $Launcher
+            Kind      = $spec.Kind
+            Layout    = $spec.Layout
+            Files     = @($entries)
+            Path      = $zip
+            Bytes     = (Get-Item -LiteralPath $zip).Length
+            Sha256    = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
+            # The agent that wrote it. Codex changed its on-disk history between builds,
+            # so a receiver on a different version is worth warning about.
+            Version   = Get-BridgeLauncherVersion -Launcher $Launcher
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-BridgeLauncherVersion {
+    <# The agent's version string, or '' when it cannot be asked. Never throws. #>
+    param([Parameter(Mandatory)][string]$Launcher)
+    try {
+        $path = Get-BridgeLauncherPath -Launcher $Launcher
+        if (-not $path) { return '' }
+        $out = & $path --version 2>&1 | Select-Object -First 1
+        ([string]$out).Trim()
+    }
+    catch { '' }
+}
+
+function Install-BridgeSessionBundle {
+    <#
+        Unpacks a bundle into this machine's agent home as a session of its own, and
+        returns the new session id.
+
+        The copy is deliberately given a NEW id rather than the one it had. That single
+        choice removes the hardest problem in moving a session between machines: if two
+        machines could hold the same id, something would have to arbitrate which of them
+        may write - across machines that cannot reach each other, with no arbiter, and
+        with no way at all to stop someone typing `claude --resume <id>` at a keyboard.
+        Renaming the original was tried on paper and does not work: a rename revokes
+        neither an open handle nor another hard link, so both copies stay writable.
+
+        With a new id there is nothing to arbitrate. Each machine holds one session that
+        only it has, the original stays usable where it always was, and continuing both
+        is divergence between two clearly different sessions rather than two writers
+        corrupting one transcript.
+
+        The digest is checked before anything is written. See New-BridgeSessionBundle for
+        why that is not optional.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$BundlePath,
+        [Parameter(Mandatory)][object]$Manifest,
+        [string]$NewSessionId,
+        # Where the forked session should think it is working. Only recorded; nothing is
+        # created, and the caller has already checked it is an approved workspace.
+        [string]$WorkingDirectory
+    )
+
+    if (-not [System.IO.File]::Exists($BundlePath)) { throw "bundle not found: $BundlePath" }
+    $actual = (Get-FileHash -LiteralPath $BundlePath -Algorithm SHA256).Hash
+    if ($actual -ne [string]$Manifest.Sha256) {
+        throw "bundle digest mismatch: expected $($Manifest.Sha256), got $actual"
+    }
+    if (-not $NewSessionId) { $NewSessionId = [guid]::NewGuid().ToString() }
+
+    $unpack = Join-Path ([System.IO.Path]::GetTempPath()) "bridge-unpack-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    New-Item -ItemType Directory -Path $unpack -Force | Out-Null
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($BundlePath, $unpack)
+
+        $old = [string]$Manifest.SessionId
+        foreach ($f in Get-ChildItem -LiteralPath $unpack -File) {
+            # Text transcripts name the session inside as well as outside. Rewritten so
+            # the copy is consistently its own session; a binary sits untouched, since
+            # the filename is what the agent resolves on.
+            if ($f.Extension -in @('.jsonl', '.yaml', '.json', '.md')) {
+                $text = [System.IO.File]::ReadAllText($f.FullName)
+                if ($text.Contains($old)) {
+                    [System.IO.File]::WriteAllText($f.FullName, $text.Replace($old, $NewSessionId))
+                }
+            }
+        }
+
+        switch ([string]$Manifest.Kind) {
+            'copilot' {
+                $agentHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { Join-Path $HOME '.copilot' }
+                $dest = Join-Path (Join-Path $agentHome 'session-state') $NewSessionId
+                New-Item -ItemType Directory -Path $dest -Force | Out-Null
+                Get-ChildItem -LiteralPath $unpack -File | ForEach-Object {
+                    Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $dest $_.Name) -Force
+                }
+                if ($WorkingDirectory) { Set-BridgeCopilotWorkspaceCwd -Path (Join-Path $dest 'workspace.yaml') -Cwd $WorkingDirectory }
+            }
+            'claude' {
+                $agentHome = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $HOME '.claude' }
+                # The folder encodes a working directory, and any name resolves - proven
+                # by resuming from one called zzz-totally-unrelated-name. It is named for
+                # the target's own directory so a human reading the folder list is not
+                # misled about where the session now runs.
+                $slug = if ($WorkingDirectory) { ($WorkingDirectory -replace '[:\\/]', '-').TrimStart('-') } else { 'bridge-transferred' }
+                $dest = Join-Path (Join-Path $agentHome 'projects') $slug
+                New-Item -ItemType Directory -Path $dest -Force | Out-Null
+                $src = Get-ChildItem -LiteralPath $unpack -File | Select-Object -First 1
+                Copy-Item -LiteralPath $src.FullName -Destination (Join-Path $dest "$NewSessionId.jsonl") -Force
+            }
+            'codex' {
+                $agentHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+                $now = [DateTimeOffset]::Now
+                $dest = Join-Path (Join-Path $agentHome 'sessions') (Join-Path $now.ToString('yyyy') (Join-Path $now.ToString('MM') $now.ToString('dd')))
+                New-Item -ItemType Directory -Path $dest -Force | Out-Null
+                $src = Get-ChildItem -LiteralPath $unpack -File | Select-Object -First 1
+                # The id must stay in the filename; the timestamp part is free.
+                $stamp = $now.ToString('yyyy-MM-ddTHH-mm-ss')
+                Copy-Item -LiteralPath $src.FullName -Destination (Join-Path $dest "rollout-$stamp-$NewSessionId.jsonl") -Force
+            }
+            default { throw "unknown session kind '$($Manifest.Kind)'" }
+        }
+        $NewSessionId
+    }
+    finally {
+        Remove-Item -LiteralPath $unpack -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Set-BridgeCopilotWorkspaceCwd {
+    <#
+        Points a forked Copilot session's workspace record at the directory it will
+        actually run in.
+
+        The original path came from another machine and will usually not exist here -
+        this fleet has sessions under 'rezna', 'danswett' and 'dswett' - so leaving it
+        would describe a tree that is not there.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Cwd
+    )
+    if (-not [System.IO.File]::Exists($Path)) { return }
+    $lines = foreach ($line in [System.IO.File]::ReadAllLines($Path)) {
+        if ($line -match '^cwd:\s') { "cwd: $Cwd" } else { $line }
+    }
+    [System.IO.File]::WriteAllLines($Path, @($lines))
+}
+
 function Read-BridgeConsoleScreen {
     <#
         The visible text of a session's terminal, or '' when it cannot be read: its
