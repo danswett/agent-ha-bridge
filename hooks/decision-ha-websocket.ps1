@@ -1152,7 +1152,8 @@ function Assert-BridgePublicationWriter {
             $target = $State.Policy[$Component]
             $comparison = ([version]$Artifact.version).CompareTo([version]$target.version)
             if ($State.Policy.mode -ceq 'pin') {
-                if ($comparison -ne 0 -or $Artifact.hash -cne $target.hash) { throw 'Authorized rollback pins an exact publication target; automatic writers cannot leave that pin.' }
+                # Numeric aliases must not relabel an exact pin before receipt validation.
+                if ($Artifact.version -cne $target.version -or $Artifact.hash -cne $target.hash) { throw 'Authorized rollback pins an exact publication target; automatic writers cannot leave that pin.' }
             }
             elseif ($comparison -lt 0) { throw "An older $Component cannot cross the publication version fence." }
             elseif ($comparison -eq 0 -and $Artifact.hash -cne $target.hash) { throw "Equal $Component versions have conflicting content; bump the version or explicitly authorize a pinned generation." }
