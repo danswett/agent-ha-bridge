@@ -45,6 +45,7 @@
         'tests\test-resume-discovery.ps1'
         'tests\test-runner.ps1'
         'tests\test-security.ps1'
+        'tests\test-service-target.ps1'
         'tests\test-state-read.ps1'
         'tests\test-state-snapshot.ps1'
         'tests\test-status-card.ps1'
