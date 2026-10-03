@@ -3006,7 +3006,10 @@ function Read-BridgeHaMqttSubscription {
     param(
         [Parameter(Mandatory)][string]$Topic,
         [Parameter(Mandatory)][scriptblock]$Until,
-        [int]$TimeoutSeconds = 300
+        [int]$TimeoutSeconds = 300,
+        # Called once the subscription is live. Nothing published here is retained, so a
+        # sender that starts before this has fired is talking to no one.
+        [scriptblock]$OnReady
     )
 
     $token = (Get-HomeAssistantHeaders).Authorization -replace '^Bearer ', ''
@@ -3041,6 +3044,7 @@ function Read-BridgeHaMqttSubscription {
 
         & $send @{ id = 1; type = 'mqtt/subscribe'; topic = $Topic }
         [void](& $recv)                                   # subscription result
+        if ($OnReady) { & $OnReady }
 
         while (-not $cancel.IsCancellationRequested) {
             $msg = & $recv
