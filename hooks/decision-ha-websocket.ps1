@@ -6,7 +6,7 @@
 #>
 
 . (Join-Path $PSScriptRoot 'bridge-secrets.ps1')
-$script:BridgeDashboardRenderVersion = '1.0.0'
+$script:BridgeDashboardRenderVersion = '1.1.0'
 $script:BridgeDashboardObservation = $null
 
 function Invoke-CopilotHaWebSocket {

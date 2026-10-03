@@ -994,6 +994,12 @@ the fencing protocol and the operator policy generation are different things.
 Ordinary authorized publication may advance compatible artifact versions, but never
 silently replaces equal-version/different-content artifacts or lowers a fence.
 
+The composed renderer that includes End-session confirmation uses publication version
+`1.1.0`. The earlier frozen `1.0.0` candidate is a different render artifact, even
+when bridge/card versions or session inputs match. Inspect targets again from the
+complete selected build before an authorized policy change; do not reuse the old
+renderer target/hash or edit a receipt to make it appear current.
+
 Rollback is an explicit next-generation **pin of exact card and renderer versions
 and content hashes**. It is not a permanent force flag or a transactional installer
 rollback. For a card-only rollback, inspect an approved historical card file with

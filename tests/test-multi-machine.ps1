@@ -658,6 +658,48 @@ $env:AGENT_BRIDGE_DAEMON_NORUN = '1'
 . (Join-Path $PSScriptRoot '..\hooks\agent-bridge-daemon.ps1')
 Remove-Item Env:\AGENT_BRIDGE_DAEMON_NORUN -ErrorAction SilentlyContinue
 
+# Cache age is not a transport boundary. Keep the reader/retry layer real, and
+# record rejected requests before their best-effort callers can hide the error.
+$script:SweepHttpStates = @()
+$script:SweepHttpRequests = [Collections.Generic.List[object]]::new()
+$script:SweepHttpTemplateRefused = $false
+function Invoke-RestMethod {
+    param([object]$Method, [object]$Uri, [object]$Headers, [object]$Body, [object]$ContentType, [object]$TimeoutSec)
+
+    $request = [pscustomobject]@{
+        Method = $Method; Uri = $Uri; Unexpected = $true
+        HasHeaders = ($Headers -is [hashtable]); TimeoutSeconds = $TimeoutSec
+        BodyIsString = ($Body -is [string]); ContentType = $ContentType; ExtraArgumentCount = $args.Count
+    }
+    $script:SweepHttpRequests.Add($request)
+    if ($args.Count -ne 0 -or $Headers -isnot [hashtable] -or $Headers.Count -ne 0 -or
+        $Method -isnot [string] -or $Uri -isnot [string] -or
+        $TimeoutSec -isnot [int] -or $TimeoutSec -ne 15) {
+        throw "Unexpected synthetic sweep HTTP request shape: $Method $Uri"
+    }
+    if ($Method -ceq 'Post' -and $Uri -ceq 'http://publication.invalid:8123/api/template' -and
+        $ContentType -is [string] -and $ContentType -ceq 'application/json' -and $Body -is [string]) {
+        $payload = $Body | ConvertFrom-Json -AsHashtable
+        if ($payload -is [Collections.IDictionary] -and $payload.Count -eq 1 -and
+            ($payload.Keys -ccontains 'template') -and $payload.template -is [string] -and
+            $payload.template -ceq $script:DaemonBridgeStatesTemplate) {
+            $request.Unexpected = $false
+            if ($script:SweepHttpTemplateRefused) {
+                $response = [Net.Http.HttpResponseMessage]::new([Net.HttpStatusCode]::BadRequest)
+                throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('Synthetic template refusal', $response)
+            }
+            $filtered = @($script:SweepHttpStates | Where-Object { $_.entity_id -cmatch '^[^.]+\.(agent_bridge_|mcp_)' })
+            return (ConvertTo-Json -InputObject $filtered -Depth 10 -Compress)
+        }
+    }
+    elseif ($Method -ceq 'Get' -and $Uri -ceq 'http://publication.invalid:8123/api/states' -and
+        -not $PSBoundParameters.ContainsKey('Body') -and -not $PSBoundParameters.ContainsKey('ContentType')) {
+        $request.Unexpected = $false
+        return ,$script:SweepHttpStates
+    }
+    throw "Unexpected synthetic sweep HTTP request: $Method $Uri"
+}
+
 $script:Swept = @()
 function Publish-CopilotMqttMessage {
     param([string]$Topic, [AllowEmptyString()][string]$Payload, [hashtable]$Headers, [switch]$Retain)
@@ -679,10 +721,17 @@ $sweepStates = @(
     [pscustomobject]@{ entity_id = 'select.agent_bridge_3333333333333333_decision'; state = 'Idle'; attributes = [pscustomobject]@{} }
 )
 $script:DaemonStatesCache = $sweepStates
-$script:DaemonStatesCacheAt = [DateTimeOffset]::Now
+$script:SweepHttpStates = $script:DaemonStatesCache
+$script:DaemonStatesCacheAt = [DateTimeOffset]::MinValue
 $script:SweepLog = @()
+$orphanReadStart = $script:SweepHttpRequests.Count
 Clear-CopilotMqttOrphans -Headers @{} -Live @{ '11111111-1111-1111-1111-111111111111' = $true }
 
+Test-That 'the orphan sweep refreshes an expired cache through the synthetic template' {
+    $script:SweepHttpRequests.Count -eq ($orphanReadStart + 1) -and
+        $script:SweepHttpRequests[-1].Method -ceq 'Post' -and
+        $script:SweepHttpRequests[-1].Uri -ceq 'http://publication.invalid:8123/api/template'
+}
 Test-That 'the abandoned session is cleared' {
     @($script:Swept | Where-Object { $_ -match 'agent_bridge_3333333333333333' }).Count -ge 1
 }
@@ -722,7 +771,8 @@ $hexStates = @(
     [pscustomobject]@{ entity_id = 'button.agent_bridge_abcdef012345_new_session'; state = 'unknown'; attributes = [pscustomobject]@{} }
 )
 $script:DaemonStatesCache = $hexStates
-$script:DaemonStatesCacheAt = [DateTimeOffset]::Now
+$script:SweepHttpStates = $script:DaemonStatesCache
+$script:DaemonStatesCacheAt = [DateTimeOffset]::MinValue
 Clear-CopilotMqttOrphans -Headers @{} -Live @{}
 Test-That 'a hostname shaped like a node id is still recognised as a machine' {
     @($script:Swept).Count -eq 0
@@ -734,7 +784,8 @@ $script:SweepLog = @()
 $script:DaemonStatesCache = @(
     [pscustomobject]@{ entity_id = 'select.agent_bridge_4444444444444444_decision'; state = 'Idle'; attributes = [pscustomobject]@{} }
 )
-$script:DaemonStatesCacheAt = [DateTimeOffset]::Now
+$script:SweepHttpStates = $script:DaemonStatesCache
+$script:DaemonStatesCacheAt = [DateTimeOffset]::MinValue
 Clear-CopilotMqttOrphans -Headers @{} -Live @{}
 Test-That 'an incomplete picture skips the sweep rather than guessing' {
     # Deleting a running machine's entities is far worse than leaving a dead session
@@ -812,11 +863,18 @@ $script:DaemonStatesCache = @(
     # The unscoped helper from before the switch was per-machine.
     [pscustomobject]@{ entity_id = 'input_boolean.agent_bridge_detailed_activity'; state = 'off'; attributes = [pscustomobject]@{} }
 )
-$script:DaemonStatesCacheAt = [DateTimeOffset]::Now
+$script:SweepHttpStates = $script:DaemonStatesCache
+$script:DaemonStatesCacheAt = [DateTimeOffset]::MinValue
 $script:DaemonStaleHelperSeen = @{}
 $known = @([pscustomobject]@{ Slug = 'stillhere' })
 
+$helperReadStart = $script:SweepHttpRequests.Count
 $firstPass = Clear-DaemonStaleMachineHelper -Machines $known -Headers @{}
+Test-That 'the stale-helper sweep refreshes an expired cache through the synthetic template' {
+    $script:SweepHttpRequests.Count -eq ($helperReadStart + 1) -and
+        $script:SweepHttpRequests[-1].Method -ceq 'Post' -and
+        $script:SweepHttpRequests[-1].Uri -ceq 'http://publication.invalid:8123/api/template'
+}
 Test-That 'a switch with no machine is not deleted the first time it is seen' {
     # A machine creates its switch at startup and publishes its sensors moments
     # later, so a snapshot taken in between shows a helper with no machine.
@@ -848,7 +906,8 @@ $script:DaemonStaleHelperSeen = @{}
 $script:DaemonStatesCache = @(
     [pscustomobject]@{ entity_id = 'input_boolean.agent_bridge_oldbox_detailed_activity'; state = 'on'; attributes = [pscustomobject]@{} }
 )
-$script:DaemonStatesCacheAt = [DateTimeOffset]::Now
+$script:SweepHttpStates = $script:DaemonStatesCache
+$script:DaemonStatesCacheAt = [DateTimeOffset]::MinValue
 [void](Clear-DaemonStaleMachineHelper -Machines $known -Headers @{})
 [void](Clear-DaemonStaleMachineHelper -Machines $known -Headers @{})
 Test-That 'a snapshot with no machine sensors in it is treated as incomplete' {
@@ -864,7 +923,8 @@ $script:DaemonStatesCache = @(
     (New-MachineState -Slug 'stillhere' -Machine 'STILL-HERE'),
     [pscustomobject]@{ entity_id = 'input_boolean.agent_bridge_oldbox_detailed_activity'; state = 'on'; attributes = [pscustomobject]@{} }
 )
-$script:DaemonStatesCacheAt = [DateTimeOffset]::Now
+$script:SweepHttpStates = $script:DaemonStatesCache
+$script:DaemonStatesCacheAt = [DateTimeOffset]::MinValue
 [void](Clear-DaemonStaleMachineHelper -Machines $known -Headers @{})
 [void](Clear-DaemonStaleMachineHelper -Machines @($known + [pscustomobject]@{ Slug = 'oldbox' }) -Headers @{})
 [void](Clear-DaemonStaleMachineHelper -Machines $known -Headers @{})
@@ -968,6 +1028,50 @@ Test-That 'a non-interactive run never prompts' {
         -Prompt { throw 'a scripted uninstall must not block on a prompt' }
     -not $d.Clear
 }
+
+Write-Host '--- the real reader handles expired synthetic state responses ---'
+$script:SweepHttpStates = @(
+    (New-MachineState -Slug 'fixture' -Machine 'FIXTURE')
+    [pscustomobject]@{ entity_id = 'light.fixture_unrelated'; state = 'off'; attributes = [pscustomobject]@{} }
+)
+$script:SweepHttpTemplateRefused = $true
+$script:DaemonStatesTemplateRefused = $false
+$script:DaemonStatesCacheAt = [DateTimeOffset]::MinValue
+$fallbackReadStart = $script:SweepHttpRequests.Count
+$fallbackStates = Get-DaemonHomeAssistantStates -Headers @{}
+Test-That 'an expired cache falls back to the full synthetic state array after template refusal' {
+    $fallbackStates.Count -eq 2 -and
+        $fallbackStates[0].entity_id -ceq 'sensor.agent_bridge_fixture_sessions' -and
+        $fallbackStates[1].entity_id -ceq 'light.fixture_unrelated' -and
+        $script:SweepHttpRequests.Count -eq ($fallbackReadStart + 2) -and
+        $script:SweepHttpRequests[-2].Method -ceq 'Post' -and
+        $script:SweepHttpRequests[-1].Method -ceq 'Get' -and $script:DaemonStatesTemplateRefused
+}
+
+$script:DaemonStatesCacheAt = [DateTimeOffset]::MinValue
+$refusedReadStart = $script:SweepHttpRequests.Count
+$refusedStates = Get-DaemonHomeAssistantStates -Headers @{}
+Test-That 'the next expired read remembers the refusal instead of retrying the template' {
+    $refusedStates.Count -eq 2 -and $script:DaemonStatesTemplateRefused -and
+        $script:SweepHttpRequests.Count -eq ($refusedReadStart + 1) -and
+        $script:SweepHttpRequests[-1].Method -ceq 'Get' -and
+        $script:SweepHttpRequests[-1].Uri -ceq 'http://publication.invalid:8123/api/states'
+}
+
+$script:SweepHttpTemplateRefused = $false
+$script:DaemonStatesTemplateRefused = $false
+$script:SweepHttpStates = @()
+$script:DaemonStatesCacheAt = [DateTimeOffset]::MinValue
+$emptyReadStart = $script:SweepHttpRequests.Count
+$emptyStates = Get-DaemonHomeAssistantStates -Headers @{}
+Test-That 'an empty filtered refresh stays an empty array without a fallback request' {
+    $emptyStates -is [Array] -and $emptyStates.Count -eq 0 -and
+        $script:SweepHttpRequests.Count -eq ($emptyReadStart + 1) -and
+        $script:SweepHttpRequests[-1].Method -ceq 'Post'
+}
+Test-That 'unexpected sweep requests stay visible even when a best-effort caller catches them' {
+    @($script:SweepHttpRequests | Where-Object Unexpected).Count -eq 0
+} (($script:SweepHttpRequests | Where-Object Unexpected | ForEach-Object { "$($_.Method) $($_.Uri)" }) -join ' | ')
 
 Write-Host ''
 if ($script:Failures -gt 0) {

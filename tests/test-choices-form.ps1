@@ -76,6 +76,12 @@ $headers = @{ Authorization = '******' }
 # Entity states as Home Assistant would hold them, filled in from the discovery
 # payloads and the starting values the bridge publishes. Nothing is invented here.
 $script:HaStates = @{}
+function Get-HomeAssistantState {
+    param([string]$EntityId, [hashtable]$Headers)
+    if (-not $script:HaStates.Contains($EntityId)) { throw "no such entity: $EntityId" }
+    $entry = $script:HaStates[$EntityId]
+    [pscustomobject]@{ entity_id = $EntityId; state = [string]$entry.state; attributes = $entry.attributes }
+}
 function Publish-CopilotMqttMessage {
     param([string]$Topic, [string]$Payload, [hashtable]$Headers, [switch]$Retain)
     if ($Topic -match '/select/[^/]+/(decision|f\d)/config$') {
@@ -225,13 +231,6 @@ foreach ($call in @($rendered.calls)) {
 }
 $script:HaStates["text.${node}_reply"] = [ordered]@{ state = 'nothing to add'; attributes = @{} }
 $script:HaStates["button.${node}_submit"] = [ordered]@{ state = [DateTimeOffset]::Now.ToString('o'); attributes = @{} }
-
-function Get-HomeAssistantState {
-    param([string]$EntityId, [hashtable]$Headers)
-    if (-not $script:HaStates.Contains($EntityId)) { throw "no such entity: $EntityId" }
-    $entry = $script:HaStates[$EntityId]
-    [pscustomobject]@{ entity_id = $EntityId; state = [string]$entry.state; attributes = $entry.attributes }
-}
 
 $marker = [pscustomobject]@{
     decisionId = 'd1'

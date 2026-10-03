@@ -1112,6 +1112,10 @@ Write-Host '--- explicit policy generations, rollback and real failure paths ---
         $oldSource = New-TestPublicationCard '2.0.0'
         $newSource = New-TestPublicationCard '3.0.0'
         $oldTarget = Get-BridgePublicationTarget -CardSourcePath $oldSource
+        Test-That 'the composed renderer target advances independently of the card version' {
+            $oldTarget.render.version -ceq '1.1.0' -and $oldTarget.card.version -ceq '2.0.0' -and
+                $oldTarget.render.hash -ceq (Get-BridgeRenderArtifact).hash
+        }
         Set-TestPublicationCardUrl -Url (Get-BridgeInlineReplyCardUrl -SourcePath $newSource -Version '3.0.0')
         Test-That 'bootstrap cannot silently set a fence below an actually observed newer card' {
             try { Set-BridgePublicationPolicy -ExpectedGeneration 0 -ExpectedPolicyHash absent -Target $oldTarget | Out-Null; $false }
@@ -1129,6 +1133,14 @@ Write-Host '--- explicit policy generations, rollback and real failure paths ---
             (@($record.Keys | Sort-Object) -join ',') -ceq 'id,type,url'
         }
 
+        $script:BridgeDashboardRenderVersion = '1.0.0'
+        $script:TestPublication.Commands.Clear()
+        Test-That 'the previous renderer version cannot replace the composed publication' {
+            try { Save-CopilotSessionDashboard -Sessions @() | Out-Null; $false }
+            catch { $_.Exception.Message -match 'older.*render' -and @(Get-TestPublicationWrites).Count -eq 0 }
+        }
+        $script:BridgeDashboardRenderVersion = $originalRenderVersion
+
         # Participating renderer versions share the fencing protocol; the pinned
         # unmodified 1.22.2 implementation is exercised separately, not modeled here.
         $script:BridgeDashboardRenderVersion = '2.0.0'
@@ -1139,7 +1151,7 @@ Write-Host '--- explicit policy generations, rollback and real failure paths ---
             $upgraded.Ok -and $advanced.card.version -eq '3.0.0' -and $advanced.render.version -eq '2.0.0' -and
                 $advanced.protocol -eq 1 -and $advanced.generation -eq 1
         }
-        $script:BridgeDashboardRenderVersion = '1.0.0'
+        $script:BridgeDashboardRenderVersion = $originalRenderVersion
         $script:TestPublication.Commands.Clear()
         Test-That 'an older participating renderer refuses the real save path' {
             try { Save-CopilotSessionDashboard -Sessions @() | Out-Null; $false }
@@ -1158,7 +1170,7 @@ Write-Host '--- explicit policy generations, rollback and real failure paths ---
         $pinned = (Read-BridgePublicationState).Policy
         Test-That 'an explicit next generation rolls back exact targets without erasing high-water fences' {
             $rolledBack.Ok -and $pinned.mode -eq 'pin' -and $pinned.generation -eq 2 -and
-                $pinned.card.version -eq '2.0.0' -and $pinned.render.version -eq '1.0.0' -and
+                $pinned.card.version -eq '2.0.0' -and $pinned.render.version -eq $originalRenderVersion -and
                 $pinned.highCard.version -eq '3.0.0' -and $pinned.highRender.version -eq '2.0.0' -and
                 (Get-BridgeDashboardPublication).Verified
         }
@@ -1267,7 +1279,7 @@ Write-Host '--- explicit policy generations, rollback and real failure paths ---
             catch { $_.Exception.Message -match 'module' -and @(Get-TestPublicationWrites).Count -eq 0 }
         }
 
-        $script:BridgeDashboardRenderVersion = '1.0.0'
+        $script:BridgeDashboardRenderVersion = $originalRenderVersion
         Initialize-TestPublicationStore
         Initialize-TestPublicationAuthority
         $receiptBeforeEquivalentOrigin = Get-BridgePublicationReceiptPath
@@ -1328,7 +1340,7 @@ Write-Host '--- explicit policy generations, rollback and real failure paths ---
 
         Write-Host '--- dashboard publication honors the actual exact card pin ---'
         Initialize-TestPublicationStore
-        $script:BridgeDashboardRenderVersion = '1.0.0'
+        $script:BridgeDashboardRenderVersion = $originalRenderVersion
         $advanceSource = New-TestPublicationCard '1.21.0'
         $pinSource = New-TestPublicationCard '1.20.0'
         $wrongContentSource = New-TestPublicationCard '1.20.0' 'export const differentContent = true;'
