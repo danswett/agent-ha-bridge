@@ -2825,6 +2825,239 @@ function Set-BridgeCopilotWorkspaceCwd {
     [System.IO.File]::WriteAllLines($Path, @($lines))
 }
 
+function Get-BridgeBundleChunk {
+    <#
+        Splits bundle bytes into pieces small enough to publish, measuring what actually
+        goes on the wire rather than the slice.
+
+        A raw slice is not the packet. Base64 inflates it by a third, the envelope adds
+        its sequence and offset fields, and the topic string rides along too. A "2 MB"
+        test published a ~2.8 MB packet, which is how this limit was learned: mosquitto
+        2.1 lowered the default max_packet_size to 2,000,000 bytes, and exceeding it
+        disconnects Home Assistant from the broker - not just this publish, but every
+        MQTT entity on the instance, repeatedly, until the oversize message is gone.
+
+        So each piece is measured encoded and shrunk until it fits. The default budget is
+        a quarter of a megabyte: an order of magnitude under that ceiling, so a fleet
+        whose broker has never been reconfigured is still safe, and large enough that a
+        typical session is one or two pieces.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes,
+        [Parameter(Mandatory)][string]$Topic,
+        [int]$Budget = 262144
+    )
+
+    if ($Bytes.Length -eq 0) { return @() }
+    # Base64 is 4 bytes per 3, and the envelope and topic are along for the ride.
+    # Floor, not [int]: PowerShell's cast rounds, so [int]0.9 is 1 - which in the shrink
+    # loop below gave a size that could never get smaller and a loop that never ended.
+    $overhead = $Topic.Length + 96
+    $slice = [Math]::Max(1, [int][Math]::Floor(($Budget - $overhead) * 3 / 4))
+
+    $chunks = [System.Collections.Generic.List[object]]::new()
+    $offset = 0
+    while ($offset -lt $Bytes.Length) {
+        # Each piece is sized by measurement, not arithmetic: the arithmetic above is an
+        # estimate, and being wrong by a few bytes at the ceiling is what breaks a broker.
+        $take = [Math]::Min($slice, $Bytes.Length - $offset)
+        $fitted = $false
+        while ($take -gt 0) {
+            $buf = [byte[]]::new($take)
+            [Array]::Copy($Bytes, $offset, $buf, 0, $take)
+            $payload = @{ s = $chunks.Count; o = $offset; d = [Convert]::ToBase64String($buf) } |
+                ConvertTo-Json -Compress
+            $encoded = [Text.Encoding]::UTF8.GetByteCount($payload) + $Topic.Length
+            if ($encoded -le $Budget) {
+                $chunks.Add([pscustomobject]@{
+                    Seq = $chunks.Count; Offset = $offset; Length = $take
+                    Payload = $payload; Encoded = $encoded
+                })
+                $fitted = $true
+                break
+            }
+            # Always strictly smaller, so this terminates even when 90% rounds back up.
+            $take = [Math]::Min($take - 1, [int][Math]::Floor($take * 0.9))
+        }
+        if (-not $fitted) { throw "cannot fit a chunk within $Budget bytes for topic '$Topic'" }
+        $offset += $take
+    }
+    @($chunks)
+}
+
+function Join-BridgeBundleChunk {
+    <#
+        Rebuilds bundle bytes from received pieces, or throws saying what is wrong.
+
+        Refuses a gap rather than writing a shorter file: an archive missing a slice from
+        its middle can still extract, and the result would be a transcript that looks
+        plausible and is not.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Chunks,
+        [Parameter(Mandatory)][int]$TotalBytes,
+        [AllowEmptyString()][string]$Sha256 = ''
+    )
+
+    $bytes = [byte[]]::new($TotalBytes)
+    $ordered = @(@($Chunks) | Where-Object { $null -ne $_ } | Sort-Object { [int]$_.o })
+    foreach ($chunk in $ordered) {
+        $data = [Convert]::FromBase64String([string]$chunk.d)
+        $offset = [int]$chunk.o
+        if ($offset -lt 0 -or ($offset + $data.Length) -gt $TotalBytes) {
+            throw "chunk $($chunk.s) lies outside the bundle"
+        }
+        [Array]::Copy($data, 0, $bytes, $offset, $data.Length)
+    }
+
+    # Coverage is checked by walking the pieces, not by marking every byte: a bundle is
+    # megabytes and a per-byte loop made this take seconds for no extra certainty.
+    $reached = 0
+    foreach ($chunk in $ordered) {
+        $offset = [int]$chunk.o
+        if ($offset -gt $reached) {
+            throw "bundle incomplete: nothing covers bytes $reached..$($offset - 1) of $TotalBytes"
+        }
+        $end = $offset + [Convert]::FromBase64String([string]$chunk.d).Length
+        if ($end -gt $reached) { $reached = $end }
+    }
+    if ($reached -lt $TotalBytes) {
+        throw "bundle incomplete: $($TotalBytes - $reached) of $TotalBytes bytes never arrived"
+    }
+
+    if ($Sha256) {
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try { $actual = [BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '') }
+        finally { $sha.Dispose() }
+        if ($actual -ne $Sha256.ToUpperInvariant()) {
+            throw "bundle digest mismatch: expected $Sha256, got $actual"
+        }
+    }
+    $bytes
+}
+
+function Get-BridgeTransferTopic {
+    <#
+        Where one transfer's messages live: a topic per transfer, under the owning
+        machine.
+
+        Deliberately not under `homeassistant/`, and never named by a discovery config,
+        so Home Assistant creates no entity for it. That is what keeps chunk payloads out
+        of the state machine and therefore out of the recorder and backups - clearing a
+        retained topic afterwards would not remove rows already written.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Slug,
+        [Parameter(Mandatory)][string]$Correlation
+    )
+    "$($script:CopilotMqttConfig.TopicRoot)/transfer/$Slug/$Correlation"
+}
+
+function Send-BridgeSessionBundle {
+    <#
+        Publishes a bundle as a manifest followed by its chunks.
+
+        Not retained, any of it. A retained chunk would sit on the broker after the
+        transfer, be redelivered to every reconnecting subscriber, and - at these sizes -
+        is exactly the shape of message that took this fleet's MQTT down for twenty-five
+        minutes. The receiver is listening before this is called; a transfer nobody is
+        listening for is simply lost, which is the right outcome.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Manifest,
+        [Parameter(Mandatory)][string]$Slug,
+        [Parameter(Mandatory)][string]$Correlation,
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [int]$Budget = 262144,
+        [scriptblock]$OnProgress
+    )
+
+    $root = Get-BridgeTransferTopic -Slug $Slug -Correlation $Correlation
+    $bytes = [IO.File]::ReadAllBytes([string]$Manifest.Path)
+    $chunks = @(Get-BridgeBundleChunk -Bytes $bytes -Topic "$root/c" -Budget $Budget)
+
+    Publish-CopilotMqttMessage -Topic "$root/manifest" -Headers $Headers -Payload (@{
+        session  = [string]$Manifest.SessionId
+        launcher = [string]$Manifest.Launcher
+        kind     = [string]$Manifest.Kind
+        bytes    = [int]$Manifest.Bytes
+        sha256   = [string]$Manifest.Sha256
+        chunks   = $chunks.Count
+        version  = [string]$Manifest.Version
+    } | ConvertTo-Json -Compress)
+
+    foreach ($chunk in $chunks) {
+        Publish-CopilotMqttMessage -Topic "$root/c" -Headers $Headers -Payload $chunk.Payload
+        if ($OnProgress) { & $OnProgress $chunk.Seq $chunks.Count }
+    }
+    $chunks.Count
+}
+
+function Read-BridgeHaMqttSubscription {
+    <#
+        Collects messages published to a topic, over Home Assistant's WebSocket API.
+
+        The receiving half of the data path, and the reason chunks need no entity: this
+        subscribes to the topic directly, so nothing is ever written to a state and the
+        recorder has nothing to keep.
+
+        Returns once -Until says so or the timeout passes, whichever comes first.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Topic,
+        [Parameter(Mandatory)][scriptblock]$Until,
+        [int]$TimeoutSeconds = 300
+    )
+
+    $token = (Get-HomeAssistantHeaders).Authorization -replace '^Bearer ', ''
+    $wsUri = [Uri](($script:DecisionBridgeConfig.HomeAssistantBaseUrl -replace '^http', 'ws').TrimEnd('/') + '/api/websocket')
+    Assert-BridgeHttpAllowed -Uri $wsUri -Transport WebSocket
+    Assert-BridgeAuthAllowed
+
+    $socket = [Net.WebSockets.ClientWebSocket]::new()
+    $cancel = [Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds($TimeoutSeconds))
+    $received = [System.Collections.Generic.List[object]]::new()
+    try {
+        [void]$socket.ConnectAsync($wsUri, $cancel.Token).GetAwaiter().GetResult()
+        $buffer = [ArraySegment[byte]]::new([byte[]]::new(1048576))
+        $recv = {
+            $text = [Text.StringBuilder]::new()
+            do {
+                $r = $socket.ReceiveAsync($buffer, $cancel.Token).GetAwaiter().GetResult()
+                [void]$text.Append([Text.Encoding]::UTF8.GetString($buffer.Array, 0, $r.Count))
+            } while (-not $r.EndOfMessage)
+            $text.ToString() | ConvertFrom-Json
+        }
+        $send = {
+            param($o)
+            $b = [Text.Encoding]::UTF8.GetBytes(($o | ConvertTo-Json -Depth 10 -Compress))
+            [void]$socket.SendAsync([ArraySegment[byte]]::new($b), [Net.WebSockets.WebSocketMessageType]::Text, $true, $cancel.Token).GetAwaiter().GetResult()
+        }
+
+        [void](& $recv)                                   # auth_required
+        & $send @{ type = 'auth'; access_token = $token }
+        $auth = & $recv
+        if ([string]$auth.type -ne 'auth_ok') { throw "websocket auth failed: $($auth.type)" }
+
+        & $send @{ id = 1; type = 'mqtt/subscribe'; topic = $Topic }
+        [void](& $recv)                                   # subscription result
+
+        while (-not $cancel.IsCancellationRequested) {
+            $msg = & $recv
+            if ([string]$msg.type -ne 'event') { continue }
+            $payload = $msg.event.payload
+            if ($null -eq $payload) { continue }
+            try { $received.Add(($payload | ConvertFrom-Json)) } catch { continue }
+            if (& $Until @($received)) { break }
+        }
+        @($received)
+    }
+    finally {
+        try { [void]$socket.CloseAsync([Net.WebSockets.WebSocketCloseStatus]::NormalClosure, 'done', [Threading.CancellationToken]::None).GetAwaiter().GetResult() } catch { }
+        $socket.Dispose(); $cancel.Dispose()
+    }
+}
+
 function Read-BridgeConsoleScreen {
     <#
         The visible text of a session's terminal, or '' when it cannot be read: its
