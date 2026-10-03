@@ -57,6 +57,17 @@ try {
         'name: Transferred session'
     )
     Set-Content -Path (Join-Path $dir 'huge-working-file.bin') -Value ('x' * 5000)
+    # The session's own persistent content, which a transfer has to bring: a checkpoint
+    # summary and an artifact, each naming the session so the id rewrite is exercised
+    # below the top level too.
+    New-Item -ItemType Directory -Path (Join-Path $dir 'checkpoints') -Force | Out-Null
+    Set-Content -Path (Join-Path $dir 'checkpoints\001-first.md') -Value "# checkpoint for $oldId`n$marker"
+    New-Item -ItemType Directory -Path (Join-Path $dir 'files\nested') -Force | Out-Null
+    Set-Content -Path (Join-Path $dir 'files\notes.md') -Value "artifact of $oldId"
+    Set-Content -Path (Join-Path $dir 'files\nested\notes.md') -Value 'same leaf, different folder'
+    # Undo state for files on this machine's disks; meaningless once the session moves.
+    New-Item -ItemType Directory -Path (Join-Path $dir 'rewind-file-snapshots') -Force | Out-Null
+    Set-Content -Path (Join-Path $dir 'rewind-file-snapshots\snap.bin') -Value ('y' * 4000)
 
     $srcClaude = Join-Path $root 'src-claude'
     $cdir = Join-Path $srcClaude 'projects\-Users-someone-else-repo'
@@ -77,11 +88,15 @@ try {
 
     $env:COPILOT_HOME = $srcCopilot
     $spec = Get-BridgeSessionBundleSpec -SessionId $oldId -Launcher 'copilot'
-    Test-That 'a Copilot session is its transcript and workspace record' {
-        @($spec.Files | ForEach-Object { [IO.Path]::GetFileName($_) } | Sort-Object) -join ',' -eq 'events.jsonl,workspace.yaml'
+    Test-That 'a Copilot session is its transcript, workspace record and own content' {
+        @($spec.Files | ForEach-Object { [IO.Path]::GetRelativePath($spec.Root, $_) } | Sort-Object) -join ',' -eq
+            'checkpoints\001-first.md,events.jsonl,files\nested\notes.md,files\notes.md,workspace.yaml'
     }
     Test-That 'and not its working files, which can run to hundreds of megabytes' {
         @($spec.Files | Where-Object { $_ -like '*huge-working-file*' }).Count -eq 0
+    }
+    Test-That 'nor this machine''s rewind snapshots, which mean nothing elsewhere' {
+        @($spec.Files | Where-Object { $_ -like '*rewind-file-snapshots*' }).Count -eq 0
     }
     Test-That 'a session that is not there yields nothing rather than a guess' {
         $null -eq (Get-BridgeSessionBundleSpec -SessionId 'ffffffff-0000-0000-0000-000000000000' -Launcher 'copilot')
@@ -184,6 +199,22 @@ try {
     }
     Test-That 'the workspace record points at the directory it will actually run in' {
         @(Get-Content (Join-Path $newDir 'workspace.yaml')) -contains 'cwd: C:\here\now'
+    }
+    Test-That 'the checkpoints and artifacts came too, in the folders they were in' {
+        (Test-Path (Join-Path $newDir 'checkpoints\001-first.md')) -and
+        (Test-Path (Join-Path $newDir 'files\notes.md')) -and
+        (Test-Path (Join-Path $newDir 'files\nested\notes.md'))
+    }
+    Test-That 'two artifacts sharing a leaf name stayed distinct rather than colliding' {
+        (Get-Content (Join-Path $newDir 'files\notes.md') -Raw).Contains('artifact of') -and
+        (Get-Content (Join-Path $newDir 'files\nested\notes.md') -Raw).Contains('same leaf, different folder')
+    }
+    Test-That 'the id was rewritten below the top level as well' {
+        $cp = Get-Content (Join-Path $newDir 'checkpoints\001-first.md') -Raw
+        $cp.Contains($newId) -and -not $cp.Contains($oldId)
+    }
+    Test-That 'the rewind snapshots did not travel' {
+        -not (Test-Path (Join-Path $newDir 'rewind-file-snapshots'))
     }
     Test-That 'the original is STILL there on the source machine, untouched' {
         $env:COPILOT_HOME = $srcCopilot

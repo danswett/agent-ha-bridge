@@ -2620,18 +2620,35 @@ function Get-BridgeSessionBundleSpec {
             $agentHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { Join-Path $HOME '.copilot' }
             $dir = Join-Path (Join-Path $agentHome 'session-state') $SessionId
             if (-not [System.IO.Directory]::Exists($dir)) { return $null }
-            # The conversation and its workspace record. Not the whole directory: a
-            # session's own working files can run to hundreds of megabytes, and none of
-            # it is needed to continue the conversation.
+            # The conversation, its workspace record, and the session's own persistent
+            # content. Not the whole directory: rewind-file-snapshots is this machine's
+            # undo state for files on this machine's disks, and means nothing once the
+            # session is somewhere else.
+            #
+            # checkpoints and files are included because they are part of the session
+            # rather than scratch. A live test transferred a session with 605 artifacts
+            # under files\ and 10 checkpoint summaries, and the fork arrived with the
+            # conversation referring to both and neither present - the transcript said
+            # "saved to files\discovery-proposal" about a directory that was now empty.
             #
             # session.db is deliberately left out. It is binary, so the id rewrite that
             # makes the copy its own session cannot touch it, and a database still
             # naming the original would disagree with the directory it sits in. Nothing
             # establishes it is needed - the sessions proven to resume after a move did
             # not have one - so it stays out until something does.
-            $files = @('events.jsonl', 'workspace.yaml') |
-                ForEach-Object { Join-Path $dir $_ } | Where-Object { [System.IO.File]::Exists($_) }
-            if (@($files).Count -eq 0) { return $null }
+            $files = [System.Collections.Generic.List[string]]::new()
+            foreach ($name in @('events.jsonl', 'workspace.yaml')) {
+                $path = Join-Path $dir $name
+                if ([System.IO.File]::Exists($path)) { $files.Add($path) }
+            }
+            foreach ($sub in @('checkpoints', 'files')) {
+                $subPath = Join-Path $dir $sub
+                if (-not [System.IO.Directory]::Exists($subPath)) { continue }
+                foreach ($f in [System.IO.Directory]::EnumerateFiles($subPath, '*', [System.IO.SearchOption]::AllDirectories)) {
+                    $files.Add($f)
+                }
+            }
+            if ($files.Count -eq 0) { return $null }
             [pscustomobject]@{
                 Kind = 'copilot'; Root = $dir; Files = @($files)
                 # A directory named for the session; the copy gets a directory of its own.
@@ -2689,9 +2706,17 @@ function New-BridgeSessionBundle {
     New-Item -ItemType Directory -Path $stage -Force | Out-Null
     try {
         $entries = foreach ($f in @($spec.Files)) {
-            $leaf = [System.IO.Path]::GetFileName($f)
-            Copy-Item -LiteralPath $f -Destination (Join-Path $stage $leaf) -Force
-            $leaf
+            # Relative to the session root, not the leaf: a Copilot session keeps content
+            # in checkpoints\ and files\, and flattening those collides the moment two
+            # subdirectories hold the same name.
+            $relative = [System.IO.Path]::GetRelativePath($spec.Root, $f)
+            $target = Join-Path $stage $relative
+            $parent = [System.IO.Path]::GetDirectoryName($target)
+            if ($parent -and -not [System.IO.Directory]::Exists($parent)) {
+                New-Item -ItemType Directory -Path $parent -Force | Out-Null
+            }
+            Copy-Item -LiteralPath $f -Destination $target -Force
+            $relative
         }
 
         $zip = Join-Path $Destination "$safeId.zip"
@@ -2789,7 +2814,7 @@ function Install-BridgeSessionBundle {
         [System.IO.Compression.ZipFile]::ExtractToDirectory($BundlePath, $unpack)
 
         $old = [string]$Manifest.SessionId
-        foreach ($f in Get-ChildItem -LiteralPath $unpack -File) {
+        foreach ($f in Get-ChildItem -LiteralPath $unpack -File -Recurse) {
             # Text transcripts name the session inside as well as outside. Rewritten so
             # the copy is consistently its own session; a binary sits untouched, since
             # the filename is what the agent resolves on.
@@ -2806,8 +2831,16 @@ function Install-BridgeSessionBundle {
                 $agentHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { Join-Path $HOME '.copilot' }
                 $dest = Join-Path (Join-Path $agentHome 'session-state') $NewSessionId
                 New-Item -ItemType Directory -Path $dest -Force | Out-Null
-                Get-ChildItem -LiteralPath $unpack -File | ForEach-Object {
-                    Copy-Item -LiteralPath $_.FullName -Destination (Join-Path $dest $_.Name) -Force
+                # Recursive: checkpoints\ and files\ are part of the session, and a
+                # top-level-only copy silently left both behind.
+                Get-ChildItem -LiteralPath $unpack -File -Recurse | ForEach-Object {
+                    $relative = [System.IO.Path]::GetRelativePath($unpack, $_.FullName)
+                    $target = Join-Path $dest $relative
+                    $parent = [System.IO.Path]::GetDirectoryName($target)
+                    if ($parent -and -not [System.IO.Directory]::Exists($parent)) {
+                        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+                    }
+                    Copy-Item -LiteralPath $_.FullName -Destination $target -Force
                 }
                 if ($WorkingDirectory) { Set-BridgeCopilotWorkspaceCwd -Path (Join-Path $dest 'workspace.yaml') -Cwd $WorkingDirectory }
             }
