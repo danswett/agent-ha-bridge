@@ -430,7 +430,7 @@ function Install-BridgeReplyCard {
         if ($publication.CardUrl -cne $state.Url) { throw 'The card changed while advancing its fence; no card write was sent.' }
     }
     catch {
-        if ($_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        if ($_.Exception.Data['BridgeTestNetworkBlocked'] -or $_.Exception.Data['BridgeTestWriteBlocked']) { throw }
         $result.Action = 'blocked'
         $result.Ok = $present
         $result.Registered = $state.Registered
@@ -465,7 +465,7 @@ function Install-BridgeReplyCard {
         $result.Ok = $true
     }
     catch {
-        if ($_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        if ($_.Exception.Data['BridgeTestNetworkBlocked'] -or $_.Exception.Data['BridgeTestWriteBlocked']) { throw }
         $result.Detail = "could not register the resource: $($_.Exception.Message)"
         $result.Ok = $false
         $result.Action = 'unconfirmed'

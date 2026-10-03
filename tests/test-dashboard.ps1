@@ -248,6 +248,9 @@ try {
         receipt = (Test-Path -LiteralPath (Get-BridgePublicationReceiptPath) -PathType Leaf)
         writes = @(Get-TestPublicationWrites).Count
         processId = $PID
+        fixtureRoot = $env:AGENT_HA_BRIDGE_TEST_ROOT
+        fixtureId = $env:AGENT_HA_BRIDGE_TEST_ID
+        configPath = (Get-BridgeInstallContext).ConfigPath
     } | ConvertTo-Json -Compress
     exit 0
 }
@@ -262,7 +265,9 @@ catch {
         Replace('__REPAIR__', $(if ($Repair) { 'yes' } else { 'no' }))
     [IO.File]::WriteAllText($childPath, $source, [Text.UTF8Encoding]::new($false))
     . (Join-Path $PSScriptRoot 'runner-support.ps1')
-    $sandbox = New-BridgeTestSandbox -ParentDirectory $fixtureRoot
+    # Restart the same installation inside its verified sandbox. A nested sandbox
+    # correctly rejects the parent installation's config as an escaped path.
+    $sandbox = $env:AGENT_HA_BRIDGE_TEST_ROOT
     $start = New-BridgeTestProcessStartInfo -ScriptPath $childPath -Sandbox $sandbox -Group Offline
     $start.Environment['AGENT_HA_BRIDGE_CONFIG'] = $script:BridgeInstallContext.ConfigPath
     $child = Invoke-BridgeTestProcess -StartInfo $start -TimeoutSeconds 30
@@ -1133,6 +1138,55 @@ Write-Host '--- explicit policy generations, rollback and real failure paths ---
             (@($record.Keys | Sort-Object) -join ',') -ceq 'id,type,url'
         }
 
+        $boundaryReceiptPath = Get-BridgePublicationReceiptPath
+        $boundaryReceiptBytes = [IO.File]::ReadAllBytes($boundaryReceiptPath)
+        $boundaryStore = Get-TestPublicationStore
+        try {
+            [IO.File]::WriteAllText($boundaryReceiptPath, '{"protocol":', [Text.UTF8Encoding]::new($false))
+            $script:TestPublication.Commands.Clear()
+            Test-That 'card publication propagates a marked receipt read instead of returning a blocked result' {
+                try { Install-BridgeReplyCard -SourcePath $oldSource | Out-Null; $false }
+                catch {
+                    $_.Exception.Data['BridgeTestWriteBlocked'] -eq $true -and
+                        @(Get-TestPublicationWrites).Count -eq 0
+                }
+            }
+            [IO.File]::WriteAllBytes($boundaryReceiptPath, $boundaryReceiptBytes)
+
+            $boundarySource = New-TestPublicationCard '2.1.0'
+            $boundaryProbe = @{
+                ReceiptPath = $boundaryReceiptPath
+                CardResourceId = (Get-BridgeReplyCardState).ResourceId
+                CardWriteSeen = $false
+                WritesAtCorruption = 0
+            }
+            $boundaryInvoker = {
+                param([hashtable[]]$Commands)
+                $responses = Invoke-TestPublicationCommands -Commands $Commands
+                foreach ($command in $Commands) {
+                    if ($command.type -ceq 'lovelace/resources/update' -and
+                        $command.resource_id -ceq $boundaryProbe.CardResourceId) {
+                        [IO.File]::WriteAllText($boundaryProbe.ReceiptPath, '{"protocol":', [Text.UTF8Encoding]::new($false))
+                        $boundaryProbe.CardWriteSeen = $true
+                        $boundaryProbe.WritesAtCorruption = @(Get-TestPublicationWrites).Count
+                    }
+                }
+                Write-Output -NoEnumerate $responses
+            }
+            Test-That 'card confirmation propagates a real marked receipt error after its synthetic write' {
+                try { Install-BridgeReplyCard -SourcePath $boundarySource -Invoker $boundaryInvoker | Out-Null; $false }
+                catch {
+                    $_.Exception.Data['BridgeTestWriteBlocked'] -eq $true -and $boundaryProbe.CardWriteSeen -and
+                        @(Get-TestPublicationWrites).Count -eq $boundaryProbe.WritesAtCorruption
+                }
+            }
+        }
+        finally {
+            [IO.File]::WriteAllBytes($boundaryReceiptPath, $boundaryReceiptBytes)
+            Set-TestPublicationStore $boundaryStore
+            $script:TestPublication.Commands.Clear()
+        }
+
         $script:BridgeDashboardRenderVersion = '1.0.0'
         $script:TestPublication.Commands.Clear()
         Test-That 'the previous renderer version cannot replace the composed publication' {
@@ -1293,6 +1347,12 @@ Write-Host '--- explicit policy generations, rollback and real failure paths ---
         Test-That 'a genuinely fresh process verifies the intact policy and persisted receipt' {
             $restarted.ExitCode -eq 0 -and -not $restarted.TimedOut -and $restarted.Observation.verified -and
                 $restarted.Observation.receipt -and $restarted.Observation.processId -ne $PID -and $restarted.Observation.writes -eq 0
+        }
+        Test-That 'a fresh publisher keeps the same installation inside its verified sandbox' {
+            $restarted.Observation.fixtureRoot -ceq $env:AGENT_HA_BRIDGE_TEST_ROOT -and
+                $restarted.Observation.fixtureId -ceq $env:AGENT_HA_BRIDGE_TEST_ID -and
+                $restarted.Observation.configPath -ceq $script:BridgeInstallContext.ConfigPath -and
+                (Test-BridgeInstallDescendant $restarted.Observation.configPath $restarted.Observation.fixtureRoot)
         }
         $deletedAfterRestart = Get-TestPublicationStore
         $deletedAfterRestart.dashboards = @()

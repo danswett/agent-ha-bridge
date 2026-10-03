@@ -1095,6 +1095,7 @@ function Sync-DaemonDashboard {
         return $true
     }
     catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked']) { throw }
         if (-not $_.Exception.Data['BridgePublicationRefused']) { $script:BridgeDashboardObservation = $null }
         Write-DaemonLog -Message "dashboard publication not current: $($_.Exception.Message)"
         return $false

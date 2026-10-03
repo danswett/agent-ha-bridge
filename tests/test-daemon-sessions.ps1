@@ -399,6 +399,25 @@ $firstPublication = Sync-DaemonDashboard -Descriptors $publicationDescriptors -C
 Test-That 'the real save persists a dashboard before it becomes current' {
     $firstPublication -and (Get-TestPublicationStore).configs.Contains('agent-decisions')
 } ($script:Log[-1])
+$boundaryReceiptPath = Get-BridgePublicationReceiptPath
+$boundaryReceiptBytes = [IO.File]::ReadAllBytes($boundaryReceiptPath)
+$boundarySignature = $script:DaemonDashboardSignature
+try {
+    [IO.File]::WriteAllText($boundaryReceiptPath, '{"protocol":', [Text.UTF8Encoding]::new($false))
+    $script:TestPublication.Commands.Clear()
+    Test-That 'reconciliation propagates a marked receipt error without publication or signature advance' {
+        try {
+            Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers | Out-Null
+            $false
+        }
+        catch {
+            $_.Exception.Data['BridgeTestWriteBlocked'] -eq $true -and
+                @(Get-TestPublicationWrites).Count -eq 0 -and
+                $script:DaemonDashboardSignature -ceq $boundarySignature
+        }
+    }
+}
+finally { [IO.File]::WriteAllBytes($boundaryReceiptPath, $boundaryReceiptBytes) }
 $unchangedSignature = $script:DaemonDashboardSignature
 $deletedStore = Get-TestPublicationStore
 $deletedStore.dashboards = @()
