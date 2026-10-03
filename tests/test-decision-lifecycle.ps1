@@ -438,7 +438,7 @@ try {
         function Get-LiveMcpSessions { param($Headers) @{} }
         function Get-BridgeSessionDisplay { param($SessionId, $Kind, $WorkingDirectory) [pscustomobject]@{ Name = "$Kind`: synthetic"; Machine = 'TEST' } }
         function Get-DaemonLaunchCapabilities { @{} }
-        function Publish-DaemonGlobalStatus { param($Descriptors, $Capabilities, $Headers) }
+        function Publish-DaemonGlobalStatus { param($Descriptors, $Capabilities, $Resumable, $Headers) }
         function Publish-DaemonOnlineHeartbeat { param($Headers) }
         function Sync-DaemonDashboard { param($Descriptors, $Capabilities, $Headers) $true }
         function Remove-CopilotMqttSession { param($SessionId, $Headers) }

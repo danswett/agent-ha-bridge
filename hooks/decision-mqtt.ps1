@@ -752,6 +752,24 @@ function Publish-CopilotMqttNewSession {
     Publish-CopilotMqttMessage -Topic "$prefix/sensor/$node/new_prompt_payload/config" `
         -Payload ($promptPayloadConfig | ConvertTo-Json -Depth 8 -Compress) -Headers $Headers -Retain
 
+    # Where another machine asks this one to send a session it holds. Small, legible and
+    # worth recording - it is the control plane. The transcript itself never comes this
+    # way: chunks go to a topic no discovery config names, so Home Assistant creates no
+    # entity for them and the recorder keeps nothing, which clearing a retained topic
+    # afterwards would not achieve.
+    $transferRequestConfig = @{
+        name                  = 'Session transfer request'
+        unique_id             = "agent_bridge_${Slug}_transfer_request"
+        object_id             = "agent_bridge_${Slug}_transfer_request"
+        state_topic           = "$root/transfer/request"
+        value_template        = '{{ value_json.at }}'
+        json_attributes_topic = "$root/transfer/request"
+        icon                  = 'mdi:transfer'
+        device                = $device
+    }
+    Publish-CopilotMqttMessage -Topic "$prefix/sensor/$node/transfer_request/config" `
+        -Payload ($transferRequestConfig | ConvertTo-Json -Depth 8 -Compress) -Headers $Headers -Retain
+
     $workspaceConfig = @{
         name          = 'New session workspace'
         unique_id     = "agent_bridge_${Slug}_new_workspace"
@@ -918,6 +936,45 @@ function Clear-CopilotMqttNewSessionPrompt {
         -Payload '{}' -Headers $Headers -Retain
 }
 
+function Set-CopilotMqttTransferRequest {
+    <#
+        Asks the machine that holds a session to send it here.
+
+        Retained, so the owning machine finds it whenever its next reconcile comes round
+        rather than having to be listening at the moment of the press - the same reason
+        a launch prompt is retained. Tiny, and nothing of the transcript is in it.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Slug,
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][string]$Launcher,
+        [Parameter(Mandatory)][string]$Requester,
+        [Parameter(Mandatory)][string]$Correlation,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    Publish-CopilotMqttMessage -Topic "$(Get-CopilotMqttMachineTopicRoot -Slug $Slug)/transfer/request" `
+        -Payload (@{
+            at = [DateTimeOffset]::Now.ToString('o')
+            session = $SessionId; launcher = $Launcher
+            requester = $Requester; correlation = $Correlation
+        } | ConvertTo-Json -Compress) -Headers $Headers -Retain
+}
+
+function Clear-CopilotMqttTransferRequest {
+    <#
+        Clears a handled request, so the same one is not served again on the next pass.
+        Retained means it would be, otherwise.
+    #>
+    param(
+        [string]$Slug,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    Publish-CopilotMqttMessage -Topic "$(Get-CopilotMqttMachineTopicRoot -Slug $Slug)/transfer/request" `
+        -Payload '{}' -Headers $Headers -Retain
+}
+
 function Set-CopilotMqttNewSessionResult {
     <#
         Reports the outcome of the last launch. Truncated to the Home Assistant state
@@ -1044,6 +1101,13 @@ function Publish-CopilotMqttGlobalStatus {
         # it correctly without knowing anything about how it is configured.
         [hashtable]$Capabilities = @{},
 
+        # Sessions this machine could reopen, so another machine can show them. Already
+        # reduced and bounded by the caller: this publishes what it is given and makes
+        # no judgement about what may travel, because deciding that belongs with the
+        # machine that owns the sessions rather than with the transport.
+        [AllowEmptyCollection()]
+        [object[]]$Resumable = @(),
+
         [string]$Slug,
 
         [string]$MachineName,
@@ -1080,6 +1144,7 @@ function Publish-CopilotMqttGlobalStatus {
         machine = $MachineName
         machine_slug = $Slug
         capabilities = $Capabilities
+        resumable = @($Resumable)
         updated = [DateTimeOffset]::Now.ToString('o')
     } | ConvertTo-Json -Depth 6 -Compress) -Headers $Headers -Retain
 }
@@ -1205,11 +1270,18 @@ function Get-BridgePeerMachine {
         $machine = ''
         $sessions = @()
         $capabilities = @{}
+        $resumable = @()
         if ($null -ne $attributes) {
             if ($attributes.PSObject.Properties.Name -contains 'machine') { $machine = [string]$attributes.machine }
             if ($attributes.PSObject.Properties.Name -contains 'sessions') { $sessions = @($attributes.sessions) }
             if ($attributes.PSObject.Properties.Name -contains 'capabilities' -and $null -ne $attributes.capabilities) {
                 $capabilities = $attributes.capabilities
+            }
+            # Absent on a machine running a bridge from before sessions were shared,
+            # which simply means it offers none - the same shape as a machine that has
+            # chosen not to share any.
+            if ($attributes.PSObject.Properties.Name -contains 'resumable' -and $null -ne $attributes.resumable) {
+                $resumable = @($attributes.resumable)
             }
         }
         # An older machine's sensor predates the machine attribute, so fall back to the
@@ -1221,6 +1293,7 @@ function Get-BridgePeerMachine {
             Machine = $machine
             Sessions = @($sessions)
             Capabilities = $capabilities
+            Resumable = @($resumable)
             Online = [bool]$online[$slug]
             IsSelf = ($slug -eq $self)
             EntityId = $entityId
@@ -1251,6 +1324,7 @@ function Get-CopilotMqttMachineTopic {
         "$prefix/button/$node/install_update/config"
         "$prefix/text/$node/new_prompt/config"
         "$prefix/sensor/$node/new_prompt_payload/config"
+        "$prefix/sensor/$node/transfer_request/config"
         "$prefix/select/$node/new_workspace/config"
         "$prefix/select/$node/new_profile/config"
         "$prefix/select/$node/new_agent/config"
@@ -1269,6 +1343,7 @@ function Get-CopilotMqttMachineTopic {
         "$root/update/state"
         "$root/newsession/result"
         "$root/newsession/promptpayload"
+        "$root/transfer/request"
         "$root/online/state"
         "$root/global/state"
         "$root/global/attr"

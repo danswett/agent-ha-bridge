@@ -2571,10 +2571,712 @@ function Get-BridgeResumableSessions {
             Launcher  = $entry.Launcher
             Folder    = $entry.Folder
             Updated   = $entry.Updated
+            # Carried through rather than dropped here. Without it the opt-in detail
+            # setting could never share a title: the per-agent readers produce a
+            # Summary, this projection discarded it, and everything downstream saw an
+            # object that had never had one.
+            Summary   = $entry.Summary
         }
     }
 
     @($results)
+}
+
+function Get-BridgeUnlinkedDescendantFile {
+    <#
+        Every file under a directory, without ever stepping through a link.
+
+        Directory.EnumerateFiles with AllDirectories follows symlinks and Windows
+        junctions. A session directory is not a trusted tree - its files\ is where a
+        session puts whatever it was working on - so a single junction called `files\x`
+        pointing at a repository, or at the user's profile, would have put that
+        directory's contents into a bundle and sent them to another machine. A link
+        cycle would not have terminated at all.
+
+        So the walk is explicit and refuses reparse points on both files and
+        directories, rather than trying to decide whether a particular target is
+        acceptable.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    $out = [System.Collections.Generic.List[string]]::new()
+    if (-not [System.IO.Directory]::Exists($Path)) { return $out.ToArray() }
+
+    $pending = [System.Collections.Generic.Queue[string]]::new()
+    $pending.Enqueue($Path)
+    while ($pending.Count -gt 0) {
+        $current = $pending.Dequeue()
+        foreach ($entry in [System.IO.Directory]::EnumerateFileSystemEntries($current)) {
+            $info = [System.IO.FileInfo]::new($entry)
+            if ($info.Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }
+            if ($info.Attributes -band [System.IO.FileAttributes]::Directory) { $pending.Enqueue($entry) }
+            else { $out.Add($entry) }
+        }
+    }
+    # Unwrapped would make an empty result $null under StrictMode rather than nothing.
+    $out.ToArray()
+}
+
+function Get-BridgeSessionBundleSpec {
+    <#
+        Where a session's transcript lives and what identifies it, per agent.
+
+        One place, because three things need the same answer and had better agree: what
+        to collect when a session is sent somewhere, where to put it when it arrives, and
+        what has to be renamed for the copy to be a session in its own right.
+
+        Each agent resolves a session by *name*, which was established by moving real
+        sessions and watching them fail: a Claude transcript not called `<id>.jsonl`
+        gives "No conversation found", and a Codex rollout whose filename loses its id
+        gives "no rollout found for thread id". So the name is the identity, and a copy
+        installed under a new name is a new session - which is exactly what makes a
+        transfer safe.
+
+        Returns $null for a session that cannot be found, rather than guessing.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][string]$Launcher
+    )
+
+    # The id reaches here from another machine's MQTT payload and is about to build
+    # paths and a -Filter. Unsanitised it is three separate primitives: `..\..\x` walks
+    # out of the session-state root, `*` is a glob that -Recurse will happily resolve to
+    # somebody else's transcript, and either one reaches the archive name too. Real ids
+    # are UUIDs and pass through this untouched.
+    $SessionId = Get-CopilotSafeSessionKey -SessionId $SessionId
+    if ($SessionId -notmatch '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+        return $null
+    }
+
+    $kind = (Get-BridgeLauncher -Launcher $Launcher).Kind
+    switch ($kind) {
+        'copilot' {
+            $agentHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { Join-Path $HOME '.copilot' }
+            $dir = Join-Path (Join-Path $agentHome 'session-state') $SessionId
+            if (-not [System.IO.Directory]::Exists($dir)) { return $null }
+            # The conversation, its workspace record, and the session's own persistent
+            # content. Not the whole directory: rewind-file-snapshots is this machine's
+            # undo state for files on this machine's disks, and means nothing once the
+            # session is somewhere else.
+            #
+            # checkpoints and files are included because they are part of the session
+            # rather than scratch. A live test transferred a session with 605 artifacts
+            # under files\ and 10 checkpoint summaries, and the fork arrived with the
+            # conversation referring to both and neither present - the transcript said
+            # "saved to files\discovery-proposal" about a directory that was now empty.
+            #
+            # session.db is deliberately left out. It is binary, so the id rewrite that
+            # makes the copy its own session cannot touch it, and a database still
+            # naming the original would disagree with the directory it sits in. Nothing
+            # establishes it is needed - the sessions proven to resume after a move did
+            # not have one - so it stays out until something does.
+            $files = [System.Collections.Generic.List[string]]::new()
+            foreach ($name in @('events.jsonl', 'workspace.yaml')) {
+                $path = Join-Path $dir $name
+                if (-not [System.IO.File]::Exists($path)) { continue }
+                # A symlinked transcript resolves somewhere this session does not own.
+                if ([System.IO.FileInfo]::new($path).Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }
+                $files.Add($path)
+            }
+            foreach ($sub in @('checkpoints', 'files')) {
+                $subPath = Join-Path $dir $sub
+                if (-not [System.IO.Directory]::Exists($subPath)) { continue }
+                if ([System.IO.DirectoryInfo]::new($subPath).Attributes -band [System.IO.FileAttributes]::ReparsePoint) { continue }
+                foreach ($f in (Get-BridgeUnlinkedDescendantFile -Path $subPath)) { $files.Add($f) }
+            }
+            if ($files.Count -eq 0) { return $null }
+            [pscustomobject]@{
+                Kind = 'copilot'; Root = $dir; Files = @($files)
+                # A directory named for the session; the copy gets a directory of its own.
+                Layout = 'directory'
+            }
+        }
+        'claude' {
+            $agentHome = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $HOME '.claude' }
+            $projects = Join-Path $agentHome 'projects'
+            if (-not [System.IO.Directory]::Exists($projects)) { return $null }
+            $file = Get-ChildItem -LiteralPath $projects -Filter "$SessionId.jsonl" -File -Recurse -Force -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            if (-not $file) { return $null }
+            [pscustomobject]@{ Kind = 'claude'; Root = $file.Directory.FullName; Files = @($file.FullName); Layout = 'file' }
+        }
+        'codex' {
+            $agentHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+            $sessions = Join-Path $agentHome 'sessions'
+            if (-not [System.IO.Directory]::Exists($sessions)) { return $null }
+            $file = Get-ChildItem -LiteralPath $sessions -Filter "rollout-*$SessionId.jsonl" -File -Recurse -Force -ErrorAction SilentlyContinue |
+                Select-Object -First 1
+            if (-not $file) { return $null }
+            [pscustomobject]@{ Kind = 'codex'; Root = $file.Directory.FullName; Files = @($file.FullName); Layout = 'file' }
+        }
+        default { $null }
+    }
+}
+
+function New-BridgeSessionBundle {
+    <#
+        Packs a session's transcript into a zip beside a manifest describing it.
+
+        Read-only with respect to the session: nothing is renamed, moved, locked or
+        marked. The copy that stays behind remains a perfectly good session, which is the
+        whole reason this is safe to do while the fleet is in any state at all.
+
+        The manifest carries a SHA256 of the archive because the receiving side must be
+        able to refuse a damaged one *before* it writes anything into an agent's home.
+        That matters most for Copilot: handed `--session-id` for a session whose files are
+        absent or unreadable, it does not fail - it silently starts a new, empty session
+        under that id and exits 0.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][string]$Launcher,
+        [Parameter(Mandatory)][string]$Destination,
+        # A bound on what is read, checked before a byte is copied. Distinct from the
+        # cap on what goes on the wire, which is measured on the zip afterwards: a
+        # session observed in testing was 62.6 MB on disk and well under a 25 MB wire
+        # cap once compressed, so refusing on raw size against the wire cap would have
+        # turned away a transfer that works. This exists only to stop the work itself
+        # being unbounded. 0 disables it.
+        [long]$MaxSourceBytes = 0
+    )
+
+    $spec = Get-BridgeSessionBundleSpec -SessionId $SessionId -Launcher $Launcher
+    if ($null -eq $spec) { throw "no $Launcher session files found for $SessionId" }
+    # Sanitised above; used again here because it names the archive.
+    $safeId = Get-CopilotSafeSessionKey -SessionId $SessionId
+
+    # Before the staging directory exists, let alone a copy. The file list is fully
+    # known from the spec, and `files\` is a session's own artifact store with nothing
+    # upstream bounding it - so without this one request could have the owning machine
+    # copy and compress an arbitrarily large tree into temp, inside the single-threaded
+    # reconcile, answering nothing else while it did.
+    if ($MaxSourceBytes -gt 0) {
+        $total = 0L
+        foreach ($f in @($spec.Files)) { $total += [System.IO.FileInfo]::new($f).Length }
+        if ($total -gt $MaxSourceBytes) {
+            throw "that session is $([int]($total / 1MB)) MB on disk, over the $([int]($MaxSourceBytes / 1MB)) MB a transfer will read"
+        }
+    }
+
+    $stage = Join-Path $Destination "stage-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    New-Item -ItemType Directory -Path $stage -Force | Out-Null
+    try {
+        # What the files looked like before the copy started. A session is only checked
+        # for being live once, in the snapshot the caller took at the start of its
+        # reconcile, and sending can take tens of seconds - so someone resuming the
+        # source in between would have the agent appending while this reads, producing a
+        # fork that is digest-valid and truncated. That cannot be prevented from here:
+        # there is no lock an agent CLI would honour. It can be *detected*, and a refusal
+        # is the right answer, because a silently half-copied conversation is worse than
+        # no transfer at all.
+        $witness = @{}
+        foreach ($f in @($spec.Files)) {
+            $info = [System.IO.FileInfo]::new($f)
+            $witness[$f] = "$($info.Length):$($info.LastWriteTimeUtc.Ticks)"
+        }
+
+        $entries = foreach ($f in @($spec.Files)) {
+            # Relative to the session root, not the leaf: a Copilot session keeps content
+            # in checkpoints\ and files\, and flattening those collides the moment two
+            # subdirectories hold the same name.
+            $relative = [System.IO.Path]::GetRelativePath($spec.Root, $f)
+            $target = Join-Path $stage $relative
+            $parent = [System.IO.Path]::GetDirectoryName($target)
+            if ($parent -and -not [System.IO.Directory]::Exists($parent)) {
+                New-Item -ItemType Directory -Path $parent -Force | Out-Null
+            }
+            Copy-Item -LiteralPath $f -Destination $target -Force
+            $relative
+        }
+
+        $zip = Join-Path $Destination "$safeId.zip"
+        if ([System.IO.File]::Exists($zip)) { Remove-Item -LiteralPath $zip -Force }
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::CreateFromDirectory($stage, $zip,
+            [System.IO.Compression.CompressionLevel]::Optimal, $false)
+
+        # Re-read after the copy, not before: a file that grew or was rewritten while it
+        # was being read makes the archive a snapshot of no single moment.
+        foreach ($f in @($spec.Files)) {
+            $info = [System.IO.FileInfo]::new($f)
+            if (-not $info.Exists -or $witness[$f] -ne "$($info.Length):$($info.LastWriteTimeUtc.Ticks)") {
+                throw "that session changed while it was being packed - it is probably open somewhere"
+            }
+        }
+
+        [pscustomobject]@{
+            SessionId = $SessionId
+            Launcher  = $Launcher
+            Kind      = $spec.Kind
+            Layout    = $spec.Layout
+            Files     = @($entries)
+            Path      = $zip
+            Bytes     = (Get-Item -LiteralPath $zip).Length
+            Sha256    = (Get-FileHash -LiteralPath $zip -Algorithm SHA256).Hash
+            # The agent that wrote it. Codex changed its on-disk history between builds,
+            # so a receiver on a different version is worth warning about.
+            Version   = Get-BridgeLauncherVersion -Launcher $Launcher
+        }
+    }
+    finally {
+        Remove-Item -LiteralPath $stage -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Get-BridgeLauncherVersion {
+    <#
+        The agent's version string, or '' when it cannot be asked. Never throws, and
+        never waits.
+
+        The timeout is the point. This runs inside the daemon's reconcile, on a path a
+        *peer machine* can trigger by asking for a session, so a CLI that sits there
+        instead of answering would stop this machine reconciling at all - no activity,
+        no decisions, no replies - until it gave up. An agent not answering `--version`
+        is a case this codebase has already hit: "it may be waiting to be signed in".
+        The field is only a cosmetic warning about version skew, so it is never worth a
+        stalled daemon.
+    #>
+    param([Parameter(Mandatory)][string]$Launcher)
+    try {
+        $path = Get-BridgeLauncherPath -Launcher $Launcher
+        if (-not $path) { return '' }
+        $probe = Invoke-BridgeCommandProbe -Executable $path -Arguments @('--version') -TimeoutMs 5000
+        if (-not $probe.Ran -or $probe.TimedOut) { return '' }
+        $out = [string]$probe.StandardOutput
+        if ([string]::IsNullOrWhiteSpace($out)) { $out = [string]$probe.Output }
+        (@($out -split "`n") | Where-Object { $_.Trim() } | Select-Object -First 1).Trim()
+    }
+    catch { '' }
+}
+
+function Install-BridgeSessionBundle {
+    <#
+        Unpacks a bundle into this machine's agent home as a session of its own, and
+        returns the new session id.
+
+        The copy is deliberately given a NEW id rather than the one it had. That single
+        choice removes the hardest problem in moving a session between machines: if two
+        machines could hold the same id, something would have to arbitrate which of them
+        may write - across machines that cannot reach each other, with no arbiter, and
+        with no way at all to stop someone typing `claude --resume <id>` at a keyboard.
+        Renaming the original was tried on paper and does not work: a rename revokes
+        neither an open handle nor another hard link, so both copies stay writable.
+
+        With a new id there is nothing to arbitrate. Each machine holds one session that
+        only it has, the original stays usable where it always was, and continuing both
+        is divergence between two clearly different sessions rather than two writers
+        corrupting one transcript.
+
+        The digest is checked before anything is written. See New-BridgeSessionBundle for
+        why that is not optional.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$BundlePath,
+        [Parameter(Mandatory)][object]$Manifest,
+        [string]$NewSessionId,
+        # Where the forked session should think it is working. Only recorded; nothing is
+        # created, and the caller has already checked it is an approved workspace.
+        [string]$WorkingDirectory
+    )
+
+    if (-not [System.IO.File]::Exists($BundlePath)) { throw "bundle not found: $BundlePath" }
+    $actual = (Get-FileHash -LiteralPath $BundlePath -Algorithm SHA256).Hash
+    if ($actual -ne [string]$Manifest.Sha256) {
+        throw "bundle digest mismatch: expected $($Manifest.Sha256), got $actual"
+    }
+    if (-not $NewSessionId) { $NewSessionId = [guid]::NewGuid().ToString() }
+
+    $unpack = Join-Path ([System.IO.Path]::GetTempPath()) "bridge-unpack-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+    New-Item -ItemType Directory -Path $unpack -Force | Out-Null
+    try {
+        Add-Type -AssemblyName System.IO.Compression.FileSystem
+        [System.IO.Compression.ZipFile]::ExtractToDirectory($BundlePath, $unpack)
+
+        $old = [string]$Manifest.SessionId
+        foreach ($f in Get-ChildItem -LiteralPath $unpack -File -Recurse) {
+            # Text transcripts name the session inside as well as outside. Rewritten so
+            # the copy is consistently its own session; a binary sits untouched, since
+            # the filename is what the agent resolves on.
+            if ($f.Extension -in @('.jsonl', '.yaml', '.json', '.md')) {
+                $text = [System.IO.File]::ReadAllText($f.FullName)
+                if ($text.Contains($old)) {
+                    [System.IO.File]::WriteAllText($f.FullName, $text.Replace($old, $NewSessionId))
+                }
+            }
+        }
+
+        switch ([string]$Manifest.Kind) {
+            'copilot' {
+                $agentHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { Join-Path $HOME '.copilot' }
+                $dest = Join-Path (Join-Path $agentHome 'session-state') $NewSessionId
+                New-Item -ItemType Directory -Path $dest -Force | Out-Null
+                # Recursive: checkpoints\ and files\ are part of the session, and a
+                # top-level-only copy silently left both behind.
+                Get-ChildItem -LiteralPath $unpack -File -Recurse | ForEach-Object {
+                    $relative = [System.IO.Path]::GetRelativePath($unpack, $_.FullName)
+                    $target = Join-Path $dest $relative
+                    $parent = [System.IO.Path]::GetDirectoryName($target)
+                    if ($parent -and -not [System.IO.Directory]::Exists($parent)) {
+                        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+                    }
+                    Copy-Item -LiteralPath $_.FullName -Destination $target -Force
+                }
+                if ($WorkingDirectory) { Set-BridgeCopilotWorkspaceCwd -Path (Join-Path $dest 'workspace.yaml') -Cwd $WorkingDirectory }
+            }
+            'claude' {
+                $agentHome = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $HOME '.claude' }
+                # The folder encodes a working directory, and any name resolves - proven
+                # by resuming from one called zzz-totally-unrelated-name. It is named for
+                # the target's own directory so a human reading the folder list is not
+                # misled about where the session now runs.
+                $slug = if ($WorkingDirectory) { ($WorkingDirectory -replace '[:\\/]', '-').TrimStart('-') } else { 'bridge-transferred' }
+                $dest = Join-Path (Join-Path $agentHome 'projects') $slug
+                New-Item -ItemType Directory -Path $dest -Force | Out-Null
+                $src = Get-ChildItem -LiteralPath $unpack -File | Select-Object -First 1
+                Copy-Item -LiteralPath $src.FullName -Destination (Join-Path $dest "$NewSessionId.jsonl") -Force
+            }
+            'codex' {
+                $agentHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+                $now = [DateTimeOffset]::Now
+                $dest = Join-Path (Join-Path $agentHome 'sessions') (Join-Path $now.ToString('yyyy') (Join-Path $now.ToString('MM') $now.ToString('dd')))
+                New-Item -ItemType Directory -Path $dest -Force | Out-Null
+                $src = Get-ChildItem -LiteralPath $unpack -File | Select-Object -First 1
+                # The id must stay in the filename; the timestamp part is free.
+                $stamp = $now.ToString('yyyy-MM-ddTHH-mm-ss')
+                Copy-Item -LiteralPath $src.FullName -Destination (Join-Path $dest "rollout-$stamp-$NewSessionId.jsonl") -Force
+            }
+            default { throw "unknown session kind '$($Manifest.Kind)'" }
+        }
+
+        # A digest proves the archive arrived intact. It does not prove there was a
+        # session in it: an empty-but-valid archive would create the directory, write
+        # nothing, and hand back an id. For Copilot that is the exact fail-open this
+        # whole design exists to avoid, because `--session-id` against an empty
+        # directory starts a new empty session and exits 0. So the result is checked for
+        # what it is supposed to be, and withdrawn if it is not.
+        # Kind doubles as a launcher name here ('copilot', 'claude', 'codex' are both),
+        # so this works whether or not the manifest carried a Launcher.
+        $installed = Get-BridgeSessionBundleSpec -SessionId $NewSessionId -Launcher ([string]$Manifest.Kind)
+        if ($null -eq $installed) {
+            Remove-BridgeInstalledSession -SessionId $NewSessionId -Kind ([string]$Manifest.Kind)
+            throw 'bundle contained no usable session files'
+        }
+        $NewSessionId
+    }
+    finally {
+        Remove-Item -LiteralPath $unpack -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+
+function Remove-BridgeInstalledSession {
+    <#
+        Withdraws a session this machine just installed, when it turned out not to be
+        one. Only ever called on a freshly created id, so there is nothing of anyone
+        else's to delete.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][string]$Kind
+    )
+
+    $safe = Get-CopilotSafeSessionKey -SessionId $SessionId
+    switch ($Kind) {
+        'copilot' {
+            $agentHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { Join-Path $HOME '.copilot' }
+            Remove-Item -LiteralPath (Join-Path (Join-Path $agentHome 'session-state') $safe) -Recurse -Force -ErrorAction SilentlyContinue
+        }
+        'claude' {
+            $agentHome = if ($env:CLAUDE_CONFIG_DIR) { $env:CLAUDE_CONFIG_DIR } else { Join-Path $HOME '.claude' }
+            Get-ChildItem -LiteralPath (Join-Path $agentHome 'projects') -Filter "$safe.jsonl" -File -Recurse -Force -ErrorAction SilentlyContinue |
+                ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+        }
+        'codex' {
+            $agentHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+            Get-ChildItem -LiteralPath (Join-Path $agentHome 'sessions') -Filter "rollout-*$safe.jsonl" -File -Recurse -Force -ErrorAction SilentlyContinue |
+                ForEach-Object { Remove-Item -LiteralPath $_.FullName -Force -ErrorAction SilentlyContinue }
+        }
+    }
+}
+
+function Set-BridgeCopilotWorkspaceCwd {
+    <#
+        Points a forked Copilot session's workspace record at the directory it will
+        actually run in.
+
+        The original path came from another machine and will usually not exist here -
+        this fleet has sessions under 'rezna', 'danswett' and 'dswett' - so leaving it
+        would describe a tree that is not there.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Cwd
+    )
+    if (-not [System.IO.File]::Exists($Path)) { return }
+    $lines = foreach ($line in [System.IO.File]::ReadAllLines($Path)) {
+        if ($line -match '^cwd:\s') { "cwd: $Cwd" } else { $line }
+    }
+    [System.IO.File]::WriteAllLines($Path, @($lines))
+}
+
+function Test-BridgeTransferComplete {
+    <#
+        Whether every chunk of a bundle has arrived.
+
+        Counts distinct sequence numbers rather than messages. Chunks are published at
+        QoS 1, which permits redelivery, so a raw message count let one chunk arriving
+        twice stand in for one that had not arrived at all: the subscription closed
+        early and reassembly failed as incomplete while the sender was still publishing
+        perfectly good chunks.
+    #>
+    param([AllowEmptyCollection()][AllowNull()][object[]]$Messages)
+
+    $manifest = @($Messages) | Where-Object { $null -ne $_ -and $_.PSObject.Properties['sha256'] } | Select-Object -First 1
+    if ($null -eq $manifest) { return $false }
+    $seen = @(@($Messages) |
+        Where-Object { $null -ne $_ -and $_.PSObject.Properties['d'] -and $_.PSObject.Properties['s'] } |
+        ForEach-Object { [int]$_.s } | Sort-Object -Unique)
+    @($seen).Count -ge [int]$manifest.chunks
+}
+
+function Get-BridgeBundleChunk {
+    <#
+        Splits bundle bytes into pieces small enough to publish, measuring what actually
+        goes on the wire rather than the slice.
+
+        A raw slice is not the packet. Base64 inflates it by a third, the envelope adds
+        its sequence and offset fields, and the topic string rides along too. A "2 MB"
+        test published a ~2.8 MB packet, which is how this limit was learned: mosquitto
+        2.1 lowered the default max_packet_size to 2,000,000 bytes, and exceeding it
+        disconnects Home Assistant from the broker - not just this publish, but every
+        MQTT entity on the instance, repeatedly, until the oversize message is gone.
+
+        So each piece is measured encoded and shrunk until it fits. The default budget is
+        a quarter of a megabyte: an order of magnitude under that ceiling, so a fleet
+        whose broker has never been reconfigured is still safe, and large enough that a
+        typical session is one or two pieces.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][byte[]]$Bytes,
+        [Parameter(Mandatory)][string]$Topic,
+        [int]$Budget = 262144
+    )
+
+    if ($Bytes.Length -eq 0) { return @() }
+    # Base64 is 4 bytes per 3, and the envelope and topic are along for the ride.
+    # Floor, not [int]: PowerShell's cast rounds, so [int]0.9 is 1 - which in the shrink
+    # loop below gave a size that could never get smaller and a loop that never ended.
+    $overhead = $Topic.Length + 96
+    $slice = [Math]::Max(1, [int][Math]::Floor(($Budget - $overhead) * 3 / 4))
+
+    $chunks = [System.Collections.Generic.List[object]]::new()
+    $offset = 0
+    while ($offset -lt $Bytes.Length) {
+        # Each piece is sized by measurement, not arithmetic: the arithmetic above is an
+        # estimate, and being wrong by a few bytes at the ceiling is what breaks a broker.
+        $take = [Math]::Min($slice, $Bytes.Length - $offset)
+        $fitted = $false
+        while ($take -gt 0) {
+            $buf = [byte[]]::new($take)
+            [Array]::Copy($Bytes, $offset, $buf, 0, $take)
+            $payload = @{ s = $chunks.Count; o = $offset; d = [Convert]::ToBase64String($buf) } |
+                ConvertTo-Json -Compress
+            $encoded = [Text.Encoding]::UTF8.GetByteCount($payload) + $Topic.Length
+            if ($encoded -le $Budget) {
+                $chunks.Add([pscustomobject]@{
+                    Seq = $chunks.Count; Offset = $offset; Length = $take
+                    Payload = $payload; Encoded = $encoded
+                })
+                $fitted = $true
+                break
+            }
+            # Always strictly smaller, so this terminates even when 90% rounds back up.
+            $take = [Math]::Min($take - 1, [int][Math]::Floor($take * 0.9))
+        }
+        if (-not $fitted) { throw "cannot fit a chunk within $Budget bytes for topic '$Topic'" }
+        $offset += $take
+    }
+    @($chunks)
+}
+
+function Join-BridgeBundleChunk {
+    <#
+        Rebuilds bundle bytes from received pieces, or throws saying what is wrong.
+
+        Refuses a gap rather than writing a shorter file: an archive missing a slice from
+        its middle can still extract, and the result would be a transcript that looks
+        plausible and is not.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Chunks,
+        [Parameter(Mandatory)][int]$TotalBytes,
+        [AllowEmptyString()][string]$Sha256 = ''
+    )
+
+    $bytes = [byte[]]::new($TotalBytes)
+    $ordered = @(@($Chunks) | Where-Object { $null -ne $_ } | Sort-Object { [int]$_.o })
+    foreach ($chunk in $ordered) {
+        $data = [Convert]::FromBase64String([string]$chunk.d)
+        $offset = [int]$chunk.o
+        if ($offset -lt 0 -or ($offset + $data.Length) -gt $TotalBytes) {
+            throw "chunk $($chunk.s) lies outside the bundle"
+        }
+        [Array]::Copy($data, 0, $bytes, $offset, $data.Length)
+    }
+
+    # Coverage is checked by walking the pieces, not by marking every byte: a bundle is
+    # megabytes and a per-byte loop made this take seconds for no extra certainty.
+    $reached = 0
+    foreach ($chunk in $ordered) {
+        $offset = [int]$chunk.o
+        if ($offset -gt $reached) {
+            throw "bundle incomplete: nothing covers bytes $reached..$($offset - 1) of $TotalBytes"
+        }
+        $end = $offset + [Convert]::FromBase64String([string]$chunk.d).Length
+        if ($end -gt $reached) { $reached = $end }
+    }
+    if ($reached -lt $TotalBytes) {
+        throw "bundle incomplete: $($TotalBytes - $reached) of $TotalBytes bytes never arrived"
+    }
+
+    if ($Sha256) {
+        $sha = [Security.Cryptography.SHA256]::Create()
+        try { $actual = [BitConverter]::ToString($sha.ComputeHash($bytes)).Replace('-', '') }
+        finally { $sha.Dispose() }
+        if ($actual -ne $Sha256.ToUpperInvariant()) {
+            throw "bundle digest mismatch: expected $Sha256, got $actual"
+        }
+    }
+    $bytes
+}
+
+function Get-BridgeTransferTopic {
+    <#
+        Where one transfer's messages live: a topic per transfer, under the owning
+        machine.
+
+        Deliberately not under `homeassistant/`, and never named by a discovery config,
+        so Home Assistant creates no entity for it. That is what keeps chunk payloads out
+        of the state machine and therefore out of the recorder and backups - clearing a
+        retained topic afterwards would not remove rows already written.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Slug,
+        [Parameter(Mandatory)][string]$Correlation
+    )
+    "$($script:CopilotMqttConfig.TopicRoot)/transfer/$Slug/$Correlation"
+}
+
+function Send-BridgeSessionBundle {
+    <#
+        Publishes a bundle as a manifest followed by its chunks.
+
+        Not retained, any of it. A retained chunk would sit on the broker after the
+        transfer, be redelivered to every reconnecting subscriber, and - at these sizes -
+        is exactly the shape of message that took this fleet's MQTT down for twenty-five
+        minutes. The receiver is listening before this is called; a transfer nobody is
+        listening for is simply lost, which is the right outcome.
+    #>
+    param(
+        [Parameter(Mandatory)][object]$Manifest,
+        [Parameter(Mandatory)][string]$Slug,
+        [Parameter(Mandatory)][string]$Correlation,
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [int]$Budget = 262144,
+        [scriptblock]$OnProgress
+    )
+
+    $root = Get-BridgeTransferTopic -Slug $Slug -Correlation $Correlation
+    $bytes = [IO.File]::ReadAllBytes([string]$Manifest.Path)
+    $chunks = @(Get-BridgeBundleChunk -Bytes $bytes -Topic "$root/c" -Budget $Budget)
+
+    Publish-CopilotMqttMessage -Topic "$root/manifest" -Headers $Headers -Payload (@{
+        session  = [string]$Manifest.SessionId
+        launcher = [string]$Manifest.Launcher
+        kind     = [string]$Manifest.Kind
+        bytes    = [int]$Manifest.Bytes
+        sha256   = [string]$Manifest.Sha256
+        chunks   = $chunks.Count
+        version  = [string]$Manifest.Version
+    } | ConvertTo-Json -Compress)
+
+    foreach ($chunk in $chunks) {
+        Publish-CopilotMqttMessage -Topic "$root/c" -Headers $Headers -Payload $chunk.Payload
+        if ($OnProgress) { & $OnProgress $chunk.Seq $chunks.Count }
+    }
+    $chunks.Count
+}
+
+function Read-BridgeHaMqttSubscription {
+    <#
+        Collects messages published to a topic, over Home Assistant's WebSocket API.
+
+        The receiving half of the data path, and the reason chunks need no entity: this
+        subscribes to the topic directly, so nothing is ever written to a state and the
+        recorder has nothing to keep.
+
+        Returns once -Until says so or the timeout passes, whichever comes first.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Topic,
+        [Parameter(Mandatory)][scriptblock]$Until,
+        [int]$TimeoutSeconds = 300,
+        # Called once the subscription is live. Nothing published here is retained, so a
+        # sender that starts before this has fired is talking to no one.
+        [scriptblock]$OnReady
+    )
+
+    $token = (Get-HomeAssistantHeaders).Authorization -replace '^Bearer ', ''
+    $wsUri = [Uri](($script:DecisionBridgeConfig.HomeAssistantBaseUrl -replace '^http', 'ws').TrimEnd('/') + '/api/websocket')
+    Assert-BridgeHttpAllowed -Uri $wsUri -Transport WebSocket
+    Assert-BridgeAuthAllowed
+
+    $socket = [Net.WebSockets.ClientWebSocket]::new()
+    $cancel = [Threading.CancellationTokenSource]::new([TimeSpan]::FromSeconds($TimeoutSeconds))
+    $received = [System.Collections.Generic.List[object]]::new()
+    try {
+        [void]$socket.ConnectAsync($wsUri, $cancel.Token).GetAwaiter().GetResult()
+        $buffer = [ArraySegment[byte]]::new([byte[]]::new(1048576))
+        $recv = {
+            $text = [Text.StringBuilder]::new()
+            do {
+                $r = $socket.ReceiveAsync($buffer, $cancel.Token).GetAwaiter().GetResult()
+                [void]$text.Append([Text.Encoding]::UTF8.GetString($buffer.Array, 0, $r.Count))
+            } while (-not $r.EndOfMessage)
+            $text.ToString() | ConvertFrom-Json
+        }
+        $send = {
+            param($o)
+            $b = [Text.Encoding]::UTF8.GetBytes(($o | ConvertTo-Json -Depth 10 -Compress))
+            [void]$socket.SendAsync([ArraySegment[byte]]::new($b), [Net.WebSockets.WebSocketMessageType]::Text, $true, $cancel.Token).GetAwaiter().GetResult()
+        }
+
+        [void](& $recv)                                   # auth_required
+        & $send @{ type = 'auth'; access_token = $token }
+        $auth = & $recv
+        if ([string]$auth.type -ne 'auth_ok') { throw "websocket auth failed: $($auth.type)" }
+
+        & $send @{ id = 1; type = 'mqtt/subscribe'; topic = $Topic }
+        [void](& $recv)                                   # subscription result
+        if ($OnReady) { & $OnReady }
+
+        while (-not $cancel.IsCancellationRequested) {
+            # A cancelled receive throws rather than returning, so without this the
+            # timeout escapes as "A task was canceled" and the caller's own "that
+            # machine did not send it" message is unreachable.
+            try { $msg = & $recv } catch { break }
+            if ([string]$msg.type -ne 'event') { continue }
+            $payload = $msg.event.payload
+            if ($null -eq $payload) { continue }
+            try { $received.Add(($payload | ConvertFrom-Json)) } catch { continue }
+            if (& $Until @($received)) { break }
+        }
+        @($received)
+    }
+    finally {
+        try { [void]$socket.CloseAsync([Net.WebSockets.WebSocketCloseStatus]::NormalClosure, 'done', [Threading.CancellationToken]::None).GetAwaiter().GetResult() } catch { }
+        $socket.Dispose(); $cancel.Dispose()
+    }
 }
 
 function Read-BridgeConsoleScreen {
