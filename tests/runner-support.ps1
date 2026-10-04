@@ -295,6 +295,8 @@ function New-BridgeTestProcessStartInfo {
         Assert-BridgeTestPath -Path $ScriptPath -SourceEntry
     }
     $boundary = Get-BridgeTestSandbox -Root $Sandbox
+    # A real CLI entry changes script scope; both source paths belong to the validated boundary.
+    $sourceRoot = [string]$boundary['repository']
     if (-not $ownedProbe -and -not (Test-BridgeInstallDescendant $ScriptPath $Sandbox) -and
         -not (Test-BridgeInstallDescendant $ScriptPath $boundary['repository'])) {
         throw 'The test entry must be in its sandbox or the source checkout.'
@@ -308,7 +310,7 @@ function New-BridgeTestProcessStartInfo {
 
     $pwsh = Join-Path $PSHOME $(if ($IsWindows) { 'pwsh.exe' } else { 'pwsh' })
     $start = [Diagnostics.ProcessStartInfo]::new($pwsh)
-    $start.WorkingDirectory = $script:BridgeTestRepository
+    $start.WorkingDirectory = $sourceRoot
     $start.UseShellExecute = $false
     $start.CreateNoWindow = $true
     $start.RedirectStandardInput = $true
@@ -390,7 +392,7 @@ if (-not $?) {
 exit 0
 '@
     $command = $command.Replace('__SUITE__', $ScriptPath.Replace("'", "''"))
-    $command = $command.Replace('__CONTEXT__', (Join-Path $script:BridgeTestRepository 'hooks\bridge-install-context.ps1').Replace("'", "''"))
+    $command = $command.Replace('__CONTEXT__', (Join-Path $sourceRoot 'hooks\bridge-install-context.ps1').Replace("'", "''"))
     $command = $command.Replace('__ARGUMENTS__', (@($ScriptArguments | ForEach-Object { "'" + $_.Replace("'", "''") + "'" }) -join ' '))
     foreach ($argument in @('-NoLogo', '-NoProfile', '-NonInteractive', '-EncodedCommand',
         [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command)))) {

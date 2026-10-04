@@ -1,150 +1,273 @@
 #Requires -Version 7.0
 <#
 .SYNOPSIS
-    Tests for the update-install feedback: the in-progress spinner and the
-    completion / failure notification.
-
+    Update outcomes and real MQTT payloads against the supported HA contract.
 .DESCRIPTION
-    Pressing the Home Assistant install button used to give no visible feedback - the
-    update entity flipped silently. Now the daemon shows a spinner on the press, the
-    detached updater drops an outcome marker, and whichever daemon runs next turns
-    that marker into an authoritative "up to date" state plus a persistent
-    notification.
-
-    These tests cover the two new pieces without touching Home Assistant:
-
-      * Publish-CopilotMqttUpdate emits in_progress true / false in the state payload;
-      * Invoke-DaemonUpdateOutcome announces success, announces failure, ignores a
-        stale or malformed marker, and always consumes the marker.
-
-    The daemon file is dot-sourced with AGENT_BRIDGE_DAEMON_NORUN set so its
-    functions load without the daemon starting.
+    Uses actual lookup, daemon consumers, publisher JSON and synthetic config/marker
+    files. Only REST/WebSocket and a read/replace filesystem race are simulated.
+    The consumer subset is not a live HA test or required local-health verification.
 #>
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
+. (Join-Path $PSScriptRoot 'runner-support.ps1')
+Assert-BridgeTestEnvironment -Required
+
+$configPath = $env:AGENT_HA_BRIDGE_CONFIG
+Assert-BridgeTestPath -Path $configPath
+$config = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json -AsHashtable
+$config['updates']['installedVersion'] = '1.1.0'
+$config['updates']['checkForUpdates'] = $true
+$config | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $configPath -Encoding UTF8
 
 $env:AGENT_BRIDGE_DAEMON_NORUN = '1'
 . (Join-Path $PSScriptRoot '..\hooks\agent-bridge-daemon.ps1')
-
-# Isolate the marker from the real daemon's file so a test run can never make the
-# live bridge announce a phantom update.
-$script:DaemonConfig.UpdateOutcomeFile = Join-Path ([IO.Path]::GetTempPath()) "test-update-outcome-$([guid]::NewGuid().ToString('N').Substring(0,8)).json"
 $outcomeFile = $script:DaemonConfig.UpdateOutcomeFile
-$headers = @{ Authorization = 'Bearer test' }
+Assert-BridgeTestPath -Path @($outcomeFile, $script:BridgeUpdateConfig.CacheFile)
+$headers = @{ Authorization = 'Bearer synthetic-test-token' }
 
-$script:Failures = 0
-function Test-That {
-    param([string]$Name, [scriptblock]$Condition, [string]$Detail = '')
-    $ok = $false
-    try { $ok = [bool](& $Condition) } catch { $Detail = $_.Exception.Message }
-    if ($ok) { Write-Host "  PASS  $Name" }
-    else {
-        Write-Host "  FAIL  $Name$(if ($Detail) { " - $Detail" })" -ForegroundColor Red
-        $script:Failures++
-    }
+function Assert-UpdateOutcome {
+    param([string]$Name, [bool]$Condition)
+    if (-not $Condition) { throw "FAIL: $Name" }
+    Write-Host "  PASS  $Name"
 }
 
-# --- in_progress in the state payload (real Publish-CopilotMqttUpdate) ------------
-# Mock only the transport, so the real function's JSON is what gets asserted.
 $script:MqttMsgs = @()
-function Publish-CopilotMqttMessage {
-    param([string]$Topic, [AllowEmptyString()][string]$Payload, [hashtable]$Headers, [switch]$Retain)
-    $script:MqttMsgs += [pscustomobject]@{ Topic = $Topic; Payload = $Payload }
-}
-function Get-StatePayload { ($script:MqttMsgs | Where-Object { $_.Topic -match '/update/state$' } | Select-Object -First 1).Payload }
-
-Write-Host '--- the update entity carries an in_progress flag ---'
-$script:MqttMsgs = @()
-Publish-CopilotMqttUpdate -InstalledVersion '1.1.0' -LatestVersion '1.2.0' -InProgress -Headers $headers
-Test-That 'a press publishes in_progress=true' { (Get-StatePayload) -match '"in_progress":true' } (Get-StatePayload)
-$script:MqttMsgs = @()
-Publish-CopilotMqttUpdate -InstalledVersion '1.2.0' -LatestVersion '1.2.0' -Headers $headers
-Test-That 'a normal publish is in_progress=false' { (Get-StatePayload) -match '"in_progress":false' } (Get-StatePayload)
-
-# --- Invoke-DaemonUpdateOutcome --------------------------------------------------
-# Now shadow the higher-level calls so the announcer can be observed in isolation.
-$script:Published = @()
 $script:Notified = @()
-function Publish-CopilotMqttUpdate {
-    param([string]$InstalledVersion, [string]$LatestVersion, [string]$ReleaseUrl = '', [string]$ReleaseNotes = '', [switch]$InProgress, [hashtable]$Headers)
-    $script:Published += [pscustomobject]@{ Installed = $InstalledVersion; Latest = $LatestVersion; InProgress = [bool]$InProgress }
+$script:Lookup = 'current'
+function Invoke-RestMethod {
+    param($Uri, $Method, $Headers, $Body, $ContentType, $TimeoutSec, $WebSession)
+    if ($Uri -like 'https://api.github.com/repos/*/releases/latest') {
+        if ($script:Lookup -eq 'unavailable') { throw [IO.IOException]::new('synthetic lookup outage') }
+        if ($script:Lookup -eq 'not-found') {
+            $response = [Net.Http.HttpResponseMessage]::new([Net.HttpStatusCode]::NotFound)
+            throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('Not Found', $response)
+        }
+        $tag = if ($script:Lookup -eq 'available') { 'v1.2.0' } else { 'v1.1.0' }
+        return [pscustomobject]@{
+            tag_name = $tag; name = $tag; body = ''; published_at = ''
+            html_url = "https://example.test/releases/$tag"; zipball_url = "https://example.test/archive/$tag.zip"
+        }
+    }
+    if ($Uri -like 'http://127.0.0.1:1/api/states/button.*') { return [pscustomobject]@{ state = 'unavailable' } }
+    $data = if ($Body -is [byte[]]) { [Text.Encoding]::UTF8.GetString($Body) | ConvertFrom-Json } else { $Body | ConvertFrom-Json }
+    if ($Uri -eq 'http://127.0.0.1:1/api/services/mqtt/publish') {
+        $script:MqttMsgs += [pscustomobject]@{ Topic = $data.topic; Payload = $data.payload }
+        return @()
+    }
+    if ($Uri -eq 'http://127.0.0.1:1/api/services/persistent_notification/create') {
+        $script:Notified += $data
+        return @()
+    }
+    throw "Unexpected REST fixture endpoint: $Uri"
 }
-function Set-CopilotMqttUpdateEntityIds { }
-function Invoke-HomeAssistantService {
-    param([string]$Domain, [string]$Service, [hashtable]$Data, [hashtable]$Headers, [int]$TimeoutSec = 15)
-    $script:Notified += [pscustomobject]@{ Domain = $Domain; Service = $Service; Title = [string]$Data.title; Message = [string]$Data.message; Id = [string]$Data.notification_id }
+function Invoke-CopilotHaWebSocket {
+    param($Commands)
+    if (@($Commands).Count -ne 1 -or $Commands[0].type -ne 'config/entity_registry/list') { throw 'Unexpected WebSocket fixture command.' }
+    $replies = [Collections.Generic.List[object]]::new()
+    $replies.Add([object[]]@([pscustomobject]@{ unique_id = 'unrelated-fixture'; entity_id = 'sensor.fixture' }))
+    return ,$replies.ToArray()
 }
-function Get-BridgeUpdateStatus { param([switch]$Force) [pscustomobject]@{ Installed = '1.1.0'; Latest = '1.2.0'; Available = $true; Url = ''; Notes = '' } }
-function Write-DaemonLog { param($Message) }
-
-function Reset-Capture {
-    $script:Published = @()
+function Get-StatePayload {
+    ($script:MqttMsgs | Where-Object { $_.Topic -match '/update/state$' } | Select-Object -Last 1).Payload
+}
+function Reset-UpdateCapture {
+    $script:MqttMsgs = @()
     $script:Notified = @()
+    $script:DaemonUpdatePendingAttempt = ''
     Remove-Item -LiteralPath $outcomeFile -Force -ErrorAction SilentlyContinue
 }
-function Write-Marker { param([hashtable]$Data) ($Data | ConvertTo-Json -Compress) | Set-Content -LiteralPath $outcomeFile -Encoding UTF8 }
-$now = { [DateTimeOffset]::Now.ToString('o') }
+function Write-Marker {
+    param([hashtable]$Data)
+    $Data | ConvertTo-Json -Compress | Set-Content -LiteralPath $outcomeFile -Encoding UTF8
+}
+function Set-RecordedVersion {
+    param([string]$Version)
+    $saved = Get-Content -LiteralPath $configPath -Raw | ConvertFrom-Json -AsHashtable
+    $saved['updates']['installedVersion'] = $Version
+    $saved | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $configPath -Encoding UTF8
+}
+
+function Receive-UpdatePayload {
+    param([hashtable]$Consumer, [string]$StatePayload = (Get-StatePayload))
+    # Contract subset, not HA/Jinja execution: HA 2026.9.4 at
+    # 9212531f40a0b7b23229a90d688dd79d9dfccff4:
+    # mqtt/update.py uses cv.string (including some scalar coercions) and updates
+    # only present keys. Identical discovery does not reset retained attributes.
+    # HA compares versions with AwesomeVersion; this subset covers only the
+    # three-part numeric strings emitted in these fixtures, not all HA inputs.
+    $discovery = ($script:MqttMsgs | Where-Object { $_.Topic -match '/update/.+/config$' } | Select-Object -Last 1).Payload | ConvertFrom-Json
+    if ($discovery.availability_topic -cne $discovery.state_topic -or
+        $discovery.availability_template -cne "{{ 'online' if value_json.get('latest_version') else 'offline' }}") {
+        throw 'The discovery payload does not match the supported availability contract.'
+    }
+    $wire = $StatePayload | ConvertFrom-Json -AsHashtable
+    foreach ($key in @('installed_version', 'latest_version')) {
+        if ($wire.Contains($key)) {
+            if ($wire[$key] -isnot [string] -or $wire[$key] -notmatch '^\d+\.\d+\.\d+$') {
+                throw 'This publisher fixture must emit three-part numeric version strings.'
+            }
+            $Consumer[$key] = $wire[$key]
+        }
+    }
+    if ($wire.Contains('release_summary')) {
+        if ($wire['release_summary'] -isnot [string]) { throw 'This publisher fixture must emit a string summary.' }
+        $Consumer['release_summary'] = $wire['release_summary']
+    }
+    $Consumer['in_progress'] = $wire['in_progress']
+    $Consumer['state'] = if (-not $wire.Contains('latest_version') -or -not $wire['latest_version']) { 'unavailable' }
+        elseif ($null -eq $Consumer['installed_version'] -or $null -eq $Consumer['latest_version']) { 'unknown' }
+        elseif ([version]$Consumer['latest_version'] -gt [version]$Consumer['installed_version']) { 'on' } else { 'off' }
+}
+$consumer = @{ installed_version = $null; latest_version = $null; release_summary = $null; state = 'unknown'; in_progress = $false }
+
+Publish-CopilotMqttUpdate -InstalledVersion '1.1.0' -LatestVersion '1.2.0' -ReleaseNotes 'Fixture release notes' -InProgress -Headers $headers
+Receive-UpdatePayload $consumer
+Assert-UpdateOutcome 'a real available publish carries the spinner and newer version' ($consumer.state -eq 'on' -and $consumer.in_progress)
+Assert-UpdateOutcome 'the real publisher preserves nonempty release notes' ($consumer.release_summary -ceq 'Fixture release notes')
+# Replay only the historical omission against the same discovery and retained
+# consumer. All production-path assertions below use unmodified captured JSON.
+$omittedSummary = Get-StatePayload | ConvertFrom-Json -AsHashtable
+$omittedSummary.Remove('release_summary')
+Receive-UpdatePayload $consumer -StatePayload ($omittedSummary | ConvertTo-Json -Compress)
+Assert-UpdateOutcome 'an omitted summary retains its old text despite identical discovery' ($consumer.release_summary -ceq 'Fixture release notes')
+Reset-UpdateCapture
+Publish-CopilotMqttUpdate -InstalledVersion '1.1.0' -LatestVersion $null -Headers $headers
+Receive-UpdatePayload $consumer
+Assert-UpdateOutcome 'unknown latest is omitted, not a null or synthetic version' (-not ((Get-StatePayload | ConvertFrom-Json -AsHashtable).Contains('latest_version')))
+Assert-UpdateOutcome 'omission retains the old attribute but availability overrides its old on-state' ($consumer.latest_version -eq '1.2.0' -and $consumer.state -eq 'unavailable' -and -not $consumer.in_progress)
 
 Write-Host '--- no marker is a no-op ---'
-Reset-Capture
-Invoke-DaemonUpdateOutcome -Headers $headers
-Test-That 'nothing is published or notified' { $script:Published.Count -eq 0 -and $script:Notified.Count -eq 0 }
+Reset-UpdateCapture
+[void](Invoke-DaemonUpdateOutcome -Headers $headers)
+Assert-UpdateOutcome 'nothing is published or notified' ($script:MqttMsgs.Count -eq 0 -and $script:Notified.Count -eq 0)
 
-Write-Host '--- a success marker announces the new version ---'
-Reset-Capture
-Write-Marker @{ success = $true; version = '1.2.0'; releaseUrl = 'https://example.test/rel'; at = (& $now) }
-Invoke-DaemonUpdateOutcome -Headers $headers
-Test-That 'it publishes up to date with the spinner off' {
-    $script:Published.Count -ge 1 -and $script:Published[-1].Installed -eq '1.2.0' -and
-    $script:Published[-1].Latest -eq '1.2.0' -and -not $script:Published[-1].InProgress
-}
-Test-That 'it fires one notification naming the version' {
-    $script:Notified.Count -eq 1 -and
-    $script:Notified[0].Title -match '^Bridge updated on ' -and
-    $script:Notified[0].Message -match '1\.2\.0'
-}
-Test-That 'the notification is a stable single id, scoped to this machine' {
-    # Shared, two machines updating would overwrite each other's notification and the
-    # titles would read identically, so there was no way to tell which had updated.
-    $script:Notified[0].Id -eq "agent_bridge_update_$(Get-BridgeMachineSlug)"
-}
-Test-That 'the marker is consumed' { -not (Test-Path -LiteralPath $outcomeFile) }
+Write-Host '--- legacy Boolean success does not replace the actual version record ---'
+Reset-UpdateCapture
+Set-RecordedVersion '1.3.0'
+Write-Marker @{ success = $true; version = '1.2.0'; releaseUrl = 'https://example.test/rel'; at = [DateTimeOffset]::Now.ToString('o') }
+[void](Invoke-DaemonUpdateOutcome -Headers $headers)
+Receive-UpdatePayload $consumer
+Assert-UpdateOutcome 'the attempted release is not substituted for the recorded version' ($consumer.installed_version -eq '1.3.0' -and $consumer.latest_version -eq '1.2.0' -and $consumer.state -eq 'off')
+Assert-UpdateOutcome 'completion notification names both observations without certifying health' ($script:Notified.Count -eq 1 -and $script:Notified[0].message -match '1\.2\.0.*1\.3\.0.*not certified')
+Assert-UpdateOutcome 'the notification is scoped to this machine' ($script:Notified[0].notification_id -eq "agent_bridge_update_$(Get-BridgeMachineSlug)")
+Assert-UpdateOutcome 'the claimed marker is consumed' (-not (Test-Path -LiteralPath $outcomeFile))
 
 Write-Host '--- a failure marker clears the spinner and reports the error ---'
-Reset-Capture
-Write-Marker @{ success = $false; error = 'disk full'; at = (& $now) }
-Invoke-DaemonUpdateOutcome -Headers $headers
-Test-That 'it clears the spinner' { $script:Published.Count -ge 1 -and -not $script:Published[-1].InProgress }
-Test-That 'it leaves the update available for retry' { $script:Published[-1].Installed -eq '1.1.0' }
-Test-That 'it notifies with the error text' {
-    $script:Notified.Count -eq 1 -and
-    $script:Notified[0].Title -match '^Bridge update failed on ' -and
-    $script:Notified[0].Message -match 'disk full'
-}
-Test-That 'the marker is consumed' { -not (Test-Path -LiteralPath $outcomeFile) }
+Reset-UpdateCapture
+Set-RecordedVersion '1.1.0'
+Write-Marker @{ schemaVersion = 1; attemptId = ('a' * 32); success = $false; exitCode = 1; version = '1.2.0'; error = 'disk full'; at = [DateTimeOffset]::Now.ToString('o') }
+[void](Invoke-DaemonUpdateOutcome -Headers $headers)
+Receive-UpdatePayload $consumer
+Assert-UpdateOutcome 'retry availability is established by both actual JSON versions and the consumer' ($consumer.state -eq 'on' -and $consumer.installed_version -eq '1.1.0' -and $consumer.latest_version -eq '1.2.0' -and -not $consumer.in_progress)
+Assert-UpdateOutcome 'failure reports the error without claiming rollback' ($script:Notified.Count -eq 1 -and $script:Notified[0].message -match 'disk full.*no rollback is claimed')
+
+Reset-UpdateCapture
+Set-RecordedVersion '1.2.0'
+Write-Marker @{ success = $false; version = '1.2.0'; error = 'failed after recording version'; at = [DateTimeOffset]::Now.ToString('o') }
+[void](Invoke-DaemonUpdateOutcome -Headers $headers)
+Receive-UpdatePayload $consumer
+Assert-UpdateOutcome 'failure after mutation does not claim that the old version survived' ($consumer.installed_version -eq '1.2.0' -and $script:Notified[0].title -match '^Bridge update failed')
+
+Reset-UpdateCapture
+Write-Marker @{ success = $false; error = 'old marker without target'; at = [DateTimeOffset]::Now.ToString('o') }
+[void](Invoke-DaemonUpdateOutcome -Headers $headers)
+Receive-UpdatePayload $consumer
+Assert-UpdateOutcome 'a legacy failure without a target is not advertised as current or retryable' ($consumer.state -eq 'unavailable' -and $script:Notified[0].title -match '^Bridge update failed')
 
 Write-Host '--- a stale marker is ignored ---'
-Reset-Capture
+Reset-UpdateCapture
 Write-Marker @{ success = $true; version = '1.2.0'; at = ([DateTimeOffset]::Now.AddHours(-24)).ToString('o') }
-Invoke-DaemonUpdateOutcome -Headers $headers
-Test-That 'no notification fires for an old marker' { $script:Notified.Count -eq 0 }
-Test-That 'the stale marker is still consumed' { -not (Test-Path -LiteralPath $outcomeFile) }
+[void](Invoke-DaemonUpdateOutcome -Headers $headers)
+Assert-UpdateOutcome 'no completion is announced for an old marker' ($script:Notified.Count -eq 0 -and -not (Test-Path -LiteralPath $outcomeFile))
 
-Write-Host '--- a malformed marker is dropped safely ---'
-Reset-Capture
-Set-Content -LiteralPath $outcomeFile -Value '{ not valid json' -Encoding UTF8
-Invoke-DaemonUpdateOutcome -Headers $headers
-Test-That 'it does not throw and notifies nothing' { $script:Notified.Count -eq 0 }
-Test-That 'the bad marker is removed' { -not (Test-Path -LiteralPath $outcomeFile) }
-
-Remove-Item -LiteralPath $outcomeFile -Force -ErrorAction SilentlyContinue
-
-Write-Host ''
-if ($script:Failures) {
-    Write-Host "$($script:Failures) check(s) failed" -ForegroundColor Red
-    exit 1
+foreach ($bad in @('malformed', 'string-true', 'string-false', 'unsupported', 'inconsistent', 'future', 'unversioned-attempt', 'bad-legacy-target')) {
+    Reset-UpdateCapture
+    $marker = @{ schemaVersion = 1; attemptId = ('a' * 32); success = $true; exitCode = 0; version = '1.2.0'; at = [DateTimeOffset]::Now.ToString('o') }
+    switch ($bad) {
+        'string-true' { $marker.success = 'true' }
+        'string-false' { $marker.success = 'false' }
+        'unsupported' { $marker.schemaVersion = 9 }
+        'inconsistent' { $marker.exitCode = 1 }
+        'future' { $marker.at = [DateTimeOffset]::Now.AddDays(1).ToString('o') }
+        'unversioned-attempt' { $marker.Remove('schemaVersion') }
+        'bad-legacy-target' {
+            $marker = @{ success = $false; version = 'not-a-version'; error = 'synthetic failure'; at = [DateTimeOffset]::Now.ToString('o') }
+        }
+    }
+    Write-Marker $marker
+    if ($bad -eq 'malformed') { Set-Content -LiteralPath $outcomeFile -Value '{ invalid json' }
+    [void](Invoke-DaemonUpdateOutcome -Headers $headers)
+    Receive-UpdatePayload $consumer
+    Assert-UpdateOutcome "$bad cannot announce completion or a known latest version" ($script:Notified.Count -eq 0 -and $consumer.state -eq 'unavailable' -and -not (Test-Path -LiteralPath $outcomeFile))
 }
-Write-Host 'All checks passed' -ForegroundColor Green
-# Explicit: without it pwsh reports the last external command's exit code.
+
+Write-Host '--- a replacement notice survives the older notice read ---'
+Reset-UpdateCapture
+$script:ReplaceOnRead = $true
+function Get-Content {
+    [CmdletBinding()]
+    param([string]$LiteralPath, [switch]$Raw, [string]$Encoding)
+    $text = Microsoft.PowerShell.Management\Get-Content @PSBoundParameters
+    if ($script:ReplaceOnRead -and ($LiteralPath -eq $outcomeFile -or $LiteralPath -like "$outcomeFile.*.reading")) {
+        $script:ReplaceOnRead = $false
+        Write-Marker @{ success = $true; version = '1.3.0'; at = [DateTimeOffset]::Now.ToString('o') }
+    }
+    $text
+}
+Write-Marker @{ success = $true; version = '1.2.0'; at = [DateTimeOffset]::Now.ToString('o') }
+try { [void](Invoke-DaemonUpdateOutcome -Headers $headers) }
+finally { Remove-Item Function:\Get-Content }
+Assert-UpdateOutcome 'consuming an old notice does not delete its replacement' ((Read-BridgeUpdateOutcome -Path $outcomeFile).Version -eq '1.3.0')
+
+Write-Host '--- lookup truth changes republish even when Available stays false ---'
+Reset-UpdateCapture
+Set-RecordedVersion '1.1.0'
+$script:DaemonUpdateSignature = ''
+$script:DaemonUpdatePublished = $false
+$script:DaemonUpdateAvailable = $false
+$expected = @('off', 'unavailable', 'off', 'unavailable', 'off', 'on')
+$lookups = @('current', 'unavailable', 'current', 'not-found', 'current', 'available')
+$index = 0
+foreach ($lookup in $lookups) {
+    $script:Lookup = $lookup
+    $before = @($script:MqttMsgs | Where-Object { $_.Topic -match '/update/state$' }).Count
+    Remove-Item -LiteralPath $script:BridgeUpdateConfig.CacheFile -Force -ErrorAction SilentlyContinue
+    Sync-DaemonUpdateStatus -Headers $headers
+    Receive-UpdatePayload $consumer
+    $after = @($script:MqttMsgs | Where-Object { $_.Topic -match '/update/state$' }).Count
+    Assert-UpdateOutcome "$lookup is republished with the supported consumer state" ($after -eq $before + 1 -and $consumer.state -eq $expected[$index])
+    $wire = Get-StatePayload | ConvertFrom-Json -AsHashtable
+    if ($lookup -in @('unavailable', 'not-found')) {
+        Assert-UpdateOutcome "$lookup retains its distinct explanation in the real payload" (
+            $wire.release_summary -match $(if ($lookup -eq 'not-found') { '404.*existence and access are not confirmed' } else { 'could not be established' }) -and
+            $consumer.release_summary -ceq $wire.release_summary)
+    }
+    elseif ($lookup -eq 'current' -and $index -gt 0) {
+        Assert-UpdateOutcome "known no-notes recovery after $($lookups[$index - 1]) explicitly clears the prior explanation" (
+            $wire.Contains('release_summary') -and $wire.release_summary -is [string] -and
+            $wire.release_summary -ceq '' -and $consumer.release_summary -ceq '')
+    }
+    $index++
+}
+
+Write-Host '--- marked guard failures propagate through daemon outcome and status consumers ---'
+Reset-UpdateCapture
+Write-Marker @{ success = $true; version = '1.2.0'; at = [DateTimeOffset]::Now.ToString('o') }
+$restStub = (Get-Item Function:\Invoke-RestMethod).ScriptBlock
+Remove-Item Function:\Invoke-RestMethod
+$blocked = $false
+try { Sync-DaemonUpdateStatus -Headers $headers }
+catch { $blocked = [bool]$_.Exception.Data['BridgeTestNetworkBlocked'] }
+finally { Set-Item Function:\Invoke-RestMethod -Value $restStub }
+Assert-UpdateOutcome 'real network guard refusal is not converted to a cosmetic update failure' $blocked
+$script:DaemonConfig.UpdateOutcomeFile = Join-Path (Split-Path $env:AGENT_HA_BRIDGE_TEST_ROOT -Parent) 'forbidden-outcome.json'
+$blocked = $false
+try { Sync-DaemonUpdateStatus -Headers $headers }
+catch { $blocked = [bool]$_.Exception.Data['BridgeTestWriteBlocked'] }
+finally { $script:DaemonConfig.UpdateOutcomeFile = $outcomeFile }
+Assert-UpdateOutcome 'real write guard refusal is not swallowed by the daemon consumer' $blocked
+
+Reset-UpdateCapture
+Write-Host 'All update outcome checks passed'
 exit 0

@@ -105,6 +105,52 @@ An update whose installer cannot accept the bound installation root is refused
 before that installer runs. Restart existing clients after adapter changes so
 cached hooks use the current payload.
 
+### Update lookup, intent and completion
+
+Update status distinguishes an unavailable lookup, a latest-release endpoint
+returning 404, a known release with nothing newer to install, and a known newer
+release. GitHub's bare 404 does not establish that the repository exists or that
+the caller can access it. Neither unavailable nor not-found means "up to date";
+both leave the latest version unestablished. Failed lookups retain the short retry
+interval rather than trusting an older release left in the cache.
+
+The MQTT update entity is unavailable while that version is unestablished; other
+entities on the machine remain available. The publisher omits `latest_version`
+and derives entity-specific availability from its presence on the state topic.
+Stock Home Assistant rejects JSON null versions, and omission alone retains the
+previous version attribute. Do not interpret that retained attribute as a new
+successful check, or substitute an empty/"unknown" version string.
+The publisher always supplies `release_summary`, using an empty string to clear
+previous failure text when a successful lookup has no release notes. Omitting the
+summary retains it, and replaying identical discovery does not reset it.
+This uses the [MQTT update availability contract](https://www.home-assistant.io/integrations/update.mqtt/)
+and the stock 2026.9.4 consumer at
+[`9212531f40a0b7b23229a90d688dd79d9dfccff4`](https://github.com/home-assistant/core/tree/9212531f40a0b7b23229a90d688dd79d9dfccff4/homeassistant/components/mqtt).
+
+`update -Check` never prompts or installs, including with `-Force` and without
+`-Yes`. An unestablished lookup exits unsuccessfully rather than reporting current.
+`-Force` reinstalls the validated newest release even if its version is equal to or
+older than the recorded version. Without Force, a known older release is a no-op.
+Force does not bypass lookup, archive VERSION, or installation-root checks.
+
+Detached `Started` means only that the operating system accepted the launch.
+Foreground completion requires the actual child's exit code and this attempt's
+typed terminal receipt. Each foreground attempt reserves its own result file
+beside staging; the daemon atomically claims a separate shared notice. Neither a
+stale notice nor a daemon consuming that notice can supply or erase the parent's
+proof. Legacy Boolean notices remain readable, but cannot prove a new foreground
+attempt. Malformed, unknown-schema, or string-valued success fields are rejected.
+Child output is retained in the selected runtime's update log before foreground
+staging is removed.
+
+An outcome records the **attempted** release separately from the installed version
+read again from the selected configuration. A failed in-place installer may have
+already changed that record or other files; failure does not claim rollback or
+preservation of old bytes. "Installer completed" covers the installer return and
+owned-runtime restart request, not required local installation health. Whole-install
+locking, complete payload manifests, atomic activation, rollback and required local
+health remain separate work; this slice does not make installation transactional.
+
 ## Approved workspaces and isolated launches
 
 `newSession.workspaces` is the executable directory allowlist. Its entries are path

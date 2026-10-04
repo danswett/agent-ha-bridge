@@ -12,6 +12,8 @@
 #>
 
 $script:DaemonMemoryTrimmedAt = [DateTimeOffset]::MinValue
+$script:DaemonUpdateSignature = ''
+$script:DaemonUpdatePendingAttempt = ''
 
 function Invoke-DaemonMemoryTrim {
     <#
@@ -44,10 +46,9 @@ function Invoke-DaemonUpdateOutcome {
     <#
         Announces the result of a self-update.
 
-        The updater runs detached, with none of the bridge's modules or Home Assistant
-        config loaded, so it cannot publish cleanly itself. It drops a small outcome
+        The updater has no Home Assistant publishing client loaded. It drops an outcome
         file instead, and whichever daemon runs next turns that into a visible
-        notification and an authoritative update-entity state. Reading it every
+        notification and the currently recorded installed version. Reading it every
         reconcile - not only at startup - means the announcement fires whether the
         daemon was restarted by a successful update or kept running through a failed
         one.
@@ -55,58 +56,68 @@ function Invoke-DaemonUpdateOutcome {
     param([Parameter(Mandatory)][hashtable]$Headers)
 
     $path = $script:DaemonConfig.UpdateOutcomeFile
-    if (-not (Test-Path -LiteralPath $path)) { return }
-
-    $outcome = $null
-    try { $outcome = Get-Content -LiteralPath $path -Raw -Encoding UTF8 | ConvertFrom-Json } catch { $outcome = $null }
-    # A malformed or unreadable marker must not wedge the daemon: drop it and move on.
-    Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
-    if ($null -eq $outcome) { return }
-
-    # Ignore a marker from long ago - a machine that was off for a week should not pop
-    # a surprise notification when it wakes.
+    $claimed = "$path.$([guid]::NewGuid().ToString('N')).reading"
+    if (Test-BridgeTestExecution) { Assert-BridgeTestPath -Path @($path, $claimed) }
+    if (-not (Test-Path -LiteralPath $path)) { return $false }
+    # Claim atomically, rather than deleting a replacement notice written between
+    # read and remove. The foreground parent's per-attempt proof is a different file.
+    Assert-BridgeInstallPayload -Root $path -CheckAncestors
+    $ownsClaim = $false
     try {
-        if ($outcome.PSObject.Properties.Name -contains 'at' -and $outcome.at) {
-            if (([DateTimeOffset]::Now - [DateTimeOffset]::Parse([string]$outcome.at)).TotalHours -gt 6) { return }
+        try {
+            [IO.File]::Move($path, $claimed)
+            $ownsClaim = $true
         }
-    }
-    catch { }
-
-    $success = ($outcome.PSObject.Properties.Name -contains 'success' -and $outcome.success)
-    $version = if ($outcome.PSObject.Properties.Name -contains 'version') { [string]$outcome.version } else { '' }
-    $url = if ($outcome.PSObject.Properties.Name -contains 'releaseUrl') { [string]$outcome.releaseUrl } else { '' }
-
-    try {
-        if ($success) {
-            # Authoritative "up to date" using the version actually installed, so the
-            # entity is correct even on a daemon whose cached config is still stale.
-            Publish-CopilotMqttUpdate -InstalledVersion $version -LatestVersion $version `
-                -ReleaseUrl $url -Headers $Headers
-            [void](Set-CopilotMqttUpdateEntityIds)
-            $script:DaemonUpdateAvailable = $false
-            $script:DaemonUpdatePublished = $true
-            $message = "The Home Assistant bridge updated to **$version**."
-            if ($url) { $message += " [Release notes]($url)" }
+        catch [IO.FileNotFoundException] { return $false }
+        $outcome = Read-BridgeUpdateOutcome -Path $claimed
+        if (([DateTimeOffset]::Now - $outcome.At).TotalHours -gt 6) { return $false }
+        if ($script:DaemonUpdatePendingAttempt -eq $outcome.AttemptId) { $script:DaemonUpdatePendingAttempt = '' }
+        $installed = Get-BridgeInstalledVersion -Refresh
+        Publish-CopilotMqttUpdate -InstalledVersion $installed -LatestVersion $outcome.Version `
+            -ReleaseUrl $outcome.ReleaseUrl -InProgress:([bool]$script:DaemonUpdatePendingAttempt) -Headers $Headers
+        [void](Set-CopilotMqttUpdateEntityIds)
+        $script:DaemonUpdateAvailable = (ConvertTo-BridgeVersion $outcome.Version) -gt (ConvertTo-BridgeVersion $installed)
+        $script:DaemonUpdatePublished = $true
+        $script:DaemonUpdateSignature = ''
+        if ($outcome.Success) {
+            $message = "The bridge installer completed for **$($outcome.Version)**; currently recorded version: **$installed**. Required local installation health is not certified by this result."
+            if ($outcome.ReleaseUrl) { $message += " [Release notes]($($outcome.ReleaseUrl))" }
             Invoke-HomeAssistantService -Domain 'persistent_notification' -Service 'create' `
-                -Data @{ title = "Bridge updated on $($script:DaemonMachineName)"; message = $message; notification_id = "agent_bridge_update_$($script:DaemonMachineSlug)" } `
+                -Data @{ title = "Bridge installer completed on $($script:DaemonMachineName)"; message = $message; notification_id = "agent_bridge_update_$($script:DaemonMachineSlug)" } `
                 -Headers $Headers
-            Write-DaemonLog -Message "self-update announced: updated to $version"
+            Write-DaemonLog -Message "self-update installer completed for $($outcome.Version); recorded version $installed"
         }
         else {
-            $err = if ($outcome.PSObject.Properties.Name -contains 'error') { [string]$outcome.error } else { 'unknown error' }
-            # Clear the spinner, but leave the update showing as available so it can be
-            # retried.
-            $installed = (Get-BridgeUpdateStatus).Installed
-            $latest = if ($version) { $version } else { $installed }
-            Publish-CopilotMqttUpdate -InstalledVersion $installed -LatestVersion $latest -Headers $Headers
+            $attempt = if ($outcome.Version) { "to $($outcome.Version)" } else { '(target not recorded)' }
             Invoke-HomeAssistantService -Domain 'persistent_notification' -Service 'create' `
-                -Data @{ title = "Bridge update failed on $($script:DaemonMachineName)"; message = "The bridge update did not complete: $err"; notification_id = "agent_bridge_update_$($script:DaemonMachineSlug)" } `
+                -Data @{
+                    title = "Bridge update failed on $($script:DaemonMachineName)"
+                    message = "The bridge update $attempt did not complete: $($outcome.Error). Currently recorded version: $installed. The installation may be partially changed; no rollback is claimed."
+                    notification_id = "agent_bridge_update_$($script:DaemonMachineSlug)"
+                } `
                 -Headers $Headers
-            Write-DaemonLog -Message "self-update announced: FAILED ($err)"
+            Write-DaemonLog -Message "self-update FAILED for $($outcome.Version): $($outcome.Error); recorded version $installed"
         }
+        return $true
     }
     catch {
-        Write-DaemonLog -Message "update outcome announce failed: $($_.Exception.Message)"
+        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        Write-DaemonLog -Message "update outcome could not be verified or announced: $($_.Exception.Message)"
+        $script:DaemonUpdateSignature = ''
+        try {
+            Publish-CopilotMqttUpdate -InstalledVersion (Get-BridgeInstalledVersion -Refresh) -LatestVersion $null -Headers $Headers
+        }
+        catch {
+            if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+            Write-DaemonLog -Message "could not publish unknown update result: $($_.Exception.Message)"
+        }
+        return $true
+    }
+    finally {
+        if ($ownsClaim) {
+            if (Test-BridgeTestExecution) { Assert-BridgeTestPath -Path $claimed }
+            if (Test-Path -LiteralPath $claimed) { Remove-Item -LiteralPath $claimed -Force -ErrorAction Stop }
+        }
     }
 }
 
@@ -117,14 +128,14 @@ function Sync-DaemonUpdateStatus {
 
         Both halves are deliberately forgiving: an update check that fails, or a
         GitHub outage, must never disturb a running session. The check itself is
-        cached for a day inside Get-BridgeLatestRelease, so calling this on every
-        reconcile costs nothing.
+        cached for its configured interval inside Get-BridgeLatestRelease, with a
+        shorter retry window when the lookup is unavailable.
     #>
     param([Parameter(Mandatory)][hashtable]$Headers)
 
     # A pending self-update result is announced regardless of the update-check opt-out:
     # it is the response to the user pressing install, not a background poll.
-    Invoke-DaemonUpdateOutcome -Headers $Headers
+    $outcomeHandled = Invoke-DaemonUpdateOutcome -Headers $Headers
 
     # Opting out has to stop the network call, not just hide the result, so this is
     # checked before anything else happens.
@@ -132,12 +143,14 @@ function Sync-DaemonUpdateStatus {
 
     try {
         $status = Get-BridgeUpdateStatus
-        $latest = if ($status.Available) { $status.Latest } else { $status.Installed }
-
-        if ($status.Available -ne $script:DaemonUpdateAvailable -or -not $script:DaemonUpdatePublished) {
+        $latest = $status.Latest
+        $notes = if ($status.State -in @('Unavailable', 'NotFound')) { $status.Detail } else { $status.Notes }
+        $signature = @($status.State, $status.Installed, $latest, $status.Url, $notes) | ConvertTo-Json -Compress
+        if (-not $outcomeHandled -and ($signature -cne $script:DaemonUpdateSignature -or -not $script:DaemonUpdatePublished)) {
             Publish-CopilotMqttUpdate -InstalledVersion $status.Installed -LatestVersion $latest `
-                -ReleaseUrl $status.Url -ReleaseNotes $status.Notes -Headers $Headers
+                -ReleaseUrl $status.Url -ReleaseNotes $notes -InProgress:([bool]$script:DaemonUpdatePendingAttempt) -Headers $Headers
             [void](Set-CopilotMqttUpdateEntityIds)
+            $script:DaemonUpdateSignature = $signature
             $script:DaemonUpdatePublished = $true
             if ($status.Available -ne $script:DaemonUpdateAvailable) {
                 $script:DaemonUpdateAvailable = $status.Available
@@ -145,9 +158,11 @@ function Sync-DaemonUpdateStatus {
                     Write-DaemonLog -Message "update available: $($status.Installed) -> $($status.Latest)"
                 }
             }
+            if ($status.State -in @('Unavailable', 'NotFound')) { Write-DaemonLog -Message $status.Detail }
         }
     }
     catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
         Write-DaemonLog -Message "update check failed: $($_.Exception.Message)"
         return
     }
@@ -176,6 +191,7 @@ function Sync-DaemonUpdateStatus {
                 -ReleaseUrl $status.Url -ReleaseNotes $status.Notes -InProgress -Headers $Headers
         }
         catch {
+            if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
             Write-DaemonLog -Message "could not show update spinner: $($_.Exception.Message)"
         }
 
@@ -189,26 +205,34 @@ function Sync-DaemonUpdateStatus {
             $result = Invoke-BridgeSelfUpdate -Detached
         }
         catch {
+            if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
             $result = [pscustomobject]@{ Started = $false; Detail = $_.Exception.Message }
         }
         Write-DaemonLog -Message "self-update: $($result.Detail)"
-        if (-not $result.Started) {
+        if ($result.Started) {
+            $script:DaemonUpdatePendingAttempt = $result.AttemptId
+        }
+        else {
             try {
-                Publish-CopilotMqttUpdate -InstalledVersion $status.Installed -LatestVersion $latest `
-                    -ReleaseUrl $status.Url -ReleaseNotes $status.Notes -Headers $Headers
+                $current = $result.PSObject.Properties['State'] -and $result.State -eq 'Current'
+                $knownTarget = if ($result.PSObject.Properties['AttemptedVersion']) { $result.AttemptedVersion } else { $null }
+                Publish-CopilotMqttUpdate -InstalledVersion (Get-BridgeInstalledVersion -Refresh) -LatestVersion $knownTarget -Headers $Headers
+                $script:DaemonUpdateSignature = ''
                 Invoke-HomeAssistantService -Domain 'persistent_notification' -Service 'create' `
                     -Data @{
-                        title           = "Bridge update failed on $($script:DaemonMachineName)"
+                        title = if ($current) { "No newer bridge release on $($script:DaemonMachineName)" } else { "Bridge update failed on $($script:DaemonMachineName)" }
                         message         = "The bridge update did not start: $($result.Detail)"
                         notification_id = "agent_bridge_update_$($script:DaemonMachineSlug)"
                     } -Headers $Headers
             }
             catch {
+                if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
                 Write-DaemonLog -Message "could not clear the update spinner: $($_.Exception.Message)"
             }
         }
     }
     catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
         # The button may not exist yet on a first run - but say so rather than losing
         # a real failure, which is how a stuck "Installing" went unexplained.
         Write-DaemonLog -Message "update install check skipped: $($_.Exception.Message)"

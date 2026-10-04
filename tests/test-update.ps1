@@ -107,12 +107,16 @@ Write-Host '--- the cache ---'
 $realCachePath = $script:BridgeUpdateConfig.CacheFile
 $cachePath = Join-Path $env:TEMP ("bridge-update-test-" + [guid]::NewGuid().ToString('N') + '.json')
 $script:BridgeUpdateConfig.CacheFile = $cachePath
+$validCachedRelease = [pscustomobject]@{
+    Tag = 'v9.9.9'; Url = 'https://example.test/releases/v9.9.9'
+    Zip = 'https://example.test/archive/v9.9.9.zip'; Notes = ''; Name = ''; Published = ''
+}
 try {
     # A cache that is fresh must be used rather than re-fetching. A bogus tag proves
     # the value came from the cache and not the network.
     [pscustomobject]@{
         CheckedAt = [DateTimeOffset]::Now.ToString('o')
-        Release   = [pscustomobject]@{ Tag = 'v9.9.9'; Url = 'x'; Zip = 'x'; Notes = ''; Name = ''; Published = '' }
+        Release   = $validCachedRelease
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
 
     $cached = Get-BridgeLatestRelease
@@ -125,7 +129,7 @@ try {
     # An expired cache must be refetched rather than trusted.
     [pscustomobject]@{
         CheckedAt = [DateTimeOffset]::Now.AddDays(-3).ToString('o')
-        Release   = [pscustomobject]@{ Tag = 'v9.9.9'; Url = 'x'; Zip = 'x'; Notes = ''; Name = ''; Published = '' }
+        Release   = $validCachedRelease
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
     $refreshed = Get-BridgeLatestRelease
     Test-That 'an expired cache is refetched (network)' {
@@ -135,7 +139,7 @@ try {
     Write-Host '--- the check interval controls how often GitHub is polled ---'
     [pscustomobject]@{
         CheckedAt = [DateTimeOffset]::Now.AddHours(-2).ToString('o')
-        Release   = [pscustomobject]@{ Tag = 'v9.9.9'; Url = 'x'; Zip = 'x'; Notes = ''; Name = ''; Published = '' }
+        Release   = $validCachedRelease
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
     Test-That 'a wide interval reuses a 2h-old cache' { (Get-BridgeLatestRelease -CheckHours 24).Tag -eq 'v9.9.9' }
     # A refetch hits the mocked (offline) network and returns null, proving a shorter
@@ -152,7 +156,7 @@ try {
     [pscustomobject]@{
         CheckedAt = [DateTimeOffset]::Now.AddMinutes(-30).ToString('o')
         Reached   = $false
-        Release   = [pscustomobject]@{ Tag = 'v9.9.9'; Url = 'x'; Zip = 'x'; Notes = ''; Name = ''; Published = '' }
+        Release   = $validCachedRelease
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
     Test-That 'a 30-minute-old failure is re-polled, not trusted for six hours' {
         $null -eq (Get-BridgeLatestRelease)
@@ -161,26 +165,27 @@ try {
     [pscustomobject]@{
         CheckedAt = [DateTimeOffset]::Now.AddMinutes(-5).ToString('o')
         Reached   = $false
-        Release   = [pscustomobject]@{ Tag = 'v9.9.9'; Url = 'x'; Zip = 'x'; Notes = ''; Name = ''; Published = '' }
+        Release   = $validCachedRelease
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
-    Test-That 'but a five-minute-old one is, so an outage is not hammered' {
-        (Get-BridgeLatestRelease).Tag -eq 'v9.9.9'
+    Test-That 'a five-minute-old failure stays unknown rather than trusting retained release data' {
+        $lookup = Get-BridgeLatestRelease -IncludeStatus
+        $lookup.State -eq 'Unavailable' -and $null -eq $lookup.Release
     }
 
     [pscustomobject]@{
         CheckedAt = [DateTimeOffset]::Now.AddHours(-2).ToString('o')
         Reached   = $true
-        Release   = [pscustomobject]@{ Tag = 'v9.9.9'; Url = 'x'; Zip = 'x'; Notes = ''; Name = ''; Published = '' }
+        Release   = $validCachedRelease
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
     Test-That 'a real answer is still believed for the full interval' {
         (Get-BridgeLatestRelease).Tag -eq 'v9.9.9'
     }
 
-    # A cache written by an older version has no Reached field at all, and must keep
-    # the behaviour it was written under rather than being re-polled every 15 minutes.
+    # An older cache with a validated release still has affirmative metadata. A null
+    # legacy cache does not establish whether the request failed or returned 404.
     [pscustomobject]@{
         CheckedAt = [DateTimeOffset]::Now.AddHours(-2).ToString('o')
-        Release   = [pscustomobject]@{ Tag = 'v9.9.9'; Url = 'x'; Zip = 'x'; Notes = ''; Name = ''; Published = '' }
+        Release   = $validCachedRelease
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
     Test-That 'a cache from an older version is read as before' {
         (Get-BridgeLatestRelease).Tag -eq 'v9.9.9'
@@ -192,17 +197,22 @@ try {
         ((Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json).Reached) -eq $false
     }
 
-    # 404 is the one failure that is also an answer - the repository exists and has no
-    # releases - so it is cached like a reply rather than retried every 15 minutes.
+    # A bare 404 does not establish repository existence/access. Preserve it as a
+    # distinct endpoint result, never as "installed equals latest".
     function Invoke-RestMethod {
         $response = [System.Net.Http.HttpResponseMessage]::new([System.Net.HttpStatusCode]::NotFound)
         throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('Not Found', $response)
     }
     Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
     $null = Get-BridgeLatestRelease -Force
-    Test-That 'a repository with no releases counts as reached' {
+    Test-That 'a latest-release 404 is retained without inventing release metadata' {
         $written = Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json
         $written.Reached -and $null -eq $written.Release
+    }
+    Test-That 'a latest-release 404 is not a current-version claim' {
+        $notFound = Get-BridgeUpdateStatus
+        $notFound.State -eq 'NotFound' -and $null -eq $notFound.Latest -and
+            $notFound.Detail -match 'existence and access are not confirmed'
     }
     function Invoke-RestMethod { throw 'network disabled in test' }
 
@@ -213,6 +223,9 @@ try {
     function Get-BridgeUpdateRepository { 'danswett/this-repository-does-not-exist-9f8e7d' }
     $status = Get-BridgeUpdateStatus -Force
     Test-That 'a missing repository is not an available update' { -not $status.Available }
+    Test-That 'an unavailable lookup does not report a fabricated latest version' {
+        $status.State -eq 'Unavailable' -and $null -eq $status.Latest
+    }
     Test-That 'it still reports the installed version' { $status.Installed -match '^\d+\.\d+' } $status.Installed
     Test-That 'the failed check is recorded so it is not retried immediately' {
         Test-Path -LiteralPath $cachePath
@@ -281,6 +294,7 @@ function Start-Process {
 }
 $detachedRun = Invoke-BridgeSelfUpdate -Detached
 Test-That 'a detached update reports that it started' { $detachedRun.Started -eq $true } "$($detachedRun.Detail)"
+Test-That 'launch acceptance is not completion' { $detachedRun.State -eq 'Started' -and -not $detachedRun.Success }
 Test-That 'and really launched pwsh with the generated script' {
     $null -ne $script:LaunchedWith -and
     $script:LaunchedWith.FilePath -match 'pwsh' -and

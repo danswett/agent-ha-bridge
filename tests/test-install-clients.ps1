@@ -706,7 +706,7 @@ param([string]$TargetHome, [string]$InstallRoot, [switch]$ClearEntities)
 function Get-BridgeUpdateRepository { 'selected-install' }
 function Get-BridgeUpdateStatus {
     param([switch]$Force)
-    [pscustomobject]@{ Installed = '1'; Latest = '1'; Available = $false }
+    [pscustomobject]@{ Installed = '1'; Latest = '1'; Available = $false; LookupState = 'Found'; State = 'Current' }
 }
 '@
         }

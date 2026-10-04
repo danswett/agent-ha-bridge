@@ -593,7 +593,7 @@ function Publish-CopilotMqttUpdate {
     #>
     param(
         [Parameter(Mandatory)][string]$InstalledVersion,
-        [Parameter(Mandatory)][string]$LatestVersion,
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$LatestVersion,
         [string]$ReleaseUrl = '',
         [string]$ReleaseNotes = '',
         [switch]$InProgress,
@@ -611,6 +611,8 @@ function Publish-CopilotMqttUpdate {
         unique_id   = "agent_bridge_${Slug}_update"
         object_id   = "agent_bridge_${Slug}_update"
         state_topic = $stateTopic
+        availability_topic = $stateTopic
+        availability_template = "{{ 'online' if value_json.get('latest_version') else 'offline' }}"
         device_class = 'firmware'
         icon        = 'mdi:package-up'
         device      = $device
@@ -626,15 +628,19 @@ function Publish-CopilotMqttUpdate {
 
     $state = @{
         installed_version = $InstalledVersion
-        latest_version    = $LatestVersion
         title             = 'AI coding agent Home Assistant bridge'
+        # Omission retains old failure text, even when identical discovery is replayed.
+        release_summary   = $notes
         # Always present, so Home Assistant shows a spinner while an install runs and
         # clears it the moment a later publish reports false, rather than inferring
         # the flag from an absent key.
         in_progress       = [bool]$InProgress
     }
+    # Stock MQTT update rejects JSON null versions and retains an omitted version.
+    # Availability therefore carries "not established", without inventing a version
+    # or hiding any other entity on this device. See installation-isolation.md.
+    if (-not [string]::IsNullOrWhiteSpace($LatestVersion)) { $state['latest_version'] = $LatestVersion }
     if ($ReleaseUrl) { $state['release_url'] = $ReleaseUrl }
-    if ($notes) { $state['release_summary'] = $notes }
 
     Publish-CopilotMqttMessage -Topic $stateTopic `
         -Payload ($state | ConvertTo-Json -Depth 6 -Compress) -Headers $Headers -Retain
