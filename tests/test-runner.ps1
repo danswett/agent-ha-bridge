@@ -407,7 +407,7 @@ $probeBoundary = Get-BridgeTestSandbox -Root $env:AGENT_HA_BRIDGE_TEST_ROOT
                     catch { $refusal = $_ }
                     Write-BoundaryRecord -Prefix 'P6-CONSTRUCTOR' -Record ([ordered]@{
                         Case = $markerCase.Name; Stage = $operation; Sandbox = $badBox
-                        MarkerBytes = $(if (Test-Path -LiteralPath $badMarker) { (Get-Item -LiteralPath $badMarker).Length } else { $null })
+                        MarkerBytes = $(if (Test-Path -LiteralPath $badMarker) { (Get-Item -LiteralPath $badMarker -Force).Length } else { $null })
                         MarkerSha256 = $(if (Test-Path -LiteralPath $badMarker) { (Get-FileHash -LiteralPath $badMarker -Algorithm SHA256).Hash } else { $null })
                         MarkerRaw = $(if (Test-Path -LiteralPath $badMarker) { [IO.File]::ReadAllText($badMarker) } else { $null })
                         ReturnedObject = ($null -ne $unexpected); ChildStarted = $false
