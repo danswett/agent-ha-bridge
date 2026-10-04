@@ -13,30 +13,43 @@ function Get-BridgeAttachmentRoot {
     <#
         Where images from the reply card are written before being attached.
 
-        The path must not contain a space. The CLI attaches a file when the prompt
-        references it as `@<path>`, and there is no way to quote a path in that
-        syntax, so a space would split one attachment into two broken words.
-        LOCALAPPDATA normally qualifies, but it sits under the user profile, so a
-        user name containing a space would make every attachment unusable - hence
-        the fallback to the public profile, which never contains one.
+        A space in the private path is a transport limitation, not permission to
+        put the file in Public or shared TEMP. Formatting refuses that submission.
+        Unidentified legacy storage is left alone rather than claimed by this writer.
     #>
     param([switch]$NoCreate)
     $context = Get-BridgeInstallContext
-    $root = ''
-    # macOS: beside the bridge's config, or /tmp for a home folder with a space.
-    if (-not $script:BridgeIsWindows) {
-        $root = Join-Path $context.BridgeHome 'attachments'
-        if ($root -match '\s') { $root = Join-Path $env:TEMP 'agent-ha-bridge-attachments' }
+    Get-BridgeAttachmentRootForInstallation -BridgeHome $context.BridgeHome -LocalAppData $context.LocalAppData `
+        -InstallationId $context.Id -Legacy $context.Legacy -NoCreate:$NoCreate
+}
+
+function Get-BridgeAttachmentRootForInstallation {
+    <# The production allocator; context acquisition remains with the public wrapper. #>
+    param(
+        [Parameter(Mandatory)][string]$BridgeHome,
+        [AllowNull()][AllowEmptyString()][string]$LocalAppData,
+        [Parameter(Mandatory)][AllowNull()][AllowEmptyString()][string]$InstallationId,
+        [Parameter(Mandatory)][bool]$Legacy,
+        [switch]$NoCreate
+    )
+
+    if ($Legacy -or [string]::IsNullOrWhiteSpace($InstallationId)) {
+        throw 'Attachment staging requires an installation identity. Reconfigure the installation before sending attachments; legacy files were not changed.'
     }
-    elseif (-not [string]::IsNullOrWhiteSpace($context.LocalAppData)) {
-        $root = Join-Path $context.LocalAppData 'agent-ha-bridge\attachments'
+    $root = if ($script:BridgeIsWindows -and -not [string]::IsNullOrWhiteSpace($LocalAppData)) {
+        Join-Path $LocalAppData 'agent-ha-bridge\attachments'
     }
-    if ([string]::IsNullOrWhiteSpace($root) -or $root -match '\s') {
-        $root = Join-Path $context.PublicRoot 'agent-ha-bridge\attachments'
+    else {
+        Join-Path $BridgeHome 'attachments'
     }
-    if (-not $context.Legacy) { $root = Join-Path $root "install-$($context.Id)" }
-    if (-not $NoCreate -and -not (Test-Path -LiteralPath $root)) {
-        New-Item -ItemType Directory -Path $root -Force | Out-Null
+    $root = Join-Path $root "install-$($InstallationId)"
+    if (Test-BridgeTestExecution) { Assert-BridgeTestPath -Path $root }
+    Assert-BridgeInstallPayload -Root $root -CheckAncestors
+    if (-not $NoCreate) {
+        [void][IO.Directory]::CreateDirectory($root)
+        if (-not (Protect-BridgeSecretFile -Path $root)) {
+            throw 'Could not protect the attachment directory; no attachment contents were written.'
+        }
     }
     $root
 }
@@ -127,10 +140,9 @@ function New-BridgeAttachmentPrompt {
         Builds the text that is typed into the CLI for a reply carrying attachments.
 
         Copilot CLI attaches a file when the prompt references it as `@<path>`, so
-        the attachments lead and the typed text follows. A path containing a space
-        cannot be expressed that way and is dropped rather than silently corrupting
-        the rest of the prompt; Get-BridgeAttachmentRoot exists to make that
-        impossible in the first place.
+        the attachments lead and the typed text follows. No quoted-path transport
+        has been established here. Refuse unrepresentable paths rather than sending
+        the text or a subset of the attachments without telling the sender.
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
@@ -139,8 +151,9 @@ function New-BridgeAttachmentPrompt {
 
     $parts = [System.Collections.Generic.List[string]]::new()
     foreach ($path in @($Paths)) {
-        if ([string]::IsNullOrWhiteSpace($path)) { continue }
-        if ($path -match '\s') { continue }
+        if ([string]::IsNullOrWhiteSpace($path) -or $path -match '\s') {
+            throw 'An attachment path cannot be represented by the current reply transport; no reply was sent.'
+        }
         $parts.Add("@$path")
     }
 
@@ -166,26 +179,46 @@ function Save-BridgeReplyAttachment {
     )
 
     $extension = ''
-    try { $extension = [System.IO.Path]::GetExtension($Name) } catch { $extension = '' }
+    try { $extension = [System.IO.Path]::GetExtension($Name) }
+    catch {
+        if ($_.Exception.Data['BridgeTestNetworkBlocked'] -or $_.Exception.Data['BridgeTestWriteBlocked']) { throw }
+        $extension = ''
+    }
     if ($extension -notin @('.png', '.jpg', '.jpeg', '.gif', '.webp', '.heic', '.heif', '.pdf')) {
         $extension = '.png'
     }
 
     $safeId = $ImageId -replace '[^0-9a-zA-Z]', ''
-    if ([string]::IsNullOrWhiteSpace($safeId)) { return '' }
-
-    $path = Join-Path (Get-BridgeAttachmentRoot) "$safeId$extension"
-    $uri = "$($script:DecisionBridgeConfig.HomeAssistantBaseUrl)/api/image/serve/$ImageId/original"
+    if ([string]::IsNullOrWhiteSpace($safeId)) {
+        Write-DaemonLog -Message 'could not stage an attachment with an unusable image identifier'
+        return ''
+    }
 
     try {
+        $uri = "$($script:DecisionBridgeConfig.HomeAssistantBaseUrl)/api/image/serve/$ImageId/original"
+        Assert-BridgeHttpAllowed -Uri $uri -Transport WebRequest
+        $root = Get-BridgeAttachmentRoot
+        # A repeated image id must not truncate bytes retained from an earlier send.
+        $path = Join-Path $root "$([guid]::NewGuid().ToString('N'))-$safeId$extension"
+        if (Test-BridgeTestExecution) { Assert-BridgeTestPath -Path $path }
+        Assert-BridgeInstallPayload -Root $path -CheckAncestors
+        Initialize-BridgeSecretFile -Path $path
         Invoke-WebRequest -Uri $uri -Headers $Headers -OutFile $path -UseBasicParsing -ErrorAction Stop | Out-Null
+        if (Test-BridgeTestExecution) { Assert-BridgeTestPath -Path $path }
+        Assert-BridgeInstallPayload -Root $path -CheckAncestors
+        if (-not (Test-BridgeSecretFileProtected -Path $root) -or
+            -not (Test-BridgeSecretFileProtected -Path $path) -or
+            -not (Test-Path -LiteralPath $path -PathType Leaf) -or
+            (Get-Item -LiteralPath $path -Force).Length -eq 0) {
+            throw 'The downloaded attachment is missing, empty or no longer protected.'
+        }
     }
     catch {
+        if ($_.Exception.Data['BridgeTestNetworkBlocked'] -or $_.Exception.Data['BridgeTestWriteBlocked']) { throw }
         Write-DaemonLog -Message "could not fetch attachment $ImageId : $($_.Exception.Message)"
         return ''
     }
 
-    if (-not (Test-Path -LiteralPath $path)) { return '' }
     $path
 }
 
@@ -194,10 +227,9 @@ function Get-BridgeAttachmentFileName {
         A file name from the reply card, rewritten into one that is safe to hand the
         CLI as `@<path>`.
 
-        Every part of this is load-bearing. That syntax has no quoting, so a space
-        would split one attachment into two broken words - the same reason
-        Get-BridgeAttachmentRoot refuses a root containing one. The name arrives from
-        a browser, so a directory separator or `..` in it would write the file
+        The current transport has no established quoting, so a space would split
+        one attachment into two broken words. The name arrives from a browser, so
+        a directory separator or `..` in it would write the file
         somewhere other than the attachment root. The extension is kept, and only the
         extension is trusted to be short, because the CLI decides how to treat an
         attachment from it.
@@ -233,9 +265,8 @@ function Save-BridgeReplyFile {
         limit keeps the state machine healthy, and this one is what stops a payload
         that did not come from the card writing whatever it likes to disk.
 
-        The name is prefixed with a random token so that two replies sending the same
-        file name do not overwrite each other - attachments live for a day, which is
-        long enough for that to happen.
+        The random prefix keeps a later send from overwriting a private copy retained
+        after failure or still awaiting the client's read.
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyString()][string]$Name,
@@ -243,40 +274,58 @@ function Save-BridgeReplyFile {
         [int]$MaxBytes = 262144
     )
 
-    if ([string]::IsNullOrWhiteSpace($Base64)) { return '' }
+    if ([string]::IsNullOrWhiteSpace($Base64)) {
+        Write-DaemonLog -Message 'could not stage an inline attachment with no bytes'
+        return ''
+    }
 
     $bytes = $null
     try { $bytes = [Convert]::FromBase64String($Base64) }
     catch {
+        if ($_.Exception.Data['BridgeTestNetworkBlocked'] -or $_.Exception.Data['BridgeTestWriteBlocked']) { throw }
         Write-DaemonLog -Message "could not decode attachment '$Name': $($_.Exception.Message)"
         return ''
     }
 
-    if ($null -eq $bytes -or $bytes.Length -eq 0) { return '' }
+    if ($null -eq $bytes -or $bytes.Length -eq 0) {
+        Write-DaemonLog -Message 'could not stage an empty inline attachment'
+        return ''
+    }
     if ($bytes.Length -gt $MaxBytes) {
         Write-DaemonLog -Message "attachment '$Name' is $($bytes.Length) bytes, over the $MaxBytes limit"
         return ''
     }
 
-    $safe = Get-BridgeAttachmentFileName -Name $Name
-    $token = [guid]::NewGuid().ToString('N').Substring(0, 8)
-    $path = Join-Path (Get-BridgeAttachmentRoot) "$token-$safe"
-
     try {
+        $safe = Get-BridgeAttachmentFileName -Name $Name
+        $token = [guid]::NewGuid().ToString('N')
+        $root = Get-BridgeAttachmentRoot
+        $path = Join-Path $root "$token-$safe"
+        if (Test-BridgeTestExecution) { Assert-BridgeTestPath -Path $path }
+        Assert-BridgeInstallPayload -Root $path -CheckAncestors
+        Initialize-BridgeSecretFile -Path $path
         [IO.File]::WriteAllBytes($path, $bytes)
+        if (Test-BridgeTestExecution) { Assert-BridgeTestPath -Path $path }
+        Assert-BridgeInstallPayload -Root $path -CheckAncestors
+        if (-not (Test-BridgeSecretFileProtected -Path $root) -or
+            -not (Test-BridgeSecretFileProtected -Path $path) -or
+            -not (Test-Path -LiteralPath $path -PathType Leaf)) {
+            throw 'The inline attachment is missing or no longer protected.'
+        }
     }
     catch {
+        if ($_.Exception.Data['BridgeTestNetworkBlocked'] -or $_.Exception.Data['BridgeTestWriteBlocked']) { throw }
         Write-DaemonLog -Message "could not write attachment '$Name': $($_.Exception.Message)"
         return ''
     }
 
-    if (-not (Test-Path -LiteralPath $path)) { return '' }
     $path
 }
 
 function Remove-BridgeHomeAssistantImage {
     <#
-        Deletes an uploaded image from Home Assistant once it is safely on disk here.
+        Deletes an uploaded image after staging and successful reply transport.
+        Transport success is not proof that the client has read the local copy.
 
         Best effort: a failure leaves a file in Home Assistant's upload store, which
         is untidy but harmless, and must never stop a reply being delivered.
@@ -287,6 +336,7 @@ function Remove-BridgeHomeAssistantImage {
         [void](Invoke-CopilotHaWebSocket -Commands @(@{ type = 'image/delete'; image_id = $ImageId }))
     }
     catch {
+        if ($_.Exception.Data['BridgeTestNetworkBlocked'] -or $_.Exception.Data['BridgeTestWriteBlocked']) { throw }
         Write-DaemonLog -Message "could not remove uploaded image $ImageId from Home Assistant: $($_.Exception.Message)"
     }
 }
@@ -295,22 +345,25 @@ function Remove-BridgeStaleAttachment {
     <#
         Clears attachments left behind by previous replies.
 
-        They are only needed until the CLI has read them, which happens within
-        seconds of delivery, but deleting immediately would race that read. A day is
-        far longer than the CLI needs and keeps the folder from growing without end.
+        Immediate deletion would race the client's read. This opportunistic sweep
+        after a successful reply is not an acknowledgement or an idle expiry budget.
     #>
     param([int]$MaxAgeHours = 24)
 
     try {
         $cutoff = (Get-Date).AddHours(-$MaxAgeHours)
-        $root = Get-BridgeAttachmentRoot
+        $root = Get-BridgeAttachmentRoot -NoCreate
+        if (-not (Test-Path -LiteralPath $root -PathType Container)) { return }
         foreach ($file in @(Get-ChildItem -LiteralPath $root -File -ErrorAction SilentlyContinue)) {
             if ($file.LastWriteTime -lt $cutoff) {
                 Remove-Item -LiteralPath $file.FullName -Force -ErrorAction SilentlyContinue
             }
         }
     }
-    catch { }
+    catch {
+        if ($_.Exception.Data['BridgeTestNetworkBlocked'] -or $_.Exception.Data['BridgeTestWriteBlocked']) { throw }
+        Write-DaemonLog -Message "could not clean up old attachments: $($_.Exception.Message)"
+    }
 }
 
 function Invoke-PendingReplies {
@@ -439,23 +492,39 @@ function Send-DaemonCardPayload {
     $entry = $Entry
     $node = Get-CopilotMqttNodeId -SessionId $sessionId
     $payload = $null
+    $payloadState = $null
     try {
         $payloadState = Get-DaemonEntityState -EntityId "sensor.${node}_reply_payload" -Headers $Headers
         $payload = Get-BridgeReplyPayload -State $payloadState
     }
     catch {
+        if ($_.Exception.Data['BridgeTestNetworkBlocked'] -or $_.Exception.Data['BridgeTestWriteBlocked']) { throw }
         # No payload sensor yet (a session published before this existed), or it is
         # unreadable. The text box still works.
     }
-    if ($null -eq $payload) { return $false }
 
+    # The parser tolerates missing attachment metadata for older callers. The send
+    # consumer must not turn that tolerance into an apparently complete text-only send.
+    $requestedAttachments = 0
+    if ($payloadState -and $payloadState.PSObject.Properties['attributes'] -and $payloadState.attributes) {
+        foreach ($field in @('images', 'files')) {
+            if ($payloadState.attributes.PSObject.Properties[$field] -and $null -ne $payloadState.attributes.$field) {
+                $requestedAttachments += @($payloadState.attributes.$field).Count
+            }
+        }
+    }
+    $stamp = if ($payload) { [string]$payload.Stamp }
+        elseif ($payloadState -and $payloadState.PSObject.Properties['state']) { [string]$payloadState.state }
+        else { '' }
+    if ([string]::IsNullOrWhiteSpace($stamp) -or $stamp -in @('unknown', 'unavailable') -or
+        ($null -eq $payload -and $requestedAttachments -eq 0)) { return $false }
     $lastPayload = if ($entry.PSObject.Properties['LastReplyPayloadAt']) { [string]$entry.LastReplyPayloadAt } else { '' }
-    if ($payload.Stamp -eq $lastPayload) { return $false }
+    if ($stamp -eq $lastPayload) { return $false }
 
     # Record the stamp before delivering, not after. Delivery types the reply into the
     # console one character at a time, which is long enough for the next reconcile to
     # see the same payload still sitting there and send it a second time.
-    Set-DaemonSessionProperty -Entry $entry -Name 'LastReplyPayloadAt' -Value $payload.Stamp
+    Set-DaemonSessionProperty -Entry $entry -Name 'LastReplyPayloadAt' -Value $stamp
 
     # Who is driving from here, and armed so the turn this is about to start is not
     # read as somebody typing in the terminal - the same reason a Submit press arms it.
@@ -463,61 +532,86 @@ function Send-DaemonCardPayload {
     # box's 255 characters, left an agent-driven session showing as the person's the
     # moment it began answering. Guarded because a payload built by an older card - or
     # by a test - has no Driver, and reading a missing property throws under StrictMode.
-    $payloadDriver = if ($payload.PSObject.Properties['Driver'] -and $payload.Driver) {
-        [string]$payload.Driver
-    } else { 'human' }
-    Set-DaemonDriverPending -Entry $entry -Driver $payloadDriver
-
-    try {
-        Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Sending...' -Headers $Headers | Out-Null
+    if ($payload) {
+        $payloadDriver = if ($payload.PSObject.Properties['Driver'] -and $payload.Driver) {
+            [string]$payload.Driver
+        } else { 'human' }
+        Set-DaemonDriverPending -Entry $entry -Driver $payloadDriver
     }
-    catch { }
 
     $paths = [System.Collections.Generic.List[string]]::new()
     $fetched = [System.Collections.Generic.List[string]]::new()
-    foreach ($image in @($payload.Images)) {
-        $saved = Save-BridgeReplyAttachment -ImageId $image.Id -Name $image.Name -Headers $Headers
-        if (-not [string]::IsNullOrWhiteSpace($saved)) {
+    try {
+        if ($null -eq $payload) { throw 'The attachment metadata is incomplete; no reply was sent.' }
+        $parsedAttachments = @($payload.Images).Count
+        if ($payload.PSObject.Properties['Files']) { $parsedAttachments += @($payload.Files).Count }
+        if ($parsedAttachments -ne $requestedAttachments) {
+            throw 'The attachment metadata is incomplete; no reply was sent.'
+        }
+        try {
+            Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Sending...' -Headers $Headers | Out-Null
+        }
+        catch {
+            if ($_.Exception.Data['BridgeTestNetworkBlocked'] -or $_.Exception.Data['BridgeTestWriteBlocked']) { throw }
+            Write-DaemonLog -Message "could not show reply progress for $sessionId : $($_.Exception.Message)"
+        }
+
+        foreach ($image in @($payload.Images)) {
+            $saved = Save-BridgeReplyAttachment -ImageId $image.Id -Name $image.Name -Headers $Headers
+            if ([string]::IsNullOrWhiteSpace($saved)) {
+                throw 'An image could not be staged privately; no reply was sent and source images were kept.'
+            }
             $paths.Add($saved)
             $fetched.Add($image.Id)
         }
-    }
 
-    # Guarded rather than read straight through: under StrictMode a payload with no
-    # such property - one an older reply card produced, or a test's own shape - would
-    # throw here and lose a reply that had nothing wrong with it.
-    if ($payload.PSObject.Properties['Files']) {
-        foreach ($file in @($payload.Files)) {
-            if ($null -eq $file) { continue }
-            $written = Save-BridgeReplyFile -Name $file.Name -Base64 $file.Base64
-            if (-not [string]::IsNullOrWhiteSpace($written)) { $paths.Add($written) }
+        # Old cards have no Files property; their text/image submissions still work.
+        if ($payload.PSObject.Properties['Files']) {
+            foreach ($file in @($payload.Files)) {
+                if ($null -eq $file) { throw 'The attachment metadata is incomplete; no reply was sent.' }
+                $written = Save-BridgeReplyFile -Name $file.Name -Base64 $file.Base64
+                if ([string]::IsNullOrWhiteSpace($written)) {
+                    throw 'A file could not be staged privately; no reply was sent and source images were kept.'
+                }
+                $paths.Add($written)
+            }
         }
-    }
 
-    $prompt = New-BridgeAttachmentPrompt -Text $payload.Text -Paths $paths.ToArray()
-    if ([string]::IsNullOrWhiteSpace($prompt)) {
-        # Disarmed: no turn is coming, so leaving it armed would hand the glow to
-        # whatever the person types next in the terminal - the same reason an agent
-        # press on an empty box disarms rather than waiting.
+        $prompt = New-BridgeAttachmentPrompt -Text $payload.Text -Paths $paths.ToArray()
+        if ([string]::IsNullOrWhiteSpace($prompt)) {
+            Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $false
+            Write-DaemonLog -Message "reply card payload for $($sessionId.Substring(0,8)) had nothing deliverable"
+            return $true
+        }
+
+        $attachmentNote = if ($paths.Count -gt 0) { " with $($paths.Count) attachment(s)" } else { '' }
+        Write-DaemonLog -Message "reply card payload for $($sessionId.Substring(0,8))$attachmentNote"
+        Set-DaemonSessionProperty -Entry $entry -Name 'LastReply' -Value $payload.Text
+        # Card output must not join the Boolean and turn a failed send into success.
+        $delivered = @(Invoke-DaemonReply -SessionId $sessionId -Text $prompt -Headers $Headers `
+            -DisplayText $payload.Text -ClearReplyBox:$false) | Select-Object -Last 1
+    }
+    catch {
         Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $false
-        Write-DaemonLog -Message "reply card payload for $($sessionId.Substring(0,8)) had nothing deliverable"
+        if ($_.Exception.Data['BridgeTestNetworkBlocked'] -or $_.Exception.Data['BridgeTestWriteBlocked']) { throw }
+        $failure = $_.Exception.Message
+        Write-DaemonLog -Message "reply card payload failed for $sessionId : $failure"
+        try {
+            Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Reply NOT sent' `
+                -Extra @{ error = $failure } -Headers $Headers | Out-Null
+        }
+        catch {
+            if ($_.Exception.Data['BridgeTestNetworkBlocked'] -or $_.Exception.Data['BridgeTestWriteBlocked']) { throw }
+            Write-DaemonLog -Message "could not show reply failure for $sessionId : $($_.Exception.Message)"
+        }
         return $true
     }
-
-    $attachmentNote = if ($paths.Count -gt 0) { " with $($paths.Count) attachment(s)" } else { '' }
-    Write-DaemonLog -Message "reply card payload for $($sessionId.Substring(0,8))$attachmentNote"
-
-    Set-DaemonSessionProperty -Entry $entry -Name 'LastReply' -Value $payload.Text
-    # Taken as the last thing emitted rather than assigned straight across: the call
-    # writes to the card on its way through, and that output would otherwise join the
-    # result and make a failed delivery look like a successful one.
-    $delivered = @(Invoke-DaemonReply -SessionId $sessionId -Text $prompt -Headers $Headers `
-        -DisplayText $payload.Text -ClearReplyBox:$false) | Select-Object -Last 1
     if (-not $delivered) {
         # Nothing was sent, so no agent turn is coming and the arming above has to go
         # back. Left armed, the next thing typed in the terminal would consume it and
         # show a person's turn with the agent's edge.
         Set-DaemonSessionProperty -Entry $entry -Name 'DriverPending' -Value $false
+        return $true
     }
     else {
         # The window starts now, not when the payload was picked up, so a slow delivery
@@ -530,8 +624,8 @@ function Send-DaemonCardPayload {
             -Value ([DateTimeOffset]::Now.ToString('o'))
     }
 
-    # Only once it is delivered, so a failed send leaves the image in place to be
-    # retried by hand.
+    # Only successful transport permits cleanup; failures keep all source images and
+    # staged private data. This is not a client-read or completed-turn acknowledgement.
     foreach ($id in $fetched) { Remove-BridgeHomeAssistantImage -ImageId $id | Out-Null }
     Remove-BridgeStaleAttachment | Out-Null
     $true

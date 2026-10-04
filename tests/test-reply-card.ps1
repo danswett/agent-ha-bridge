@@ -136,10 +136,9 @@ Test-That 'several attachments all appear' {
 Test-That 'an image with no message is still a valid prompt' {
     (New-BridgeAttachmentPrompt -Text '' -Paths @('C:\att\a.png')) -eq '@C:\att\a.png'
 }
-# There is no way to quote a path in the @ syntax, so a space would split one
-# attachment into two broken words and corrupt the rest of the prompt.
-Test-That 'a path containing a space is dropped rather than corrupting the prompt' {
-    (New-BridgeAttachmentPrompt -Text 'hi' -Paths @('C:\my att\a.png')) -eq 'hi'
+Test-That 'a path containing a space refuses the whole prompt instead of dropping the attachment' {
+    try { $null = New-BridgeAttachmentPrompt -Text 'hi' -Paths @('C:\att\b.png', 'C:\my att\a.png'); $false }
+    catch { $_.Exception.Message -like '*cannot be represented*' }
 }
 Test-That 'surrounding whitespace is trimmed off the typed text' {
     (New-BridgeAttachmentPrompt -Text '   padded   ') -eq 'padded'
@@ -150,11 +149,23 @@ Test-That 'an empty reply with no attachments produces nothing to send' {
 
 Write-Host '--- where attachments are stored ---'
 
-Test-That 'the attachment folder never contains a space' {
-    (Get-BridgeAttachmentRoot) -notmatch '\s'
+$replyAttachmentContext = $script:BridgeInstallContext
+try {
+    $script:BridgeInstallContext = Resolve-BridgeInstallContext -TargetHome (
+        Join-Path $env:TEMP "reply attachments $([guid]::NewGuid().ToString('N'))")
+    Test-That 'reading the private attachment path does not create it' {
+        -not (Test-Path -LiteralPath (Get-BridgeAttachmentRoot -NoCreate))
+    }
+    Test-That 'a spaced attachment directory stays private instead of moving to Public' {
+        $__root = Get-BridgeAttachmentRoot
+        $__root -match '\s' -and
+            (Test-BridgeInstallDescendant $__root $script:BridgeInstallContext.Home) -and
+            -not (Test-BridgeInstallDescendant $__root $script:BridgeInstallContext.PublicRoot) -and
+            (Test-BridgeSecretFileProtected -Path $__root)
+    }
 }
-Test-That 'the attachment folder exists once asked for' {
-    Test-Path -LiteralPath (Get-BridgeAttachmentRoot)
+finally {
+    $script:BridgeInstallContext = $replyAttachmentContext
 }
 
 Write-Host '--- the MQTT entity behind the card ---'

@@ -87,11 +87,20 @@ entries pointing to this server, from both the Desktop file and its existing bac
 Claude and Codex session-entity cleanup reads each adapter's owned registry
 independently; it does not require a Copilot session-state directory.
 
-New attachment storage is partitioned by installation identity under the existing
-attachment allocation policy. This does **not** change its space-free path,
-PUBLIC fallback or permissions policy. Shared legacy attachment directories and
-unattributed files are not recursively removed. `-KeepConfig` also retains the
-installation metadata so a later reconfiguration keeps the same identity.
+New attachments use a protected `install-<id>` directory under the installation's
+LocalAppData on Windows, or its BridgeHome on macOS and when Windows LocalAppData
+is missing. Directories and destination files are protected before content is
+written and checked afterward; existing path/reparse checks do not promise
+race-free protection against concurrent filesystem changes. Public/shared-TEMP
+fallbacks are not used. Unidentified legacy installations refuse attachment sends
+until reconfigured; old shared directories and unattributed files are left alone,
+not migrated, re-permissioned or recursively removed. `-NoCreate` only reads the
+chosen path; it does not create, repair permissions or migrate data. A private path
+that the current reply transport cannot represent, including whitespace, refuses
+the whole attachment-bearing submission rather than sending only its text or a
+subset. Failed staging or transport retains source images and staged private data
+without automatic retry; this is not a durable queue or a client acknowledgement.
+`-KeepConfig` retains installation metadata so reconfiguration keeps the identity.
 
 Target-home/custom-root installations do not register system services, alter user
 PATH, install global dependencies or provision shared Home Assistant resources.

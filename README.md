@@ -1284,14 +1284,23 @@ locations until upgraded. No shared scheduled task is created by an isolated ins
   1.10.1 copied the card into `config\www`; that file is no longer used and can be
   deleted.
 * **Images go via Home Assistant.** A pasted image is uploaded to Home Assistant, pulled
-  down by the daemon, attached to the prompt as `@<path>`, and then deleted from Home
-  Assistant. Local copies are kept for a day in case the CLI is slow to read them.
+  into protected installation-scoped storage by the daemon and attached as `@<path>`.
+  Only successful reply transport permits deletion of the Home Assistant source;
+  staging or transport failure retains source images and staged private files.
+  Transport success is not proof that the client read the file or completed a turn.
+  Local files older than a day are swept after a successful reply, not on an idle
+  expiry schedule. This is not a durable retry queue: the card still clears drafts
+  after MQTT publication and a newer submission can replace the single payload.
 * **Other files go inside the reply.** `/api/image/upload` decodes what it is given and
   refuses anything that is not an image, so a document is base64'd into the reply payload
   instead and written out by the daemon. That puts it in a Home Assistant state attribute,
   hence the **256 KB** ceiling; a larger file is refused on the card rather than sent. The
-  name is rewritten before it is written to disk — `@<path>` has no quoting, so a space in
-  a file name would split one attachment into two broken words.
+  name is rewritten before it is written to a protected file. The current transport
+  has no established quoted-path support: whitespace in the private directory refuses
+  the entire attachment-bearing submission, without sending just text or a subset.
+  There is no Public/shared-TEMP fallback and no automatic retry. Unidentified legacy
+  installations must be reconfigured before sending attachments; old shared files are
+  preserved for a separate ownership-aware migration.
 * **A file needs the receiving machine updated too.** The card is one shared resource, so
   it offers file attachments for every session once the designated writer publishes
   that card, while a machine still on an older bridge ignores the `files` in the payload and

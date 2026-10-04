@@ -111,7 +111,11 @@ function Protect-BridgeSecretFile {
             $acl.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
                 $me, [Security.AccessControl.FileSystemRights]::FullControl, $inherit,
                 [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow))
-            $acl.SetOwner($me)
+            # DACL repair needs WRITE_DAC; marking even the same owner for
+            # persistence additionally requests WRITE_OWNER.
+            if ($acl.GetOwner([Security.Principal.SecurityIdentifier]) -ne $me) {
+                $acl.SetOwner($me)
+            }
             [IO.FileSystemAclExtensions]::SetAccessControl($item, $acl)
         }
         return Test-BridgeSecretFileProtected -Path $Path
