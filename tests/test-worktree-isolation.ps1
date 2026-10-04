@@ -287,20 +287,17 @@ try {
         @($withDiscovery | Where-Object { $_.Path -eq $notRepo }).Count -eq 1
     }
 
-    Write-Host '--- the daemon is given no console to lose ---'
-    # A console inherited from an interactive session outlives nothing: when the session
-    # is disconnected, or the short-lived process that started the daemon exits, the
-    # handle stops resolving and PowerShell throws on anything reaching console plumbing.
-    # The first thing to hit it was this very feature - launching into an isolate
-    # workspace - and the message named git rather than the console. Seen on two
-    # machines, one running an unmodified release.
+    Write-Host '--- daemon launch warnings survive a poisoned console ---'
+    # CreateNoWindow avoids flashing a daemon console, but does not make a console
+    # app truly detached. A long-running daemon can still reach PowerShell's console
+    # plumbing after attach/detach work and see "The handle is invalid."
     $supervisorAst = [Management.Automation.Language.Parser]::ParseFile(
         (Join-Path $PSScriptRoot '..\hooks\agent-bridge-supervisor.ps1'), [ref]$null, [ref]$null)
     $supervisorAssignments = @($supervisorAst.FindAll({
         param($node) $node -is [Management.Automation.Language.AssignmentStatementAst]
     }, $true) | ForEach-Object { $_.Extent.Text })
 
-    Test-That 'the supervisor starts the daemon with CreateNoWindow' {
+    Test-That 'the supervisor suppresses a daemon console window with CreateNoWindow' {
         @($supervisorAssignments | Where-Object { $_ -match '\$start\.CreateNoWindow\s*=\s*\$true' }).Count -eq 1
     }
     Test-That 'and not WindowStyle, which is ignored when UseShellExecute is false' {
@@ -322,6 +319,89 @@ try {
         -not $consoleRefusal.Isolated -and
             $consoleRefusal.Detail -like '*lost its console handle*' -and
             $consoleRefusal.Detail -like '*agent-ha-bridge restart*'
+    }
+
+    if ($script:BridgeIsWindows) {
+        $consoleDir = Join-Path $sandbox 'invalid-console'
+        [void][System.IO.Directory]::CreateDirectory($consoleDir)
+        $consoleScript = Join-Path $consoleDir 'invalid-console.ps1'
+        $consoleResult = Join-Path $consoleDir 'result.txt'
+        $sessionLaunchPath = (Resolve-Path (Join-Path $PSScriptRoot '..\hooks\session-launch.ps1')).Path
+        $commonPath = (Resolve-Path (Join-Path $PSScriptRoot '..\hooks\decision-bridge-common.ps1')).Path
+
+@"
+Set-StrictMode -Version Latest
+`$ErrorActionPreference = 'Stop'
+. '$($commonPath -replace "'", "''")'
+. '$($sessionLaunchPath -replace "'", "''")'
+
+function Get-Process {
+    [CmdletBinding()]
+    [OutputType([System.Diagnostics.Process], [object[]])]
+    param([string[]]`$Name = @(), [int[]]`$Id = @())
+    `$own = Microsoft.PowerShell.Management\Get-Process -Id `$PID
+    if (`$Id.Count -and `$PID -notin `$Id) { return @() }
+    if (`$Name.Count -and @(`$Name | Where-Object { `$own.ProcessName -like `$_ }).Count -eq 0) { return @() }
+    `$own
+}
+
+`$repo = '$($repo -replace "'", "''")'
+`$worktreeRoot = '$((Join-Path $consoleDir 'wt') -replace "'", "''")'
+`$script:DecisionBridgeConfig.SessionStateRoot = '$((Join-Path $consoleDir 'sessions') -replace "'", "''")'
+`$script:TestSettings = @{
+    'newSession.worktreeRoot'       = `$worktreeRoot
+    'newSession.worktreeLimit'      = 10
+    'newSession.worktreeIdleHours'  = 0
+    'newSession.discoverWorkspaces' = `$false
+    'newSession.workspaces'         = @()
+}
+function Get-BridgeSetting {
+    param([Parameter(Mandatory)][string]`$Path, `$Default = `$null)
+    if (`$script:TestSettings.ContainsKey(`$Path)) { return `$script:TestSettings[`$Path] }
+    `$Default
+}
+function Get-BridgeDiscoveredWorkspaces { @() }
+
+`$victim = `$null
+try {
+    `$seed = New-BridgeSessionWorktree -RepositoryPath `$repo
+    if (-not `$seed.Isolated) { throw "seed failed: `$(`$seed.Detail)" }
+    [System.IO.File]::WriteAllText((Get-BridgeWorktreeMarkerPath -Path `$seed.Path), 'not-a-date')
+    `$normal = New-BridgeSessionWorktree -RepositoryPath `$repo
+
+    Add-Type -Namespace BridgeInvalidConsoleTest -Name ConsoleApi -MemberDefinition @'
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError=true)]
+public static extern bool AttachConsole(uint dwProcessId);
+[System.Runtime.InteropServices.DllImport("kernel32.dll", SetLastError=true)]
+public static extern bool FreeConsole();
+'@
+    `$victim = Start-Process -FilePath 'cmd.exe' -ArgumentList '/c', 'timeout /t 30 /nobreak' -WindowStyle Hidden -PassThru
+    Start-Sleep -Milliseconds 800
+    [void][BridgeInvalidConsoleTest.ConsoleApi]::FreeConsole()
+    [void][BridgeInvalidConsoleTest.ConsoleApi]::AttachConsole([uint32]`$victim.Id)
+    [void][BridgeInvalidConsoleTest.ConsoleApi]::FreeConsole()
+
+    `$invalid = New-BridgeSessionWorktree -RepositoryPath `$repo
+    try { Stop-Process -Id `$victim.Id -Force -ErrorAction SilentlyContinue } catch { }
+    [System.IO.File]::WriteAllText('$($consoleResult -replace "'", "''")', "normal=`$(`$normal.Isolated)`ninvalid=`$(`$invalid.Isolated)`ndetail=`$(`$invalid.Detail)`n")
+}
+catch {
+    [System.IO.File]::WriteAllText('$($consoleResult -replace "'", "''")', "error=`$(`$_.Exception.Message)`n")
+    exit 1
+}
+finally {
+    try { if (`$victim) { Stop-Process -Id `$victim.Id -Force -ErrorAction SilentlyContinue } } catch { }
+}
+"@ | Set-Content -LiteralPath $consoleScript -Encoding UTF8
+
+        $consoleChild = Start-Process -FilePath 'pwsh' -WindowStyle Hidden -PassThru -ArgumentList @(
+            '-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-File', $consoleScript
+        )
+        [void]$consoleChild.WaitForExit(120000)
+        $consoleOutcome = if (Test-Path -LiteralPath $consoleResult) { Get-Content -LiteralPath $consoleResult -Raw } else { 'NO RESULT' }
+        Test-That 'a cleanup warning under a poisoned Windows console still permits isolation' {
+            $consoleOutcome -match 'normal=True' -and $consoleOutcome -match 'invalid=True'
+        } $consoleOutcome
     }
 }
 finally {
