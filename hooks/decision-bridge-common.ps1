@@ -2562,6 +2562,69 @@ function Get-DecisionFieldOptionValue {
     return ,$values[$found]
 }
 
+function Read-BridgeTranscriptStream {
+    <#
+        Frames a bounded append from a caller-owned stream. SnapshotLength is captured
+        from that opened handle before the wrapper applies its own shrink policy;
+        neither a growing file nor positive short reads extend that byte budget.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowNull()][IO.Stream]$Stream,
+        [Parameter(Mandatory)][long]$Offset,
+        [Parameter(Mandatory)][long]$SnapshotLength,
+        [Parameter(Mandatory)][int]$MaxTailBytes
+    )
+
+    if ($null -eq $Stream) { throw [ArgumentNullException]::new('Stream') }
+    if (-not $Stream.CanRead -or -not $Stream.CanSeek) {
+        throw [ArgumentException]::new('The transcript stream must be readable and seekable.', 'Stream')
+    }
+    if ($Offset -lt 0) { throw [ArgumentOutOfRangeException]::new('Offset') }
+    if ($SnapshotLength -lt $Offset) { throw [ArgumentOutOfRangeException]::new('SnapshotLength') }
+    if ($MaxTailBytes -le 0) { throw [ArgumentOutOfRangeException]::new('MaxTailBytes') }
+
+    $result = [pscustomobject]@{ Lines = @(); Offset = $Offset }
+    if ($Offset -eq $SnapshotLength) { return $result }
+
+    $start = [Math]::Max($Offset, $SnapshotLength - [long]$MaxTailBytes)
+    $aligned = $start -eq 0
+    if ($start -gt 0) {
+        # An adopted EOF or a capped start can bisect a record even when the next
+        # visible character is '{'. One look-behind byte establishes the boundary.
+        [void]$Stream.Seek($start - 1, [IO.SeekOrigin]::Begin)
+        $before = $Stream.ReadByte()
+        if ($before -lt 0) { return $result }
+        $aligned = $before -eq 10
+    }
+
+    [void]$Stream.Seek($start, [IO.SeekOrigin]::Begin)
+    $buffer = [byte[]]::new([int]($SnapshotLength - $start))
+    $read = 0
+    while ($read -lt $buffer.Length) {
+        $count = $Stream.Read($buffer, $read, $buffer.Length - $read)
+        if ($count -eq 0) { break }
+        $read += $count
+    }
+
+    $lines = [Collections.Generic.List[string]]::new()
+    $lineStart = 0
+    while ($lineStart -lt $read) {
+        $lineEnd = [Array]::IndexOf($buffer, [byte]10, $lineStart, $read - $lineStart)
+        if ($lineEnd -lt 0) { break }
+        if ($aligned) {
+            # A split UTF-8 sequence becomes replacement text when decoded early.
+            # Re-encoding that text corrupted the cursor for half-written answers.
+            $lines.Add([Text.Encoding]::UTF8.GetString($buffer, $lineStart, $lineEnd - $lineStart))
+        }
+        else { $aligned = $true }
+        $lineStart = $lineEnd + 1
+        $result.Offset = $start + [long]$lineStart
+    }
+    # With no LF, even a skipped window start is not a committed record boundary.
+    $result.Lines = @($lines)
+    $result
+}
+
 function Get-CopilotTranscriptTailLines {
     <#
         `Get-Content -Tail` walks a transcript backwards line by line and takes over
