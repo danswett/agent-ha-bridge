@@ -60,9 +60,171 @@ try {
         }
     }
 
+    function Get-OwnerRightsSetupIdentityFacts {
+        param(
+            [AllowNull()][Security.Principal.SecurityIdentifier]$Identity,
+            [AllowNull()][Security.Principal.SecurityIdentifier]$FileOwner,
+            [AllowNull()][Security.Principal.SecurityIdentifier]$CurrentUser,
+            [AllowNull()][Security.Principal.SecurityIdentifier]$TokenDefaultOwner
+        )
+        [pscustomobject]@{
+            Available = $null -ne $Identity
+            EqualsFileOwner = $(if ($null -ne $Identity -and $null -ne $FileOwner) { $Identity.Equals($FileOwner) } else { $null })
+            EqualsCurrentUser = $(if ($null -ne $Identity -and $null -ne $CurrentUser) { $Identity.Equals($CurrentUser) } else { $null })
+            EqualsTokenDefaultOwner = $(if ($null -ne $Identity -and $null -ne $TokenDefaultOwner) { $Identity.Equals($TokenDefaultOwner) } else { $null })
+            IsBuiltinAdministrators = $(if ($null -ne $Identity) { $Identity.IsWellKnown([Security.Principal.WellKnownSidType]::BuiltinAdministratorsSid) } else { $null })
+            IsLocalSystem = $(if ($null -ne $Identity) { $Identity.IsWellKnown([Security.Principal.WellKnownSidType]::LocalSystemSid) } else { $null })
+        }
+    }
+
+    function Add-OwnerRightsSetupReadError {
+        param(
+            [string]$Stage,
+            [Management.Automation.ErrorRecord]$ErrorRecord,
+            [AllowEmptyCollection()][Collections.Generic.List[object]]$Errors
+        )
+        Assert-OwnerRightsErrorNotGuard -ErrorRecord $ErrorRecord
+        $cause = $ErrorRecord.Exception.GetBaseException()
+        $Errors.Add([pscustomobject]@{
+            Stage = $Stage; ExceptionType = $ErrorRecord.Exception.GetType().FullName
+            HResult = $ErrorRecord.Exception.HResult
+            CauseType = $cause.GetType().FullName; CauseHResult = $cause.HResult
+        })
+    }
+
+    function Write-OwnerRightsSetupDiagnostic {
+        param([string]$Path, [bool]$GuardOwnerMatchesCurrentUser)
+        Assert-BridgeTestPath -Path $Path
+        $availability = [ordered]@{
+            Item = 'not-attempted'; SecurityDescriptor = 'not-attempted'; FileOwner = 'not-attempted'
+            CurrentToken = 'not-attempted'; CurrentUser = 'not-attempted'; TokenDefaultOwner = 'not-attempted'
+            Dacl = 'not-attempted'
+        }
+        $errors = [Collections.Generic.List[object]]::new()
+        $item = $null; $descriptor = $null; $fileOwner = $null
+        $tokenIdentity = $null; $currentUser = $null; $tokenDefaultOwner = $null
+        $accessRulesProtected = $null; $accessRulesCanonical = $null; $ruleCount = $null
+        $rules = @()
+        try {
+            $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+            $availability.Item = 'available'
+        }
+        catch {
+            $readError = $_
+            $availability.Item = 'error'
+            Add-OwnerRightsSetupReadError -Stage 'item' -ErrorRecord $readError -Errors $errors
+        }
+        if ($null -ne $item) {
+            try {
+                $descriptor = [IO.FileSystemAclExtensions]::GetAccessControl(
+                    $item, [Security.AccessControl.AccessControlSections]'Access, Owner')
+                $availability.SecurityDescriptor = 'available'
+            }
+            catch {
+                $readError = $_
+                $availability.SecurityDescriptor = 'error'
+                Add-OwnerRightsSetupReadError -Stage 'security-descriptor' -ErrorRecord $readError -Errors $errors
+            }
+        }
+        if ($null -ne $descriptor) {
+            try {
+                $fileOwner = $descriptor.GetOwner([Security.Principal.SecurityIdentifier])
+                $availability.FileOwner = if ($null -ne $fileOwner) { 'available' } else { 'unavailable' }
+            }
+            catch {
+                $readError = $_
+                $availability.FileOwner = 'error'
+                Add-OwnerRightsSetupReadError -Stage 'file-owner' -ErrorRecord $readError -Errors $errors
+            }
+            try {
+                $rules = @($descriptor.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+                $accessRulesProtected = $descriptor.AreAccessRulesProtected
+                $accessRulesCanonical = $descriptor.AreAccessRulesCanonical
+                $ruleCount = $rules.Count
+                $availability.Dacl = 'available'
+            }
+            catch {
+                $readError = $_
+                $availability.Dacl = 'error'
+                Add-OwnerRightsSetupReadError -Stage 'dacl' -ErrorRecord $readError -Errors $errors
+            }
+        }
+        try {
+            try {
+                $tokenIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+                $availability.CurrentToken = if ($null -ne $tokenIdentity) { 'available' } else { 'unavailable' }
+            }
+            catch {
+                $readError = $_
+                $availability.CurrentToken = 'error'
+                Add-OwnerRightsSetupReadError -Stage 'current-token' -ErrorRecord $readError -Errors $errors
+            }
+            if ($null -ne $tokenIdentity) {
+                try {
+                    $currentUser = $tokenIdentity.User
+                    $availability.CurrentUser = if ($null -ne $currentUser) { 'available' } else { 'unavailable' }
+                }
+                catch {
+                    $readError = $_
+                    $availability.CurrentUser = 'error'
+                    Add-OwnerRightsSetupReadError -Stage 'current-user' -ErrorRecord $readError -Errors $errors
+                }
+                try {
+                    $tokenDefaultOwner = $tokenIdentity.Owner
+                    $availability.TokenDefaultOwner = if ($null -ne $tokenDefaultOwner) { 'available' } else { 'unavailable' }
+                }
+                catch {
+                    $readError = $_
+                    $availability.TokenDefaultOwner = 'error'
+                    Add-OwnerRightsSetupReadError -Stage 'token-default-owner' -ErrorRecord $readError -Errors $errors
+                }
+            }
+        }
+        finally {
+            if ($null -ne $tokenIdentity) {
+                try { $tokenIdentity.Dispose() }
+                catch {
+                    $readError = $_
+                    Add-OwnerRightsSetupReadError -Stage 'token-dispose' -ErrorRecord $readError -Errors $errors
+                }
+            }
+        }
+        $comparisons = @{ FileOwner = $fileOwner; CurrentUser = $currentUser; TokenDefaultOwner = $tokenDefaultOwner }
+        $ruleMetadata = @()
+        if ($availability.Dacl -ceq 'available') {
+            $ruleMetadata = @(foreach ($rule in $rules) {
+                [pscustomobject]@{
+                    AccessControlType = [string]$rule.AccessControlType; RightsMask = [long]$rule.FileSystemRights
+                    IsInherited = [bool]$rule.IsInherited
+                    InheritanceFlags = [string]$rule.InheritanceFlags; PropagationFlags = [string]$rule.PropagationFlags
+                    Identity = Get-OwnerRightsSetupIdentityFacts -Identity $rule.IdentityReference @comparisons
+                }
+            })
+        }
+        # Keep identities and error text out of logs; the original guard still
+        # decides whether setup may proceed, even if an optional read is unavailable.
+        $observation = [pscustomobject]@{
+            SchemaVersion = 1; Phase = 'before-current-user-owner-precondition'
+            TargetLeaf = [IO.Path]::GetFileName($Path)
+            IsDirectory = $(if ($null -ne $item) { [bool]$item.PSIsContainer } else { $null })
+            GuardOwnerMatchesCurrentUser = $GuardOwnerMatchesCurrentUser
+            ReadAvailability = [pscustomobject]$availability
+            FileOwner = Get-OwnerRightsSetupIdentityFacts -Identity $fileOwner @comparisons
+            CurrentUser = Get-OwnerRightsSetupIdentityFacts -Identity $currentUser @comparisons
+            TokenDefaultOwner = Get-OwnerRightsSetupIdentityFacts -Identity $tokenDefaultOwner @comparisons
+            Dacl = [pscustomobject]@{
+                AccessRulesProtected = $accessRulesProtected; AccessRulesCanonical = $accessRulesCanonical
+                RuleCount = $ruleCount; Rules = $ruleMetadata
+            }
+            ReadErrors = @($errors.ToArray())
+        }
+        Write-Host ('OWNER_RIGHTS_SETUP_DIAGNOSTIC ' + ($observation | ConvertTo-Json -Depth 7 -Compress))
+    }
+
     function Set-OwnerRightsFixtureModifyDacl {
         param([string]$Path)
         $before = Get-OwnerRightsFixtureState -Path $Path
+        Write-OwnerRightsSetupDiagnostic -Path $Path -GuardOwnerMatchesCurrentUser $before.OwnerMatchesCurrentUser
         if (-not $before.OwnerMatchesCurrentUser) {
             throw 'OWNER_RIGHTS_FIXTURE_UNESTABLISHED: the synthetic target is not already current-user-owned; no ownership change was attempted.'
         }
