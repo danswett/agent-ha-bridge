@@ -61,17 +61,22 @@ $status = Get-BridgeUpdateStatus -Force
 
 Write-Host "    repository : $(Get-BridgeUpdateRepository)"
 Write-Host "    installed  : $($status.Installed)"
-Write-Host "    latest     : $($status.Latest)"
+Write-Host "    latest     : $(if ($status.Latest) { $status.Latest } else { 'not established' })"
 
-if (-not $status.Available -and -not $Force) {
-    if ($status.Installed -eq $status.Latest) {
-        Write-Host '    already up to date' -ForegroundColor Green
-    }
-    else {
-        # Also covers a repository with no releases yet, where latest falls back to
-        # the installed version.
-        Write-Host '    nothing newer published' -ForegroundColor Green
-    }
+if (-not $status.PSObject.Properties['State']) {
+    Write-Host '    this older update helper cannot establish lookup status; nothing will be installed' -ForegroundColor Red
+    exit 1
+}
+if ($status.State -in @('Unavailable', 'NotFound')) {
+    Write-Host "    $($status.Detail)" -ForegroundColor Yellow
+    exit 1
+}
+if ($Check) {
+    Write-Host "    $($status.State); check only, nothing installed."
+    return
+}
+if ($status.State -eq 'Current' -and -not $Force) {
+    Write-Host '    no newer release found; nothing installed' -ForegroundColor Green
     return
 }
 
@@ -92,16 +97,15 @@ if (-not $Yes) {
     }
 }
 
-if ($Check) {
-    Write-Host 'Check only; nothing installed.'
-    return
-}
-
 Write-Host '==> Installing' -ForegroundColor Cyan
 # Not detached: run in the foreground so the outcome is visible. The daemon uses the
 # detached path instead, because the installer restarts the task it runs under.
-$result = Invoke-BridgeSelfUpdate -InstallRoot $updateContext.BridgeHome -TargetHome $(if ($updateContext.Isolated) { $updateContext.Home } else { '' })
+$result = Invoke-BridgeSelfUpdate -Force:$Force -InstallRoot $updateContext.BridgeHome -TargetHome $(if ($updateContext.Isolated) { $updateContext.Home } else { '' })
 Write-Host "    $($result.Detail)"
+if ($result.State -eq 'Current') { return }
 Write-Host ''
 Write-Host "Log: $(Get-BridgeRuntimePath -Name 'agent-bridge-update.log' -Context $updateContext)"
+if ($result.Success -isnot [bool] -or -not $result.Success -or $result.State -ne 'Completed') {
+    exit 1
+}
 Write-Host 'Restart any running Copilot or Claude sessions to pick up the new hooks.' -ForegroundColor Yellow

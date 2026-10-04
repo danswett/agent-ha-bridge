@@ -58,6 +58,8 @@
         'tests\test-transcript-cache.ps1'
         'tests\test-turn-end.ps1'
         'tests\test-update.ps1'
+        'tests\test-update-cli.ps1'
+        'tests\test-update-intake.ps1'
         'tests\test-update-outcome.ps1'
         'tests\test-verbose-toggle.ps1'
         'tests\test-worktree-isolation.ps1'
