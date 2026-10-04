@@ -56,6 +56,7 @@
         'tests\test-stop-session.ps1'
         'tests\test-terminal-window.ps1'
         'tests\test-transcript-cache.ps1'
+        'tests\test-transcript-framing.ps1'
         'tests\test-turn-end.ps1'
         'tests\test-update.ps1'
         'tests\test-update-cli.ps1'

@@ -291,8 +291,8 @@ function Read-ClaudeTranscriptAppend {
         Reads the bytes appended since the last offset.
 
         Mirrors the daemon's reader: a capped tail so a session that produced a huge
-        burst cannot stall the loop, and a reset when the file shrinks, which means it
-        was rotated or rewritten.
+        burst cannot stall the loop, and a reset when the file shrinks. Length alone
+        cannot identify a same-size replacement or a file that shrank and regrew.
     #>
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -301,42 +301,22 @@ function Read-ClaudeTranscriptAppend {
     )
 
     if (-not (Test-Path -LiteralPath $Path)) {
-        return [pscustomobject]@{ Lines = @(); Offset = 0 }
+        return [pscustomobject]@{ Lines = @(); Offset = [long]0 }
     }
-
-    $length = (Get-Item -LiteralPath $Path).Length
-    if ($length -lt $Offset) { $Offset = 0 }
-    if ($length -eq $Offset) {
-        return [pscustomobject]@{ Lines = @(); Offset = $Offset }
-    }
-
-    $start = $Offset
-    if (($length - $start) -gt $MaxTailBytes) { $start = $length - $MaxTailBytes }
 
     $stream = [IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
     try {
-        [void]$stream.Seek($start, 'Begin')
-        $buffer = New-Object byte[] ($length - $start)
-        $read = $stream.Read($buffer, 0, $buffer.Length)
-        $text = [Text.Encoding]::UTF8.GetString($buffer, 0, $read)
+        $length = $stream.Length
+        if ($length -lt $Offset) { $Offset = 0 }
+        $append = Read-BridgeTranscriptStream -Stream $stream -Offset $Offset `
+            -SnapshotLength $length -MaxTailBytes $MaxTailBytes
     }
     finally {
         $stream.Dispose()
     }
 
-    # A trailing partial line is left for the next pass by rewinding the offset, so a
-    # line is never parsed half-written.
-    $lines = $text -split "`n"
-    $trailing = 0
-    if (-not $text.EndsWith("`n") -and $lines.Count -gt 0) {
-        $trailing = [Text.Encoding]::UTF8.GetByteCount($lines[-1])
-        # When the batch is nothing but a partial line there is no complete line to
-        # return; slicing would otherwise hand back the fragment itself.
-        $lines = if ($lines.Count -ge 2) { $lines[0..($lines.Count - 2)] } else { @() }
-    }
-
     [pscustomobject]@{
-        Lines  = @($lines | Where-Object { $_.Trim() })
-        Offset = $length - $trailing
+        Lines  = @($append.Lines | Where-Object { $_.Trim() })
+        Offset = $append.Offset
     }
 }

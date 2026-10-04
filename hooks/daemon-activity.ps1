@@ -196,44 +196,23 @@ function Read-TranscriptAppend {
             $result.Offset = $length
             return $result
         }
-        if ($length -eq $Offset) { return $result }
-
-        $start = $Offset
-        if (($length - $start) -gt $script:DaemonConfig.MaxTailBytes) {
-            $start = $length - $script:DaemonConfig.MaxTailBytes
-        }
-
-        [void]$stream.Seek($start, [IO.SeekOrigin]::Begin)
-        $buffer = New-Object byte[] ($length - $start)
-        $read = $stream.Read($buffer, 0, $buffer.Length)
-        $text = [Text.Encoding]::UTF8.GetString($buffer, 0, $read)
-
-        # A line still being written is withheld, and the offset is rewound by its
-        # length so it is read again once it is complete.
-        #
-        # Without this the offset moved past a half-written line, ConvertFrom-Json
-        # threw on it, and the throw was swallowed - so that message never reached
-        # the card at all. It hit the turn's final answer most of all: that is the
-        # largest thing written, the fast lane reads every 100 ms, and the write is
-        # the last of the turn, so nothing afterwards ever corrected it. The card
-        # then sat on the previous message while the status said idle.
-        #
-        # Codex's own reader has always done this; this is the shared reader Copilot
-        # uses, and Claude falls back to.
-        $lines = $text -split "`n"
-        $trailing = 0
-        if (-not $text.EndsWith("`n") -and $lines.Count -gt 0) {
-            $trailing = [Text.Encoding]::UTF8.GetByteCount($lines[-1])
-            $lines = if ($lines.Count -ge 2) { $lines[0..($lines.Count - 2)] } else { @() }
-        }
-
-        # From what was actually read, not $length: a short read must not skip bytes.
-        $result.Offset = $start + $read - $trailing
-        # StartsWith('{') also drops a partial *leading* line, which MaxTailBytes can
-        # cut into when a session has written more than the tail in one go.
-        $result.Lines = @($lines | Where-Object { $_.Trim().StartsWith('{') })
+        # Half-written final answers used to be parsed, dropped, and never retried.
+        # The shared framer withholds them using byte boundaries, not decoded lengths.
+        $append = Read-BridgeTranscriptStream -Stream $stream -Offset $Offset `
+            -SnapshotLength $length -MaxTailBytes $script:DaemonConfig.MaxTailBytes
+        $result.Lines = @($append.Lines | Where-Object { $_.Trim().StartsWith('{') })
+        $result.Offset = $append.Offset
     }
     catch {
+        $failure = $_.Exception
+        while ($true) {
+            if ($failure.Data['BridgeTestWriteBlocked'] -or $failure.Data['BridgeTestNetworkBlocked']) { throw }
+            if ($null -eq $failure.InnerException) { break }
+            $failure = $failure.InnerException
+        }
+        if ($failure -isnot [IO.IOException] -and $failure -isnot [UnauthorizedAccessException] -and
+            $failure -isnot [System.Security.SecurityException]) { throw }
+        Write-DaemonLog -Message "transcript read failed for '$Path': $($failure.Message)"
         return $result
     }
     finally {

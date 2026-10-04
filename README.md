@@ -83,6 +83,14 @@ each fill the same three roles — intercept a prompt, stream activity, deliver 
   paired with its matching `tool.execution_complete` is the authoritative "answered"
   signal, whichever input produced it — so the two paths can't collide.
 
+Activity tails find complete LF-delimited records in bytes before UTF-8 decoding;
+unfinished records, including split characters or CRLF, wait for the next read.
+Each read has a fixed bounded window plus at most one look-behind byte. A partial
+leading record is skipped, so capped or oversized records are not lossless replay.
+Complete records retain normal UTF-8 replacement decoding. Cursors track byte
+positions, not file identity: same-size/larger replacement or truncation followed
+by regrowth can go undetected. Existing shrink and session-adoption policies remain.
+
 **The hooks are fast.** An agent waits for every hook, and starting PowerShell alone
 takes a quarter of a second, so each hook is a small native program,
 `agent-bridge-hook`, that hands the event to the daemon and returns in tens of

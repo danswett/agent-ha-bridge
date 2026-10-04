@@ -191,36 +191,22 @@ function Read-CodexTranscriptAppend {
     )
 
     if ([string]::IsNullOrWhiteSpace($Path) -or -not (Test-Path -LiteralPath $Path)) {
-        return [pscustomobject]@{ Lines = @(); Offset = 0 }
+        return [pscustomobject]@{ Lines = @(); Offset = [long]0 }
     }
-
-    $length = (Get-Item -LiteralPath $Path).Length
-    if ($length -lt $Offset) { $Offset = 0 }
-    if ($length -eq $Offset) { return [pscustomobject]@{ Lines = @(); Offset = $Offset } }
-
-    $start = $Offset
-    if (($length - $start) -gt $MaxTailBytes) { $start = $length - $MaxTailBytes }
 
     $stream = [IO.File]::Open($Path, 'Open', 'Read', 'ReadWrite')
     try {
-        [void]$stream.Seek($start, 'Begin')
-        $buffer = New-Object byte[] ($length - $start)
-        $read = $stream.Read($buffer, 0, $buffer.Length)
-        $text = [Text.Encoding]::UTF8.GetString($buffer, 0, $read)
+        $length = $stream.Length
+        if ($length -lt $Offset) { $Offset = 0 }
+        $append = Read-BridgeTranscriptStream -Stream $stream -Offset $Offset `
+            -SnapshotLength $length -MaxTailBytes $MaxTailBytes
     }
     finally {
         $stream.Dispose()
     }
 
-    $lines = $text -split "`n"
-    $trailing = 0
-    if (-not $text.EndsWith("`n") -and $lines.Count -gt 0) {
-        $trailing = [Text.Encoding]::UTF8.GetByteCount($lines[-1])
-        $lines = if ($lines.Count -ge 2) { $lines[0..($lines.Count - 2)] } else { @() }
-    }
-
     [pscustomobject]@{
-        Lines  = @($lines | Where-Object { $_.Trim() })
-        Offset = $length - $trailing
+        Lines  = @($append.Lines | Where-Object { $_.Trim() })
+        Offset = $append.Offset
     }
 }
