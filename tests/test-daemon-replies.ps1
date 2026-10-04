@@ -101,6 +101,7 @@ Write-Host '--- a file attachment that is not an image ---'
 # arrives as bytes inside the payload and is written out here instead.
 $script:AttachRoot = Join-Path ([IO.Path]::GetTempPath()) "test-daemon-attach-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
 New-Item -ItemType Directory -Path $script:AttachRoot -Force | Out-Null
+if (-not (Protect-BridgeSecretFile -Path $script:AttachRoot)) { throw 'Could not protect the unit fixture directory.' }
 function Get-BridgeAttachmentRoot { $script:AttachRoot }
 
 $plan = "# plan`nchoose B"
@@ -184,12 +185,18 @@ Remove-Item -LiteralPath $script:AttachRoot -Recurse -Force -ErrorAction Silentl
 Write-Host '--- a payload from the reply card ---'
 $script:Replies = @(); $script:Removed = @(); $script:Saved = @(); $script:Wrote = @()
 $script:DeliverResult = $true
+$script:FailedImage = ''
 function Invoke-DaemonReply { param($SessionId, $Text, $Headers, $DisplayText, [switch]$ClearReplyBox)
     $script:Replies += [pscustomobject]@{ Text = $Text; StampAtDelivery = $state[$sid].LastReplyPayloadAt }
     # The real one writes to the card on its way through, so it emits before returning.
     'emitted'
     $script:DeliverResult }
-function Save-BridgeReplyAttachment { param($ImageId, $Name, $Headers) $script:Saved += $ImageId; "C:\att\$ImageId.png" }
+function Save-BridgeReplyAttachment {
+    param($ImageId, $Name, $Headers)
+    $script:Saved += $ImageId
+    if ($ImageId -eq $script:FailedImage) { return '' }
+    "C:\att\$ImageId.png"
+}
 function Save-BridgeReplyFile { param($Name, $Base64, $MaxBytes) $script:Wrote += $Name; "C:\att\$Name" }
 function Remove-BridgeHomeAssistantImage { param($ImageId) $script:Removed += $ImageId; 'emitted' }
 function Remove-BridgeStaleAttachment { 'emitted' }
@@ -228,6 +235,28 @@ Test-That 'a payload carrying a file delivers it as an attachment too' {
 Test-That 'the file is written out rather than fetched from Home Assistant' {
     ($script:Wrote -join ',') -eq 'plan.md' -and $script:Removed.Count -eq 0
 }
+
+$script:Replies = @(); $script:Removed = @(); $script:FailedImage = 'missing'
+Set-Payload -Stamp 't3' -Text 'do not send only this text' -Images @('kept', 'missing')
+$handled = Send-DaemonCardPayload -SessionId $sid -Entry $entry -Headers $headers
+Test-That 'one failed attachment refuses the whole submission without deleting the staged image source' {
+    $handled -eq $true -and $script:Replies.Count -eq 0 -and $script:Removed.Count -eq 0 -and
+        $entry.LastReplyPayloadAt -eq 't3' -and -not $entry.DriverPending
+}
+Test-That 'the failed submission remains consumed instead of being retried automatically' {
+    (Send-DaemonCardPayload -SessionId $sid -Entry $entry -Headers $headers) -eq $false -and
+        $script:Replies.Count -eq 0 -and $script:Removed.Count -eq 0
+}
+$script:FailedImage = ''
+$script:DeliverResult = $false
+Set-Payload -Stamp 't4' -Text 'transport refuses this' -Images @('retained')
+$lastDelivered = $entry.LastPayloadDeliveredAt
+[void](Send-DaemonCardPayload -SessionId $sid -Entry $entry -Headers $headers)
+Test-That 'a false transport result keeps its source image and prior success stamp' {
+    $script:Replies.Count -eq 1 -and $script:Removed.Count -eq 0 -and
+        $entry.LastPayloadDeliveredAt -eq $lastDelivered -and -not $entry.DriverPending
+}
+$script:DeliverResult = $true
 
 $script:Ha = @{}
 Test-That 'no payload sensor leaves the text box to do its job' { (Send-DaemonCardPayload -SessionId $sid -Entry $entry -Headers $headers) -eq $false }

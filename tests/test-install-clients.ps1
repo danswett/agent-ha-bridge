@@ -804,9 +804,11 @@ function Get-BridgeUpdateStatus {
     $savedAttachmentPlatform = $script:BridgeIsWindows
     try {
         $script:BridgeInstallContext = Resolve-BridgeInstallContext -TargetHome (Join-Path $isolationRoot 'home with spaces')
-        $script:BridgeIsWindows = $false
-        Test-That 'macOS attachment isolation preserves the existing space-free TEMP fallback' {
-            $expected = Join-Path (Join-Path $env:TEMP 'agent-ha-bridge-attachments') "install-$($script:BridgeInstallContext.Id)"
+        Test-That 'a spaced installation keeps its canonical private attachment path without a TEMP fallback' {
+            $parent = if ($script:BridgeIsWindows) {
+                Join-Path $script:BridgeInstallContext.LocalAppData 'agent-ha-bridge\attachments'
+            } else { Join-Path $script:BridgeInstallContext.BridgeHome 'attachments' }
+            $expected = Join-Path $parent "install-$($script:BridgeInstallContext.Id)"
             (Get-BridgeAttachmentRoot -NoCreate) -eq $expected
         }
     }
