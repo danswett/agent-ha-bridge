@@ -221,12 +221,255 @@ try {
         Write-Host ('OWNER_RIGHTS_SETUP_DIAGNOSTIC ' + ($observation | ConvertTo-Json -Depth 7 -Compress))
     }
 
-    function Set-OwnerRightsFixtureModifyDacl {
+    function Get-OwnerRightsDaclFingerprint {
         param([string]$Path)
+        Assert-BridgeTestPath -Path $Path
+        $access = [IO.FileSystemAclExtensions]::GetAccessControl(
+            (Get-Item -LiteralPath $Path -Force -ErrorAction Stop), [Security.AccessControl.AccessControlSections]::Access)
+        $raw = [Security.AccessControl.RawSecurityDescriptor]::new($access.GetSecurityDescriptorBinaryForm(), 0)
+        if ($null -eq $raw.DiscretionaryAcl) { throw 'OWNER_RIGHTS_FIXTURE_UNESTABLISHED: the fixture has no readable DACL.' }
+        $bytes = [byte[]]::new($raw.DiscretionaryAcl.BinaryLength)
+        $raw.DiscretionaryAcl.GetBinaryForm($bytes, 0)
+        [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
+    }
+
+    function Get-OwnerRightsByteEvidence {
+        param([string[]]$Paths = @())
+        foreach ($path in @($Paths | Select-Object -Unique)) {
+            Assert-BridgeTestPath -Path $path
+            if (-not (Test-Path -LiteralPath $path -PathType Leaf)) {
+                throw 'OWNER_RIGHTS_FIXTURE_UNESTABLISHED: a byte-preservation witness is missing.'
+            }
+            $bytes = [IO.File]::ReadAllBytes($path)
+            [pscustomobject]@{
+                Leaf = [IO.Path]::GetFileName($path); Length = $bytes.Length
+                Sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes))
+            }
+        }
+    }
+
+    function Test-OwnerRightsEvidenceEqual {
+        param($Before, $After)
+        (ConvertTo-Json -InputObject $Before -Depth 8 -Compress) -ceq
+            (ConvertTo-Json -InputObject $After -Depth 8 -Compress)
+    }
+
+    function ConvertTo-OwnerRightsStateEvidence {
+        param($State)
+        [pscustomobject]@{
+            IsDirectory = $State.IsDirectory; OwnerMatchesCurrentUser = $State.OwnerMatchesCurrentUser
+            AccessRulesProtected = $State.AccessRulesProtected; RuleCount = $State.RuleCount
+            SingleCurrentUserAllow = $State.SingleCurrentUserAllow; Rights = $State.Rights
+            InheritanceMatches = $State.InheritanceMatches; RuleInherited = $State.RuleInherited
+            ExactModifyDacl = $State.ExactModifyDacl; ExactPrivateDacl = $State.ExactPrivateDacl
+        }
+    }
+
+    function Assert-OwnerRightsTokenProfile {
+        param([Security.Principal.SecurityIdentifier]$UserSid, [Security.Principal.SecurityIdentifier]$DefaultOwnerSid)
+        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+        try {
+            if ($null -eq $identity.User -or $null -eq $identity.Owner -or
+                -not $identity.User.Equals($UserSid) -or -not $identity.Owner.Equals($DefaultOwnerSid)) {
+                throw 'OWNER_RIGHTS_FIXTURE_UNESTABLISHED: the actual user/default-owner profile changed.'
+            }
+        }
+        finally { $identity.Dispose() }
+    }
+
+    function Get-OwnerRightsCreationProfile {
+        param(
+            [string]$Path, [Security.Principal.SecurityIdentifier]$UserSid,
+            [Security.Principal.SecurityIdentifier]$DefaultOwnerSid
+        )
+        Assert-BridgeTestPath -Path $Path
+        Assert-OwnerRightsTokenProfile -UserSid $UserSid -DefaultOwnerSid $DefaultOwnerSid
+        $descriptor = [IO.FileSystemAclExtensions]::GetAccessControl(
+            (Get-Item -LiteralPath $Path -Force -ErrorAction Stop), [Security.AccessControl.AccessControlSections]::Owner)
+        $owner = $descriptor.GetOwner([Security.Principal.SecurityIdentifier])
+        if ($null -eq $owner) { throw 'OWNER_RIGHTS_FIXTURE_UNESTABLISHED: the created object owner is unreadable.' }
+        [pscustomobject]@{
+            State = Get-OwnerRightsFixtureState -Path $Path
+            OwnerMatchesTokenDefaultOwner = $owner.Equals($DefaultOwnerSid)
+            TokenDefaultOwnerMatchesCurrentUser = $DefaultOwnerSid.Equals($UserSid)
+            Owner = Get-OwnerRightsSetupIdentityFacts -Identity $owner -FileOwner $owner -CurrentUser $UserSid -TokenDefaultOwner $DefaultOwnerSid
+            TokenDefaultOwner = Get-OwnerRightsSetupIdentityFacts -Identity $DefaultOwnerSid -FileOwner $owner -CurrentUser $UserSid -TokenDefaultOwner $DefaultOwnerSid
+        }
+    }
+
+    function New-OwnerRightsComparisonPath {
+        param([string]$Path, [switch]$Directory)
+        Assert-BridgeTestPath -Path $Path
+        if ((Test-Path -LiteralPath $Path) -or
+            -not (Test-Path -LiteralPath (Split-Path $Path -Parent) -PathType Container)) {
+            throw 'OWNER_RIGHTS_FIXTURE_UNESTABLISHED: a comparison path must be fresh under an existing fixture parent.'
+        }
+        if ($Directory) { [void][IO.Directory]::CreateDirectory($Path) }
+        else {
+            $empty = [IO.File]::Open($Path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            $empty.Dispose()
+        }
+        Assert-BridgeTestPath -Path $Path
+        if (-not $script:OwnerRightsFreshComparisonPaths.Add([IO.Path]::GetFullPath($Path))) {
+            throw 'OWNER_RIGHTS_FIXTURE_UNESTABLISHED: a comparison creation was registered twice.'
+        }
+    }
+
+    function Initialize-OwnerRightsComparisonOwner {
+        param(
+            [string]$Path, [string[]]$PreserveFiles = @(),
+            [Security.Principal.SecurityIdentifier]$UserSid, [Security.Principal.SecurityIdentifier]$DefaultOwnerSid
+        )
+        Assert-BridgeTestPath -Path $Path
+        if (-not $script:OwnerRightsFreshComparisonPaths.Remove([IO.Path]::GetFullPath($Path))) {
+            throw 'OWNER_RIGHTS_FIXTURE_UNESTABLISHED: ownership setup is limited to one fresh comparison creation.'
+        }
+        $before = Get-OwnerRightsCreationProfile -Path $Path -UserSid $UserSid -DefaultOwnerSid $DefaultOwnerSid
+        $accessBefore = Get-OwnerRightsDaclFingerprint -Path $Path
+        $bytePaths = @($PreserveFiles)
+        if (-not $before.State.IsDirectory) { $bytePaths += $Path }
+        $bytesBefore = @(Get-OwnerRightsByteEvidence -Paths $bytePaths)
+        $required = -not $before.State.OwnerMatchesCurrentUser
+        if ($required) {
+            $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+            $ownerOnly = [IO.FileSystemAclExtensions]::GetAccessControl($item, [Security.AccessControl.AccessControlSections]::Owner)
+            $ownerOnly.SetOwner($UserSid)
+            try {
+                [IO.FileSystemAclExtensions]::SetAccessControl($item, $ownerOnly)
+            }
+            catch {
+                $setupError = $_
+                Assert-OwnerRightsErrorNotGuard -ErrorRecord $setupError
+                $cause = $setupError.Exception.GetBaseException()
+                Write-Host ('OWNER_RIGHTS_OWNER_ESTABLISH ' + (@{
+                    leaf = [IO.Path]::GetFileName($Path); outcome = 'failed'; ownerWriteAttempted = $true
+                    beforeOwner = $before.Owner; errorType = $cause.GetType().FullName; hresult = $cause.HResult
+                } | ConvertTo-Json -Depth 5 -Compress))
+                throw 'OWNER_RIGHTS_FIXTURE_UNESTABLISHED: existing rights did not establish ownership of the fresh comparison.'
+            }
+        }
+        $after = Get-OwnerRightsCreationProfile -Path $Path -UserSid $UserSid -DefaultOwnerSid $DefaultOwnerSid
+        $accessUnchanged = $accessBefore -ceq (Get-OwnerRightsDaclFingerprint -Path $Path) -and
+            $before.State.AccessRulesProtected -eq $after.State.AccessRulesProtected
+        $bytesUnchanged = Test-OwnerRightsEvidenceEqual $bytesBefore @(Get-OwnerRightsByteEvidence -Paths $bytePaths)
+        Write-Host ('OWNER_RIGHTS_OWNER_ESTABLISH ' + (@{
+            leaf = [IO.Path]::GetFileName($Path); freshCreation = $true; ownerWriteAttempted = $required
+            outcome = $(if ($after.State.OwnerMatchesCurrentUser -and $accessUnchanged -and $bytesUnchanged) { 'established' } else { 'readback-failed' })
+            beforeOwner = $before.Owner; afterOwner = $after.Owner
+            before = ConvertTo-OwnerRightsStateEvidence $before.State
+            after = ConvertTo-OwnerRightsStateEvidence $after.State
+            daclUnchanged = $accessUnchanged; originalBytesPreserved = $bytesUnchanged
+        } | ConvertTo-Json -Depth 6 -Compress))
+        if (-not $after.State.OwnerMatchesCurrentUser -or -not $accessUnchanged -or -not $bytesUnchanged) {
+            throw 'OWNER_RIGHTS_FIXTURE_UNESTABLISHED: fresh owner setup changed data/DACL state or did not establish the current user.'
+        }
+    }
+
+    function Invoke-OwnerRightsNativeChildControl {
+        param(
+            [string]$Parent, [ValidateSet('directory','file')][string]$Kind,
+            [Security.Principal.SecurityIdentifier]$UserSid, [Security.Principal.SecurityIdentifier]$DefaultOwnerSid
+        )
+        Assert-BridgeTestPath -Path $Parent
+        Assert-OwnerRightsTokenProfile -UserSid $UserSid -DefaultOwnerSid $DefaultOwnerSid
+        $parentBefore = Get-OwnerRightsFixtureState -Path $Parent
+        $parentAccess = Get-OwnerRightsDaclFingerprint -Path $Parent
+        $parentReady = if ($Kind -eq 'directory') { $parentBefore.ExactModifyDacl } else { $parentBefore.ExactPrivateDacl }
+        if (-not $parentBefore.IsDirectory -or -not $parentReady) {
+            throw 'OWNER_RIGHTS_CONTROL_UNESTABLISHED: the real control parent has the wrong ownership/DACL profile.'
+        }
+        $path = Join-Path $Parent $(if ($Kind -eq 'directory') { 'native-directory-control' } else { 'native-file-control.bin' })
+        Assert-BridgeTestPath -Path $path
+        if (Test-Path -LiteralPath $path) { throw 'OWNER_RIGHTS_CONTROL_UNESTABLISHED: a matched child must be newly created.' }
+        if ($Kind -eq 'directory') { [void][IO.Directory]::CreateDirectory($path) }
+        else {
+            $empty = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+            $empty.Dispose()
+        }
+        $before = Get-OwnerRightsCreationProfile -Path $path -UserSid $UserSid -DefaultOwnerSid $DefaultOwnerSid
+        $beforeAccess = Get-OwnerRightsDaclFingerprint -Path $path
+        $expectedRights = if ($Kind -eq 'directory') {
+            [long]([Security.AccessControl.FileSystemRights]::Modify -bor [Security.AccessControl.FileSystemRights]::Synchronize)
+        } else { [long][Security.AccessControl.FileSystemRights]::FullControl }
+        if ($before.State.IsDirectory -ne ($Kind -eq 'directory') -or
+            -not $before.OwnerMatchesTokenDefaultOwner -or $before.State.AccessRulesProtected -or
+            -not $before.State.SingleCurrentUserAllow -or -not $before.State.RuleInherited -or
+            -not $before.State.InheritanceMatches -or $before.State.Rights -ne $expectedRights) {
+            throw 'OWNER_RIGHTS_CONTROL_UNESTABLISHED: fresh creation did not have the matched raw owner/inherited-ACE profile.'
+        }
+        $ownerRequired = -not $before.State.OwnerMatchesCurrentUser
+        $item = Get-Item -LiteralPath $path -Force -ErrorAction Stop
+        $descriptor = [IO.FileSystemAclExtensions]::GetAccessControl($item, [Security.AccessControl.AccessControlSections]'Access, Owner')
+        $descriptor.SetAccessRuleProtection($true, $false)
+        foreach ($rule in @($descriptor.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))) {
+            $descriptor.RemoveAccessRuleAll($rule)
+        }
+        $inherit = if ($Kind -eq 'directory') {
+            [Security.AccessControl.InheritanceFlags]'ContainerInherit, ObjectInherit'
+        } else { [Security.AccessControl.InheritanceFlags]::None }
+        $descriptor.AddAccessRule([Security.AccessControl.FileSystemAccessRule]::new(
+            $UserSid, [Security.AccessControl.FileSystemRights]::FullControl, $inherit,
+            [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow))
+        if ($ownerRequired) { $descriptor.SetOwner($UserSid) }
+        # Owner-only success followed by a DACL write would change the starting
+        # rights. Only the matching combined persist may supply a denial result.
+        $denial = $null
+        try {
+            [IO.FileSystemAclExtensions]::SetAccessControl($item, $descriptor)
+        }
+        catch {
+            $controlError = $_
+            Assert-OwnerRightsErrorNotGuard -ErrorRecord $controlError
+            $denial = $controlError.Exception.GetBaseException()
+            if (-not $ownerRequired -or $denial.GetType() -ne [UnauthorizedAccessException] -or $denial.HResult -ne -2147024891) {
+                Write-Host ('OWNER_RIGHTS_NATIVE_CONTROL_ERROR ' + (@{
+                    kind = $Kind; ownerChangeRequired = $ownerRequired
+                    type = $denial.GetType().FullName; hresult = $denial.HResult
+                } | ConvertTo-Json -Compress))
+                throw 'OWNER_RIGHTS_CONTROL_UNESTABLISHED: native hardening failed outside the matched ownership-required denial.'
+            }
+        }
+        $after = Get-OwnerRightsCreationProfile -Path $path -UserSid $UserSid -DefaultOwnerSid $DefaultOwnerSid
+        $parentUnchanged = (Test-OwnerRightsEvidenceEqual $parentBefore (Get-OwnerRightsFixtureState -Path $Parent)) -and
+            $parentAccess -ceq (Get-OwnerRightsDaclFingerprint -Path $Parent)
+        $emptyUnchanged = if ($Kind -eq 'directory') {
+            @(Get-ChildItem -LiteralPath $path -Force -ErrorAction Stop).Count -eq 0
+        } else { (Get-Item -LiteralPath $path -Force).Length -eq 0 }
+        $outcome = if ($null -eq $denial) { 'permitted' } else { 'ownership-required-denied' }
+        $established = if ($null -eq $denial) { $after.State.ExactPrivateDacl }
+            else {
+                $after.OwnerMatchesTokenDefaultOwner -and -not $after.State.OwnerMatchesCurrentUser -and
+                    (Test-OwnerRightsEvidenceEqual $before.State $after.State) -and
+                    $beforeAccess -ceq (Get-OwnerRightsDaclFingerprint -Path $path)
+            }
+        if (-not $established -or -not $parentUnchanged -or -not $emptyUnchanged) {
+            throw 'OWNER_RIGHTS_CONTROL_UNESTABLISHED: native capability readback changed the parent/data or did not match its outcome.'
+        }
+        [pscustomobject]@{
+            Path = $path; Outcome = $outcome; OwnerChangeRequired = $ownerRequired
+            BeforeState = $before.State; BeforeDaclFingerprint = $beforeAccess
+            Observation = [pscustomobject]@{
+                kind = $Kind; leaf = [IO.Path]::GetFileName($path); outcome = $outcome
+                ownerChangeRequired = $ownerRequired; ownerBefore = $before.Owner; ownerAfter = $after.Owner
+                rawOwnerMatchesTokenDefaultOwner = $before.OwnerMatchesTokenDefaultOwner
+                tokenDefaultOwnerMatchesCurrentUser = $before.TokenDefaultOwnerMatchesCurrentUser
+                before = ConvertTo-OwnerRightsStateEvidence $before.State
+                after = ConvertTo-OwnerRightsStateEvidence $after.State
+                parentUnchanged = $parentUnchanged; emptyContentPreserved = $emptyUnchanged
+                errorType = $(if ($denial) { $denial.GetType().FullName } else { $null })
+                hresult = $(if ($denial) { $denial.HResult } else { $null })
+            }
+        }
+    }
+
+    function Set-OwnerRightsFixtureModifyDacl {
+        param([string]$Path, [string[]]$PreserveFiles = @())
+        Initialize-OwnerRightsComparisonOwner -Path $Path -PreserveFiles $PreserveFiles `
+            -UserSid $ownerRightsCurrentUser -DefaultOwnerSid $ownerRightsDefaultOwner
         $before = Get-OwnerRightsFixtureState -Path $Path
         Write-OwnerRightsSetupDiagnostic -Path $Path -GuardOwnerMatchesCurrentUser $before.OwnerMatchesCurrentUser
         if (-not $before.OwnerMatchesCurrentUser) {
-            throw 'OWNER_RIGHTS_FIXTURE_UNESTABLISHED: the synthetic target is not already current-user-owned; no ownership change was attempted.'
+            throw 'OWNER_RIGHTS_FIXTURE_UNESTABLISHED: current-user ownership is not established; the Modify-only DACL was not applied.'
         }
         $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
         $descriptor = [IO.FileSystemAclExtensions]::GetAccessControl($item, [Security.AccessControl.AccessControlSections]::Access)
@@ -259,6 +502,17 @@ try {
         }
     }
 
+    $ownerRightsIdentity = [Security.Principal.WindowsIdentity]::GetCurrent()
+    try {
+        $ownerRightsCurrentUser = $ownerRightsIdentity.User
+        $ownerRightsDefaultOwner = $ownerRightsIdentity.Owner
+    }
+    finally { $ownerRightsIdentity.Dispose() }
+    if ($null -eq $ownerRightsCurrentUser -or $null -eq $ownerRightsDefaultOwner) {
+        throw 'OWNER_RIGHTS_FIXTURE_UNESTABLISHED: the actual current-user/default-owner profile is unavailable.'
+    }
+    $ownerRightsUserDefaultProfile = $ownerRightsDefaultOwner.Equals($ownerRightsCurrentUser)
+    $script:OwnerRightsFreshComparisonPaths = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
     $ownerRightsRoot = Join-Path $credentialRoot 'owner-rights'
     Assert-BridgeTestPath -Path $ownerRightsRoot
     [void][IO.Directory]::CreateDirectory($ownerRightsRoot)
@@ -268,18 +522,21 @@ try {
         $ownerRightsTarget = Join-Path $ownerRightsRoot "$ownerRightsKind-target"
         Assert-BridgeTestPath -Path @($ownerRightsControl, $ownerRightsTarget)
         if ($ownerRightsKind -eq 'directory') {
-            [void][IO.Directory]::CreateDirectory($ownerRightsControl)
-            [void][IO.Directory]::CreateDirectory($ownerRightsTarget)
+            New-OwnerRightsComparisonPath -Path $ownerRightsControl -Directory
+            New-OwnerRightsComparisonPath -Path $ownerRightsTarget -Directory
             $ownerRightsBytesPath = Join-Path $ownerRightsTarget 'existing.bin'
         }
         else {
+            New-OwnerRightsComparisonPath -Path $ownerRightsControl
+            New-OwnerRightsComparisonPath -Path $ownerRightsTarget
             [IO.File]::WriteAllBytes($ownerRightsControl, [byte[]](0, 1, 2, 127, 255))
             $ownerRightsBytesPath = $ownerRightsTarget
         }
         Assert-BridgeTestPath -Path $ownerRightsBytesPath
         [IO.File]::WriteAllBytes($ownerRightsBytesPath, [byte[]](0, 1, 2, 127, 255))
         $ownerRightsControlBefore = Set-OwnerRightsFixtureModifyDacl -Path $ownerRightsControl
-        $ownerRightsTargetBefore = Set-OwnerRightsFixtureModifyDacl -Path $ownerRightsTarget
+        $ownerRightsTargetBefore = Set-OwnerRightsFixtureModifyDacl -Path $ownerRightsTarget -PreserveFiles @($ownerRightsBytesPath)
+        Assert-OwnerRightsTokenProfile -UserSid $ownerRightsCurrentUser -DefaultOwnerSid $ownerRightsDefaultOwner
         $ownerRightsDescriptor = [IO.FileSystemAclExtensions]::GetAccessControl(
             (Get-Item -LiteralPath $ownerRightsControl -Force), [Security.AccessControl.AccessControlSections]::Owner)
         $ownerRightsSameOwner = $ownerRightsDescriptor.GetOwner([Security.Principal.SecurityIdentifier])
@@ -344,26 +601,48 @@ try {
         }
         if ($ownerRightsKind -eq 'directory') {
             $ownerRightsChildState = $null
+            $ownerRightsChildProfile = $null
+            $ownerRightsRawChildPrivate = $null
             if ($ownerRightsProtected) {
                 $ownerRightsChild = Join-Path $ownerRightsTarget 'inherited.bin'
                 Assert-BridgeTestPath -Path $ownerRightsChild
+                if (Test-Path -LiteralPath $ownerRightsChild) { throw 'OWNER_RIGHTS_FIXTURE_UNESTABLISHED: the raw inherited child is not fresh.' }
                 [IO.File]::WriteAllBytes($ownerRightsChild, [byte[]](9, 8, 7))
-                $ownerRightsChildState = Get-OwnerRightsFixtureState -Path $ownerRightsChild
+                $ownerRightsChildProfile = Get-OwnerRightsCreationProfile -Path $ownerRightsChild `
+                    -UserSid $ownerRightsCurrentUser -DefaultOwnerSid $ownerRightsDefaultOwner
+                $ownerRightsChildState = $ownerRightsChildProfile.State
+                $ownerRightsRawChildPrivate = Test-BridgeSecretFileProtected -Path $ownerRightsChild
             }
-            Write-Host ('OWNER_RIGHTS_INHERITANCE ' + (@{ attempted = $ownerRightsProtected; child = $ownerRightsChildState } | ConvertTo-Json -Depth 4 -Compress))
-            Test-That 'the protected directory actually passes only current-user FullControl to a new child' {
-                $null -ne $ownerRightsChildState -and $ownerRightsChildState.OwnerMatchesCurrentUser -and
+            Write-Host ('OWNER_RIGHTS_INHERITANCE ' + (@{
+                attempted = $ownerRightsProtected; child = $ownerRightsChildState
+                rawOwner = $(if ($ownerRightsChildProfile) { $ownerRightsChildProfile.Owner } else { $null })
+                ownerMatchesTokenDefaultOwner = $(if ($ownerRightsChildProfile) { $ownerRightsChildProfile.OwnerMatchesTokenDefaultOwner } else { $null })
+                tokenDefaultOwnerMatchesCurrentUser = $ownerRightsUserDefaultProfile
+                rawChildVerifiedPrivate = $ownerRightsRawChildPrivate
+            } | ConvertTo-Json -Depth 5 -Compress))
+            Test-That 'the raw child inherits only current-user FullControl while its owner follows the actual token default' {
+                $null -ne $ownerRightsChildState -and $ownerRightsChildProfile.OwnerMatchesTokenDefaultOwner -and
+                    $ownerRightsChildState.OwnerMatchesCurrentUser -eq $ownerRightsUserDefaultProfile -and
                     $ownerRightsChildState.SingleCurrentUserAllow -and $ownerRightsChildState.InheritanceMatches -and
                     $ownerRightsChildState.RuleInherited -eq $true -and
-                    $ownerRightsChildState.Rights -eq [long][Security.AccessControl.FileSystemRights]::FullControl
+                    $ownerRightsChildState.Rights -eq [long][Security.AccessControl.FileSystemRights]::FullControl -and
+                    $ownerRightsRawChildPrivate -eq $false
             }
         }
     }
 
     foreach ($ownerRightsWriterKind in @('existing-file', 'new-directory')) {
+        $ownerRightsExpectedWriterOutcome = 'private-write'
+        $ownerRightsDirectoryControl = $null
+        $ownerRightsFileControl = $null
+        $ownerRightsParentBefore = $null
+        $ownerRightsParentAccess = $null
+        $ownerRightsSourceBefore = @()
+        $ownerRightsSourcePath = $null
         if ($ownerRightsWriterKind -eq 'existing-file') {
             $ownerRightsWriterPath = Join-Path $ownerRightsRoot 'writer-existing.json'
             Assert-BridgeTestPath -Path $ownerRightsWriterPath
+            New-OwnerRightsComparisonPath -Path $ownerRightsWriterPath
             [IO.File]::WriteAllText($ownerRightsWriterPath, 'synthetic-original-bytes')
             $ownerRightsWriterBefore = Set-OwnerRightsFixtureModifyDacl -Path $ownerRightsWriterPath
             $ownerRightsWriterControl = $ownerRightsControls['file']
@@ -371,23 +650,74 @@ try {
         else {
             $ownerRightsWriterParent = Join-Path $ownerRightsRoot 'writer-parent'
             Assert-BridgeTestPath -Path $ownerRightsWriterParent
-            [void][IO.Directory]::CreateDirectory($ownerRightsWriterParent)
-            $ownerRightsWriterBefore = Set-OwnerRightsFixtureModifyDacl -Path $ownerRightsWriterParent
+            New-OwnerRightsComparisonPath -Path $ownerRightsWriterParent -Directory
+            $ownerRightsSourcePath = Join-Path $ownerRightsWriterParent 'source.bin'
+            Assert-BridgeTestPath -Path $ownerRightsSourcePath
+            [IO.File]::WriteAllText($ownerRightsSourcePath, 'synthetic-parent-source-bytes')
+            $ownerRightsWriterBefore = Set-OwnerRightsFixtureModifyDacl -Path $ownerRightsWriterParent -PreserveFiles @($ownerRightsSourcePath)
+            $ownerRightsParentBefore = Get-OwnerRightsFixtureState -Path $ownerRightsWriterParent
+            $ownerRightsParentAccess = Get-OwnerRightsDaclFingerprint -Path $ownerRightsWriterParent
+            $ownerRightsSourceBefore = @(Get-OwnerRightsByteEvidence -Paths @($ownerRightsSourcePath))
             $ownerRightsWriterPath = Join-Path $ownerRightsWriterParent 'new\config.json'
             Assert-BridgeTestPath -Path $ownerRightsWriterPath
+            if (Test-Path -LiteralPath (Split-Path $ownerRightsWriterPath -Parent)) {
+                throw 'OWNER_RIGHTS_FIXTURE_UNESTABLISHED: the real writer destination must remain absent before its call.'
+            }
             $ownerRightsWriterControl = $ownerRightsControls['directory']
+            $ownerRightsDirectoryControl = Invoke-OwnerRightsNativeChildControl -Parent $ownerRightsWriterParent -Kind directory `
+                -UserSid $ownerRightsCurrentUser -DefaultOwnerSid $ownerRightsDefaultOwner
+            if ($ownerRightsDirectoryControl.Outcome -ceq 'ownership-required-denied') {
+                $ownerRightsExpectedWriterOutcome = 'new-directory-refusal'
+            }
+            elseif ($ownerRightsDirectoryControl.Outcome -ceq 'permitted') {
+                $ownerRightsFileControl = Invoke-OwnerRightsNativeChildControl -Parent $ownerRightsDirectoryControl.Path -Kind file `
+                    -UserSid $ownerRightsCurrentUser -DefaultOwnerSid $ownerRightsDefaultOwner
+                if ($ownerRightsFileControl.Outcome -ceq 'ownership-required-denied') {
+                    $ownerRightsExpectedWriterOutcome = 'new-file-refusal'
+                }
+                elseif ($ownerRightsFileControl.Outcome -cne 'permitted') {
+                    throw 'OWNER_RIGHTS_CONTROL_UNESTABLISHED: the file capability has no recognized measured outcome.'
+                }
+            }
+            else { throw 'OWNER_RIGHTS_CONTROL_UNESTABLISHED: the directory capability has no recognized measured outcome.' }
+            if ($ownerRightsUserDefaultProfile -and $ownerRightsExpectedWriterOutcome -cne 'private-write') {
+                throw 'OWNER_RIGHTS_CONTROL_UNESTABLISHED: the current-user default-owner profile must retain private writer success.'
+            }
+            $ownerRightsControlParentKept = (Test-OwnerRightsEvidenceEqual $ownerRightsParentBefore (Get-OwnerRightsFixtureState -Path $ownerRightsWriterParent)) -and
+                $ownerRightsParentAccess -ceq (Get-OwnerRightsDaclFingerprint -Path $ownerRightsWriterParent)
+            $ownerRightsControlSourceKept = Test-OwnerRightsEvidenceEqual $ownerRightsSourceBefore @(Get-OwnerRightsByteEvidence -Paths @($ownerRightsSourcePath))
+            Write-Host ('OWNER_RIGHTS_NESTED_CAPABILITY ' + (@{
+                tokenDefaultOwnerMatchesCurrentUser = $ownerRightsUserDefaultProfile
+                directory = $ownerRightsDirectoryControl.Observation
+                file = $(if ($ownerRightsFileControl) { $ownerRightsFileControl.Observation } else { $null })
+                expectedWriterOutcome = $ownerRightsExpectedWriterOutcome
+                parentPreserved = $ownerRightsControlParentKept; sourceBytesPreserved = $ownerRightsControlSourceKept
+                realTargetStillAbsent = -not (Test-Path -LiteralPath (Split-Path $ownerRightsWriterPath -Parent))
+            } | ConvertTo-Json -Depth 8 -Compress))
+            Test-That 'the matched native child controls establish a writer outcome without changing its Modify parent or source bytes' {
+                $ownerRightsControlParentKept -and $ownerRightsControlSourceKept -and $ownerRightsParentBefore.ExactModifyDacl -and
+                    -not (Test-Path -LiteralPath (Split-Path $ownerRightsWriterPath -Parent)) -and
+                    $ownerRightsDirectoryControl.Observation.rawOwnerMatchesTokenDefaultOwner -and
+                    ($ownerRightsExpectedWriterOutcome -cin @('private-write','new-directory-refusal','new-file-refusal')) -and
+                    (-not $ownerRightsUserDefaultProfile -or $ownerRightsExpectedWriterOutcome -ceq 'private-write')
+            }
         }
+        Assert-OwnerRightsTokenProfile -UserSid $ownerRightsCurrentUser -DefaultOwnerSid $ownerRightsDefaultOwner
         $ownerRightsWriterError = $null
         try { Write-BridgeSecretFile -Path $ownerRightsWriterPath -Content 'synthetic-written-by-real-writer' }
         catch {
             $ownerRightsWriterError = $_
             Assert-OwnerRightsErrorNotGuard -ErrorRecord $ownerRightsWriterError
         }
+        Assert-OwnerRightsTokenProfile -UserSid $ownerRightsCurrentUser -DefaultOwnerSid $ownerRightsDefaultOwner
         $ownerRightsWriterAfter = $null
+        $ownerRightsWriterProfile = $null
         $ownerRightsWriterBytes = $null
         $ownerRightsWriterVerified = $false
         if (Test-Path -LiteralPath $ownerRightsWriterPath -PathType Leaf) {
-            $ownerRightsWriterAfter = Get-OwnerRightsFixtureState -Path $ownerRightsWriterPath
+            $ownerRightsWriterProfile = Get-OwnerRightsCreationProfile -Path $ownerRightsWriterPath `
+                -UserSid $ownerRightsCurrentUser -DefaultOwnerSid $ownerRightsDefaultOwner
+            $ownerRightsWriterAfter = $ownerRightsWriterProfile.State
             $ownerRightsWriterBytes = [IO.File]::ReadAllText($ownerRightsWriterPath)
             $ownerRightsWriterVerified = Test-BridgeSecretFileProtected -Path $ownerRightsWriterPath
         }
@@ -396,17 +726,72 @@ try {
              ($ownerRightsWriterKind -eq 'new-directory' -and -not [string]::IsNullOrEmpty($ownerRightsWriterBytes)))) {
             throw 'OWNER_RIGHTS_WRITER: a refused real write changed or exposed credential bytes.'
         }
+        $ownerRightsParentKept = $true
+        $ownerRightsSourceKept = $true
+        $ownerRightsTargetDirectoryProfile = $null
+        $ownerRightsMatchedOutcome = $null -eq $ownerRightsWriterError -and $null -ne $ownerRightsWriterAfter -and
+            $ownerRightsWriterAfter.ExactPrivateDacl -and $ownerRightsWriterVerified -and
+            $ownerRightsWriterBytes -ceq 'synthetic-written-by-real-writer'
+        if ($ownerRightsWriterKind -eq 'new-directory') {
+            $ownerRightsParentKept = (Test-OwnerRightsEvidenceEqual $ownerRightsParentBefore (Get-OwnerRightsFixtureState -Path $ownerRightsWriterParent)) -and
+                $ownerRightsParentAccess -ceq (Get-OwnerRightsDaclFingerprint -Path $ownerRightsWriterParent)
+            $ownerRightsSourceKept = Test-OwnerRightsEvidenceEqual $ownerRightsSourceBefore @(Get-OwnerRightsByteEvidence -Paths @($ownerRightsSourcePath))
+            $ownerRightsTargetDirectory = Split-Path $ownerRightsWriterPath -Parent
+            $ownerRightsTargetDirectoryState = $null
+            if (Test-Path -LiteralPath $ownerRightsTargetDirectory -PathType Container) {
+                $ownerRightsTargetDirectoryProfile = Get-OwnerRightsCreationProfile -Path $ownerRightsTargetDirectory `
+                    -UserSid $ownerRightsCurrentUser -DefaultOwnerSid $ownerRightsDefaultOwner
+                $ownerRightsTargetDirectoryState = $ownerRightsTargetDirectoryProfile.State
+            }
+            if ($ownerRightsExpectedWriterOutcome -ceq 'private-write') {
+                $ownerRightsMatchedOutcome = $ownerRightsMatchedOutcome -and $null -ne $ownerRightsTargetDirectoryState -and
+                    $ownerRightsTargetDirectoryState.ExactPrivateDacl
+            }
+            elseif ($ownerRightsExpectedWriterOutcome -ceq 'new-directory-refusal') {
+                $ownerRightsMatchedOutcome = $null -ne $ownerRightsWriterError -and
+                    $ownerRightsWriterError.Exception.Message -ceq 'Could not protect the new credential directory; no credential contents were written.' -and
+                    $null -ne $ownerRightsTargetDirectoryState -and -not (Test-Path -LiteralPath $ownerRightsWriterPath) -and
+                    $ownerRightsTargetDirectoryProfile.OwnerMatchesTokenDefaultOwner -and
+                    (Test-OwnerRightsEvidenceEqual -Before (ConvertTo-OwnerRightsStateEvidence $ownerRightsDirectoryControl.BeforeState) `
+                        -After (ConvertTo-OwnerRightsStateEvidence $ownerRightsTargetDirectoryState)) -and
+                    $ownerRightsDirectoryControl.BeforeDaclFingerprint -ceq (Get-OwnerRightsDaclFingerprint -Path $ownerRightsTargetDirectory)
+            }
+            elseif ($ownerRightsExpectedWriterOutcome -ceq 'new-file-refusal') {
+                $ownerRightsMatchedOutcome = $null -ne $ownerRightsWriterError -and
+                    $ownerRightsWriterError.Exception.Message -ceq 'Could not protect the credential file; no new contents were written.' -and
+                    $null -ne $ownerRightsTargetDirectoryState -and $ownerRightsTargetDirectoryState.ExactPrivateDacl -and
+                    $null -ne $ownerRightsWriterAfter -and (Get-Item -LiteralPath $ownerRightsWriterPath -Force).Length -eq 0 -and
+                    $ownerRightsWriterProfile.OwnerMatchesTokenDefaultOwner -and
+                    (Test-OwnerRightsEvidenceEqual -Before (ConvertTo-OwnerRightsStateEvidence $ownerRightsFileControl.BeforeState) `
+                        -After (ConvertTo-OwnerRightsStateEvidence $ownerRightsWriterAfter)) -and
+                    $ownerRightsFileControl.BeforeDaclFingerprint -ceq (Get-OwnerRightsDaclFingerprint -Path $ownerRightsWriterPath)
+            }
+        }
         Write-Host ('OWNER_RIGHTS_WRITER ' + (@{
             kind = $ownerRightsWriterKind; ownerControl = $ownerRightsWriterControl.Outcome; before = $ownerRightsWriterBefore
-            error = $(if ($ownerRightsWriterError) { $ownerRightsWriterError.Exception.ToString() } else { $null })
+            error = $(if ($ownerRightsWriterError) { @{
+                type = $ownerRightsWriterError.Exception.GetType().FullName; hresult = $ownerRightsWriterError.Exception.HResult
+            } } else { $null })
             after = $ownerRightsWriterAfter; finalVerifier = $ownerRightsWriterVerified
             requestedBytesWritten = ($ownerRightsWriterBytes -ceq 'synthetic-written-by-real-writer')
             originalBytesPreserved = ($ownerRightsWriterBytes -ceq 'synthetic-original-bytes')
+            tokenDefaultOwnerMatchesCurrentUser = $ownerRightsUserDefaultProfile
+            expectedOutcome = $ownerRightsExpectedWriterOutcome; matchedOutcome = $ownerRightsMatchedOutcome
+            parentPreserved = $ownerRightsParentKept; sourceBytesPreserved = $ownerRightsSourceKept
+            fileOwner = $(if ($ownerRightsWriterProfile) { $ownerRightsWriterProfile.Owner } else { $null })
+            createdDirectoryOwner = $(if ($ownerRightsTargetDirectoryProfile) { $ownerRightsTargetDirectoryProfile.Owner } else { $null })
         } | ConvertTo-Json -Depth 5 -Compress))
-        Test-That "the real writer protects the $ownerRightsWriterKind case under an owned Modify-only boundary" {
-            $null -eq $ownerRightsWriterError -and $null -ne $ownerRightsWriterAfter -and
-                $ownerRightsWriterAfter.ExactPrivateDacl -and $ownerRightsWriterVerified -and
-                $ownerRightsWriterBytes -ceq 'synthetic-written-by-real-writer'
+        if ($ownerRightsWriterKind -eq 'existing-file') {
+            Test-That 'the real writer protects the existing-file case under an owned Modify-only boundary' {
+                $null -eq $ownerRightsWriterError -and $null -ne $ownerRightsWriterAfter -and
+                    $ownerRightsWriterAfter.ExactPrivateDacl -and $ownerRightsWriterVerified -and
+                    $ownerRightsWriterBytes -ceq 'synthetic-written-by-real-writer'
+            }
+        }
+        else {
+            Test-That 'the real nested writer matches the measured ownership capability with private success or the exact byte-free refusal' {
+                $ownerRightsMatchedOutcome -and $ownerRightsParentKept -and $ownerRightsSourceKept
+            }
         }
     }
 }
@@ -414,8 +799,8 @@ finally {
     Remove-BridgeTestSandbox -Sandbox $env:AGENT_HA_BRIDGE_TEST_ROOT -Directory $credentialRoot
 }
 
-if ($script:OwnerRightsAssertions -ne 9) {
-    throw "The owner-rights matrix did not attempt all nine assertions: $($script:OwnerRightsAssertions)."
+if ($script:OwnerRightsAssertions -ne 10) {
+    throw "The owner-rights matrix did not attempt all ten assertions: $($script:OwnerRightsAssertions)."
 }
 Write-Host ('OWNER_RIGHTS_MATRIX_COMPLETE ' + (@{
     matrixCompleted = $true
