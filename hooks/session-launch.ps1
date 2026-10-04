@@ -23,6 +23,20 @@
     Nothing here needs Home Assistant, so it is straightforward to test offline.
 #>
 
+function Write-BridgeLaunchWarning {
+    param([Parameter(Mandatory)][string]$Message)
+
+    try {
+        Microsoft.PowerShell.Utility\Write-Warning $Message
+    }
+    catch {
+        # A long-running Windows daemon can survive with a poisoned console handle
+        # after console attach/detach work. Warnings must not turn safe cleanup
+        # failures into refused launches.
+        try { Write-DecisionBridgeLog -Message "launch warning: $Message (warning host failed: $($_.Exception.Message))" } catch { }
+    }
+}
+
 function ConvertTo-BridgeArgumentString {
     <#
         Builds a Windows command line from an argument array.
@@ -245,7 +259,7 @@ function Get-BridgeWorkspaceChoices {
         $isolate = $false
         if ($null -ne $entry -and $entry.PSObject.Properties['isolate']) {
             if ($entry.isolate -isnot [bool]) {
-                Write-Warning "Workspace '$label' has a non-Boolean isolate setting; it is not an executable target."
+                Write-BridgeLaunchWarning "Workspace '$label' has a non-Boolean isolate setting; it is not an executable target."
                 continue
             }
             $isolate = $entry.isolate
@@ -361,7 +375,7 @@ function Test-BridgeWorkspacePathApproved {
             }
         }
     }
-    catch { Write-Warning "Workspace approval could not be established: $($_.Exception.Message)" }
+    catch { Write-BridgeLaunchWarning "Workspace approval could not be established: $($_.Exception.Message)" }
     $false
 }
 
@@ -479,7 +493,7 @@ function Remove-BridgeWorktreeLaunchReservation {
         $true
     }
     catch {
-        Write-Warning "The worktree remains protected: $($_.Exception.Message)"
+        Write-BridgeLaunchWarning "The worktree remains protected: $($_.Exception.Message)"
         $false
     }
     finally {
@@ -782,7 +796,7 @@ function Test-BridgeWorktreeFinished {
             }
         }
     }
-    catch { Write-Warning "Worktree physical paths could not be authorized: $($_.Exception.Message)"; return $false }
+    catch { Write-BridgeLaunchWarning "Worktree physical paths could not be authorized: $($_.Exception.Message)"; return $false }
 
     # --no-optional-locks so asking the question cannot itself write to the index.
     $status = Invoke-BridgeGit -Directory $WorktreePath -Arguments @('--no-optional-locks', 'status', '--porcelain', '--untracked-files=all', '--ignored=matching')
@@ -795,7 +809,7 @@ function Test-BridgeWorktreeFinished {
     if (-not $ahead.Ok -or $ahead.Output -ne '0') { return $false }
 
     try { $created = Get-BridgeWorktreeCreatedAt -Path $WorktreePath }
-    catch { Write-Warning $_.Exception.Message; return $false }
+    catch { Write-BridgeLaunchWarning $_.Exception.Message; return $false }
     ([datetime]::Now - $created).TotalHours -ge $IdleHours
 }
 
@@ -858,12 +872,12 @@ function Remove-BridgeWorktreeFiles {
         [System.IO.Directory]::Delete($WorktreePath, $false)
         $removedDirectory = $true
     }
-    catch { Write-Warning "Worktree cleanup stopped without recursive deletion: $($_.Exception.Message)" }
+    catch { Write-BridgeLaunchWarning "Worktree cleanup stopped without recursive deletion: $($_.Exception.Message)" }
     finally {
         if (-not $removedDirectory) {
             if ([System.IO.File]::Exists($stagedPointer)) {
                 try { [System.IO.File]::Move($stagedPointer, $dotGit) }
-                catch { Write-Warning "Worktree metadata was retained at '$stagedPointer'; automatic restoration was refused: $($_.Exception.Message)" }
+                catch { Write-BridgeLaunchWarning "Worktree metadata was retained at '$stagedPointer'; automatic restoration was refused: $($_.Exception.Message)" }
             }
             if ($removedTracked -and [System.IO.File]::Exists($dotGit)) {
                 # Without --force, checkout-index restores missing files only. A new
@@ -871,20 +885,20 @@ function Remove-BridgeWorktreeFiles {
                 try {
                     Assert-BridgeInstallPayload -Root $WorktreePath -RelativePaths (@('.git') + $trackedPaths)
                     $restore = Invoke-BridgeGit -Directory $WorktreePath -Arguments @('checkout-index', '--all')
-                    if (-not $restore.Ok) { Write-Warning "Existing files were preserved; inspect the stopped worktree cleanup: $($restore.Output)" }
+                    if (-not $restore.Ok) { Write-BridgeLaunchWarning "Existing files were preserved; inspect the stopped worktree cleanup: $($restore.Output)" }
                 }
-                catch { Write-Warning "Worktree restoration refused uncertain physical paths: $($_.Exception.Message)" }
+                catch { Write-BridgeLaunchWarning "Worktree restoration refused uncertain physical paths: $($_.Exception.Message)" }
             }
         }
         foreach ($temporary in @($temporaryIndex) + $(if ($removedDirectory) { @($stagedPointer) } else { @() })) {
             try { if ([System.IO.File]::Exists($temporary)) { [System.IO.File]::Delete($temporary) } }
-            catch { Write-Warning "Cleanup metadata was retained at '$temporary': $($_.Exception.Message)" }
+            catch { Write-BridgeLaunchWarning "Cleanup metadata was retained at '$temporary': $($_.Exception.Message)" }
         }
         foreach ($lock in $ownedLocks) {
             try { $lock.Stream.Dispose() }
             finally {
                 try { [System.IO.File]::Delete($lock.Path) }
-                catch { Write-Warning "The owned cleanup lock could not be removed: $($_.Exception.Message)" }
+                catch { Write-BridgeLaunchWarning "The owned cleanup lock could not be removed: $($_.Exception.Message)" }
             }
         }
     }
@@ -907,14 +921,14 @@ function Remove-BridgeFinishedWorktree {
             if (Test-BridgeWorktreeInUse -WorktreePath $worktree -Usage $usage) { continue }
             $common = Invoke-BridgeGit -Directory $worktree -Arguments @('rev-parse', '--path-format=absolute', '--git-common-dir')
             if (-not $common.Ok -or -not (Test-BridgeInstallPath -Left (Resolve-BridgeWorkspaceDirectory $common.Output) -Right $operation.CommonDirectory)) {
-                Write-Warning "Worktree repository ownership is uncertain; preserving '$worktree'."
+                Write-BridgeLaunchWarning "Worktree repository ownership is uncertain; preserving '$worktree'."
                 continue
             }
             if (-not (Test-BridgeWorktreeFinished -WorktreePath $worktree -BaseRef $baseRef -IdleHours $IdleHours)) { continue }
             if (Remove-BridgeWorktreeFiles -WorktreePath $worktree -BaseRef $baseRef -IdleHours $IdleHours) { $removed++ }
         }
     }
-    catch { Write-Warning "Managed worktrees were retained because cleanup could not be authorized: $($_.Exception.Message)" }
+    catch { Write-BridgeLaunchWarning "Managed worktrees were retained because cleanup could not be authorized: $($_.Exception.Message)" }
     finally {
         if ($null -ne $operation) { $operation.Mutex.ReleaseMutex(); $operation.Mutex.Dispose() }
     }
@@ -964,7 +978,7 @@ function New-BridgeSessionWorktree {
         # ago. Best effort: a prune that fails must not stop a launch.
         $removed = 0
         try { $removed = Remove-BridgeFinishedWorktree -RepositoryPath $RepositoryPath -IdleHours $IdleHours }
-        catch { Write-Warning "Worktree cleanup was refused; existing trees were retained: $($_.Exception.Message)" }
+        catch { Write-BridgeLaunchWarning "Worktree cleanup was refused; existing trees were retained: $($_.Exception.Message)" }
 
         $existing = @(Get-BridgeManagedWorktree -RepositoryPath $RepositoryPath)
         $registered = @(Get-BridgeRepositoryWorktree -RepositoryPath $RepositoryPath)
@@ -1012,7 +1026,7 @@ function New-BridgeSessionWorktree {
             $marker = Get-BridgeWorktreeMarkerPath -Path $target
             if ($marker) { [System.IO.File]::WriteAllText($marker, [DateTime]::Now.ToString('o')) }
         }
-        catch { Write-Warning "The isolated worktree is retained unmanaged because its marker could not be written: $($_.Exception.Message)" }
+        catch { Write-BridgeLaunchWarning "The isolated worktree is retained unmanaged because its marker could not be written: $($_.Exception.Message)" }
 
         $relative = Get-BridgeWorkspaceRelativeDirectory -Path $RepositoryPath -RepositoryRoot $inside.Output
         $targetRoot = Resolve-BridgeWorkspaceDirectory -Path $target
