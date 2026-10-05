@@ -167,7 +167,8 @@ jobs:
             'summary.json',
             'tests_test-registration-isolation_ps1.log',
             'tests_test-decision-lifecycle_ps1.log',
-            'tests_test-write-boundary-callers_ps1.log'
+            'tests_test-write-boundary-callers_ps1.log',
+            'tests_test-secret-owner-rights_ps1.log'
           )
           $files = [Collections.Generic.List[object]]::new()
           foreach ($name in $names) {
@@ -347,7 +348,8 @@ jobs:
             'summary.json',
             'tests_test-registration-isolation_ps1.log',
             'tests_test-decision-lifecycle_ps1.log',
-            'tests_test-write-boundary-callers_ps1.log'
+            'tests_test-write-boundary-callers_ps1.log',
+            'tests_test-secret-owner-rights_ps1.log'
           )
           $files = [Collections.Generic.List[object]]::new()
           foreach ($name in $names) {

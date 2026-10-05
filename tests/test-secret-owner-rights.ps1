@@ -315,6 +315,165 @@ try {
         }
     }
 
+    function Write-OwnerRightsComparisonPhase {
+        param(
+            [Parameter(Mandatory)]
+            [ValidateSet('existing-before', 'after-owner-read', 'after-set-owner', 'after-persist', 'after-profile-readback', 'before-postcondition', IgnoreCase = $false)]
+            [string]$Phase,
+            [Parameter(Mandatory)][string]$Path, [AllowEmptyCollection()][string[]]$BytePaths = @(),
+            [Security.Principal.SecurityIdentifier]$UserSid, [Security.Principal.SecurityIdentifier]$DefaultOwnerSid,
+            [AllowNull()]$Descriptor = $null
+        )
+        Assert-BridgeTestPath -Path $Path
+        $phases = @('existing-before', 'after-owner-read', 'after-set-owner', 'after-persist', 'after-profile-readback', 'before-postcondition')
+        $availability = [ordered]@{
+            Item = 'not-attempted'; SecurityDescriptor = 'not-attempted'; Owner = 'not-attempted'
+            Dacl = 'not-attempted'; Bytes = 'not-attempted'; Descriptor = 'not-provided'; Runtime = 'not-attempted'
+        }
+        $errors = [Collections.Generic.List[object]]::new()
+        $phaseItem = $null; $diskDescriptor = $null; $fileOwner = $null
+        $ownerFacts = $null; $daclFacts = $null; $runtimeFacts = $null
+        $byteWitnesses = @(); $byteWitnessCount = $null; $descriptorType = $null
+        $witnessPaths = @($BytePaths | Select-Object -Unique)
+        try {
+            $phaseItem = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
+            $availability.Item = 'available'
+        }
+        catch { $availability.Item = 'unavailable'; Add-OwnerRightsSetupReadError -Stage 'phase-item' -ErrorRecord $_ -Errors $errors }
+        if ($null -ne $phaseItem) {
+            try {
+                $diskDescriptor = [IO.FileSystemAclExtensions]::GetAccessControl(
+                    $phaseItem, [Security.AccessControl.AccessControlSections]'Access, Owner')
+                $availability.SecurityDescriptor = 'available'
+            }
+            catch {
+                $availability.SecurityDescriptor = 'unavailable'
+                Add-OwnerRightsSetupReadError -Stage 'phase-security-descriptor' -ErrorRecord $_ -Errors $errors
+            }
+        }
+        if ($null -ne $diskDescriptor) {
+            try {
+                $fileOwner = $diskDescriptor.GetOwner([Security.Principal.SecurityIdentifier])
+                if ($null -eq $fileOwner) { throw [InvalidOperationException]::new('Phase owner metadata is unavailable.') }
+                $ownerFacts = Get-OwnerRightsSetupIdentityFacts -Identity $fileOwner -FileOwner $fileOwner `
+                    -CurrentUser $UserSid -TokenDefaultOwner $DefaultOwnerSid
+                $availability.Owner = 'available'
+            }
+            catch { $availability.Owner = 'unavailable'; Add-OwnerRightsSetupReadError -Stage 'phase-owner' -ErrorRecord $_ -Errors $errors }
+            try {
+                # One disk descriptor binds the phase's DACL hash, flags and ACE projection.
+                $rawDescriptor = [Security.AccessControl.RawSecurityDescriptor]::new($diskDescriptor.GetSecurityDescriptorBinaryForm(), 0)
+                if ($null -eq $rawDescriptor.DiscretionaryAcl) { throw [InvalidOperationException]::new('Phase DACL metadata is unavailable.') }
+                $daclBytes = [byte[]]::new($rawDescriptor.DiscretionaryAcl.BinaryLength)
+                $rawDescriptor.DiscretionaryAcl.GetBinaryForm($daclBytes, 0)
+                $phaseRules = @($diskDescriptor.GetAccessRules($true, $true, [Security.Principal.SecurityIdentifier]))
+                $inheritedCount = @($phaseRules | Where-Object { $_.IsInherited }).Count
+                $ruleShapes = @(for ($ruleIndex = 0; $ruleIndex -lt [Math]::Min(16, $phaseRules.Count); $ruleIndex++) {
+                    $phaseRule = $phaseRules[$ruleIndex]
+                    [pscustomobject]@{
+                        AccessControlType = [string]$phaseRule.AccessControlType; RightsMask = [long]$phaseRule.FileSystemRights
+                        IsInherited = [bool]$phaseRule.IsInherited
+                        InheritanceFlags = [string]$phaseRule.InheritanceFlags; PropagationFlags = [string]$phaseRule.PropagationFlags
+                        Identity = Get-OwnerRightsSetupIdentityFacts -Identity $phaseRule.IdentityReference -FileOwner $fileOwner `
+                            -CurrentUser $UserSid -TokenDefaultOwner $DefaultOwnerSid
+                    }
+                })
+                $daclFacts = [pscustomobject]@{
+                    Sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($daclBytes))
+                    AccessRulesProtected = $diskDescriptor.AreAccessRulesProtected
+                    AccessRulesCanonical = $diskDescriptor.AreAccessRulesCanonical
+                    RuleCount = $phaseRules.Count; InheritedCount = $inheritedCount; ExplicitCount = $phaseRules.Count - $inheritedCount
+                    RuleLimit = 16; ProjectedRuleCount = $ruleShapes.Count; RulesTruncated = $phaseRules.Count -gt 16
+                    Rules = $ruleShapes
+                }
+                $availability.Dacl = 'available'
+            }
+            catch { $availability.Dacl = 'unavailable'; Add-OwnerRightsSetupReadError -Stage 'phase-dacl' -ErrorRecord $_ -Errors $errors }
+        }
+        try {
+            foreach ($witnessPath in $witnessPaths) {
+                Assert-BridgeTestPath -Path $witnessPath
+                if (-not (Test-BridgeInstallPath $witnessPath $Path) -and
+                    -not (Test-BridgeInstallDescendant $witnessPath $Path)) {
+                    throw [InvalidOperationException]::new('Phase byte witness is outside its comparison target.')
+                }
+            }
+            $readWitnesses = @(Get-OwnerRightsByteEvidence -Paths $witnessPaths)
+            $byteWitnesses = @(for ($witnessIndex = 0; $witnessIndex -lt $readWitnesses.Count; $witnessIndex++) {
+                [pscustomobject]@{
+                    Ordinal = $witnessIndex + 1; Length = $readWitnesses[$witnessIndex].Length
+                    Sha256 = $readWitnesses[$witnessIndex].Sha256
+                }
+            })
+            $byteWitnessCount = $readWitnesses.Count
+            $availability.Bytes = 'available'
+        }
+        catch { $availability.Bytes = 'unavailable'; Add-OwnerRightsSetupReadError -Stage 'phase-bytes' -ErrorRecord $_ -Errors $errors }
+        if ($null -ne $Descriptor) {
+            try {
+                $descriptorType = $Descriptor.GetType().FullName
+                if ($Descriptor -isnot [Security.AccessControl.ObjectSecurity]) {
+                    throw [InvalidCastException]::new('Phase descriptor is not ObjectSecurity.')
+                }
+                $availability.Descriptor = 'available'
+            }
+            catch {
+                $availability.Descriptor = 'unavailable'
+                Add-OwnerRightsSetupReadError -Stage 'phase-descriptor-type' -ErrorRecord $_ -Errors $errors
+            }
+        }
+        $dirtyFlags = @(foreach ($fieldName in @('_ownerModified', '_daclModified', '_groupModified', '_saclModified')) {
+            $flag = [ordered]@{ Name = $fieldName; Availability = $availability.Descriptor; Value = $null }
+            if ($availability.Descriptor -ceq 'available') {
+                try {
+                    $field = [Security.AccessControl.ObjectSecurity].GetField(
+                        $fieldName, [Reflection.BindingFlags]'Instance, NonPublic')
+                    if ($null -eq $field) { throw [MissingFieldException]::new('Phase dirty-flag metadata is unavailable.') }
+                    if ($field.IsStatic -or $field.FieldType -ne [bool] -or
+                        $field.DeclaringType -ne [Security.AccessControl.ObjectSecurity]) {
+                        throw [InvalidCastException]::new('Phase dirty-flag metadata is not the expected instance Boolean.')
+                    }
+                    $value = $field.GetValue($Descriptor)
+                    if ($value -isnot [bool]) { throw [InvalidCastException]::new('Phase dirty-flag value is not Boolean.') }
+                    $flag.Value = $value
+                }
+                catch {
+                    $flag.Availability = 'unavailable'
+                    Add-OwnerRightsSetupReadError -Stage "phase-dirty-$fieldName" -ErrorRecord $_ -Errors $errors
+                }
+            }
+            [pscustomobject]$flag
+        })
+        try {
+            $assemblyFacts = @(foreach ($assembly in @(
+                [IO.FileSystemAclExtensions].Assembly, [Security.AccessControl.ObjectSecurity].Assembly
+            )) {
+                $assemblyName = $assembly.GetName()
+                [pscustomobject]@{
+                    Name = $assemblyName.Name; Version = $assemblyName.Version.ToString()
+                    ModuleIdentity = $assembly.ManifestModule.ModuleVersionId.ToString()
+                }
+            })
+            $runtimeFacts = [pscustomobject]@{
+                PowerShellVersion = $PSVersionTable.PSVersion.ToString()
+                Runtime = [Runtime.InteropServices.RuntimeInformation]::FrameworkDescription
+                AclAssemblies = $assemblyFacts
+            }
+            $availability.Runtime = 'available'
+        }
+        catch { $availability.Runtime = 'unavailable'; Add-OwnerRightsSetupReadError -Stage 'phase-runtime' -ErrorRecord $_ -Errors $errors }
+        $observation = [ordered]@{
+            SchemaVersion = 1; Phase = $Phase; Ordinal = [Array]::IndexOf($phases, $Phase) + 1
+            TargetLeaf = 'directory-control'; ReadAvailability = [pscustomobject]$availability
+            Owner = $ownerFacts; Dacl = $daclFacts
+            RequestedByteWitnessCount = $witnessPaths.Count; ByteWitnessCount = $byteWitnessCount; ByteWitnesses = $byteWitnesses
+            Descriptor = [pscustomobject]@{ ClrType = $descriptorType; DirtyFlags = $dirtyFlags; ManagedObservationOnly = $true }
+            Runtime = $runtimeFacts; ReadErrors = @($errors.ToArray())
+        }
+        [Console]::Out.WriteLine('OWNER_RIGHTS_SETUP_PHASE ' + ($observation | ConvertTo-Json -Depth 9 -Compress))
+        [Console]::Out.Flush()
+    }
+
     function Initialize-OwnerRightsComparisonOwner {
         param(
             [string]$Path, [string[]]$PreserveFiles = @(),
@@ -330,10 +489,22 @@ try {
         if (-not $before.State.IsDirectory) { $bytePaths += $Path }
         $bytesBefore = @(Get-OwnerRightsByteEvidence -Paths $bytePaths)
         $required = -not $before.State.OwnerMatchesCurrentUser
+        $capturePhases = $before.State.IsDirectory -and [StringComparer]::Ordinal.Equals([IO.Path]::GetFileName($Path), 'directory-control') -and
+            -not (Get-Variable -Name OwnerRightsComparisonPhaseClaimed -Scope Script -ErrorAction Ignore)
+        if ($capturePhases) {
+            $script:OwnerRightsComparisonPhaseClaimed = $true
+            Write-OwnerRightsComparisonPhase -Phase existing-before -Path $Path -BytePaths $bytePaths -UserSid $UserSid -DefaultOwnerSid $DefaultOwnerSid
+        }
         if ($required) {
             $item = Get-Item -LiteralPath $Path -Force -ErrorAction Stop
             $ownerOnly = [IO.FileSystemAclExtensions]::GetAccessControl($item, [Security.AccessControl.AccessControlSections]::Owner)
+            if ($capturePhases) {
+                Write-OwnerRightsComparisonPhase -Phase after-owner-read -Path $Path -BytePaths $bytePaths -UserSid $UserSid -DefaultOwnerSid $DefaultOwnerSid -Descriptor $ownerOnly
+            }
             $ownerOnly.SetOwner($UserSid)
+            if ($capturePhases) {
+                Write-OwnerRightsComparisonPhase -Phase after-set-owner -Path $Path -BytePaths $bytePaths -UserSid $UserSid -DefaultOwnerSid $DefaultOwnerSid -Descriptor $ownerOnly
+            }
             try {
                 [IO.FileSystemAclExtensions]::SetAccessControl($item, $ownerOnly)
             }
@@ -347,8 +518,14 @@ try {
                 } | ConvertTo-Json -Depth 5 -Compress))
                 throw 'OWNER_RIGHTS_FIXTURE_UNESTABLISHED: existing rights did not establish ownership of the fresh comparison.'
             }
+            if ($capturePhases) {
+                Write-OwnerRightsComparisonPhase -Phase after-persist -Path $Path -BytePaths $bytePaths -UserSid $UserSid -DefaultOwnerSid $DefaultOwnerSid -Descriptor $ownerOnly
+            }
         }
         $after = Get-OwnerRightsCreationProfile -Path $Path -UserSid $UserSid -DefaultOwnerSid $DefaultOwnerSid
+        if ($capturePhases) {
+            Write-OwnerRightsComparisonPhase -Phase after-profile-readback -Path $Path -BytePaths $bytePaths -UserSid $UserSid -DefaultOwnerSid $DefaultOwnerSid -Descriptor $(if ($required) { $ownerOnly } else { $null })
+        }
         $accessUnchanged = $accessBefore -ceq (Get-OwnerRightsDaclFingerprint -Path $Path) -and
             $before.State.AccessRulesProtected -eq $after.State.AccessRulesProtected
         $bytesUnchanged = Test-OwnerRightsEvidenceEqual $bytesBefore @(Get-OwnerRightsByteEvidence -Paths $bytePaths)
@@ -360,6 +537,9 @@ try {
             after = ConvertTo-OwnerRightsStateEvidence $after.State
             daclUnchanged = $accessUnchanged; originalBytesPreserved = $bytesUnchanged
         } | ConvertTo-Json -Depth 6 -Compress))
+        if ($capturePhases) {
+            Write-OwnerRightsComparisonPhase -Phase before-postcondition -Path $Path -BytePaths $bytePaths -UserSid $UserSid -DefaultOwnerSid $DefaultOwnerSid -Descriptor $(if ($required) { $ownerOnly } else { $null })
+        }
         if (-not $after.State.OwnerMatchesCurrentUser -or -not $accessUnchanged -or -not $bytesUnchanged) {
             throw 'OWNER_RIGHTS_FIXTURE_UNESTABLISHED: fresh owner setup changed data/DACL state or did not establish the current user.'
         }
