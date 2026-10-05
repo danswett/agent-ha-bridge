@@ -119,7 +119,57 @@ function New-ControlFixture {
         ConfigurationIsDirectory = $false
         PrettyCommand = $false
         ExpectedGuard = $false
+        SurrogateCarrier = ''
+        SurrogateRawToken = ''
+        CaptureMaterializationFailure = $false
     }
+}
+
+function Set-ControlSurrogateFixture {
+    param(
+        [hashtable]$Fixture,
+        [string]$Carrier,
+        [string]$Mode,
+        [string]$RawToken,
+        [bool]$Malformed
+    )
+    $intendedIdentity = switch -CaseSensitive ($Mode) {
+        'paired' { 'issuer-' + [char]::ConvertFromUtf32(0x1f600) }
+        'paired-distinct' { 'issuer-' + [char]::ConvertFromUtf32(0x1f603) }
+        'literal' { 'issuer-\uD800' }
+        'literal-low' { 'issuer-\uDC00' }
+        'replacement' { 'issuer-' + [char]0xfffd }
+        'malformed' { 'issuer-exact-01' }
+        default { throw 'Unknown surrogate fixture identity mode.' }
+    }
+    $Fixture.Principal.issuer = $intendedIdentity
+    $Fixture.Configuration.controlAuthorization.principals[0].issuer = $intendedIdentity
+    $Fixture.Command.issuer = $intendedIdentity
+
+    # Serialize only a safe placeholder, then replace its JSON token with literal
+    # escaped bytes. No invalid in-memory UTF-16 goes through a repairing serializer.
+    $placeholder = 'surrogate-fixture-token'
+    if ($Carrier -ceq 'command') {
+        $Fixture.Command.issuer = $placeholder
+        $json = ConvertTo-Json -InputObject $Fixture.Command -Depth 20 -Compress
+        $Fixture.Command.issuer = $intendedIdentity
+    }
+    elseif ($Carrier -ceq 'policy') {
+        $Fixture.Configuration.controlAuthorization.principals[0].issuer = $placeholder
+        $json = ConvertTo-Json -InputObject $Fixture.Configuration -Depth 20 -Compress
+        $Fixture.Configuration.controlAuthorization.principals[0].issuer = $intendedIdentity
+    }
+    else { throw 'Unknown surrogate fixture carrier.' }
+    $token = '"' + $placeholder + '"'
+    if ([regex]::Matches($json, [regex]::Escape($token)).Count -ne 1) {
+        throw 'The surrogate fixture placeholder was not unique.'
+    }
+    $bytes = [Text.Encoding]::UTF8.GetBytes($json.Replace($token, $RawToken))
+    if ($Carrier -ceq 'command') { $Fixture.RawCommand = $bytes }
+    else { $Fixture.RawConfiguration = $bytes }
+    $Fixture.SurrogateCarrier = $Carrier
+    $Fixture.SurrogateRawToken = $RawToken
+    $Fixture.CaptureMaterializationFailure = $Malformed
 }
 
 function Set-ControlFixtureMutation {
@@ -355,6 +405,30 @@ foreach ($grant in $actions.Keys) {
     }
 }
 
+# Valid controls precede the first original-helper RED case; the existing matrix
+# and literal cases keep their relative order and expectations.
+$surrogateRows = @(
+    ,@('surrogate-command-paired','command','paired','"issuer-\uD83D\uDE00"','Eligible','EligibleUnderAssumptions','valid')
+    ,@('surrogate-policy-paired','policy','paired','"issuer-\uD83D\uDE00"','Eligible','EligibleUnderAssumptions','valid')
+    ,@('surrogate-command-literal','command','literal','"issuer-\\uD800"','Eligible','EligibleUnderAssumptions','valid')
+    ,@('surrogate-policy-literal','policy','literal-low','"issuer-\\uDC00"','Eligible','EligibleUnderAssumptions','valid')
+    ,@('surrogate-command-paired-distinct','command','paired-distinct','"issuer-\uD83D\uDE00"','Ineligible','PrincipalBindingMismatch','valid')
+    ,@('surrogate-command-literal-distinct','command','paired','"issuer-\\uD83D\\uDE00"','Ineligible','PrincipalBindingMismatch','valid')
+    ,@('surrogate-command-high','command','malformed','"issuer-\uD800"','Ineligible','CommandInvalid','malformed')
+    ,@('surrogate-command-low','command','malformed','"issuer-\uDC00"','Ineligible','CommandInvalid','malformed')
+    ,@('surrogate-policy-high','policy','malformed','"issuer-\uD800"','Ineligible','PolicyInvalid','malformed')
+    ,@('surrogate-policy-low','policy','malformed','"issuer-\uDC00"','Ineligible','PolicyInvalid','malformed')
+    ,@('surrogate-command-high-replacement','command','replacement','"issuer-\uD800"','Ineligible','CommandInvalid','malformed')
+    ,@('surrogate-policy-low-replacement','policy','replacement','"issuer-\uDC00"','Ineligible','PolicyInvalid','malformed')
+)
+foreach ($row in $surrogateRows) {
+    $cases.Add(@{
+        Id = $row[0]; Action = 'session.reply'; Grant = 'reply'; Mutation = 'none'
+        SurrogateCarrier = $row[1]; SurrogateMode = $row[2]; SurrogateRawToken = $row[3]
+        Eligibility = $row[4]; Reason = $row[5]; MalformedSurrogate = ($row[6] -ceq 'malformed')
+    })
+}
+
 $rows = @(
     ,@('missing-config','Unavailable','ConfigurationReadFailed')
     ,@('directory-config','Unavailable','ConfigurationReadFailed')
@@ -546,6 +620,10 @@ try {
         [void][IO.Directory]::CreateDirectory($root)
         $fixture = New-ControlFixture -Root $root -Action $case.Action -GrantedCapability $case.Grant
         Set-ControlFixtureMutation -Fixture $fixture -Mutation $case.Mutation
+        if ($case.ContainsKey('SurrogateCarrier')) {
+            Set-ControlSurrogateFixture -Fixture $fixture -Carrier $case.SurrogateCarrier `
+                -Mode $case.SurrogateMode -RawToken $case.SurrogateRawToken -Malformed $case.MalformedSurrogate
+        }
         # The actual input path may intentionally be invalid. Only fixture-owned
         # configuration.json is created; an outside guard target is never touched.
         $writtenPath = Join-Path $root 'configuration.json'
@@ -557,12 +635,21 @@ try {
         }
         $commandBytes = $fixture.RawCommand
         if ($null -eq $commandBytes) { $commandBytes = ConvertTo-ControlFixtureBytes $fixture.Command -Pretty:$fixture.PrettyCommand }
+        if ($fixture.SurrogateCarrier) {
+            $escapedBytes = $commandBytes
+            if ($fixture.SurrogateCarrier -ceq 'policy') { $escapedBytes = $configurationBytes }
+            $escapedText = [Text.Encoding]::UTF8.GetString($escapedBytes)
+            Test-ControlThat "$($case.Id): the intended escaped JSON token reaches the component unchanged" (
+                [regex]::Matches($escapedText, [regex]::Escape($fixture.SurrogateRawToken)).Count -eq 1 -and
+                -not $escapedText.Contains([string][char]0xfffd))
+        }
         $before = Get-ControlFixtureSnapshot $root
         $commandBefore = if ($commandBytes -is [byte[]]) { Get-ControlFixtureHash -Bytes $commandBytes } else { '' }
         $contentBefore = if ($fixture.Content -is [byte[]]) { Get-ControlFixtureHash -Bytes $fixture.Content } else { '' }
         $actual = @()
         $guard = $false
         $exceptionClass = ''
+        $failureSite = $null
         $script:ControlCalls++
         try {
             $actual = @(Get-BridgeControlEligibility -ConfigurationContext $fixture.ConfigurationContext `
@@ -571,12 +658,26 @@ try {
         }
         catch {
             $failure = $_.Exception
+            $lastFailure = $failure
             while ($null -ne $failure) {
                 if ($failure.Data['BridgeTestWriteBlocked']) { $guard = $true }
+                if ($failure.Data['BridgeTestNetworkBlocked'] -or $failure -is [ObjectDisposedException]) { throw }
+                $lastFailure = $failure
                 $exceptionClass = $failure.GetType().FullName
                 $failure = $failure.InnerException
             }
-            if (-not $fixture.ExpectedGuard) { throw }
+            if ($guard -and -not $fixture.ExpectedGuard) { throw }
+            if (-not $fixture.ExpectedGuard -and -not $fixture.CaptureMaterializationFailure) { throw }
+            if ($fixture.CaptureMaterializationFailure) {
+                if ($lastFailure.GetType() -ne [InvalidOperationException]) { throw }
+                $invocation = $_.InvocationInfo
+                $failureSite = [ordered]@{ Command = $null; Script = $null; Line = $null }
+                if ($null -ne $invocation) {
+                    if ($null -ne $invocation.MyCommand) { $failureSite.Command = [string]$invocation.MyCommand.Name }
+                    $failureSite.Script = [IO.Path]::GetFileName([string]$invocation.ScriptName)
+                    $failureSite.Line = $invocation.ScriptLineNumber
+                }
+            }
         }
         $after = Get-ControlFixtureSnapshot $root
         $record = [ordered]@{
@@ -587,6 +688,7 @@ try {
             CommandUnchanged = ($commandBefore -eq '' -or $commandBefore -ceq (Get-ControlFixtureHash -Bytes $commandBytes))
             ContentUnchanged = ($contentBefore -eq '' -or $contentBefore -ceq (Get-ControlFixtureHash -Bytes $fixture.Content))
         }
+        if ($fixture.CaptureMaterializationFailure) { $record['FailureSite'] = $failureSite }
         Write-Host ('CONTROL_POLICY_CASE ' + ($record | ConvertTo-Json -Depth 8 -Compress))
         Test-ControlThat "$($case.Id): configuration and caller buffers are unchanged" (
             $record.ConfigurationUnchanged -and $record.CommandUnchanged -and $record.ContentUnchanged)
@@ -614,6 +716,12 @@ try {
         if ($case.Reason -in @('InvalidJson', 'InvalidUtf8', 'ConfigurationReadFailed')) {
             Test-ControlThat "$($case.Id): an actual safe exception class is retained" (
                 $actual[0].DiagnosticType -match '^System\.[A-Za-z.]+Exception$')
+        }
+        if ($fixture.CaptureMaterializationFailure) {
+            Test-ControlThat "$($case.Id): only the narrow materialization failure becomes schema ineligibility" (
+                $actual[0].DiagnosticType -ceq 'System.InvalidOperationException' -and
+                $actual[0].DiagnosticPhase -ceq $(if ($fixture.SurrogateCarrier -ceq 'policy') { 'Policy' } else { 'Command' }) -and
+                $exceptionClass -ceq '' -and $null -eq $failureSite)
         }
         if ($case.Eligibility -ceq 'Eligible') {
             Test-ControlThat "$($case.Id): exact original bytes define both digests and request identity" (

@@ -43,10 +43,11 @@ function Get-BridgeControlEligibility {
     }
 
     function Stop-ControlEvaluation {
-        param([string]$Reason, [string]$Eligibility = 'Ineligible')
+        param([string]$Reason, [string]$Eligibility = 'Ineligible', [string]$DiagnosticType = '')
         $failure = [IO.InvalidDataException]::new('Control eligibility validation refused the input.')
         $failure.Data['BridgeControlReason'] = $Reason
         $failure.Data['BridgeControlEligibility'] = $Eligibility
+        $failure.Data['BridgeControlDiagnosticType'] = $DiagnosticType
         throw $failure
     }
 
@@ -85,7 +86,63 @@ function Get-BridgeControlEligibility {
         param($Value, [string]$Reason, [switch]$Json, [switch]$Path)
         if ($Json) {
             if ($Value.ValueKind -ne [Text.Json.JsonValueKind]::String) { Stop-ControlEvaluation $Reason }
-            $Value = $Value.GetString()
+            $jsonString = $Value
+            try { $Value = $jsonString.GetString() }
+            catch {
+                $materializationFailure = $_.Exception
+                $actualFailure = $materializationFailure
+                while ($null -ne $materializationFailure) {
+                    if ($materializationFailure.Data['BridgeTestWriteBlocked'] -or
+                        $materializationFailure.Data['BridgeTestNetworkBlocked'] -or
+                        $materializationFailure -is [ObjectDisposedException]) { throw }
+                    $actualFailure = $materializationFailure
+                    $materializationFailure = $materializationFailure.InnerException
+                }
+                if ($actualFailure.GetType() -ne [InvalidOperationException]) { throw }
+
+                # JsonDocument can retain an unpaired escaped surrogate as a String.
+                # Classify only that raw-token defect, not every GetString lifetime
+                # or programming failure. Escaped backslashes are not recursive \u.
+                $raw = $jsonString.GetRawText()
+                $end = $raw.Length - 1
+                if ($end -lt 1 -or $raw[0] -ne [char]34 -or $raw[$end] -ne [char]34) { throw }
+                $cursor = 1
+                $malformedSurrogate = $false
+                while ($cursor -lt $end) {
+                    if ($raw[$cursor] -ne [char]92) { $cursor++; continue }
+                    if ($cursor + 1 -ge $end) { throw }
+                    if ($raw[$cursor + 1] -ne [char]117) { $cursor += 2; continue }
+                    if ($cursor + 6 -gt $end) { throw }
+                    $unit = 0
+                    if (-not [int]::TryParse($raw.Substring($cursor + 2, 4),
+                            [Globalization.NumberStyles]::HexNumber,
+                            [Globalization.CultureInfo]::InvariantCulture, [ref]$unit)) { throw }
+                    if ($unit -ge 0xdc00 -and $unit -le 0xdfff) {
+                        $malformedSurrogate = $true
+                        break
+                    }
+                    if ($unit -ge 0xd800 -and $unit -le 0xdbff) {
+                        $next = $cursor + 6
+                        if ($next + 6 -gt $end -or $raw[$next] -ne [char]92 -or
+                            $raw[$next + 1] -ne [char]117) {
+                            $malformedSurrogate = $true
+                            break
+                        }
+                        $low = 0
+                        if (-not [int]::TryParse($raw.Substring($next + 2, 4),
+                                [Globalization.NumberStyles]::HexNumber,
+                                [Globalization.CultureInfo]::InvariantCulture, [ref]$low)) { throw }
+                        if ($low -lt 0xdc00 -or $low -gt 0xdfff) {
+                            $malformedSurrogate = $true
+                            break
+                        }
+                        $cursor += 12
+                    }
+                    else { $cursor += 6 }
+                }
+                if (-not $malformedSurrogate) { throw }
+                Stop-ControlEvaluation -Reason $Reason -DiagnosticType $actualFailure.GetType().FullName
+            }
         }
         $maximum = if ($Path) { 32768 } else { 256 }
         if ($Value -isnot [string] -or $Value.Length -eq 0 -or $Value.Length -gt $maximum -or
@@ -476,7 +533,8 @@ function Get-BridgeControlEligibility {
         if ($guardFailure) { throw }
         if ($null -ne $validationFailure) {
             return New-ControlResult ([string]$validationFailure.Data['BridgeControlEligibility']) `
-                ([string]$validationFailure.Data['BridgeControlReason'])
+                ([string]$validationFailure.Data['BridgeControlReason']) `
+                ([string]$validationFailure.Data['BridgeControlDiagnosticType'])
         }
         if ($actual -is [Text.DecoderFallbackException]) {
             return New-ControlResult 'Ineligible' 'InvalidUtf8' $actual.GetType().FullName

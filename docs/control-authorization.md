@@ -233,13 +233,28 @@ Every ordinary result contains exactly:
 | `RequestId` | Validated request ID, or null before validation |
 | `CommandSha256`, `ContentSha256` | Exact digests, or null before their computation |
 | `DiagnosticPhase` | Inputs, configuration read/UTF-8/JSON, policy, command UTF-8/JSON/validation, time, content UTF-8/validation, or eligibility |
-| `DiagnosticType` | Empty for component refusals; actual exception class for handled file/decoder/parser failures |
+| `DiagnosticType` | Empty when no exception is translated; actual safe exception class for handled file/decoder/parser/string-materialization failures |
 
 Reasons distinguish missing/invalid inputs and policy, byte ceilings, version/action
 and capability mismatch, principal/configuration/generation/target binding, missing
 grants/scopes, invalid time, expiry, not-before and content/digest refusal. File errors
 return `Unavailable / ConfigurationReadFailed`, with the actual safe exception class.
 Invalid UTF-8/JSON returns `Ineligible / InvalidUtf8` or `InvalidJson`.
+
+JSON parsing can retain a String token containing an unpaired escaped UTF-16
+surrogate even though materializing that value is invalid. At the existing String
+kind boundary, only an exact `System.InvalidOperationException` from `GetString`,
+together with a raw token containing an unpaired escaped high/low surrogate,
+becomes the caller's named schema ineligibility (for example `PolicyInvalid` or
+`CommandInvalid`). Its `DiagnosticType` retains that safe exception class.
+
+Classification is local to the materialization call and does not match exception
+messages. Guard markers, disposed-document/lifetime errors, other exception types
+and an unexpected materialization failure without that raw-token defect propagate.
+No global InvalidOperationException fallback is added. Valid supplementary pairs
+and literal backslash-u text are neither replaced nor recursively decoded, and no
+malformed value is repaired into a different eligible identity. Original byte
+digests and exact decoded-identity comparisons remain unchanged.
 
 No result returns configuration/policy bodies, credentials, raw content, paths,
 exception messages, authenticated/admitted/done flags or native completion claims.
@@ -268,6 +283,21 @@ fresh policy reads. A repeated eligible evaluation explicitly demonstrates that 
 is not replay prevention; a supplied clock moving backwards demonstrates that there
 is no persisted clock-history protection. It does not authenticate HA/MQTT/MCP, probe
 a live process, alter privileges or exercise producer migration.
+
+Escaped-surrogate regressions construct actual JSON bytes by replacing one safe
+serialized placeholder with an explicit escaped token, not by serializing an
+invalid in-memory surrogate. Policy and command paths include high/low refusals,
+valid paired/literal controls, distinct-identity controls and replacement-character
+grant counterexamples. Valid controls precede the first malformed regression.
+The existing cases retain their relative order and outcomes.
+
+Only those new malformed cases may retain the expected exact original-helper
+InvalidOperationException as safe class and invocation-site metadata before the
+unchanged named-result assertion fails. They never fabricate an Ineligible result
+for that RED baseline. Other unexpected, disposed-document and guard failures still
+propagate. This records an actual failure if a later
+authorized original-helper run reaches it; it is not product reproduction evidence
+from source preparation, and no complete exception chain is invented.
 
 Source preparation and static parser/analyzer results do not mean this fixture has
 run. Runtime validation requires its own reviewed byte seal, assertion inventory and
