@@ -318,14 +318,14 @@ try {
     function Write-OwnerRightsComparisonPhase {
         param(
             [Parameter(Mandatory)]
-            [ValidateSet('existing-before', 'after-owner-read', 'after-set-owner', 'after-persist', 'after-profile-readback', 'before-postcondition', IgnoreCase = $false)]
+            [ValidateSet('existing-before', 'after-owner-read', 'after-set-owner', 'after-persist', 'after-profile-readback', 'before-owner-readiness-check', IgnoreCase = $false)]
             [string]$Phase,
             [Parameter(Mandatory)][string]$Path, [AllowEmptyCollection()][string[]]$BytePaths = @(),
             [Security.Principal.SecurityIdentifier]$UserSid, [Security.Principal.SecurityIdentifier]$DefaultOwnerSid,
             [AllowNull()]$Descriptor = $null
         )
         Assert-BridgeTestPath -Path $Path
-        $phases = @('existing-before', 'after-owner-read', 'after-set-owner', 'after-persist', 'after-profile-readback', 'before-postcondition')
+        $phases = @('existing-before', 'after-owner-read', 'after-set-owner', 'after-persist', 'after-profile-readback', 'before-owner-readiness-check')
         $availability = [ordered]@{
             Item = 'not-attempted'; SecurityDescriptor = 'not-attempted'; Owner = 'not-attempted'
             Dacl = 'not-attempted'; Bytes = 'not-attempted'; Descriptor = 'not-provided'; Runtime = 'not-attempted'
@@ -463,7 +463,8 @@ try {
         }
         catch { $availability.Runtime = 'unavailable'; Add-OwnerRightsSetupReadError -Stage 'phase-runtime' -ErrorRecord $_ -Errors $errors }
         $observation = [ordered]@{
-            SchemaVersion = 1; Phase = $Phase; Ordinal = [Array]::IndexOf($phases, $Phase) + 1
+            SchemaVersion = 2; Phase = $Phase; Ordinal = [Array]::IndexOf($phases, $Phase) + 1
+            SetupIntent = 'fresh-current-owner-modify-baseline'; ComparisonBaselineReady = $false
             TargetLeaf = 'directory-control'; ReadAvailability = [pscustomobject]$availability
             Owner = $ownerFacts; Dacl = $daclFacts
             RequestedByteWitnessCount = $witnessPaths.Count; ByteWitnessCount = $byteWitnessCount; ByteWitnesses = $byteWitnesses
@@ -488,6 +489,9 @@ try {
         $bytePaths = @($PreserveFiles)
         if (-not $before.State.IsDirectory) { $bytePaths += $Path }
         $bytesBefore = @(Get-OwnerRightsByteEvidence -Paths $bytePaths)
+        if (-not $bytesBefore.Count) {
+            throw 'OWNER_RIGHTS_FIXTURE_UNESTABLISHED: a comparison baseline needs a real byte-preservation witness.'
+        }
         $required = -not $before.State.OwnerMatchesCurrentUser
         $capturePhases = $before.State.IsDirectory -and [StringComparer]::Ordinal.Equals([IO.Path]::GetFileName($Path), 'directory-control') -and
             -not (Get-Variable -Name OwnerRightsComparisonPhaseClaimed -Scope Script -ErrorAction Ignore)
@@ -513,6 +517,7 @@ try {
                 Assert-OwnerRightsErrorNotGuard -ErrorRecord $setupError
                 $cause = $setupError.Exception.GetBaseException()
                 Write-Host ('OWNER_RIGHTS_OWNER_ESTABLISH ' + (@{
+                    schemaVersion = 2; setupIntent = 'fresh-current-owner-modify-baseline'; comparisonBaselineReady = $false
                     leaf = [IO.Path]::GetFileName($Path); outcome = 'failed'; ownerWriteAttempted = $true
                     beforeOwner = $before.Owner; errorType = $cause.GetType().FullName; hresult = $cause.HResult
                 } | ConvertTo-Json -Depth 5 -Compress))
@@ -526,22 +531,34 @@ try {
         if ($capturePhases) {
             Write-OwnerRightsComparisonPhase -Phase after-profile-readback -Path $Path -BytePaths $bytePaths -UserSid $UserSid -DefaultOwnerSid $DefaultOwnerSid -Descriptor $(if ($required) { $ownerOnly } else { $null })
         }
-        $accessUnchanged = $accessBefore -ceq (Get-OwnerRightsDaclFingerprint -Path $Path) -and
+        $accessAfter = Get-OwnerRightsDaclFingerprint -Path $Path
+        $accessUnchanged = $accessBefore -ceq $accessAfter -and
             $before.State.AccessRulesProtected -eq $after.State.AccessRulesProtected
-        $bytesUnchanged = Test-OwnerRightsEvidenceEqual $bytesBefore @(Get-OwnerRightsByteEvidence -Paths $bytePaths)
+        $bytesAfter = @(Get-OwnerRightsByteEvidence -Paths $bytePaths)
+        $bytesUnchanged = Test-OwnerRightsEvidenceEqual $bytesBefore $bytesAfter
+        # Fresh owner initialization may change inherited ACLs. The exact Modify
+        # baseline is deliberately established and verified before any comparison.
         Write-Host ('OWNER_RIGHTS_OWNER_ESTABLISH ' + (@{
+            schemaVersion = 2; setupIntent = 'fresh-current-owner-modify-baseline'; comparisonBaselineReady = $false
             leaf = [IO.Path]::GetFileName($Path); freshCreation = $true; ownerWriteAttempted = $required
-            outcome = $(if ($after.State.OwnerMatchesCurrentUser -and $accessUnchanged -and $bytesUnchanged) { 'established' } else { 'readback-failed' })
+            outcome = $(if ($after.State.OwnerMatchesCurrentUser -and $bytesUnchanged) { 'owner-ready-before-modify' } else { 'readback-failed' })
             beforeOwner = $before.Owner; afterOwner = $after.Owner
             before = ConvertTo-OwnerRightsStateEvidence $before.State
             after = ConvertTo-OwnerRightsStateEvidence $after.State
             daclUnchanged = $accessUnchanged; originalBytesPreserved = $bytesUnchanged
+            beforeDaclSha256 = $accessBefore; afterDaclSha256 = $accessAfter
+            byteWitnessCount = $bytesBefore.Count
         } | ConvertTo-Json -Depth 6 -Compress))
         if ($capturePhases) {
-            Write-OwnerRightsComparisonPhase -Phase before-postcondition -Path $Path -BytePaths $bytePaths -UserSid $UserSid -DefaultOwnerSid $DefaultOwnerSid -Descriptor $(if ($required) { $ownerOnly } else { $null })
+            Write-OwnerRightsComparisonPhase -Phase before-owner-readiness-check -Path $Path -BytePaths $bytePaths -UserSid $UserSid -DefaultOwnerSid $DefaultOwnerSid -Descriptor $(if ($required) { $ownerOnly } else { $null })
         }
-        if (-not $after.State.OwnerMatchesCurrentUser -or -not $accessUnchanged -or -not $bytesUnchanged) {
-            throw 'OWNER_RIGHTS_FIXTURE_UNESTABLISHED: fresh owner setup changed data/DACL state or did not establish the current user.'
+        if (-not $after.State.OwnerMatchesCurrentUser -or -not $bytesUnchanged) {
+            throw 'OWNER_RIGHTS_FIXTURE_UNESTABLISHED: fresh owner initialization changed data or did not establish the current user.'
+        }
+        [pscustomobject]@{
+            OwnerWriteAttempted = $required; IntermediateDaclUnchanged = $accessUnchanged
+            InitialDaclSha256 = $accessBefore; OwnerReadyDaclSha256 = $accessAfter
+            BytePaths = $bytePaths; OriginalByteEvidence = $bytesBefore
         }
     }
 
@@ -644,7 +661,7 @@ try {
 
     function Set-OwnerRightsFixtureModifyDacl {
         param([string]$Path, [string[]]$PreserveFiles = @())
-        Initialize-OwnerRightsComparisonOwner -Path $Path -PreserveFiles $PreserveFiles `
+        $ownerSetup = Initialize-OwnerRightsComparisonOwner -Path $Path -PreserveFiles $PreserveFiles `
             -UserSid $ownerRightsCurrentUser -DefaultOwnerSid $ownerRightsDefaultOwner
         $before = Get-OwnerRightsFixtureState -Path $Path
         Write-OwnerRightsSetupDiagnostic -Path $Path -GuardOwnerMatchesCurrentUser $before.OwnerMatchesCurrentUser
@@ -666,8 +683,35 @@ try {
             [Security.AccessControl.PropagationFlags]::None, [Security.AccessControl.AccessControlType]::Allow))
         # Access-only setup never asks to change an owner or creates a deny ACE.
         [IO.FileSystemAclExtensions]::SetAccessControl($item, $descriptor)
-        $after = Get-OwnerRightsFixtureState -Path $Path
-        if (-not $after.ExactModifyDacl) { throw 'OWNER_RIGHTS_FIXTURE_UNESTABLISHED: the actual owner/Modify-only DACL shape differs.' }
+        $afterProfile = Get-OwnerRightsCreationProfile -Path $Path `
+            -UserSid $ownerRightsCurrentUser -DefaultOwnerSid $ownerRightsDefaultOwner
+        $after = $afterProfile.State
+        $baselineAccess = [IO.FileSystemAclExtensions]::GetAccessControl(
+            (Get-Item -LiteralPath $Path -Force -ErrorAction Stop), [Security.AccessControl.AccessControlSections]::Access)
+        $baselineCanonical = $baselineAccess.AreAccessRulesCanonical
+        $baselineDaclSha256 = Get-OwnerRightsDaclFingerprint -Path $Path
+        $baselineBytes = @(Get-OwnerRightsByteEvidence -Paths $ownerSetup.BytePaths)
+        $bytesPreserved = Test-OwnerRightsEvidenceEqual $ownerSetup.OriginalByteEvidence $baselineBytes
+        Assert-OwnerRightsTokenProfile -UserSid $ownerRightsCurrentUser -DefaultOwnerSid $ownerRightsDefaultOwner
+        $baselineReady = $after.ExactModifyDacl -and $afterProfile.Owner.EqualsCurrentUser -and $baselineCanonical -and
+            $after.IsDirectory -eq $before.IsDirectory -and $ownerSetup.OriginalByteEvidence.Count -gt 0 -and $bytesPreserved
+        [Console]::Out.WriteLine('OWNER_RIGHTS_COMPARISON_BASELINE ' + (@{
+            schemaVersion = 1; setupIntent = 'fresh-current-owner-modify-baseline'
+            leaf = [IO.Path]::GetFileName($Path); ownerWriteAttempted = $ownerSetup.OwnerWriteAttempted
+            intermediateDaclUnchanged = $ownerSetup.IntermediateDaclUnchanged
+            initialDaclSha256 = $ownerSetup.InitialDaclSha256; ownerReadyDaclSha256 = $ownerSetup.OwnerReadyDaclSha256
+            beforeModify = ConvertTo-OwnerRightsStateEvidence $before
+            baseline = ConvertTo-OwnerRightsStateEvidence $after
+            baselineCanonical = $baselineCanonical; baselineDaclSha256 = $baselineDaclSha256
+            originalByteWitnesses = @($ownerSetup.OriginalByteEvidence | Select-Object Length, Sha256)
+            finalByteWitnesses = @($baselineBytes | Select-Object Length, Sha256)
+            byteWitnessCount = $baselineBytes.Count; originalBytesPreserved = $bytesPreserved
+            tokenProfileVerified = $true; comparisonBaselineReady = $baselineReady
+        } | ConvertTo-Json -Depth 6 -Compress))
+        [Console]::Out.Flush()
+        if (-not $baselineReady) {
+            throw 'OWNER_RIGHTS_FIXTURE_UNESTABLISHED: the fresh comparison did not reach the exact current-owner canonical Modify baseline with preserved bytes.'
+        }
         $after
     }
 
@@ -704,18 +748,26 @@ try {
         if ($ownerRightsKind -eq 'directory') {
             New-OwnerRightsComparisonPath -Path $ownerRightsControl -Directory
             New-OwnerRightsComparisonPath -Path $ownerRightsTarget -Directory
+            $ownerRightsControlBytesPath = Join-Path $ownerRightsControl 'existing.bin'
+            Assert-BridgeTestPath -Path $ownerRightsControlBytesPath
+            [IO.File]::WriteAllBytes($ownerRightsControlBytesPath, [byte[]](0, 1, 2, 127, 255))
             $ownerRightsBytesPath = Join-Path $ownerRightsTarget 'existing.bin'
         }
         else {
             New-OwnerRightsComparisonPath -Path $ownerRightsControl
             New-OwnerRightsComparisonPath -Path $ownerRightsTarget
             [IO.File]::WriteAllBytes($ownerRightsControl, [byte[]](0, 1, 2, 127, 255))
+            $ownerRightsControlBytesPath = $ownerRightsControl
             $ownerRightsBytesPath = $ownerRightsTarget
         }
         Assert-BridgeTestPath -Path $ownerRightsBytesPath
         [IO.File]::WriteAllBytes($ownerRightsBytesPath, [byte[]](0, 1, 2, 127, 255))
-        $ownerRightsControlBefore = Set-OwnerRightsFixtureModifyDacl -Path $ownerRightsControl
+        $ownerRightsControlBefore = Set-OwnerRightsFixtureModifyDacl -Path $ownerRightsControl -PreserveFiles @($ownerRightsControlBytesPath)
         $ownerRightsTargetBefore = Set-OwnerRightsFixtureModifyDacl -Path $ownerRightsTarget -PreserveFiles @($ownerRightsBytesPath)
+        if (-not (Test-OwnerRightsEvidenceEqual (ConvertTo-OwnerRightsStateEvidence $ownerRightsControlBefore) `
+            (ConvertTo-OwnerRightsStateEvidence $ownerRightsTargetBefore))) {
+            throw 'OWNER_RIGHTS_FIXTURE_UNESTABLISHED: the fresh control and target comparison baselines differ.'
+        }
         Assert-OwnerRightsTokenProfile -UserSid $ownerRightsCurrentUser -DefaultOwnerSid $ownerRightsDefaultOwner
         $ownerRightsDescriptor = [IO.FileSystemAclExtensions]::GetAccessControl(
             (Get-Item -LiteralPath $ownerRightsControl -Force), [Security.AccessControl.AccessControlSections]::Owner)
