@@ -91,6 +91,16 @@ Complete records retain normal UTF-8 replacement decoding. Cursors track byte
 positions, not file identity: same-size/larger replacement or truncation followed
 by regrowth can go undetected. Existing shrink and session-adoption policies remain.
 
+Registration discovery keeps validated live sessions separate from uncertain ownership.
+An unreadable or incomplete record does not retire its known owner, clear a pending
+decision, or let an older retirement queue delete it; valid neighboring sessions still
+stream activity. Incomplete discovery conservatively holds absence-based cleanup,
+launch/resume decisions and complete global-inventory/dashboard replacement while
+observing the actual accepted view. Existing cards keep updating, but a newly adopted
+card may wait for completeness. A successful reread, including repair at the same file
+timestamp, resumes held work without a restart; a skipped operation is not cached as
+published. This does not promise atomic registration writes or file-identity recovery.
+
 **The hooks are fast.** An agent waits for every hook, and starting PowerShell alone
 takes a quarter of a second, so each hook is a small native program,
 `agent-bridge-hook`, that hands the event to the daemon and returns in tens of

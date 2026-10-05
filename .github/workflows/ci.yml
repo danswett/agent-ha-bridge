@@ -98,8 +98,137 @@ jobs:
           if ($LASTEXITCODE) { throw 'build failed' }
 
       - name: Canonical offline PowerShell suites
+        id: offline
         shell: pwsh
-        run: pwsh -NoProfile -File tests/run-tests.ps1
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $results = Join-Path $env:RUNNER_TEMP ("bridge-offline-{0}-{1}-{2}-{3}" -f
+            $env:GITHUB_RUN_ID, $env:GITHUB_RUN_ATTEMPT, $env:GITHUB_JOB, [guid]::NewGuid().ToString('N'))
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "results-directory=$results" -Encoding utf8
+          $checkout = @(git rev-parse --verify HEAD)
+          if ($LASTEXITCODE -ne 0 -or $checkout.Count -ne 1 -or $checkout[0] -cnotmatch '^[0-9a-f]{40}$') {
+            throw 'Cannot identify the checkout before the Offline run.'
+          }
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "checkout-sha=$($checkout[0])" -Encoding utf8
+          $runner = Join-Path 'tests' 'run-tests.ps1'
+          pwsh -NoProfile -File $runner -ResultsDirectory $results
+          $runnerExit = $LASTEXITCODE
+          exit $runnerExit
+
+      # Success must retain the child-suite evidence too, not just a green job status.
+      - name: Collect bounded Offline evidence
+        id: offline-evidence
+        if: ${{ always() }}
+        shell: pwsh
+        env:
+          OFFLINE_RESULTS: ${{ steps.offline.outputs.results-directory }}
+          OFFLINE_CHECKOUT_SHA: ${{ steps.offline.outputs.checkout-sha }}
+          OFFLINE_OUTCOME: ${{ steps.offline.outcome }}
+          CI_EVENT_SHA: ${{ github.sha }}
+          CI_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          CI_WORKFLOW_REF: ${{ github.workflow_ref }}
+          CI_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CI_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $tempRoot = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd([IO.Path]::DirectorySeparatorChar)
+          $bundle = Join-Path $tempRoot ("bridge-offline-evidence-" + [guid]::NewGuid().ToString('N'))
+          if (Test-Path -LiteralPath $bundle) { throw 'The evidence bundle already exists.' }
+          [void](New-Item -ItemType Directory -Path $bundle -ErrorAction Stop)
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "bundle-directory=$bundle" -Encoding utf8
+          $sourceState = 'not-provided'
+          $sourceErrorType = $null
+          $results = $null
+          if (-not [string]::IsNullOrWhiteSpace($env:OFFLINE_RESULTS)) {
+            try {
+              if (-not [IO.Path]::IsPathFullyQualified($env:OFFLINE_RESULTS)) { throw 'Results path is not absolute.' }
+              $results = [IO.Path]::GetFullPath($env:OFFLINE_RESULTS)
+              $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+              if (-not [string]::Equals([IO.Path]::GetDirectoryName($results), $tempRoot, $comparison)) {
+                throw 'Results path is not a direct child of runner temp.'
+              }
+              $sourceState = 'missing'
+              if (Test-Path -LiteralPath $results) {
+                $directory = Get-Item -LiteralPath $results -Force
+                if (-not $directory.PSIsContainer -or ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                  throw 'Results path is not an unlinked directory.'
+                }
+                $sourceState = 'present'
+              }
+            }
+            catch {
+              $sourceState = 'unavailable'
+              $sourceErrorType = $_.Exception.GetType().FullName
+            }
+          }
+          $names = @(
+            'summary.json',
+            'tests_test-registration-isolation_ps1.log',
+            'tests_test-decision-lifecycle_ps1.log',
+            'tests_test-write-boundary-callers_ps1.log'
+          )
+          $files = [Collections.Generic.List[object]]::new()
+          foreach ($name in $names) {
+            $entry = [ordered]@{ name = $name; state = 'missing'; bytes = $null; sha256 = $null; errorType = $null }
+            if ($sourceState -eq 'unavailable') { $entry.state = 'unavailable' }
+            elseif ($sourceState -eq 'present') {
+              try {
+                $source = Join-Path $results $name
+                if (Test-Path -LiteralPath $source) {
+                  $item = Get-Item -LiteralPath $source -Force
+                  if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                    throw 'An allowlisted result is not an unlinked file.'
+                  }
+                  $hash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
+                  $target = Join-Path $bundle $name
+                  Copy-Item -LiteralPath $source -Destination $target -ErrorAction Stop
+                  $entry.bytes = (Get-Item -LiteralPath $target).Length
+                  $entry.sha256 = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
+                  if ($entry.sha256 -cne $hash -or $entry.bytes -ne $item.Length) { throw 'Evidence copy differs from its source.' }
+                  $entry.state = 'present'
+                }
+              }
+              catch {
+                $entry.state = 'error'
+                $entry.errorType = $_.Exception.GetType().FullName
+              }
+            }
+            $files.Add($entry)
+          }
+          $checkout = @(git rev-parse --verify HEAD)
+          $checkoutSha = if ($LASTEXITCODE -eq 0 -and $checkout.Count -eq 1 -and $checkout[0] -cmatch '^[0-9a-f]{40}$') {
+            $checkout[0]
+          } else { $null }
+          [ordered]@{
+            schemaVersion = 1
+            checkoutSha = $checkoutSha; offlineCheckoutSha = $env:OFFLINE_CHECKOUT_SHA
+            eventSha = $env:CI_EVENT_SHA; workflowSha = $env:CI_WORKFLOW_SHA; workflowRef = $env:CI_WORKFLOW_REF
+            prHeadSha = $(if ($env:CI_PR_HEAD_SHA) { $env:CI_PR_HEAD_SHA } else { $null })
+            prBaseSha = $(if ($env:CI_PR_BASE_SHA) { $env:CI_PR_BASE_SHA } else { $null })
+            runId = $env:GITHUB_RUN_ID; runAttempt = $env:GITHUB_RUN_ATTEMPT
+            job = $env:GITHUB_JOB; os = $env:RUNNER_OS; offlineOutcome = $env:OFFLINE_OUTCOME
+            sourceState = $sourceState; sourceErrorType = $sourceErrorType; files = $files.ToArray()
+          } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $bundle 'provenance.json') -Encoding utf8
+          if (-not $checkoutSha -or $sourceState -eq 'unavailable' -or @($files | Where-Object { $_.state -eq 'error' }).Count) {
+            throw 'Offline evidence collection failed; see provenance.json for explicit availability states.'
+          }
+          if ($env:OFFLINE_OUTCOME -eq 'success' -and
+              (@($files | Where-Object { $_.state -ne 'present' -or $_.bytes -eq 0 }).Count -or
+               -not [StringComparer]::Ordinal.Equals($checkoutSha, $env:OFFLINE_CHECKOUT_SHA))) {
+            throw 'A successful Offline run lacks required evidence or its checkout changed.'
+          }
+
+      - name: Upload bounded Offline evidence
+        if: ${{ always() && steps.offline-evidence.outputs.bundle-directory != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: offline-evidence-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          path: ${{ steps.offline-evidence.outputs.bundle-directory }}
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: false
 
   macos:
     name: macOS (platform layer, tmux delivery, suites)
@@ -149,8 +278,137 @@ jobs:
           go build -trimpath -ldflags '-s -w' -o agent-bridge-hook .
 
       - name: Canonical offline PowerShell suites
+        id: offline
         shell: pwsh
-        run: pwsh -NoProfile -File tests/run-tests.ps1
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $results = Join-Path $env:RUNNER_TEMP ("bridge-offline-{0}-{1}-{2}-{3}" -f
+            $env:GITHUB_RUN_ID, $env:GITHUB_RUN_ATTEMPT, $env:GITHUB_JOB, [guid]::NewGuid().ToString('N'))
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "results-directory=$results" -Encoding utf8
+          $checkout = @(git rev-parse --verify HEAD)
+          if ($LASTEXITCODE -ne 0 -or $checkout.Count -ne 1 -or $checkout[0] -cnotmatch '^[0-9a-f]{40}$') {
+            throw 'Cannot identify the checkout before the Offline run.'
+          }
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "checkout-sha=$($checkout[0])" -Encoding utf8
+          $runner = Join-Path 'tests' 'run-tests.ps1'
+          pwsh -NoProfile -File $runner -ResultsDirectory $results
+          $runnerExit = $LASTEXITCODE
+          exit $runnerExit
+
+      # Success must retain the child-suite evidence too, not just a green job status.
+      - name: Collect bounded Offline evidence
+        id: offline-evidence
+        if: ${{ always() }}
+        shell: pwsh
+        env:
+          OFFLINE_RESULTS: ${{ steps.offline.outputs.results-directory }}
+          OFFLINE_CHECKOUT_SHA: ${{ steps.offline.outputs.checkout-sha }}
+          OFFLINE_OUTCOME: ${{ steps.offline.outcome }}
+          CI_EVENT_SHA: ${{ github.sha }}
+          CI_WORKFLOW_SHA: ${{ github.workflow_sha }}
+          CI_WORKFLOW_REF: ${{ github.workflow_ref }}
+          CI_PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+          CI_PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $PSNativeCommandUseErrorActionPreference = $false
+          $tempRoot = [IO.Path]::GetFullPath($env:RUNNER_TEMP).TrimEnd([IO.Path]::DirectorySeparatorChar)
+          $bundle = Join-Path $tempRoot ("bridge-offline-evidence-" + [guid]::NewGuid().ToString('N'))
+          if (Test-Path -LiteralPath $bundle) { throw 'The evidence bundle already exists.' }
+          [void](New-Item -ItemType Directory -Path $bundle -ErrorAction Stop)
+          Add-Content -LiteralPath $env:GITHUB_OUTPUT -Value "bundle-directory=$bundle" -Encoding utf8
+          $sourceState = 'not-provided'
+          $sourceErrorType = $null
+          $results = $null
+          if (-not [string]::IsNullOrWhiteSpace($env:OFFLINE_RESULTS)) {
+            try {
+              if (-not [IO.Path]::IsPathFullyQualified($env:OFFLINE_RESULTS)) { throw 'Results path is not absolute.' }
+              $results = [IO.Path]::GetFullPath($env:OFFLINE_RESULTS)
+              $comparison = if ($IsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+              if (-not [string]::Equals([IO.Path]::GetDirectoryName($results), $tempRoot, $comparison)) {
+                throw 'Results path is not a direct child of runner temp.'
+              }
+              $sourceState = 'missing'
+              if (Test-Path -LiteralPath $results) {
+                $directory = Get-Item -LiteralPath $results -Force
+                if (-not $directory.PSIsContainer -or ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                  throw 'Results path is not an unlinked directory.'
+                }
+                $sourceState = 'present'
+              }
+            }
+            catch {
+              $sourceState = 'unavailable'
+              $sourceErrorType = $_.Exception.GetType().FullName
+            }
+          }
+          $names = @(
+            'summary.json',
+            'tests_test-registration-isolation_ps1.log',
+            'tests_test-decision-lifecycle_ps1.log',
+            'tests_test-write-boundary-callers_ps1.log'
+          )
+          $files = [Collections.Generic.List[object]]::new()
+          foreach ($name in $names) {
+            $entry = [ordered]@{ name = $name; state = 'missing'; bytes = $null; sha256 = $null; errorType = $null }
+            if ($sourceState -eq 'unavailable') { $entry.state = 'unavailable' }
+            elseif ($sourceState -eq 'present') {
+              try {
+                $source = Join-Path $results $name
+                if (Test-Path -LiteralPath $source) {
+                  $item = Get-Item -LiteralPath $source -Force
+                  if ($item.PSIsContainer -or ($item.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                    throw 'An allowlisted result is not an unlinked file.'
+                  }
+                  $hash = (Get-FileHash -LiteralPath $source -Algorithm SHA256).Hash
+                  $target = Join-Path $bundle $name
+                  Copy-Item -LiteralPath $source -Destination $target -ErrorAction Stop
+                  $entry.bytes = (Get-Item -LiteralPath $target).Length
+                  $entry.sha256 = (Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash
+                  if ($entry.sha256 -cne $hash -or $entry.bytes -ne $item.Length) { throw 'Evidence copy differs from its source.' }
+                  $entry.state = 'present'
+                }
+              }
+              catch {
+                $entry.state = 'error'
+                $entry.errorType = $_.Exception.GetType().FullName
+              }
+            }
+            $files.Add($entry)
+          }
+          $checkout = @(git rev-parse --verify HEAD)
+          $checkoutSha = if ($LASTEXITCODE -eq 0 -and $checkout.Count -eq 1 -and $checkout[0] -cmatch '^[0-9a-f]{40}$') {
+            $checkout[0]
+          } else { $null }
+          [ordered]@{
+            schemaVersion = 1
+            checkoutSha = $checkoutSha; offlineCheckoutSha = $env:OFFLINE_CHECKOUT_SHA
+            eventSha = $env:CI_EVENT_SHA; workflowSha = $env:CI_WORKFLOW_SHA; workflowRef = $env:CI_WORKFLOW_REF
+            prHeadSha = $(if ($env:CI_PR_HEAD_SHA) { $env:CI_PR_HEAD_SHA } else { $null })
+            prBaseSha = $(if ($env:CI_PR_BASE_SHA) { $env:CI_PR_BASE_SHA } else { $null })
+            runId = $env:GITHUB_RUN_ID; runAttempt = $env:GITHUB_RUN_ATTEMPT
+            job = $env:GITHUB_JOB; os = $env:RUNNER_OS; offlineOutcome = $env:OFFLINE_OUTCOME
+            sourceState = $sourceState; sourceErrorType = $sourceErrorType; files = $files.ToArray()
+          } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath (Join-Path $bundle 'provenance.json') -Encoding utf8
+          if (-not $checkoutSha -or $sourceState -eq 'unavailable' -or @($files | Where-Object { $_.state -eq 'error' }).Count) {
+            throw 'Offline evidence collection failed; see provenance.json for explicit availability states.'
+          }
+          if ($env:OFFLINE_OUTCOME -eq 'success' -and
+              (@($files | Where-Object { $_.state -ne 'present' -or $_.bytes -eq 0 }).Count -or
+               -not [StringComparer]::Ordinal.Equals($checkoutSha, $env:OFFLINE_CHECKOUT_SHA))) {
+            throw 'A successful Offline run lacks required evidence or its checkout changed.'
+          }
+
+      - name: Upload bounded Offline evidence
+        if: ${{ always() && steps.offline-evidence.outputs.bundle-directory != '' }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: offline-evidence-${{ github.run_id }}-${{ github.run_attempt }}-${{ github.job }}
+          path: ${{ steps.offline-evidence.outputs.bundle-directory }}
+          if-no-files-found: error
+          retention-days: 7
+          overwrite: false
 
   installer-host:
     name: Installer host tests (${{ matrix.os }})

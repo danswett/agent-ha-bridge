@@ -30,7 +30,8 @@ $script:ClaudeProjectsRoot = Join-Path $script:BridgeInstallContext.ClaudeHome '
 $script:ClaudeSessionStaleMinutes = 240
 
 function Get-ClaudeStateRoot {
-    if (-not (Test-Path -LiteralPath $script:ClaudeStateRoot)) {
+    param([switch]$NoCreate)
+    if (-not $NoCreate -and -not (Test-Path -LiteralPath $script:ClaudeStateRoot)) {
         New-Item -ItemType Directory -Path $script:ClaudeStateRoot -Force | Out-Null
     }
     $script:ClaudeStateRoot
@@ -158,7 +159,11 @@ function Get-ClaudeSessionRegistrations {
         call grows without bound. Measured at 200 stale entries it cost ~350 ms a
         call before this.
     #>
-    param([switch]$IncludeStale)
+    param([switch]$IncludeStale, [switch]$AsObservation)
+
+    if ($AsObservation) {
+        return Read-DaemonAdapterRegistrations -Kind claude -Root (Get-ClaudeStateRoot -NoCreate)
+    }
 
     $root = Get-ClaudeStateRoot
     if (-not (Test-Path -LiteralPath $root)) { return @() }

@@ -135,6 +135,382 @@ function New-DaemonCopilotSession {
     }
 }
 
+function Read-DaemonRegistrationFile {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][ValidateSet('claude', 'codex')][string]$Kind,
+        [ValidateSet('Discovery', 'Hook')][string]$Projection = 'Discovery'
+    )
+    $stamp = $null
+    $code = 'ReadFailed'
+    try {
+        if (Test-BridgeTestExecution) { Assert-BridgeTestPath -Path $Path }
+        $file = Get-Item -LiteralPath $Path -ErrorAction Stop
+        if ($file.PSIsContainer -or ($file.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+            $code = 'UnsafeRecordPath'
+            throw 'Registration path is not an ordinary file.'
+        }
+        $stamp = $file.LastWriteTimeUtc.Ticks
+        $length = $file.Length
+        $raw = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 -ErrorAction Stop
+        $code = 'InvalidJson'
+        $parsed = $raw | ConvertFrom-Json -NoEnumerate -ErrorAction Stop
+        $code = 'InvalidRecordShape'
+        if ($parsed -isnot [pscustomobject]) { throw 'Registration is not a JSON object.' }
+        $value = [ordered]@{}
+        $required = if ($Projection -eq 'Discovery') {
+            @('SessionId', 'TranscriptPath', 'WorkingDirectory', 'Updated') +
+                $(if ($Kind -eq 'codex') { @('Model', 'Status', 'Activity') } else { @() })
+        } elseif ($Kind -eq 'codex') { @('Status', 'Activity') } else { @() }
+        $optional = if ($Kind -eq 'claude') { @('HookStatus', 'HookStatusAt') } else { @('Model', 'Updated') }
+        foreach ($field in @($required) + @($optional)) {
+            $property = $parsed.PSObject.Properties[$field]
+            if (-not $property) {
+                if ($required -contains $field) { throw 'A required registration field is missing.' }
+                continue
+            }
+            $text = $property.Value
+            if ($field -in @('Updated', 'HookStatusAt') -and
+                ($text -is [datetime] -or $text -is [DateTimeOffset])) { $text = ([DateTimeOffset]$text).ToString('o') }
+            if ($text -isnot [string]) { throw 'A registration field has the wrong type.' }
+            if ($field -eq 'SessionId' -and [string]::IsNullOrWhiteSpace($text)) { throw 'Registration identity is empty.' }
+            if ($field -in @('Updated', 'HookStatusAt') -and $text) {
+                $instant = [DateTimeOffset]::MinValue
+                if (-not [DateTimeOffset]::TryParse($text, [ref]$instant)) { throw 'Registration timestamp is invalid.' }
+            }
+            $value[$field] = $text
+        }
+        if ($Projection -eq 'Discovery' -or $parsed.PSObject.Properties['ProcessId']) {
+            $processId = 0
+            if (-not $parsed.PSObject.Properties['ProcessId'] -or
+                $parsed.ProcessId -is [bool] -or $parsed.ProcessId -is [Array] -or
+                -not [int]::TryParse([string]$parsed.ProcessId, [ref]$processId) -or $processId -lt 0) {
+                throw 'Registration process identity is invalid.'
+            }
+            $value['ProcessId'] = $processId
+        }
+        if ($Projection -eq 'Discovery') {
+            $key = if ($Kind -eq 'claude') { Get-ClaudeSafeSessionKey -SessionId $value.SessionId }
+                else { Get-CodexSafeSessionKey -SessionId $value.SessionId }
+            $comparison = if ($script:BridgeIsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+            if (-not [string]::Equals($file.Name, "$key.json", $comparison)) { throw 'Registration identity does not match its path.' }
+            $value['Ended'] = $false
+            if ($Kind -eq 'codex' -and $parsed.PSObject.Properties['Ended']) {
+                if ($parsed.Ended -isnot [bool]) { throw 'Registration ended state is invalid.' }
+                $value['Ended'] = $parsed.Ended
+            }
+        }
+        $file.Refresh()
+        if (-not $file.Exists -or $file.LastWriteTimeUtc.Ticks -ne $stamp -or $file.Length -ne $length) {
+            $code = 'ChangedDuringRead'
+            throw 'Registration changed during the read.'
+        }
+        return [pscustomobject]@{ Known = $true; Record = [pscustomobject]$value; Stamp = $stamp; Path = $Path; Diagnostic = $null }
+    }
+    catch {
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        return [pscustomobject]@{
+            Known = $false; Record = $null; Stamp = $stamp; Path = $Path
+            Diagnostic = [pscustomobject]@{ Kind = $Kind; Path = $Path; Code = $code }
+        }
+    }
+}
+
+function Read-DaemonAdapterRegistrations {
+    param([Parameter(Mandatory)][ValidateSet('claude', 'codex')][string]$Kind, [Parameter(Mandatory)][string]$Root)
+    if (Test-BridgeTestExecution) { Assert-BridgeTestPath -Path $Root }
+    $inventory = Get-BridgeAgentProcesses -Agent $Kind -AsObservation
+    $known = [bool]$inventory.Known
+    $diagnostics = [Collections.Generic.List[object]]::new()
+    foreach ($diagnostic in $inventory.Diagnostics) {
+        if ($diagnostic.Code -ne 'ProcessDisappeared') {
+            $diagnostics.Add([pscustomobject]@{ Kind = $Kind; Path = $Root; Code = $diagnostic.Code })
+        }
+    }
+    $livePids = @{}
+    foreach ($process in $inventory.Processes) { $livePids[[int]$process.Id] = $true }
+    $accounted = @{}
+    $records = [Collections.Generic.List[object]]::new()
+    $files = @()
+    try {
+        if (Test-Path -LiteralPath $Root -ErrorAction Stop) {
+            $directory = Get-Item -LiteralPath $Root -ErrorAction Stop
+            if (-not $directory.PSIsContainer -or ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                throw 'Registration root is not an ordinary directory.'
+            }
+            $files = @(Get-ChildItem -LiteralPath $Root -Filter '*.json' -File -ErrorAction Stop)
+        }
+    }
+    catch {
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        $known = $false
+        $diagnostics.Add([pscustomobject]@{ Kind = $Kind; Path = $Root; Code = 'EnumerationFailed' })
+    }
+    foreach ($file in $files) {
+        if ($Kind -eq 'codex' -and $file.Name -like '*.approval.json') { continue }
+        $read = Read-DaemonRegistrationFile -Path $file.FullName -Kind $Kind
+        if (-not $read.Known) {
+            $known = $false
+            $diagnostics.Add($read.Diagnostic)
+            continue
+        }
+        $entry = $read.Record
+        $alive = $entry.ProcessId -gt 0 -and $livePids.ContainsKey($entry.ProcessId) -and -not $entry.Ended
+        if ($entry.ProcessId -gt 0 -and $livePids.ContainsKey($entry.ProcessId)) {
+            $accounted[$entry.ProcessId] = $true
+        }
+        if (-not $entry.Ended -and ($entry.ProcessId -eq 0 -or (-not $alive -and -not $inventory.Known))) {
+            $known = $false
+            $diagnostics.Add([pscustomobject]@{ Kind = $Kind; Path = $file.FullName; Code = 'OwnerUnresolved' })
+            continue
+        }
+        if ($Kind -eq 'claude' -and $alive -and [string]::IsNullOrWhiteSpace($entry.TranscriptPath)) {
+            $known = $false
+            $diagnostics.Add([pscustomobject]@{ Kind = $Kind; Path = $file.FullName; Code = 'TranscriptIdentityMissing' })
+            continue
+        }
+        $entry | Add-Member -NotePropertyName IsLive -NotePropertyValue $alive
+        $entry | Add-Member -NotePropertyName StatePath -NotePropertyValue $file.FullName
+        $records.Add($entry)
+        $staleMinutes = if ($Kind -eq 'claude') { $script:ClaudeSessionStaleMinutes } else { $script:CodexSessionStaleMinutes }
+        $fresh = -not $entry.Updated -or [DateTimeOffset]::Parse($entry.Updated) -gt [DateTimeOffset]::Now.AddMinutes(-$staleMinutes)
+        # Keep a validated Ended receipt while its process is still draining. Deleting
+        # it first would make that same process "unaccounted" on the retirement pass.
+        $endedCanPrune = $entry.Ended -and ($entry.ProcessId -eq 0 -or ($inventory.Known -and -not $livePids.ContainsKey($entry.ProcessId)))
+        if ($endedCanPrune -or (-not $entry.Ended -and $inventory.Known -and $entry.ProcessId -gt 0 -and
+                -not $alive -and ($Kind -eq 'codex' -or -not $fresh))) {
+            try { Remove-Item -LiteralPath $file.FullName -Force -ErrorAction Stop }
+            catch {
+                if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+                $known = $false
+                $diagnostics.Add([pscustomobject]@{ Kind = $Kind; Path = $file.FullName; Code = 'PruneFailed' })
+            }
+        }
+    }
+    foreach ($processId in $livePids.Keys) {
+        if (-not $accounted.ContainsKey($processId)) {
+            $known = $false
+            $diagnostics.Add([pscustomobject]@{ Kind = $Kind; Path = $Root; Code = 'UnaccountedProcess' })
+        }
+    }
+    [pscustomobject]@{ Known = $known; Records = @($records.ToArray()); Diagnostics = @($diagnostics.ToArray()) }
+}
+
+function New-DaemonDiscoverySnapshot {
+    param([hashtable]$Live = @{}, [hashtable]$State = @{}, [switch]$Complete)
+    $catalogue = @{}
+    $previous = Get-Variable -Name DaemonOwnerCatalogue -Scope Script -ErrorAction SilentlyContinue
+    $pending = Get-Variable -Name DaemonPendingRetire -Scope Script -ErrorAction SilentlyContinue
+    $ids = @(@($State.Keys) + @($Live.Keys) + $(if ($pending) { @($pending.Value) } else { @() }) | Select-Object -Unique)
+    foreach ($id in $ids) {
+        if (-not $id) { continue }
+        $kind = ''
+        $path = ''
+        if ($Live.ContainsKey($id)) {
+            $session = $Live[$id]
+            if ($session.PSObject.Properties['Kind']) { $kind = [string]$session.Kind }
+            if ($session.PSObject.Properties['RegistrationPath']) { $path = [string]$session.RegistrationPath }
+        }
+        if (-not $kind -and $State.ContainsKey($id) -and $null -ne $State[$id] -and $State[$id].PSObject.Properties['Kind']) {
+            $kind = [string]$State[$id].Kind
+        }
+        if (-not $path -and $previous -and $previous.Value.ContainsKey($id)) {
+            $kind = [string]$previous.Value[$id].Kind
+            $path = [string]$previous.Value[$id].Path
+        }
+        $keyReader = if ($kind -eq 'claude') { 'Get-ClaudeSafeSessionKey' } else { 'Get-CodexSafeSessionKey' }
+        if (-not $path -and $kind -in @('claude', 'codex') -and (Get-Command $keyReader -ErrorAction SilentlyContinue)) {
+            $key = if ($kind -eq 'claude') { Get-ClaudeSafeSessionKey -SessionId $id } else { Get-CodexSafeSessionKey -SessionId $id }
+            $path = Get-BridgeRuntimePath "agent-bridge-$kind\$key.json"
+        }
+        $catalogue[$id] = [pscustomobject]@{ SessionId = [string]$id; Kind = $kind; Path = $path }
+    }
+    [pscustomobject]@{
+        Complete = [bool]$Complete; Live = $Live; PositiveLive = $Live
+        OwnerCatalogue = $catalogue; UncertainIds = @{}; UncertainKinds = @{}
+        Diagnostics = [Collections.Generic.List[object]]::new()
+    }
+}
+
+function Set-DaemonDiscoveryUncertain {
+    param(
+        [AllowNull()]$Snapshot = $null, [string]$Kind = '', [string]$Path = '',
+        [string]$SessionId = '', [string]$Code = 'RecordUnreadable'
+    )
+    if ($null -eq $Snapshot) {
+        $current = Get-Variable -Name DaemonDiscoverySnapshot -Scope Script -ErrorAction SilentlyContinue
+        if ($current -and $current.Value) { $Snapshot = $current.Value }
+        else {
+            $active = Get-Variable -Name DaemonLive -Scope Script -ErrorAction SilentlyContinue
+            $map = if ($active -and $active.Value -is [hashtable]) { $active.Value } else { @{} }
+            $Snapshot = New-DaemonDiscoverySnapshot -Live $map
+            $script:DaemonDiscoverySnapshot = $Snapshot
+        }
+    }
+    $Snapshot.Complete = $false
+    $matches = @()
+    if ($SessionId) { $matches = @($SessionId) }
+    elseif ($Path) {
+        $comparison = if ($script:BridgeIsWindows) { [StringComparison]::OrdinalIgnoreCase } else { [StringComparison]::Ordinal }
+        $matches = @($Snapshot.OwnerCatalogue.Keys | Where-Object {
+            $owner = $Snapshot.OwnerCatalogue[$_]
+            $owner.Kind -eq $Kind -and $owner.Path -and [string]::Equals($owner.Path, $Path, $comparison)
+        })
+    }
+    foreach ($id in $matches) {
+        $Snapshot.UncertainIds[$id] = $true
+        [void]$Snapshot.Live.Remove($id)
+    }
+    if ($matches.Count -eq 0) { $Snapshot.UncertainKinds[$Kind] = $true }
+    $Snapshot.Diagnostics.Add([pscustomobject]@{ Kind = $Kind; Path = $Path; Code = $Code; KnownOwners = @($matches) })
+    Write-DaemonLog -Message "session discovery uncertain ($Kind/$Code); absence-based work is held"
+}
+
+function Test-DaemonRetirementObservation {
+    param([AllowNull()]$Snapshot, [Parameter(Mandatory)][string]$SessionId)
+    if (-not (Test-DaemonDiscoveryContext -Snapshot $Snapshot)) { return $false }
+    if ($Snapshot.Live.ContainsKey($SessionId) -or $Snapshot.UncertainIds.ContainsKey($SessionId)) { return $false }
+    # Unknown attribution deliberately protects the whole local negative namespace.
+    # This does not add an owner to PositiveLive or expire uncertainty into death.
+    [bool]$Snapshot.Complete
+}
+
+function Test-DaemonDiscoveryContext {
+    param([AllowNull()]$Snapshot)
+    if ($null -eq $Snapshot) { return $false }
+    foreach ($field in @('Complete', 'Live', 'PositiveLive', 'UncertainIds', 'OwnerCatalogue')) {
+        if (-not $Snapshot.PSObject.Properties[$field]) { return $false }
+    }
+    $Snapshot.Complete -is [bool] -and $Snapshot.Live -is [hashtable] -and
+        $Snapshot.UncertainIds -is [hashtable] -and $Snapshot.OwnerCatalogue -is [hashtable] -and
+        [object]::ReferenceEquals($Snapshot.Live, $Snapshot.PositiveLive)
+}
+
+function Update-DaemonOwnerCatalogue {
+    param([Parameter(Mandatory)]$Snapshot, [Parameter(Mandatory)][hashtable]$State)
+    $bounded = @{}
+    foreach ($id in @(@($State.Keys) + @($Snapshot.Live.Keys) + @($script:DaemonPendingRetire) | Select-Object -Unique)) {
+        if ($Snapshot.OwnerCatalogue.ContainsKey($id)) { $bounded[$id] = $Snapshot.OwnerCatalogue[$id] }
+    }
+    $script:DaemonOwnerCatalogue = $bounded
+}
+
+function Get-DaemonSessionDiscovery {
+    param([hashtable]$State = @{})
+    $live = @{}
+    $issues = [Collections.Generic.List[object]]::new()
+    $selected = Get-BridgeSelectedClients
+    foreach ($kind in @($script:DaemonAgents.Keys)) {
+        if ($null -ne $selected -and $selected -notcontains $kind) { continue }
+        try {
+            $result = switch ($kind) {
+                'claude' { Get-LiveClaudeSessions -AsObservation }
+                'codex' { Get-LiveCodexSessions -AsObservation }
+                default {
+                    $find = (Get-DaemonAgent -Kind $kind).FindSessions
+                    $map = if ($find) { & $find } else { @{} }
+                    if ($map -isnot [hashtable]) { throw 'Invalid discovery result.' }
+                    $inventory = Get-BridgeAgentProcesses -Agent $kind -AsObservation
+                    $pids = @{}
+                    foreach ($process in $inventory.Processes) { $pids[[int]$process.Id] = $true }
+                    $validated = @{}
+                    $accounted = @{}
+                    $legacyIssues = [Collections.Generic.List[object]]::new()
+                    foreach ($id in $map.Keys) {
+                        $session = $map[$id]
+                        $pidValue = 0
+                        if ($null -eq $session -or -not $session.PSObject.Properties['ProcessId'] -or
+                            -not [int]::TryParse([string]$session.ProcessId, [ref]$pidValue) -or
+                            -not $pids.ContainsKey($pidValue)) {
+                            $legacyIssues.Add([pscustomobject]@{ Kind = $kind; Path = ''; Code = 'SessionProcessUnresolved'; SessionId = [string]$id })
+                            continue
+                        }
+                        $validated[$id] = $session
+                        $accounted[$pidValue] = $true
+                    }
+                    foreach ($pidValue in $pids.Keys) {
+                        if (-not $accounted.ContainsKey($pidValue)) {
+                            $legacyIssues.Add([pscustomobject]@{ Kind = $kind; Path = ''; Code = 'UnaccountedProcess' })
+                        }
+                    }
+                    foreach ($diagnostic in $inventory.Diagnostics) {
+                        if ($diagnostic.Code -ne 'ProcessDisappeared') {
+                            $legacyIssues.Add([pscustomobject]@{ Kind = $kind; Path = ''; Code = $diagnostic.Code })
+                        }
+                    }
+                    [pscustomobject]@{
+                        Known = $inventory.Known -and $legacyIssues.Count -eq 0
+                        Live = $validated; Diagnostics = @($legacyIssues.ToArray())
+                    }
+                }
+            }
+            foreach ($id in $result.Live.Keys) {
+                if ($live.ContainsKey($id)) {
+                    $issues.Add([pscustomobject]@{ Kind = ''; Path = ''; Code = 'AmbiguousSessionId'; SessionId = [string]$id })
+                }
+                $live[$id] = $result.Live[$id]
+            }
+            foreach ($issue in $result.Diagnostics) { $issues.Add($issue) }
+            if (-not $result.Known -and @($result.Diagnostics).Count -eq 0) {
+                $issues.Add([pscustomobject]@{ Kind = $kind; Path = ''; Code = 'IncompleteAdapter' })
+            }
+        }
+        catch {
+            if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+            $issues.Add([pscustomobject]@{ Kind = $kind; Path = ''; Code = 'AdapterReadFailed' })
+        }
+    }
+    $snapshot = New-DaemonDiscoverySnapshot -Live $live -State $State -Complete
+    foreach ($id in @($live.Keys)) {
+        if (-not $State.ContainsKey($id) -or $null -eq $State[$id] -or
+            -not $State[$id].PSObject.Properties['Kind'] -or
+            -not $live[$id].PSObject.Properties['Kind']) { continue }
+        $priorKind = [string]$State[$id].Kind
+        if ($priorKind -in @('copilot', 'claude', 'codex') -and $priorKind -ne [string]$live[$id].Kind) {
+            $issues.Add([pscustomobject]@{ Kind = ''; Path = ''; Code = 'OwnerKindChanged'; SessionId = [string]$id })
+        }
+    }
+    foreach ($issue in $issues) {
+        $id = if ($issue.PSObject.Properties['SessionId']) { [string]$issue.SessionId } else { '' }
+        Set-DaemonDiscoveryUncertain -Snapshot $snapshot -Kind $issue.Kind -Path $issue.Path -Code $issue.Code -SessionId $id
+    }
+    foreach ($group in @($snapshot.OwnerCatalogue.Values | Where-Object Path | Group-Object Path -CaseSensitive:(-not $script:BridgeIsWindows))) {
+        if ($group.Count -le 1) { continue }
+        foreach ($owner in $group.Group) {
+            Set-DaemonDiscoveryUncertain -Snapshot $snapshot -Kind $owner.Kind -Path $owner.Path `
+                -SessionId $owner.SessionId -Code 'AmbiguousRegistrationPath'
+        }
+    }
+    $snapshot
+}
+
+function Get-DaemonUnavailableAdapterObservation {
+    param([Parameter(Mandatory)][ValidateSet('claude', 'codex')][string]$Kind)
+    $inventory = Get-BridgeAgentProcesses -Agent $Kind -AsObservation
+    $root = Get-BridgeRuntimePath "agent-bridge-$Kind"
+    $hasRecords = $true
+    try {
+        $hasRecords = $false
+        if (Test-Path -LiteralPath $root -ErrorAction Stop) {
+            $directory = Get-Item -LiteralPath $root -ErrorAction Stop
+            if (-not $directory.PSIsContainer -or ($directory.Attributes -band [IO.FileAttributes]::ReparsePoint)) {
+                throw 'Unavailable adapter root is unreadable.'
+            }
+            $hasRecords = @(Get-ChildItem -LiteralPath $root -Filter '*.json' -File -ErrorAction Stop |
+                Where-Object { $Kind -ne 'codex' -or $_.Name -notlike '*.approval.json' }).Count -gt 0
+        }
+    }
+    catch {
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        $hasRecords = $true
+    }
+    $known = $inventory.Known -and $inventory.Processes.Count -eq 0 -and -not $hasRecords
+    [pscustomobject]@{
+        Known = [bool]$known; Live = @{}
+        Diagnostics = $(if ($known) { @() } else { @([pscustomobject]@{ Kind = $Kind; Path = $root; Code = 'AdapterUnavailable' }) })
+    }
+}
+
 function Get-LiveCodexSessions {
     <#
         Live Codex sessions, from the registrations its hooks write.
@@ -147,10 +523,16 @@ function Get-LiveCodexSessions {
         Liveness is authoritative here in a way it is not for the others, because
         Codex fires an explicit SessionEnd.
     #>
-    if (-not $script:CodexAdapterLoaded) { return @{} }
-
+    param([switch]$AsObservation)
     $live = @{}
-    foreach ($registration in @(Get-CodexSessionRegistrations)) {
+    if (-not $script:CodexAdapterLoaded) {
+        $unavailable = Get-DaemonUnavailableAdapterObservation -Kind codex
+        if ($AsObservation) { return $unavailable }
+        if (-not $unavailable.Known) { throw 'Codex session discovery is unavailable.' }
+        return $live
+    }
+    $observed = Get-CodexSessionRegistrations -AsObservation
+    foreach ($registration in $observed.Records) {
         if (-not $registration.IsLive) { continue }
         $live[$registration.SessionId] = [pscustomobject]@{
             SessionId        = $registration.SessionId
@@ -161,8 +543,11 @@ function Get-LiveCodexSessions {
             Activity         = $registration.Activity
             LastWrite        = [DateTime]::UtcNow
             Kind             = 'codex'
+            RegistrationPath = $registration.StatePath
         }
     }
+    if ($AsObservation) { return [pscustomobject]@{ Known = $observed.Known; Live = $live; Diagnostics = $observed.Diagnostics } }
+    if (-not $observed.Known) { throw 'Codex session discovery is incomplete; use its observation result.' }
     $live
 }
 
@@ -427,6 +812,8 @@ function Get-LiveMcpSessions {
 
 function Get-LiveBridgeSessions {
     <# Every live session across the front ends the bridge supports (see daemon-agents.ps1). #>
+    param([switch]$AsObservation, [hashtable]$State = @{})
+    if ($AsObservation) { return Get-DaemonSessionDiscovery -State $State }
     $live = @{}
     $selected = Get-BridgeSelectedClients
     foreach ($kind in @($script:DaemonAgents.Keys)) {
@@ -447,10 +834,16 @@ function Get-LiveClaudeSessions {
         Claude has no inuse.<pid>.lock, so liveness is the recorded pid still being a
         running claude process - established in Get-ClaudeSessionRegistrations.
     #>
-    if (-not $script:ClaudeAdapterLoaded) { return @{} }
-
+    param([switch]$AsObservation)
     $live = @{}
-    foreach ($registration in @(Get-ClaudeSessionRegistrations)) {
+    if (-not $script:ClaudeAdapterLoaded) {
+        $unavailable = Get-DaemonUnavailableAdapterObservation -Kind claude
+        if ($AsObservation) { return $unavailable }
+        if (-not $unavailable.Known) { throw 'Claude session discovery is unavailable.' }
+        return $live
+    }
+    $observed = Get-ClaudeSessionRegistrations -AsObservation
+    foreach ($registration in $observed.Records) {
         if (-not $registration.IsLive) { continue }
         # Claude creates the transcript only when the first message is sent, so a
         # session just started - from the dashboard, typically - has none yet. It is
@@ -467,10 +860,13 @@ function Get-LiveClaudeSessions {
             LastWrite        = [IO.File]::GetLastWriteTimeUtc($transcript)
             Kind             = 'claude'
             # The status the last hook set, and when (see Sync-DaemonHookStatus).
-            HookStatus       = [string]$registration.HookStatus
-            HookStatusAt     = [string]$registration.HookStatusAt
+            HookStatus       = if ($registration.PSObject.Properties['HookStatus']) { [string]$registration.HookStatus } else { '' }
+            HookStatusAt     = if ($registration.PSObject.Properties['HookStatusAt']) { [string]$registration.HookStatusAt } else { '' }
+            RegistrationPath = $registration.StatePath
         }
     }
+    if ($AsObservation) { return [pscustomobject]@{ Known = $observed.Known; Live = $live; Diagnostics = $observed.Diagnostics } }
+    if (-not $observed.Known) { throw 'Claude session discovery is incomplete; use its observation result.' }
     $live
 }
 

@@ -140,9 +140,15 @@ function Clear-CopilotMqttOrphans {
     #>
     param(
         [Parameter(Mandatory)][hashtable]$Headers,
-        [Parameter(Mandatory)][hashtable]$Live
+        [Parameter(Mandatory)][hashtable]$Live,
+        [AllowNull()]$Discovery = $null
     )
 
+    if (-not (Test-DaemonDiscoveryContext -Snapshot $Discovery) -or -not $Discovery.Complete -or
+        -not [object]::ReferenceEquals($Live, $Discovery.Live)) {
+        Write-DaemonLog -Message 'orphan sweep skipped: local session ownership observation is incomplete'
+        return $false
+    }
     $liveNodes = @{}
     foreach ($sessionId in $Live.Keys) {
         $liveNodes[(Get-CopilotMqttNodeId -SessionId $sessionId)] = $true
@@ -152,8 +158,9 @@ function Clear-CopilotMqttOrphans {
         $states = Get-DaemonHomeAssistantStates -Headers $Headers
     }
     catch {
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
         Write-DaemonLog -Message "orphan sweep skipped: $($_.Exception.Message)"
-        return
+        return $false
     }
 
     # Every machine, including this one, so a machine-level node is never mistaken for
@@ -161,7 +168,7 @@ function Clear-CopilotMqttOrphans {
     $peers = @(Get-BridgePeerMachine -States $states)
     if ($peers.Count -eq 0) {
         Write-DaemonLog -Message 'orphan sweep skipped: no machine sensors visible yet'
-        return
+        return $false
     }
     foreach ($peer in $peers) {
         $liveNodes[(Get-CopilotMqttMachineNode -Slug $peer.Slug)] = $true
@@ -191,11 +198,13 @@ function Clear-CopilotMqttOrphans {
                 Publish-CopilotMqttMessage -Topic $topic -Payload '' -Headers $Headers -Retain
             }
             catch {
+                if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
                 # Best effort; a missed one is caught on the next startup sweep.
             }
         }
         Write-DaemonLog -Message "cleared orphaned entities for node $node"
     }
+    $true
 }
 
 $script:DaemonStaleHelperSeen = @{}
@@ -353,13 +362,23 @@ function Sync-DaemonSessions {
 
         # The live sessions, when the caller has just found them - the main loop does,
         # and scanning twice a pass doubled the cost.
-        [hashtable]$Live
+        [hashtable]$Live,
+        [AllowNull()]$Discovery = $null
     )
 
-    $live = if ($null -ne $Live) { $Live } else { Get-LiveBridgeSessions }
+    if ($null -eq $Discovery) {
+        if ($null -ne $Live) { throw 'Session synchronization requires the live map and its observation context.' }
+        $Discovery = Get-LiveBridgeSessions -AsObservation -State $State
+    }
+    if (-not (Test-DaemonDiscoveryContext -Snapshot $Discovery)) { throw 'Session discovery context is invalid.' }
+    if ($null -ne $Live -and -not [object]::ReferenceEquals($Live, $Discovery.Live)) {
+        throw 'Session synchronization received mismatched discovery data.'
+    }
+    $live = $Discovery.Live
     $verbose = Test-VerboseStreaming -Headers $Headers
     # The fast lane streams between reconciles from this snapshot.
     $script:DaemonLive = $live
+    $script:DaemonDiscoverySnapshot = $Discovery
     $script:DaemonVerbose = $verbose
 
     # Note sessions that have exited, and drop them from state now, but defer removing
@@ -370,6 +389,7 @@ function Sync-DaemonSessions {
     $goneSessions = @()
     foreach ($known in @($State.Keys)) {
         if ($live.ContainsKey($known)) { continue }
+        if (-not (Test-DaemonRetirementObservation -Snapshot $Discovery -SessionId $known)) { continue }
         $goneSessions += $known
         $State.Remove($known)
     }
@@ -385,23 +405,30 @@ function Sync-DaemonSessions {
     }
 
     $descriptors = @(Get-DaemonSessionDescriptors -State $State -Headers $Headers)
-    $capabilities = Get-DaemonLaunchCapabilities
-    Publish-DaemonGlobalStatus -Descriptors $descriptors -Capabilities $capabilities `
-        -Resumable @($script:DaemonResumeOffered) -Headers $Headers
-    # $live, not $State.Keys: a session whose adoption returned $null is running but
-    # absent from state, and bundling one mid-sentence is exactly what this guards.
-    # The marked test-boundary throws are re-raised rather than logged, the convention
-    # #59 established: a suite that reaches the real transfer without stubbing it would
-    # otherwise see a tidy refusal and pass, which is the exact failure that change
-    # exists to close.
-    try { Invoke-DaemonTransferRequest -LiveSessionIds @($live.Keys) -Headers $Headers }
-    catch {
-        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
-        Write-DaemonLog -Message "transfer request check failed: $($_.Exception.Message)"
+    if ($Discovery.Complete) {
+        $capabilities = Get-DaemonLaunchCapabilities
+        Publish-DaemonGlobalStatus -Descriptors $descriptors -Capabilities $capabilities `
+            -Resumable @($script:DaemonResumeOffered) -Headers $Headers
+        # $live, not $State.Keys: a session whose adoption returned $null is running but
+        # absent from state, and bundling one mid-sentence is exactly what this guards.
+        # The marked test-boundary throws are re-raised rather than logged, the convention
+        # #59 established: a suite that reaches the real transfer without stubbing it would
+        # otherwise see a tidy refusal and pass, which is the exact failure that change
+        # exists to close. An incomplete view cannot authorize a transfer.
+        try { Invoke-DaemonTransferRequest -LiveSessionIds @($live.Keys) -Headers $Headers }
+        catch {
+            if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+            Write-DaemonLog -Message "transfer request check failed: $($_.Exception.Message)"
+        }
     }
     Publish-DaemonOnlineHeartbeat -Headers $Headers
-    $dashboardCurrent = Sync-DaemonDashboard -Descriptors $descriptors -Capabilities $capabilities -Headers $Headers
-    Complete-DaemonSessionRetirement -Gone $goneSessions -DashboardCurrent $dashboardCurrent -Headers $Headers
+    $dashboardCurrent = if ($Discovery.Complete) {
+        Sync-DaemonDashboard -Descriptors $descriptors -Capabilities $capabilities -Headers $Headers
+    } else {
+        Sync-DaemonDashboard -Descriptors $descriptors -Capabilities @{} -Headers $Headers -ObserveOnly
+    }
+    Complete-DaemonSessionRetirement -Gone $goneSessions -DashboardCurrent $dashboardCurrent -Headers $Headers -Discovery $Discovery
+    Update-DaemonOwnerCatalogue -Snapshot $Discovery -State $State
 }
 
 function Add-DaemonSession {
@@ -1200,9 +1227,22 @@ function Sync-DaemonDashboard {
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Descriptors,
         [Parameter(Mandatory)][hashtable]$Capabilities,
-        [Parameter(Mandatory)][hashtable]$Headers
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [switch]$ObserveOnly
     )
 
+    if ($ObserveOnly) {
+        $script:BridgeDashboardObservation = $null
+        try {
+            $script:BridgeDashboardObservation = Get-BridgeDashboardPublication
+            return [bool]$script:BridgeDashboardObservation.Verified
+        }
+        catch {
+            if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+            Write-DaemonLog -Message 'dashboard observation failed while session ownership is incomplete'
+            return $false
+        }
+    }
     $peers = @(Get-DaemonPeerMachines -Headers $Headers)
     $allDescriptors = @(Get-DaemonAllDescriptors -Descriptors $Descriptors -Peers $peers)
     $machineCards = @(Get-DaemonMachineCards -Capabilities $Capabilities -Peers $peers `
@@ -1245,7 +1285,7 @@ function Sync-DaemonDashboard {
         return $true
     }
     catch {
-        if ($_.Exception.Data['BridgeTestWriteBlocked']) { throw }
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
         if (-not $_.Exception.Data['BridgePublicationRefused']) { $script:BridgeDashboardObservation = $null }
         Write-DaemonLog -Message "dashboard publication not current: $($_.Exception.Message)"
         return $false
@@ -1270,7 +1310,8 @@ function Complete-DaemonSessionRetirement {
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Gone,
         [Parameter(Mandatory)][bool]$DashboardCurrent,
-        [Parameter(Mandatory)][hashtable]$Headers
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [AllowNull()]$Discovery = $null
     )
 
     # A non-writer can observe a valid newer renderer with different inputs. Retire
@@ -1282,11 +1323,23 @@ function Complete-DaemonSessionRetirement {
     $held = @()
     foreach ($queued in @($script:DaemonPendingRetire)) {
         if (-not $queued) { continue }
+        if ((Test-DaemonDiscoveryContext -Snapshot $Discovery) -and $Discovery.Live.ContainsKey($queued)) { continue }
+        if (-not (Test-DaemonRetirementObservation -Snapshot $Discovery -SessionId $queued)) {
+            $held += $queued
+            continue
+        }
         $node = Get-CopilotMqttNodeId -SessionId $queued
         if ($verified -and $observation.Value.ReferencedNodes -cnotcontains $node) { $safe += $queued }
         else { $held += $queued }
     }
-    $retirePlan = Update-DaemonRetireQueue -Queued $safe -Gone $Gone -DashboardCurrent ([bool]$verified)
+    $eligibleGone = @(
+        foreach ($id in $Gone) {
+            if ((Test-DaemonDiscoveryContext -Snapshot $Discovery) -and $Discovery.Live.ContainsKey($id)) { continue }
+            if (Test-DaemonRetirementObservation -Snapshot $Discovery -SessionId $id) { $id }
+            else { $held += $id }
+        }
+    )
+    $retirePlan = Update-DaemonRetireQueue -Queued $safe -Gone $eligibleGone -DashboardCurrent ([bool]$verified)
     $retirePlan.Queue = @(@($retirePlan.Queue) + $held | Select-Object -Unique)
     $script:DaemonPendingRetire = @($retirePlan.Queue)
     foreach ($known in @($retirePlan.Retire)) {
@@ -1296,6 +1349,7 @@ function Complete-DaemonSessionRetirement {
             Write-DaemonLog -Message "retired session $($known.Substring(0, [Math]::Min(8, $known.Length)))"
         }
         catch {
+            if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
             Write-DaemonLog -Message "retire failed for $known : $($_.Exception.Message)"
         }
     }

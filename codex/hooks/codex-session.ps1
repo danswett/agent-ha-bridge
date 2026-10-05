@@ -44,7 +44,8 @@ $script:CodexHome = $script:BridgeInstallContext.CodexHome
 $script:CodexSessionStaleMinutes = 240
 
 function Get-CodexStateRoot {
-    if (-not (Test-Path -LiteralPath $script:CodexStateRoot)) {
+    param([switch]$NoCreate)
+    if (-not $NoCreate -and -not (Test-Path -LiteralPath $script:CodexStateRoot)) {
         New-Item -ItemType Directory -Path $script:CodexStateRoot -Force | Out-Null
     }
     $script:CodexStateRoot
@@ -256,7 +257,11 @@ function Get-CodexSessionRegistrations {
         where no SessionEnd is delivered. Pruning matters because nothing else would
         ever remove these files.
     #>
-    param([switch]$IncludeEnded)
+    param([switch]$IncludeEnded, [switch]$AsObservation)
+
+    if ($AsObservation) {
+        return Read-DaemonAdapterRegistrations -Kind codex -Root (Get-CodexStateRoot -NoCreate)
+    }
 
     $root = Get-CodexStateRoot
     if (-not (Test-Path -LiteralPath $root)) { return @() }

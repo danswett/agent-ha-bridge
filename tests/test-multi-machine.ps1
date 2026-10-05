@@ -725,7 +725,8 @@ $script:SweepHttpStates = $script:DaemonStatesCache
 $script:DaemonStatesCacheAt = [DateTimeOffset]::MinValue
 $script:SweepLog = @()
 $orphanReadStart = $script:SweepHttpRequests.Count
-Clear-CopilotMqttOrphans -Headers @{} -Live @{ '11111111-1111-1111-1111-111111111111' = $true }
+$sweepLive = @{ '11111111-1111-1111-1111-111111111111' = $true }
+Clear-CopilotMqttOrphans -Headers @{} -Live $sweepLive -Discovery (New-DaemonDiscoverySnapshot -Live $sweepLive -Complete)
 
 Test-That 'the orphan sweep refreshes an expired cache through the synthetic template' {
     $script:SweepHttpRequests.Count -eq ($orphanReadStart + 1) -and
@@ -773,7 +774,8 @@ $hexStates = @(
 $script:DaemonStatesCache = $hexStates
 $script:SweepHttpStates = $script:DaemonStatesCache
 $script:DaemonStatesCacheAt = [DateTimeOffset]::MinValue
-Clear-CopilotMqttOrphans -Headers @{} -Live @{}
+$sweepLive = @{}
+Clear-CopilotMqttOrphans -Headers @{} -Live $sweepLive -Discovery (New-DaemonDiscoverySnapshot -Live $sweepLive -Complete)
 Test-That 'a hostname shaped like a node id is still recognised as a machine' {
     @($script:Swept).Count -eq 0
 }
@@ -786,7 +788,8 @@ $script:DaemonStatesCache = @(
 )
 $script:SweepHttpStates = $script:DaemonStatesCache
 $script:DaemonStatesCacheAt = [DateTimeOffset]::MinValue
-Clear-CopilotMqttOrphans -Headers @{} -Live @{}
+$sweepLive = @{}
+Clear-CopilotMqttOrphans -Headers @{} -Live $sweepLive -Discovery (New-DaemonDiscoverySnapshot -Live $sweepLive -Complete)
 Test-That 'an incomplete picture skips the sweep rather than guessing' {
     # Deleting a running machine's entities is far worse than leaving a dead session
     # a little longer; the sweep runs again on the next start.

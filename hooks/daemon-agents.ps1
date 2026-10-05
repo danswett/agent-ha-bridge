@@ -112,19 +112,26 @@ $script:DaemonAgents = [ordered]@{
                 $registration = Get-BridgeRuntimePath "agent-bridge-claude\$(Get-ClaudeSafeSessionKey -SessionId $Id).json"
                 $script:ClaudeRegistrationPaths[$Id] = $registration
             }
-            $stamp = [IO.File]::GetLastWriteTimeUtc($registration).Ticks
+            $stamp = try { [IO.File]::GetLastWriteTimeUtc($registration).Ticks }
+            catch {
+                if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+                Set-DaemonDiscoveryUncertain -Kind claude -Path $registration -SessionId $Id -Code 'StampUnreadable'
+                return $false
+            }
             if (-not $script:DaemonRegistrationStamps.ContainsKey($Id) -or $script:DaemonRegistrationStamps[$Id] -ne $stamp) {
-                $script:DaemonRegistrationStamps[$Id] = $stamp
-                try {
-                    $fresh = Get-Content -LiteralPath $registration -Raw | ConvertFrom-Json
-                    foreach ($field in @('HookStatus', 'HookStatusAt')) {
-                        if ($fresh.PSObject.Properties[$field]) {
-                            $Session | Add-Member -NotePropertyName $field -NotePropertyValue ([string]$fresh.$field) -Force
-                        }
-                    }
-                    $changed = $true
+                $read = Read-DaemonRegistrationFile -Path $registration -Kind claude -Projection Hook
+                if (-not $read.Known) {
+                    Set-DaemonDiscoveryUncertain -Kind claude -Path $registration -SessionId $Id -Code $read.Diagnostic.Code
+                    return $false
                 }
-                catch { }
+                $fresh = $read.Record
+                foreach ($field in @('HookStatus', 'HookStatusAt')) {
+                    if ($fresh.PSObject.Properties[$field]) {
+                        $Session | Add-Member -NotePropertyName $field -NotePropertyValue ([string]$fresh.$field) -Force
+                    }
+                }
+                $script:DaemonRegistrationStamps[$Id] = $read.Stamp
+                $changed = $true
             }
             $changed
         }
@@ -176,6 +183,7 @@ $script:DaemonAgents = [ordered]@{
         FastActivity = {
             param($Id, $Entry, $Session, $Headers)
             $republish = Sync-DaemonCodexHookStatus -Id $Id -Entry $Entry -Headers $Headers
+            if (-not $script:DaemonLive.ContainsKey($Id)) { return }
             $length = 0L
             try { $length = [IO.FileInfo]::new([string]$Session.Transcript).Length } catch { }
             if ($republish -or ($length -gt 0 -and $length -ne [long]$Entry.Offset)) {
