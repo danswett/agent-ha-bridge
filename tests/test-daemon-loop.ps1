@@ -34,12 +34,19 @@ $script:DaemonLive = @{}
 
 $script:Calls = [System.Collections.Generic.List[string]]::new()
 function Write-DaemonLog { param([string]$Message) $script:Calls.Add("log:$Message") }
-foreach ($name in 'Invoke-PendingReplies', 'Invoke-PendingStops', 'Sync-DaemonNewSession', 'Get-LiveBridgeSessions',
+foreach ($name in 'Invoke-PendingReplies', 'Invoke-PendingStops', 'Sync-DaemonNewSession',
     'Sync-DaemonSessions', 'Repair-CopilotSessionEntities', 'Invoke-DaemonFastActivity', 'Invoke-PendingDecisions',
     'Invoke-PendingCodexApprovals', 'Sync-DaemonUpdateStatus', 'Sync-DaemonClients', 'Clear-DaemonStaleNote',
     'Write-DaemonState', 'Set-BridgeHomeAssistantReachable', 'Set-BridgeDaemonAlive') {
     Set-Item -Path "function:script:$name" -Value ([scriptblock]::Create("`$script:Calls.Add('$name')"))
 }
+function Get-LiveBridgeSessions {
+    param([switch]$AsObservation, [hashtable]$State)
+    $script:Calls.Add('Get-LiveBridgeSessions')
+    if ($AsObservation) { return New-DaemonDiscoverySnapshot -Live @{} -State $State -Complete }
+    @{}
+}
+$script:DaemonDiscoverySnapshot = New-DaemonDiscoverySnapshot -Live $script:DaemonLive -State $state -Complete
 
 Write-Host '--- what the loop watches ---'
 $watch = Get-DaemonWatchEntities -State $state

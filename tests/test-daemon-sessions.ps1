@@ -298,8 +298,13 @@ Initialize-TestPublicationAuthority -ServeCard
 $script:Ids = @{ s1 = '11111111-0000-4000-8000-000000000001'; s2 = '22222222-0000-4000-8000-000000000002'; s3 = '33333333-0000-4000-8000-000000000003'
     s4 = '44444444-0000-4000-8000-000000000004'; s5 = '55555555-0000-4000-8000-000000000005' }
 function New-Session { param([string]$Id) [pscustomobject]@{ SessionId = $script:Ids[$Id]; Kind = 'claude'; Transcript = 'C:\nope.jsonl'; WorkingDirectory = 'C:\x'; ProcessId = 1 } }
+function Invoke-TestSessionSync {
+    param([hashtable]$Headers, [hashtable]$State, [hashtable]$Live)
+    Sync-DaemonSessions -Headers $Headers -State $State -Live $Live `
+        -Discovery (New-DaemonDiscoverySnapshot -Live $Live -State $State -Complete)
+}
 $state = @{}
-Sync-DaemonSessions -Headers $headers -State $state -Live @{ $script:Ids.s1 = (New-Session 's1'); $script:Ids.s2 = (New-Session 's2') }
+Invoke-TestSessionSync -Headers $headers -State $state -Live @{ $script:Ids.s1 = (New-Session 's1'); $script:Ids.s2 = (New-Session 's2') }
 Test-That 'new sessions are published and adopted into state' { (@($script:Published | Sort-Object) -join ',') -eq (@($script:Ids.s1, $script:Ids.s2) -join ',') -and $state.Count -eq 2 }
 # A session registering is what says a launch note about one not registering is out of
 # date - the 90-second wait is short for a first launch that has to sign in first.
@@ -309,19 +314,19 @@ Test-That 'and the dashboard is built with them' { @($script:DashboardSessions).
 Test-That 'the global status lists them' { @($script:GlobalSessions).Count -eq 2 }
 
 $script:Published = @(); $script:FailPublish = @{ $script:Ids.s3 = $true }
-Sync-DaemonSessions -Headers $headers -State $state -Live @{ $script:Ids.s1 = (New-Session 's1'); $script:Ids.s2 = (New-Session 's2'); $script:Ids.s3 = (New-Session 's3') }
+Invoke-TestSessionSync -Headers $headers -State $state -Live @{ $script:Ids.s1 = (New-Session 's1'); $script:Ids.s2 = (New-Session 's2'); $script:Ids.s3 = (New-Session 's3') }
 Test-That 'a session whose publish fails is not adopted, so it is tried again' { -not $state.ContainsKey($script:Ids.s3) }
 Test-That 'known sessions stream their activity instead of being republished' { $script:Streamed -contains $script:Ids.s1 -and $script:Published.Count -eq 0 }
 
-Sync-DaemonSessions -Headers $headers -State $state -Live @{ $script:Ids.s1 = (New-Session 's1') }
+Invoke-TestSessionSync -Headers $headers -State $state -Live @{ $script:Ids.s1 = (New-Session 's1') }
 Test-That 'an ended session leaves state at once' { -not $state.ContainsKey($script:Ids.s2) }
 Test-That 'and its card leaves the dashboard' { @($script:DashboardSessions).Count -eq 1 }
 Test-That 'but its entities wait a pass, so the browser is not left pointing at nothing' { $script:Retired.Count -eq 0 }
-Sync-DaemonSessions -Headers $headers -State $state -Live @{ $script:Ids.s1 = (New-Session 's1') }
+Invoke-TestSessionSync -Headers $headers -State $state -Live @{ $script:Ids.s1 = (New-Session 's1') }
 Test-That 'and are retired on the next' { ($script:Retired -join ',') -eq $script:Ids.s2 }
 
 $rebuilds = @($script:Log | Where-Object { $_ -like 'dashboard rebuilt*' }).Count
-Sync-DaemonSessions -Headers $headers -State $state -Live @{ $script:Ids.s1 = (New-Session 's1') }
+Invoke-TestSessionSync -Headers $headers -State $state -Live @{ $script:Ids.s1 = (New-Session 's1') }
 Test-That 'an unchanged pass does not rebuild the dashboard' { @($script:Log | Where-Object { $_ -like 'dashboard rebuilt*' }).Count -eq $rebuilds }
 
 Write-Host '--- a session renamed while it runs ---'
@@ -331,11 +336,11 @@ $renamed = $script:Ids.s4
 function New-CopilotSession { param([string]$Id) [pscustomobject]@{ SessionId = $script:Ids[$Id]; Kind = 'copilot'; Transcript = 'C:\nope.jsonl'; WorkingDirectory = 'C:\x'; ProcessId = 1 } }
 $script:DisplayNames[$renamed] = 'Copilot: the whole first prompt, at length'
 $renameState = @{}
-Sync-DaemonSessions -Headers $headers -State $renameState -Live @{ $renamed = (New-CopilotSession 's4') }
+Invoke-TestSessionSync -Headers $headers -State $renameState -Live @{ $renamed = (New-CopilotSession 's4') }
 Test-That 'it is adopted under the name its workspace file gave' { $renameState[$renamed].Name -eq 'Copilot: the whole first prompt, at length' }
 
 $script:DisplayNames[$renamed] = 'Copilot: agent-ha-bridge'
-$renameLeak = Sync-DaemonSessions -Headers $headers -State $renameState -Live @{ $renamed = (New-CopilotSession 's4') }
+$renameLeak = Invoke-TestSessionSync -Headers $headers -State $renameState -Live @{ $renamed = (New-CopilotSession 's4') }
 Test-That 'renaming it is picked up next pass, though the old name looked perfectly real' { $renameState[$renamed].Name -eq 'Copilot: agent-ha-bridge' }
 Test-That 'the new name reaches its status attributes' { $script:StatusAttributes[$renamed].session -eq 'Copilot: agent-ha-bridge' }
 Test-That 'and its card header' { @($script:DashboardSessions | Where-Object { $_.Name -eq 'Copilot: agent-ha-bridge' }).Count -eq 1 }
@@ -345,7 +350,7 @@ Test-That 'and the republish it triggers returns nothing to the reconcile' { $nu
 # id fallback, from a build that published it before its own adapter had loaded.
 $stale = $script:Ids.s5
 $staleState = @{ $stale = [pscustomobject]@{ Offset = 0; Name = "Copilot: $($stale.Substring(0, 8))"; Machine = 'DESK'; Status = 'idle'; Kind = 'claude' } }
-Sync-DaemonSessions -Headers $headers -State $staleState -Live @{ $stale = (New-Session 's5') }
+Invoke-TestSessionSync -Headers $headers -State $staleState -Live @{ $stale = (New-Session 's5') }
 Test-That 'a stale id fallback on another agent still heals' { $staleState[$stale].Name -eq "Claude: $stale" }
 
 Write-Host ''
@@ -475,7 +480,8 @@ $script:TestPublication.Commands.Clear()
 $script:DaemonPendingRetire = @($retiringId)
 $script:Retired = @()
 $differentInputs = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
-Complete-DaemonSessionRetirement -Gone @() -DashboardCurrent $differentInputs -Headers $headers
+Complete-DaemonSessionRetirement -Gone @() -DashboardCurrent $differentInputs -Headers $headers `
+    -Discovery (New-DaemonDiscoverySnapshot -Complete)
 Test-That 'a skipped non-writer save does not claim its differing inputs were published' {
     -not $differentInputs -and @(Get-TestPublicationWrites).Count -eq 0
 }
@@ -496,7 +502,8 @@ Set-TestPublicationIdentity -Participant 'observer-b'
 $script:Retired = @()
 $script:DaemonPendingRetire = @($retiringId)
 $notYetRemoved = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
-Complete-DaemonSessionRetirement -Gone @() -DashboardCurrent $notYetRemoved -Headers $headers
+Complete-DaemonSessionRetirement -Gone @() -DashboardCurrent $notYetRemoved -Headers $headers `
+    -Discovery (New-DaemonDiscoverySnapshot -Complete)
 Test-That 'a non-writer retains entities that the actual accepted view still renders' {
     -not $notYetRemoved -and $script:Retired.Count -eq 0 -and $script:DaemonPendingRetire -contains $retiringId
 }
@@ -506,7 +513,8 @@ $lastSignature = $script:DaemonDashboardSignature
 $script:TestPublication.Reject['lovelace/config/save'] = '{"code":"unknown_error","message":"Save rejected"}'
 $failedSave = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
 $script:Retired = @()
-Complete-DaemonSessionRetirement -Gone @() -DashboardCurrent $failedSave -Headers $headers
+Complete-DaemonSessionRetirement -Gone @() -DashboardCurrent $failedSave -Headers $headers `
+    -Discovery (New-DaemonDiscoverySnapshot -Complete)
 Test-That 'the actual void-or-throw save failure neither advances currentness nor retires entities' {
     -not $failedSave -and $script:DaemonDashboardSignature -ceq $lastSignature -and $script:Retired.Count -eq 0
 }
@@ -540,7 +548,8 @@ foreach ($mismatchingSource in @($unpinnedSource, $sameVersionWrongSource)) {
     $script:DaemonPendingRetire = @($retiringId)
     $script:TestPublication.Commands.Clear()
     $pinMismatchCurrent = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
-    Complete-DaemonSessionRetirement -Gone @() -DashboardCurrent $pinMismatchCurrent -Headers $headers
+    Complete-DaemonSessionRetirement -Gone @() -DashboardCurrent $pinMismatchCurrent -Headers $headers `
+        -Discovery (New-DaemonDiscoverySnapshot -Complete)
     Test-That "an observer refuses a self-consistent out-of-pin $mismatchingVersion view despite matching signatures" {
         -not $pinMismatchCurrent -and @(Get-TestPublicationWrites).Count -eq 0
     }
@@ -558,7 +567,8 @@ foreach ($mismatchingSource in @($unpinnedSource, $sameVersionWrongSource)) {
     $script:DaemonPendingRetire = @($retiringId)
     $script:TestPublication.Commands.Clear()
     $observedPin = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
-    Complete-DaemonSessionRetirement -Gone @() -DashboardCurrent $observedPin -Headers $headers
+    Complete-DaemonSessionRetirement -Gone @() -DashboardCurrent $observedPin -Headers $headers `
+        -Discovery (New-DaemonDiscoverySnapshot -Complete)
     Test-That "restoring the exact pin permits observer currentness and safe retirement after $mismatchingVersion interference" {
         $restoredPin -and $observedPin -and $script:Retired -contains $retiringId -and @(Get-TestPublicationWrites).Count -eq 0
     }
@@ -587,7 +597,7 @@ $reportSession = New-Session 's1'
 $reportSession.Transcript = Join-Path (Split-Path $script:TestPublication.Path -Parent) 'reporting.jsonl'
 [IO.File]::WriteAllText($reportSession.Transcript, '')
 $reportState = @{}
-Sync-DaemonSessions -Headers $headers -State $reportState -Live @{ $reportSession.SessionId = $reportSession }
+Invoke-TestSessionSync -Headers $headers -State $reportState -Live @{ $reportSession.SessionId = $reportSession }
 $reportTopics = Get-CopilotMqttTopics -SessionId $reportSession.SessionId
 $machineRoot = Get-CopilotMqttMachineTopicRoot -Slug $script:DaemonMachineSlug
 Test-That 'the actual reconcile and MQTT publisher still publish per-session status during migration' {

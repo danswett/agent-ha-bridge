@@ -434,7 +434,11 @@ try {
             $script:RestoreStopCalls++
             [pscustomobject]@{ Stopped = $false; Detail = 'Synthetic process remains alive' }
         }
-        function Get-LiveBridgeSessions { $script:RestoreLive }
+        function Get-LiveBridgeSessions {
+            param([switch]$AsObservation, [hashtable]$State)
+            if ($AsObservation) { return New-DaemonDiscoverySnapshot -Live $script:RestoreLive -State $State -Complete }
+            $script:RestoreLive
+        }
         function Get-LiveMcpSessions { param($Headers) @{} }
         function Get-BridgeSessionDisplay { param($SessionId, $Kind, $WorkingDirectory) [pscustomobject]@{ Name = "$Kind`: synthetic"; Machine = 'TEST' } }
         function Get-DaemonLaunchCapabilities { @{} }
@@ -485,7 +489,8 @@ try {
             $read = Read-DaemonState
             $script:RestoreLive = $Fixture.Live
             $script:RestorePublished.Clear()
-            Restore-DaemonSessionCards -Headers $headers -State $read -Live $Fixture.Live
+            Restore-DaemonSessionCards -Headers $headers -State $read -Live $Fixture.Live `
+                -Discovery (New-DaemonDiscoverySnapshot -Live $Fixture.Live -State $read -Complete)
             $Fixture.State = $read
         }
         try {

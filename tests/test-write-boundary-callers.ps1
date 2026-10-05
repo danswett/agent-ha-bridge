@@ -154,7 +154,18 @@ foreach ($name in @(
 )) {
     Set-Item -LiteralPath "function:$name" -Value { param($Headers, $State, $Live) }
 }
-function Get-LiveBridgeSessions { @{} }
+function Get-LiveBridgeSessions {
+    $live = @{}
+    [pscustomobject]@{ Complete = $true; Live = $live; PositiveLive = $live; OwnerCatalogue = @{}; UncertainIds = @{} }
+}
+$script:DaemonSessionCleanupPending = @{}
+$platformAst = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repository 'hooks\bridge-platform.ps1'), [ref]$null, [ref]$null)
+$guardFunction = $platformAst.Find({
+    param($node)
+    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -eq 'Test-BridgeObservationGuardFailure'
+}, $true)
+if (-not $guardFunction) { throw 'The actual observation guard function was not found.' }
+. ([scriptblock]::Create($guardFunction.Extent.Text))
 $script:SnapshotCleared = $false
 $script:OrdinaryReconcileLogged = $false
 function Clear-DaemonReconcileSnapshot { $script:SnapshotCleared = $true }

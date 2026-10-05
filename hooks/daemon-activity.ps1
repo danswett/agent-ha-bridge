@@ -690,14 +690,22 @@ function Sync-DaemonCodexHookStatus {
     )
 
     if (-not $script:CodexAdapterLoaded) { return $false }
-    $registration = Join-Path (Get-CodexStateRoot) ((Get-CodexSafeSessionKey -SessionId $Id) + '.json')
-    $stamp = [IO.File]::GetLastWriteTimeUtc($registration).Ticks
+    $registration = Join-Path (Get-CodexStateRoot -NoCreate) ((Get-CodexSafeSessionKey -SessionId $Id) + '.json')
+    $stamp = try { [IO.File]::GetLastWriteTimeUtc($registration).Ticks }
+    catch {
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        Set-DaemonDiscoveryUncertain -Kind codex -Path $registration -SessionId $Id -Code 'StampUnreadable'
+        return $false
+    }
     $key = "codex:$Id"
     if ($script:DaemonRegistrationStamps.ContainsKey($key) -and $script:DaemonRegistrationStamps[$key] -eq $stamp) { return $false }
-    $script:DaemonRegistrationStamps[$key] = $stamp
-
-    $fresh = try { Get-Content -LiteralPath $registration -Raw | ConvertFrom-Json } catch { $null }
-    if ($null -eq $fresh) { return $false }
+    $read = Read-DaemonRegistrationFile -Path $registration -Kind codex -Projection Hook
+    if (-not $read.Known) {
+        Set-DaemonDiscoveryUncertain -Kind codex -Path $registration -SessionId $Id -Code $read.Diagnostic.Code
+        return $false
+    }
+    $fresh = $read.Record
+    $script:DaemonRegistrationStamps[$key] = $read.Stamp
     $failedStopAt = Get-DaemonFailedStopRequestTime -Entry $Entry
     if ($null -ne $failedStopAt) {
         # The first read after restart is not itself new native activity.
@@ -721,17 +729,20 @@ function Sync-DaemonCodexHookStatus {
             # Codex names its model on every hook call, so the entry follows it rather
             # than staying on whatever the launch asked for - a /model typed into its
             # window then shows on the card.
-            if ([string]$fresh.Model) { Set-DaemonSessionProperty -Entry $Entry -Name 'Model' -Value ([string]$fresh.Model) }
+            if ($fresh.PSObject.Properties['Model'] -and [string]$fresh.Model) { Set-DaemonSessionProperty -Entry $Entry -Name 'Model' -Value ([string]$fresh.Model) }
             Set-CopilotMqttStatus -SessionId $Id -Status $status -Headers $Headers -Attributes (
                 Add-DaemonTuningAttributes -Attributes @{
                     session    = $Entry.Name
                     machine    = $Entry.Machine
                     updated    = [DateTimeOffset]::Now.ToString('o')
-                    process_id = [int]($fresh.ProcessId ?? 0)
+                    process_id = if ($fresh.PSObject.Properties['ProcessId']) { [int]$fresh.ProcessId } else { 0 }
                 } -Tuning $Entry)
             $Entry.Status = $status
         }
-        catch { Write-DaemonLog -Message "codex status publish failed for $Id : $($_.Exception.Message)" }
+        catch {
+            if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+            Write-DaemonLog -Message "codex status publish failed for $Id : $($_.Exception.Message)"
+        }
     }
     $true
 }
@@ -912,7 +923,13 @@ function Invoke-DaemonFastActivity {
 
     # A session launched from the dashboard is followed up here too, so its
     # registration - or its trust question - is noticed within a second.
-    try { Update-DaemonPendingLaunch -Headers $Headers } catch { }
+    $discovery = Get-Variable -Name DaemonDiscoverySnapshot -Scope Script -ErrorAction SilentlyContinue
+    if (-not $discovery -or $null -eq $discovery.Value -or $discovery.Value.Complete) {
+        try { Update-DaemonPendingLaunch -Headers $Headers }
+        catch {
+            if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        }
+    }
 
     # An End session confirmation nobody made in time, so the card stops asking for a
     # second press within a tick rather than at the next reconcile. Gated on the
@@ -934,7 +951,11 @@ function Invoke-DaemonFastActivity {
     if (($null -ne $script:DaemonHookSpoolEvents -and $script:DaemonHookSpoolEvents.Count -gt 0) -or
         $script:DaemonHookSpoolAttempts.Count -gt 0 -or
         ([DateTime]::UtcNow - $script:DaemonHookSpoolSweptAt).TotalSeconds -ge $script:DaemonHookSpoolSweepSeconds) {
-        try { $null = Invoke-DaemonHookSpool } catch { Write-DaemonLog -Message "hook spool failed: $($_.Exception.Message)" }
+        try { $null = Invoke-DaemonHookSpool }
+        catch {
+            if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+            Write-DaemonLog -Message "hook spool failed: $($_.Exception.Message)"
+        }
     }
 
     $live = $script:DaemonLive
@@ -955,6 +976,7 @@ function Invoke-DaemonFastActivity {
 
         $changed = $false
         if ($agent.PollRegistration) { $changed = [bool](& $agent.PollRegistration $id $session) }
+        if (-not $live.ContainsKey($id)) { continue }
 
         $transcript = [string]$session.Transcript
         if (-not $changed) {

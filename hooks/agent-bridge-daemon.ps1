@@ -182,6 +182,9 @@ $script:DaemonDashboardSignature = $null
 # sessions and verbose setting the last reconcile saw, and the last-seen write time of
 # each Claude registration.
 $script:DaemonLive = @{}
+$script:DaemonDiscoverySnapshot = $null
+$script:DaemonOwnerCatalogue = @{}
+$script:DaemonSessionCleanupPending = @{}
 $script:DaemonVerbose = $false
 $script:DaemonRegistrationStamps = @{}
 
@@ -590,10 +593,35 @@ function Test-DaemonDriverPending {
     ([DateTimeOffset]::Now - $since).TotalSeconds -lt $script:DaemonConfig.DriverArmSeconds
 }
 
+function Invoke-DaemonStartupSessionCleanup {
+    param(
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [Parameter(Mandatory)][hashtable]$State,
+        [AllowNull()]$Discovery,
+        [Parameter(Mandatory)][ValidateSet('Legacy', 'Orphans')][string]$Phase
+    )
+    if (-not (Test-DaemonDiscoveryContext -Snapshot $Discovery) -or -not $Discovery.Complete) {
+        $script:DaemonSessionCleanupPending[$Phase] = $true
+        Write-DaemonLog -Message "startup session cleanup deferred ($Phase): ownership observation is incomplete"
+        return $false
+    }
+    if ($Phase -eq 'Legacy') {
+        [void](Invoke-DaemonLegacyCleanup -Headers $Headers -Live $Discovery.Live -State $State)
+    }
+    else {
+        if (-not (Clear-CopilotMqttOrphans -Headers $Headers -Live $Discovery.Live -Discovery $Discovery)) {
+            $script:DaemonSessionCleanupPending[$Phase] = $true
+            return $false
+        }
+    }
+    [void]$script:DaemonSessionCleanupPending.Remove($Phase)
+    $true
+}
+
 function Initialize-DaemonStartup {
     # Once per start, before the first pass: tidy what an earlier daemon or an older
     # bridge left behind, and get ready for the first reply.
-    param([hashtable]$Headers, [hashtable]$State, [hashtable]$Live)
+    param([hashtable]$Headers, [hashtable]$State, [hashtable]$Live, [AllowNull()]$Discovery = $null)
     $headers = $Headers
     $state = $State
     $live = $Live
@@ -648,9 +676,10 @@ function Initialize-DaemonStartup {
     # entities appear alongside their unavailable predecessors rather than replacing
     # them. Self-guarding, and a no-op once it has run.
     try {
-        [void](Invoke-DaemonLegacyCleanup -Headers $headers -Live $live -State $state)
+        [void](Invoke-DaemonStartupSessionCleanup -Headers $headers -State $state -Discovery $Discovery -Phase Legacy)
     }
     catch {
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
         Write-DaemonLog -Message "legacy entity cleanup failed: $($_.Exception.Message)"
     }
 
@@ -676,7 +705,7 @@ function Initialize-DaemonStartup {
         Write-DaemonLog -Message "online sensor setup failed: $($_.Exception.Message)"
     }
 
-    Clear-CopilotMqttOrphans -Headers $headers -Live $live
+    [void](Invoke-DaemonStartupSessionCleanup -Headers $headers -State $state -Discovery $Discovery -Phase Orphans)
 }
 
 function Restore-DaemonSessionCards {
@@ -686,12 +715,13 @@ function Restore-DaemonSessionCards {
     # transcript activity would sit at 'unknown' on the dashboard after a restart.
     # This is a handful of publishes once per daemon start, so it is done
     # unconditionally rather than guarded.
-    param([hashtable]$Headers, [hashtable]$State, [hashtable]$Live)
+    param([hashtable]$Headers, [hashtable]$State, [hashtable]$Live, [AllowNull()]$Discovery = $null)
     $headers = $Headers
     $state = $State
-    $live = $Live
+    if ($null -eq $Discovery) { $Discovery = Get-LiveBridgeSessions -AsObservation -State $state }
+    $live = $Discovery.Live
 
-    Sync-DaemonSessions -Headers $headers -State $state
+    Sync-DaemonSessions -Headers $headers -State $state -Live $live -Discovery $Discovery
     # Reasoning is only shown while the verbose toggle is on, matching the reconcile,
     # so read it once for the restore below.
     $primeVerbose = Test-VerboseStreaming -Headers $headers
@@ -824,6 +854,7 @@ function Invoke-DaemonHit {
             Invoke-PendingReplies -Headers $headers -State $state -Live $script:DaemonLive
         }
         catch {
+            if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
             Write-DaemonLog -Message "reply delivery failed: $($_.Exception.Message)"
         }
     }
@@ -837,7 +868,7 @@ function Invoke-DaemonHit {
             Invoke-PendingStops -Headers $headers -State $state -Live $script:DaemonLive
         }
         catch {
-            if ($_.Exception.Data['BridgeTestWriteBlocked']) { throw }
+            if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
             Write-DaemonLog -Message "end session failed: $($_.Exception.Message)"
         }
     }
@@ -846,10 +877,15 @@ function Invoke-DaemonHit {
     # press landed, and waiting for the next reconcile left it up to 15 s late.
     if ($hit.EntityId -eq $script:DaemonEntity.NewSession) {
         try {
+            if ($null -eq $script:DaemonDiscoverySnapshot -or -not $script:DaemonDiscoverySnapshot.Complete) {
+                Set-CopilotMqttNewSessionResult -Headers $headers -Text 'Session discovery is incomplete; launch is temporarily held.'
+                return
+            }
             $liveNow = if ($script:DaemonLive -is [hashtable]) { $script:DaemonLive } else { @{} }
             Sync-DaemonNewSession -Headers $headers -Live $liveNow
         }
         catch {
+            if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
             Write-DaemonLog -Message "launch failed: $($_.Exception.Message)"
         }
     }
@@ -871,8 +907,14 @@ function Invoke-DaemonReconcile {
         # It is cleared at the end of the pass rather than left to age, so nothing
         # outside a reconcile can read a value from one.
         Set-DaemonReconcileSnapshot -Headers $headers
-        $live = Get-LiveBridgeSessions
-        Sync-DaemonSessions -Headers $headers -State $state -Live $live
+        $discovery = Get-LiveBridgeSessions -AsObservation -State $state
+        $live = $discovery.Live
+        foreach ($phase in @('Legacy', 'Orphans')) {
+            if ($script:DaemonSessionCleanupPending.ContainsKey($phase)) {
+                [void](Invoke-DaemonStartupSessionCleanup -Headers $headers -State $state -Discovery $discovery -Phase $phase)
+            }
+        }
+        Sync-DaemonSessions -Headers $headers -State $state -Live $live -Discovery $discovery
         Repair-CopilotSessionEntities -Headers $headers -State $state -Live $live
         Invoke-DaemonFastActivity -Headers $headers -State $state
         Invoke-PendingDecisions -Headers $headers -State $state -Live $live
@@ -882,7 +924,7 @@ function Invoke-DaemonReconcile {
         Invoke-PendingStops -Headers $headers -State $state -Live $live
         Invoke-DaemonFastActivity -Headers $headers -State $state
         Sync-DaemonUpdateStatus -Headers $headers
-        Sync-DaemonNewSession -Headers $headers -Live $live
+        if ($discovery.Complete) { Sync-DaemonNewSession -Headers $headers -Live $live }
         Sync-DaemonClients -Headers $headers
         Clear-DaemonStaleNote -Headers $headers
         Invoke-DaemonFastActivity -Headers $headers -State $state
@@ -894,7 +936,7 @@ function Invoke-DaemonReconcile {
         Set-BridgeDaemonAlive
     }
     catch {
-        if ($_.Exception.Data['BridgeTestWriteBlocked']) { throw }
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
         Write-DaemonLog -Message "reconcile failed: $($_.Exception.Message)"
     }
     finally {
@@ -917,19 +959,21 @@ function Start-BridgeDaemon {
     # longer live, which both removes its Home Assistant entities and drops it from
     # state. Pruning first would discard the record while leaving the published
     # entities behind as orphans.
-    $live = Get-LiveBridgeSessions
+    $discovery = Get-LiveBridgeSessions -AsObservation -State $state
+    $live = $discovery.Live
     # Seed the fast lane, so streaming starts now rather than after the first reconcile.
     $script:DaemonLive = $live
+    $script:DaemonDiscoverySnapshot = $discovery
 
-    Initialize-DaemonStartup -Headers $headers -State $state -Live $live
-    Restore-DaemonSessionCards -Headers $headers -State $state -Live $live
+    Initialize-DaemonStartup -Headers $headers -State $state -Live $live -Discovery $discovery
+    Restore-DaemonSessionCards -Headers $headers -State $state -Live $live -Discovery $discovery
     Repair-CopilotSessionEntities -Headers $headers -State $state -Live $live
     Invoke-PendingDecisions -Headers $headers -State $state -Live $live
     Invoke-PendingReplies -Headers $headers -State $state -Live $live
     Invoke-PendingCodexApprovals -Headers $headers -State $state -Live $live
     Invoke-PendingStops -Headers $headers -State $state -Live $live
     Sync-DaemonUpdateStatus -Headers $headers
-    Sync-DaemonNewSession -Headers $headers -Live $live
+    if ($discovery.Complete) { Sync-DaemonNewSession -Headers $headers -Live $live }
     Write-DaemonState -State $state
 
     if ($RunOnce) {
@@ -1003,4 +1047,3 @@ if (-not $env:AGENT_BRIDGE_DAEMON_NORUN) {
         $mutex.Dispose()
     }
 }
-

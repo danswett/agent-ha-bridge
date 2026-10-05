@@ -150,12 +150,115 @@ function ConvertFrom-BridgePsLine {
 
 function Get-BridgeCommandLine {
     <# A process's full command line, or ''. #>
-    param([Parameter(Mandatory)][int]$ProcessId)
+    param([Parameter(Mandatory)][int]$ProcessId, [switch]$AsObservation)
+    $observation = [pscustomobject]@{ State = 'Unknown'; Text = ''; ProcessId = $ProcessId; Code = 'Unreadable'; NativeExit = $null }
+    if ($AsObservation -and $ProcessId -le 0) { $observation.Code = 'InvalidProcessId'; return $observation }
     if ($script:BridgeIsWindows) {
-        return [string](Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue).CommandLine
+        $readErrors = @()
+        try { $row = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue -ErrorVariable readErrors }
+        catch {
+            if (-not $AsObservation -or (Test-BridgeObservationGuardFailure -ErrorRecord $_)) { throw }
+            $observation.Code = 'CommandQueryFailed'
+            return $observation
+        }
+        if (-not $AsObservation) { return [string]$row.CommandLine }
+        foreach ($readError in $readErrors) {
+            if (Test-BridgeObservationGuardFailure -ErrorRecord $readError) { throw $readError }
+        }
+        if ($readErrors.Count) { $observation.Code = 'CommandQueryFailed'; return $observation }
+        $rows = @($row)
+        if ($null -eq $row -or $rows.Count -eq 0) {
+            $observation.State = 'Absent'; $observation.Code = 'ProcessNotFound'
+        }
+        elseif ($rows.Count -eq 1 -and $rows[0].PSObject.Properties['CommandLine'] -and
+            $rows[0].CommandLine -is [string] -and -not [string]::IsNullOrWhiteSpace($rows[0].CommandLine)) {
+            $observation.State = 'Readable'; $observation.Text = $rows[0].CommandLine; $observation.Code = ''
+        }
+        else { $observation.Code = 'CommandIdentityUnreadable' }
+        return $observation
     }
-    try { [string](& /bin/ps -o 'args=' -p $ProcessId 2>$null | Select-Object -First 1) } catch { '' }
+    try {
+        $query = Invoke-BridgePsCommandLine -ProcessId $ProcessId
+        $line = $query.Text
+        $nativeExit = $query.ExitCode
+        if ($query.PSObject.Properties['Failure'] -and $query.Failure -and -not $AsObservation) {
+            throw $query.Failure
+        }
+        if (-not $AsObservation) { return $line }
+        $observation.NativeExit = $nativeExit
+        if ($nativeExit -eq 0 -and -not [string]::IsNullOrWhiteSpace($line)) {
+            $observation.State = 'Readable'; $observation.Text = $line; $observation.Code = ''
+        }
+        elseif ($nativeExit -in @(0, 1)) {
+            # ps's status alone is not disappearance. A separate, scoped PID read
+            # must specifically establish absence; denied/ambiguous reads stay unknown.
+            $presence = Get-BridgeProcessPresenceObservation -ProcessId $ProcessId
+            if ($presence.State -eq 'Absent') {
+                $observation.State = 'Absent'; $observation.Code = 'ProcessDisappeared'
+            }
+            else { $observation.Code = 'CommandIdentityUnreadable' }
+        }
+        else { $observation.Code = 'CommandQueryFailed' }
+        return $observation
+    }
+    catch {
+        if (-not $AsObservation) { return '' }
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        $observation.Code = 'CommandQueryFailed'
+        return $observation
+    }
     finally { $global:LASTEXITCODE = 0 }
+}
+
+function Invoke-BridgePsCommandLine {
+    param([Parameter(Mandatory)][int]$ProcessId)
+    $line = ''
+    $exitCode = $null
+    $failure = $null
+    try {
+        $line = [string](& /bin/ps -o 'args=' -p $ProcessId 2>$null | Select-Object -First 1)
+        $exitCode = $LASTEXITCODE
+    }
+    catch {
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        $failure = $_
+        # Native-error preference can throw before the next statement. Only that
+        # exception's own exit is evidence; an unrelated failure cannot reuse LASTEXITCODE.
+        if ($_.Exception.GetType().FullName -ceq 'System.Management.Automation.NativeCommandExitException' -and
+            $_.Exception.PSObject.Properties['ExitCode']) { $exitCode = [int]$_.Exception.ExitCode }
+    }
+    [pscustomobject]@{ Text = $line; ExitCode = $exitCode; Failure = $failure }
+}
+
+function Test-BridgeObservationGuardFailure {
+    param([Parameter(Mandatory)]$ErrorRecord)
+    $failure = $ErrorRecord.Exception
+    while ($null -ne $failure) {
+        if ($failure.Data['BridgeTestWriteBlocked'] -or $failure.Data['BridgeTestNetworkBlocked']) { return $true }
+        $failure = $failure.InnerException
+    }
+    $false
+}
+
+function Get-BridgeProcessPresenceObservation {
+    param([Parameter(Mandatory)][int]$ProcessId)
+    if ($ProcessId -le 0) { return [pscustomobject]@{ State = 'Unknown'; Code = 'InvalidProcessId' } }
+    $readErrors = @()
+    try { $rows = @(Get-Process -Id $ProcessId -ErrorAction SilentlyContinue -ErrorVariable readErrors) }
+    catch {
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        return [pscustomobject]@{ State = 'Unknown'; Code = 'ProcessQueryFailed' }
+    }
+    foreach ($readError in $readErrors) {
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $readError) { throw $readError }
+    }
+    if (@($readErrors | Where-Object { $_.FullyQualifiedErrorId -notlike 'NoProcessFoundForGivenId,*' }).Count) {
+        return [pscustomobject]@{ State = 'Unknown'; Code = 'ProcessQueryFailed' }
+    }
+    if ($rows.Count -eq 0 -and $readErrors.Count -gt 0) {
+        return [pscustomobject]@{ State = 'Absent'; Code = 'ProcessNotFound' }
+    }
+    [pscustomobject]@{ State = 'PresentOrUnknown'; Code = '' }
 }
 
 function ConvertFrom-BridgeProcessObject {
@@ -541,12 +644,91 @@ function Get-BridgeAgentProcesses {
         bun is fetched for the same reason it is accepted below: a CLI run under it
         would otherwise never be a candidate, and the check for it could never fire.
     #>
-    param([Parameter(Mandatory)][string]$Agent)
-    if ($script:BridgeIsWindows) { return @(Get-Process -Name $Agent -ErrorAction SilentlyContinue) }
-    $candidates = @(@($Agent, "$Agent.exe", 'node', 'bun') | ForEach-Object {
-            Get-Process -Name $_ -ErrorAction SilentlyContinue
-        })
-    @($candidates | Sort-Object -Property Id -Unique | Where-Object { Test-BridgeAgentProcess -Process $_ -Agent $Agent })
+    param([Parameter(Mandatory)][string]$Agent, [switch]$AsObservation)
+    $names = if ($script:BridgeIsWindows) { @($Agent) } else { @($Agent, "$Agent.exe", 'node', 'bun') }
+    $candidates = [Collections.Generic.List[object]]::new()
+    $diagnostics = [Collections.Generic.List[object]]::new()
+    $known = $true
+    foreach ($name in $names) {
+        $readErrors = @()
+        try {
+            Get-Process -Name $name -ErrorAction SilentlyContinue -ErrorVariable readErrors |
+                ForEach-Object { $candidates.Add($_) }
+        }
+        catch {
+            if (-not $AsObservation -or (Test-BridgeObservationGuardFailure -ErrorRecord $_)) { throw }
+            $known = $false
+            $diagnostics.Add([pscustomobject]@{ Agent = $Agent; Operation = 'Enumerate'; Code = 'EnumerationFailed'; ProcessId = $null })
+        }
+        if ($AsObservation) {
+            foreach ($readError in $readErrors) {
+                if (Test-BridgeObservationGuardFailure -ErrorRecord $readError) { throw $readError }
+                if ($readError.FullyQualifiedErrorId -notlike 'NoProcessFoundForGivenName,*') {
+                    $known = $false
+                    $diagnostics.Add([pscustomobject]@{ Agent = $Agent; Operation = 'Enumerate'; Code = 'EnumerationFailed'; ProcessId = $null })
+                }
+            }
+        }
+    }
+    if (-not $AsObservation) {
+        if ($script:BridgeIsWindows) { return @($candidates.ToArray()) }
+        return @($candidates.ToArray() | Sort-Object -Property Id -Unique |
+            Where-Object { Test-BridgeAgentProcess -Process $_ -Agent $Agent })
+    }
+
+    $positive = @{}
+    $seenNames = @{}
+    $conflicted = @{}
+    foreach ($candidate in $candidates) {
+        $processId = 0
+        try {
+            if ($null -eq $candidate -or -not $candidate.PSObject.Properties['Id'] -or
+                -not [int]::TryParse([string]$candidate.Id, [ref]$processId) -or $processId -le 0) {
+                throw 'Unreadable process identity.'
+            }
+            $processName = if ($candidate.PSObject.Properties['ProcessName']) { [string]$candidate.ProcessName } else { [string]$candidate.Name }
+            if ([string]::IsNullOrWhiteSpace($processName)) { throw 'Unreadable process identity.' }
+            if ($conflicted.ContainsKey($processId)) { continue }
+            if ($seenNames.ContainsKey($processId) -and
+                -not [string]::Equals($seenNames[$processId], $processName, [StringComparison]::OrdinalIgnoreCase)) {
+                $known = $false
+                $conflicted[$processId] = $true
+                [void]$positive.Remove($processId)
+                $diagnostics.Add([pscustomobject]@{ Agent = $Agent; Operation = 'Identity'; Code = 'IdentityChanged'; ProcessId = $processId })
+                continue
+            }
+            $seenNames[$processId] = $processName
+            $view = [pscustomobject]@{ Id = $processId; ProcessName = $processName; CommandLine = '' }
+            if (-not $script:BridgeIsWindows -and ($processName -replace '\.exe$', '') -in @('node', 'bun')) {
+                $command = Get-BridgeCommandLine -ProcessId $processId -AsObservation
+                if ($command.State -eq 'Absent') {
+                    $diagnostics.Add([pscustomobject]@{ Agent = $Agent; Operation = 'Identity'; Code = 'ProcessDisappeared'; ProcessId = $processId })
+                    continue
+                }
+                if ($command.State -ne 'Readable' -or [string]::IsNullOrWhiteSpace($command.Text)) {
+                    $known = $false
+                    $diagnostics.Add([pscustomobject]@{ Agent = $Agent; Operation = 'Identity'; Code = 'IdentityUnreadable'; ProcessId = $processId })
+                    continue
+                }
+                $view.CommandLine = $command.Text
+            }
+            if (Test-BridgeAgentProcess -Process $view -Agent $Agent) {
+                # Return identity facts, not a borrowed/mutated process object or the
+                # command line used locally by the existing identification predicate.
+                $positive[$processId] = [pscustomobject]@{ Id = $processId; ProcessName = $processName }
+            }
+        }
+        catch {
+            if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+            $known = $false
+            $diagnostics.Add([pscustomobject]@{ Agent = $Agent; Operation = 'Identity'; Code = 'IdentityUnreadable'; ProcessId = $processId })
+        }
+    }
+    [pscustomobject]@{
+        Known = $known
+        Processes = @($positive.Values | Sort-Object Id)
+        Diagnostics = @($diagnostics.ToArray())
+    }
 }
 
 function Get-BridgeAgentProcessSessionIds {
