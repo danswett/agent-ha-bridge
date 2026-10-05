@@ -313,51 +313,592 @@ Test-That 'an unarmed session reports what it is doing, as before' {
 function Set-CopilotMqttStatus {
     param([string]$SessionId, [string]$Status, [hashtable]$Headers, [hashtable]$Attributes)
 }
-$script:DaemonStopArmed = @{}
-[void](Set-DaemonStopArm -SessionId $sid -Status 'working' -ProcessId 0)
-$script:Activity = @()
-Publish-BridgeSessionStatus -SessionId $sid -SessionName 'S' -Machine 'M' -Status 'waiting' `
-    -Activity 'Needs your permission' -Headers $headers
-Test-That 'an adapter publication cannot wipe the question either' {
-    $script:Activity[-1] -eq $script:CopilotEndSessionConfirmNote
+# Cold imports do not belong inside a ten-second prompt precondition. The child
+# becomes ready first; neither its final parent timestamp nor a reused output file
+# proves what its real store consumer saw.
+. (Join-Path $PSScriptRoot 'runner-support.ps1')
+
+function Get-StopFixturePathIdentity {
+    param([Parameter(Mandatory)][string]$Path)
+    $canonical = ConvertTo-BridgeInstallPath $Path
+    if ($IsWindows) { $canonical = $canonical.ToLowerInvariant() }
+    [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($canonical)))
 }
 
-# The case the in-process check cannot reach: a standalone Claude hook has neither
-# Get-DaemonCardSummary nor the daemon's in-memory arm, and was publishing its raw
-# activity straight over the question. Run in a real child process with only the
-# adapter loaded, so the daemon-free route is the one actually exercised.
-$childOut = Join-Path ([IO.Path]::GetTempPath()) "stop-prompt-$([guid]::NewGuid().ToString('N').Substring(0,8)).txt"
-$childScript = @"
+function Get-StopFixtureContextIdentity {
+    $context = Get-BridgeInstallContext
+    @{
+        Home = Get-StopFixturePathIdentity $context.Home
+        Config = Get-StopFixturePathIdentity $context.ConfigPath
+        Runtime = Get-StopFixturePathIdentity (Get-BridgeRuntimeRoot -Context $context)
+        Store = Get-StopFixturePathIdentity (Get-BridgeStopPromptPath)
+    }
+}
+
+function Write-StopFixtureRecord {
+    param([string]$Path, [string]$Invocation, [string]$Kind, [Collections.IDictionary]$Data)
+    Assert-BridgeTestPath -Path @($Path, "$Path.pending")
+    $json = @{ Schema = 'stop-prompt-1'; Invocation = $Invocation; Kind = $Kind; Data = $Data } |
+        ConvertTo-Json -Depth 12 -Compress
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($json)
+    if ($bytes.Length -gt 16384) { throw 'Stop fixture metadata exceeds its byte bound.' }
+    $file = [IO.File]::Open("$Path.pending", [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+    try { $file.Write($bytes, 0, $bytes.Length); $file.Flush($true) }
+    finally { $file.Dispose() }
+    [IO.File]::Move("$Path.pending", $Path)
+}
+
+function Read-StopFixtureRecord {
+    param([string]$Path, [string]$Invocation, [string]$Kind)
+    Assert-BridgeTestPath -Path $Path
+    $bytes = [byte[]]::new(16385)
+    $count = 0
+    $file = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+    try {
+        while ($count -lt $bytes.Length) {
+            $read = $file.Read($bytes, $count, $bytes.Length - $count)
+            if ($read -eq 0) { break }
+            $count += $read
+        }
+    }
+    finally { $file.Dispose() }
+    if ($count -eq 0 -or $count -gt 16384) { throw 'Stop fixture metadata is empty or oversized.' }
+    $record = [Text.UTF8Encoding]::new($false, $true).GetString($bytes, 0, $count) | ConvertFrom-Json -AsHashtable
+    if ($record -isnot [Collections.IDictionary] -or $record.Count -ne 4 -or
+        $record['Schema'] -cne 'stop-prompt-1' -or $record['Invocation'] -cne $Invocation -or
+        $record['Kind'] -cne $Kind -or $record['Data'] -isnot [Collections.IDictionary]) {
+        throw 'Stop fixture metadata does not belong to this invocation and stage.'
+    }
+    $data = $record['Data']
+    $fields = switch ($Kind) {
+        'Ready' { @('Scenario', 'Context', 'DaemonAbsent', 'ProcessId', 'BirthUtcTicks', 'ReadyUtcTicks') }
+        'Release' { @('Scenario') }
+        'Result' {
+            @('Scenario', 'Phase', 'Context', 'DaemonAbsent', 'PathCalls', 'StoreCalls', 'ConsumerCalls', 'StatusCalls',
+                'ActivityCalls', 'StoreIdentity', 'StoreState', 'KeyPresent', 'UntilUtcTicks', 'ConsumerBeforeUtcTicks',
+                'ConsumerAfterUtcTicks', 'ConsumerState', 'SessionMatches', 'Summaries', 'Events', 'ObservationError',
+                'ErrorType', 'WriteGuard', 'NetworkGuard')
+        }
+        default { throw 'Stop fixture metadata kind is unsupported.' }
+    }
+    if (@(Compare-Object $fields @($data.Keys) -CaseSensitive).Count -or $data.Scenario -cnotin @('Armed', 'Cleared')) {
+        throw 'Stop fixture metadata fields are invalid.'
+    }
+    if ($Kind -ne 'Release') {
+        if ($data.DaemonAbsent -isnot [bool]) { throw 'Stop fixture daemon observation is invalid.' }
+        if ($null -ne $data.Context) {
+            if ($data.Context -isnot [Collections.IDictionary] -or
+                @(Compare-Object @('Home', 'Config', 'Runtime', 'Store') @($data.Context.Keys) -CaseSensitive).Count) {
+                throw 'Stop fixture context identity is invalid.'
+            }
+            foreach ($value in $data.Context.Values) {
+                if ($value -isnot [string] -or $value -cnotmatch '^[A-F0-9]{64}$') { throw 'Stop fixture context hash is invalid.' }
+            }
+        }
+        foreach ($key in @($data.Keys | Where-Object { $_ -like '*UtcTicks' })) {
+            if ($null -ne $data[$key] -and ($data[$key] -isnot [string] -or $data[$key] -cnotmatch '^[0-9]{1,19}$')) {
+                throw 'Stop fixture timestamp representation is invalid.'
+            }
+        }
+    }
+    if ($Kind -eq 'Ready' -and ($null -eq $data.Context -or
+        ($data.ProcessId -isnot [int] -and $data.ProcessId -isnot [long]) -or $data.ProcessId -le 0)) {
+        throw 'Stop fixture READY identity is invalid.'
+    }
+    if ($Kind -eq 'Result') {
+        if ($data.Phase -cnotin @('Imports', 'Ready', 'WaitingRelease', 'Publishing', 'Complete') -or
+            $data.WriteGuard -isnot [bool] -or $data.NetworkGuard -isnot [bool] -or $data.SessionMatches -isnot [bool] -or
+            ($null -ne $data.KeyPresent -and $data.KeyPresent -isnot [bool]) -or
+            ($null -ne $data.StoreIdentity -and $data.StoreIdentity -cnotmatch '^[A-F0-9]{64}$') -or
+            ($null -ne $data.StoreState -and $data.StoreState -cnotin @('Empty', 'Ok', 'Failed')) -or
+            ($null -ne $data.ConsumerState -and $data.ConsumerState -cnotin @('Prompt', 'None', 'Unknown')) -or
+            ($null -ne $data.ObservationError -and $data.ObservationError -cnotin
+                @('PathIdentity', 'UntilType', 'StoreShape', 'ConsumerShape', 'UnexpectedSummary')) -or
+            ($null -ne $data.ErrorType -and ($data.ErrorType.Length -gt 256 -or $data.ErrorType -cnotmatch '^System\.[A-Za-z.]+Exception$'))) {
+            throw 'Stop fixture result classifications are invalid.'
+        }
+        foreach ($key in @('PathCalls', 'StoreCalls', 'ConsumerCalls', 'StatusCalls', 'ActivityCalls')) {
+            if (($data[$key] -isnot [int] -and $data[$key] -isnot [long]) -or $data[$key] -lt 0 -or $data[$key] -gt 16) {
+                throw 'Stop fixture call count is invalid.'
+            }
+        }
+        if ($data.Summaries -isnot [array] -or $data.Summaries.Count -gt 16 -or
+            @($data.Summaries | Where-Object { $_ -isnot [string] -or $_ -cnotin
+                @('Press End session again to end it', 'Needs your permission') }).Count -or
+            $data.Events -isnot [array] -or $data.Events.Count -gt 96 -or
+            @($data.Events | Where-Object { $_ -isnot [string] -or $_ -cnotin
+                @('Status', 'ConsumerEnter', 'Path', 'Store', 'ConsumerExit', 'Activity') }).Count) {
+            throw 'Stop fixture bounded publication observations are invalid.'
+        }
+    }
+    $data
+}
+
+function Receive-StopFixtureOutput {
+    param([hashtable]$Streams)
+    foreach ($capture in $Streams.Values) {
+        while ($null -ne $capture.Pending -and $capture.Pending.IsCompleted) {
+            $completed = $capture.Pending
+            $capture.Pending = $null
+            $count = $completed.GetAwaiter().GetResult()
+            if ($count -eq 0) { $capture.Ended = $true; break }
+            $capture.ObservedBytes += $count
+            $retained = [Math]::Min($count, 32768 - [int]$capture.Bytes.Length)
+            if ($retained -gt 0) { $capture.Bytes.Write($capture.Buffer, 0, $retained) }
+            if ($capture.ObservedBytes -gt 32768) {
+                $capture.Overflow = $true
+                throw 'Stop fixture child stream exceeded32768 bytes; it is not a successful truncated result.'
+            }
+            $capture.Pending = $capture.Source.ReadAsync($capture.Buffer, 0, $capture.Buffer.Length)
+        }
+    }
+}
+
+function Invoke-StopFixturePublisher {
+    param(
+        [Parameter(Mandatory)][ValidateSet('Armed', 'Cleared')][string]$Scenario,
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+    $invocation = [guid]::NewGuid().ToString('N')
+    $root = Join-Path $env:TEMP "stop-prompt-$invocation"
+    Assert-BridgeTestPath -Path $root
+    if (Test-Path -LiteralPath $root) { throw 'The fresh stop fixture root already exists.' }
+    $rootCreated = $false
+    $childFile = Join-Path $root 'child.ps1'
+    $readyFile = Join-Path $root 'ready.json'
+    $releaseFile = Join-Path $root 'release.json'
+    $resultFile = Join-Path $root 'result.json'
+    $process = [Diagnostics.Process]::new()
+    $heldHandle = $null
+    $streams = @{}
+    $watch = [Diagnostics.Stopwatch]::new()
+    $primaryFailure = $null
+    $cleanupErrors = [Collections.Generic.List[string]]::new()
+    $cleanupFailures = [Collections.Generic.List[object]]::new()
+    $probe = [ordered]@{
+        Scenario = $Scenario; Invocation = $invocation; Stage = 'Preparing'
+        ProcessStarted = $false; ProcessId = $null; BirthUtcTicks = $null; ExitObserved = $false; ExitCode = $null
+        ExitUtcTicks = $null; LifecycleMilliseconds = $null
+        ParentContext = $null; Ready = $null; ReadyObserved = $false
+        ReadyUtcTicks = $null; ReadyObservedUtcTicks = $null; ContextMatches = $false
+        ArmSucceeded = $null; ArmUtcTicks = $null; ParentUntilUtcTicks = $null; ClearObserved = $null
+        ReleaseUtcTicks = $null; Child = $null; ErrorType = $null; WriteGuard = $false; NetworkGuard = $false
+        ForcedCleanup = $false; CleanupIdentity = 'NotNeeded'; CleanupErrors = @(); Streams = @{}; FixtureFilesRemoved = $false
+    }
+    try {
+        [void][IO.Directory]::CreateDirectory($root)
+        $rootCreated = $true
+        $expectedContext = Get-StopFixtureContextIdentity
+        $probe.ParentContext = $expectedContext
+        $childText = @'
+param(
+    [Parameter(Mandatory, Position=0)][string]$FixtureRepository,
+    [Parameter(Mandatory, Position=1)][string]$FixtureRoot,
+    [Parameter(Mandatory, Position=2)][string]$FixtureInvocation,
+    [Parameter(Mandatory, Position=3)][ValidateSet('Armed','Cleared')][string]$FixtureScenario,
+    [Parameter(Mandatory, Position=4)][string]$FixtureSession
+)
 Set-StrictMode -Version Latest
-`$ErrorActionPreference = 'Stop'
-. '$((Join-Path $PSScriptRoot '..\hooks\decision-bridge-common.ps1'))'
-. '$((Join-Path $PSScriptRoot '..\hooks\decision-mqtt.ps1'))'
-. '$((Join-Path $PSScriptRoot '..\hooks\bridge-adapter.ps1'))'
-function Set-CopilotMqttStatus { param(`$SessionId, `$Status, `$Headers, `$Attributes) }
-function Set-CopilotMqttActivity {
-    param(`$SessionId, `$Summary, `$Detail, `$Headers)
-    Set-Content -LiteralPath '$childOut' -Value `$Summary -Encoding utf8
+$ErrorActionPreference = 'Stop'
+'@
+        foreach ($helper in @('Get-StopFixturePathIdentity', 'Get-StopFixtureContextIdentity',
+            'Write-StopFixtureRecord', 'Read-StopFixtureRecord')) {
+            $childText += "`nfunction $helper {`n$((Get-Command -Name $helper -CommandType Function).Definition)`n}`n"
+        }
+        $childText += @'
+$script:StopFixture = @{
+    Scenario = $FixtureScenario; Phase = 'Imports'; Context = $null; DaemonAbsent = $false
+    PathCalls = 0; StoreCalls = 0; ConsumerCalls = 0; StatusCalls = 0; ActivityCalls = 0
+    StoreIdentity = $null; StoreState = $null; KeyPresent = $null; UntilUtcTicks = $null
+    ConsumerBeforeUtcTicks = $null; ConsumerAfterUtcTicks = $null; ConsumerState = $null
+    SessionMatches = $true; Summaries = @(); Events = @(); ObservationError = $null
+    ErrorType = $null; WriteGuard = $false; NetworkGuard = $false
 }
-`$daemonLoaded = [bool](Get-Command -Name Get-DaemonCardSummary -CommandType Function -ErrorAction Ignore)
-if (`$daemonLoaded) { throw 'the child must not have daemon state' }
-Publish-BridgeSessionStatus -SessionId '$sid' -SessionName 'S' -Machine 'M' -Status 'waiting' ``
-    -Activity 'Needs your permission' -Headers @{}
-"@
-$childFile = Join-Path ([IO.Path]::GetTempPath()) "stop-prompt-child-$([guid]::NewGuid().ToString('N').Substring(0,8)).ps1"
-Set-Content -LiteralPath $childFile -Value $childScript -Encoding utf8
-# Not Get-Process: it is mocked above, and this needs the real executable.
+try {
+    . (Join-Path $FixtureRepository 'hooks\decision-bridge-common.ps1')
+    . (Join-Path $FixtureRepository 'hooks\decision-mqtt.ps1')
+    . (Join-Path $FixtureRepository 'hooks\bridge-adapter.ps1')
+    Assert-BridgeTestPath -Path $FixtureRoot
+    Assert-BridgeTestEnvironment -Required
+    $script:StopFixture.DaemonAbsent = -not [bool](Get-Command Get-DaemonCardSummary -CommandType Function -ErrorAction Ignore)
+    if (-not $script:StopFixture.DaemonAbsent) { throw 'Stop fixture child unexpectedly loaded daemon state.' }
+    $script:StopFixture.Context = Get-StopFixtureContextIdentity
+    $script:StopOriginalPath = (Get-Command Get-BridgeStopPromptPath -CommandType Function).ScriptBlock
+    $script:StopOriginalStore = (Get-Command Read-BridgeStopPromptStore -CommandType Function).ScriptBlock
+    $script:StopOriginalConsumer = (Get-Command Get-BridgeStopPrompt -CommandType Function).ScriptBlock
+    function Get-BridgeStopPromptPath {
+        $script:StopFixture.PathCalls++
+        $actualPath = & $script:StopOriginalPath
+        try { $script:StopFixture.StoreIdentity = Get-StopFixturePathIdentity $actualPath }
+        catch { $script:StopFixture.ObservationError = 'PathIdentity'; throw }
+        $script:StopFixture.Events += 'Path'
+        return $actualPath
+    }
+    function Read-BridgeStopPromptStore {
+        $script:StopFixture.StoreCalls++
+        $actualStore = & $script:StopOriginalStore
+        $script:StopFixture.Events += 'Store'
+        if ($actualStore -is [Collections.IDictionary] -and $actualStore.Contains('State') -and
+            $actualStore.Contains('Prompts') -and $actualStore.Prompts -is [Collections.IDictionary]) {
+            $script:StopFixture.StoreState = [string]$actualStore.State
+            $script:StopFixture.KeyPresent = $actualStore.Prompts.ContainsKey($FixtureSession)
+            if ($script:StopFixture.KeyPresent) {
+                $until = $actualStore.Prompts[$FixtureSession].Until
+                if ($until -is [DateTimeOffset]) { $script:StopFixture.UntilUtcTicks = [string]$until.UtcDateTime.Ticks }
+                else { $script:StopFixture.ObservationError = 'UntilType' }
+            }
+        }
+        else { $script:StopFixture.ObservationError = 'StoreShape' }
+        return $actualStore
+    }
+    function Get-BridgeStopPrompt {
+        param([Parameter(Mandatory)][string]$SessionId)
+        $script:StopFixture.ConsumerCalls++
+        $script:StopFixture.SessionMatches = $script:StopFixture.SessionMatches -and ($SessionId -ceq $FixtureSession)
+        $script:StopFixture.ConsumerBeforeUtcTicks = [string][DateTimeOffset]::Now.UtcDateTime.Ticks
+        $script:StopFixture.Events += 'ConsumerEnter'
+        try {
+            $actualPrompt = & $script:StopOriginalConsumer @PSBoundParameters
+            if ($actualPrompt -is [Collections.IDictionary] -and $actualPrompt.Contains('State')) {
+                $script:StopFixture.ConsumerState = [string]$actualPrompt.State
+            }
+            else { $script:StopFixture.ObservationError = 'ConsumerShape' }
+            return $actualPrompt
+        }
+        finally {
+            $script:StopFixture.ConsumerAfterUtcTicks = [string][DateTimeOffset]::Now.UtcDateTime.Ticks
+            $script:StopFixture.Events += 'ConsumerExit'
+        }
+    }
+    function Set-CopilotMqttStatus {
+        param($SessionId, $Status, $Headers, $Attributes)
+        $script:StopFixture.StatusCalls++
+        $script:StopFixture.SessionMatches = $script:StopFixture.SessionMatches -and ($SessionId -ceq $FixtureSession)
+        $script:StopFixture.Events += 'Status'
+    }
+    function Set-CopilotMqttActivity {
+        param($SessionId, $Summary, $Detail, $Headers)
+        $script:StopFixture.ActivityCalls++
+        $script:StopFixture.SessionMatches = $script:StopFixture.SessionMatches -and ($SessionId -ceq $FixtureSession)
+        if ($Summary -cnotin @('Press End session again to end it', 'Needs your permission')) {
+            $script:StopFixture.ObservationError = 'UnexpectedSummary'
+            throw 'Stop fixture received an unexpected synthetic summary.'
+        }
+        $script:StopFixture.Summaries += [string]$Summary
+        $script:StopFixture.Events += 'Activity'
+    }
+    $self = [Diagnostics.Process]::GetCurrentProcess()
+    try {
+        $ready = @{
+            Scenario = $FixtureScenario; Context = $script:StopFixture.Context; DaemonAbsent = $script:StopFixture.DaemonAbsent
+            ProcessId = $self.Id; BirthUtcTicks = [string]$self.StartTime.ToUniversalTime().Ticks
+            ReadyUtcTicks = [string][DateTimeOffset]::Now.UtcDateTime.Ticks
+        }
+    }
+    finally { $self.Dispose() }
+    $script:StopFixture.Phase = 'Ready'
+    Write-StopFixtureRecord -Path (Join-Path $FixtureRoot 'ready.json') -Invocation $FixtureInvocation -Kind Ready -Data $ready
+    $releaseWatch = [Diagnostics.Stopwatch]::StartNew()
+    $script:StopFixture.Phase = 'WaitingRelease'
+    while (-not [IO.File]::Exists((Join-Path $FixtureRoot 'release.json'))) {
+        if ($releaseWatch.ElapsedMilliseconds -ge 15000) { throw 'Stop fixture release was not observed within15 seconds.' }
+        Start-Sleep -Milliseconds 20
+    }
+    $release = Read-StopFixtureRecord -Path (Join-Path $FixtureRoot 'release.json') -Invocation $FixtureInvocation -Kind Release
+    if ($release.Scenario -cne $FixtureScenario) { throw 'Stop fixture release scenario differs.' }
+    $script:StopFixture.Phase = 'Publishing'
+    Publish-BridgeSessionStatus -SessionId $FixtureSession -SessionName 'S' -Machine 'M' -Status 'waiting' `
+        -Activity 'Needs your permission' -Headers @{}
+    if ($script:StopFixture.ObservationError) { throw 'Stop fixture observation failed; no behavioral success is claimed.' }
+    $script:StopFixture.Phase = 'Complete'
+}
+catch {
+    $script:StopFixture.ErrorType = $_.Exception.GetType().FullName
+    $cause = $_.Exception
+    while ($null -ne $cause) {
+        if ($cause.Data['BridgeTestWriteBlocked']) { $script:StopFixture.WriteGuard = $true }
+        if ($cause.Data['BridgeTestNetworkBlocked']) { $script:StopFixture.NetworkGuard = $true }
+        $cause = $cause.InnerException
+    }
+    throw
+}
+finally {
+    Write-StopFixtureRecord -Path (Join-Path $FixtureRoot 'result.json') -Invocation $FixtureInvocation -Kind Result -Data $script:StopFixture
+}
+exit 0
+'@
+        Assert-BridgeTestPath -Path $childFile
+        [IO.File]::WriteAllText($childFile, $childText, [Text.UTF8Encoding]::new($false))
+        $process.StartInfo = New-BridgeTestProcessStartInfo -ScriptPath $childFile -Sandbox $env:AGENT_HA_BRIDGE_TEST_ROOT `
+            -ScriptArguments @($script:BridgeTestRepository, $root, $invocation, $Scenario, $SessionId)
+        $probe.Stage = 'Starting'
+        $watch.Start()
+        $probe.ProcessStarted = $process.Start()
+        if (-not $probe.ProcessStarted) { throw 'Stop fixture child did not start.' }
+        $probe.ProcessId = $process.Id
+        $heldHandle = $process.SafeHandle
+        $probe.BirthUtcTicks = [string]$process.StartTime.ToUniversalTime().Ticks
+        $process.StandardInput.Close()
+        foreach ($streamName in @('Stdout', 'Stderr')) {
+            $source = if ($streamName -eq 'Stdout') { $process.StandardOutput.BaseStream } else { $process.StandardError.BaseStream }
+            $capture = @{
+                Source = $source; Buffer = [byte[]]::new(4096); Bytes = [IO.MemoryStream]::new()
+                Pending = $null; ObservedBytes = 0L; Ended = $false; Overflow = $false
+            }
+            $capture.Pending = $source.ReadAsync($capture.Buffer, 0, $capture.Buffer.Length)
+            $streams[$streamName] = $capture
+        }
+        $probe.Stage = 'WaitingReady'
+        while (-not [IO.File]::Exists($readyFile)) {
+            Receive-StopFixtureOutput $streams
+            if ($process.HasExited) { throw 'Stop fixture child exited before READY.' }
+            if ($watch.ElapsedMilliseconds -ge 30000) { throw 'Stop fixture READY exceeded30 seconds.' }
+            [void]$process.WaitForExit(20)
+        }
+        $ready = Read-StopFixtureRecord -Path $readyFile -Invocation $invocation -Kind Ready
+        $probe.Ready = $ready
+        if ($watch.ElapsedMilliseconds -ge 30000 -or $ready.Scenario -cne $Scenario -or $ready.ProcessId -ne $probe.ProcessId -or
+            $ready.BirthUtcTicks -cne $probe.BirthUtcTicks -or $ready.DaemonAbsent -ne $true -or $process.HasExited) {
+            throw 'Stop fixture READY is not from the live owned daemon-free child.'
+        }
+        foreach ($key in @('Home', 'Config', 'Runtime', 'Store')) {
+            if ($ready.Context[$key] -cne $expectedContext[$key]) { throw 'Stop fixture child context or store differs.' }
+        }
+        $readyTicks = 0L
+        if (-not [long]::TryParse([string]$ready.ReadyUtcTicks, [ref]$readyTicks) -or
+            $readyTicks -lt [long]$probe.BirthUtcTicks) {
+            throw 'Stop fixture READY timestamp is unavailable.'
+        }
+        $probe.ReadyUtcTicks = [string]$readyTicks
+        $probe.ReadyObservedUtcTicks = [string][DateTimeOffset]::Now.UtcDateTime.Ticks
+        if ($readyTicks -gt [long]$probe.ReadyObservedUtcTicks) { throw 'Stop fixture READY clock ordering is invalid.' }
+        $probe.ReadyObserved = $true
+        $probe.ContextMatches = $true
+        $probe.Stage = 'SettingPrecondition'
+        if ($Scenario -eq 'Armed') {
+            if ($script:DaemonConfig.StopConfirmSeconds -ne 10) { throw 'The production confirmation window changed.' }
+            $script:DaemonStopArmed = @{}
+            $armResult = Set-DaemonStopArm -SessionId $SessionId -Status 'working' -ProcessId 0
+            if ($armResult -isnot [bool]) { throw 'Stop fixture armer returned an ambiguous outcome.' }
+            $probe.ArmSucceeded = $armResult
+            if (-not $probe.ArmSucceeded) { throw 'Stop fixture could not establish the real arm.' }
+            $probe.ArmUtcTicks = [string]$script:DaemonStopArmed[$SessionId].At.UtcDateTime.Ticks
+            $store = Read-BridgeStopPromptStore
+            if ($store.State -cne 'Ok' -or -not $store.Prompts.ContainsKey($SessionId)) { throw 'Stop fixture arm has no readable record.' }
+            $probe.ParentUntilUtcTicks = [string]$store.Prompts[$SessionId].Until.UtcDateTime.Ticks
+            if ([long]$probe.ArmUtcTicks -lt [long]$probe.ReadyObservedUtcTicks) { throw 'Stop fixture arm did not follow READY.' }
+            $script:Activity = @()
+            Publish-BridgeSessionStatus -SessionId $SessionId -SessionName 'S' -Machine 'M' -Status 'waiting' `
+                -Activity 'Needs your permission' -Headers $Headers
+            Test-That 'an adapter publication cannot wipe the question either' {
+                $script:Activity[-1] -eq $script:CopilotEndSessionConfirmNote
+            }
+            if ($script:Activity[-1] -ne $script:CopilotEndSessionConfirmNote) { throw 'Stop fixture in-process precondition failed.' }
+        }
+        else {
+            Remove-DaemonStopArm -SessionId $SessionId
+            $store = Read-BridgeStopPromptStore
+            $probe.ClearObserved = $store.State -cin @('Empty', 'Ok') -and -not $store.Prompts.ContainsKey($SessionId)
+            if (-not $probe.ClearObserved) { throw 'Stop fixture real clear was not observed.' }
+        }
+        $probe.ReleaseUtcTicks = [string][DateTimeOffset]::Now.UtcDateTime.Ticks
+        if ([long]$probe.ReleaseUtcTicks -lt [long]$probe.ReadyObservedUtcTicks -or
+            ($Scenario -eq 'Armed' -and ([long]$probe.ReleaseUtcTicks -lt [long]$probe.ArmUtcTicks -or
+                [long]$probe.ReleaseUtcTicks -ge [long]$probe.ParentUntilUtcTicks))) {
+            throw 'Stop fixture precondition elapsed or its clock moved before release.'
+        }
+        $probe.Stage = 'WaitingExit'
+        Write-StopFixtureRecord -Path $releaseFile -Invocation $invocation -Kind Release -Data @{ Scenario = $Scenario }
+        while (-not $process.HasExited) {
+            Receive-StopFixtureOutput $streams
+            if ($watch.ElapsedMilliseconds -ge 45000) { throw 'Stop fixture child exceeded its45-second lifecycle.' }
+            [void]$process.WaitForExit(20)
+        }
+        $probe.ExitObserved = $true
+        $probe.ExitCode = [int]$process.ExitCode
+        $probe.ExitUtcTicks = [string]$process.ExitTime.ToUniversalTime().Ticks
+        $probe.LifecycleMilliseconds = $watch.ElapsedMilliseconds
+        if ($probe.LifecycleMilliseconds -ge 45000) { throw 'Stop fixture observed completion outside its lifecycle bound.' }
+        $probe.Stage = 'ReadingResult'
+        if ([IO.File]::Exists($resultFile)) {
+            $probe.Child = Read-StopFixtureRecord -Path $resultFile -Invocation $invocation -Kind Result
+        }
+        if ($probe.ExitCode -ne 0 -or $null -eq $probe.Child) { throw 'Stop fixture requires a real zero exit and a fresh result.' }
+        $child = $probe.Child
+        if ($null -eq $child.Context) { throw 'Stop fixture completed result has no context identity.' }
+        foreach ($key in @('Home', 'Config', 'Runtime', 'Store')) {
+            if ($child.Context[$key] -cne $expectedContext[$key]) { throw 'Stop fixture completed context differs.' }
+        }
+        if ($child.Scenario -cne $Scenario -or $child.Phase -cne 'Complete' -or -not $child.DaemonAbsent -or
+            $child.ErrorType -or $child.ObservationError -or $child.WriteGuard -or $child.NetworkGuard -or
+            -not $child.SessionMatches -or $child.PathCalls -ne 1 -or $child.StoreCalls -ne 1 -or
+            $child.ConsumerCalls -ne 1 -or $child.StatusCalls -ne 1 -or $child.ActivityCalls -ne 1 -or
+            @($child.Summaries).Count -ne 1 -or $child.StoreIdentity -cne $expectedContext.Store -or
+            ($child.Events -join ',') -cne 'Status,ConsumerEnter,Path,Store,ConsumerExit,Activity') {
+            throw 'Stop fixture did not observe one unchanged real consumer and publication.'
+        }
+        $beforeTicks = 0L; $afterTicks = 0L
+        if (-not [long]::TryParse([string]$child.ConsumerBeforeUtcTicks, [ref]$beforeTicks) -or
+            -not [long]::TryParse([string]$child.ConsumerAfterUtcTicks, [ref]$afterTicks) -or
+            $beforeTicks -lt [long]$probe.ReleaseUtcTicks -or $afterTicks -lt $beforeTicks) {
+            throw 'Stop fixture consumer clock observation is missing or nonmonotonic.'
+        }
+        if ($Scenario -eq 'Armed') {
+            $untilTicks = 0L
+            if ($child.StoreState -cne 'Ok' -or $child.KeyPresent -ne $true -or $child.ConsumerState -cne 'Prompt' -or
+                -not [long]::TryParse([string]$child.UntilUtcTicks, [ref]$untilTicks) -or
+                $child.UntilUtcTicks -cne $probe.ParentUntilUtcTicks -or $afterTicks -ge $untilTicks) {
+                throw 'Stop fixture positive consumer was not proven wholly inside the actual live-record window.'
+            }
+        }
+        elseif ($child.StoreState -cnotin @('Empty', 'Ok') -or $child.KeyPresent -ne $false -or
+            $null -ne $child.UntilUtcTicks -or $child.ConsumerState -cne 'None') {
+            throw 'Stop fixture cleared consumer did not observe actual None.'
+        }
+        $probe.Stage = 'Complete'
+    }
+    catch {
+        $primaryFailure = $_
+        $probe.ErrorType = $_.Exception.GetType().FullName
+        $cause = $_.Exception
+        while ($null -ne $cause) {
+            if ($cause.Data['BridgeTestWriteBlocked']) { $probe.WriteGuard = $true }
+            if ($cause.Data['BridgeTestNetworkBlocked']) { $probe.NetworkGuard = $true }
+            $cause = $cause.InnerException
+        }
+    }
+    finally {
+        if ($probe.ProcessStarted) {
+            try {
+                $probe.CleanupIdentity = 'Inspecting'
+                if (-not $process.HasExited) {
+                    $cleanupBirth = 0L
+                    if ($null -eq $heldHandle -or $heldHandle.IsInvalid -or $heldHandle.IsClosed -or
+                        $probe.ProcessId -isnot [int] -or $probe.ProcessId -le 0 -or $process.Id -ne $probe.ProcessId -or
+                        $probe.BirthUtcTicks -isnot [string] -or $probe.BirthUtcTicks -cnotmatch '^[1-9][0-9]{0,18}$' -or
+                        -not [long]::TryParse($probe.BirthUtcTicks, [ref]$cleanupBirth) -or
+                        $cleanupBirth -gt [datetime]::MaxValue.Ticks -or
+                        $process.StartTime.ToUniversalTime().Ticks -ne $cleanupBirth) {
+                        $probe.CleanupIdentity = 'Refused'
+                        throw 'Stop fixture PID cleanup requires a valid held handle, PID and observed matching full birth.'
+                    }
+                    $probe.CleanupIdentity = 'Verified'
+                    $probe.ForcedCleanup = $true
+                    Microsoft.PowerShell.Management\Stop-Process -Id $probe.ProcessId -Force -ErrorAction Stop
+                    if (-not $process.WaitForExit(5000)) { throw 'Stop fixture owned child did not exit during bounded cleanup.' }
+                }
+                else { $probe.CleanupIdentity = 'AlreadyExited' }
+                $probe.ExitObserved = $true
+                $probe.ExitCode = [int]$process.ExitCode
+                $probe.ExitUtcTicks = [string]$process.ExitTime.ToUniversalTime().Ticks
+            }
+            catch {
+                if ($probe.CleanupIdentity -eq 'Inspecting') { $probe.CleanupIdentity = 'Unavailable' }
+                $cleanupFailures.Add($_)
+                $cleanupErrors.Add('OwnedProcess:' + $_.Exception.GetType().FullName)
+            }
+        }
+        $drain = [Diagnostics.Stopwatch]::StartNew()
+        try {
+            while (@($streams.Values | Where-Object { -not $_.Ended }).Count -and $drain.ElapsedMilliseconds -lt 5000) {
+                Receive-StopFixtureOutput $streams
+                if (@($streams.Values | Where-Object { -not $_.Ended }).Count) { Start-Sleep -Milliseconds 10 }
+            }
+            if (@($streams.Values | Where-Object { -not $_.Ended }).Count) { throw 'Stop fixture streams did not finish draining.' }
+        }
+        catch {
+            $cleanupFailures.Add($_)
+            $cleanupErrors.Add('Streams:' + $_.Exception.GetType().FullName)
+        }
+        if ($probe.ExitObserved -and $null -eq $probe.Child -and [IO.File]::Exists($resultFile)) {
+            try { $probe.Child = Read-StopFixtureRecord -Path $resultFile -Invocation $invocation -Kind Result }
+            catch {
+                $cleanupFailures.Add($_)
+                $cleanupErrors.Add('ResultRecord:' + $_.Exception.GetType().FullName)
+            }
+        }
+        if ($null -ne $probe.Child) {
+            if ($probe.Child.WriteGuard) { $probe.WriteGuard = $true }
+            if ($probe.Child.NetworkGuard) { $probe.NetworkGuard = $true }
+        }
+        # Child errors can contain paths. Retain bounded byte counts/hashes with the
+        # actual exit and safe observations, rather than echoing those streams.
+        foreach ($streamName in $streams.Keys) {
+            $capture = $streams[$streamName]
+            $probe.Streams[$streamName] = @{
+                ObservedBytes = $capture.ObservedBytes; RetainedBytes = $capture.Bytes.Length; Complete = $capture.Ended
+                Overflow = $capture.Overflow; Sha256 = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($capture.Bytes.ToArray()))
+            }
+            try { $capture.Source.Dispose(); $capture.Bytes.Dispose() }
+            catch {
+                $cleanupFailures.Add($_)
+                $cleanupErrors.Add('StreamDispose:' + $_.Exception.GetType().FullName)
+            }
+        }
+        try { $process.Dispose() }
+        catch {
+            $cleanupFailures.Add($_)
+            $cleanupErrors.Add('ProcessDispose:' + $_.Exception.GetType().FullName)
+        }
+        $watch.Stop()
+        if ($rootCreated) {
+            foreach ($path in @($childFile, $readyFile, "$readyFile.pending", $releaseFile, "$releaseFile.pending", $resultFile, "$resultFile.pending")) {
+                try {
+                    Assert-BridgeTestPath -Path $path
+                    if ([IO.File]::Exists($path)) { [IO.File]::Delete($path) }
+                }
+                catch {
+                    $cleanupFailures.Add($_)
+                    $cleanupErrors.Add('Files:' + $_.Exception.GetType().FullName)
+                }
+            }
+            try {
+                Assert-BridgeTestPath -Path $root
+                [IO.Directory]::Delete($root, $false)
+                $probe.FixtureFilesRemoved = $true
+            }
+            catch {
+                $cleanupFailures.Add($_)
+                $cleanupErrors.Add('Directory:' + $_.Exception.GetType().FullName)
+            }
+        }
+        else { $probe.FixtureFilesRemoved = $true }
+        foreach ($failure in $cleanupFailures) {
+            $cause = $failure.Exception
+            while ($null -ne $cause) {
+                if ($cause.Data['BridgeTestWriteBlocked']) { $probe.WriteGuard = $true }
+                if ($cause.Data['BridgeTestNetworkBlocked']) { $probe.NetworkGuard = $true }
+                $cause = $cause.InnerException
+            }
+        }
+        $probe.CleanupErrors = $cleanupErrors.ToArray()
+        $json = $probe | ConvertTo-Json -Depth 12 -Compress
+        if ([Text.Encoding]::UTF8.GetByteCount($json) -gt 16384) { throw 'Stop fixture reporting exceeded its metadata bound.' }
+        Write-Host ('STOP_PROMPT_FIXTURE ' + $json)
+    }
+    if ($null -eq $primaryFailure -and $cleanupFailures.Count) { $primaryFailure = $cleanupFailures[0] }
+    if ($null -ne $primaryFailure) {
+        if ($probe.WriteGuard) { $primaryFailure.Exception.Data['BridgeTestWriteBlocked'] = $true }
+        if ($probe.NetworkGuard) { $primaryFailure.Exception.Data['BridgeTestNetworkBlocked'] = $true }
+        throw $primaryFailure
+    }
+    if ($cleanupErrors.Count -or $probe.ForcedCleanup -or -not $probe.ExitObserved -or $probe.ExitCode -ne 0) {
+        throw 'Stop fixture cleanup or native completion failed; no behavioral success is claimed.'
+    }
+    [pscustomobject]$probe
+}
+
+# Not Get-Process: it is mocked above, and the unchanged later probes need the real executable.
 $pwshPath = [Diagnostics.Process]::GetCurrentProcess().MainModule.FileName
-& $pwshPath -NoProfile -File $childFile 2>&1 | Out-Null
+$armedPublisher = Invoke-StopFixturePublisher -Scenario Armed -SessionId $sid -Headers $headers
 Test-That 'a separate hook process cannot wipe it either' {
-    (Get-Content -LiteralPath $childOut -Raw).Trim() -eq $script:CopilotEndSessionConfirmNote
+    $armedPublisher.Child.Summaries[0] -eq $script:CopilotEndSessionConfirmNote
 }
-# And without a recorded question it publishes exactly what it always did.
-Remove-DaemonStopArm -SessionId $sid
-& $pwshPath -NoProfile -File $childFile 2>&1 | Out-Null
+$clearedPublisher = Invoke-StopFixturePublisher -Scenario Cleared -SessionId $sid -Headers $headers
 Test-That 'and with none recorded it publishes what it always did' {
-    (Get-Content -LiteralPath $childOut -Raw).Trim() -eq 'Needs your permission'
+    $clearedPublisher.Child.Summaries[0] -eq 'Needs your permission'
 }
-Remove-Item -LiteralPath $childFile, $childOut -Force -ErrorAction SilentlyContinue
 
 $script:DaemonStopArmed = @{}
 $script:Activity = @()
