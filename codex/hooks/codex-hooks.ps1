@@ -162,9 +162,12 @@ function Invoke-CodexHook {
         $decisionId = "$node-$([DateTimeOffset]::Now.ToUnixTimeMilliseconds())"
         $question = $activity
         $choices = @('Approve', 'Deny')
+        # Shown even when the answer channels cannot be read first: nothing re-arms a
+        # Codex approval, and it is answered by its Approve/Deny tap, not through Send
+        # or the reply card that the snapshot protects.
         Set-CopilotMqttDecision -SessionId $sessionId -SessionName $display.Name `
             -Machine $display.Machine -Question $question -Choices $choices `
-            -Fields @() -DecisionId $decisionId -Headers $headers | Out-Null
+            -Fields @() -DecisionId $decisionId -Headers $headers -PublishWithoutBaseline | Out-Null
         Write-CodexApprovalMarker -SessionId $sessionId -DecisionId $decisionId -Question $question | Out-Null
 
         Send-BridgeNotification -Title (Format-BridgeNotificationTitle "Approval needed: $($display.Name)") `

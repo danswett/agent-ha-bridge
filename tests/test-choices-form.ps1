@@ -179,13 +179,32 @@ Test-That 'both answer channels are read before anything about the question is p
         param([string]$Topic, [string]$Payload, [hashtable]$Headers, [switch]$Retain)
         $script:Order.Add("publish $Topic")
     }
-    Set-CopilotMqttDecision -SessionId 'abc123de-f456-7890-abcd-ef12345600aa' -SessionName 'Copilot: order' `
+    Set-CopilotMqttDecision -SessionId '0dd0e000-0000-4000-8000-0000000000aa' -SessionName 'Copilot: order' `
         -Machine 'BOX' -Question 'Which?' -Choices @() -Fields $fields -DecisionId 'order-check' -Headers $headers | Out-Null
     $first = $script:Order.FindIndex([Predicate[string]]{ param($s) $s -like 'publish *' })
     $reads = @($script:Order | Where-Object { $_ -like 'read *' })
     $first -eq 2 -and $reads.Count -eq 2 -and
         $reads[0] -like '*_reply_payload' -and $reads[1] -like '*_submit'
 } "order: $(@($script:Order | Select-Object -First 4) -join ' | ')"
+
+# A question shown without a snapshot can never tell an answer from what was there, so it
+# is not shown at all until the snapshot can be taken; the daemon retries both.
+$script:Published = 0
+Test-That 'a question whose answer channels cannot be read is not shown' {
+    function Get-CopilotDecisionChannelObservation { param($EntityId, $Headers) [pscustomobject]@{ State = 'unknown'; Value = '' } }
+    function Publish-CopilotMqttMessage { param([string]$Topic, [string]$Payload, [hashtable]$Headers, [switch]$Retain) $script:Published++ }
+    $shown = Set-CopilotMqttDecision -SessionId '0dd0e000-1111-4000-8000-0000000000bb' -SessionName 'Copilot: unread' `
+        -Machine 'BOX' -Question 'Which?' -Choices @() -Fields $fields -DecisionId 'unreadable' -Headers $headers
+    $null -eq $shown -and $script:Published -eq 0
+} "published=$($script:Published)"
+$script:Published = 0
+Test-That 'but one nothing would re-arm can still be shown when asked to' {
+    function Get-CopilotDecisionChannelObservation { param($EntityId, $Headers) [pscustomobject]@{ State = 'unknown'; Value = '' } }
+    function Publish-CopilotMqttMessage { param([string]$Topic, [string]$Payload, [hashtable]$Headers, [switch]$Retain) $script:Published++ }
+    $shown = Set-CopilotMqttDecision -SessionId '0dd0e000-2222-4000-8000-0000000000cc' -SessionName 'Codex: approve' `
+        -Machine 'BOX' -Question 'Run it?' -Choices @('Approve', 'Deny') -Fields @() -DecisionId 'approval' -Headers $headers -PublishWithoutBaseline
+    $null -ne $shown -and $script:Published -gt 0
+} "published=$($script:Published)"
 
 Write-Host '--- the question the bridge armed ---'
 Test-That 'the decision selector carries only Cancel, so the fields are the answer' {

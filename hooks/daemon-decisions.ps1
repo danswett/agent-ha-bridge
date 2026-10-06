@@ -177,13 +177,15 @@ function Confirm-DaemonDecisionArmed {
     try {
         $armed = Get-HomeAssistantState -EntityId "select.${node}_decision" -Headers $Headers
         if ([string]::IsNullOrWhiteSpace([string]$armed.attributes.question)) {
-            Set-CopilotMqttDecision -SessionId $SessionId `
+            $shown = Set-CopilotMqttDecision -SessionId $SessionId `
                 -SessionName ([string]$State[$SessionId].Name) `
                 -Machine ([string]$State[$SessionId].Machine) `
                 -Question ([string]$Marker.question) `
                 -Choices @($Marker.choices) -Fields @($Marker.fields) `
-                -DecisionId ([string]$Marker.decisionId) -Headers $Headers | Out-Null
-            Write-DaemonLog -Message "armed card from marker for $($SessionId.Substring(0,8)) (hook could not reach Home Assistant)"
+                -DecisionId ([string]$Marker.decisionId) -Headers $Headers
+            if ($null -ne $shown) {
+                Write-DaemonLog -Message "armed card from marker for $($SessionId.Substring(0,8)) (hook could not reach Home Assistant)"
+            }
         }
     }
     catch {

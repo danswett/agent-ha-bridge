@@ -1842,7 +1842,14 @@ function Set-CopilotMqttDecision {
         [string]$DecisionId,
 
         [Parameter(Mandatory)]
-        [hashtable]$Headers
+        [hashtable]$Headers,
+
+        # Publish even when the answer channels could not be read first. Only for a
+        # question nothing will re-arm later - a Codex approval, answered by its own
+        # Approve/Deny tap rather than through Send or the reply card - because for
+        # everything else an unshown question is retried by the daemon, and a shown
+        # one without a snapshot cannot tell an answer from what was already there.
+        [switch]$PublishWithoutBaseline
     )
 
     [void](Get-DecisionSchemaFieldChoices -Field ([pscustomobject]@{ enum = @($Choices) }))
@@ -1865,8 +1872,16 @@ function Set-CopilotMqttDecision {
     # Write-once and keyed by decision id, so arming the same question twice records it
     # once and a replacement question cannot disturb it; if it cannot be established the
     # daemon establishes it on a later pass and reads no answer until it has.
-    [void](Initialize-CopilotDecisionBaseline -SessionId $SessionId -DecisionId $DecisionId `
-        -PayloadEntityId "sensor.${node}_reply_payload" -SubmitEntityId "button.${node}_submit" -Headers $Headers)
+    $baseline = Initialize-CopilotDecisionBaseline -SessionId $SessionId -DecisionId $DecisionId `
+        -PayloadEntityId "sensor.${node}_reply_payload" -SubmitEntityId "button.${node}_submit" -Headers $Headers
+    # No snapshot, no question on screen. Publishing anyway is how an answer given in
+    # the gap came to be recorded as the snapshot by the daemon's later pass and never
+    # accepted. The marker is already written, so Confirm-DaemonDecisionArmed retries
+    # both on its next pass; $null tells a caller nothing was shown. A question with no
+    # id can never have a snapshot, so it is shown as it always was.
+    if (-not $baseline.Recorded -and -not [string]::IsNullOrWhiteSpace($DecisionId) -and -not $PublishWithoutBaseline) {
+        return $null
+    }
 
     $device = New-CopilotMqttDeviceBlock -Node $node -SessionName $SessionName -Machine $Machine
     $availability = @(@{ topic = $topics.Availability; payload_available = 'online'; payload_not_available = 'offline' })

@@ -746,6 +746,38 @@ Test-That 'an exception from the transport still reads as possibly written' {
 function Invoke-BridgeConsoleSend { param($ProcessId, $Text, $Submit, $DelayMs) $script:ConsoleWrites++; 'ok:sent' }
 function Invoke-BridgeConsoleChoice { param($ProcessId, $DownCount, $Text, $StepDelayMs) $script:ConsoleWrites++; 'ok:choice' }
 
+# A transition used to truncate the record and rewrite it through the same handle, so a
+# daemon killed between the two left the only record of the attempt empty - unreadable,
+# never answerable again, and not recreatable because the file still existed. It is now
+# staged and renamed into place under a lock beside the record.
+Test-That 'a transition replaces the record whole, and leaves nothing beside it' {
+    [void](New-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'atomic1' -Answer 'Yes')
+    $path = Get-CopilotDecisionAttemptPath -SessionId $attemptSid -DecisionId 'atomic1'
+    $moved = Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'atomic1' -State 'injecting'
+    # Not -Filter "<name>.*": on Windows that pattern matches the record's own name too.
+    $leaf = Split-Path $path -Leaf
+    $left = @(Get-ChildItem -LiteralPath (Split-Path $path -Parent) | Where-Object { $_.Name -ne $leaf -and $_.Name.StartsWith("$leaf.") })
+    $null -ne $moved -and [string](Get-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'atomic1').state -ceq 'injecting' -and $left.Count -eq 0
+}
+
+Test-That 'a caller that cannot take the lock loses the transition, and the record is untouched' {
+    [void](New-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'atomic2' -Answer 'Yes')
+    $path = Get-CopilotDecisionAttemptPath -SessionId $attemptSid -DecisionId 'atomic2'
+    $before = [IO.File]::ReadAllText($path)
+    $held = [IO.FileStream]::new("$path.lock", [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None, 1, [IO.FileOptions]::DeleteOnClose)
+    try { $moved = Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'atomic2' -State 'injecting' }
+    finally { $held.Dispose() }
+    $null -eq $moved -and [IO.File]::ReadAllText($path) -ceq $before
+}
+Test-That 'and once the lock is free the same transition goes through' {
+    $null -ne (Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'atomic2' -State 'injecting')
+}
+Test-That 'the record on disk is always a complete record' {
+    $path = Get-CopilotDecisionAttemptPath -SessionId $attemptSid -DecisionId 'atomic2'
+    [void](Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'atomic2' -State 'delivered' -Detail ('x' * 10))
+    $null -ne (ConvertFrom-Json ([IO.File]::ReadAllText($path)))
+}
+
 Test-That 'an attempt is never read against a different question' {
     $path = Get-CopilotDecisionAttemptPath -SessionId $attemptSid -DecisionId 'a4'
     [IO.File]::WriteAllText($path, '{"decisionId":"somebody-else","state":"injecting"}')

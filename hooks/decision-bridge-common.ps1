@@ -2776,13 +2776,23 @@ function Set-CopilotDecisionAttemptState {
     $path = Get-CopilotDecisionAttemptPath -SessionId $SessionId -DecisionId $DecisionId
     if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
 
+    # The exclusive handle is on a lock file beside the record, not on the record
+    # itself, so the record can be replaced whole. It used to be truncated and
+    # rewritten through that handle, and a daemon killed between the two left the only
+    # record of the attempt empty: unreadable, so never answerable again, and not
+    # recreatable because the file still existed. Now the new record is written to a
+    # temporary file and renamed over the old one, which a crash leaves as either the
+    # old record or the new one. The lock file deletes itself when the handle closes,
+    # and a second caller that cannot open it loses the transition, as before.
     $handle = $null
-    try { $handle = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
-    catch { return $null }
     try {
-        $reader = [IO.StreamReader]::new($handle, [Text.UTF8Encoding]::new($false), $false, 1024, $true)
-        $text = $reader.ReadToEnd()
-        $reader.Dispose()
+        $handle = [IO.FileStream]::new("$path.lock", [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite,
+            [IO.FileShare]::None, 1, [IO.FileOptions]::DeleteOnClose)
+    }
+    catch { return $null }
+    $staged = $null
+    try {
+        $text = [IO.File]::ReadAllText($path)
         $record = $null
         try { $record = ConvertFrom-DecisionJson -Json $text } catch { return $null }
         if ($null -eq $record -or -not $record.PSObject.Properties['state']) { return $null }
@@ -2801,17 +2811,24 @@ function Set-CopilotDecisionAttemptState {
         $record | Add-Member -NotePropertyName detail -NotePropertyValue $Detail -Force
         $record | Add-Member -NotePropertyName changedAt -NotePropertyValue ([DateTimeOffset]::Now.ToString('o')) -Force
         $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($record | ConvertTo-Json -Depth 8 -Compress))
-        $handle.SetLength(0)
-        $handle.Position = 0
-        $handle.Write($bytes, 0, $bytes.Length)
-        $handle.Flush()
+        $staged = "$path.$([guid]::NewGuid().ToString('N')).tmp"
+        $out = [IO.FileStream]::new($staged, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        try { $out.Write($bytes, 0, $bytes.Length); $out.Flush($true) }
+        finally { $out.Dispose() }
+        [IO.File]::Move($staged, $path, $true)
+        $staged = $null
         return $record
     }
     catch {
         Write-DecisionBridgeLog -Message "could not advance a decision attempt: $($_.Exception.Message)"
         return $null
     }
-    finally { if ($null -ne $handle) { $handle.Dispose() } }
+    finally {
+        # A staged copy that never became the record is removed, so a failure leaves
+        # nothing behind beside it - the record itself was never touched.
+        if ($null -ne $staged) { Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue }
+        if ($null -ne $handle) { $handle.Dispose() }
+    }
 }
 
 function Start-CopilotDecisionAttempt {
