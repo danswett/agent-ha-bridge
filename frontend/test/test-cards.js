@@ -407,11 +407,17 @@ async function checkDeferredChoices() {
     env.calls.map((c) => c.data.option).join(' / '));
   check('and Send stays held until that is acknowledged, not because the state matches',
     sendRow(card).getAttribute('disabled') === 'disabled', labels(card).join('|'));
-  env.calls[env.calls.length - 1].settle.resolve();
+  // The second call acknowledged while the first is still in flight. The pending set
+  // holds only the latest value asked for, so the first was invisible to it and Send
+  // went live over a write that could still land and tick the row back on.
+  env.calls[1].settle.resolve();
   await flush();
-  check('once it is acknowledged Send is released',
+  check('an earlier write still in flight keeps Send held, even once the later one is acknowledged',
+    sendRow(card).getAttribute('disabled') === 'disabled', labels(card).join('|'));
+  env.calls[0].settle.resolve();
+  await flush();
+  check('once nothing is outstanding Send is released',
     sendRow(card).getAttribute('disabled') === null && pickedRows(card) === 'Auth', pickedRows(card));
-  for (const call of env.calls) { call.settle.resolve(); }
   await flush();
 
   console.log('--- answers given faster than Home Assistant replies ---');

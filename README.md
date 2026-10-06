@@ -1372,6 +1372,12 @@ Two `ask_user` argument shapes are handled. Current builds pass **`message`** pl
   Both forms are published while they fit, so a card older than 1.23.0 goes on writing
   the words and is understood; where the words are too long to be offered at all, an
   older card cannot answer that one question and says so rather than failing silently.
+* **One rough edge, written down rather than smoothed over.** On a question whose
+  options are too long for the written-out form, a card older than 1.22.0 draws the
+  slot's own entries - so it shows `#1`, `#2`, `#1,2` and so on, which mean nothing to
+  read. Anything tapped there still answers correctly, and before this change the
+  question did not reach the dashboard at all, so it is a gain; but the readable fix
+  is to serve a current card.
 * **Up to 4 fields.** Larger forms fall back to freeform, with the question carrying a
   numbered outline of every field and its options, marking any default.
 * **Typing is answering.** Every Copilot option list ends in "Other (type your

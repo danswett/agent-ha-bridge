@@ -2680,6 +2680,35 @@ function Get-CopilotDecisionBaselinePath {
     "$stem.baseline-$key.json"
 }
 
+function Test-CopilotDecisionBaselineJson {
+    <#
+        Whether a baseline record's text is a usable record for a given question.
+
+        One definition, used by the reader and by the recovery path, so "valid" can
+        never mean two things. A record is usable only when it parses, names this
+        question, and carries a determinate state for both channels - an unreadable
+        channel is not a baseline, and because the record is written once, accepting
+        one would leave the question unanswerable for ever.
+    #>
+    param(
+        [AllowEmptyString()][AllowNull()][string]$Json,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$DecisionId
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Json) -or [string]::IsNullOrWhiteSpace($DecisionId)) { return $false }
+    try { $record = ConvertFrom-DecisionJson -Json $Json }
+    catch { return $false }
+    if ($null -eq $record -or -not $record.PSObject.Properties['decisionId']) { return $false }
+    if (-not [StringComparer]::Ordinal.Equals([string]$record.decisionId, $DecisionId)) { return $false }
+    foreach ($channel in @('payload', 'submit')) {
+        if (-not $record.PSObject.Properties[$channel]) { return $false }
+        $entry = $record.$channel
+        if ($null -eq $entry -or -not $entry.PSObject.Properties['state']) { return $false }
+        if (([string]$entry.state) -cnotin @('present', 'absent')) { return $false }
+    }
+    $true
+}
+
 function Set-CopilotDecisionMarkerBaseline {
     <#
         Records what a question's input channels already held when it was armed, so
@@ -2732,12 +2761,42 @@ function Set-CopilotDecisionMarkerBaseline {
         }
         catch [IO.IOException] {
             # Already claimed, which is the normal second call for the same question.
-            # Only a record that reads back counts; one that does not is this
-            # question's own debris and may be replaced, because the name is the
-            # question's and a replacement question has a different one.
-            if (Test-CopilotDecisionBaselineRecorded -SessionId $SessionId -DecisionId $DecisionId) { return $true }
-            Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
-            [IO.File]::Move($staging, $path)
+            # Only a record that reads back counts; one that does not is debris from a
+            # build that wrote in place, and is replaced - but never by deleting it.
+            #
+            # Deleting first can destroy the winner: two recoverers both see the torn
+            # file, the first replaces it with a good record, and the second's delete
+            # then removes that good record. So the replacement is done through an
+            # exclusive handle on the file itself. Whoever gets the handle is the only
+            # one who can act on it, and the other has to look again - by which time
+            # there is a valid record to accept.
+            for ($attempt = 0; $attempt -lt 3; $attempt++) {
+                if (Test-CopilotDecisionBaselineRecorded -SessionId $SessionId -DecisionId $DecisionId) { return $true }
+                $handle = $null
+                try {
+                    $handle = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None)
+                }
+                catch {
+                    # Somebody else holds it and is doing exactly this. Look again.
+                    Start-Sleep -Milliseconds 25
+                    continue
+                }
+                try {
+                    # Re-read through the handle we hold, so the decision to replace is
+                    # made about the bytes nobody else can be changing.
+                    $reader = [IO.StreamReader]::new($handle, [Text.UTF8Encoding]::new($false), $false, 1024, $true)
+                    $existing = $reader.ReadToEnd()
+                    $reader.Dispose()
+                    if (Test-CopilotDecisionBaselineJson -Json $existing -DecisionId $DecisionId) { return $true }
+                    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($json)
+                    $handle.SetLength(0)
+                    $handle.Position = 0
+                    $handle.Write($bytes, 0, $bytes.Length)
+                    $handle.Flush()
+                }
+                finally { $handle.Dispose() }
+                return (Test-CopilotDecisionBaselineRecorded -SessionId $SessionId -DecisionId $DecisionId)
+            }
             return (Test-CopilotDecisionBaselineRecorded -SessionId $SessionId -DecisionId $DecisionId)
         }
         finally {
@@ -2856,29 +2915,42 @@ function Test-CopilotDecisionBaselineRecorded {
     )
 
     if ([string]::IsNullOrWhiteSpace($DecisionId)) { return $false }
-    $marker = [pscustomobject]@{ decisionId = $DecisionId }
-    foreach ($channel in @('payload', 'submit')) {
-        $entry = Get-CopilotDecisionMarkerBaseline -Marker $marker -Channel $channel -SessionId $SessionId
-        if ($entry.State -eq 'unknown') { return $false }
-    }
-    $true
+    $path = Get-CopilotDecisionBaselinePath -SessionId $SessionId -DecisionId $DecisionId
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
+    try { $text = [IO.File]::ReadAllText($path) } catch { return $false }
+    Test-CopilotDecisionBaselineJson -Json $text -DecisionId $DecisionId
 }
 
 function Remove-CopilotDecisionMarker {
     param(
         [Parameter(Mandatory)][string]$SessionId,
-        [AllowEmptyString()][string]$DecisionId = ''
+        [AllowEmptyString()][string]$DecisionId = '',
+        [switch]$AllBaselines
     )
     $path = Get-CopilotDecisionMarkerPath -SessionId $SessionId
-    # The baseline of the question being retired goes with it, and only that one.
+    # The question's own baseline goes with its marker, and only that one.
     #
-    # Sweeping every baseline for the session is not safe: a replacement question may
-    # already have been armed and recorded its own, and deleting that would let the
-    # new question adopt whatever the card holds as "what was always there" - losing
-    # an answer typed in between. Where the caller cannot say which question it is
-    # retiring, the baselines are left alone; they are small, named for their
-    # question, and the session directory goes when the session does.
-    if (-not [string]::IsNullOrWhiteSpace($DecisionId)) {
+    # Sweeping the session's baselines is not safe while the session is alive: a
+    # replacement question may already have been armed and recorded its own, and
+    # deleting that would let the new question adopt whatever the card holds as "what
+    # was always there" - losing an answer typed in between. A session being retired
+    # is the one case where there can be no replacement, and says so with
+    # -AllBaselines.
+    if ($AllBaselines) {
+        try {
+            $stem = [IO.Path]::GetFileNameWithoutExtension($path)
+            $directory = [IO.Path]::GetDirectoryName($path)
+            if (Test-Path -LiteralPath $directory -PathType Container) {
+                foreach ($stale in @(Get-ChildItem -LiteralPath $directory -Filter "$stem.baseline-*.json" -File -ErrorAction SilentlyContinue)) {
+                    Remove-Item -LiteralPath $stale.FullName -Force -ErrorAction SilentlyContinue
+                }
+            }
+        }
+        catch {
+            Write-DecisionBridgeLog -Message "could not clear decision baselines for $SessionId : $($_.Exception.Message)"
+        }
+    }
+    elseif (-not [string]::IsNullOrWhiteSpace($DecisionId)) {
         $baseline = Get-CopilotDecisionBaselinePath -SessionId $SessionId -DecisionId $DecisionId
         if (Test-Path -LiteralPath $baseline) {
             Remove-Item -LiteralPath $baseline -Force -ErrorAction SilentlyContinue

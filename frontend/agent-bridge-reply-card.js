@@ -953,6 +953,12 @@ class AgentBridgeChoicesCard extends HTMLElement {
     // Counts taps, so a reply arriving late can be matched to the one that caused
     // it. The question id cannot do that job: two taps on one question share it.
     this._op = 0;
+    // Every write still outstanding, by entity. The pending set holds only the
+    // *latest* value asked for, so an earlier write that has not come back is
+    // invisible to it: ticking a row and unticking it leaves two calls in flight, and
+    // acknowledging the second released Send while the first could still land and tick
+    // the row back on. Send is held while anything at all is outstanding.
+    this._inflight = {};
     this._note = '';
   }
 
@@ -1071,6 +1077,16 @@ class AgentBridgeChoicesCard extends HTMLElement {
     for (const key of Object.keys(this._pending)) {
       if (this._pending[key].generation !== generation) { delete this._pending[key]; }
     }
+    // A write still in flight for a question that has been replaced cannot answer the
+    // one now on screen, so it must not hold its Send either. Home Assistant refuses
+    // a value the republished slot no longer offers, so it cannot quietly land in it.
+    for (const key of Object.keys(this._inflight)) {
+      const set = this._inflight[key];
+      for (const op of Object.keys(set)) {
+        if (set[op] !== generation) { delete set[op]; }
+      }
+      if (Object.keys(set).length === 0) { delete this._inflight[key]; }
+    }
 
     // Fields first, then whatever the main selector offers - which on a form is only
     // 'Cancel request'. A field group is shown only while it is carrying options, so
@@ -1123,7 +1139,7 @@ class AgentBridgeChoicesCard extends HTMLElement {
 
     const show = groups.length > 0;
     this.hidden = !show;
-    if (!show) { this._sent = ''; this._pending = {}; this._note = ''; return; }
+    if (!show) { this._sent = ''; this._pending = {}; this._inflight = {}; this._note = ''; return; }
 
     // What has been tapped and not yet confirmed. A slot is only settled once Home
     // Assistant has both accepted the call and shown the value it was asked for.
@@ -1140,7 +1156,7 @@ class AgentBridgeChoicesCard extends HTMLElement {
       else if (group.multi) { group.picked = pending.picked.slice(); }
       else { group.chosen = pending.value; }
     }
-    const waiting = Object.keys(this._pending).length > 0;
+    const waiting = Object.keys(this._pending).length > 0 || Object.keys(this._inflight).length > 0;
     if (!waiting && this._note === CHOICE_SAVING_NOTE) { this._note = ''; }
     if (waiting && !this._note) { this._note = CHOICE_SAVING_NOTE; }
 
@@ -1256,6 +1272,7 @@ class AgentBridgeChoicesCard extends HTMLElement {
     try { call = this._hass.callService('select', 'select_option', { entity_id: group.entityId, option: value }); }
     catch (err) { this._failPending(group.entityId, op, err); return; }
     if (!call || typeof call.then !== 'function') { return; }
+    this._track(group.entityId, op, true, generation);
     call.then(
       () => {
         // Accepted. Only this tap's own acknowledgement counts: an older one arriving
@@ -1263,15 +1280,22 @@ class AgentBridgeChoicesCard extends HTMLElement {
         // arrives separately and clears it, but when the slot already held the value
         // nothing further is coming, so this redraw is what stops Send being held for
         // ever.
+        this._track(group.entityId, op, false);
         const pending = this._pending[group.entityId];
-        if (pending && pending.op === op) {
-          pending.acked = true;
-          this._last = '';
-          this._render();
-        }
+        if (pending && pending.op === op) { pending.acked = true; }
+        this._last = '';
+        this._render();
       },
       // A rejected call must take its own tick back with it, and only its own.
-      (err) => this._failPending(group.entityId, op, err));
+      (err) => { this._track(group.entityId, op, false); this._failPending(group.entityId, op, err); });
+  }
+
+  /* Adds or removes one outstanding write, tied to the question it was made on. */
+  _track(entityId, op, outstanding, generation) {
+    const set = this._inflight[entityId] || (this._inflight[entityId] = {});
+    if (outstanding) { set[op] = generation; }
+    else { delete set[op]; }
+    if (Object.keys(set).length === 0) { delete this._inflight[entityId]; }
   }
 
   /*
@@ -1302,7 +1326,10 @@ class AgentBridgeChoicesCard extends HTMLElement {
    */
   _send() {
     if (this._sent || !this._hass || !this._config.submit) { return; }
+    // Nothing outstanding, in either sense: no tap waiting to be shown, and no write
+    // still in flight that could land afterwards and change what is about to be sent.
     if (Object.keys(this._pending).length > 0) { return; }
+    if (Object.keys(this._inflight).length > 0) { return; }
     let call;
     try { call = this._hass.callService('button', 'press', { entity_id: this._config.submit }); }
     catch (err) { this._failSend(err); return; }

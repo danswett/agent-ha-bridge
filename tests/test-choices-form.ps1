@@ -782,8 +782,9 @@ else {
     foreach ($cardName in @($released.Keys)) {
         $run = Invoke-ReleasedCard -CardPath $released[$cardName] -Taps @('Auth', 'Search')
         Test-That "card $cardName loads and draws this question" {
-            [string]$run.version -eq $cardName -and [string]::IsNullOrEmpty([string]$run.threw) -and -not $run.hidden
-        } "version=[$($run.version)] threw=[$($run.threw)] hidden=[$($run.hidden)]"
+            [string]$run.version -eq $cardName -and [string]::IsNullOrEmpty([string]$run.threw) -and -not $run.hidden -and
+            @($run.missing).Count -eq 0 -and @($run.rows | Where-Object { $_.tag -eq 'BUTTON' }).Count -gt 0
+        } "version=[$($run.version)] threw=[$($run.threw)] hidden=[$($run.hidden)] missing=[$(@($run.missing) -join ',')] rows=[$(@($run.rows | ForEach-Object { $_.text }) -join '|')]"
         Test-That "card $cardName writes a value Home Assistant accepts" {
             @($run.calls).Count -gt 0 -and @(@($run.calls) | Where-Object { $_.rejected }).Count -eq 0
         } "calls=[$(@($run.calls) | ForEach-Object { "$($_.data.option)$(if ($_.rejected) { '!REJECTED' })" })]"
@@ -799,30 +800,99 @@ else {
         } "last=[$(@($run.calls)[-1].data.option)]"
     }
 
-    # Long options: the written-out form is too long to be an entry at all, so only
-    # positions are published. A card that does not know them cannot answer this one -
-    # and must find that out as a refusal rather than storing one option silently.
+    # Long options, where the written-out form is too long to be an entry at all, so
+    # positions are the only carrier. The two older cards behave differently and both
+    # are recorded rather than assumed:
+    #
+    # 1.21.1 knows nothing of multi-select and draws the slot's own entries, which here
+    # are the positions - so it shows '#1', '#2' and so on, which mean nothing to a
+    # person. It is not wrong, and anything it writes still decodes correctly; it is
+    # simply unreadable. Before this change the question did not reach the dashboard at
+    # all, so this is a gain with a rough edge, and the edge is written down.
+    #
+    # 1.22.0 does know multi-select, draws the real options, and writes them joined -
+    # which is not on the list, so Home Assistant refuses it and the slot stays put.
     $script:HaStates = @{}
     Set-CopilotMqttDecision -SessionId $sessionId -SessionName 'Copilot: a task' -Machine 'BOX' `
         -Question 'Which follow-ups do you want?' -Choices @() -Fields $realField `
         -DecisionId 'd8' -Headers $headers | Out-Null
 
-    foreach ($cardName in @('1.21.1', '1.22.0')) {
-        $run = Invoke-ReleasedCard -CardPath $released[$cardName] -Taps @($realOptions[0], $realOptions[2])
-        Test-That "card $cardName is still offered the long-worded question" {
-            [string]::IsNullOrEmpty([string]$run.threw) -and -not $run.hidden
-        } "threw=[$($run.threw)] hidden=[$($run.hidden)]"
-        Test-That "card $cardName cannot answer it, and is refused rather than half-stored" {
-            $wrote = @($run.calls)
-            $wrote.Count -eq 0 -or @($wrote | Where-Object { -not $_.rejected }).Count -eq 0
-        } "calls=[$(@($run.calls) | ForEach-Object { "$($_.data.option.Substring(0,[Math]::Min(24,$_.data.option.Length)))$(if ($_.rejected) { '!REJECTED' })" })]"
-        Test-That "card $cardName leaves the slot on its placeholder, so the daemon reads it unanswered" {
-            [string]$script:HaStates["select.${node}_f1"].state -eq 'Choose...'
-        } "state=[$($script:HaStates["select.${node}_f1"].state)]"
-    }
+    $old = Invoke-ReleasedCard -CardPath $released['1.21.1'] -Taps @('#1')
+    Test-That 'card 1.21.1 draws the positions themselves, because it has no idea what they stand for' {
+        [string]::IsNullOrEmpty([string]$old.threw) -and -not $old.hidden -and
+        @($old.missing).Count -eq 0 -and
+        @($old.rows | Where-Object { $_.tag -eq 'BUTTON' -and $_.text -eq '#1' }).Count -eq 1
+    } "threw=[$($old.threw)] missing=[$(@($old.missing) -join ',')] rows=[$(@($old.rows | ForEach-Object { $_.text }) -join '|')]"
+    Test-That 'and what it writes is accepted and still means the right option' {
+        @($old.calls).Count -eq 1 -and -not @($old.calls)[0].rejected -and
+        (@(Resolve-DecisionMultiSelectChoice -Field $realField[0] -Choice ([string]@($old.calls)[0].data.option)) -join '|') -ceq $realOptions[0]
+    } "calls=[$(@($old.calls) | ForEach-Object { "$($_.data.option)$(if ($_.rejected) { '!REJECTED' })" })]"
+
+    $script:HaStates = @{}
+    Set-CopilotMqttDecision -SessionId $sessionId -SessionName 'Copilot: a task' -Machine 'BOX' `
+        -Question 'Which follow-ups do you want?' -Choices @() -Fields $realField `
+        -DecisionId 'd8b' -Headers $headers | Out-Null
+
+    $mid = Invoke-ReleasedCard -CardPath $released['1.22.0'] -Taps @($realOptions[0], $realOptions[2])
+    Test-That 'card 1.22.0 draws the real options, because the bridge publishes them beside the slot' {
+        [string]::IsNullOrEmpty([string]$mid.threw) -and -not $mid.hidden -and @($mid.missing).Count -eq 0
+    } "threw=[$($mid.threw)] missing=[$(@($mid.missing) -join ',')]"
+    Test-That 'but cannot answer it, and is refused rather than half-stored' {
+        @($mid.calls).Count -gt 0 -and @(@($mid.calls) | Where-Object { -not $_.rejected }).Count -eq 0
+    } "calls=[$(@($mid.calls) | ForEach-Object { "$($_.data.option.Substring(0,[Math]::Min(20,$_.data.option.Length)))$(if ($_.rejected) { '!REJECTED' })" })]"
+    Test-That 'and leaves the slot on its placeholder, so the daemon reads it unanswered' {
+        [string]$script:HaStates["select.${node}_f1"].state -eq 'Choose...'
+    } "state=[$($script:HaStates["select.${node}_f1"].state)]"
 
     Remove-Item -LiteralPath $releasedDir -Recurse -Force -ErrorAction SilentlyContinue
 }
+
+# A field whose own options are written like positions keeps the words as its only
+# carrier, so the two can never be confused. It still has to be fully answerable.
+Write-Host ''
+Write-Host '--- a field whose options look like positions ---'
+$script:HaStates = @{}
+$hashField = @([pscustomobject]@{
+    Label = 'Tickets'; Options = @('#1', '#2', 'Something else'); IsText = $false
+    MultiSelect = $true; MultiSelectStyle = 'space-toggle'; DefaultIndexes = @(1)
+})
+Set-CopilotMqttDecision -SessionId $sessionId -SessionName 'Copilot: a task' -Machine 'BOX' `
+    -Question 'Which tickets?' -Choices @() -Fields $hashField `
+    -DecisionId 'd9' -Headers $headers | Out-Null
+
+Test-That 'it is offered the written-out form only, never positions' {
+    $offered = @($script:HaStates["select.${node}_f1"].attributes.options)
+    ($offered -join ',') -eq 'Choose...,#1,#2,Something else,#1 + #2,#1 + Something else,#2 + Something else,#1 + #2 + Something else'
+} "offered=[$(@($script:HaStates["select.${node}_f1"].attributes.options) -join ',')]"
+Test-That 'and the card is not told to write positions' {
+    -not $script:HaStates["select.${node}_decision"].attributes.Contains('field_1_codes')
+} "attrs=[$(@($script:HaStates["select.${node}_decision"].attributes.Keys) -join ',')]"
+# The default still has to arrive ticked, which means falling back to the written-out
+# start value because this field has no position form to use.
+Test-That 'its schema default still opens ticked, through the written-out form' {
+    [string]$script:HaStates["select.${node}_f1"].state -eq '#2'
+} "state=[$($script:HaStates["select.${node}_f1"].state)]"
+
+$hashCard = Invoke-ChoicesCard -Taps @('Something else')
+Test-That 'the card draws the options themselves and composes on the default' {
+    [string]@($hashCard.calls)[-1].data.option -eq '#2 + Something else'
+} "calls=[$(@($hashCard.calls) | ForEach-Object { $_.data.option })]"
+
+foreach ($call in @($hashCard.calls)) { $script:HaStates[[string]$call.data.entity_id].state = [string]$call.data.option }
+$script:HaStates["text.${node}_reply"] = [ordered]@{ state = ' '; attributes = @{} }
+$script:HaStates["button.${node}_submit"] = [ordered]@{ state = [DateTimeOffset]::Now.ToString('o'); attributes = @{} }
+$hashMarker = [pscustomobject]@{ decisionId = 'd9'; mode = 'multiple_choice'; armedAt = $armedMulti.ToString('o'); fields = $hashField }
+Set-Baseline -DecisionId 'd9'
+$hashState = @{ $sessionId = [pscustomobject]@{ Name = 'Copilot: a task'; Machine = 'BOX'; LastSubmitAt = '' } }
+$hashAnswer = Read-DaemonDecisionAnswer -SessionId $sessionId -Marker $hashMarker -State $hashState -Headers $headers
+Test-That 'and the daemon reads exactly those two back, with the words as the selection' {
+    (@($hashAnswer.Selections) -join '|') -eq '#2 + Something else' -and $hashAnswer.Answer -ceq '#2 + Something else'
+} "selections=[$(@($hashAnswer.Selections) -join '|')] answer=[$($hashAnswer.Answer)]"
+Test-That 'and the keystrokes tick the second and third rows' {
+    $esc = [string][char]27
+    @(Get-BridgeFormPayloads -Fields $hashField -Selections @($hashAnswer.Selections))[0].Payload -eq
+        ($esc + '[B') + ($esc + '[B') + ' '
+} ((@(Get-BridgeFormPayloads -Fields $hashField -Selections @($hashAnswer.Selections))[0].Payload) -replace [regex]::Escape([string][char]27), '<esc>')
 
 # --- 7. the words typed at a choice question ------------------------------------
 
