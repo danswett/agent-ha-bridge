@@ -164,6 +164,43 @@ Test-That 'Cancel still withdraws without a Send, because it is not an answer' {
 }
 $script:Ha = @{ "select.${node}_decision" = 'Awaiting answer...'; "button.${node}_submit" = $oldPress }
 Test-That 'the placeholder is not an answer' { (Read-DaemonDecisionAnswer -SessionId $sid -Marker $choice -State $state -Headers $headers).Answer -eq '' }
+
+# A press made before anything was tapped stays different from the arm-time snapshot
+# for ever, so the first option tapped after it used to send itself with no second
+# press. The form path had this fixed; the selector carries its own choices and never
+# goes near that path, so it needed the same treatment.
+$script:Transient = @()
+$script:Ha["button.${node}_submit"] = $armedAt.AddMinutes(3).ToString('o')
+Test-That 'Send pressed with nothing chosen sends nothing' {
+    (Read-DaemonDecisionAnswer -SessionId $sid -Marker $choice -State $state -Headers $headers).Answer -eq ''
+}
+Test-That 'and the card says so, rather than the button looking broken' {
+    $script:Transient -contains 'Not sent - choose an option'
+} ($script:Transient -join '|')
+$spentAtChoice = @($script:Transient).Count
+[void](Read-DaemonDecisionAnswer -SessionId $sid -Marker $choice -State $state -Headers $headers)
+Test-That 'and is told once, not at every pass over the question' {
+    @($script:Transient).Count -eq $spentAtChoice
+} ($script:Transient -join '|')
+$script:Ha["select.${node}_decision"] = 'Yes'
+Test-That 'tapping an option after that early Send does not send it' {
+    (Read-DaemonDecisionAnswer -SessionId $sid -Marker $choice -State $state -Headers $headers).Answer -eq ''
+}
+$script:Ha["button.${node}_submit"] = $armedAt.AddMinutes(4).ToString('o')
+Test-That 'pressing Send again then sends it' {
+    (Read-DaemonDecisionAnswer -SessionId $sid -Marker $choice -State $state -Headers $headers).Answer -eq 'Yes'
+}
+# The spent press belongs to the question it was made at. A new question arriving while
+# the button still reads that press must not find it already spent.
+$next = [pscustomobject]@{
+    mode = 'multiple_choice'; decisionId = 'd2b'; question = 'Pick'; fields = @(); choices = @('Yes', 'No')
+    injectedAnswer = ''; armedAt = $armedAt.ToString('o')
+}
+Set-Baseline -DecisionId 'd2b' -SubmitState 'present' -SubmitValue $oldPress
+$script:Ha = @{ "select.${node}_decision" = 'Yes'; "button.${node}_submit" = $armedAt.AddMinutes(3).ToString('o') }
+Test-That 'a press spent at one question is not spent at the next' {
+    (Read-DaemonDecisionAnswer -SessionId $sid -Marker $next -State $state -Headers $headers).Answer -eq 'Yes'
+}
 $free = [pscustomobject]@{
     mode = 'freeform'; decisionId = 'd3'; question = 'Why?'; fields = @(); choices = @()
     injectedAnswer = ''; armedAt = $armedAt.ToString('o')

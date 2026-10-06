@@ -315,7 +315,7 @@ $emitted = @([regex]::Matches($daemonSource, "-Summary\s+'([^']+)'") |
     ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
 Test-That 'the daemon really does emit the refusals this checks for' {
     @('Not sent - answer every field', 'Not sent - this question takes options',
-      'Not sent - no Send button on this session') |
+      'Not sent - choose an option', 'Not sent - no Send button on this session') |
         ForEach-Object { $emitted -contains $_ } | Where-Object { -not $_ } | Measure-Object |
         ForEach-Object { $_.Count -eq 0 }
 } "emitted=[$($emitted -join '|')]"
@@ -326,6 +326,7 @@ Test-That 'the daemon really does emit the refusals this checks for' {
 $warnStates = @(
     'Not sent - answer every field'
     'Not sent - this question takes options'
+    'Not sent - choose an option'
     'Not sent - no Send button on this session'
     'Answer differs - check the terminal'
     'Answer unconfirmed - check the terminal'

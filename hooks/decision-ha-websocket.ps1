@@ -2417,6 +2417,7 @@ ha-card {
             'Reply sent', 'Reply NOT sent'
             'Answer sent', 'Answer NOT sent'
             'Not sent - answer every field'
+            'Not sent - choose an option'
             'Not sent - this question takes options'
             'Not sent - no Send button on this session'
             'Answer may be wrong - check the terminal'

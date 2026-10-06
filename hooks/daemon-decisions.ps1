@@ -352,6 +352,69 @@ function Test-DaemonSendPressed {
     [pscustomobject]@{ Pressed = $pressed; Readable = $true; Exists = $current.Exists; At = $current.Value }
 }
 
+function Get-DaemonSpentPressKey {
+    <#
+        The identity of a Send press already spent at a question that could not be
+        answered yet.
+
+        The question is in the key as well as the press, so a question arriving while
+        the button still reads the same press does not inherit it as already spent.
+
+        One format, shared by both paths that spend a press - a form and the main
+        selector - because they share one slot in the saved state. Written out twice it
+        would only have to drift once for a press spent by one to read as new to the
+        other, which is the bug this exists to stop.
+    #>
+    param(
+        [Parameter(Mandatory)]$Marker,
+        [Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$PressedAt
+    )
+
+    "$([string]$Marker.decisionId)|$PressedAt"
+}
+
+function Test-DaemonPressSpent {
+    <#
+        Whether this press has already been spent at this question.
+
+        A press stays different from the arm-time snapshot for ever, so a press made
+        too early - at a half-filled form, or at a choice with nothing tapped yet -
+        would otherwise read as new on every later pass, and the tap that completed the
+        answer would become the send. That is the one thing Send exists to prevent.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowNull()]$Entry,
+        [Parameter(Mandatory)]$Marker,
+        [Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$PressedAt
+    )
+
+    if ($null -eq $Entry) { return $false }
+    $spent = if ($Entry.PSObject.Properties['IncompleteSubmit']) { [string]$Entry.IncompleteSubmit } else { '' }
+    $spent -ceq (Get-DaemonSpentPressKey -Marker $Marker -PressedAt $PressedAt)
+}
+
+function Set-DaemonPressSpent {
+    <#
+        Records a press as spent, in the daemon's saved state so that a restart does
+        not revive it.
+
+        Written out rather than handed to Set-DaemonSessionProperty, which lives in the
+        daemon script: this file is dot-sourced on its own by suites that never load
+        it, and the call resolved to nothing at run time rather than at parse time, so
+        only the one suite that exercised this line noticed.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowNull()]$Entry,
+        [Parameter(Mandatory)]$Marker,
+        [Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$PressedAt
+    )
+
+    if ($null -eq $Entry) { return }
+    $key = Get-DaemonSpentPressKey -Marker $Marker -PressedAt $PressedAt
+    if ($Entry.PSObject.Properties['IncompleteSubmit']) { $Entry.IncompleteSubmit = $key }
+    else { $Entry | Add-Member -NotePropertyName IncompleteSubmit -NotePropertyValue $key -Force }
+}
+
 function Read-DaemonDecisionCardText {
     <#
         Text the reply card published as an answer to the question now armed, with the
@@ -455,7 +518,12 @@ function Read-DaemonDecisionAnswer {
                 # Cancel above is the one exception: withdrawing a question is a
                 # deliberate act in itself, not an answer waiting to be confirmed.
                 $send = Test-DaemonSendPressed -SessionId $SessionId -Marker $Marker -Headers $Headers
-                if ($send.Pressed) { $answer = $s }
+                # A press made before anything was tapped was spent then, so tapping an
+                # option does not send it on its own.
+                if ($send.Pressed -and
+                    -not (Test-DaemonPressSpent -Entry $State[$SessionId] -Marker $Marker -PressedAt $send.At)) {
+                    $answer = $s
+                }
             }
             else {
                 # Nothing tapped, but something typed. Every Copilot option list ends
@@ -467,6 +535,25 @@ function Read-DaemonDecisionAnswer {
                     $answer = $card.Text
                     $isFreeText = $true
                     $stamp = $card.Stamp
+                }
+                else {
+                    # Send pressed at a question with nothing tapped and nothing typed.
+                    # Spending it here is what stops the option tapped next from
+                    # sending itself, and saying so is the difference between a button
+                    # that looks broken and one that is waiting on you.
+                    $send = Test-DaemonSendPressed -SessionId $SessionId -Marker $Marker -Headers $Headers
+                    if ($send.Pressed -and
+                        -not (Test-DaemonPressSpent -Entry $State[$SessionId] -Marker $Marker -PressedAt $send.At)) {
+                        Set-DaemonPressSpent -Entry $State[$SessionId] -Marker $Marker -PressedAt $send.At
+                        try {
+                            Set-DaemonTransientActivity -SessionId $SessionId -Summary 'Not sent - choose an option' `
+                                -Extra @{ hint = 'or type an answer' } -Headers $Headers | Out-Null
+                        }
+                        catch {
+                            if (Test-DaemonMarkedGuardError -ErrorRecord $_) { throw }
+                        }
+                        Write-DaemonLog -Message "submit pressed for $($SessionId.Substring(0,8)) with nothing chosen"
+                    }
                 }
             }
         }
@@ -644,9 +731,9 @@ function Read-DaemonFormAnswer {
     # send, which is the one thing Send exists to prevent. Recorded per question, in
     # the daemon's saved state, so a restart does not revive it.
     $sessionEntry = $State[$sessionId]
-    $spentPress = "$([string]$marker.decisionId)|$pressedAt"
-    $spent = if ($sessionEntry.PSObject.Properties['IncompleteSubmit']) { [string]$sessionEntry.IncompleteSubmit } else { '' }
-    if ($pressIsNew -and $spent -ceq $spentPress) { $pressIsNew = $false }
+    if ($pressIsNew -and (Test-DaemonPressSpent -Entry $sessionEntry -Marker $marker -PressedAt $pressedAt)) {
+        $pressIsNew = $false
+    }
 
     # Nothing to press. Said out loud once, because a card that cannot send looks
     # exactly like one being ignored. A button that is there and has merely never
@@ -685,8 +772,7 @@ function Read-DaemonFormAnswer {
         }
         catch { }
         Write-DaemonLog -Message "submit pressed for $($sessionId.Substring(0,8)) with fields still unanswered"
-        if ($sessionEntry.PSObject.Properties['IncompleteSubmit']) { $sessionEntry.IncompleteSubmit = $spentPress }
-        else { $sessionEntry | Add-Member -NotePropertyName IncompleteSubmit -NotePropertyValue $spentPress -Force }
+        Set-DaemonPressSpent -Entry $sessionEntry -Marker $marker -PressedAt $pressedAt
     }
 
     # Words typed at a question that cannot take them - a form with no free-text
