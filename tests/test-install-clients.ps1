@@ -512,6 +512,75 @@ Test-That 'a command that never answers is killed, not waited on' { $probeSlow.T
 $probeMissing = Invoke-BridgeCommandProbe -Executable $missingExe
 Test-That 'a command that cannot be executed at all is not reported as run' { -not $probeMissing.Ran }
 
+if ($IsWindows) {
+    Write-Host '--- background probes never recreate a detached daemon console ---'
+    $consoleRoot = Join-Path $env:TEMP "probe-console-$([guid]::NewGuid().ToString('N'))"
+    [void][IO.Directory]::CreateDirectory($consoleRoot)
+    $consoleScript = Join-Path $consoleRoot 'probe.ps1'
+    $platformPath = (Join-Path $PSScriptRoot '..\hooks\bridge-platform.ps1').Replace("'", "''")
+    $childSource = @'
+$ErrorActionPreference = 'Stop'
+. '__PLATFORM__'
+Add-Type @"
+using System;
+using System.Runtime.InteropServices;
+public class ProbeConsole {
+    [DllImport("kernel32.dll")] public static extern bool FreeConsole();
+    [DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();
+}
+"@
+$null = [ProbeConsole]::FreeConsole()
+$pwsh = (Get-Process -Id $PID).Path
+$code = '[Console]::WriteLine("first"); [Console]::WriteLine("second"); [Console]::Error.WriteLine("error"); exit 3'
+$encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($code))
+$probe = Invoke-BridgeCommandProbe -Executable $pwsh -Arguments @('-NoProfile', '-EncodedCommand', $encoded)
+if (-not $probe.Ran -or $probe.ExitCode -ne 3 -or $probe.StandardOutput -notmatch "first\r?\nsecond" -or $probe.Output -notmatch 'error') {
+    throw "Probe output was not preserved: $($probe | ConvertTo-Json -Compress)"
+}
+if ([ProbeConsole]::GetConsoleWindow() -ne [IntPtr]::Zero) { throw 'Probe allocated a console for its detached parent.' }
+$slow = Invoke-BridgeCommandProbe -Executable $pwsh -Arguments @('-NoProfile', '-Command', 'Start-Sleep -Seconds 30') -TimeoutMs 1000
+if (-not $slow.TimedOut) { throw 'The background command deadline was not enforced.' }
+if ([ProbeConsole]::GetConsoleWindow() -ne [IntPtr]::Zero) { throw 'Timed-out probe allocated a console.' }
+$cache = Join-Path $PSScriptRoot 'type-cache'
+Add-BridgeCompiledType -TypeName ConsoleFreeCompiledType -Source 'public class ConsoleFreeCompiledType {}' -CacheDir $cache
+if (-not ([Management.Automation.PSTypeName]'ConsoleFreeCompiledType').Type) { throw 'The background type was not compiled.' }
+if ([ProbeConsole]::GetConsoleWindow() -ne [IntPtr]::Zero) { throw 'Type compilation allocated a console.' }
+'console-free'
+'@
+    [IO.File]::WriteAllText($consoleScript, $childSource.Replace('__PLATFORM__', $platformPath))
+    $consoleProcess = [Diagnostics.Process]::new()
+    try {
+        $start = [Diagnostics.ProcessStartInfo]::new($probePwsh)
+        $start.UseShellExecute = $false
+        $start.CreateNoWindow = $true
+        $start.RedirectStandardInput = $true
+        $start.RedirectStandardOutput = $true
+        $start.RedirectStandardError = $true
+        foreach ($argument in @('-NoProfile', '-NonInteractive', '-File', $consoleScript)) { $start.ArgumentList.Add($argument) }
+        $consoleProcess.StartInfo = $start
+        [void]$consoleProcess.Start()
+        $consoleProcess.StandardInput.Close()
+        $consoleOut = $consoleProcess.StandardOutput.ReadToEndAsync()
+        $consoleErr = $consoleProcess.StandardError.ReadToEndAsync()
+        $consoleFinished = $consoleProcess.WaitForExit(15000)
+        if (-not $consoleFinished) { $consoleProcess.Kill($true); $consoleProcess.WaitForExit() }
+        $consoleText = $consoleOut.GetAwaiter().GetResult() + $consoleErr.GetAwaiter().GetResult()
+        Test-That 'a detached background process preserves output and deadlines without a console' {
+            $consoleFinished -and $consoleProcess.ExitCode -eq 0 -and $consoleText -match 'console-free'
+        } $consoleText
+    }
+    finally {
+        $consoleProcess.Dispose()
+        Remove-Item -LiteralPath $consoleScript -Force
+        $consoleCache = Join-Path $consoleRoot 'type-cache'
+        if (Test-Path -LiteralPath $consoleCache) {
+            Get-ChildItem -LiteralPath $consoleCache -File | Remove-Item -Force
+            Remove-Item -LiteralPath $consoleCache -Force
+        }
+        Remove-Item -LiteralPath $consoleRoot -Force
+    }
+}
+
 Test-That 'Test-BridgeCommandRuns agrees that pwsh runs' { Test-BridgeCommandRuns -Executable $probePwsh }
 Test-That 'and that a missing file does not' { -not (Test-BridgeCommandRuns -Executable $missingExe) }
 
