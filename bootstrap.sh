@@ -5,7 +5,7 @@
 #
 # The macOS counterpart of bootstrap.ps1. It makes sure PowerShell 7 (every bridge
 # script runs under pwsh) and tmux (each session runs in tmux, so the dashboard can
-# type into it) are installed, downloads the branch and hands over to install.ps1 -
+# type into it) are installed, downloads the latest release and hands over to its install.ps1 -
 # which asks for everything else.
 #
 # Apple silicon: both come from Homebrew, which is offered if it is missing.
@@ -13,11 +13,14 @@
 # own package and tmux from MacPorts (offered too, with Apple's command line tools it
 # needs). Homebrew is still used on an Intel Mac that already has a working one.
 #
-# BRANCH=<name> installs another branch.
+# BRIDGE_VERSION=<x.y.z> installs that release instead; BRANCH=<name> installs a branch's
+# unreleased code, to try a change before it ships. Not VERSION=: that name is common
+# enough in a shell's environment to pick a release nobody asked for.
 set -euo pipefail
 
 repo="danswett/agent-ha-bridge"
-branch="${BRANCH:-main}"
+version="${BRIDGE_VERSION:-}"
+branch="${BRANCH:-}"
 
 step() { printf '\033[36m==> %s\033[0m\n' "$1"; }
 fail() { echo "$1" >&2; exit 1; }
@@ -61,6 +64,28 @@ load_paths
 latest_asset() {
     { curl -fsSL "https://api.github.com/repos/$1/releases/latest" |
         grep -Eo '"browser_download_url": *"[^"]+"' | cut -d'"' -f4 | grep -E -- "$2" | head -n 1; } || true
+}
+
+# The archive to install: the latest published release, unless a version or a branch
+# is named. It used to default to main, so the one-liner installed whatever had merged
+# that minute - including work deliberately held out of every release. A failed lookup
+# stops rather than falling back to main for the same reason.
+archive_url() {
+    if [ -n "$version" ] && [ -n "$branch" ]; then fail "Set BRIDGE_VERSION or BRANCH, not both."; fi
+    if [ -n "$branch" ]; then
+        echo "https://github.com/$repo/archive/refs/heads/$branch.tar.gz"
+        return
+    fi
+    local tag
+    if [ -n "$version" ]; then
+        tag="v${version#v}"
+    else
+        # releases/latest never returns a draft or a prerelease.
+        tag="$({ curl -fsSL "https://api.github.com/repos/$repo/releases/latest" |
+            grep -Eo '"tag_name": *"[^"]+"' | head -n 1 | cut -d'"' -f4; } || true)"
+        [ -n "$tag" ] || fail "Could not look up the latest $repo release. Check the connection and run this again, or set BRIDGE_VERSION."
+    fi
+    echo "https://github.com/$repo/archive/refs/tags/$tag.tar.gz"
 }
 
 # `installer` decides what it has been handed from the file name, so the download has
@@ -159,8 +184,9 @@ echo "    using $pwsh_path"
 staging="$(mktemp -d -t agent-ha-bridge)"
 trap 'rm -rf "$staging"' EXIT
 
-step "Downloading $repo ($branch)"
-curl -fsSL "https://github.com/$repo/archive/refs/heads/$branch.tar.gz" | tar -xz -C "$staging"
+archive="$(archive_url)"
+step "Downloading $archive"
+curl -fsSL "$archive" | tar -xz -C "$staging"
 root="$(find "$staging" -mindepth 1 -maxdepth 1 -type d | head -n 1)"
 [ -n "$root" ] || fail "The downloaded archive did not contain the expected folder."
 

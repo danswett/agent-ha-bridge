@@ -18,10 +18,42 @@ check() {
     else echo "  FAIL  $1 - got [$2] want [$3]"; fails=$((fails + 1)); fi
 }
 
+# --- which archive is installed ---------------------------------------------------
+# Before the BSD-mktemp check below, because none of this needs it. The one-liner used to
+# install main, so a machine set up from the README ran whatever had merged that minute,
+# including work deliberately held out of every release.
+eval "$(awk '/^archive_url\(\) \{/,/^\}/' "$src")"
+repo='danswett/agent-ha-bridge'
+fail() { echo "FAILED: $1"; exit 1; }
+
+echo '--- which archive is installed ---'
+curl() { printf '{\n  "url": "x",\n  "tag_name": "v1.32.3",\n  "name": "v1.32.3"\n}\n'; }
+version='' branch=''
+check 'by default the latest release, not main' "$(archive_url)" \
+    'https://github.com/danswett/agent-ha-bridge/archive/refs/tags/v1.32.3.tar.gz'
+version='1.31.0'
+check 'BRIDGE_VERSION pins a release' "$(archive_url)" \
+    'https://github.com/danswett/agent-ha-bridge/archive/refs/tags/v1.31.0.tar.gz'
+version='v1.31.0'
+check 'with or without its v' "$(archive_url)" \
+    'https://github.com/danswett/agent-ha-bridge/archive/refs/tags/v1.31.0.tar.gz'
+version='' branch='main'
+check 'BRANCH still installs a branch when asked for by name' "$(archive_url)" \
+    'https://github.com/danswett/agent-ha-bridge/archive/refs/heads/main.tar.gz'
+version='1.31.0' branch='main'
+check 'naming both is refused' "$(archive_url || true)" 'FAILED: Set BRIDGE_VERSION or BRANCH, not both.'
+version='' branch=''
+curl() { return 22; }
+check 'a failed lookup stops instead of falling back to main' "$(archive_url || true)" \
+    'FAILED: Could not look up the latest danswett/agent-ha-bridge release. Check the connection and run this again, or set BRIDGE_VERSION.'
+unset -f curl fail
+
 # BSD mktemp, which is what macOS has. Said plainly rather than skipped silently,
 # so running this on Linux reports why instead of failing as a bug in bootstrap.sh.
 if ! probe="$(mktemp -d -t bootstrap-test 2>/dev/null)"; then
-    echo "  SKIP  this needs BSD mktemp, as macOS has; bootstrap.sh is macOS-only" >&2
+    echo "  SKIP  the rest needs BSD mktemp, as macOS has; bootstrap.sh is macOS-only" >&2
+    # The archive checks above have already run, and a failure there still counts.
+    [ "$fails" -eq 0 ] || { echo "$fails check(s) failed"; exit 1; }
     exit 0
 fi
 rmdir "$probe"
