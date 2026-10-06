@@ -39,7 +39,9 @@ function Invoke-BridgeConsoleSend {
     if (-not $script:BridgeIsWindows) {
         return Send-BridgeTmuxText -ProcessId $ProcessId -Text $Text -Submit:$Submit -SubmitDelayMs $DelayMs
     }
-    Initialize-CopilotConsoleInjector
+    # A failed compile has typed nothing, so it says so rather than throwing past the
+    # caller's write boundary as though a key might have gone.
+    try { Initialize-CopilotConsoleInjector } catch { return "init-failed:$($_.Exception.Message)" }
     [string][CopilotCli.ConsoleInjector]::Send([uint32]$ProcessId, $Text, $Submit, $DelayMs)
 }
 
@@ -54,8 +56,29 @@ function Invoke-BridgeConsoleChoice {
     if (-not $script:BridgeIsWindows) {
         return Send-BridgeTmuxChoice -ProcessId $ProcessId -DownCount $DownCount -Text $Text -StepDelayMs $StepDelayMs
     }
-    Initialize-CopilotConsoleInjector
+    try { Initialize-CopilotConsoleInjector } catch { return "init-failed:$($_.Exception.Message)" }
     [string][CopilotCli.ConsoleInjector]::SendChoice([uint32]$ProcessId, $DownCount, $Text, $StepDelayMs)
+}
+
+function Test-BridgeConsoleOutcomeBeforeWrite {
+    <#
+        Whether a console send failed before it wrote anything.
+
+        Only the outcomes each transport returns ahead of its first write count:
+        compiling the injector, attaching to the console and opening its input on
+        Windows; finding tmux and the session's pane on macOS. Anything else - a
+        failure part-way through, a partial write, an exception - is read as possibly
+        written, because releasing a question that was half typed is what lets a second
+        answer land on top of the first.
+
+        Without this every failure with a live target pid read as written, so a console
+        that could not even be attached settled the attempt as 'unknown' and the
+        question was never retried, though no key had reached it.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Outcome)
+
+    if ([string]::IsNullOrEmpty($Outcome)) { return $false }
+    ($Outcome -match '^(init-failed|attach-failed|conin-failed)(:|$)') -or ($Outcome -cin @('no-tmux', 'not-in-tmux'))
 }
 
 function Initialize-CopilotConsoleInjector {
@@ -528,10 +551,12 @@ function Send-CopilotSessionPrompt {
 
     try {
         # From here nobody can say how much landed, so it is recorded before the write
-        # rather than worked out afterwards from how it failed.
+        # rather than worked out afterwards from how it failed - except for the outcomes
+        # the transport only ever returns ahead of its first write.
         $result.Wrote = $true
         $outcome = Invoke-BridgeConsoleSend -ProcessId $targetPid -Text $clean `
             -Submit (-not $NoSubmit.IsPresent) -DelayMs $SubmitDelayMs
+        if (Test-BridgeConsoleOutcomeBeforeWrite -Outcome $outcome) { $result.Wrote = $false }
         $result.Detail = $outcome
         $result.Delivered = $outcome.StartsWith('ok:')
     }
@@ -793,6 +818,10 @@ function Send-CopilotSessionForm {
         # committing Enter delivered together - the same shape Send already uses for a
         # reply, which is the delivery path with a long record of working.
         $outcome = 'ok:form'
+        # Whether any earlier write in this walk may have landed. A pre-write failure
+        # only means nothing was typed when it is the very first write of the walk;
+        # after that the earlier fields are on the screen whatever this one did.
+        $earlier = $false
         for ($i = 0; $i -lt $steps.Count; $i++) {
             # A multi-select field needs each toggle in its own attach-write-detach.
             # Delivered as one write - the digits and the walk to Submit together -
@@ -806,6 +835,8 @@ function Send-CopilotSessionForm {
                 $isLast = ($k -eq ($keys.Count - 1))
                 $result.Wrote = $true
                 $r = Invoke-BridgeConsoleSend -ProcessId $targetPid -Text $keys[$k] -Submit $isLast -DelayMs $StepDelayMs
+                if (-not $earlier -and (Test-BridgeConsoleOutcomeBeforeWrite -Outcome $r)) { $result.Wrote = $false }
+                $earlier = $true
                 if (-not $r.StartsWith('ok')) { $outcome = "field${i}:$r"; $failed = $true; break }
                 if (-not $isLast) { Start-Sleep -Milliseconds $script:BridgeFormKeyGapMs }
             }
@@ -889,9 +920,11 @@ function Send-CopilotSessionChoice {
 
     try {
         # From here nobody can say how much landed, so it is recorded before the write
-        # rather than worked out afterwards from how it failed.
+        # rather than worked out afterwards from how it failed - except for the outcomes
+        # the transport only ever returns ahead of its first write.
         $result.Wrote = $true
         $outcome = Invoke-BridgeConsoleChoice -ProcessId $targetPid -DownCount $downs -Text $clean -StepDelayMs $StepDelayMs
+        if (Test-BridgeConsoleOutcomeBeforeWrite -Outcome $outcome) { $result.Wrote = $false }
         $result.Detail = $outcome
         $result.Delivered = $outcome.StartsWith('ok:')
     }

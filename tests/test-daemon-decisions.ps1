@@ -698,6 +698,54 @@ Test-That 'and a form refused before the console says it did not' {
     $d = Send-CopilotSessionForm -SessionId $sid -Fields $f -Selections @('B') -ProcessId 4242
     -not $d.Wrote -and -not $d.Delivered -and $script:ConsoleWrites -eq 0
 } "detail=$((Send-CopilotSessionForm -SessionId $sid -Fields @([pscustomobject]@{ Label='F'; Options=@('A','B'); IsText=$false }, [pscustomobject]@{ Label='G'; Options=@('C','D'); IsText=$false }) -Selections @('B') -ProcessId 4242).Detail)"
+
+# A failure with a live target pid used to read as written whatever it was, so a console
+# that could not even be attached settled the attempt as 'unknown' and the question was
+# never retried, though nothing had been typed. Only the outcomes a transport returns
+# ahead of its first write may say otherwise; a failure part-way still reads as written.
+foreach ($before in 'attach-failed:1341', 'conin-failed:5', 'init-failed:compile', 'no-tmux', 'not-in-tmux') {
+    $script:SendOutcome = $before
+    function Invoke-BridgeConsoleSend { param($ProcessId, $Text, $Submit, $DelayMs) $script:ConsoleWrites++; $script:SendOutcome }
+    function Invoke-BridgeConsoleChoice { param($ProcessId, $DownCount, $Text, $StepDelayMs) $script:ConsoleWrites++; $script:SendOutcome }
+    Test-That "a prompt that failed with $before says nothing was written" {
+        $d = Send-CopilotSessionPrompt -SessionId $sid -Text 'hello' -ProcessId 4242
+        -not $d.Wrote -and -not $d.Delivered
+    }
+    Test-That "and so does a choice, and the first write of a form" {
+        $c = Send-CopilotSessionChoice -SessionId $sid -Text 'other words' -ChoiceCount 2 -ProcessId 4242
+        $f = Send-CopilotSessionForm -SessionId $sid -ProcessId 4242 `
+            -Fields @([pscustomobject]@{ Label = 'F'; Options = @('A', 'B'); IsText = $false }) -Selections @('B')
+        -not $c.Wrote -and -not $f.Wrote
+    }
+}
+foreach ($midway in 'write-failed:6', 'partial:3/10', 'enter-failed:6', 'down-failed:6') {
+    $script:SendOutcome = $midway
+    Test-That "a prompt that failed with $midway still says it may have written" {
+        (Send-CopilotSessionPrompt -SessionId $sid -Text 'hello' -ProcessId 4242).Wrote
+    }
+}
+$script:FormSends = 0
+Test-That 'a form whose later field could not attach still says it wrote, because the earlier one landed' {
+    $script:FormSends = 0
+    function Invoke-BridgeConsoleSend {
+        param($ProcessId, $Text, $Submit, $DelayMs)
+        $script:FormSends++
+        if ($script:FormSends -eq 1) { 'ok:sent' } else { 'attach-failed:1341' }
+    }
+    $f = @(
+        [pscustomobject]@{ Label = 'F'; Options = @('A', 'B'); IsText = $false }
+        [pscustomobject]@{ Label = 'G'; Options = @('C', 'D'); IsText = $false })
+    $d = Send-CopilotSessionForm -SessionId $sid -Fields $f -Selections @('B', 'D') -ProcessId 4242
+    $d.Wrote -and -not $d.Delivered -and $script:FormSends -eq 2
+} "sends=$($script:FormSends)"
+Test-That 'an exception from the transport still reads as possibly written' {
+    function Invoke-BridgeConsoleSend { param($ProcessId, $Text, $Submit, $DelayMs) throw 'console went away' }
+    $d = Send-CopilotSessionPrompt -SessionId $sid -Text 'hello' -ProcessId 4242
+    $d.Wrote -and -not $d.Delivered
+}
+function Invoke-BridgeConsoleSend { param($ProcessId, $Text, $Submit, $DelayMs) $script:ConsoleWrites++; 'ok:sent' }
+function Invoke-BridgeConsoleChoice { param($ProcessId, $DownCount, $Text, $StepDelayMs) $script:ConsoleWrites++; 'ok:choice' }
+
 Test-That 'an attempt is never read against a different question' {
     $path = Get-CopilotDecisionAttemptPath -SessionId $attemptSid -DecisionId 'a4'
     [IO.File]::WriteAllText($path, '{"decisionId":"somebody-else","state":"injecting"}')

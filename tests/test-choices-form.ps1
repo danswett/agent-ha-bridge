@@ -163,6 +163,30 @@ Set-CopilotMqttDecision -SessionId $sessionId -SessionName 'Copilot: a task' -Ma
     -Question 'How should this land?' -Choices @() -Fields $fields `
     -DecisionId 'd1' -Headers $headers | Out-Null
 
+Write-Host '--- what the answer channels held is read before the question is shown ---'
+# The snapshot used to be taken after the question was published, so an answer sent in
+# the gap was recorded as "what was already there" and never accepted, while the card
+# said it had gone. Recorded here in a scope of its own, so the stubs go with it.
+$script:Order = [Collections.Generic.List[string]]::new()
+Test-That 'both answer channels are read before anything about the question is published' {
+    $script:Order = [Collections.Generic.List[string]]::new()
+    function Get-CopilotDecisionChannelObservation {
+        param($EntityId, $Headers)
+        $script:Order.Add("read $EntityId")
+        [pscustomobject]@{ State = 'absent'; Value = '' }
+    }
+    function Publish-CopilotMqttMessage {
+        param([string]$Topic, [string]$Payload, [hashtable]$Headers, [switch]$Retain)
+        $script:Order.Add("publish $Topic")
+    }
+    Set-CopilotMqttDecision -SessionId 'abc123de-f456-7890-abcd-ef12345600aa' -SessionName 'Copilot: order' `
+        -Machine 'BOX' -Question 'Which?' -Choices @() -Fields $fields -DecisionId 'order-check' -Headers $headers | Out-Null
+    $first = $script:Order.FindIndex([Predicate[string]]{ param($s) $s -like 'publish *' })
+    $reads = @($script:Order | Where-Object { $_ -like 'read *' })
+    $first -eq 2 -and $reads.Count -eq 2 -and
+        $reads[0] -like '*_reply_payload' -and $reads[1] -like '*_submit'
+} "order: $(@($script:Order | Select-Object -First 4) -join ' | ')"
+
 Write-Host '--- the question the bridge armed ---'
 Test-That 'the decision selector carries only Cancel, so the fields are the answer' {
     (@($script:HaStates["select.${node}_decision"].attributes.options) -join ',') -eq 'Awaiting answer...,Cancel request'

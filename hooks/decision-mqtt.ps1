@@ -1856,6 +1856,18 @@ function Set-CopilotMqttDecision {
     }
     $topics = Get-CopilotMqttTopics -SessionId $SessionId
     $node = $topics.Node
+
+    # What the answer channels already held, recorded before anything about this
+    # question is published - not after. Once the question is on screen somebody can
+    # answer it, and an answer given before the snapshot was taken would be recorded as
+    # "what was already there" and never accepted, while the card showed it as sent.
+    # Recording first means everything the snapshot holds predates the question.
+    # Write-once and keyed by decision id, so arming the same question twice records it
+    # once and a replacement question cannot disturb it; if it cannot be established the
+    # daemon establishes it on a later pass and reads no answer until it has.
+    [void](Initialize-CopilotDecisionBaseline -SessionId $SessionId -DecisionId $DecisionId `
+        -PayloadEntityId "sensor.${node}_reply_payload" -SubmitEntityId "button.${node}_submit" -Headers $Headers)
+
     $device = New-CopilotMqttDeviceBlock -Node $node -SessionName $SessionName -Machine $Machine
     $availability = @(@{ topic = $topics.Availability; payload_available = 'online'; payload_not_available = 'offline' })
 
@@ -1960,16 +1972,6 @@ function Set-CopilotMqttDecision {
     }
     Publish-CopilotMqttMessage -Topic $topics.DecisionAttributes `
         -Payload ($questionAttrs | ConvertTo-Json -Depth 8 -Compress) -Headers $Headers -Retain
-
-    # What the answer channels already held, recorded here because here is the
-    # boundary that matters: the hook arms the card before any daemon sweep, so an
-    # answer given in that gap would otherwise be read later and adopted as "what was
-    # already there", losing it. Write-once and keyed by decision id, so arming the
-    # same question twice records it once and a replacement question cannot disturb
-    # it; if it cannot be established the daemon establishes it on a later pass and
-    # reads no answer until it has.
-    [void](Initialize-CopilotDecisionBaseline -SessionId $SessionId -DecisionId $DecisionId `
-        -PayloadEntityId "sensor.${node}_reply_payload" -SubmitEntityId "button.${node}_submit" -Headers $Headers)
 
     $topics
 }
