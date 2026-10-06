@@ -852,8 +852,12 @@ else {
 Write-Host ''
 Write-Host '--- a field whose options look like positions ---'
 $script:HaStates = @{}
+# 'X' first, deliberately. With options '#1','#2',... position 1 and the option named
+# '#1' are the same string, so a decoder that read the label as a position agreed by
+# accident and the bug hid. Here position 1 is 'X' and the second option is '#1', so
+# the two readings disagree and anything that confuses them shows up.
 $hashField = @([pscustomobject]@{
-    Label = 'Tickets'; Options = @('#1', '#2', 'Something else'); IsText = $false
+    Label = 'Tickets'; Options = @('X', '#1', 'Something else'); IsText = $false
     MultiSelect = $true; MultiSelectStyle = 'space-toggle'; DefaultIndexes = @(1)
 })
 Set-CopilotMqttDecision -SessionId $sessionId -SessionName 'Copilot: a task' -Machine 'BOX' `
@@ -862,7 +866,7 @@ Set-CopilotMqttDecision -SessionId $sessionId -SessionName 'Copilot: a task' -Ma
 
 Test-That 'it is offered the written-out form only, never positions' {
     $offered = @($script:HaStates["select.${node}_f1"].attributes.options)
-    ($offered -join ',') -eq 'Choose...,#1,#2,Something else,#1 + #2,#1 + Something else,#2 + Something else,#1 + #2 + Something else'
+    ($offered -join ',') -eq 'Choose...,X,#1,Something else,X + #1,X + Something else,#1 + Something else,X + #1 + Something else'
 } "offered=[$(@($script:HaStates["select.${node}_f1"].attributes.options) -join ',')]"
 Test-That 'and the card is not told to write positions' {
     -not $script:HaStates["select.${node}_decision"].attributes.Contains('field_1_codes')
@@ -870,12 +874,12 @@ Test-That 'and the card is not told to write positions' {
 # The default still has to arrive ticked, which means falling back to the written-out
 # start value because this field has no position form to use.
 Test-That 'its schema default still opens ticked, through the written-out form' {
-    [string]$script:HaStates["select.${node}_f1"].state -eq '#2'
+    [string]$script:HaStates["select.${node}_f1"].state -eq '#1'
 } "state=[$($script:HaStates["select.${node}_f1"].state)]"
 
 $hashCard = Invoke-ChoicesCard -Taps @('Something else')
 Test-That 'the card draws the options themselves and composes on the default' {
-    [string]@($hashCard.calls)[-1].data.option -eq '#2 + Something else'
+    [string]@($hashCard.calls)[-1].data.option -eq '#1 + Something else'
 } "calls=[$(@($hashCard.calls) | ForEach-Object { $_.data.option })]"
 
 foreach ($call in @($hashCard.calls)) { $script:HaStates[[string]$call.data.entity_id].state = [string]$call.data.option }
@@ -886,7 +890,7 @@ Set-Baseline -DecisionId 'd9'
 $hashState = @{ $sessionId = [pscustomobject]@{ Name = 'Copilot: a task'; Machine = 'BOX'; LastSubmitAt = '' } }
 $hashAnswer = Read-DaemonDecisionAnswer -SessionId $sessionId -Marker $hashMarker -State $hashState -Headers $headers
 Test-That 'and the daemon reads exactly those two back, with the words as the selection' {
-    (@($hashAnswer.Selections) -join '|') -eq '#2 + Something else' -and $hashAnswer.Answer -ceq '#2 + Something else'
+    (@($hashAnswer.Selections) -join '|') -eq '#1 + Something else' -and $hashAnswer.Answer -ceq '#1 + Something else'
 } "selections=[$(@($hashAnswer.Selections) -join '|')] answer=[$($hashAnswer.Answer)]"
 Test-That 'and the keystrokes tick the second and third rows' {
     $esc = [string][char]27

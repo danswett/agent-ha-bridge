@@ -922,13 +922,18 @@ function multiSelectCode(options, picked) {
  * every earlier card writes, and are still published whenever they fit, so both have
  * to read back here.
  *
+ * Whether this field uses positions is asked *before* the value's shape, and that
+ * order matters: a field may offer an option written like a position, and for that
+ * field '#1' is the option's own text. Testing the shape first showed the first
+ * option ticked when the second was chosen.
+ *
  * The joined form is matched whole rather than split on the separator: an option's
  * own text may contain " + ", and then two different answers look identical. The
  * bridge refuses to split for the same reason.
  */
-function multiSelectPick(options, separator, state) {
+function multiSelectPick(options, separator, state, useCodes) {
   if (!state || options.length === 0 || options.length > 20) { return []; }
-  if (CHOICE_CODE_PATTERN.test(state)) {
+  if (useCodes && CHOICE_CODE_PATTERN.test(state)) {
     const seen = new Set();
     const picked = [];
     for (const part of state.slice(1).split(',')) {
@@ -1143,7 +1148,7 @@ class AgentBridgeChoicesCard extends HTMLElement {
           armed.codes = !!decisionAttrs[`field_${i + 1}_codes`];
           armed.slotOptions = armed.options;
           armed.options = base;
-          armed.picked = multiSelectPick(base, armed.separator, armed.chosen);
+          armed.picked = multiSelectPick(base, armed.separator, armed.chosen, armed.codes);
         }
       }
       fields.push(armed);
