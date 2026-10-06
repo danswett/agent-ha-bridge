@@ -45,10 +45,9 @@ function Test-BridgeNativeHook {
 
     if (-not [IO.File]::Exists($Path)) { return $false }
     try {
-        $output = & $Path --version 2>$null
-        $ok = ($LASTEXITCODE -eq 0) -and -not [string]::IsNullOrWhiteSpace(($output | Out-String))
-        $global:LASTEXITCODE = 0
-        return $ok
+        $probe = Invoke-BridgeCommandProbe -Executable $Path
+        return ($probe.Ran -and -not $probe.TimedOut -and $probe.ExitCode -eq 0 -and
+            -not [string]::IsNullOrWhiteSpace($probe.StandardOutput))
     }
     catch { return $false }
 }
@@ -157,8 +156,9 @@ function Get-BridgeCopilotVersion {
     $command = Get-Command copilot -ErrorAction SilentlyContinue | Select-Object -First 1
     if (-not $command) { return $null }
     try {
-        $text = (& $command.Source --version 2>$null | Out-String)
-        $global:LASTEXITCODE = 0
+        $probe = Invoke-BridgeCommandProbe -Executable $command.Source
+        if (-not $probe.Ran -or $probe.TimedOut -or $probe.ExitCode -ne 0) { return $null }
+        $text = $probe.StandardOutput
         if ($text -match '(\d+\.\d+\.\d+)') { return [version]$Matches[1] }
     }
     catch { }
