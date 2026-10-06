@@ -31,6 +31,9 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot '..\hooks\decision-mqtt.ps1')
 . (Join-Path $PSScriptRoot '..\hooks\decision-ha-websocket.ps1')
 . (Join-Path $PSScriptRoot '..\hooks\daemon-decisions.ps1')
+# The injector too, so the last link - the keystrokes a read answer turns into - is
+# checked against the same field definitions the card and the daemon just used.
+. (Join-Path $PSScriptRoot '..\hooks\decision-inject.ps1')
 # Its guard, so dot-sourcing it gives the functions without running the card check -
 # which talks to Home Assistant and re-sources the files above, undoing every stub.
 $env:BRIDGE_FRONTEND_NORUN = '1'
@@ -80,7 +83,9 @@ function Get-HomeAssistantState {
     param([string]$EntityId, [hashtable]$Headers)
     if (-not $script:HaStates.Contains($EntityId)) { throw "no such entity: $EntityId" }
     $entry = $script:HaStates[$EntityId]
-    [pscustomobject]@{ entity_id = $EntityId; state = [string]$entry.state; attributes = $entry.attributes }
+    # An object, not the dictionary it is stored in: Home Assistant's own JSON parses
+    # to one, and the daemon reads attributes the way it reads every other entity's.
+    [pscustomobject]@{ entity_id = $EntityId; state = [string]$entry.state; attributes = [pscustomobject]$entry.attributes }
 }
 function Publish-CopilotMqttMessage {
     param([string]$Topic, [string]$Payload, [hashtable]$Headers, [switch]$Retain)
@@ -166,6 +171,48 @@ Test-That 'with the field entities on it, not only the decision' {
 Test-That 'and every one of them is an entity the bridge actually published' {
     @(@($cardConfig.fields) | Where-Object { -not $script:HaStates.Contains([string]$_) }).Count -eq 0
 } "published=[$(($script:HaStates.Keys | Sort-Object) -join ',')]"
+Test-That 'and the submit button, because Send answer is the card''s row now' {
+    $cardConfig.PSObject.Properties['submit'] -and [string]$cardConfig.submit -eq "button.${node}_submit"
+} "submit=[$(if ($null -ne $cardConfig -and $cardConfig.PSObject.Properties['submit']) { $cardConfig.submit } else { '<missing>' })]"
+
+# The reply box stops being swapped out the moment a question arrives. That swap
+# existed because the daemon could not read the card's payload while a question was
+# armed; now it can, so what is on screen is the same box as the rest of the session.
+$replyCards = @($sessionCard.cards | Where-Object { "$($_.type)" -eq 'custom:agent-bridge-reply-card' })
+Test-That 'the reply box is the reply card, armed question or not' {
+    $replyCards.Count -eq 1
+} "types=[$(@($sessionCard.cards | ForEach-Object { if ($_.type -eq 'conditional') { "conditional($($_.card.type))" } else { $_.type } }) -join '|')]"
+Test-That 'and the old entity row with a button beside it is gone' {
+    @($sessionCard.cards | Where-Object { "$($_.type)" -eq 'custom:layout-card' }).Count -eq 0 -and
+    @($sessionCard.cards | Where-Object { $_.type -eq 'conditional' -and "$($_.card.type)" -eq 'custom:layout-card' }).Count -eq 0
+}
+
+# The other side of the same gate. An older card has neither Send answer nor the
+# checkbox rows, so it must still get the pair it knows how to use - an ungated
+# change here looks right on this machine and silently leaves one running an older
+# card with no way to send a form at all.
+Set-TestPublicationCardUrl -Url '/local/agent-bridge-reply-card.js?v=1.21.1'
+Save-CopilotSessionDashboard `
+    -Sessions @([pscustomobject]@{ Node = $node; Name = 'Copilot: a task'; Machine = 'BOX'; Kind = 'copilot' }) `
+    -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.21.1'
+$oldDash = $script:SavedConfig | ConvertTo-Json -Depth 40 | ConvertFrom-Json -Depth 40
+$oldCard = @($oldDash.views[0].cards | Where-Object { $_.type -eq 'custom:agent-bridge-session-card' })[0]
+$oldChoices = @($oldCard.cards | Where-Object {
+    $_.type -eq 'conditional' -and "$($_.card.type)" -eq 'custom:agent-bridge-choices-card'
+})[0].card
+
+Test-That 'an older card is not handed a submit entity it would ignore' {
+    -not $oldChoices.PSObject.Properties['submit']
+}
+Test-That 'and keeps the entity pair for whenever a question is armed' {
+    @($oldCard.cards | Where-Object { $_.type -eq 'conditional' -and "$($_.card.type)" -eq 'custom:layout-card' }).Count -eq 1
+} "types=[$(@($oldCard.cards | ForEach-Object { if ($_.type -eq 'conditional') { "conditional($($_.card.type))" } else { $_.type } }) -join '|')]"
+
+# Back to the version under test for everything below.
+Set-TestPublicationCardUrl -Url "/local/agent-bridge-reply-card.js?v=$cardVersion"
+Save-CopilotSessionDashboard `
+    -Sessions @([pscustomobject]@{ Node = $node; Name = 'Copilot: a task'; Machine = 'BOX'; Kind = 'copilot' }) `
+    -ReplyCardUrl "/local/agent-bridge-reply-card.js?v=$cardVersion"
 
 # --- 3. the real card, on that config and those states ----------------------------
 
@@ -181,8 +228,13 @@ if (-not $node_exe) {
 function Invoke-ChoicesCard {
     <# The rows the real card draws, and the service calls the given taps produce. #>
     param([Parameter(Mandatory)][string[]]$Taps)
+    $config = @{ decision = [string]$cardConfig.decision; fields = @(@($cardConfig.fields) | ForEach-Object { [string]$_ }) }
+    # Forwarded rather than written out: Send answer only exists because the view
+    # hands the card a submit entity, and a view that stopped doing so has to fail
+    # here rather than quietly leave a form with no way to send it.
+    if ($cardConfig.PSObject.Properties['submit']) { $config.submit = [string]$cardConfig.submit }
     $job = @{
-        config = @{ decision = [string]$cardConfig.decision; fields = @(@($cardConfig.fields) | ForEach-Object { [string]$_ }) }
+        config = $config
         states = $script:HaStates
         taps   = @($Taps)
     } | ConvertTo-Json -Depth 20 -Compress
@@ -268,6 +320,165 @@ $withdrawn = Read-DaemonFormAnswer -SessionId $sessionId -Marker $marker -State 
 Test-That 'and the daemon reads that as the request being withdrawn' {
     $withdrawn.Answer -eq 'Cancel request'
 } "answer=[$($withdrawn.Answer)]"
+
+# --- 5. one choice, and the Send that every answer now needs --------------------
+
+Write-Host ''
+Write-Host '--- a single choice is a field like any other, and waits for Send ---'
+# It used to ride on the main selector and go the instant it was tapped, so the
+# dashboard behaved two ways for one gesture: this question sent itself, the form
+# beside it waited. A tap is also the easiest thing to do by accident on a phone, and
+# there was nothing to undo it with.
+$script:HaStates = @{}
+$oneField = @([pscustomobject]@{ Label = 'Database'; Options = @('PostgreSQL', 'SQLite'); IsText = $false })
+$armedOne = [DateTimeOffset]::Now.AddSeconds(-5)
+Set-CopilotMqttDecision -SessionId $sessionId -SessionName 'Copilot: a task' -Machine 'BOX' `
+    -Question 'Which database?' -Choices @('PostgreSQL', 'SQLite') -Fields $oneField `
+    -DecisionId 'd2' -Headers $headers | Out-Null
+
+Test-That 'the one option list is published as a field, not on the main selector' {
+    (@($script:HaStates["select.${node}_f1"].attributes.options) -join ',') -eq 'Choose...,PostgreSQL,SQLite' -and
+    (@($script:HaStates["select.${node}_decision"].attributes.options) -join ',') -eq 'Awaiting answer...,Cancel request'
+} "f1=[$(@($script:HaStates["select.${node}_f1"].attributes.options) -join ',')] decision=[$(@($script:HaStates["select.${node}_decision"].attributes.options) -join ',')]"
+
+$single = Invoke-ChoicesCard -Taps @('SQLite')
+Test-That 'tapping an option sets the field, not the decision selector' {
+    @($single.calls).Count -eq 1 -and
+    [string]@($single.calls)[0].data.entity_id -eq "select.${node}_f1" -and
+    [string]@($single.calls)[0].data.option -eq 'SQLite'
+} "calls=[$(@($single.calls) | ForEach-Object { "$($_.data.entity_id)=$($_.data.option)" })]"
+Test-That 'and the card offers Send answer, because nothing sends itself now' {
+    @($single.rows | Where-Object { $_.text -eq 'Send answer' }).Count -eq 1
+} "rows=[$(@($single.rows | ForEach-Object { $_.text }) -join '|')]"
+
+foreach ($call in @($single.calls)) { $script:HaStates[[string]$call.data.entity_id].state = [string]$call.data.option }
+$script:HaStates["text.${node}_reply"] = [ordered]@{ state = ' '; attributes = @{} }
+$script:HaStates["button.${node}_submit"] = [ordered]@{ state = $armedOne.ToString('o'); attributes = @{} }
+$oneMarker = [pscustomobject]@{ decisionId = 'd2'; mode = 'multiple_choice'; armedAt = $armedOne.ToString('o'); fields = $oneField }
+$oneState = @{ $sessionId = [pscustomobject]@{ Name = 'Copilot: a task'; Machine = 'BOX'; LastSubmitAt = '' } }
+
+Test-That 'a chosen option on its own is not an answer yet' {
+    [string]::IsNullOrWhiteSpace((Read-DaemonDecisionAnswer -SessionId $sessionId -Marker $oneMarker -State $oneState -Headers $headers).Answer)
+}
+
+$pressed = Invoke-ChoicesCard -Taps @('Send answer')
+Test-That 'Send answer presses the submit button the daemon waits on' {
+    @($pressed.calls).Count -eq 1 -and
+    [string]@($pressed.calls)[0].domain -eq 'button' -and
+    [string]@($pressed.calls)[0].service -eq 'press' -and
+    [string]@($pressed.calls)[0].data.entity_id -eq "button.${node}_submit"
+} "calls=[$(@($pressed.calls) | ForEach-Object { "$($_.domain).$($_.service) $($_.data.entity_id)" })]"
+
+$script:HaStates["button.${node}_submit"].state = [DateTimeOffset]::Now.ToString('o')
+$oneAnswer = Read-DaemonDecisionAnswer -SessionId $sessionId -Marker $oneMarker -State $oneState -Headers $headers
+Test-That 'and then the daemon reads exactly the option that was tapped' {
+    $oneAnswer.Answer -eq 'SQLite' -and (@($oneAnswer.Selections) -join '|') -eq 'SQLite' -and -not $oneAnswer.IsFreeText
+} "answer=[$($oneAnswer.Answer)] selections=[$(@($oneAnswer.Selections) -join '|')]"
+
+# --- 6. a question that takes several options -----------------------------------
+
+Write-Host ''
+Write-Host '--- and a multi-select question takes as many as you like ---'
+$script:HaStates = @{}
+$multiField = @([pscustomobject]@{
+    Label = 'Features'; Options = @('Auth', 'Billing', 'Search'); IsText = $false
+    MultiSelect = $true; MultiSelectStyle = 'space-toggle'; DefaultIndexes = @()
+})
+$armedMulti = [DateTimeOffset]::Now.AddSeconds(-5)
+Set-CopilotMqttDecision -SessionId $sessionId -SessionName 'Copilot: a task' -Machine 'BOX' `
+    -Question 'Which features?' -Choices @('Auth', 'Billing', 'Search') -Fields $multiField `
+    -DecisionId 'd3' -Headers $headers | Out-Null
+
+Test-That 'the slot enumerates every combination, because a select holds one value' {
+    (@($script:HaStates["select.${node}_f1"].attributes.options) -join ',') -eq
+        'Choose...,Auth,Billing,Search,Auth + Billing,Auth + Search,Billing + Search,Auth + Billing + Search'
+} "f1=[$(@($script:HaStates["select.${node}_f1"].attributes.options) -join ',')]"
+Test-That 'and the options themselves ride on the attributes for the card to draw' {
+    $a = $script:HaStates["select.${node}_decision"].attributes
+    $a['field_1_multi'] -and (@($a['field_1_options']) -join ',') -eq 'Auth,Billing,Search' -and
+    $a['field_1_separator'] -eq ' + '
+} "attrs=[$(@($script:HaStates["select.${node}_decision"].attributes.Keys) -join ',')]"
+
+$multi = Invoke-ChoicesCard -Taps @('Auth', 'Search')
+Test-That 'the card draws the options, not the combinations' {
+    (@($multi.rows | Where-Object { $_.tag -eq 'BUTTON' } | ForEach-Object { $_.text }) -join '|') -eq
+        'Auth|Billing|Search|Send answer|Cancel request'
+} "rows=[$(@($multi.rows | ForEach-Object { $_.text }) -join '|')]"
+Test-That 'and says on the heading that more than one may be ticked' {
+    @($multi.rows | Where-Object { @($_.classes) -contains 'label' } | ForEach-Object { $_.text }) -contains 'Features (pick any)'
+} "labels=[$(@($multi.rows | Where-Object { @($_.classes) -contains 'label' } | ForEach-Object { $_.text }) -join '|')]"
+Test-That 'two taps leave the slot holding both, not just the last one' {
+    [string]@($multi.calls)[-1].data.option -eq 'Auth + Search'
+} "calls=[$(@($multi.calls) | ForEach-Object { "$($_.data.entity_id)=$($_.data.option)" })]"
+Test-That 'and both rows stay ticked while the choice is still being made' {
+    (@($multi.rows | Where-Object { @($_.classes) -contains 'chosen' } | ForEach-Object { $_.text }) -join '|') -eq 'Auth|Search'
+} "chosen=[$(@($multi.rows | Where-Object { @($_.classes) -contains 'chosen' } | ForEach-Object { $_.text }) -join '|')]"
+
+foreach ($call in @($multi.calls)) { $script:HaStates[[string]$call.data.entity_id].state = [string]$call.data.option }
+$untick = Invoke-ChoicesCard -Taps @('Auth')
+Test-That 'tapping a ticked option unticks it rather than sending it' {
+    [string]@($untick.calls)[-1].data.option -eq 'Search'
+} "calls=[$(@($untick.calls) | ForEach-Object { "$($_.data.entity_id)=$($_.data.option)" })]"
+$script:HaStates["select.${node}_f1"].state = 'Auth + Search'
+
+$script:HaStates["text.${node}_reply"] = [ordered]@{ state = ' '; attributes = @{} }
+$script:HaStates["button.${node}_submit"] = [ordered]@{ state = [DateTimeOffset]::Now.ToString('o'); attributes = @{} }
+$multiMarker = [pscustomobject]@{ decisionId = 'd3'; mode = 'multiple_choice'; armedAt = $armedMulti.ToString('o'); fields = $multiField }
+$multiState = @{ $sessionId = [pscustomobject]@{ Name = 'Copilot: a task'; Machine = 'BOX'; LastSubmitAt = '' } }
+$multiAnswer = Read-DaemonDecisionAnswer -SessionId $sessionId -Marker $multiMarker -State $multiState -Headers $headers
+
+Test-That 'the daemon reads both options back off that one slot' {
+    (@($multiAnswer.Selections) -join '|') -eq 'Auth + Search'
+} "selections=[$(@($multiAnswer.Selections) -join '|')]"
+Test-That 'and the keystrokes tick exactly those two rows, with no walk to a Submit' {
+    $esc = [string][char]27
+    @(Get-BridgeFormPayloads -Fields $multiField -Selections @($multiAnswer.Selections))[0].Payload -eq
+        (' ' + ($esc + '[B') + ($esc + '[B') + ' ')
+} ((@(Get-BridgeFormPayloads -Fields $multiField -Selections @($multiAnswer.Selections))[0].Payload) -replace [regex]::Escape([string][char]27), '<esc>')
+
+# --- 7. the words typed at a choice question ------------------------------------
+
+Write-Host ''
+Write-Host '--- and words typed in the reply box answer through "Other" ---'
+# The box was on screen, Send worked, and the daemon read only the selector - so the
+# words went nowhere and nothing anywhere said so.
+$script:HaStates = @{}
+Set-CopilotMqttDecision -SessionId $sessionId -SessionName 'Copilot: a task' -Machine 'BOX' `
+    -Question 'Which database?' -Choices @('PostgreSQL', 'SQLite') -Fields $oneField `
+    -DecisionId 'd4' -Headers $headers | Out-Null
+$armedText = [DateTimeOffset]::Now.AddSeconds(-5)
+$script:HaStates["text.${node}_reply"] = [ordered]@{ state = ' '; attributes = @{} }
+$script:HaStates["button.${node}_submit"] = [ordered]@{ state = $armedText.ToString('o'); attributes = @{} }
+$script:HaStates["sensor.${node}_reply_payload"] = [ordered]@{
+    state = [DateTimeOffset]::Now.ToString('o')
+    # An object, not a dictionary: this is what Home Assistant's own JSON parses to,
+    # and the daemon reads it the way it reads every other entity's attributes.
+    attributes = [pscustomobject]@{ text = 'DuckDB, actually'; images = @(); files = @() }
+}
+$textMarker = [pscustomobject]@{ decisionId = 'd4'; mode = 'multiple_choice'; armedAt = $armedText.ToString('o'); fields = $oneField }
+$textState = @{ $sessionId = [pscustomobject]@{ Name = 'Copilot: a task'; Machine = 'BOX'; LastSubmitAt = '' } }
+$typed = Read-DaemonDecisionAnswer -SessionId $sessionId -Marker $textMarker -State $textState -Headers $headers
+
+Test-That 'what was typed is the answer, and is marked as typed rather than chosen' {
+    $typed.Answer -eq 'DuckDB, actually' -and $typed.IsFreeText -and $typed.IsChoice
+} "answer=[$($typed.Answer)] freeText=[$($typed.IsFreeText)]"
+Test-That 'and the publish it came from is named, so it is not sent twice' {
+    -not [string]::IsNullOrWhiteSpace($typed.PayloadStamp)
+}
+
+# A payload older than the question belongs to the reply path, not to this question.
+$script:HaStates["sensor.${node}_reply_payload"].state = $armedText.AddMinutes(-1).ToString('o')
+Test-That 'something said before the question was asked is not its answer' {
+    [string]::IsNullOrWhiteSpace((Read-DaemonDecisionAnswer -SessionId $sessionId -Marker $textMarker -State $textState -Headers $headers).Answer)
+}
+
+# An attachment cannot be typed into an arrow-key prompt, and consuming it here would
+# destroy it; the reply path stages and delivers it once the question has gone.
+$script:HaStates["sensor.${node}_reply_payload"].state = [DateTimeOffset]::Now.ToString('o')
+$script:HaStates["sensor.${node}_reply_payload"].attributes.images = @([pscustomobject]@{ id = 'i1'; name = 'shot.png' })
+Test-That 'a reply carrying an image is left alone rather than half-delivered' {
+    [string]::IsNullOrWhiteSpace((Read-DaemonDecisionAnswer -SessionId $sessionId -Marker $textMarker -State $textState -Headers $headers).Answer)
+}
 
 Write-Host ''
 if ($script:Failures) {

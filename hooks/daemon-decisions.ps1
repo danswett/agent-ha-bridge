@@ -80,7 +80,9 @@ function Invoke-PendingDecisions {
         if (-not $recheck.Pending) { continue }
 
         [void](Invoke-DaemonDecisionAnswer -SessionId $sessionId -Marker $marker `
-            -Answer $read.Answer -IsChoice $read.IsChoice -Selections $read.Selections -Headers $Headers)
+            -Answer $read.Answer -IsChoice $read.IsChoice -IsFreeText $read.IsFreeText `
+            -Selections $read.Selections -PayloadStamp $read.PayloadStamp `
+            -State $State -Headers $Headers)
     }
 }
 
@@ -181,12 +183,93 @@ function Confirm-DaemonDecisionArmed {
     }
 }
 
+function Test-DaemonDecisionUsesFields {
+    <#
+        Whether a question is answered through its field slots rather than the main
+        selector.
+
+        Read off the card rather than re-derived: Set-CopilotMqttDecision publishes
+        multi_field beside the question, from the same decision that put the controls
+        on screen, so this cannot disagree with what is there. The marker's own field
+        list is not that decision - Claude's parser keeps a field in the marker for
+        the keystrokes while publishing its options on the main selector - and reading
+        it instead would send the daemon looking at a slot that was never armed.
+
+        The marker is only the fallback, for a card armed before the attribute existed.
+    #>
+    param(
+        [Parameter(Mandatory)]$Marker,
+        [AllowNull()]$DecisionState
+    )
+
+    $attrs = if ($null -ne $DecisionState -and $DecisionState.PSObject.Properties['attributes']) {
+        $DecisionState.attributes
+    } else { $null }
+    if ($null -ne $attrs -and $attrs.PSObject.Properties['multi_field']) { return [bool]$attrs.multi_field }
+    @($Marker.fields).Count -gt 1
+}
+
+function Read-DaemonDecisionCardText {
+    <#
+        Text the reply card published as an answer to the question now armed, with
+        the stamp identifying that publish, or empty when there is none.
+
+        The reply card is the box every other part of a session card uses, and until
+        card 1.22.0 the dashboard swapped it out for a plain entity row the moment a
+        question arrived - because the daemon only ever read the selector. So on a
+        choice question, whose native prompt always offers "Other (type your answer)",
+        a typed answer went nowhere: the box was on screen, Send worked, and nothing
+        anywhere recorded that the words had been thrown away.
+
+        Only a payload published after the question was armed counts. An older one
+        belongs to the reply path, which delivers it once the card clears, and reading
+        it here would answer the question with whatever was last said to the session.
+
+        A payload carrying attachments is left alone entirely. An image cannot be
+        typed into an arrow-key prompt, and consuming it here would destroy it; the
+        reply path stages and delivers it properly once the question is gone.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)]$Marker,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $node = Get-CopilotMqttNodeId -SessionId $SessionId
+    $empty = [pscustomobject]@{ Text = ''; Stamp = '' }
+    $state = $null
+    try { $state = Get-HomeAssistantState -EntityId "sensor.${node}_reply_payload" -Headers $Headers }
+    catch { return $empty }
+    if ($null -eq $state -or -not $state.PSObject.Properties['state']) { return $empty }
+
+    $stamp = [string]$state.state
+    if ([string]::IsNullOrWhiteSpace($stamp) -or $stamp -in @('unknown', 'unavailable')) { return $empty }
+    try {
+        if (([datetimeoffset]$stamp) -le ([datetimeoffset][string]$Marker.armedAt)) { return $empty }
+    }
+    catch { return $empty }
+
+    $attrs = if ($state.PSObject.Properties['attributes']) { $state.attributes } else { $null }
+    if ($null -eq $attrs) { return $empty }
+    foreach ($name in @('images', 'files')) {
+        if ($attrs.PSObject.Properties[$name] -and @($attrs.$name).Count -gt 0) { return $empty }
+    }
+    $text = if ($attrs.PSObject.Properties['text']) { [string]$attrs.text } else { '' }
+    if ([string]::IsNullOrWhiteSpace($text)) { return $empty }
+    [pscustomobject]@{ Text = $text; Stamp = $stamp }
+}
+
 function Read-DaemonDecisionAnswer {
     <#
         What the card holds as the answer to a pending question, as
-        { Answer, Selections, IsChoice }: a submitted form (Read-DaemonFormAnswer), the
-        selector's choice, or the reply box's text. Answer is '' when there is nothing
-        to send yet; $null when the card could not be read.
+        { Answer, Selections, IsChoice, IsFreeText, PayloadStamp }: a submitted form
+        (Read-DaemonFormAnswer), the selector's choice, text typed into the reply card,
+        or the reply box's text. Answer is '' when there is nothing to send yet; $null
+        when the card could not be read.
+
+        IsFreeText says the answer was typed rather than chosen, so a choice question
+        answered in words is delivered through the prompt's own "Other" entry rather
+        than hunted for in an option list it was never in.
     #>
     param(
         [Parameter(Mandatory)][string]$SessionId,
@@ -199,40 +282,80 @@ function Read-DaemonDecisionAnswer {
     $isChoice = ([string]$Marker.mode -eq 'multiple_choice')
     $answer = ''
     $selections = @()
+    $isFreeText = $false
+    $stamp = ''
+    # Which controls the card is showing is read from the card, but a card that
+    # cannot be read must not cost a freeform question its answer - the reply box is
+    # answered without the selector having anything to do with it. So the failure is
+    # kept and only raised on the path that genuinely needs the selector.
+    $sel = $null
+    $selError = $null
+    try { $sel = Get-HomeAssistantState -EntityId "select.${node}_decision" -Headers $Headers }
+    catch { $selError = $_ }
     try {
-        if (@($Marker.fields).Count -gt 1) {
+        if (Test-DaemonDecisionUsesFields -Marker $Marker -DecisionState $sel) {
+            if ($null -ne $selError) { throw $selError }
             $form = Read-DaemonFormAnswer -SessionId $SessionId -Marker $Marker -State $State -Headers $Headers
             $answer = $form.Answer
             $selections = @($form.Selections)
+            $stamp = [string]$form.PayloadStamp
+            if ($form.PSObject.Properties['IsFreeText']) { $isFreeText = [bool]$form.IsFreeText }
         }
         elseif ($isChoice) {
-            $sel = Get-HomeAssistantState -EntityId "select.${node}_decision" -Headers $Headers
+            if ($null -ne $selError) { throw $selError }
             $s = [string]$sel.state
             if ($s -notin @('Idle', 'Awaiting answer...', 'unknown', 'unavailable', '')) { $answer = $s }
+            else {
+                # Nothing tapped, but something typed. Every Copilot option list ends
+                # in "Other (type your answer)", so words are a real answer here.
+                $card = Read-DaemonDecisionCardText -SessionId $SessionId -Marker $Marker -Headers $Headers
+                if (-not [string]::IsNullOrWhiteSpace($card.Text)) {
+                    $answer = $card.Text
+                    $isFreeText = $true
+                    $stamp = $card.Stamp
+                }
+            }
         }
         else {
-            $rep = Get-HomeAssistantState -EntityId "text.${node}_reply" -Headers $Headers
-            $r = [string]$rep.state
-            # Whitespace is the blank sentinel the reply box is parked on, not an
-            # answer, so it must not be injected.
-            if (-not [string]::IsNullOrWhiteSpace($r) -and
-                $r -notin @('unknown', 'unavailable')) { $answer = $r }
+            $card = Read-DaemonDecisionCardText -SessionId $SessionId -Marker $Marker -Headers $Headers
+            if (-not [string]::IsNullOrWhiteSpace($card.Text)) {
+                $answer = $card.Text
+                $stamp = $card.Stamp
+            }
+            else {
+                $rep = Get-HomeAssistantState -EntityId "text.${node}_reply" -Headers $Headers
+                $r = [string]$rep.state
+                # Whitespace is the blank sentinel the reply box is parked on, not an
+                # answer, so it must not be injected.
+                if (-not [string]::IsNullOrWhiteSpace($r) -and
+                    $r -notin @('unknown', 'unavailable')) { $answer = $r }
+            }
         }
     }
     catch {
         return $null
     }
-    [pscustomobject]@{ Answer = $answer; Selections = $selections; IsChoice = $isChoice }
+    [pscustomobject]@{
+        Answer       = $answer
+        Selections   = $selections
+        IsChoice     = $isChoice
+        IsFreeText   = $isFreeText
+        PayloadStamp = $stamp
+    }
 }
 
 function Read-DaemonFormAnswer {
     <#
-        A multi-field form's answer, as { Answer, Selections }, once it has been
-        submitted with every field chosen; Answer is '' until then.
+        A multi-field form's answer, as { Answer, Selections, PayloadStamp,
+        IsFreeText }, once it has been submitted with every field chosen; Answer is ''
+        until then.
 
         One dropdown per field. Cancel still rides on the main selector, and the answer
         is only complete once every field has been chosen - a half-filled form must not
-        be injected.
+        be injected. PayloadStamp names the reply-card publish a free-text field was
+        taken from, so it can be marked used after delivery rather than before, and
+        IsFreeText says a lone choice was answered in words through the prompt's own
+        "Other (type your answer)" entry instead of by tapping an option.
     #>
     param(
         [Parameter(Mandatory)][string]$SessionId,
@@ -250,8 +373,14 @@ function Read-DaemonFormAnswer {
 
     $sel = Get-HomeAssistantState -EntityId "select.${node}_decision" -Headers $Headers
     if ([string]$sel.state -eq 'Cancel request') {
-        return [pscustomobject]@{ Answer = 'Cancel request'; Selections = @() }
+        return [pscustomobject]@{ Answer = 'Cancel request'; Selections = @(); PayloadStamp = ''; IsFreeText = $false }
     }
+
+    # Typed into the reply card since this question was armed, if anything was. It is
+    # both the free-text field's value and - because pressing Send is how a person
+    # says they are done - a submit in its own right.
+    $card = Read-DaemonDecisionCardText -SessionId $sessionId -Marker $marker -Headers $Headers
+    $takesText = @($markerFields | Where-Object { Test-DecisionFieldIsText -Field $_ }).Count -gt 0
 
     $picked = @()
     $missingChoice = $false
@@ -268,12 +397,15 @@ function Read-DaemonFormAnswer {
         # empty field the same way the terminal does - by committing it untouched.
         if (Test-DecisionFieldIsText -Field $markerField) {
             $v = ''
-            try {
-                $rep = Get-HomeAssistantState -EntityId "text.${node}_reply" -Headers $Headers
-                $v = [string]$rep.state
+            if (-not [string]::IsNullOrWhiteSpace($card.Text)) { $v = $card.Text }
+            else {
+                try {
+                    $rep = Get-HomeAssistantState -EntityId "text.${node}_reply" -Headers $Headers
+                    $v = [string]$rep.state
+                }
+                catch { }
+                if ([string]::IsNullOrWhiteSpace($v) -or $v -in @('unknown', 'unavailable')) { $v = '' }
             }
-            catch { }
-            if ([string]::IsNullOrWhiteSpace($v) -or $v -in @('unknown', 'unavailable')) { $v = '' }
             $picked += $v
             continue
         }
@@ -288,6 +420,27 @@ function Read-DaemonFormAnswer {
         $picked += $v
     }
     if ($missingChoice) { $picked = @() }
+
+    # A single choice answered in words rather than by tapping. Every Copilot option
+    # list ends in "Other (type your answer)", and that entry is the one place words
+    # can get into an arrow-key prompt - so this is a real answer, and pressing Send
+    # on the reply card is how it is committed.
+    #
+    # Not offered for a multi-select field: its "Other" row sits in a checkbox list,
+    # where Enter accepts whatever is ticked rather than opening a text box, and that
+    # has not been seen happen. Guessing would record an answer nobody gave.
+    if ($markerFields.Count -eq 1 -and -not $takesText -and $missingChoice -and
+        -not (Test-DecisionFieldIsMultiSelect -Field $markerFields[0]) -and
+        -not [string]::IsNullOrWhiteSpace($card.Text)) {
+        try {
+            Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Sending answer...' `
+                -Extra @{ answer = $card.Text } -Headers $Headers | Out-Null
+        }
+        catch { }
+        return [pscustomobject]@{
+            Answer = $card.Text; Selections = @(); PayloadStamp = $card.Stamp; IsFreeText = $true
+        }
+    }
 
     # Every field chosen is not enough: a multi-field answer is only sent when Submit
     # is pressed, so selections can be reviewed and changed first. An MQTT button's
@@ -327,7 +480,31 @@ function Read-DaemonFormAnswer {
         Write-DaemonLog -Message "submit pressed for $($sessionId.Substring(0,8)) with fields still unanswered"
     }
 
-    if ($pressIsNew -and $picked.Count -eq $markerFields.Count) {
+    # Words typed at a question that cannot take them - a form with no free-text
+    # field, or a single choice that has already been tapped. Said out loud once per
+    # publish rather than swallowed: silently dropping what somebody typed is the
+    # whole bug this work exists to fix, and it is no better when the words cannot
+    # be used.
+    if (-not [string]::IsNullOrWhiteSpace($card.Text) -and -not $takesText) {
+        $entry = $State[$sessionId]
+        $toldAt = if ($entry.PSObject.Properties['LastDecisionTextNoticeAt']) { [string]$entry.LastDecisionTextNoticeAt } else { '' }
+        if ($toldAt -ne $card.Stamp) {
+            if ($entry.PSObject.Properties['LastDecisionTextNoticeAt']) { $entry.LastDecisionTextNoticeAt = $card.Stamp }
+            else { $entry | Add-Member -NotePropertyName LastDecisionTextNoticeAt -NotePropertyValue $card.Stamp -Force }
+            try {
+                Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Not sent - this question takes options' `
+                    -Extra @{ typed = $card.Text } -Headers $Headers | Out-Null
+            }
+            catch { }
+            Write-DaemonLog -Message "reply card text for $($sessionId.Substring(0,8)) is not answerable by this question"
+        }
+    }
+
+    # Send on the reply card submits too, but only a complete form: an incomplete one
+    # already has its own "answer every field" report, and a payload stays fresh for
+    # as long as it sits there, so counting it would repeat that every reconcile.
+    $cardSubmits = ($takesText -and -not [string]::IsNullOrWhiteSpace($card.Stamp))
+    if (($pressIsNew -or $cardSubmits) -and $picked.Count -eq $markerFields.Count) {
         $submitted = $true
         if (-not [string]::IsNullOrWhiteSpace($pressedAt)) {
             # Consume the press so the same one cannot also be read as a Send for the
@@ -349,7 +526,10 @@ function Read-DaemonFormAnswer {
         $selections = @($picked)
         $answer = ($picked -join ' + ')
     }
-    [pscustomobject]@{ Answer = $answer; Selections = $selections }
+    # The stamp travels with the answer so the payload is marked as used only once it
+    # has actually reached the prompt; a failed injection must leave it to be retried.
+    $stamp = if ($submitted -and $cardSubmits) { [string]$card.Stamp } else { '' }
+    [pscustomobject]@{ Answer = $answer; Selections = $selections; PayloadStamp = $stamp; IsFreeText = $false }
 }
 
 function Get-DaemonAskUserState {
@@ -429,7 +609,13 @@ function Invoke-DaemonDecisionAnswer {
         [Parameter(Mandatory)][object]$Marker,
         [Parameter(Mandatory)][string]$Answer,
         [Parameter(Mandatory)][bool]$IsChoice,
+        [bool]$IsFreeText = $false,
         [AllowEmptyCollection()][string[]]$Selections = @(),
+
+        # The reply-card publish this answer was typed in, marked as used once it has
+        # landed so the reply path does not deliver the same words a second time.
+        [AllowEmptyString()][string]$PayloadStamp = '',
+        [AllowNull()][hashtable]$State = $null,
         [Parameter(Mandatory)][hashtable]$Headers
     )
 
@@ -439,7 +625,14 @@ function Invoke-DaemonDecisionAnswer {
     $processId = Get-DaemonSessionProcessId -SessionId $SessionId
     $deliveredSelections = @()
 
-    if ($IsChoice) {
+    if ($IsChoice -and $IsFreeText) {
+        # Typed, not chosen. The prompt's own "Other (type your answer)" entry is the
+        # only way words get into an arrow-key option list, and hunting for the text
+        # among the options would simply fail - it was never one of them.
+        $delivery = Send-CopilotSessionChoice -SessionId $SessionId -Text $Answer `
+            -ChoiceCount (@($Marker.choices).Count) -ProcessId $processId
+    }
+    elseif ($IsChoice) {
         # The native prompt is one arrow-key option list per field (tabbed when there
         # is more than one). Selecting by index returns the schema's real value for
         # each field, so prefer that; the per-field "Other (type your answer)" text
@@ -480,6 +673,14 @@ function Invoke-DaemonDecisionAnswer {
 
     if ($delivery.Delivered) {
         Set-CopilotDecisionMarkerInjected -SessionId $SessionId -Answer $Answer -Selections $deliveredSelections
+        # Mark the reply-card publish used only now. Recorded under the same name the
+        # reply path reads, so the words that answered a question are never delivered
+        # again as a fresh reply once the card clears.
+        if (-not [string]::IsNullOrWhiteSpace($PayloadStamp) -and $null -ne $State -and $State.ContainsKey($SessionId)) {
+            $entry = $State[$SessionId]
+            if ($entry.PSObject.Properties['LastReplyPayloadAt']) { $entry.LastReplyPayloadAt = $PayloadStamp }
+            else { $entry | Add-Member -NotePropertyName LastReplyPayloadAt -NotePropertyValue $PayloadStamp -Force }
+        }
         try {
             Invoke-HomeAssistantService -Domain 'text' -Service 'set_value' -Headers $Headers `
                 -Data @{ entity_id = "text.${node}_reply"; value = $script:DaemonConfig.ReplyBlankValue }

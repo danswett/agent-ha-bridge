@@ -698,17 +698,26 @@ function Invoke-WebRequest {
                            if ($MultiField) { $answer += ', "Region?"="East"' }
                            "Your questions have been answered: $answer."
                        }
+            # Where the answer sits is where Set-CopilotMqttDecision puts the controls:
+            # in the field slots for anything published with fields, which is every
+            # Copilot question and any multi-field Claude one, and on the main selector
+            # for a lone Claude question, whose parser publishes its options there and
+            # keeps the field only in the marker for the keystrokes.
+            $usesSlots = $MultiField -or ($Kind -eq 'copilot')
             $ha = @{
                 "select.$($topics.Node)_decision" = [pscustomobject]@{
-                    state = $(if ($MultiField) { 'Awaiting answer...' } else { $Selection })
-                    attributes = [pscustomobject]@{ question = $marker.question; options = @($marker.choices); decision_id = $marker.decisionId }
+                    state = $(if ($usesSlots) { 'Awaiting answer...' } else { $Selection })
+                    attributes = [pscustomobject]@{
+                        question = $marker.question; options = @($marker.choices)
+                        decision_id = $marker.decisionId; multi_field = $usesSlots
+                    }
                 }
                 "text.$($topics.Node)_reply" = [pscustomobject]@{ state = 'old reply' }
                 "button.$($topics.Node)_submit" = [pscustomobject]@{ state = ([DateTimeOffset]$marker.armedAt).AddSeconds(1).ToString('o') }
             }
             for ($index = 1; $index -le $script:CopilotMqttMaxFields; $index++) {
                 $ha[(Get-CopilotMqttFieldEntityId -Node $topics.Node -Index $index)] = [pscustomobject]@{
-                    state = $(if ($MultiField -and $index -eq 1) { $Selection } elseif ($MultiField -and $index -eq 2) { 'East' } else { 'Idle' })
+                    state = $(if ($usesSlots -and $index -eq 1) { $Selection } elseif ($MultiField -and $index -eq 2) { 'East' } else { 'Idle' })
                 }
             }
             $script:DeliveryFixture = [pscustomobject]@{
@@ -717,6 +726,7 @@ function Invoke-WebRequest {
                 State = @{ $sid = [pscustomobject]@{ Name = 'Synthetic'; Machine = 'TEST'; LastReply = 'old reply' } }
                 Ha = $ha; Inputs = [Collections.Generic.List[object]]::new(); Activity = [Collections.Generic.List[string]]::new()
                 ExpectedSelections = $(if ($MultiField) { @($Selection, 'East') } else { @($Selection) })
+                UsesSlots = $usesSlots
                 ResultKind = $ResultKind; Content = $content; ResultWritten = $false
                 FormDelivered = $true; FallbackDelivered = $false; UnexpectedInput = 0
                 DecisionReads = 0; TerminalOnRead = $false; CardClears = 0
@@ -745,7 +755,7 @@ function Invoke-WebRequest {
                     $read = Read-DaemonDecisionAnswer -SessionId $fixture.SessionId -Marker $marker -State $fixture.State -Headers @{}
                     Test-That "$label reads the ordinary dashboard selection without seeding the marker" {
                         $read.IsChoice -and $read.Answer -ceq ($fixture.ExpectedSelections -join ' + ') -and
-                            @($read.Selections).Count -eq $(if ($case.Multi) { 2 } else { 0 }) -and
+                            @($read.Selections).Count -eq $(if ($fixture.UsesSlots) { @($fixture.ExpectedSelections).Count } else { 0 }) -and
                             (-not $marker.PSObject.Properties['injectedSelections'] -or @($marker.injectedSelections).Count -eq 0)
                     }
                     Test-That "$label preserves the actual client hook identity" {
@@ -805,9 +815,16 @@ function Invoke-WebRequest {
                     Invoke-DeliveryPass
                     Invoke-DeliveryPass
                     Test-That "$kind terminal answer $timing prevents input and removes the pending marker" {
+                        # A form acknowledges the Send before it injects, and from the
+                        # moment a single choice became a field that is every question
+                        # - so the acknowledgement can land in the instant between the
+                        # card being read and the terminal answer arriving. What must
+                        # not happen is input, or a warning: nothing was delivered and
+                        # nothing differs.
                         $fixture.ResultWritten -and $fixture.Inputs.Count -eq 0 -and $fixture.UnexpectedInput -eq 0 -and
                             $null -eq (Get-CopilotDecisionMarker -SessionId $fixture.SessionId) -and
-                            $fixture.CardClears -eq 1 -and $fixture.Activity.Count -eq 0
+                            $fixture.CardClears -eq 1 -and
+                            @($fixture.Activity | Where-Object { $_ -notlike 'Sending answer*' }).Count -eq 0
                     }
                 }
                 foreach ($fallback in @($false, $true)) {
@@ -876,6 +893,9 @@ function Invoke-WebRequest {
                 Transcript = $transcript
                 CallId = $CallId
                 DecisionEntity = "select.${node}_decision"
+                # Where a published choice is actually answered: its field slot, which
+                # is what Set-CopilotMqttDecision puts every option list into now.
+                FieldEntity = "select.${node}_f1"
                 ReplyEntity = "text.${node}_reply"
                 Topics = $script:A23Topics
             }
@@ -1017,7 +1037,7 @@ function Invoke-WebRequest {
             (@($attributes.choices) -join '|') -ceq 'Yes|No' -and $attributes.mode -ceq 'multiple_choice'
         }
         Test-That 're-arming a placeholder does not inject an answer' { $script:A23Inputs.Count -eq 0 }
-        $script:A23Ha[$fixture.DecisionEntity].state = 'No'
+        $script:A23Ha[$fixture.FieldEntity].state = 'No'
         Invoke-PendingDecisions -Headers $headers -State $fixture.State -Live $script:DaemonLive
         Invoke-PendingDecisions -Headers $headers -State $fixture.State -Live $script:DaemonLive
         $delivered = Get-CopilotDecisionMarker -SessionId $fixture.SessionId
@@ -1054,7 +1074,7 @@ function Invoke-WebRequest {
             $null -ne (Get-CopilotDecisionMarker -SessionId $fixture.SessionId) -and $script:A23Inputs.Count -eq 0
         }
         Add-A23QuestionResult -Fixture $fixture -Content 'User responded: true'
-        $script:A23Ha[$fixture.DecisionEntity].state = 'No'
+        $script:A23Ha[$fixture.FieldEntity].state = 'No'
         Invoke-PendingDecisions -Headers $headers -State $fixture.State -Live $script:DaemonLive
         Test-That 'a completed terminal answer prevents a competing dashboard choice from being delivered' {
             $script:A23Inputs.Count -eq 0 -and $null -eq (Get-CopilotDecisionMarker -SessionId $fixture.SessionId) -and

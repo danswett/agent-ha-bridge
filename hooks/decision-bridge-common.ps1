@@ -1174,10 +1174,16 @@ function Test-DecisionFieldIsText {
     return (@($Field.Options).Count -eq 0)
 }
 
-# The most subset entries a multi-select field's dropdown may carry. Claude's schema
-# allows 2-4 options, which is 3, 7 or 15 subsets; anything beyond that is refused
-# rather than published as a dropdown nobody could scroll.
-$script:DecisionMultiSelectMaxChoices = 15
+# The most subset entries a multi-select field's slot may carry. Claude's schema
+# allows 2-4 options, which is 3, 7 or 15 subsets; Copilot's `type: array` fields are
+# written by whoever asks and routinely run to five or six, so 15 refused perfectly
+# ordinary questions outright. 63 is every subset of six options.
+#
+# The ceiling is not about what a person reads. From card 1.22.0 the card draws the
+# options themselves as checkboxes and only ever writes one of these labels back; the
+# full list is what the Home Assistant select must enumerate to hold the answer at
+# all, and what an older card still renders a row each for.
+$script:DecisionMultiSelectMaxChoices = 63
 $script:DecisionMultiSelectSeparator = ' + '
 
 function Test-DecisionFieldIsMultiSelect {
@@ -1193,6 +1199,70 @@ function Test-DecisionFieldIsMultiSelect {
     if ($null -eq $Field) { return $false }
     if (-not $Field.PSObject.Properties['MultiSelect']) { return $false }
     [bool]$Field.MultiSelect
+}
+
+function Get-DecisionMultiSelectStyle {
+    <#
+        How a client's own prompt takes several options at once: 'space-toggle' or
+        'numbered'.
+
+        These are two different prompts, not one with two spellings, which is exactly
+        what A19 refused to let the bridge assume. Copilot CLI draws a checkbox list -
+        the arrows move a cursor, Space checks the focused row, Enter accepts the lot,
+        and the hint line reads "space toggle". Claude Code numbers its rows, typing a
+        digit toggles that row wherever the cursor is, and a Submit row below the list
+        commits. A digit typed at Copilot's list does nothing; a Space pressed at
+        Claude's is a space.
+
+        A field records which prompt it came from. Anything that does not say is
+        Claude's, because its parser is the only thing that has ever set MultiSelect -
+        so a marker written before this existed keeps the behaviour it was written for.
+        An unrecognised style is refused rather than guessed at.
+    #>
+    param([AllowNull()][object]$Field)
+
+    if ($null -eq $Field -or -not $Field.PSObject.Properties['MultiSelectStyle']) { return 'numbered' }
+    $style = [string]$Field.MultiSelectStyle
+    if ([string]::IsNullOrWhiteSpace($style)) { return 'numbered' }
+    if ($style -cnotin @('numbered', 'space-toggle')) {
+        throw [IO.InvalidDataException]::new('A decision field records a multi-select style this bridge cannot drive.')
+    }
+    $style
+}
+
+function Get-DecisionMultiSelectChecked {
+    <#
+        The option positions already checked when a multi-select prompt appears, in
+        ascending order.
+
+        A schema default is not cosmetic here: Copilot shows those rows checked
+        before anything is typed, so toggling blindly turns an option the user wanted
+        off again. The native capture behind A19 is precisely this - with Beta already
+        selected, one Space on Alpha produced "Beta, Alpha" - and it is why the walk
+        below compares against this set rather than starting from nothing.
+
+        Returned bare, like every other list here, so `@(...)` at the call site reads
+        as a count of positions. Wrapped with a comma it arrives as one empty array
+        inside an array, and "nothing is checked" counts as one thing checked.
+    #>
+    param([AllowNull()][object]$Field)
+
+    if ($null -eq $Field -or -not $Field.PSObject.Properties['DefaultIndexes']) { return @() }
+    $count = @($Field.Options).Count
+    $seen = [Collections.Generic.SortedSet[int]]::new()
+    foreach ($entry in @($Field.DefaultIndexes)) {
+        if ($entry -isnot [int] -and $entry -isnot [long]) {
+            throw [IO.InvalidDataException]::new('A multi-select default position must be a whole number.')
+        }
+        $index = [int]$entry
+        if ($index -lt 0 -or $index -ge $count) {
+            throw [IO.InvalidDataException]::new('A multi-select default names a position outside its field.')
+        }
+        if (-not $seen.Add($index)) {
+            throw [IO.InvalidDataException]::new('A multi-select default names the same option twice.')
+        }
+    }
+    [int[]]@($seen)
 }
 
 function Get-DecisionMultiSelectChoices {
@@ -1296,7 +1366,16 @@ function Test-DecisionFieldsAnswerable {
     $list = @($Fields)
     if ($list.Count -eq 0 -or $list.Count -gt $MaxFields) { return $false }
     $textCount = @($list | Where-Object { Test-DecisionFieldIsText -Field $_ }).Count
-    ($textCount -le 1)
+    if ($textCount -gt 1) { return $false }
+    # A multi-select slot carries the combinations of its options, so a field with
+    # more options than that list can hold has no control on the card at all. Left
+    # unchecked it published a slot offering nothing but 'Choose...', which can never
+    # be answered and which the daemon waits on for ever.
+    foreach ($field in $list) {
+        if (-not (Test-DecisionFieldIsMultiSelect -Field $field)) { continue }
+        if (@(Get-DecisionMultiSelectChoices -Field $field).Count -eq 0) { return $false }
+    }
+    $true
 }
 
 function Get-DecisionSchemaFields {
@@ -1315,7 +1394,10 @@ function Get-DecisionSchemaFields {
         swallowed by the live prompt.
 
         Names, typed values, option identities and defaults survive the marker.
-        DefaultIndex is the initial scalar focus, not the dashboard placeholder.
+        DefaultIndex is the initial scalar focus, not the dashboard placeholder. A
+        `type: array` field is captured as multi-select, with the positions its default
+        already checks; its value list is what the answer is checked against, so an
+        array is never inferred back from the labels on screen.
     #>
     param(
         [AllowNull()][psobject]$Schema
@@ -1353,16 +1435,40 @@ function Get-DecisionSchemaFields {
             }
             $defaultIndex = $matches[0]
         }
+        # `type: array` is how an ask_user schema says "pick as many of these as you
+        # like", and the field slot that used to be published for it took exactly one.
+        # The default is a list of values, not a cursor position, because the prompt
+        # shows those rows already checked - see Get-DecisionMultiSelectChecked.
+        $defaultIndexes = [Collections.Generic.List[int]]::new()
+        if ($isArray -and $hasDefault -and $choices.Count -gt 0) {
+            foreach ($entry in @($default)) {
+                $key = ConvertTo-Json -InputObject $entry -Depth 32 -Compress
+                $hits = @(
+                    for ($index = 0; $index -lt $values.Count; $index++) {
+                        if ([StringComparer]::Ordinal.Equals($key, (ConvertTo-Json -InputObject $values[$index] -Depth 32 -Compress))) { $index }
+                    }
+                )
+                if ($hits.Count -ne 1 -or $defaultIndexes.Contains($hits[0])) {
+                    throw [IO.InvalidDataException]::new('Each multi-select decision default must identify exactly one distinct option.')
+                }
+                $defaultIndexes.Add($hits[0])
+            }
+        }
         $fields += [pscustomobject]@{
-            Name         = $name
-            Label        = $label
-            Options      = @($choices | ForEach-Object { [string]$_.Label })
-            Values       = $values
-            OptionIds    = @($choices | ForEach-Object { [string]$_.Id })
-            HasDefault   = $hasDefault
-            Default      = $default
-            DefaultIndex = $defaultIndex
-            IsText       = ($choices.Count -eq 0)
+            Name             = $name
+            Label            = $label
+            Options          = @($choices | ForEach-Object { [string]$_.Label })
+            Values           = $values
+            OptionIds        = @($choices | ForEach-Object { [string]$_.Id })
+            HasDefault       = $hasDefault
+            Default          = $default
+            DefaultIndex     = $defaultIndex
+            IsText           = ($choices.Count -eq 0)
+            MultiSelect      = ($isArray -and $choices.Count -gt 0)
+            # Named rather than inferred from the client, so the keystrokes a marker
+            # is answered with cannot drift from the prompt it was captured off.
+            MultiSelectStyle = $(if ($isArray -and $choices.Count -gt 0) { 'space-toggle' } else { '' })
+            DefaultIndexes   = @($defaultIndexes.ToArray())
         }
     }
     @($fields)
@@ -1498,6 +1604,20 @@ function Repair-DecisionToolArguments {
                     $schemaChoices | ForEach-Object { Repair-DecisionTextEncoding -Text $_ }
                 )
                 $fields = @(Get-DecisionSchemaFields -Schema $schema)
+                # A single multi-select field with more options than its slot can
+                # enumerate combinations for has no control on the card. Offering its
+                # options singly would be worse than offering nothing: one tap would
+                # answer a "pick as many as you like" question with exactly one.
+                if ($fields.Count -eq 1 -and -not (Test-DecisionFieldsAnswerable -Fields $fields)) {
+                    $outline = Format-DecisionSchemaOutline -Schema $schema
+                    if ([string]::IsNullOrWhiteSpace($outline)) {
+                        $outline = "Options:`n" + ((@($fields[0].Options) | ForEach-Object { "   - $_" }) -join "`n")
+                    }
+                    $question = "$question`n`n$outline"
+                    $choices = @()
+                    $fields = @()
+                    $terminalOnly = $true
+                }
             }
             else {
                 # A multi-field form is published as one dropdown per field, so the

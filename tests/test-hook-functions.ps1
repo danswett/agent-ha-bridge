@@ -128,7 +128,8 @@ $wideAsk = [pscustomobject]@{
     tool_input = [pscustomobject]@{ questions = @(
         [pscustomobject]@{ question = 'Which?'; header = 'Many'; multiSelect = $true; options = @(
             [pscustomobject]@{ label = 'A' }, [pscustomobject]@{ label = 'B' }, [pscustomobject]@{ label = 'C' },
-            [pscustomobject]@{ label = 'D' }, [pscustomobject]@{ label = 'E' }) }
+            [pscustomobject]@{ label = 'D' }, [pscustomobject]@{ label = 'E' }, [pscustomobject]@{ label = 'F' },
+            [pscustomobject]@{ label = 'G' }) }
     ) }
 }
 $null = Invoke-ClaudeAskHook -HookEvent $wideAsk -Ancestors @(30)
