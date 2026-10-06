@@ -150,6 +150,13 @@ $null = Invoke-ClaudeAskHook -HookEvent $soloAsk -Ancestors @(30)
 Test-That 'a lone multi-select question offers combinations on the main selector' {
     ($script:Published[-1].Choices -join ' / ') -eq 'Auth / Billing / Auth + Billing'
 } ($script:Published[-1].Choices -join ' / ')
+# Written out, never as positions. Copilot's cards carry a set as '#1,3' because they
+# draw their own checkboxes and only use the slot to hold the answer; here the
+# combinations are the rows somebody reads and chooses between, so a position would be
+# a row of gibberish. The two clients are separate contracts and must stay so.
+Test-That 'and never as the positions the Copilot slot carries' {
+    @($script:Published[-1].Choices | Where-Object { $_ -match '^#' }).Count -eq 0
+} ($script:Published[-1].Choices -join ' / ')
 Test-That 'and is not sent to the terminal' { -not $script:Markers[-1].TerminalOnly }
 
 $script:Markers = @(); $script:Published = @(); $script:Notified = @()

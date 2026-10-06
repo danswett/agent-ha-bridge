@@ -81,7 +81,9 @@ $headers = @{ Authorization = '******' }
 $script:HaStates = @{}
 function Get-HomeAssistantState {
     param([string]$EntityId, [hashtable]$Headers)
-    if (-not $script:HaStates.Contains($EntityId)) { throw "no such entity: $EntityId" }
+    # Shaped like Home Assistant's own refusal: it answers 404 for an entity it does
+    # not have, and the bridge tells that apart from being unable to read at all.
+    if (-not $script:HaStates.Contains($EntityId)) { throw "404 Not Found: no such entity: $EntityId" }
     $entry = $script:HaStates[$EntityId]
     # An object, not the dictionary it is stored in: Home Assistant's own JSON parses
     # to one, and the daemon reads attributes the way it reads every other entity's.
@@ -126,6 +128,27 @@ $fields = @(
     [pscustomobject]@{ Label = 'When';     Options = @('Now', 'After the release');                     IsText = $false }
     [pscustomobject]@{ Label = 'Notes';    Options = @();                                               IsText = $true }
 )
+
+# The baseline is what the answer channels already held when a question was armed;
+# everything after it is "has this changed". It is a write-once file per question, so
+# a scenario that needs the card to have been holding something states it here rather
+# than putting fields on the marker, which nothing reads any more.
+function Set-Baseline {
+    param(
+        [Parameter(Mandatory)][string]$DecisionId,
+        [ValidateSet('present', 'absent', 'unknown')][string]$PayloadState = 'absent',
+        [AllowEmptyString()][string]$PayloadValue = '',
+        [ValidateSet('present', 'absent', 'unknown')][string]$SubmitState = 'absent',
+        [AllowEmptyString()][string]$SubmitValue = ''
+    )
+    $path = Get-CopilotDecisionBaselinePath -SessionId $script:sessionId -DecisionId $DecisionId
+    if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+    $ok = Set-CopilotDecisionMarkerBaseline -SessionId $script:sessionId -DecisionId $DecisionId `
+        -PayloadState $PayloadState -PayloadValue $PayloadValue `
+        -SubmitState $SubmitState -SubmitValue $SubmitValue
+    if (-not $ok) { throw "could not seed a baseline for $DecisionId" }
+}
+
 $armedAt = [DateTimeOffset]::Now.AddSeconds(-5)
 Set-CopilotMqttDecision -SessionId $sessionId -SessionName 'Copilot: a task' -Machine 'BOX' `
     -Question 'How should this land?' -Choices @() -Fields $fields `
@@ -208,6 +231,116 @@ Test-That 'and keeps the entity pair for whenever a question is armed' {
     @($oldCard.cards | Where-Object { $_.type -eq 'conditional' -and "$($_.card.type)" -eq 'custom:layout-card' }).Count -eq 1
 } "types=[$(@($oldCard.cards | ForEach-Object { if ($_.type -eq 'conditional') { "conditional($($_.card.type))" } else { $_.type } }) -join '|')]"
 
+# --- 2b. the line beside Send, on the dashboard the bridge really generates --------
+
+Write-Host ''
+Write-Host '--- and the line beside Send says what actually happened ---'
+# The footer is a conditional card: it appears only while the activity sensor is
+# reporting on something just done, and the state has to be in its list by exact
+# string or the row renders as nothing at all. Every refusal the daemon can emit is
+# checked against the generated dashboard rather than against a copy written here,
+# because a string that matches all but exactly fails silently.
+function Get-SendFooter {
+    param([Parameter(Mandatory)]$SessionCard)
+    # Found by what makes it the send footer - a conditional markdown card keyed on
+    # the activity sensor - rather than by anything it says. Looking for one of the
+    # strings under test would make the search pass and fail with the fix, so a
+    # regression would read as "the footer is missing" instead of as itself.
+    $found = @($SessionCard.cards | Where-Object {
+        $_.type -eq 'conditional' -and "$($_.card.type)" -eq 'markdown' -and
+        @($_.conditions | Where-Object {
+            "$($_.entity)" -like '*_activity' -and @($_.state) -contains 'Sending...'
+        }).Count -eq 1
+    })
+    if ($found.Count -eq 0) { return $null }
+    $found[0]
+}
+
+# What the daemon actually publishes, taken from its own call sites rather than
+# retyped: a notice that is not in the list is a notice nobody sees.
+$daemonSource = Get-Content (Join-Path $PSScriptRoot '..\hooks\daemon-decisions.ps1') -Raw
+$emitted = @([regex]::Matches($daemonSource, "-Summary\s+'([^']+)'") |
+    ForEach-Object { $_.Groups[1].Value } | Sort-Object -Unique)
+Test-That 'the daemon really does emit the refusals this checks for' {
+    @('Not sent - answer every field', 'Not sent - this question takes options',
+      'Not sent - no Send button on this session') |
+        ForEach-Object { $emitted -contains $_ } | Where-Object { -not $_ } | Measure-Object |
+        ForEach-Object { $_.Count -eq 0 }
+} "emitted=[$($emitted -join '|')]"
+
+# The refusals and the two verification warnings must be drawn as warnings; a
+# refusal with a success tick is the card saying an answer was sent at the moment it
+# is refusing to send it, which is worse than saying nothing.
+$warnStates = @(
+    'Not sent - answer every field'
+    'Not sent - this question takes options'
+    'Not sent - no Send button on this session'
+    'Answer differs - check the terminal'
+    'Answer unconfirmed - check the terminal'
+    'Answer NOT sent'
+    'Reply NOT sent'
+)
+$successStates = @('Answer sent', 'Reply sent')
+$progressStates = @('Sending...', 'Sending answer...')
+
+# Jinja as Home Assistant evaluates it: the glyph is picked by a chain of tests on
+# the state string, so the classification is checked by running that chain rather
+# than by looking for the strings in it.
+function Get-FooterGlyph {
+    param([Parameter(Mandatory)][string]$Content, [Parameter(Mandatory)][AllowEmptyString()][string]$State)
+    # @() first: one matching line comes back as a bare string, and indexing [0] into
+    # a string hands back its first character - which then parses as nothing at all.
+    $body = @($Content -split "`n" | Where-Object { $_ -match '\{%\s*if' })[0]
+    if ($null -eq $body) { return '<no branch>' }
+    $branch = [regex]::Match($body, '\{%\s*if\s+(?<if>.*?)\s*%\}(?<a>[^{]*)\{%\s*elif\s+(?<elif>.*?)\s*%\}(?<b>[^{]*)\{%\s*else\s*%\}(?<c>[^{]*)\{%\s*endif\s*%\}')
+    if (-not $branch.Success) { return '<unparsed>' }
+    function Test-JinjaExpression {
+        param([string]$Expression, [string]$Value)
+        foreach ($term in ($Expression -split '\s+or\s+')) {
+            $t = $term.Trim()
+            if ($t -match "^a\s*==\s*'(?<v>.*)'$") { if ($Value -ceq $Matches['v']) { return $true }; continue }
+            if ($t -match "^a\.startswith\('(?<v>.*)'\)$") { if ($Value.StartsWith($Matches['v'], [StringComparison]::Ordinal)) { return $true }; continue }
+            if ($t -match "^'(?<v>.*)'\s+in\s+a$") { if ($Value.Contains($Matches['v'])) { return $true }; continue }
+            throw "unhandled footer condition: $t"
+        }
+        $false
+    }
+    if (Test-JinjaExpression -Expression $branch.Groups['if'].Value -Value $State) { return $branch.Groups['a'].Value.Trim() }
+    if (Test-JinjaExpression -Expression $branch.Groups['elif'].Value -Value $State) { return $branch.Groups['b'].Value.Trim() }
+    $branch.Groups['c'].Value.Trim()
+}
+
+foreach ($shape in @(
+    @{ Label = 'the current card'; Card = $sessionCard }
+    @{ Label = 'an older card';    Card = $oldCard }
+)) {
+    $footer = Get-SendFooter -SessionCard $shape.Card
+    Test-That "$($shape.Label) still gets the line beside Send" { $null -ne $footer }
+    if ($null -eq $footer) { continue }
+    $allowed = @($footer.conditions[0].state | ForEach-Object { [string]$_ })
+    $content = [string]$footer.card.content
+
+    $unlisted = @(@($warnStates + $successStates + $progressStates) | Where-Object { $allowed -notcontains $_ })
+    Test-That "$($shape.Label) lists every outcome, so none of them renders as an empty row" {
+        $unlisted.Count -eq 0
+    } "missing=[$($unlisted -join '|')]"
+
+    $mislabelled = @($warnStates | Where-Object { (Get-FooterGlyph -Content $content -State $_) -ne ([char]0x26A0 + [string][char]0xFE0F) })
+    Test-That "$($shape.Label) draws a refusal as a warning, never with a success tick" {
+        $mislabelled.Count -eq 0
+    } "mislabelled=[$(@($warnStates | ForEach-Object { "$_=>$(Get-FooterGlyph -Content $content -State $_)" }) -join '|')]"
+
+    Test-That "$($shape.Label) still ticks what really was sent" {
+        @($successStates | Where-Object { (Get-FooterGlyph -Content $content -State $_) -ne [string][char]0x2705 }).Count -eq 0
+    } "glyphs=[$(@($successStates | ForEach-Object { "$_=>$(Get-FooterGlyph -Content $content -State $_)" }) -join '|')]"
+    Test-That "$($shape.Label) still shows work in progress as waiting" {
+        @($progressStates | Where-Object { (Get-FooterGlyph -Content $content -State $_) -ne [string][char]0x23F3 }).Count -eq 0
+    } "glyphs=[$(@($progressStates | ForEach-Object { "$_=>$(Get-FooterGlyph -Content $content -State $_)" }) -join '|')]"
+    Test-That "$($shape.Label) draws ending the session as waiting, not as sent" {
+        (Get-FooterGlyph -Content $content -State 'Ending session...') -eq [string][char]0x23F3
+    } "glyph=[$(Get-FooterGlyph -Content $content -State 'Ending session...')]"
+}
+
 # Back to the version under test for everything below.
 Set-TestPublicationCardUrl -Url "/local/agent-bridge-reply-card.js?v=$cardVersion"
 Save-CopilotSessionDashboard `
@@ -227,7 +360,10 @@ if (-not $node_exe) {
 
 function Invoke-ChoicesCard {
     <# The rows the real card draws, and the service calls the given taps produce. #>
-    param([Parameter(Mandatory)][string[]]$Taps)
+    # Allowed to be empty: what the card draws before anything is tapped is itself
+    # worth asserting, and a question that arrives with rows already ticked has
+    # nothing to tap at all.
+    param([Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Taps)
     $config = @{ decision = [string]$cardConfig.decision; fields = @(@($cardConfig.fields) | ForEach-Object { [string]$_ }) }
     # Forwarded rather than written out: Send answer only exists because the view
     # hands the card a submit entity, and a view that stopped doing so has to fail
@@ -289,10 +425,6 @@ $marker = [pscustomobject]@{
     mode            = 'multiple_choice'
     armedAt         = $armedAt.ToString('o')
     fields          = $fields
-    # What the card already held when the question arrived. An answer is anything
-    # that has changed since, never anything that merely looks newer.
-    payloadBaseline = ''
-    submitBaseline  = ''
 }
 $state = @{ $sessionId = [pscustomobject]@{ Name = 'Copilot: a task'; Machine = 'BOX'; LastSubmitAt = '' } }
 $answer = Read-DaemonFormAnswer -SessionId $sessionId -Marker $marker -State $state -Headers $headers
@@ -358,8 +490,8 @@ Test-That 'and the card offers Send answer, because nothing sends itself now' {
 foreach ($call in @($single.calls)) { $script:HaStates[[string]$call.data.entity_id].state = [string]$call.data.option }
 $script:HaStates["text.${node}_reply"] = [ordered]@{ state = ' '; attributes = @{} }
 $script:HaStates["button.${node}_submit"] = [ordered]@{ state = $armedOne.ToString('o'); attributes = @{} }
-$oneMarker = [pscustomobject]@{ decisionId = 'd2'; mode = 'multiple_choice'; armedAt = $armedOne.ToString('o'); fields = $oneField
-    payloadBaseline = ''; submitBaseline = $armedOne.ToString('o') }
+$oneMarker = [pscustomobject]@{ decisionId = 'd2'; mode = 'multiple_choice'; armedAt = $armedOne.ToString('o'); fields = $oneField }
+Set-Baseline -DecisionId 'd2' -SubmitState 'present' -SubmitValue $armedOne.ToString('o')
 $oneState = @{ $sessionId = [pscustomobject]@{ Name = 'Copilot: a task'; Machine = 'BOX'; LastSubmitAt = '' } }
 
 Test-That 'a chosen option on its own is not an answer yet' {
@@ -395,9 +527,17 @@ Set-CopilotMqttDecision -SessionId $sessionId -SessionName 'Copilot: a task' -Ma
     -DecisionId 'd3' -Headers $headers | Out-Null
 
 Test-That 'the slot enumerates every combination, because a select holds one value' {
-    (@($script:HaStates["select.${node}_f1"].attributes.options) -join ',') -eq
-        'Choose...,Auth,Billing,Search,Auth + Billing,Auth + Search,Billing + Search,Auth + Billing + Search'
+    $offered = @($script:HaStates["select.${node}_f1"].attributes.options)
+    # Both carriers: the options written out for any card up to 1.22.0, then the same
+    # subsets as positions for 1.23.0 and later, which is what lets a question whose
+    # options are ordinary sentences be answered here at all.
+    ($offered -join ',') -eq
+        ('Choose...,Auth,Billing,Search,Auth + Billing,Auth + Search,Billing + Search,Auth + Billing + Search,' +
+         '#1,#2,#3,#1,2,#1,3,#2,3,#1,2,3')
 } "f1=[$(@($script:HaStates["select.${node}_f1"].attributes.options) -join ',')]"
+Test-That 'and the card is told the slot will take positions' {
+    $script:HaStates["select.${node}_decision"].attributes['field_1_codes'] -eq $true
+} "attrs=[$(@($script:HaStates["select.${node}_decision"].attributes.Keys) -join ',')]"
 Test-That 'and the options themselves ride on the attributes for the card to draw' {
     $a = $script:HaStates["select.${node}_decision"].attributes
     $a['field_1_multi'] -and (@($a['field_1_options']) -join ',') -eq 'Auth,Billing,Search' -and
@@ -413,7 +553,7 @@ Test-That 'and says on the heading that more than one may be ticked' {
     @($multi.rows | Where-Object { @($_.classes) -contains 'label' } | ForEach-Object { $_.text }) -contains 'Features (pick any)'
 } "labels=[$(@($multi.rows | Where-Object { @($_.classes) -contains 'label' } | ForEach-Object { $_.text }) -join '|')]"
 Test-That 'two taps leave the slot holding both, not just the last one' {
-    [string]@($multi.calls)[-1].data.option -eq 'Auth + Search'
+    [string]@($multi.calls)[-1].data.option -eq '#1,3'
 } "calls=[$(@($multi.calls) | ForEach-Object { "$($_.data.entity_id)=$($_.data.option)" })]"
 Test-That 'and both rows stay ticked while the choice is still being made' {
     (@($multi.rows | Where-Object { @($_.classes) -contains 'chosen' } | ForEach-Object { $_.text }) -join '|') -eq 'Auth|Search'
@@ -422,14 +562,14 @@ Test-That 'and both rows stay ticked while the choice is still being made' {
 foreach ($call in @($multi.calls)) { $script:HaStates[[string]$call.data.entity_id].state = [string]$call.data.option }
 $untick = Invoke-ChoicesCard -Taps @('Auth')
 Test-That 'tapping a ticked option unticks it rather than sending it' {
-    [string]@($untick.calls)[-1].data.option -eq 'Search'
+    [string]@($untick.calls)[-1].data.option -eq '#3'
 } "calls=[$(@($untick.calls) | ForEach-Object { "$($_.data.entity_id)=$($_.data.option)" })]"
-$script:HaStates["select.${node}_f1"].state = 'Auth + Search'
+$script:HaStates["select.${node}_f1"].state = '#1,3'
 
 $script:HaStates["text.${node}_reply"] = [ordered]@{ state = ' '; attributes = @{} }
 $script:HaStates["button.${node}_submit"] = [ordered]@{ state = [DateTimeOffset]::Now.ToString('o'); attributes = @{} }
-$multiMarker = [pscustomobject]@{ decisionId = 'd3'; mode = 'multiple_choice'; armedAt = $armedMulti.ToString('o'); fields = $multiField
-    payloadBaseline = ''; submitBaseline = '' }
+$multiMarker = [pscustomobject]@{ decisionId = 'd3'; mode = 'multiple_choice'; armedAt = $armedMulti.ToString('o'); fields = $multiField }
+Set-Baseline -DecisionId 'd3'
 $multiState = @{ $sessionId = [pscustomobject]@{ Name = 'Copilot: a task'; Machine = 'BOX'; LastSubmitAt = '' } }
 $multiAnswer = Read-DaemonDecisionAnswer -SessionId $sessionId -Marker $multiMarker -State $multiState -Headers $headers
 
@@ -441,6 +581,135 @@ Test-That 'and the keystrokes tick exactly those two rows, with no walk to a Sub
     @(Get-BridgeFormPayloads -Fields $multiField -Selections @($multiAnswer.Selections))[0].Payload -eq
         (' ' + ($esc + '[B') + ($esc + '[B') + ' ')
 } ((@(Get-BridgeFormPayloads -Fields $multiField -Selections @($multiAnswer.Selections))[0].Payload) -replace [regex]::Escape([string][char]27), '<esc>')
+
+# --- 6b. a question whose schema already has rows ticked ------------------------
+
+Write-Host ''
+Write-Host '--- a question that arrives with options already chosen ---'
+# The native prompt shows a schema default already checked, and the card used to
+# start empty regardless - a state the session was not in, and one that could only
+# be got back to by ticking the whole set again by hand.
+$script:HaStates = @{}
+$defaultedField = @([pscustomobject]@{
+    Label = 'Features'; Options = @('Auth', 'Billing', 'Search'); IsText = $false
+    MultiSelect = $true; MultiSelectStyle = 'space-toggle'; DefaultIndexes = @(0, 2)
+})
+Set-CopilotMqttDecision -SessionId $sessionId -SessionName 'Copilot: a task' -Machine 'BOX' `
+    -Question 'Which features?' -Choices @('Auth', 'Billing', 'Search') -Fields $defaultedField `
+    -DecisionId 'd3b' -Headers $headers | Out-Null
+
+Test-That 'the slot starts on exactly the set the terminal already has ticked' {
+    [string]$script:HaStates["select.${node}_f1"].state -eq '#1,3'
+} "state=[$($script:HaStates["select.${node}_f1"].state)]"
+$defaulted = Invoke-ChoicesCard -Taps @()
+Test-That 'so the card shows those rows ticked, rather than an empty list' {
+    (@($defaulted.rows | Where-Object { @($_.classes) -contains 'chosen' } | ForEach-Object { $_.text }) -join '|') -eq 'Auth|Search'
+} "chosen=[$(@($defaulted.rows | Where-Object { @($_.classes) -contains 'chosen' } | ForEach-Object { $_.text }) -join '|')]"
+Test-That 'and it still takes an explicit Send, exactly like every other question' {
+    @($defaulted.calls).Count -eq 0 -and @($defaulted.rows | Where-Object { $_.text -eq 'Send answer' }).Count -eq 1
+} "calls=[$(@($defaulted.calls).Count)] rows=[$(@($defaulted.rows | ForEach-Object { $_.text }) -join '|')]"
+
+# Accepting the defaults unchanged has to reach the terminal as no keystrokes at
+# all: those rows are already ticked there, and toggling them would turn them off.
+$script:HaStates["text.${node}_reply"] = [ordered]@{ state = ' '; attributes = @{} }
+$script:HaStates["button.${node}_submit"] = [ordered]@{ state = [DateTimeOffset]::Now.ToString('o'); attributes = @{} }
+$defaultedMarker = [pscustomobject]@{ decisionId = 'd3b'; mode = 'multiple_choice'; armedAt = $armedMulti.ToString('o'); fields = $defaultedField }
+Set-Baseline -DecisionId 'd3b'
+$defaultedState = @{ $sessionId = [pscustomobject]@{ Name = 'Copilot: a task'; Machine = 'BOX'; LastSubmitAt = '' } }
+$defaultedAnswer = Read-DaemonDecisionAnswer -SessionId $sessionId -Marker $defaultedMarker -State $defaultedState -Headers $headers
+Test-That 'the daemon reads the default set as the answer once Send is pressed' {
+    (@($defaultedAnswer.Selections) -join '|') -eq 'Auth + Search'
+} "selections=[$(@($defaultedAnswer.Selections) -join '|')]"
+Test-That 'and sending it untouched types nothing, because the rows are already ticked' {
+    @(Get-BridgeFormPayloads -Fields $defaultedField -Selections @($defaultedAnswer.Selections))[0].Payload -eq ''
+} ((@(Get-BridgeFormPayloads -Fields $defaultedField -Selections @($defaultedAnswer.Selections))[0].Payload) -replace [regex]::Escape([string][char]27), '<esc>')
+
+# A field whose combinations were too many to offer has none to start on, so it has
+# to stay on the placeholder rather than hold a value its dropdown never carried.
+$script:HaStates = @{}
+$hugeField = @([pscustomobject]@{
+    Label = 'Features'; Options = @(1..8 | ForEach-Object { "Option $_" }); IsText = $false
+    MultiSelect = $true; MultiSelectStyle = 'space-toggle'; DefaultIndexes = @(0, 1)
+})
+Set-CopilotMqttDecision -SessionId $sessionId -SessionName 'Copilot: a task' -Machine 'BOX' `
+    -Question 'Which features?' -Choices @() -Fields $hugeField `
+    -DecisionId 'd3c' -Headers $headers | Out-Null
+Test-That 'a field with too many combinations to list starts on the placeholder, not on a value it never offered' {
+    $state = [string]$script:HaStates["select.${node}_f1"].state
+    $state -eq 'Choose...' -or @($script:HaStates["select.${node}_f1"].attributes.options) -contains $state
+} "state=[$($script:HaStates["select.${node}_f1"].state)] options=$(@($script:HaStates["select.${node}_f1"].attributes.options).Count)"
+
+# --- 6c. the question that actually failed on the dashboard ---------------------
+
+Write-Host ''
+Write-Host '--- six ordinarily-worded options, the whole way through ---'
+# 2026-10-05: six plainly-worded follow-ups, nothing unusual about any of them. The
+# slot had to hold the answer as those options written out and joined, which came to
+# 350 characters against a 255-character select entry, so the bridge offered nothing
+# and the dashboard said to answer in the terminal. This follows the same question
+# from publish to keystrokes.
+$script:HaStates = @{}
+$realOptions = @(
+    'Restore this VM to release 1.32.2 now',
+    'Leave the branch installed so I can keep testing',
+    'Investigate why the dashboard stopped re-rendering at 19:30',
+    'Fix the Scout headless copilot.exe being counted as a CLI session',
+    'Commit the correction work and report to the coordinator',
+    'Raise the diverged release line (v1.32.2 vs main) with the coordinator')
+$realField = @([pscustomobject]@{
+    Label = 'Follow-ups'; Options = $realOptions; IsText = $false
+    MultiSelect = $true; MultiSelectStyle = 'space-toggle'; DefaultIndexes = @()
+})
+$armedReal = [DateTimeOffset]::Now.AddSeconds(-5)
+Set-CopilotMqttDecision -SessionId $sessionId -SessionName 'Copilot: a task' -Machine 'BOX' `
+    -Question 'Which follow-ups do you want?' -Choices @() -Fields $realField `
+    -DecisionId 'd6' -Headers $headers | Out-Null
+
+Test-That 'the question is published as a field rather than refused' {
+    $offered = @($script:HaStates["select.${node}_f1"].attributes.options)
+    $offered.Count -eq 64 -and $offered[0] -ceq 'Choose...'
+} "offered=$(@($script:HaStates["select.${node}_f1"].attributes.options).Count)"
+Test-That 'and every entry stays short, however long the options were written' {
+    $offered = @($script:HaStates["select.${node}_f1"].attributes.options)
+    ($offered | Measure-Object -Property Length -Maximum).Maximum -le 32
+} "longest=$((@($script:HaStates["select.${node}_f1"].attributes.options) | Measure-Object -Property Length -Maximum).Maximum) joined=$(($realOptions -join ' + ').Length)"
+
+$realCard = Invoke-ChoicesCard -Taps @($realOptions[0], $realOptions[2], $realOptions[5])
+Test-That 'the card draws the options themselves, in full, not the combinations' {
+    (@($realCard.rows | Where-Object { $_.tag -eq 'BUTTON' } | ForEach-Object { $_.text }) -join '|') -eq
+        (($realOptions -join '|') + '|Send answer|Cancel request')
+} "rows=[$(@($realCard.rows | ForEach-Object { $_.text }) -join '|')]"
+Test-That 'three ticks leave the slot holding all three, as positions' {
+    [string]@($realCard.calls)[-1].data.option -eq '#1,3,6'
+} "calls=[$(@($realCard.calls) | ForEach-Object { $_.data.option })]"
+Test-That 'and all three stay ticked while the choice is still being made' {
+    (@($realCard.rows | Where-Object { @($_.classes) -contains 'chosen' } | ForEach-Object { $_.text }) -join '|') -eq
+        (@($realOptions[0], $realOptions[2], $realOptions[5]) -join '|')
+} "chosen=[$(@($realCard.rows | Where-Object { @($_.classes) -contains 'chosen' } | ForEach-Object { $_.text }) -join '|')]"
+
+foreach ($call in @($realCard.calls)) { $script:HaStates[[string]$call.data.entity_id].state = [string]$call.data.option }
+$script:HaStates["text.${node}_reply"] = [ordered]@{ state = ' '; attributes = @{} }
+$script:HaStates["button.${node}_submit"] = [ordered]@{ state = [DateTimeOffset]::Now.ToString('o'); attributes = @{} }
+$realMarker = [pscustomobject]@{ decisionId = 'd6'; mode = 'multiple_choice'; armedAt = $armedReal.ToString('o'); fields = $realField }
+Set-Baseline -DecisionId 'd6'
+$realState = @{ $sessionId = [pscustomobject]@{ Name = 'Copilot: a task'; Machine = 'BOX'; LastSubmitAt = '' } }
+$realAnswer = Read-DaemonDecisionAnswer -SessionId $sessionId -Marker $realMarker -State $realState -Headers $headers
+
+Test-That 'the daemon reads it back as the options themselves, not as positions' {
+    $realAnswer.Answer -ceq (@($realOptions[0], $realOptions[2], $realOptions[5]) -join ' + ')
+} "answer=[$($realAnswer.Answer)]"
+Test-That 'and the keystrokes tick exactly those three rows' {
+    $esc = [string][char]27
+    @(Get-BridgeFormPayloads -Fields $realField -Selections @($realAnswer.Selections))[0].Payload -eq
+        (' ' + ($esc + '[B') + ($esc + '[B') + ' ' + ($esc + '[B') + ($esc + '[B') + ($esc + '[B') + ' ')
+} ((@(Get-BridgeFormPayloads -Fields $realField -Selections @($realAnswer.Selections))[0].Payload) -replace [regex]::Escape([string][char]27), '<esc>')
+
+# A slot holding something that decodes to nothing is not an answer. Reading it as one
+# would send a set nobody picked.
+$script:HaStates["select.${node}_f1"].state = '#9,99'
+Test-That 'a slot holding positions this field does not have is read as unanswered' {
+    [string]::IsNullOrWhiteSpace((Read-DaemonDecisionAnswer -SessionId $sessionId -Marker $realMarker -State $realState -Headers $headers).Answer)
+}
 
 # --- 7. the words typed at a choice question ------------------------------------
 
@@ -461,8 +730,9 @@ $script:HaStates["sensor.${node}_reply_payload"] = [ordered]@{
     # and the daemon reads it the way it reads every other entity's attributes.
     attributes = [pscustomobject]@{ text = 'DuckDB, actually'; images = @(); files = @() }
 }
-$textMarker = [pscustomobject]@{ decisionId = 'd4'; mode = 'multiple_choice'; armedAt = $armedText.ToString('o'); fields = $oneField
-    payloadBaseline = 'what-the-card-held-when-this-was-armed'; submitBaseline = $armedText.ToString('o') }
+$textMarker = [pscustomobject]@{ decisionId = 'd4'; mode = 'multiple_choice'; armedAt = $armedText.ToString('o'); fields = $oneField }
+Set-Baseline -DecisionId 'd4' -PayloadState 'present' -PayloadValue 'what-the-card-held-when-this-was-armed' `
+    -SubmitState 'present' -SubmitValue $armedText.ToString('o')
 $textState = @{ $sessionId = [pscustomobject]@{ Name = 'Copilot: a task'; Machine = 'BOX'; LastSubmitAt = '' } }
 $typed = Read-DaemonDecisionAnswer -SessionId $sessionId -Marker $textMarker -State $textState -Headers $headers
 

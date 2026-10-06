@@ -2418,7 +2418,15 @@ ha-card {
             'Answer sent', 'Answer NOT sent'
             'Not sent - answer every field'
             'Not sent - this question takes options'
+            'Not sent - no Send button on this session'
             'Answer may be wrong - check the terminal'
+            # The two the completion check emits. They were produced and never listed,
+            # so the one line that sits beside Send - the line still on screen once a
+            # long response has scrolled the header away - stayed empty for exactly the
+            # two outcomes worth reading. The header did show them, so this was never
+            # wholly silent, but the actionable place was.
+            'Answer differs - check the terminal'
+            'Answer unconfirmed - check the terminal'
             'Ending session...', 'Could not end session'
             # End session asking for its second press, and giving up on one. Taken from
             # the constants the daemon publishes rather than written out again here: a
@@ -2433,9 +2441,15 @@ ha-card {
             card = @{
                 type = 'markdown'
                 card_mod = @{ style = $bareChild }
+                # The glyph is chosen from the state, and it used to be chosen badly:
+                # it looked for an uppercase NOT and then for a lowercase 'sent', so
+                # every "Not sent - ..." refusal matched the second test and was drawn
+                # with a success tick. The card said a thing had been sent, in green,
+                # at the moment it was refusing to send it. Refusals are matched on
+                # their actual prefix now, and the two verification warnings by name.
                 content = @"
 {% set a = states('$activityEntity') %}{% set d = state_attr('$activityEntity','error') %}{% set h = state_attr('$activityEntity','hint') %}{% set w = state_attr('$activityEntity','waiting_on') %}
-<span style="font-size:0.9em">{% if a == '$($script:CopilotEndSessionConfirmNote)' or 'NOT' in a or 'Could not' in a or 'may be wrong' in a %}⚠️ {% elif 'sent' in a %}✅ {% else %}⏳ {% endif %}**{{ a }}**{% if w %} — {{ w }}{% elif h %} — {{ h }}{% elif d %} — {{ d }}{% endif %}</span>
+<span style="font-size:0.9em">{% if a == '$($script:CopilotEndSessionConfirmNote)' or a.startswith('Not sent') or 'NOT' in a or 'Could not' in a or 'may be wrong' in a or a == 'Answer differs - check the terminal' or a == 'Answer unconfirmed - check the terminal' %}⚠️ {% elif 'sent' in a %}✅ {% else %}⏳ {% endif %}**{{ a }}**{% if w %} — {{ w }}{% elif h %} — {{ h }}{% elif d %} — {{ d }}{% endif %}</span>
 "@
             }
         }

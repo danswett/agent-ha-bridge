@@ -504,6 +504,11 @@ function Invoke-WebRequest {
             $script:P3bPublished.Add([pscustomobject]@{ Topic = $Topic; Payload = (ConvertFrom-DecisionJson -Json $Payload) })
         }
         function Invoke-HomeAssistantService { param($Domain, $Service, $Headers, $Data) }
+        # Arming now reads what the answer channels already hold, so that an answer
+        # given before the first daemon sweep is not later mistaken for what was
+        # always there. Nothing exists yet on this synthetic card, which is what Home
+        # Assistant says with a 404.
+        function Get-HomeAssistantState { param($EntityId, $Headers) throw "404 Not Found: $EntityId" }
         function Set-CopilotMqttEntityIds { param($SessionId) }
         function Start-Sleep { param($Milliseconds, $Seconds) }
         $sid = 'a3000000-0000-4000-8000-000000000049'
@@ -743,7 +748,12 @@ function Invoke-WebRequest {
             }
             # Arm, then press - in that order, which is the only one in which a press
             # is somebody pressing Send rather than something the card already held.
-            [void](Set-CopilotDecisionMarkerBaseline -SessionId $sid -PayloadBaseline 'armed-baseline' -SubmitBaseline '')
+            $baselinePath = Get-CopilotDecisionBaselinePath -SessionId $sid -DecisionId ([string]$marker.decisionId)
+            if (Test-Path -LiteralPath $baselinePath) { Remove-Item -LiteralPath $baselinePath -Force }
+            if (-not (Set-CopilotDecisionMarkerBaseline -SessionId $sid -DecisionId ([string]$marker.decisionId) `
+                -PayloadState 'present' -PayloadValue 'armed-baseline' -SubmitState 'absent' -SubmitValue '')) {
+                throw "could not seed a baseline for $($marker.decisionId)"
+            }
             $ha["button.$($topics.Node)_submit"].state = ([DateTimeOffset]$marker.armedAt).AddSeconds(1).ToString('o')
             $script:DeliveryFixture
         }

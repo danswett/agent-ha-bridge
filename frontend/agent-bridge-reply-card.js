@@ -23,7 +23,7 @@
  * uploaded image these sit in the sensor's attributes.
  */
 
-const CARD_VERSION = '1.22.0';
+const CARD_VERSION = '1.23.0';
 
 /*
  * How large a non-image attachment may be.
@@ -886,18 +886,56 @@ const CHOICE_SAVING_NOTE = 'Saving your choice...';
 // The states an entity sits in when it is carrying nothing: an unarmed field slot is
 // parked on 'Idle', and a session that has gone leaves its entity behind.
 const CHOICE_UNARMED = ['', 'Idle', 'unknown', 'unavailable'];
+// The short form a slot can hold instead of the picked options written out: '#1,3' is
+// the first and third option, one-based and ascending.
+//
+// Writing the words out is what used to cap this. A Home Assistant select holds one
+// value from a published list, so a set has to be one entry in that list, and six
+// ordinary sentence-length options joined together ran to 350 characters against a
+// 255-character entry - at which point the bridge refused the field and sent the whole
+// question to the terminal. Positions are 22 characters for all ten.
+const CHOICE_CODE_PATTERN = /^#[1-9][0-9]*(,[1-9][0-9]*)*$/;
+
+/*
+ * The picked options as positions: '#1,3'. Ascending, because that is the only order
+ * the bridge accepts and the only one it writes.
+ */
+function multiSelectCode(options, picked) {
+  const indexes = picked
+    .map((option) => options.indexOf(option))
+    .filter((i) => i >= 0)
+    .sort((a, b) => a - b);
+  if (indexes.length === 0) { return ''; }
+  return `#${indexes.map((i) => i + 1).join(',')}`;
+}
 
 /*
  * Which of a multi-select field's options its slot currently stands for.
  *
- * A Home Assistant select holds one value, so the bridge enumerates every
- * combination and the slot carries whichever one is ticked. Reading it back
- * regenerates those combinations and matches the label whole, rather than splitting
- * on the separator: an option's own text may contain " + ", and then two different
- * answers look identical. The bridge refuses to split for the same reason.
+ * Two carriers mean the same thing. Positions are what this card writes when the
+ * bridge says the slot will take them. The options written out and joined are what
+ * every earlier card writes, and are still published whenever they fit, so both have
+ * to read back here.
+ *
+ * The joined form is matched whole rather than split on the separator: an option's
+ * own text may contain " + ", and then two different answers look identical. The
+ * bridge refuses to split for the same reason.
  */
 function multiSelectPick(options, separator, state) {
   if (!state || options.length === 0 || options.length > 20) { return []; }
+  if (CHOICE_CODE_PATTERN.test(state)) {
+    const seen = new Set();
+    const picked = [];
+    for (const part of state.slice(1).split(',')) {
+      const index = Number(part) - 1;
+      // Out of range or repeated is malformed, not something to make the best of:
+      // showing a set nobody picked is how a wrong answer gets sent.
+      if (!(index >= 0 && index < options.length) || seen.has(index)) { return []; }
+      seen.add(index);
+    }
+    for (const index of Array.from(seen).sort((a, b) => a - b)) { picked.push(options[index]); }
+    return picked;
+  }
   for (let mask = 1; mask < (1 << options.length); mask++) {
     const picked = options.filter((_, i) => mask & (1 << i));
     if (picked.join(separator) === state) { return picked; }
@@ -922,6 +960,9 @@ class AgentBridgeChoicesCard extends HTMLElement {
     // service call completing and the state actually arriving are separate events,
     // so the pending set is what later taps compose from and what holds Send.
     this._pending = {};
+    // Counts taps, so a reply arriving late can be matched to the one that caused
+    // it. The question id cannot do that job: two taps on one question share it.
+    this._op = 0;
     this._note = '';
   }
 
@@ -1067,6 +1108,9 @@ class AgentBridgeChoicesCard extends HTMLElement {
         if (base.length > 0) {
           armed.multi = true;
           armed.separator = String(decisionAttrs[`field_${i + 1}_separator`] || CHOICE_MULTI_SEPARATOR);
+          // Whether this slot will take positions. Absent from an older bridge, which
+          // only ever published the options written out, so the words stay the default.
+          armed.codes = !!decisionAttrs[`field_${i + 1}_codes`];
           armed.slotOptions = armed.options;
           armed.options = base;
           armed.picked = multiSelectPick(base, armed.separator, armed.chosen);
@@ -1180,6 +1224,11 @@ class AgentBridgeChoicesCard extends HTMLElement {
     if (this._sent || !this._hass) { return; }
     const generation = String(
       ((this._hass.states[this._config.decision] || {}).attributes || {}).decision_id || '');
+    // Each tap is its own operation. The question id alone is not enough to tell
+    // them apart: two taps on the same question share it, so a rejection arriving
+    // late for the first used to delete the second's tick and send the answer
+    // without it.
+    const op = ++this._op;
     let value = option;
     let picked = null;
     if (group.multi) {
@@ -1188,7 +1237,12 @@ class AgentBridgeChoicesCard extends HTMLElement {
         : group.options.filter((o) => group.picked.indexOf(o) >= 0 || o === option);
       // Nothing ticked is not an answer, so the slot goes back to its placeholder and
       // the daemon reads the field as still unanswered rather than as an empty set.
-      value = picked.length === 0 ? CHOICE_FIELD_PLACEHOLDER : picked.join(group.separator);
+      if (picked.length === 0) { value = CHOICE_FIELD_PLACEHOLDER; }
+      // Positions where the bridge said the slot will take them, because the options
+      // written out may be far longer than a select entry can hold - which is what
+      // used to send an ordinarily-worded question to the terminal instead.
+      else if (group.codes) { value = multiSelectCode(group.options, picked); }
+      else { value = picked.join(group.separator); }
     }
     else if (group.isDecision && option === CHOICE_CANCEL) {
       this._sent = option;
@@ -1196,31 +1250,42 @@ class AgentBridgeChoicesCard extends HTMLElement {
     }
 
     if (!(group.isDecision && option === CHOICE_CANCEL)) {
-      this._pending[group.entityId] = { value, picked: picked || [], generation };
+      this._pending[group.entityId] = { value, picked: picked || [], generation, op };
       this._note = CHOICE_SAVING_NOTE;
       this._last = '';
       this._render();
     }
 
-    const call = this._hass.callService('select', 'select_option', {
-      entity_id: group.entityId,
-      option: value,
-    });
-    // A rejected call must take its tick back with it, rather than leaving the card
-    // showing a choice Home Assistant never accepted.
-    if (call && typeof call.then === 'function') {
-      call.then(
-        () => {},
-        (err) => {
-          if (this._pending[group.entityId] &&
-              this._pending[group.entityId].generation === generation) {
-            delete this._pending[group.entityId];
-          }
-          this._note = `Home Assistant would not take that: ${describeThrown(err)}`;
-          this._last = '';
-          this._render();
-        });
-    }
+    let call;
+    try { call = this._hass.callService('select', 'select_option', { entity_id: group.entityId, option: value }); }
+    catch (err) { this._failPending(group.entityId, op, err); return; }
+    if (!call || typeof call.then !== 'function') { return; }
+    call.then(
+      () => {
+        // Accepted. Usually the new state arrives separately and clears this, but
+        // when the slot already held the value nothing further is coming, so a
+        // redraw here is what stops Send being held for ever.
+        const pending = this._pending[group.entityId];
+        if (pending && pending.op === op) { this._last = ''; this._render(); }
+      },
+      // A rejected call must take its own tick back with it, and only its own.
+      (err) => this._failPending(group.entityId, op, err));
+  }
+
+  /*
+   * Drops a tap Home Assistant would not take, and says so.
+   *
+   * Only if that exact tap is still the pending one. An older failure arriving after
+   * a newer tap must leave the newer tick alone: clearing it would show the answer
+   * as saved while the card quietly held something else.
+   */
+  _failPending(entityId, op, err) {
+    const pending = this._pending[entityId];
+    if (!pending || pending.op !== op) { return; }
+    delete this._pending[entityId];
+    this._note = `Home Assistant would not take that: ${describeThrown(err)}`;
+    this._last = '';
+    this._render();
   }
 
   /*
@@ -1229,12 +1294,23 @@ class AgentBridgeChoicesCard extends HTMLElement {
    *
    * Deliberately not locked the way Cancel is: the daemon refuses an incomplete form
    * and says which field is still waiting, and a row that had locked itself would
-   * leave no way to go and answer it.
+   * leave no way to go and answer it. A press Home Assistant refuses is said out
+   * loud for the same reason - a Send that silently did nothing is indistinguishable
+   * from one the session is still thinking about.
    */
   _send() {
     if (this._sent || !this._hass || !this._config.submit) { return; }
     if (Object.keys(this._pending).length > 0) { return; }
-    this._hass.callService('button', 'press', { entity_id: this._config.submit });
+    let call;
+    try { call = this._hass.callService('button', 'press', { entity_id: this._config.submit }); }
+    catch (err) { this._failSend(err); return; }
+    if (call && typeof call.then === 'function') { call.then(() => {}, (err) => this._failSend(err)); }
+  }
+
+  _failSend(err) {
+    this._note = `Send failed: ${describeThrown(err)}`;
+    this._last = '';
+    this._render();
   }
 }
 
