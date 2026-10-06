@@ -84,5 +84,6 @@
     Integration = @(
         'claude\tests\test-claude-integration.ps1'
         'codex\tests\test-codex-integration.ps1'
+        'tests\test-commit-context-capture.ps1'
     )
 }

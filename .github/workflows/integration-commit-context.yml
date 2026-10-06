@@ -1,0 +1,61 @@
+name: Integration - commit-context capture (disposable)
+
+# Disposable, opt-in measurement of whether an optimistic MQTT text.set_value commit binds
+# its committed value to an authenticated caller context. The measurement job runs ONLY
+# against an ephemeral GitHub-hosted Home Assistant Core + Mosquitto fixture it creates and
+# destroys in-job, never against production. It is path-restricted so it triggers only when
+# its own files change; workflow_dispatch is for manual runs once this file is on the
+# default branch. No secrets, no write permissions, no pull_request_target, no self-hosted
+# runner, no deployment environment: the fixture is wholly synthetic and loopback-only.
+
+on:
+  pull_request:
+    paths:
+      - '.github/workflows/integration-commit-context.yml'
+      - 'tests/test-commit-context-capture.ps1'
+      - 'tests/suites.psd1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: integration-commit-context-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  self-test:
+    # Pure evidence-classification and target-refusal unit validation. No Home Assistant,
+    # no Docker, no network. This gate must pass before the disposable measurement runs.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Pure self-test (no Home Assistant, no Docker)
+        shell: pwsh
+        run: ./tests/test-commit-context-capture.ps1 -Mode SelfTest
+
+  measure:
+    # The disposable measurement. The script preflights the environment and refuses any
+    # non-github-hosted or non-loopback target before any network or container effect.
+    needs: self-test
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    env:
+      BRIDGE_ALLOW_TEST_HTTP: '1'
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Measure commit context against a disposable HA 2026.9.4 + Mosquitto fixture
+        shell: pwsh
+        run: >
+          ./tests/test-commit-context-capture.ps1
+          -Mode Measure
+          -HaImage 'ghcr.io/home-assistant/home-assistant:2026.9.4@sha256:3e6710a7ab2a61311d9d899b719f6c3657791c63e8f4942cec4ebc42401d6b76'
+          -MosquittoImage 'eclipse-mosquitto:2.0.22@sha256:199ea8ef2e35ec2b1b37e59cfd1dbae538ed4dfa4a2251a121a52215a6248a21'
+      - name: Upload bounded evidence
+        if: always()
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: commit-context-evidence
+          path: commit-context-evidence.json
+          if-no-files-found: error
