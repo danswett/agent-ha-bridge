@@ -146,10 +146,18 @@ check('but it does not send, and the rows stay live',
 check('and Send answer is offered, because there is now something to commit',
   labels(card).includes('Send answer'), labels(card).join('|'));
 env.settle();
-buttons(card).find((b) => b.textContent === 'Send answer').click();
-check('Send answer presses the Send button the daemon waits on',
-  env.calls.length === 1 && env.calls[0].domain === 'button' && env.calls[0].service === 'press' &&
-  env.calls[0].data.entity_id === SUBMIT, JSON.stringify(env.calls));
+// The press only goes once the tap has been acknowledged, which is a promise even
+// when the stand-in answers immediately. Captured here rather than read later: the
+// rest of this file reassigns `card` and `env` while this is waiting its turn.
+const tapCard = card;
+const tapEnv = env;
+async function checkTapThenSend() {
+  await flush();
+  buttons(tapCard).find((b) => b.textContent === 'Send answer').click();
+  check('Send answer presses the Send button the daemon waits on',
+    tapEnv.calls.length === 1 && tapEnv.calls[0].domain === 'button' && tapEnv.calls[0].service === 'press' &&
+    tapEnv.calls[0].data.entity_id === SUBMIT, JSON.stringify(tapEnv.calls));
+}
 
 card = newCard(undefined, SUBMIT);
 env = hassFor('Awaiting answer...', ['Awaiting answer...', 'Yes - reboot now', 'Cancel request'], { defer: true });
@@ -179,31 +187,51 @@ console.log('--- a tap that Home Assistant has not confirmed yet ---');
 // before the first had been pushed back: ticking Auth then Search sent "Auth" and
 // then "Search", losing Auth. Send had the matching problem - pressed straight after
 // a tap it committed whatever the slot still held.
-card = newCard(undefined, SUBMIT);
-env = hassFor('Awaiting answer...', ['Awaiting answer...', 'Yes - reboot now', 'No - leave it', 'Cancel request'],
-  { defer: true });
-env.card = card;
-card.hass = env.hass;
-rows(card)[0].click();
-rows(card)[1].click();
-check('a second tap still replaces the first, not the state behind it',  env.calls.length === 2 && env.calls[1].data.option === 'No - leave it', JSON.stringify(env.calls));
-check('the row you last tapped is the one shown as chosen',
-  buttons(card).filter((b) => b.classList.contains('chosen')).map((b) => b.textContent).join('|') === 'No - leave it',
-  buttons(card).filter((b) => b.classList.contains('chosen')).map((b) => b.textContent).join('|'));
-check('Send is held while anything is unconfirmed',
-  buttons(card).find((b) => b.textContent === 'Send answer').getAttribute('disabled') === 'disabled');
-check('and the card says why rather than looking broken',
-  labels(card).includes('Saving your choice...'), labels(card).join('|'));
-buttons(card).find((b) => b.textContent === 'Send answer').click();
-check('pressing Send while unconfirmed sends nothing',
-  env.calls.filter((c) => c.domain === 'button').length === 0, JSON.stringify(env.calls));
-env.settle();
-check('once the state arrives the note goes', !labels(card).includes('Saving your choice...'), labels(card).join('|'));
-check('and Send is released',
-  buttons(card).find((b) => b.textContent === 'Send answer').getAttribute('disabled') === null);
-buttons(card).find((b) => b.textContent === 'Send answer').click();
-check('exactly the confirmed answer is sent, once',
-  env.calls.length === 1 && env.calls[0].domain === 'button', JSON.stringify(env.calls));
+//
+// In its own function because it has to await: a tap is settled only once Home
+// Assistant has acknowledged it, and an acknowledgement is a promise. The rest of
+// this file runs while this is awaiting and reassigns the shared `card` and `env`,
+// so both are local here.
+async function checkUnconfirmedTap() {
+  const unconfirmedCard = newCard(undefined, SUBMIT);
+  const unconfirmedEnv = hassFor('Awaiting answer...',
+    ['Awaiting answer...', 'Yes - reboot now', 'No - leave it', 'Cancel request'], { defer: true });
+  unconfirmedEnv.card = unconfirmedCard;
+  unconfirmedCard.hass = unconfirmedEnv.hass;
+  const c = unconfirmedCard;
+  const e = unconfirmedEnv;
+
+  rows(c)[0].click();
+  rows(c)[1].click();
+  check('a second tap still replaces the first, not the state behind it',
+    e.calls.length === 2 && e.calls[1].data.option === 'No - leave it', JSON.stringify(e.calls));
+  check('the row you last tapped is the one shown as chosen',
+    buttons(c).filter((b) => b.classList.contains('chosen')).map((b) => b.textContent).join('|') === 'No - leave it',
+    buttons(c).filter((b) => b.classList.contains('chosen')).map((b) => b.textContent).join('|'));
+  check('Send is held while anything is unconfirmed',
+    buttons(c).find((b) => b.textContent === 'Send answer').getAttribute('disabled') === 'disabled');
+  check('and the card says why rather than looking broken',
+    labels(c).includes('Saving your choice...'), labels(c).join('|'));
+  buttons(c).find((b) => b.textContent === 'Send answer').click();
+  check('pressing Send while unconfirmed sends nothing',
+    e.calls.filter((x) => x.domain === 'button').length === 0, JSON.stringify(e.calls));
+
+  // Acknowledged but the state has not arrived: still held, because the slot has not
+  // been seen holding what was asked for.
+  await flush();
+  check('an acknowledgement on its own does not release Send',
+    buttons(c).find((b) => b.textContent === 'Send answer').getAttribute('disabled') === 'disabled',
+    labels(c).join('|'));
+
+  e.settle();
+  await flush();
+  check('once the state arrives the note goes', !labels(c).includes('Saving your choice...'), labels(c).join('|'));
+  check('and Send is released',
+    buttons(c).find((b) => b.textContent === 'Send answer').getAttribute('disabled') === null);
+  buttons(c).find((b) => b.textContent === 'Send answer').click();
+  check('exactly the confirmed answer is sent, once',
+    e.calls.length === 1 && e.calls[0].domain === 'button', JSON.stringify(e.calls));
+}
 
 async function checkRefusedSelection() {
   // Local, not the shared `card`/`env`: the rest of this file runs while this is
@@ -364,6 +392,28 @@ async function checkDeferredChoices() {
     check(`'${bad}' ticks nothing rather than guessing`, pickedRows(card) === '', pickedRows(card));
   }
 
+  // Ticking a row and immediately unticking it asks for the value the slot already
+  // holds. Settling on the state alone made that look confirmed before Home Assistant
+  // had taken it at all, so Send went live over a call still in flight.
+  card = newCard(FIELDS, SUBMIT);
+  env = controlledEnv({ 1: { label: 'Features', multi: true, codes: true, options: ['Auth', 'Billing'], state: '#1' } });
+  env.card = card;
+  card.hass = env.hass;
+  check('the slot opens holding the first option', pickedRows(card) === 'Auth', pickedRows(card));
+  buttons(card).find((b) => b.textContent === 'Billing').click();
+  buttons(card).find((b) => b.textContent === 'Billing').click();
+  check('toggling back asks for the value the slot is already on',
+    env.calls[env.calls.length - 1].data.option === '#1',
+    env.calls.map((c) => c.data.option).join(' / '));
+  check('and Send stays held until that is acknowledged, not because the state matches',
+    sendRow(card).getAttribute('disabled') === 'disabled', labels(card).join('|'));
+  env.calls[env.calls.length - 1].settle.resolve();
+  await flush();
+  check('once it is acknowledged Send is released',
+    sendRow(card).getAttribute('disabled') === null && pickedRows(card) === 'Auth', pickedRows(card));
+  for (const call of env.calls) { call.settle.resolve(); }
+  await flush();
+
   console.log('--- answers given faster than Home Assistant replies ---');
 
   // Ticking two options and having the first one refused used to untick the second
@@ -414,6 +464,10 @@ async function checkDeferredChoices() {
   card.hass = env.hass;
   buttons(card).find((b) => b.textContent === 'Auth').click();
   buttons(card).find((b) => b.textContent === 'Search').click();
+  // Accepted, both of them. Home Assistant does not push a new state for a call it
+  // has not taken, so the states below are the only thing still outstanding.
+  for (const call of env.calls) { call.settle.resolve(); }
+  await flush();
   env.arrive(F(1), 'Auth');
   check('a state from the earlier tap does not confirm the later one',
     sendRow(card).getAttribute('disabled') === 'disabled' && pickedRows(card) === 'Auth|Search', pickedRows(card));
@@ -1292,6 +1346,8 @@ check('"machines" is required', (() => {
 // _launch awaits its service calls, so the checks that read them have to await it too.
 (async () => {
   await checkForgetRemoval();
+  await checkTapThenSend();
+  await checkUnconfirmedTap();
   await checkRefusedSelection();
 
   const pubEnv = launchEnv({});

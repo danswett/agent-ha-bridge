@@ -31,10 +31,18 @@ $sid = '11111111-0000-4000-8000-000000000001'
 $node = Get-CopilotMqttNodeId -SessionId $sid
 
 # Home Assistant, as a table of entity states; a missing entity throws, as a 404 does.
+# Home Assistant's own answer for an entity it does not have, as a status rather than
+# as wording: the bridge reads absence off the status code, never off a message.
+function New-TestHaNotFound {
+    param([Parameter(Mandatory)][string]$EntityId)
+    $notFound = [InvalidOperationException]::new("Response status code does not indicate success: 404 (Not Found). [$EntityId]")
+    $notFound.Data['BridgeHttpStatus'] = 404
+    $notFound
+}
 $script:Ha = @{}
 function Get-HomeAssistantState {
     param([string]$EntityId, [hashtable]$Headers)
-    if (-not $script:Ha.ContainsKey($EntityId)) { throw "404 $EntityId" }
+    if (-not $script:Ha.ContainsKey($EntityId)) { throw (New-TestHaNotFound -EntityId $EntityId) }
     $v = $script:Ha[$EntityId]
     if ($v -is [pscustomobject]) { return $v }
     [pscustomobject]@{ state = [string]$v; attributes = [pscustomobject]@{ question = 'Pick' } }
@@ -154,6 +162,14 @@ $script:Ha = @{ "text.${node}_reply" = 'Because.' }
 Test-That 'a freeform answer is read from the reply box' { (Read-DaemonDecisionAnswer -SessionId $sid -Marker $free -State $state -Headers $headers).Answer -eq 'Because.' }
 $script:Ha = @{ "text.${node}_reply" = ' ' }
 Test-That 'the blank the box is parked on is not an answer' { (Read-DaemonDecisionAnswer -SessionId $sid -Marker $free -State $state -Headers $headers).Answer -eq '' }
+# Home Assistant's own answer for an entity it does not have, as a status rather than
+# as wording: the bridge reads absence off the status code, never off a message.
+function New-TestHaNotFound {
+    param([Parameter(Mandatory)][string]$EntityId)
+    $notFound = [InvalidOperationException]::new("Response status code does not indicate success: 404 (Not Found). [$EntityId]")
+    $notFound.Data['BridgeHttpStatus'] = 404
+    $notFound
+}
 $script:Ha = @{}
 Test-That 'an unreadable card gives nothing, rather than a guess' { $null -eq (Read-DaemonDecisionAnswer -SessionId $sid -Marker $free -State $state -Headers $headers) }
 
@@ -227,13 +243,34 @@ Test-That 'a question with no id has no baseline, rather than sharing one' {
 Test-That 'nothing is readable without being told which session it belongs to' {
     (Get-CopilotDecisionMarkerBaseline -Marker ([pscustomobject]@{ decisionId = 'cas' }) -Channel 'payload').State -eq 'unknown'
 }
-Test-That 'clearing a session takes its baselines with it' {
-    Remove-CopilotDecisionMarker -SessionId $casSid
-    -not (Test-CopilotDecisionBaselineRecorded -SessionId $casSid -DecisionId 'cas') -and
-    -not (Test-CopilotDecisionBaselineRecorded -SessionId $casSid -DecisionId 'cas-next')
+Test-That 'retiring a question takes its own baseline with it' {
+    Remove-CopilotDecisionMarker -SessionId $casSid -DecisionId 'cas'
+    -not (Test-CopilotDecisionBaselineRecorded -SessionId $casSid -DecisionId 'cas')
 }
-Test-That 'and leaves another session''s alone' {
+# A replacement question may already have been armed and recorded its own. Sweeping
+# every baseline for the session would delete it, and the new question would then
+# adopt whatever the card happens to hold as "what was always there" - losing an
+# answer typed in between.
+Test-That 'and leaves a replacement question''s baseline alone' {
+    Test-CopilotDecisionBaselineRecorded -SessionId $casSid -DecisionId 'cas-next'
+}
+Test-That 'and another session''s alone' {
     Test-CopilotDecisionBaselineRecorded -SessionId $sid -DecisionId 'd4'
+}
+# A record that exists but cannot be read back is not a record. Because it is
+# write-once, treating it as one would leave the question unanswerable for ever.
+Test-That 'a half-written record is not a baseline, and is replaced rather than trusted' {
+    $path = Get-CopilotDecisionBaselinePath -SessionId $casSid -DecisionId 'cas-torn'
+    [IO.File]::WriteAllText($path, '{"decisionId":"cas-torn","payl')
+    $before = Test-CopilotDecisionBaselineRecorded -SessionId $casSid -DecisionId 'cas-torn'
+    $wrote = Set-CopilotDecisionMarkerBaseline -SessionId $casSid -DecisionId 'cas-torn' `
+        -PayloadState 'absent' -PayloadValue '' -SubmitState 'absent' -SubmitValue ''
+    -not $before -and $wrote -and (Test-CopilotDecisionBaselineRecorded -SessionId $casSid -DecisionId 'cas-torn')
+}
+Test-That 'a record naming a different question is never read against this one' {
+    $path = Get-CopilotDecisionBaselinePath -SessionId $casSid -DecisionId 'cas-wrong'
+    [IO.File]::WriteAllText($path, '{"decisionId":"somebody-else","payload":{"state":"absent","value":""},"submit":{"state":"absent","value":""}}')
+    -not (Test-CopilotDecisionBaselineRecorded -SessionId $casSid -DecisionId 'cas-wrong')
 }
 
 # 'absent' and 'unknown' are not the same answer. A channel nobody could read must
@@ -260,7 +297,15 @@ Test-That 'a button that is simply there and never pressed is not missing' {
     $seen.State -eq 'absent' -and $seen.Exists
 }
 Test-That 'one that is not on the card at all is' {
-    $script:Ha = @{}
+    # Home Assistant's own answer for an entity it does not have, as a status rather than
+# as wording: the bridge reads absence off the status code, never off a message.
+function New-TestHaNotFound {
+    param([Parameter(Mandatory)][string]$EntityId)
+    $notFound = [InvalidOperationException]::new("Response status code does not indicate success: 404 (Not Found). [$EntityId]")
+    $notFound.Data['BridgeHttpStatus'] = 404
+    $notFound
+}
+$script:Ha = @{}
     $seen = Get-DaemonDecisionChannelState -EntityId "button.${node}_x" -Headers $headers
     $seen.State -eq 'absent' -and -not $seen.Exists
 }
@@ -320,7 +365,7 @@ Test-That 'and so does establishing a baseline, rather than recording one nobody
 }
 function Get-HomeAssistantState {
     param([string]$EntityId, [hashtable]$Headers)
-    if (-not $script:Ha.ContainsKey($EntityId)) { throw "404 $EntityId" }
+    if (-not $script:Ha.ContainsKey($EntityId)) { throw (New-TestHaNotFound -EntityId $EntityId) }
     $v = $script:Ha[$EntityId]
     if ($v -is [pscustomobject]) { return $v }
     [pscustomobject]@{ state = [string]$v; attributes = [pscustomobject]@{ question = 'Pick' } }

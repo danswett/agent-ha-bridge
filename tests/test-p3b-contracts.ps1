@@ -508,7 +508,11 @@ function Invoke-WebRequest {
         # given before the first daemon sweep is not later mistaken for what was
         # always there. Nothing exists yet on this synthetic card, which is what Home
         # Assistant says with a 404.
-        function Get-HomeAssistantState { param($EntityId, $Headers) throw "404 Not Found: $EntityId" }
+        function Get-HomeAssistantState { param($EntityId, $Headers)
+            $notFound = [InvalidOperationException]::new("Response status code does not indicate success: 404 (Not Found). [$EntityId]")
+            $notFound.Data['BridgeHttpStatus'] = 404
+            throw $notFound
+        }
         function Set-CopilotMqttEntityIds { param($SessionId) }
         function Start-Sleep { param($Milliseconds, $Seconds) }
         $sid = 'a3000000-0000-4000-8000-000000000049'

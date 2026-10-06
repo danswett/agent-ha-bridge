@@ -1135,12 +1135,18 @@ class AgentBridgeChoicesCard extends HTMLElement {
     this.hidden = !show;
     if (!show) { this._sent = ''; this._pending = {}; this._note = ''; return; }
 
-    // What has been tapped and not yet confirmed. A slot whose state has caught up
-    // with what was asked for is no longer pending; anything else holds Send.
+    // What has been tapped and not yet confirmed. A slot is only settled once Home
+    // Assistant has both accepted the call and shown the value it was asked for.
+    //
+    // Matching the state alone released it too early in two ways. Toggling a row on
+    // and straight back off asks for the value the slot already holds, so it looked
+    // settled before the untick had been accepted at all - and if that call then
+    // failed, Send went with the row still ticked underneath. An older acknowledgement
+    // arriving after a newer tap did the same thing from the other direction.
     for (const group of groups) {
       const pending = this._pending[group.entityId];
       if (!pending) { continue; }
-      if (pending.value === group.state) { delete this._pending[group.entityId]; }
+      if (pending.acked && pending.value === group.state) { delete this._pending[group.entityId]; }
       else if (group.multi) { group.picked = pending.picked.slice(); }
       else { group.chosen = pending.value; }
     }
@@ -1250,7 +1256,7 @@ class AgentBridgeChoicesCard extends HTMLElement {
     }
 
     if (!(group.isDecision && option === CHOICE_CANCEL)) {
-      this._pending[group.entityId] = { value, picked: picked || [], generation, op };
+      this._pending[group.entityId] = { value, picked: picked || [], generation, op, acked: false };
       this._note = CHOICE_SAVING_NOTE;
       this._last = '';
       this._render();
@@ -1262,11 +1268,17 @@ class AgentBridgeChoicesCard extends HTMLElement {
     if (!call || typeof call.then !== 'function') { return; }
     call.then(
       () => {
-        // Accepted. Usually the new state arrives separately and clears this, but
-        // when the slot already held the value nothing further is coming, so a
-        // redraw here is what stops Send being held for ever.
+        // Accepted. Only this tap's own acknowledgement counts: an older one arriving
+        // after a newer tap must not settle the newer one. Usually the new state
+        // arrives separately and clears it, but when the slot already held the value
+        // nothing further is coming, so this redraw is what stops Send being held for
+        // ever.
         const pending = this._pending[group.entityId];
-        if (pending && pending.op === op) { this._last = ''; this._render(); }
+        if (pending && pending.op === op) {
+          pending.acked = true;
+          this._last = '';
+          this._render();
+        }
       },
       // A rejected call must take its own tick back with it, and only its own.
       (err) => this._failPending(group.entityId, op, err));

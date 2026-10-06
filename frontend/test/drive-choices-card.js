@@ -42,6 +42,10 @@ process.stdin.on('end', () => {
         if (entity) { entity.state = data.option; }
         card.hass = hass;
       }
+      // A promise, because the real one is: the card settles a tap only once the call
+      // has been acknowledged, so a stand-in that returned nothing left every tap
+      // looking unconfirmed for ever and held Send.
+      return Promise.resolve();
     },
   };
 
@@ -49,19 +53,26 @@ process.stdin.on('end', () => {
   card.setConfig(job.config);
   card.hass = hass;
 
-  const missing = [];
-  for (const label of (job.taps || [])) {
-    const row = card.shadowRoot.querySelector('.choices').children
-      .filter((r) => r.tagName === 'BUTTON')
-      .find((r) => r.textContent === label);
-    if (!row) { missing.push(label); continue; }
-    row.click();
-  }
-  const rows = card.shadowRoot.querySelector('.choices').children.map((r) => ({
-    tag: r.tagName,
-    text: r.textContent,
-    classes: ['label', 'cancel', 'chosen'].filter((c) => r.classList.contains(c)),
-  }));
+  const flush = () => new Promise((resolve) => setImmediate(resolve));
 
-  process.stdout.write(JSON.stringify({ hidden: !!card.hidden, rows, calls, missing }));
+  (async () => {
+    const missing = [];
+    for (const label of (job.taps || [])) {
+      const row = card.shadowRoot.querySelector('.choices').children
+        .filter((r) => r.tagName === 'BUTTON')
+        .find((r) => r.textContent === label);
+      if (!row) { missing.push(label); continue; }
+      row.click();
+      // Let the acknowledgement land before the next tap, as it would between two
+      // taps made by a person.
+      await flush();
+    }
+    const rows = card.shadowRoot.querySelector('.choices').children.map((r) => ({
+      tag: r.tagName,
+      text: r.textContent,
+      classes: ['label', 'cancel', 'chosen'].filter((c) => r.classList.contains(c)),
+    }));
+
+    process.stdout.write(JSON.stringify({ hidden: !!card.hidden, rows, calls, missing }));
+  })();
 });

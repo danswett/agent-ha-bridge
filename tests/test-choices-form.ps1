@@ -79,11 +79,20 @@ $headers = @{ Authorization = '******' }
 # Entity states as Home Assistant would hold them, filled in from the discovery
 # payloads and the starting values the bridge publishes. Nothing is invented here.
 $script:HaStates = @{}
+# Home Assistant's own answer for an entity it does not have, as a status rather than
+# as wording: the bridge reads absence off the status code, never off a message, so a
+# stand-in that only says "404" in words would not be saying it at all.
+function New-TestHaNotFound {
+    param([Parameter(Mandatory)][string]$EntityId)
+    $notFound = [InvalidOperationException]::new("Response status code does not indicate success: 404 (Not Found). [$EntityId]")
+    $notFound.Data['BridgeHttpStatus'] = 404
+    $notFound
+}
 function Get-HomeAssistantState {
     param([string]$EntityId, [hashtable]$Headers)
     # Shaped like Home Assistant's own refusal: it answers 404 for an entity it does
     # not have, and the bridge tells that apart from being unable to read at all.
-    if (-not $script:HaStates.Contains($EntityId)) { throw "404 Not Found: no such entity: $EntityId" }
+    if (-not $script:HaStates.Contains($EntityId)) { throw (New-TestHaNotFound -EntityId $EntityId) }
     $entry = $script:HaStates[$EntityId]
     # An object, not the dictionary it is stored in: Home Assistant's own JSON parses
     # to one, and the daemon reads attributes the way it reads every other entity's.
@@ -574,8 +583,11 @@ $multiState = @{ $sessionId = [pscustomobject]@{ Name = 'Copilot: a task'; Machi
 $multiAnswer = Read-DaemonDecisionAnswer -SessionId $sessionId -Marker $multiMarker -State $multiState -Headers $headers
 
 Test-That 'the daemon reads both options back off that one slot' {
-    (@($multiAnswer.Selections) -join '|') -eq 'Auth + Search'
-} "selections=[$(@($multiAnswer.Selections) -join '|')]"
+    # The selection is what the slot held, not how it reads: a field can offer an
+    # option that reads exactly like two others joined, and deriving one from the
+    # other sent the wrong rows.
+    (@($multiAnswer.Selections) -join '|') -eq '#1,3' -and $multiAnswer.Answer -ceq 'Auth + Search'
+} "selections=[$(@($multiAnswer.Selections) -join '|')] answer=[$($multiAnswer.Answer)]"
 Test-That 'and the keystrokes tick exactly those two rows, with no walk to a Submit' {
     $esc = [string][char]27
     @(Get-BridgeFormPayloads -Fields $multiField -Selections @($multiAnswer.Selections))[0].Payload -eq
@@ -618,8 +630,8 @@ Set-Baseline -DecisionId 'd3b'
 $defaultedState = @{ $sessionId = [pscustomobject]@{ Name = 'Copilot: a task'; Machine = 'BOX'; LastSubmitAt = '' } }
 $defaultedAnswer = Read-DaemonDecisionAnswer -SessionId $sessionId -Marker $defaultedMarker -State $defaultedState -Headers $headers
 Test-That 'the daemon reads the default set as the answer once Send is pressed' {
-    (@($defaultedAnswer.Selections) -join '|') -eq 'Auth + Search'
-} "selections=[$(@($defaultedAnswer.Selections) -join '|')]"
+    (@($defaultedAnswer.Selections) -join '|') -eq '#1,3' -and $defaultedAnswer.Answer -ceq 'Auth + Search'
+} "selections=[$(@($defaultedAnswer.Selections) -join '|')] answer=[$($defaultedAnswer.Answer)]"
 Test-That 'and sending it untouched types nothing, because the rows are already ticked' {
     @(Get-BridgeFormPayloads -Fields $defaultedField -Selections @($defaultedAnswer.Selections))[0].Payload -eq ''
 } ((@(Get-BridgeFormPayloads -Fields $defaultedField -Selections @($defaultedAnswer.Selections))[0].Payload) -replace [regex]::Escape([string][char]27), '<esc>')
@@ -709,6 +721,107 @@ Test-That 'and the keystrokes tick exactly those three rows' {
 $script:HaStates["select.${node}_f1"].state = '#9,99'
 Test-That 'a slot holding positions this field does not have is read as unanswered' {
     [string]::IsNullOrWhiteSpace((Read-DaemonDecisionAnswer -SessionId $sessionId -Marker $realMarker -State $realState -Headers $headers).Answer)
+}
+
+# --- 6d. released cards, against what the bridge publishes today ------------------
+
+Write-Host ''
+Write-Host '--- the cards that are actually out there still work ---'
+# Asserting that an older card keeps working is cheap. This takes the real file out of
+# the released tag and drives it against the real published option list, with Home
+# Assistant's own refusal of a value outside that list enforced - which is the failure
+# an ungated change would cause.
+$releasedDriver = Join-Path $PSScriptRoot '..\frontend\test\drive-released-card.js'
+$releasedDir = Join-Path ([IO.Path]::GetTempPath()) "bridge-released-cards-$([guid]::NewGuid().ToString('N').Substring(0,8))"
+[void](New-Item -ItemType Directory -Force -Path $releasedDir)
+$repoRoot = (Resolve-Path (Join-Path $PSScriptRoot '..')).Path
+$released = [ordered]@{}
+foreach ($spec in @(
+    @{ Name = '1.21.1'; Ref = 'v1.32.2' }   # the card in the latest release
+    @{ Name = '1.22.0'; Ref = '1e67436' }   # this branch's published head
+)) {
+    $out = Join-Path $releasedDir "card-$($spec.Name).js"
+    $text = & git -C $repoRoot show "$($spec.Ref):frontend/agent-bridge-reply-card.js" 2>$null
+    if ($LASTEXITCODE -ne 0 -or -not $text) { continue }
+    [IO.File]::WriteAllText($out, ($text -join "`n"), [Text.UTF8Encoding]::new($false))
+    $released[$spec.Name] = $out
+}
+if ($released.Count -lt 2) {
+    Write-Host "  SKIP  released card files are not reachable from this checkout" -ForegroundColor Yellow
+}
+else {
+    function Invoke-ReleasedCard {
+        param(
+            [Parameter(Mandatory)][string]$CardPath,
+            [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Taps
+        )
+        $config = @{ decision = [string]$cardConfig.decision; fields = @(@($cardConfig.fields) | ForEach-Object { [string]$_ }) }
+        if ($cardConfig.PSObject.Properties['submit']) { $config.submit = [string]$cardConfig.submit }
+        $job = @{ card = $CardPath; config = $config; states = $script:HaStates; taps = @($Taps) } |
+            ConvertTo-Json -Depth 40 -Compress
+        # stdout only. Anything the runtime says about an older card goes to stderr and
+        # would otherwise be spliced into the middle of the JSON.
+        $result = $job | & $node_exe $releasedDriver
+        $text = ($result -join '')
+        if ([string]::IsNullOrWhiteSpace($text)) { return [pscustomobject]@{ threw = 'the driver wrote nothing' } }
+        try { $text | ConvertFrom-Json }
+        catch { [pscustomobject]@{ threw = "unparsable driver output: $($text.Substring(0, [Math]::Min(120, $text.Length)))" } }
+    }
+
+    # Short options: both carriers are published, so an older card writes the words and
+    # Home Assistant takes them.
+    $script:HaStates = @{}
+    Set-CopilotMqttDecision -SessionId $sessionId -SessionName 'Copilot: a task' -Machine 'BOX' `
+        -Question 'Which features?' -Choices @('Auth', 'Billing', 'Search') -Fields $multiField `
+        -DecisionId 'd7' -Headers $headers | Out-Null
+
+    # Never $name here: Test-That declares a $Name parameter, PowerShell resolves
+    # variables case-insensitively up the scope it is called from, so inside a
+    # condition $name is the test's own title. These checks compared a card version
+    # against a sentence and failed while every part of them read as true.
+    foreach ($cardName in @($released.Keys)) {
+        $run = Invoke-ReleasedCard -CardPath $released[$cardName] -Taps @('Auth', 'Search')
+        Test-That "card $cardName loads and draws this question" {
+            [string]$run.version -eq $cardName -and [string]::IsNullOrEmpty([string]$run.threw) -and -not $run.hidden
+        } "version=[$($run.version)] threw=[$($run.threw)] hidden=[$($run.hidden)]"
+        Test-That "card $cardName writes a value Home Assistant accepts" {
+            @($run.calls).Count -gt 0 -and @(@($run.calls) | Where-Object { $_.rejected }).Count -eq 0
+        } "calls=[$(@($run.calls) | ForEach-Object { "$($_.data.option)$(if ($_.rejected) { '!REJECTED' })" })]"
+        # 1.21.1 predates multi-select entirely: it draws the combinations as plain
+        # rows and a tap picks one, so two taps leave the second. That is the bug this
+        # branch exists to fix, and it is recorded here rather than wished away - what
+        # matters is that it still writes something the bridge accepts rather than
+        # breaking on a list it has never seen.
+        $expected = if ($cardName -eq '1.21.1') { 'Search' } else { 'Auth|Search' }
+        Test-That "card $cardName resolves to $expected" {
+            $last = @($run.calls)[-1]
+            (@(Resolve-DecisionMultiSelectChoice -Field $multiField[0] -Choice ([string]$last.data.option)) -join '|') -eq $expected
+        } "last=[$(@($run.calls)[-1].data.option)]"
+    }
+
+    # Long options: the written-out form is too long to be an entry at all, so only
+    # positions are published. A card that does not know them cannot answer this one -
+    # and must find that out as a refusal rather than storing one option silently.
+    $script:HaStates = @{}
+    Set-CopilotMqttDecision -SessionId $sessionId -SessionName 'Copilot: a task' -Machine 'BOX' `
+        -Question 'Which follow-ups do you want?' -Choices @() -Fields $realField `
+        -DecisionId 'd8' -Headers $headers | Out-Null
+
+    foreach ($cardName in @('1.21.1', '1.22.0')) {
+        $run = Invoke-ReleasedCard -CardPath $released[$cardName] -Taps @($realOptions[0], $realOptions[2])
+        Test-That "card $cardName is still offered the long-worded question" {
+            [string]::IsNullOrEmpty([string]$run.threw) -and -not $run.hidden
+        } "threw=[$($run.threw)] hidden=[$($run.hidden)]"
+        Test-That "card $cardName cannot answer it, and is refused rather than half-stored" {
+            $wrote = @($run.calls)
+            $wrote.Count -eq 0 -or @($wrote | Where-Object { -not $_.rejected }).Count -eq 0
+        } "calls=[$(@($run.calls) | ForEach-Object { "$($_.data.option.Substring(0,[Math]::Min(24,$_.data.option.Length)))$(if ($_.rejected) { '!REJECTED' })" })]"
+        Test-That "card $cardName leaves the slot on its placeholder, so the daemon reads it unanswered" {
+            [string]$script:HaStates["select.${node}_f1"].state -eq 'Choose...'
+        } "state=[$($script:HaStates["select.${node}_f1"].state)]"
+    }
+
+    Remove-Item -LiteralPath $releasedDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
 # --- 7. the words typed at a choice question ------------------------------------
