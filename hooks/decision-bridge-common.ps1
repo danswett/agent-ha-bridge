@@ -2726,44 +2726,108 @@ function Get-CopilotDecisionAttempt {
 
 function Set-CopilotDecisionAttemptState {
     <#
-        Advances a claimed attempt, in the one direction it is allowed to go.
+        Advances an attempt under an exclusive handle on its own record, in the one
+        direction it is allowed to go.
 
-        'injecting' is written *before* the first key and is the point of no return:
-        from there the only honest outcomes are that it landed, or that nobody knows.
-        'rejected' is reachable only from 'claimed', so a question can never be
-        released for another try after something has been typed at it.
+        Reading the record, changing it and writing it back is not a compare-and-swap:
+        two passes can both read 'claimed' and both decide they may type. The record is
+        opened with no sharing, re-read through that handle, checked and written
+        through it, so the decision and the write are one indivisible step and only
+        the holder can make it.
+
+        'injecting' is the point of no return: from there the only honest outcomes are
+        that it landed, or that nobody knows. 'rejected' is reachable only from
+        'claimed', so a question can never be released for another try after something
+        has been typed at it.
+
+        Returns $true only when this call made the transition. A caller that gets
+        $false has not won it and must not type.
     #>
     param(
         [Parameter(Mandatory)][string]$SessionId,
         [Parameter(Mandatory)][AllowEmptyString()][string]$DecisionId,
         [Parameter(Mandatory)][ValidateSet('injecting', 'delivered', 'rejected', 'unknown')][string]$State,
-        [AllowEmptyString()][string]$Detail = ''
+        [AllowEmptyString()][string]$Detail = '',
+        # The one way back out of 'injecting', and only on the injector's own word
+        # that it never reached the keyboard. 'injecting' is set before the write
+        # because a crash during the write has to be visible afterwards, so a call
+        # that then fails before writing anything would otherwise be stuck as
+        # uncertain for ever. The assertion is the caller's and is named, rather than
+        # being a special case hidden inside the transition table.
+        [switch]$NothingWritten
     )
 
-    $record = Get-CopilotDecisionAttempt -SessionId $SessionId -DecisionId $DecisionId
-    if ($null -eq $record) { return $false }
-    $from = [string]$record.state
-    $allowed = switch ($State) {
-        'injecting' { $from -ceq 'claimed' }
-        'rejected'  { $from -ceq 'claimed' }
-        'delivered' { $from -cin @('claimed', 'injecting') }
-        'unknown'   { $from -cin @('claimed', 'injecting') }
-    }
-    if (-not $allowed) { return $false }
-
+    if ([string]::IsNullOrWhiteSpace($DecisionId)) { return $false }
     $path = Get-CopilotDecisionAttemptPath -SessionId $SessionId -DecisionId $DecisionId
-    $record | Add-Member -NotePropertyName state -NotePropertyValue $State -Force
-    $record | Add-Member -NotePropertyName detail -NotePropertyValue $Detail -Force
-    $record | Add-Member -NotePropertyName changedAt -NotePropertyValue ([DateTimeOffset]::Now.ToString('o')) -Force
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
+
+    $handle = $null
+    try { $handle = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
+    catch { return $false }
     try {
-        $staging = "$path.$([guid]::NewGuid().ToString('N').Substring(0, 8)).tmp"
-        [IO.File]::WriteAllText($staging, ($record | ConvertTo-Json -Depth 8 -Compress), [Text.UTF8Encoding]::new($false))
-        [IO.File]::Move($staging, $path, $true)
+        $reader = [IO.StreamReader]::new($handle, [Text.UTF8Encoding]::new($false), $false, 1024, $true)
+        $text = $reader.ReadToEnd()
+        $reader.Dispose()
+        $record = $null
+        try { $record = ConvertFrom-DecisionJson -Json $text } catch { return $false }
+        if ($null -eq $record -or -not $record.PSObject.Properties['state']) { return $false }
+        if (-not [StringComparer]::Ordinal.Equals([string]$record.decisionId, $DecisionId)) { return $false }
+
+        $from = [string]$record.state
+        $allowed = switch ($State) {
+            'injecting' { $from -ceq 'claimed' }
+            'rejected'  { $from -ceq 'claimed' -or ($from -ceq 'injecting' -and $NothingWritten.IsPresent) }
+            'delivered' { $from -cin @('claimed', 'injecting') }
+            'unknown'   { $from -cin @('claimed', 'injecting') }
+        }
+        if (-not $allowed) { return $false }
+
+        $record | Add-Member -NotePropertyName state -NotePropertyValue $State -Force
+        $record | Add-Member -NotePropertyName detail -NotePropertyValue $Detail -Force
+        $record | Add-Member -NotePropertyName changedAt -NotePropertyValue ([DateTimeOffset]::Now.ToString('o')) -Force
+        $bytes = [Text.UTF8Encoding]::new($false).GetBytes(($record | ConvertTo-Json -Depth 8 -Compress))
+        $handle.SetLength(0)
+        $handle.Position = 0
+        $handle.Write($bytes, 0, $bytes.Length)
+        $handle.Flush()
         return $true
     }
     catch {
         Write-DecisionBridgeLog -Message "could not advance a decision attempt: $($_.Exception.Message)"
         return $false
+    }
+    finally { if ($null -ne $handle) { $handle.Dispose() } }
+}
+
+function Start-CopilotDecisionAttempt {
+    <#
+        Wins the right to type at a question, and says what to type.
+
+        This is the barrier. It takes the attempt from 'claimed' to 'injecting' under
+        an exclusive handle, and hands back the answer **recorded in the claim** -
+        never the caller's own. A second pass that finds a claim left by a first used
+        to type its own input against somebody else's claim, which is two different
+        answers sharing one record of having been answered.
+
+        Returns { Started; Answer; Selections }. Started=$false means this call did not
+        win the barrier, and nothing may be typed - not a key.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$DecisionId
+    )
+
+    $idle = [pscustomobject]@{ Started = $false; Answer = ''; Selections = @() }
+    if ([string]::IsNullOrWhiteSpace($DecisionId)) { return $idle }
+    $record = Get-CopilotDecisionAttempt -SessionId $SessionId -DecisionId $DecisionId
+    if ($null -eq $record -or ([string]$record.state) -cne 'claimed') { return $idle }
+    if (-not (Set-CopilotDecisionAttemptState -SessionId $SessionId -DecisionId $DecisionId -State 'injecting')) {
+        return $idle
+    }
+    [pscustomobject]@{
+        Started    = $true
+        Answer     = [string]$record.answer
+        Selections = @($record.selections | ForEach-Object { [string]$_ })
     }
 }
 

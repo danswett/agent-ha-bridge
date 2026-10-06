@@ -498,6 +498,12 @@ function Send-CopilotSessionPrompt {
         Delivered = $false
         ProcessId = $null
         Detail = ''
+        # Whether anything was written to the console. Set at the write boundary, not
+        # worked out afterwards from the wording of a failure: once a key has gone
+        # nobody can say how much of the answer landed, and the difference between
+        # "nothing happened" and "something may have" is what decides whether the
+        # question may be answered again.
+        Wrote = $false
     }
 
     if ([string]::IsNullOrWhiteSpace($Text)) {
@@ -521,6 +527,9 @@ function Send-CopilotSessionPrompt {
     $clean = Get-CopilotInjectableText -Text $Text
 
     try {
+        # From here nobody can say how much landed, so it is recorded before the write
+        # rather than worked out afterwards from how it failed.
+        $result.Wrote = $true
         $outcome = Invoke-BridgeConsoleSend -ProcessId $targetPid -Text $clean `
             -Submit (-not $NoSubmit.IsPresent) -DelayMs $SubmitDelayMs
         $result.Detail = $outcome
@@ -733,7 +742,7 @@ function Send-CopilotSessionForm {
         [int]$ProcessId = 0
     )
 
-    $result = [pscustomobject]@{ Delivered = $false; ProcessId = $null; Detail = '' }
+    $result = [pscustomobject]@{ Delivered = $false; ProcessId = $null; Detail = ''; Wrote = $false }
 
     if ($Fields.Count -eq 0 -or $Selections.Count -ne $Fields.Count) {
         $result.Detail = "field/selection mismatch ($($Fields.Count)/$($Selections.Count))"
@@ -795,6 +804,7 @@ function Send-CopilotSessionForm {
             $failed = $false
             for ($k = 0; $k -lt $keys.Count; $k++) {
                 $isLast = ($k -eq ($keys.Count - 1))
+                $result.Wrote = $true
                 $r = Invoke-BridgeConsoleSend -ProcessId $targetPid -Text $keys[$k] -Submit $isLast -DelayMs $StepDelayMs
                 if (-not $r.StartsWith('ok')) { $outcome = "field${i}:$r"; $failed = $true; break }
                 if (-not $isLast) { Start-Sleep -Milliseconds $script:BridgeFormKeyGapMs }
@@ -851,6 +861,12 @@ function Send-CopilotSessionChoice {
         Delivered = $false
         ProcessId = $null
         Detail = ''
+        # Whether anything was written to the console. Set at the write boundary, not
+        # worked out afterwards from the wording of a failure: once a key has gone
+        # nobody can say how much of the answer landed, and the difference between
+        # "nothing happened" and "something may have" is what decides whether the
+        # question may be answered again.
+        Wrote = $false
     }
 
     if ([string]::IsNullOrWhiteSpace($Text)) {
@@ -872,6 +888,9 @@ function Send-CopilotSessionChoice {
     $downs = [Math]::Max(1, $ChoiceCount + 2)
 
     try {
+        # From here nobody can say how much landed, so it is recorded before the write
+        # rather than worked out afterwards from how it failed.
+        $result.Wrote = $true
         $outcome = Invoke-BridgeConsoleChoice -ProcessId $targetPid -DownCount $downs -Text $clean -StepDelayMs $StepDelayMs
         $result.Detail = $outcome
         $result.Delivered = $outcome.StartsWith('ok:')
