@@ -638,6 +638,16 @@ function Read-DaemonFormAnswer {
     $pressIsNew = $send.Pressed
     $pressedAt = $send.At
 
+    # A press made while the form was still incomplete is spent. It differs from the
+    # arm-time snapshot for ever, so without this, pressing Send early and then ticking
+    # the last option sent the answer on the next pass - the tap itself became the
+    # send, which is the one thing Send exists to prevent. Recorded per question, in
+    # the daemon's saved state, so a restart does not revive it.
+    $sessionEntry = $State[$sessionId]
+    $spentPress = "$([string]$marker.decisionId)|$pressedAt"
+    $spent = if ($sessionEntry.PSObject.Properties['IncompleteSubmit']) { [string]$sessionEntry.IncompleteSubmit } else { '' }
+    if ($pressIsNew -and $spent -ceq $spentPress) { $pressIsNew = $false }
+
     # Nothing to press. Said out loud once, because a card that cannot send looks
     # exactly like one being ignored. A button that is there and has merely never
     # been pressed is not this, and nor is one that could not be read this pass -
@@ -675,6 +685,8 @@ function Read-DaemonFormAnswer {
         }
         catch { }
         Write-DaemonLog -Message "submit pressed for $($sessionId.Substring(0,8)) with fields still unanswered"
+        if ($sessionEntry.PSObject.Properties['IncompleteSubmit']) { $sessionEntry.IncompleteSubmit = $spentPress }
+        else { $sessionEntry | Add-Member -NotePropertyName IncompleteSubmit -NotePropertyValue $spentPress -Force }
     }
 
     # Words typed at a question that cannot take them - a form with no free-text

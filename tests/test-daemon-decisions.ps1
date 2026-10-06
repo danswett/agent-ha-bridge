@@ -126,6 +126,17 @@ $script:Transient = @()
 Set-Form -Colour 'Blue' -Size 'Choose...' -Notes '' -Submit $armedAt.AddMinutes(1).ToString('o')
 Test-That 'a half-filled form is not sent' { (Read-DaemonFormAnswer -SessionId $sid -Marker $form -State $state -Headers $headers).Answer -eq '' }
 Test-That 'and the card says so, rather than the button looking broken' { $script:Transient -contains 'Not sent - answer every field' }
+# The early press stays different from the arm-time snapshot for ever, so it used to
+# send the form the moment the last field was ticked - the tap became the send.
+$earlyPress = $armedAt.AddMinutes(1).ToString('o')
+Set-Form -Colour 'Blue' -Size 'L' -Notes '' -Submit $earlyPress
+Test-That 'finishing the form after an early Send does not send it' {
+    (Read-DaemonFormAnswer -SessionId $sid -Marker $form -State $state -Headers $headers).Answer -eq ''
+}
+Set-Form -Colour 'Blue' -Size 'L' -Notes '' -Submit $armedAt.AddMinutes(2).ToString('o')
+Test-That 'pressing Send again then does' {
+    (Read-DaemonFormAnswer -SessionId $sid -Marker $form -State $state -Headers $headers).Answer -eq 'Blue + L + '
+}
 
 Set-Form -Colour 'Choose...' -Size 'Choose...' -Notes '' -Submit 'unknown' -Decision 'Cancel request'
 Test-That 'Cancel on the main selector cancels the form' { (Read-DaemonFormAnswer -SessionId $sid -Marker $form -State $state -Headers $headers).Answer -eq 'Cancel request' }
