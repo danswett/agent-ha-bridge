@@ -909,6 +909,19 @@ function Receive-DaemonSessionTransfer {
     $session = [string]$Entry.SessionId
     $owner = [string]$Entry.Slug
     $correlation = [guid]::NewGuid().ToString('N').Substring(0, 8)
+
+    # Before the subscription, not after the manifest. Without a secret the request this
+    # sends is unsigned, an updated source refuses it and clears it without replying, and
+    # the wait below then runs its full two minutes before reporting the source as busy
+    # or offline - which is a misleading answer to what is purely a local misconfiguration.
+    $transferSecret = Get-BridgeTransferSecret
+    if ([string]::IsNullOrEmpty($transferSecret)) {
+        Write-DaemonLog -Message 'transfer refused: no newSession.transferSecret is configured here'
+        Set-CopilotMqttNewSessionResult -Headers $Headers `
+            -Text 'Bringing sessions between machines needs a shared newSession.transferSecret, set to the same value on each machine. This one has none.' | Out-Null
+        return $null
+    }
+
     $root = Get-BridgeTransferTopic -Slug $script:DaemonMachineSlug -Correlation $correlation
     $staging = Join-Path ([IO.Path]::GetTempPath()) "bridge-recv-$correlation"
 
@@ -963,10 +976,6 @@ function Receive-DaemonSessionTransfer {
         # publish can satisfy it simply by naming the session that was asked for - and
         # then the bytes installed are theirs, resumed later by an agent with tool access
         # in an approved workspace. The digest proves integrity; only this proves origin.
-        $transferSecret = Get-BridgeTransferSecret
-        if ([string]::IsNullOrEmpty($transferSecret)) {
-            throw 'no newSession.transferSecret is configured here, so a transferred session cannot be authenticated'
-        }
         $presentedSig = if ($manifest.PSObject.Properties['sig']) { [string]$manifest.sig } else { '' }
         $expectedSig = Get-BridgeTransferSignature -Secret $transferSecret -Fields (
             Get-BridgeTransferManifestFields -SessionId ([string]$manifest.session) -Kind $declaredKind `

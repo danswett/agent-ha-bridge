@@ -689,11 +689,22 @@ Test-That 'a bundle signed by another fleet is refused' { $null -eq $got -and $s
 
 $script:Installed = @()
 $script:FakeSettings = @{}
+$script:Subscribed = 0
+$realSubscribe = ${function:Read-BridgeHaMqttSubscription}
+function Read-BridgeHaMqttSubscription { param($Topic, $TimeoutSeconds, $OnReady, $Until) $script:Subscribed++; @() }
 Set-ReplyManifest -Session $wanted -Kind 'copilot'
 $got = Receive-DaemonSessionTransfer -Entry $entry -WorkingDirectory 'C:\Users\dswett\repos' -Headers $headers -TimeoutSeconds 1
 Test-That 'with no secret here a transfer is refused rather than accepted unauthenticated' {
     $null -eq $got -and $script:Installed.Count -eq 0
 }
+Test-That 'and it refuses before subscribing, rather than waiting out the timeout' {
+    $script:Subscribed -eq 0
+}
+Test-That 'saying what is actually wrong, not that the other machine is offline' {
+    $last = @($script:Notes)[-1]
+    $last -like '*transferSecret*' -and $last -notlike '*busy or offline*'
+}
+${function:Read-BridgeHaMqttSubscription} = $realSubscribe
 $script:FakeSettings = @{ 'newSession.transferSecret' = $script:TransferSecret }
 
 Write-Host ''
