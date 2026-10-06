@@ -800,6 +800,34 @@ function Invoke-DaemonTransferRequest {
     # construction, and this one names the topic the transcript is published to.
     if ($requester -cnotmatch '^[a-z0-9_]+$') { return }
 
+    # Everything above checks the *shape* of a request. None of it establishes who sent
+    # it, and the topic is reachable by anything holding broker credentials - which on a
+    # normal instance is a much lower bar than Home Assistant admin. Without this a
+    # request is an instruction to bundle a session and publish it to a topic the
+    # requester names, which is the whole transcript plus checkpoints and files.
+    #
+    # Fail closed, both ways. No configured secret means no transfers rather than
+    # unauthenticated ones: sharing is off by default, so requiring a secret to turn it
+    # on costs nothing that was already working, and a silent downgrade to unsigned is
+    # exactly the failure this exists to remove.
+    $transferSecret = Get-BridgeTransferSecret
+    if ([string]::IsNullOrEmpty($transferSecret)) {
+        Write-DaemonLog -Message 'transfer refused: no newSession.transferSecret is configured, so requests cannot be authenticated'
+        $script:DaemonTransferServed = $correlation
+        try { Clear-CopilotMqttTransferRequest -Slug $script:DaemonMachineSlug -Headers $Headers } catch { }
+        return
+    }
+    $presented = if ($request.PSObject.Properties['sig']) { [string]$request.sig } else { '' }
+    $expected = Get-BridgeTransferSignature -Secret $transferSecret -Fields (
+        Get-BridgeTransferRequestFields -SessionId $session -Launcher $launcher `
+            -Requester $requester -Correlation $correlation -At ([string]$request.at))
+    if (-not (Test-BridgeTransferSignature -Presented $presented -Expected $expected)) {
+        Write-DaemonLog -Message "transfer refused: the request for $session was not signed by this fleet"
+        $script:DaemonTransferServed = $correlation
+        try { Clear-CopilotMqttTransferRequest -Slug $script:DaemonMachineSlug -Headers $Headers } catch { }
+        return
+    }
+
     # Deferred, not refused, and deliberately before the try: during startup
     # Restore-DaemonSessionCards reaches Sync-DaemonSessions while this list is still the
     # empty array it was initialised to - Sync-DaemonNewSession fills it moments later.
@@ -928,6 +956,24 @@ function Receive-DaemonSessionTransfer {
         $expectedKind = (Get-BridgeLauncher -Launcher ([string]$Entry.Launcher)).Kind
         if ([string]$manifest.session -cne $session -or $declaredKind -cne $expectedKind) {
             throw "that reply was for a different session - expected $session as $expectedKind, got $([string]$manifest.session) as $declaredKind"
+        }
+
+        # Who sent it, not merely what it claims to be. The session/kind check above stops
+        # a reply being redirected into another agent's home, but an attacker able to
+        # publish can satisfy it simply by naming the session that was asked for - and
+        # then the bytes installed are theirs, resumed later by an agent with tool access
+        # in an approved workspace. The digest proves integrity; only this proves origin.
+        $transferSecret = Get-BridgeTransferSecret
+        if ([string]::IsNullOrEmpty($transferSecret)) {
+            throw 'no newSession.transferSecret is configured here, so a transferred session cannot be authenticated'
+        }
+        $presentedSig = if ($manifest.PSObject.Properties['sig']) { [string]$manifest.sig } else { '' }
+        $expectedSig = Get-BridgeTransferSignature -Secret $transferSecret -Fields (
+            Get-BridgeTransferManifestFields -SessionId ([string]$manifest.session) -Kind $declaredKind `
+                -Sha256 ([string]$manifest.sha256) -Bytes ([int]$manifest.bytes) `
+                -Chunks ([int]$manifest.chunks) -Correlation $correlation)
+        if (-not (Test-BridgeTransferSignature -Presented $presentedSig -Expected $expectedSig)) {
+            throw "that session was not signed by this fleet, so it was refused before anything was written"
         }
 
         $declared = [int]$manifest.bytes

@@ -3175,6 +3175,104 @@ function Join-BridgeBundleChunk {
     $bytes
 }
 
+function Get-BridgeTransferSecret {
+    <#
+        The shared secret every machine in a fleet must hold for transfers to work, or
+        an empty string when none is configured.
+
+        A transfer rides ordinary MQTT topics. Anything holding broker credentials can
+        publish to them, and on a normal home instance that is a much lower bar than
+        Home Assistant admin - Frigate, Zigbee2MQTT, ESPHome and the rest all clear it.
+        Without a secret, "can publish MQTT" is also "can ask any machine for any
+        session it offers, and have it delivered to a topic of my choosing".
+
+        A broker ACL was considered first and rejected: mosquitto's ACL file is
+        allow-only with no deny rule, so restricting one prefix means enumerating every
+        topic every other client legitimately uses, on an instance where an MQTT mistake
+        has already taken the whole fleet offline once. Signing makes the protocol not
+        care who else can reach the transport, which is the right shape for a transport
+        that was never trusted.
+    #>
+    $secret = [string](Get-BridgeSetting 'newSession.transferSecret' '')
+    $secret.Trim()
+}
+
+function Get-BridgeTransferSignature {
+    <#
+        An HMAC-SHA256 over the fields that decide what a transfer does, hex encoded.
+
+        Canonicalised by joining the named values with a separator that cannot appear in
+        any of them, rather than by hashing serialised JSON: property order is not
+        guaranteed across PowerShell versions, and a signature that depends on it would
+        start failing on an upgrade with no visible cause.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Fields,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Secret
+    )
+
+    if ([string]::IsNullOrEmpty($Secret)) { return '' }
+    $payload = (@($Fields) -join "`u{001f}")
+    $mac = [System.Security.Cryptography.HMACSHA256]::new([Text.Encoding]::UTF8.GetBytes($Secret))
+    try {
+        [BitConverter]::ToString($mac.ComputeHash([Text.Encoding]::UTF8.GetBytes($payload))).Replace('-', '').ToLowerInvariant()
+    }
+    finally { $mac.Dispose() }
+}
+
+function Test-BridgeTransferSignature {
+    <#
+        Whether a presented signature matches, in constant time.
+
+        Ordinary -eq on strings returns as soon as it finds a difference, which leaks
+        how much of a guess was right. The amount leaked over MQTT is small, but a
+        fixed-time comparison costs nothing and removes the question.
+    #>
+    param(
+        [AllowEmptyString()][AllowNull()][string]$Presented,
+        [AllowEmptyString()][AllowNull()][string]$Expected
+    )
+
+    if ([string]::IsNullOrEmpty($Expected) -or [string]::IsNullOrEmpty($Presented)) { return $false }
+    $a = [Text.Encoding]::UTF8.GetBytes($Presented)
+    $b = [Text.Encoding]::UTF8.GetBytes($Expected)
+    if ($a.Length -ne $b.Length) { return $false }
+    $difference = 0
+    for ($i = 0; $i -lt $a.Length; $i++) { $difference = $difference -bor ($a[$i] -bxor $b[$i]) }
+    $difference -eq 0
+}
+
+function Get-BridgeTransferRequestFields {
+    <# Exactly what a request signature covers, in one place so both sides agree. #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][string]$Launcher,
+        [Parameter(Mandatory)][string]$Requester,
+        [Parameter(Mandatory)][string]$Correlation,
+        [Parameter(Mandatory)][string]$At
+    )
+    # The requester and the correlation are in here deliberately: they name the topic the
+    # transcript is published to, so an unsigned one would let a valid request be
+    # replayed with the destination changed.
+    @('transfer-request-v1', $SessionId, $Launcher, $Requester, $Correlation, $At)
+}
+
+function Get-BridgeTransferManifestFields {
+    <# Exactly what a manifest signature covers, in one place so both sides agree. #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][string]$Kind,
+        [Parameter(Mandatory)][string]$Sha256,
+        [Parameter(Mandatory)][int]$Bytes,
+        [Parameter(Mandatory)][int]$Chunks,
+        [Parameter(Mandatory)][string]$Correlation
+    )
+    # The digest is in here, which is what carries the signature down to the bytes: the
+    # chunks themselves are not signed individually, but a chunk set that does not hash
+    # to this digest is already refused by Join-BridgeBundleChunk.
+    @('transfer-manifest-v1', $SessionId, $Kind, $Sha256, [string]$Bytes, [string]$Chunks, $Correlation)
+}
+
 function Get-BridgeTransferTopic {
     <#
         Where one transfer's messages live: a topic per transfer, under the owning
@@ -3215,6 +3313,10 @@ function Send-BridgeSessionBundle {
     $bytes = [IO.File]::ReadAllBytes([string]$Manifest.Path)
     $chunks = @(Get-BridgeBundleChunk -Bytes $bytes -Topic "$root/c" -Budget $Budget)
 
+    $signature = Get-BridgeTransferSignature -Secret (Get-BridgeTransferSecret) -Fields (
+        Get-BridgeTransferManifestFields -SessionId ([string]$Manifest.SessionId) -Kind ([string]$Manifest.Kind) `
+            -Sha256 ([string]$Manifest.Sha256) -Bytes ([int]$Manifest.Bytes) -Chunks $chunks.Count -Correlation $Correlation)
+
     Publish-CopilotMqttMessage -Topic "$root/manifest" -Headers $Headers -Payload (@{
         session  = [string]$Manifest.SessionId
         launcher = [string]$Manifest.Launcher
@@ -3223,6 +3325,7 @@ function Send-BridgeSessionBundle {
         sha256   = [string]$Manifest.Sha256
         chunks   = $chunks.Count
         version  = [string]$Manifest.Version
+        sig      = $signature
     } | ConvertTo-Json -Compress)
 
     foreach ($chunk in $chunks) {
