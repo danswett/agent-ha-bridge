@@ -198,13 +198,25 @@ Test-That 'a question whose answer channels cannot be read is not shown' {
     $null -eq $shown -and $script:Published -eq 0
 } "published=$($script:Published)"
 $script:Published = 0
+$script:TapAttrs = @()
 Test-That 'but one nothing would re-arm can still be shown when asked to' {
     function Get-CopilotDecisionChannelObservation { param($EntityId, $Headers) [pscustomobject]@{ State = 'unknown'; Value = '' } }
-    function Publish-CopilotMqttMessage { param([string]$Topic, [string]$Payload, [hashtable]$Headers, [switch]$Retain) $script:Published++ }
+    function Publish-CopilotMqttMessage { param([string]$Topic, [string]$Payload, [hashtable]$Headers, [switch]$Retain)
+        $script:Published++
+        if ($Topic -match '/decision/attr$') { $script:TapAttrs += ($Payload | ConvertFrom-Json) }
+    }
     $shown = Set-CopilotMqttDecision -SessionId '0dd0e000-2222-4000-8000-0000000000cc' -SessionName 'Codex: approve' `
-        -Machine 'BOX' -Question 'Run it?' -Choices @('Approve', 'Deny') -Fields @() -DecisionId 'approval' -Headers $headers -PublishWithoutBaseline
+        -Machine 'BOX' -Question 'Run it?' -Choices @('Approve', 'Deny') -Fields @() -DecisionId 'approval' -Headers $headers `
+        -PublishWithoutBaseline -AnswerOnTap
     $null -ne $shown -and $script:Published -gt 0
 } "published=$($script:Published)"
+# The card draws Send from this attribute alone. Without it an approval showed a Send
+# the daemon never reads - it acts on Approve or Deny the moment it sees either - so
+# the tap somebody made meaning to review it first had already approved the command.
+Test-That 'and it says the tap is the answer, so no Send is drawn beside it' {
+    $a = @($script:TapAttrs)
+    $a.Count -eq 1 -and $null -ne $a[0].PSObject.Properties['answer_on_tap'] -and [bool]$a[0].answer_on_tap
+} "attrs=[$(@($script:TapAttrs) | ForEach-Object { $_.PSObject.Properties.Name -join ',' })]"
 
 Write-Host '--- the question the bridge armed ---'
 Test-That 'the decision selector carries only Cancel, so the fields are the answer' {
@@ -218,6 +230,9 @@ Test-That 'and the headings ride on the decision attributes' {
     $a = $script:HaStates["select.${node}_decision"].attributes
     $a['field_1_label'] -eq 'Approach' -and $a['field_2_label'] -eq 'When'
 }
+Test-That 'an ordinary question says nothing about taps, so it keeps its Send' {
+    -not $script:HaStates["select.${node}_decision"].attributes.Contains('answer_on_tap')
+} "[$(@($script:HaStates["select.${node}_decision"].attributes.Keys) -join ',')]"
 
 # --- 2. the card config the dashboard really generates ----------------------------
 

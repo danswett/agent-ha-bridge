@@ -1844,12 +1844,18 @@ function Set-CopilotMqttDecision {
         [Parameter(Mandatory)]
         [hashtable]$Headers,
 
-        # Publish even when the answer channels could not be read first. Only for a
+        # Published even when the answer channels could not be read first. Only for a
         # question nothing will re-arm later - a Codex approval, answered by its own
         # Approve/Deny tap rather than through Send or the reply card - because for
         # everything else an unshown question is retried by the daemon, and a shown
         # one without a snapshot cannot tell an answer from what was already there.
-        [switch]$PublishWithoutBaseline
+        [switch]$PublishWithoutBaseline,
+
+        # The tap is the answer, so the card must not offer Send beside it. Separate
+        # from -PublishWithoutBaseline, which happens to be set by the same caller
+        # today: one is about what the daemon can verify, the other about what the
+        # card draws, and a later question could want either on its own.
+        [switch]$AnswerOnTap
     )
 
     [void](Get-DecisionSchemaFieldChoices -Field ([pscustomobject]@{ enum = @($Choices) }))
@@ -1959,6 +1965,12 @@ function Set-CopilotMqttDecision {
         machine = $Machine
         asked_at = [DateTimeOffset]::Now.ToString('o')
     }
+    # Whether the tap itself is the answer. A Codex approval is published without the
+    # snapshot Send is checked against, so the daemon cannot honour a press and never
+    # looks for one; drawing Send there offered a confirmation that did not exist, and
+    # invited exactly the accidental approval it looked like it prevented. A card old
+    # enough not to know this attribute goes on drawing Send, as it did before.
+    if ($AnswerOnTap) { $questionAttrs['answer_on_tap'] = $true }
     # Field labels ride on the decision attributes so the dashboard can name each
     # dropdown after its field without rebuilding the whole Lovelace config.
     if ($usesFieldSlots) {

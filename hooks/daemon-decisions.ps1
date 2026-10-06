@@ -950,7 +950,20 @@ function Invoke-DaemonDecisionAnswer {
         }
         return $false
     }
-    if ($null -eq (Get-CopilotDecisionAttempt -SessionId $SessionId -DecisionId $decisionId)) {
+    # A record left rejected is released first. A rejection means nothing was typed, so
+    # the question is answerable again - but the record is exactly what stops that: no
+    # new claim is made while one exists, and the barrier below only moves a claim to
+    # 'injecting', never a rejection. The delete that follows a rejection is not enough
+    # on its own, because a daemon that stops in between leaves it, and the rejection
+    # taken when a claimed question has changed never deleted it at all.
+    $existing = Get-CopilotDecisionAttempt -SessionId $SessionId -DecisionId $decisionId
+    if ($null -ne $existing -and ([string]$existing.state) -ceq 'rejected') {
+        if (Remove-CopilotDecisionRejectedAttempt -SessionId $SessionId -DecisionId $decisionId) {
+            Write-DaemonLog -Message "released a rejected attempt for $short; the question can be answered again"
+            $existing = Get-CopilotDecisionAttempt -SessionId $SessionId -DecisionId $decisionId
+        }
+    }
+    if ($null -eq $existing) {
         [void](New-CopilotDecisionAttempt -SessionId $SessionId -DecisionId $decisionId `
             -Answer $Answer -Selections ([string[]]@($Selections)) `
             -IsChoice $IsChoice -IsFreeText $IsFreeText -PayloadStamp $PayloadStamp `
@@ -1078,13 +1091,12 @@ function Invoke-DaemonDecisionAnswer {
         else {
             # Nothing was typed, so the question is answerable again - and the record
             # goes with it, through the transition rather than around it. If the
-            # transition is refused the record stays exactly as it is.
+            # transition is refused the record stays exactly as it is. The delete is
+            # only the fast path: a record that survives this is released on a later
+            # pass, which is what keeps a daemon stopping here from stranding it.
             if ($null -ne (Set-CopilotDecisionAttemptState -SessionId $SessionId -DecisionId $decisionId `
                     -State 'rejected' -Detail $detail -NothingWritten)) {
-                $attemptPath = Get-CopilotDecisionAttemptPath -SessionId $SessionId -DecisionId $decisionId
-                if (Test-Path -LiteralPath $attemptPath) {
-                    Remove-Item -LiteralPath $attemptPath -Force -ErrorAction SilentlyContinue
-                }
+                [void](Remove-CopilotDecisionRejectedAttempt -SessionId $SessionId -DecisionId $decisionId)
             }
             else {
                 Write-DaemonLog -Message "could not release the attempt for $short; leaving it settled"

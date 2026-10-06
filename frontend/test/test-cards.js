@@ -98,9 +98,10 @@ console.log('--- answering ---');
 const SUBMIT = 'button.agent_bridge_abc_submit';
 const CANCEL_ROW = 'Cancel request';
 
-function hassFor(state, options, { defer = false, reject = false } = {}) {
+function hassFor(state, options, { defer = false, reject = false, attrs = undefined } = {}) {
   const calls = [];
-  const states = { [DECISION]: { state, attributes: options === undefined ? {} : { options } } };
+  const base = options === undefined ? {} : { options };
+  const states = { [DECISION]: { state, attributes: Object.assign(base, attrs || {}) } };
   const env = {
     calls,
     states,
@@ -172,6 +173,33 @@ check('Send answer sits above it, because that is the row being looked for',
   labels(card).indexOf('Send answer') < labels(card).indexOf(CANCEL_ROW), labels(card).join('|'));
 rows(card)[0].click();
 check('so a tap behind a cancel sends nothing more', env.calls.length === 1, JSON.stringify(env.calls));
+
+console.log('--- a question the tap itself answers ---');
+// A Codex approval is published without the snapshot a press is checked against, so
+// the daemon acts on Approve or Deny the moment it sees it and never looks for a
+// press. Drawing Send beside that offered a confirmation step that did not exist:
+// the command was already approved by the tap somebody made meaning to review it.
+const tapOnly = newCard(undefined, SUBMIT);
+const tapOnlyEnv = hassFor('Awaiting answer...', ['Awaiting answer...', 'Approve', 'Deny'],
+  { attrs: { answer_on_tap: true } });
+tapOnlyEnv.card = tapOnly;
+tapOnly.hass = tapOnlyEnv.hass;
+check('an approval still offers both choices',
+  labels(tapOnly).join('|') === 'Approve|Deny', labels(tapOnly).join('|'));
+check('but no Send answer beside them, because the tap is the answer',
+  !labels(tapOnly).includes('Send answer'), labels(tapOnly).join('|'));
+rows(tapOnly)[0].click();
+check('and the tap still sets the selector, which is what the daemon reads',
+  tapOnlyEnv.calls.length === 1 && tapOnlyEnv.calls[0].domain === 'select' &&
+  tapOnlyEnv.calls[0].data.option === 'Approve', JSON.stringify(tapOnlyEnv.calls));
+// The attribute is what does this, not the options happening to read Approve/Deny:
+// a question that really is answered with Send must keep it whatever it offers.
+const sendOnSame = newCard(undefined, SUBMIT);
+const sendOnSameEnv = hassFor('Awaiting answer...', ['Awaiting answer...', 'Approve', 'Deny']);
+sendOnSameEnv.card = sendOnSame;
+sendOnSame.hass = sendOnSameEnv.hass;
+check('the same options without the attribute are still sent with Send',
+  labels(sendOnSame).includes('Send answer'), labels(sendOnSame).join('|'));
 
 // The daemon clears the question, which is what releases the card for the next one.
 card.hass = hassFor('Idle', ['Idle']).hass;

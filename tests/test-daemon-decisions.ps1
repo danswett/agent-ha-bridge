@@ -518,6 +518,36 @@ Test-That 'the barrier hands back the claim''s own answer, not the caller''s' {
 Test-That 'and a second pass cannot win the barrier behind the first' {
     (Start-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'a8').Started -eq $false
 }
+# A rejection says nothing was typed, so the question is answerable again - but the
+# record is exactly what stops that, since no new claim can be made while one exists
+# and the barrier only ever moves a claim to injecting. Left behind by a daemon that
+# stopped before deleting it, or by the rejection taken when a claimed question turns
+# out to have changed, it made the question permanently unanswerable in silence.
+Test-That 'a rejected record left behind blocks the barrier, which is why it is released' {
+    [void](New-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'a9' -Answer 'Yes')
+    [void](Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a9' -State 'rejected')
+    (Start-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'a9').Started -eq $false
+}
+Test-That 'releasing it lets the question be claimed and answered again' {
+    (Remove-CopilotDecisionRejectedAttempt -SessionId $attemptSid -DecisionId 'a9') -and
+    $null -eq (Get-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'a9') -and
+    (New-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'a9' -Answer 'No') -and
+    (Start-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'a9').Answer -ceq 'No'
+}
+Test-That 'but a claim somebody may be acting on is never released' {
+    [void](New-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'a10' -Answer 'Yes')
+    -not (Remove-CopilotDecisionRejectedAttempt -SessionId $attemptSid -DecisionId 'a10') -and
+    $null -ne (Get-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'a10')
+}
+Test-That 'nor is one whose answer may already have reached the terminal' {
+    [void](Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a10' -State 'injecting')
+    [void](Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a10' -State 'unknown')
+    -not (Remove-CopilotDecisionRejectedAttempt -SessionId $attemptSid -DecisionId 'a10') -and
+    (Test-CopilotDecisionAttemptSettled -SessionId $attemptSid -DecisionId 'a10').Settled
+}
+Test-That 'and a question with no record at all needs no releasing' {
+    Remove-CopilotDecisionRejectedAttempt -SessionId $attemptSid -DecisionId 'a11'
+}
 
 Write-Host '--- the dispatcher itself, against a ledger on disk ---'
 # Not the helpers in isolation: the thing that decides whether keys are typed is
@@ -622,6 +652,24 @@ Test-That 'and the next pass really does try again' {
     [void](Invoke-Dispatch)
     $script:Typed.Count -eq 2
 } "state=$(Get-DispState)"
+
+# The same rejection, but the record outlived it - a daemon that stopped between the
+# transition and the delete, or a delete that failed. The question was answerable and
+# nothing had been typed, yet nothing could ever claim it again: the barrier only moves
+# a claim to injecting, so every later pass lost it in silence.
+Remove-CopilotDecisionMarker -SessionId $dispSid -DecisionId 'disp1'
+$script:Outcome = @{ Delivered = $true; Detail = 'ok:form'; Wrote = $true }
+[void](New-CopilotDecisionAttempt -SessionId $dispSid -DecisionId 'disp1' -Answer 'Auth' -Selections @('Auth') `
+    -IsChoice $true -FieldShape (Get-CopilotDecisionFieldShape -Fields @($dispMarker.fields)))
+[void](Set-CopilotDecisionAttemptState -SessionId $dispSid -DecisionId 'disp1' -State 'rejected')
+Test-That 'a rejected record left behind does not strand the question for ever' {
+    $script:Typed.Clear()
+    $r = Invoke-Dispatch -Answer 'Billing' -Sel @('Billing')
+    $r -and $script:Typed.Count -eq 1
+} "typed=$($script:Typed.Count) state=$(Get-DispState)"
+Test-That 'and what it types is the answer on the card now, not the rejected one' {
+    (@($script:Typed[0].Selections) -join '|') -eq 'Billing'
+} "typed=[$(@($script:Typed | ForEach-Object { @($_.Selections) -join ',' }) -join '|')]"
 
 # The partial form: it wrote, it failed, and the text route must not type on top.
 Remove-CopilotDecisionMarker -SessionId $dispSid -DecisionId 'disp1'

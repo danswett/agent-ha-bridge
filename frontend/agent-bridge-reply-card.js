@@ -23,7 +23,7 @@
  * uploaded image these sit in the sensor's attributes.
  */
 
-const CARD_VERSION = '1.23.0';
+const CARD_VERSION = '1.24.0';
 
 /*
  * How large a non-image attachment may be.
@@ -1164,7 +1164,13 @@ class AgentBridgeChoicesCard extends HTMLElement {
     // shape. Cancel is not one of those: withdrawing a question is its own act.
     const commits = fields.length > 0 ||
       !!(decision && decision.options.some((o) => o !== CHOICE_CANCEL));
-    const sends = !!(this._config.submit && commits);
+    // Unless the tap is itself the answer. A Codex approval is published without the
+    // snapshot a press is checked against, so the daemon acts on Approve or Deny the
+    // moment it sees it and never looks for a press. Drawing Send beside that offered
+    // a confirmation step that did not exist: the command was already approved by the
+    // tap somebody made expecting to review it first.
+    const tapAnswers = decisionAttrs.answer_on_tap === true;
+    const sends = !!(this._config.submit && commits && !tapAnswers);
 
     const show = groups.length > 0;
     this.hidden = !show;

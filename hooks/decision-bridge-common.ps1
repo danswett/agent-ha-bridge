@@ -2831,6 +2831,59 @@ function Set-CopilotDecisionAttemptState {
     }
 }
 
+function Remove-CopilotDecisionRejectedAttempt {
+    <#
+        Deletes an attempt record that was rejected, so its question can be claimed
+        again. Returns $true when no rejected record is left in the way.
+
+        A rejection means nothing reached the keyboard, so the question is answerable
+        again - but the record itself is what stops that happening. No new claim is
+        made while one exists, because the claim is the file's creation and a Move
+        onto an existing path fails; and the barrier only ever moves a claim to
+        'injecting', never a rejection. So a rejected record that outlives its
+        rejection leaves the question permanently unanswerable, with nothing typed and
+        nothing to say why.
+
+        Deleting it at the point of rejection is not enough on its own. A daemon that
+        stops between the transition and the delete leaves it, a delete that simply
+        fails leaves it, and the rejection taken when a claimed question turns out to
+        have changed never deleted it at all.
+
+        Under the same exclusive handle the transitions take, and only when the record
+        really is rejected: anything else is a claim somebody else may be acting on,
+        or an answer that may already have reached the terminal.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$DecisionId
+    )
+
+    if ([string]::IsNullOrWhiteSpace($DecisionId)) { return $false }
+    $path = Get-CopilotDecisionAttemptPath -SessionId $SessionId -DecisionId $DecisionId
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $true }
+
+    $handle = $null
+    try {
+        $handle = [IO.FileStream]::new("$path.lock", [IO.FileMode]::OpenOrCreate, [IO.FileAccess]::ReadWrite,
+            [IO.FileShare]::None, 1, [IO.FileOptions]::DeleteOnClose)
+    }
+    catch { return $false }
+    try {
+        $record = $null
+        try { $record = ConvertFrom-DecisionJson -Json ([IO.File]::ReadAllText($path)) } catch { return $false }
+        if ($null -eq $record -or -not $record.PSObject.Properties['state']) { return $false }
+        if (-not [StringComparer]::Ordinal.Equals([string]$record.decisionId, $DecisionId)) { return $false }
+        if (([string]$record.state) -cne 'rejected') { return $false }
+        Remove-Item -LiteralPath $path -Force
+        $true
+    }
+    catch {
+        Write-DecisionBridgeLog -Message "could not release a rejected decision attempt: $($_.Exception.Message)"
+        return $false
+    }
+    finally { if ($null -ne $handle) { $handle.Dispose() } }
+}
+
 function Start-CopilotDecisionAttempt {
     <#
         Wins the right to type at a question, and says exactly what to do.
