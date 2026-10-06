@@ -5,6 +5,7 @@
         'tests\test-auth-backoff.ps1'
         'tests\test-bridge-adapter.ps1'
         'tests\test-choices-form.ps1'
+        'tests\test-control-policy.ps1'
         'tests\test-copilot-activity.ps1'
         'tests\test-daemon-agents.ps1'
         'tests\test-daemon-decisions.ps1'
