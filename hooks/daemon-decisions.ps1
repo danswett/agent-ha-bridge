@@ -808,6 +808,36 @@ function Invoke-DaemonDecisionAnswer {
     $processId = Get-DaemonSessionProcessId -SessionId $SessionId
     $deliveredSelections = @()
 
+    # One attempt per question, claimed before a key is typed.
+    #
+    # Typing into the console and recording "answered" on the marker are two separate
+    # writes, and a daemon that stops between them leaves a question whose marker says
+    # nothing happened while the terminal may already have the answer. The next pass
+    # would read the card and type it again. The claim is what makes that state
+    # nameable; the states after it are what stop the second attempt.
+    $decisionId = if ($null -ne $Marker -and $Marker.PSObject.Properties['decisionId']) { [string]$Marker.decisionId } else { '' }
+    $settled = Test-CopilotDecisionAttemptSettled -SessionId $SessionId -DecisionId $decisionId
+    if ($settled.Settled) {
+        Write-DaemonLog -Message "not answering $short again: $($settled.Reason) (attempt $($settled.State))"
+        try {
+            Set-DaemonTransientActivity -SessionId $SessionId -Summary 'Not sent - this question was already answered' `
+                -Extra @{ hint = $settled.Reason } -Headers $Headers | Out-Null
+        }
+        catch {
+            if (Test-DaemonMarkedGuardError -ErrorRecord $_) { throw }
+        }
+        return $false
+    }
+    if (-not [string]::IsNullOrWhiteSpace($decisionId) -and
+        $null -eq (Get-CopilotDecisionAttempt -SessionId $SessionId -DecisionId $decisionId)) {
+        if (-not (New-CopilotDecisionAttempt -SessionId $SessionId -DecisionId $decisionId `
+                -Answer $Answer -Selections ([string[]]@($Selections)))) {
+            Write-DaemonLog -Message "could not claim the attempt for $short; not typing anything"
+            return $false
+        }
+    }
+    [void](Set-CopilotDecisionAttemptState -SessionId $SessionId -DecisionId $decisionId -State 'injecting')
+
     if ($IsChoice -and $IsFreeText) {
         # Typed, not chosen. The prompt's own "Other (type your answer)" entry is the
         # only way words get into an arrow-key option list, and hunting for the text
@@ -877,14 +907,35 @@ function Invoke-DaemonDecisionAnswer {
         }
         catch { }
         Write-DaemonLog -Message "decision answer injected to $short (pid $($delivery.ProcessId)): $($delivery.Detail)"
+        [void](Set-CopilotDecisionAttemptState -SessionId $SessionId -DecisionId $decisionId `
+            -State 'delivered' -Detail ([string]$delivery.Detail))
     }
     else {
+        # A failure that never reached the keyboard can be tried again; one that may
+        # have typed part of an answer cannot, because nobody can say how much landed.
+        # The injector names the first kind exactly, so they are listed rather than
+        # guessed at, and anything not on the list is treated as unknown.
+        $detail = [string]$delivery.Detail
+        $neverStarted = $detail -ceq 'empty text' -or $detail -ceq 'no live process for session' -or
+            $detail -cmatch '^field/selection mismatch'
+        [void](Set-CopilotDecisionAttemptState -SessionId $SessionId -DecisionId $decisionId `
+            -State $(if ($neverStarted) { 'rejected' } else { 'unknown' }) -Detail $detail)
+        if ($neverStarted) {
+            # Nothing was typed, so the question is answerable again - and the attempt
+            # record has to go with it or the next pass would refuse on a stale claim.
+            $attemptPath = Get-CopilotDecisionAttemptPath -SessionId $SessionId -DecisionId $decisionId
+            if (-not [string]::IsNullOrWhiteSpace($decisionId) -and (Test-Path -LiteralPath $attemptPath)) {
+                Remove-Item -LiteralPath $attemptPath -Force -ErrorAction SilentlyContinue
+            }
+        }
         try {
             Set-DaemonTransientActivity -SessionId $SessionId -Summary 'Answer NOT sent' `
-                -Extra @{ error = [string]$delivery.Detail } -Headers $Headers
+                -Extra @{ error = $detail
+                    hint = $(if ($neverStarted) { 'nothing reached the terminal' } else { 'part of it may have reached the terminal - check there' }) } `
+                -Headers $Headers
         }
         catch { }
-        Write-DaemonLog -Message "decision answer injection FAILED for $short : $($delivery.Detail)"
+        Write-DaemonLog -Message "decision answer injection FAILED for $short : $detail (attempt $(if ($neverStarted) { 'rejected' } else { 'unknown' }))"
     }
     $delivery.Delivered
 }
