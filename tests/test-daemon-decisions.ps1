@@ -410,6 +410,71 @@ function Get-HomeAssistantState {
     [pscustomobject]@{ state = [string]$v; attributes = [pscustomobject]@{ question = 'Pick' } }
 }
 
+Write-Host '--- one attempt at a question, and never a second ---'
+# Typing into the console and recording "answered" are two writes. A daemon that stops
+# between them leaves a marker saying nothing happened while the terminal may already
+# have the answer, and the next pass used to read the card and type it again.
+$attemptSid = '11111111-0000-4000-8000-0000000000a7'
+Test-That 'claiming is the file''s creation, so only the first claim wins' {
+    $first = New-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'a1' -Answer 'Yes'
+    $second = New-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'a1' -Answer 'No'
+    $kept = Get-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'a1'
+    $first -and -not $second -and [string]$kept.answer -ceq 'Yes' -and [string]$kept.state -ceq 'claimed'
+}
+Test-That 'a claim on its own does not settle the question, because nothing was typed' {
+    -not (Test-CopilotDecisionAttemptSettled -SessionId $attemptSid -DecisionId 'a1').Settled
+}
+Test-That 'once it is being typed the question is settled, and says why' {
+    [void](Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a1' -State 'injecting')
+    $s = Test-CopilotDecisionAttemptSettled -SessionId $attemptSid -DecisionId 'a1'
+    $s.Settled -and $s.State -ceq 'injecting' -and $s.Reason -match 'did not finish'
+}
+# This is the crash: stopped after the keys began and before anything was recorded.
+Test-That 'a question left mid-typing is never released for another go' {
+    (Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a1' -State 'rejected') -eq $false -and
+    (Test-CopilotDecisionAttemptSettled -SessionId $attemptSid -DecisionId 'a1').Settled
+}
+Test-That 'but it can be resolved either way' {
+    (Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a1' -State 'unknown') -and
+    (Test-CopilotDecisionAttemptSettled -SessionId $attemptSid -DecisionId 'a1').Reason -match 'may already have reached'
+}
+Test-That 'and once it is unknown it stays unknown rather than being retried' {
+    (Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a1' -State 'injecting') -eq $false -and
+    (Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a1' -State 'rejected') -eq $false
+}
+Test-That 'a failure that never reached the keyboard leaves the question answerable' {
+    [void](New-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'a2' -Answer 'Yes')
+    (Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a2' -State 'rejected') -and
+    -not (Test-CopilotDecisionAttemptSettled -SessionId $attemptSid -DecisionId 'a2').Settled
+}
+Test-That 'a delivered question is settled' {
+    [void](New-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'a3' -Answer 'Yes')
+    [void](Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a3' -State 'injecting')
+    [void](Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a3' -State 'delivered')
+    (Test-CopilotDecisionAttemptSettled -SessionId $attemptSid -DecisionId 'a3').Reason -match 'already been answered'
+}
+Test-That 'a question nobody has attempted is not settled' {
+    -not (Test-CopilotDecisionAttemptSettled -SessionId $attemptSid -DecisionId 'never').Settled
+}
+Test-That 'an attempt is never read against a different question' {
+    $path = Get-CopilotDecisionAttemptPath -SessionId $attemptSid -DecisionId 'a4'
+    [IO.File]::WriteAllText($path, '{"decisionId":"somebody-else","state":"injecting"}')
+    $null -eq (Get-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'a4') -and
+    -not (Test-CopilotDecisionAttemptSettled -SessionId $attemptSid -DecisionId 'a4').Settled
+}
+Test-That 'retiring a question takes its attempt with it, so the next one starts clean' {
+    [void](New-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'a5' -Answer 'Yes')
+    [void](Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a5' -State 'injecting')
+    Remove-CopilotDecisionMarker -SessionId $attemptSid -DecisionId 'a5'
+    $null -eq (Get-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'a5')
+}
+Test-That 'and retiring the session takes every attempt it left' {
+    [void](New-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'a6' -Answer 'Yes')
+    Remove-CopilotDecisionMarker -SessionId $attemptSid -AllBaselines
+    $null -eq (Get-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'a6') -and
+    $null -eq (Get-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'a3')
+}
+
 Write-Host '--- one pass over the pending questions ---'
 $script:Injected = @(); $script:Cleared = @(); $script:Removed = @()
 $script:Marker = $null

@@ -2649,6 +2649,150 @@ function Get-CopilotDecisionChannelObservation {
     [pscustomobject]@{ State = 'present'; Value = $value; Snapshot = $state; Exists = $true }
 }
 
+function Get-CopilotDecisionAttemptPath {
+    <# Where one question's injection attempt is recorded, beside its baseline. #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][string]$DecisionId
+    )
+
+    (Get-CopilotDecisionBaselinePath -SessionId $SessionId -DecisionId $DecisionId) -replace '\.json$', '.attempt.json'
+}
+
+function New-CopilotDecisionAttempt {
+    <#
+        Claims the one attempt at answering a question, before a single key is typed.
+
+        Writing to the console and recording "answered" on the marker are not one
+        transaction. A daemon that stops between them leaves a question whose marker
+        says nothing happened and whose terminal may already have the answer - and the
+        next pass reads the card again and types it a second time. Claiming first is
+        what makes that state nameable instead of invisible.
+
+        The claim is the file's creation, so it is atomic and the first claimant wins.
+        Returns $true only if this call is the claimant.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$DecisionId,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Answer,
+        [AllowNull()][AllowEmptyCollection()][string[]]$Selections = @()
+    )
+
+    if ([string]::IsNullOrWhiteSpace($DecisionId)) { return $false }
+    $path = Get-CopilotDecisionAttemptPath -SessionId $SessionId -DecisionId $DecisionId
+    $json = @{
+        decisionId = $DecisionId
+        state      = 'claimed'
+        answer     = $Answer
+        selections = @($Selections)
+        claimedAt  = [DateTimeOffset]::Now.ToString('o')
+    } | ConvertTo-Json -Depth 8 -Compress
+
+    try {
+        $directory = [IO.Path]::GetDirectoryName($path)
+        if (-not [string]::IsNullOrEmpty($directory) -and -not (Test-Path -LiteralPath $directory -PathType Container)) {
+            [void](New-Item -ItemType Directory -Path $directory -Force)
+        }
+        $staging = "$path.$([guid]::NewGuid().ToString('N').Substring(0, 8)).tmp"
+        [IO.File]::WriteAllText($staging, $json, [Text.UTF8Encoding]::new($false))
+        try { [IO.File]::Move($staging, $path); return $true }
+        catch [IO.IOException] { return $false }
+        finally { if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Force -ErrorAction SilentlyContinue } }
+    }
+    catch {
+        Write-DecisionBridgeLog -Message "could not claim a decision attempt: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Get-CopilotDecisionAttempt {
+    <# This question's attempt, or $null when it has never been claimed. #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$DecisionId
+    )
+
+    if ([string]::IsNullOrWhiteSpace($DecisionId)) { return $null }
+    $path = Get-CopilotDecisionAttemptPath -SessionId $SessionId -DecisionId $DecisionId
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
+    try { $record = ConvertFrom-DecisionJson -Json ([IO.File]::ReadAllText($path)) }
+    catch { return $null }
+    if ($null -eq $record -or -not $record.PSObject.Properties['state']) { return $null }
+    if (-not [StringComparer]::Ordinal.Equals([string]$record.decisionId, $DecisionId)) { return $null }
+    if (([string]$record.state) -cnotin @('claimed', 'injecting', 'delivered', 'rejected', 'unknown')) { return $null }
+    $record
+}
+
+function Set-CopilotDecisionAttemptState {
+    <#
+        Advances a claimed attempt, in the one direction it is allowed to go.
+
+        'injecting' is written *before* the first key and is the point of no return:
+        from there the only honest outcomes are that it landed, or that nobody knows.
+        'rejected' is reachable only from 'claimed', so a question can never be
+        released for another try after something has been typed at it.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$DecisionId,
+        [Parameter(Mandatory)][ValidateSet('injecting', 'delivered', 'rejected', 'unknown')][string]$State,
+        [AllowEmptyString()][string]$Detail = ''
+    )
+
+    $record = Get-CopilotDecisionAttempt -SessionId $SessionId -DecisionId $DecisionId
+    if ($null -eq $record) { return $false }
+    $from = [string]$record.state
+    $allowed = switch ($State) {
+        'injecting' { $from -ceq 'claimed' }
+        'rejected'  { $from -ceq 'claimed' }
+        'delivered' { $from -cin @('claimed', 'injecting') }
+        'unknown'   { $from -cin @('claimed', 'injecting') }
+    }
+    if (-not $allowed) { return $false }
+
+    $path = Get-CopilotDecisionAttemptPath -SessionId $SessionId -DecisionId $DecisionId
+    $record | Add-Member -NotePropertyName state -NotePropertyValue $State -Force
+    $record | Add-Member -NotePropertyName detail -NotePropertyValue $Detail -Force
+    $record | Add-Member -NotePropertyName changedAt -NotePropertyValue ([DateTimeOffset]::Now.ToString('o')) -Force
+    try {
+        $staging = "$path.$([guid]::NewGuid().ToString('N').Substring(0, 8)).tmp"
+        [IO.File]::WriteAllText($staging, ($record | ConvertTo-Json -Depth 8 -Compress), [Text.UTF8Encoding]::new($false))
+        [IO.File]::Move($staging, $path, $true)
+        return $true
+    }
+    catch {
+        Write-DecisionBridgeLog -Message "could not advance a decision attempt: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Test-CopilotDecisionAttemptSettled {
+    <#
+        Whether this question must not be typed at again, and why.
+
+        Returns { Settled; State; Reason }. 'injecting' and 'unknown' are settled
+        because something may already have reached the prompt and nobody can say how
+        much; retrying would answer twice. 'delivered' is settled because it worked.
+        'rejected' and no attempt at all are not settled - nothing was typed, so the
+        question is still answerable.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$DecisionId
+    )
+
+    $record = Get-CopilotDecisionAttempt -SessionId $SessionId -DecisionId $DecisionId
+    if ($null -eq $record) { return [pscustomobject]@{ Settled = $false; State = ''; Reason = '' } }
+    $state = [string]$record.state
+    switch ($state) {
+        'delivered' { return [pscustomobject]@{ Settled = $true; State = $state; Reason = 'it has already been answered' } }
+        'injecting' { return [pscustomobject]@{ Settled = $true; State = $state; Reason = 'an answer was being typed and did not finish - check the terminal' } }
+        'unknown'   { return [pscustomobject]@{ Settled = $true; State = $state; Reason = 'an answer may already have reached the terminal - check there' } }
+        default     { return [pscustomobject]@{ Settled = $false; State = $state; Reason = '' } }
+    }
+}
+
 function Get-CopilotDecisionBaselinePath {
     <#
         Where one question's baseline lives: beside the marker, named for the question
@@ -2952,7 +3096,7 @@ function Remove-CopilotDecisionMarker {
             $stem = [IO.Path]::GetFileNameWithoutExtension($path)
             $directory = [IO.Path]::GetDirectoryName($path)
             if (Test-Path -LiteralPath $directory -PathType Container) {
-                foreach ($stale in @(Get-ChildItem -LiteralPath $directory -Filter "$stem.baseline-*.json" -File -ErrorAction SilentlyContinue)) {
+                foreach ($stale in @(Get-ChildItem -LiteralPath $directory -Filter "$stem.baseline-*" -File -ErrorAction SilentlyContinue)) {
                     Remove-Item -LiteralPath $stale.FullName -Force -ErrorAction SilentlyContinue
                 }
             }
@@ -2962,9 +3106,12 @@ function Remove-CopilotDecisionMarker {
         }
     }
     elseif (-not [string]::IsNullOrWhiteSpace($DecisionId)) {
-        $baseline = Get-CopilotDecisionBaselinePath -SessionId $SessionId -DecisionId $DecisionId
-        if (Test-Path -LiteralPath $baseline) {
-            Remove-Item -LiteralPath $baseline -Force -ErrorAction SilentlyContinue
+        foreach ($companion in @(
+            (Get-CopilotDecisionBaselinePath -SessionId $SessionId -DecisionId $DecisionId),
+            (Get-CopilotDecisionAttemptPath -SessionId $SessionId -DecisionId $DecisionId))) {
+            if (Test-Path -LiteralPath $companion) {
+                Remove-Item -LiteralPath $companion -Force -ErrorAction SilentlyContinue
+            }
         }
     }
     if (Test-Path -LiteralPath $path) {
