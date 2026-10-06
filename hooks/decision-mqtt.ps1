@@ -959,11 +959,20 @@ function Set-CopilotMqttTransferRequest {
         [Parameter(Mandatory)][hashtable]$Headers
     )
 
+    # Signed with the fleet's shared secret. Anything holding broker credentials can
+    # publish to this topic, and an unsigned request is an instruction to bundle a
+    # session and deliver it to a topic the publisher names.
+    $at = [DateTimeOffset]::Now.ToString('o')
+    $signature = Get-BridgeTransferSignature -Secret (Get-BridgeTransferSecret) -Fields (
+        Get-BridgeTransferRequestFields -SessionId $SessionId -Launcher $Launcher `
+            -Requester $Requester -Correlation $Correlation -At $at)
+
     Publish-CopilotMqttMessage -Topic "$(Get-CopilotMqttMachineTopicRoot -Slug $Slug)/transfer/request" `
         -Payload (@{
-            at = [DateTimeOffset]::Now.ToString('o')
+            at = $at
             session = $SessionId; launcher = $Launcher
             requester = $Requester; correlation = $Correlation
+            sig = $signature
         } | ConvertTo-Json -Compress) -Headers $Headers -Retain
 }
 

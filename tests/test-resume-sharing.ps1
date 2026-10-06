@@ -261,12 +261,22 @@ $offeredId = 'cafe0000-0000-0000-0000-000000000001'
 $secretId  = 'dead0000-0000-0000-0000-000000000002'
 $script:DaemonResumeOffered = @([pscustomobject]@{ SessionId = $offeredId })
 
+$script:TransferSecret = 'suite-fleet-secret'
 function Set-Request {
-    param($Session, $Correlation, $Requester = 'peer', $At = [DateTimeOffset]::Now)
+    param($Session, $Correlation, $Requester = 'peer', $At = [DateTimeOffset]::Now, $Sig = $null)
     $script:HaStates = @{}
+    $stamp = $At.ToString('o')
+    # Signed the way a real peer would, so the gates below are still exercised rather
+    # than all refusing at the signature. An unsigned fixture would have made every one
+    # of them pass for the wrong reason - the same trap the 'c1' correlations sprang.
+    if ($null -eq $Sig) {
+        $Sig = Get-BridgeTransferSignature -Secret $script:TransferSecret -Fields (
+            Get-BridgeTransferRequestFields -SessionId $Session -Launcher 'copilot' `
+                -Requester $Requester -Correlation $Correlation -At $stamp)
+    }
     $script:RequestAttrs = [pscustomobject]@{
-        at = $At.ToString('o'); session = $Session; launcher = 'copilot'
-        requester = $Requester; correlation = $Correlation
+        at = $stamp; session = $Session; launcher = 'copilot'
+        requester = $Requester; correlation = $Correlation; sig = $Sig
     }
 }
 function Get-HomeAssistantState { param($EntityId, $Headers)
@@ -279,18 +289,17 @@ Set-Request -Session $offeredId -Correlation 'cc000001'
 Invoke-DaemonTransferRequest -LiveSessionIds @() -Headers $headers
 Test-That 'with sharing off, a request is not served at all' { $script:Served.Count -eq 0 }
 
-$script:FakeSettings = @{ 'newSession.shareResumable' = 'false' }
+$script:FakeSettings = @{ 'newSession.shareResumable' = 'false'; 'newSession.transferSecret' = $script:TransferSecret }
 $script:Served = @(); $script:DaemonTransferServed = ''
 Set-Request -Session $offeredId -Correlation 'cc000002'
 Invoke-DaemonTransferRequest -LiveSessionIds @() -Headers $headers
 Test-That 'and the string "false" is not consent to serve either' { $script:Served.Count -eq 0 }
 
-$script:FakeSettings = @{ 'newSession.shareResumable' = $true }
+$script:FakeSettings = @{ 'newSession.shareResumable' = $true; 'newSession.transferSecret' = $script:TransferSecret }
 $script:Served = @(); $script:DaemonTransferServed = ''
 Set-Request -Session $secretId -Correlation 'cc000003'
 Invoke-DaemonTransferRequest -LiveSessionIds @() -Headers $headers
 Test-That 'a session this machine never offered is refused, however it is named' { $script:Served.Count -eq 0 }
-
 $script:Served = @(); $script:DaemonTransferServed = ''
 Set-Request -Session $offeredId -Correlation 'cc000004'
 Invoke-DaemonTransferRequest -LiveSessionIds @($offeredId) -Headers $headers
@@ -335,6 +344,37 @@ Invoke-DaemonTransferRequest -LiveSessionIds @() -Headers $headers
 Test-That 'and a well-formed one still serves, so the guard is not refusing everything' {
     $script:Served -contains $offeredId
 }
+
+# Shape is not origin. Everything checked above - the id, the slug, the timestamp - is
+# something anything holding broker credentials can produce, and a request is an
+# instruction to bundle a session and publish it to a topic the requester names.
+$script:Served = @(); $script:DaemonTransferServed = ''
+Set-Request -Session $offeredId -Correlation 'ab000001' -Sig ''
+Invoke-DaemonTransferRequest -LiveSessionIds @() -Headers $headers
+Test-That 'an unsigned request is refused even though every other field is valid' { $script:Served.Count -eq 0 }
+
+$script:Served = @(); $script:DaemonTransferServed = ''
+Set-Request -Session $offeredId -Correlation 'ab000002' -Sig ('0' * 64)
+Invoke-DaemonTransferRequest -LiveSessionIds @() -Headers $headers
+Test-That 'a wrongly signed request is refused' { $script:Served.Count -eq 0 }
+
+# A signature over a different destination must not travel: the requester and the
+# correlation both name the topic the transcript is published to.
+$script:Served = @(); $script:DaemonTransferServed = ''
+$liftedSig = Get-BridgeTransferSignature -Secret $script:TransferSecret -Fields (
+    Get-BridgeTransferRequestFields -SessionId $offeredId -Launcher 'copilot' `
+        -Requester 'peer' -Correlation 'ab000003' -At ([DateTimeOffset]::Now.ToString('o')))
+Set-Request -Session $offeredId -Correlation 'ab000003' -Requester 'attacker' -Sig $liftedSig
+Invoke-DaemonTransferRequest -LiveSessionIds @() -Headers $headers
+Test-That 'a valid signature cannot be replayed with the delivery topic changed' { $script:Served.Count -eq 0 }
+
+# Fail closed rather than silently unauthenticated.
+$script:FakeSettings = @{ 'newSession.shareResumable' = $true }
+$script:Served = @(); $script:DaemonTransferServed = ''
+Set-Request -Session $offeredId -Correlation 'ab000004'
+Invoke-DaemonTransferRequest -LiveSessionIds @() -Headers $headers
+Test-That 'with no secret configured a machine serves nothing rather than serving unsigned' { $script:Served.Count -eq 0 }
+$script:FakeSettings = @{ 'newSession.shareResumable' = $true; 'newSession.transferSecret' = $script:TransferSecret }
 
 # During startup Restore-DaemonSessionCards reaches Sync-DaemonSessions before
 # Sync-DaemonNewSession has filled the offered list. Treating that moment as "we do not
@@ -575,7 +615,7 @@ Write-Host '--- a reply has to be for the session that was actually asked for --
 
 $script:Installed = @()
 $script:ReplyManifest = $null
-function Get-BridgeTransferTopic { param($Slug, $Correlation) "copilot/cli/transfer/$Slug/$Correlation/c" }
+function Get-BridgeTransferTopic { param($Slug, $Correlation) "copilot/cli/transfer/$Slug/$Correlation" }
 function Set-CopilotMqttTransferRequest { param($Slug, $SessionId, $Launcher, $Requester, $Correlation, $Headers) }
 function Join-BridgeBundleChunk { param($Chunks, $TotalBytes, $Sha256) [byte[]]::new(4) }
 function Install-BridgeSessionBundle { param($BundlePath, $Manifest, $NewSessionId, $WorkingDirectory)
@@ -587,26 +627,85 @@ function Read-BridgeHaMqttSubscription { param($Topic, $TimeoutSeconds, $OnReady
 $wanted = 'ffffffff-1111-2222-3333-444444444444'
 $entry = [pscustomobject]@{ SessionId = $wanted; Slug = 'other'; Machine = 'OTHER'; Launcher = 'copilot'; Remote = $true }
 
+# The receive side signs over the correlation it generated, which is not predictable
+# from outside, so these fixtures sign whatever correlation the call produced.
+function Set-ReplyManifest {
+    param($Session, $Kind, $Signed = $true)
+    $script:SignReply = $Signed
+    $script:ReplySession = $Session
+    $script:ReplyKind = $Kind
+}
+function Read-BridgeHaMqttSubscription { param($Topic, $TimeoutSeconds, $OnReady, $Until)
+    if ($OnReady) { & $OnReady }
+    # The correlation is the second-to-last topic segment.
+    $parts = @($Topic.TrimEnd('/#').TrimEnd('/') -split '/')
+    $corr = $parts[-1]
+    $m = [ordered]@{ sha256 = ('a' * 64); bytes = 4; chunks = 1; session = $script:ReplySession; kind = $script:ReplyKind }
+    if ($script:SignReply) {
+        $m['sig'] = Get-BridgeTransferSignature -Secret $script:TransferSecret -Fields (
+            Get-BridgeTransferManifestFields -SessionId ([string]$script:ReplySession) -Kind ([string]$script:ReplyKind) `
+                -Sha256 ('a' * 64) -Bytes 4 -Chunks 1 -Correlation $corr)
+    }
+    @([pscustomobject]$m, [pscustomobject]@{ s = 0; o = 0; d = 'AAAA' })
+}
+$script:FakeSettings = @{ 'newSession.transferSecret' = $script:TransferSecret }
+
 $script:Installed = @()
-$script:ReplyManifest = [pscustomobject]@{ sha256 = ('a'*64); bytes = 4; chunks = 1; session = $wanted; kind = 'claude' }
+Set-ReplyManifest -Session $wanted -Kind 'claude'
 $got = Receive-DaemonSessionTransfer -Entry $entry -WorkingDirectory 'C:\Users\dswett\repos' -Headers $headers -TimeoutSeconds 1
 Test-That 'a reply claiming a different agent is refused rather than installed elsewhere' {
     $null -eq $got -and $script:Installed.Count -eq 0
 }
 
 $script:Installed = @()
-$script:ReplyManifest = [pscustomobject]@{ sha256 = ('a'*64); bytes = 4; chunks = 1; session = 'dddddddd-0000-0000-0000-000000000000'; kind = 'copilot' }
+Set-ReplyManifest -Session 'dddddddd-0000-0000-0000-000000000000' -Kind 'copilot'
 $got = Receive-DaemonSessionTransfer -Entry $entry -WorkingDirectory 'C:\Users\dswett\repos' -Headers $headers -TimeoutSeconds 1
 Test-That 'a reply for a different session is refused too' {
     $null -eq $got -and $script:Installed.Count -eq 0
 }
 
 $script:Installed = @()
-$script:ReplyManifest = [pscustomobject]@{ sha256 = ('a'*64); bytes = 4; chunks = 1; session = $wanted; kind = 'copilot' }
+Set-ReplyManifest -Session $wanted -Kind 'copilot'
 $got = Receive-DaemonSessionTransfer -Entry $entry -WorkingDirectory 'C:\Users\dswett\repos' -Headers $headers -TimeoutSeconds 1
 Test-That 'and the matching reply still installs, so the check is not refusing everything' {
     $got -eq 'cccccccc-1111-1111-1111-111111111111' -and $script:Installed -contains 'copilot'
 }
+
+# An attacker racing the real owner satisfies the session/kind check trivially - it only
+# has to name what was asked for. The signature is what it cannot produce, and this is
+# the path that ends with an agent resuming someone else's bytes with tool access.
+$script:Installed = @()
+Set-ReplyManifest -Session $wanted -Kind 'copilot' -Signed $false
+$got = Receive-DaemonSessionTransfer -Entry $entry -WorkingDirectory 'C:\Users\dswett\repos' -Headers $headers -TimeoutSeconds 1
+Test-That 'an unsigned bundle naming the right session is still refused before anything is written' {
+    $null -eq $got -and $script:Installed.Count -eq 0
+}
+
+$script:Installed = @()
+$script:FakeSettings = @{ 'newSession.transferSecret' = 'a-different-fleet' }
+Set-ReplyManifest -Session $wanted -Kind 'copilot'
+$got = Receive-DaemonSessionTransfer -Entry $entry -WorkingDirectory 'C:\Users\dswett\repos' -Headers $headers -TimeoutSeconds 1
+Test-That 'a bundle signed by another fleet is refused' { $null -eq $got -and $script:Installed.Count -eq 0 }
+
+$script:Installed = @()
+$script:FakeSettings = @{}
+$script:Subscribed = 0
+$realSubscribe = ${function:Read-BridgeHaMqttSubscription}
+function Read-BridgeHaMqttSubscription { param($Topic, $TimeoutSeconds, $OnReady, $Until) $script:Subscribed++; @() }
+Set-ReplyManifest -Session $wanted -Kind 'copilot'
+$got = Receive-DaemonSessionTransfer -Entry $entry -WorkingDirectory 'C:\Users\dswett\repos' -Headers $headers -TimeoutSeconds 1
+Test-That 'with no secret here a transfer is refused rather than accepted unauthenticated' {
+    $null -eq $got -and $script:Installed.Count -eq 0
+}
+Test-That 'and it refuses before subscribing, rather than waiting out the timeout' {
+    $script:Subscribed -eq 0
+}
+Test-That 'saying what is actually wrong, not that the other machine is offline' {
+    $last = @($script:Notes)[-1]
+    $last -like '*transferSecret*' -and $last -notlike '*busy or offline*'
+}
+${function:Read-BridgeHaMqttSubscription} = $realSubscribe
+$script:FakeSettings = @{ 'newSession.transferSecret' = $script:TransferSecret }
 
 Write-Host ''
 if ($script:Failures -gt 0) { Write-Host "$($script:Failures) failed" -ForegroundColor Red; exit 1 }

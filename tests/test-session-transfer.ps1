@@ -175,6 +175,45 @@ Test-That 'a duplicate chunk rebuilds the same bytes rather than corrupting them
     (-join ($rebuilt | ForEach-Object { $_.ToString('x2') })) -eq (-join ($src | ForEach-Object { $_.ToString('x2') }))
 }
 
+Write-Host '--- signing, which is what makes the transport''s openness survivable ---'
+# Everything else about a request is shape: an id, a slug, a timestamp, all of which
+# anything holding broker credentials can produce. On a normal instance that is a far
+# lower bar than Home Assistant admin.
+$sigSecret = 'fleet-secret-value'
+$sigFields = Get-BridgeTransferRequestFields -SessionId 'aaaa1111-0000-0000-0000-000000000001' `
+    -Launcher 'copilot' -Requester 'peer' -Correlation 'abcdef01' -At '2026-01-01T00:00:00.0000000+00:00'
+$sigA = Get-BridgeTransferSignature -Secret $sigSecret -Fields $sigFields
+
+Test-That 'a signature is a hex SHA256 and is stable for the same input' {
+    $sigA -cmatch '^[0-9a-f]{64}$' -and $sigA -ceq (Get-BridgeTransferSignature -Secret $sigSecret -Fields $sigFields)
+}
+Test-That 'a different secret produces a different signature' {
+    (Get-BridgeTransferSignature -Secret 'other-secret' -Fields $sigFields) -cne $sigA
+}
+Test-That 'no secret produces no signature rather than one over an empty key' {
+    (Get-BridgeTransferSignature -Secret '' -Fields $sigFields) -eq ''
+}
+foreach ($moved in @(
+    @{ what = 'the session'; f = (Get-BridgeTransferRequestFields -SessionId 'bbbb2222-0000-0000-0000-000000000002' -Launcher 'copilot' -Requester 'peer' -Correlation 'abcdef01' -At '2026-01-01T00:00:00.0000000+00:00') }
+    @{ what = 'the requester, which names the delivery topic'; f = (Get-BridgeTransferRequestFields -SessionId 'aaaa1111-0000-0000-0000-000000000001' -Launcher 'copilot' -Requester 'attacker' -Correlation 'abcdef01' -At '2026-01-01T00:00:00.0000000+00:00') }
+    @{ what = 'the correlation, which names the delivery topic too'; f = (Get-BridgeTransferRequestFields -SessionId 'aaaa1111-0000-0000-0000-000000000001' -Launcher 'copilot' -Requester 'peer' -Correlation 'deadbeef' -At '2026-01-01T00:00:00.0000000+00:00') }
+    @{ what = 'the timestamp'; f = (Get-BridgeTransferRequestFields -SessionId 'aaaa1111-0000-0000-0000-000000000001' -Launcher 'copilot' -Requester 'peer' -Correlation 'abcdef01' -At '2026-06-06T00:00:00.0000000+00:00') }
+)) {
+    Test-That "changing $($moved.what) invalidates the signature" {
+        (Get-BridgeTransferSignature -Secret $sigSecret -Fields $moved.f) -cne $sigA
+    }
+}
+Test-That 'comparison refuses an empty presented or expected value' {
+    -not (Test-BridgeTransferSignature -Presented '' -Expected $sigA) -and
+    -not (Test-BridgeTransferSignature -Presented $sigA -Expected '') -and
+    -not (Test-BridgeTransferSignature -Presented $null -Expected $sigA)
+}
+Test-That 'and accepts only an exact match' {
+    (Test-BridgeTransferSignature -Presented $sigA -Expected $sigA) -and
+    -not (Test-BridgeTransferSignature -Presented ($sigA.Substring(0, 63) + 'f') -Expected $sigA) -and
+    -not (Test-BridgeTransferSignature -Presented $sigA.ToUpperInvariant() -Expected $sigA)
+}
+
 Write-Host ''
 if ($script:Failures -gt 0) { Write-Host "$($script:Failures) failed" -ForegroundColor Red; exit 1 }
 Write-Host 'all passed' -ForegroundColor Green

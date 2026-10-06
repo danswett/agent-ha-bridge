@@ -199,6 +199,33 @@ programme. **This design depends on that contract and must not invent a competin
 Until it exists, the transfer protocol described here is specified but not authorised to
 run on a live fleet.
 
+#### What the fleet secret does, and what it deliberately does not
+
+`newSession.transferSecret` was added afterwards, once the feature was running, because
+the gap above is reachable in practice: on a normal Home Assistant instance, holding
+broker credentials is a far lower bar than being an administrator - Frigate,
+Zigbee2MQTT, ESPHome and the rest all clear it - and an unsigned request is an
+instruction to bundle a session and publish it to a topic the requester names.
+
+The request and the manifest are HMAC-SHA256'd with a secret every machine in the fleet
+holds. Both sides fail closed: with no secret configured, nothing is served and nothing
+is accepted, rather than falling back to unsigned.
+
+**This is a pre-shared fleet key, and it is not the identity contract.** It establishes
+*membership*, not *identity*: it proves the sender holds the secret, and nothing else. It
+cannot tell DSWETT-HOME from DASDESK, so any holder can ask for anything any machine
+offers. It carries no target binding beyond the requester and correlation it signs, no
+expiry beyond the existing ten-minute freshness window, and no acknowledgement. It is a
+mitigation for a live hole, not a substitute for the contract owned elsewhere, and it
+must not be cited as one or allowed to delay it.
+
+A broker ACL was the obvious alternative and was rejected on this instance: mosquitto's
+ACL file is allow-only with no deny rule, so restricting one prefix means enumerating
+every topic every other client legitimately uses - on a broker where a single MQTT
+mistake has already taken the whole fleet offline for twenty-five minutes. Signing makes
+the protocol indifferent to who else can reach the transport, which is the right shape
+for a transport that was never trusted in the first place.
+
 ## The merged Resume list
 
 Each machine already publishes a retained sensor describing itself, which every other
