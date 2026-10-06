@@ -1627,7 +1627,9 @@ function Get-BridgeCopilotModelList {
 
     $models = @()
     try {
-        $raw = & $Path help config 2>$null | Out-String
+        $probe = Invoke-BridgeCommandProbe -Executable $Path -Arguments @('help', 'config')
+        if (-not $probe.Ran -or $probe.TimedOut -or $probe.ExitCode -ne 0) { throw "Model discovery failed: $($probe.Output)" }
+        $raw = $probe.StandardOutput
         # The block of quoted names directly under "`model`:" and nothing else: the
         # same file lists themes and modes in the same shape, so the match is anchored
         # to that heading rather than hunting for quoted strings anywhere.
@@ -2214,7 +2216,9 @@ function Get-BridgeAgencySessionJson {
     if ([string]::IsNullOrWhiteSpace($agency)) { return '' }
 
     try {
-        $raw = & $agency hub list-local-sessions --json 2>$null | Out-String
+        $probe = Invoke-BridgeCommandProbe -Executable $agency -Arguments @('hub', 'list-local-sessions', '--json') -TimeoutMs 30000
+        if (-not $probe.Ran -or $probe.TimedOut -or $probe.ExitCode -ne 0) { throw "Session discovery failed: $($probe.Output)" }
+        $raw = $probe.StandardOutput
     }
     catch {
         return ''
