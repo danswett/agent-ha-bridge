@@ -456,6 +456,152 @@ Test-That 'a delivered question is settled' {
 Test-That 'a question nobody has attempted is not settled' {
     -not (Test-CopilotDecisionAttemptSettled -SessionId $attemptSid -DecisionId 'never').Settled
 }
+Test-That 'releasing from mid-typing needs the injector''s own word that nothing was written' {
+    [void](New-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'a7' -Answer 'Yes')
+    [void](Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a7' -State 'injecting')
+    (Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a7' -State 'rejected') -eq $false -and
+    (Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a7' -State 'rejected' -NothingWritten) -eq $true
+}
+Test-That 'the barrier hands back the claim''s own answer, not the caller''s' {
+    [void](New-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'a8' -Answer 'what was claimed' -Selections @('#1'))
+    $started = Start-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'a8'
+    $started.Started -and $started.Answer -ceq 'what was claimed' -and (@($started.Selections) -join '|') -eq '#1'
+}
+Test-That 'and a second pass cannot win the barrier behind the first' {
+    (Start-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'a8').Started -eq $false
+}
+
+Write-Host '--- the dispatcher itself, against a ledger on disk ---'
+# Not the helpers in isolation: the thing that decides whether keys are typed is
+# Invoke-DaemonDecisionAnswer, and every hole found in review was in how it used them
+# rather than in what they did.
+$dispSid = '11111111-0000-4000-8000-0000000000d1'
+$script:Typed = [Collections.Generic.List[object]]::new()
+$script:Outcome = @{ Delivered = $true; Detail = 'ok:form'; Wrote = $true }
+function Send-CopilotSessionForm { param($SessionId, $Fields, $Selections, $ProcessId)
+    $script:Typed.Add([pscustomobject]@{ Route = 'form'; Selections = @($Selections) })
+    [pscustomobject]@{ Delivered = $script:Outcome.Delivered; ProcessId = 42; Detail = $script:Outcome.Detail; Wrote = $script:Outcome.Wrote }
+}
+function Send-CopilotSessionChoice { param($SessionId, $Text, $ChoiceCount, $ProcessId)
+    $script:Typed.Add([pscustomobject]@{ Route = 'choice'; Text = $Text })
+    [pscustomobject]@{ Delivered = $script:Outcome.Delivered; ProcessId = 42; Detail = $script:Outcome.Detail; Wrote = $script:Outcome.Wrote }
+}
+function Send-CopilotSessionPrompt { param($SessionId, $Text, $ProcessId)
+    $script:Typed.Add([pscustomobject]@{ Route = 'prompt'; Text = $Text })
+    [pscustomobject]@{ Delivered = $script:Outcome.Delivered; ProcessId = 42; Detail = $script:Outcome.Detail; Wrote = $script:Outcome.Wrote }
+}
+function Get-DaemonSessionProcessId { param($SessionId) 42 }
+function Complete-DaemonClaudeAnswer { param($SessionId, $Delivery, $Marker) $Delivery }
+function Set-CopilotDecisionMarkerInjected { param($SessionId, $Answer, $Selections) }
+$dispMarker = [pscustomobject]@{
+    decisionId = 'disp1'; mode = 'multiple_choice'; choices = @(); fields = @(
+        [pscustomobject]@{ Label = 'F'; Options = @('Auth', 'Billing'); IsText = $false })
+}
+# The record may legitimately be gone - a released question has none - so reading it
+# for a failure message must not itself throw under StrictMode.
+function Get-DispState {
+    $a = Get-CopilotDecisionAttempt -SessionId $dispSid -DecisionId 'disp1'
+    if ($null -eq $a) { '<no attempt>' } else { [string]$a.state }
+}
+function Invoke-Dispatch { param([string]$Answer = 'Auth', [string[]]$Sel = @('Auth'))
+    Invoke-DaemonDecisionAnswer -SessionId $dispSid -Marker $dispMarker -Answer $Answer `
+        -IsChoice $true -Selections $Sel -State @{} -Headers $headers
+}
+
+$script:Ha = @{}
+Test-That 'a clean answer is typed once and the attempt records that it landed' {
+    $script:Typed.Clear()
+    $ok = Invoke-Dispatch
+    $a = Get-CopilotDecisionAttempt -SessionId $dispSid -DecisionId 'disp1'
+    $ok -and $script:Typed.Count -eq 1 -and [string]$a.state -ceq 'delivered'
+} "typed=$($script:Typed.Count) state=$(Get-DispState)"
+Test-That 'and asking again types nothing at all' {
+    $script:Typed.Clear()
+    $again = Invoke-Dispatch
+    -not $again -and $script:Typed.Count -eq 0
+} "typed=$($script:Typed.Count)"
+
+# The crash: a record left mid-typing by a daemon that stopped.
+Remove-CopilotDecisionMarker -SessionId $dispSid -DecisionId 'disp1'
+[void](New-CopilotDecisionAttempt -SessionId $dispSid -DecisionId 'disp1' -Answer 'Auth' -Selections @('Auth'))
+[void](Set-CopilotDecisionAttemptState -SessionId $dispSid -DecisionId 'disp1' -State 'injecting')
+Test-That 'a question left mid-typing by a stopped daemon is never typed at again' {
+    $script:Typed.Clear()
+    $r = Invoke-Dispatch
+    -not $r -and $script:Typed.Count -eq 0
+} "typed=$($script:Typed.Count)"
+Test-That 'and the card says it was already answered rather than going quiet' {
+    $script:Transient -contains 'Answer NOT sent'
+} ($script:Transient -join '|')
+
+# A claim left behind without keys: the next pass must type what was CLAIMED.
+Remove-CopilotDecisionMarker -SessionId $dispSid -DecisionId 'disp1'
+[void](New-CopilotDecisionAttempt -SessionId $dispSid -DecisionId 'disp1' -Answer 'Billing' -Selections @('Billing'))
+Test-That 'a claim left without keys is honoured, and its own answer is the one typed' {
+    $script:Typed.Clear()
+    [void](Invoke-Dispatch -Answer 'Auth' -Sel @('Auth'))
+    $script:Typed.Count -eq 1 -and (@($script:Typed[0].Selections) -join '|') -eq 'Billing'
+} "typed=[$(@($script:Typed | ForEach-Object { @($_.Selections) -join ',' }) -join '|')]"
+
+# A failure that reached the keyboard must not release the question.
+Remove-CopilotDecisionMarker -SessionId $dispSid -DecisionId 'disp1'
+$script:Outcome = @{ Delivered = $false; Detail = 'no live process for session'; Wrote = $true }
+Test-That 'a failure that wrote something leaves the question settled, whatever the failure says' {
+    $script:Typed.Clear()
+    [void](Invoke-Dispatch)
+    $a = Get-CopilotDecisionAttempt -SessionId $dispSid -DecisionId 'disp1'
+    [string]$a.state -ceq 'unknown' -and (Test-CopilotDecisionAttemptSettled -SessionId $dispSid -DecisionId 'disp1').Settled
+} "state=$(Get-DispState)"
+Test-That 'and it is not typed at again on the next pass' {
+    $script:Typed.Clear()
+    [void](Invoke-Dispatch)
+    $script:Typed.Count -eq 0
+} "typed=$($script:Typed.Count)"
+
+# A failure that never reached the keyboard stays retryable, as it is today.
+Remove-CopilotDecisionMarker -SessionId $dispSid -DecisionId 'disp1'
+$script:Outcome = @{ Delivered = $false; Detail = 'no live process for session'; Wrote = $false }
+Test-That 'a failure that wrote nothing releases the question for another go' {
+    $script:Typed.Clear()
+    [void](Invoke-Dispatch)
+    # Two routes, because a form that never wrote still falls back to the text one.
+    $null -eq (Get-CopilotDecisionAttempt -SessionId $dispSid -DecisionId 'disp1') -and $script:Typed.Count -eq 2
+} "state=$(Get-DispState)"
+Test-That 'and the next pass really does try again' {
+    $script:Typed.Clear()
+    [void](Invoke-Dispatch)
+    $script:Typed.Count -eq 2
+} "state=$(Get-DispState)"
+
+# The partial form: it wrote, it failed, and the text route must not type on top.
+Remove-CopilotDecisionMarker -SessionId $dispSid -DecisionId 'disp1'
+$script:Outcome = @{ Delivered = $false; Detail = 'field0:write-failed'; Wrote = $true }
+Test-That 'a form that failed after writing does not fall back and type a second answer' {
+    $script:Typed.Clear()
+    [void](Invoke-Dispatch)
+    $script:Typed.Count -eq 1 -and $script:Typed[0].Route -ceq 'form'
+} "routes=[$(@($script:Typed | ForEach-Object { $_.Route }) -join '|')]"
+Test-That 'and the uncertainty it created is kept' {
+    (Get-DispState) -ceq 'unknown'
+}
+# But a form that never wrote still falls back, which is how a mixed form is answered.
+Remove-CopilotDecisionMarker -SessionId $dispSid -DecisionId 'disp1'
+$script:Outcome = @{ Delivered = $false; Detail = 'field/selection mismatch (1/0)'; Wrote = $false }
+Test-That 'a form that never wrote still falls back to the text route' {
+    $script:Typed.Clear()
+    [void](Invoke-Dispatch)
+    (@($script:Typed | ForEach-Object { $_.Route }) -join '|') -eq 'form|choice'
+} "routes=[$(@($script:Typed | ForEach-Object { $_.Route }) -join '|')]"
+
+Remove-CopilotDecisionMarker -SessionId $dispSid -DecisionId 'disp1'
+$script:Outcome = @{ Delivered = $true; Detail = 'ok:form'; Wrote = $true }
+Test-That 'a question with no id is never typed at, rather than slipping past unprotected' {
+    $script:Typed.Clear()
+    $noId = [pscustomobject]@{ decisionId = ''; mode = 'multiple_choice'; choices = @(); fields = @($dispMarker.fields) }
+    $r = Invoke-DaemonDecisionAnswer -SessionId $dispSid -Marker $noId -Answer 'Auth' `
+        -IsChoice $true -Selections @('Auth') -State @{} -Headers $headers
+    -not $r -and $script:Typed.Count -eq 0
+} "typed=$($script:Typed.Count)"
 Test-That 'an attempt is never read against a different question' {
     $path = Get-CopilotDecisionAttemptPath -SessionId $attemptSid -DecisionId 'a4'
     [IO.File]::WriteAllText($path, '{"decisionId":"somebody-else","state":"injecting"}')

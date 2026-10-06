@@ -297,6 +297,22 @@ function Test-DaemonChannelChanged {
     -not [StringComparer]::Ordinal.Equals([string]$Current.Value, [string]$Baseline.Value)
 }
 
+function Test-DaemonDeliveryWrote {
+    <#
+        Whether a delivery reached the keyboard.
+
+        Absent means yes. A result that does not say is not evidence that nothing was
+        typed, and the only safe reading of silence here is the one that refuses to
+        release the question - releasing it wrongly types a second answer on top of
+        half a first.
+    #>
+    param([AllowNull()]$Delivery)
+
+    if ($null -eq $Delivery) { return $true }
+    if (-not $Delivery.PSObject.Properties['Wrote']) { return $true }
+    [bool]$Delivery.Wrote
+}
+
 function Test-DaemonSendPressed {
     <#
         Whether Send has actually been pressed for this question, as
@@ -816,27 +832,38 @@ function Invoke-DaemonDecisionAnswer {
     # would read the card and type it again. The claim is what makes that state
     # nameable; the states after it are what stop the second attempt.
     $decisionId = if ($null -ne $Marker -and $Marker.PSObject.Properties['decisionId']) { [string]$Marker.decisionId } else { '' }
+    # A question with no id cannot be protected, so it is not typed at. Letting it
+    # through "because the machinery does not apply" is the same as having none.
+    if ([string]::IsNullOrWhiteSpace($decisionId)) {
+        Write-DaemonLog -Message "decision for $short has no id; not typing anything"
+        return $false
+    }
     $settled = Test-CopilotDecisionAttemptSettled -SessionId $SessionId -DecisionId $decisionId
     if ($settled.Settled) {
         Write-DaemonLog -Message "not answering $short again: $($settled.Reason) (attempt $($settled.State))"
         try {
-            Set-DaemonTransientActivity -SessionId $SessionId -Summary 'Not sent - this question was already answered' `
-                -Extra @{ hint = $settled.Reason } -Headers $Headers | Out-Null
+            Set-DaemonTransientActivity -SessionId $SessionId -Summary 'Answer NOT sent' `
+                -Extra @{ error = 'this question has already been answered once'; hint = $settled.Reason } -Headers $Headers | Out-Null
         }
         catch {
             if (Test-DaemonMarkedGuardError -ErrorRecord $_) { throw }
         }
         return $false
     }
-    if (-not [string]::IsNullOrWhiteSpace($decisionId) -and
-        $null -eq (Get-CopilotDecisionAttempt -SessionId $SessionId -DecisionId $decisionId)) {
-        if (-not (New-CopilotDecisionAttempt -SessionId $SessionId -DecisionId $decisionId `
-                -Answer $Answer -Selections ([string[]]@($Selections)))) {
-            Write-DaemonLog -Message "could not claim the attempt for $short; not typing anything"
-            return $false
-        }
+    if ($null -eq (Get-CopilotDecisionAttempt -SessionId $SessionId -DecisionId $decisionId)) {
+        [void](New-CopilotDecisionAttempt -SessionId $SessionId -DecisionId $decisionId `
+            -Answer $Answer -Selections ([string[]]@($Selections)))
     }
-    [void](Set-CopilotDecisionAttemptState -SessionId $SessionId -DecisionId $decisionId -State 'injecting')
+    # The barrier. Nothing is typed unless this call wins it, and what is typed is what
+    # the claim recorded - not this call's own input, which may belong to a different
+    # reading of the card than the claim did.
+    $attempt = Start-CopilotDecisionAttempt -SessionId $SessionId -DecisionId $decisionId
+    if (-not $attempt.Started) {
+        Write-DaemonLog -Message "did not win the attempt barrier for $short; not typing anything"
+        return $false
+    }
+    $Answer = $attempt.Answer
+    $Selections = @($attempt.Selections)
 
     if ($IsChoice -and $IsFreeText) {
         # Typed, not chosen. The prompt's own "Other (type your answer)" entry is the
@@ -867,11 +894,20 @@ function Invoke-DaemonDecisionAnswer {
             }
         }
         if ($null -eq $delivery -or -not $delivery.Delivered) {
-            if ($null -ne $delivery) {
-                Write-DaemonLog -Message "form injection unavailable for $short ($($delivery.Detail)); falling back to text"
+            # Only when the form never reached the keyboard. Falling back after it had
+            # written part of a walk types a second answer on top of half of a first,
+            # and the fallback's own result would then be the only one recorded -
+            # erasing the uncertainty the partial write created.
+            if ($null -ne $delivery -and (Test-DaemonDeliveryWrote -Delivery $delivery)) {
+                Write-DaemonLog -Message "form injection failed for $short after writing ($($delivery.Detail)); not falling back"
             }
-            $delivery = Send-CopilotSessionChoice -SessionId $SessionId -Text $Answer `
-                -ChoiceCount (@($Marker.choices).Count) -ProcessId $processId
+            else {
+                if ($null -ne $delivery) {
+                    Write-DaemonLog -Message "form injection unavailable for $short ($($delivery.Detail)); falling back to text"
+                }
+                $delivery = Send-CopilotSessionChoice -SessionId $SessionId -Text $Answer `
+                    -ChoiceCount (@($Marker.choices).Count) -ProcessId $processId
+            }
         }
     }
     else {
@@ -911,31 +947,40 @@ function Invoke-DaemonDecisionAnswer {
             -State 'delivered' -Detail ([string]$delivery.Detail))
     }
     else {
-        # A failure that never reached the keyboard can be tried again; one that may
-        # have typed part of an answer cannot, because nobody can say how much landed.
-        # The injector names the first kind exactly, so they are listed rather than
-        # guessed at, and anything not on the list is treated as unknown.
+        # Whether the question may be asked again is decided by whether anything
+        # reached the keyboard, which the injector records at the write boundary. It
+        # is never worked out from the wording of a failure: a string that happens to
+        # read like "nothing happened" would release a question that had already been
+        # half typed, which is the whole thing this exists to prevent.
         $detail = [string]$delivery.Detail
-        $neverStarted = $detail -ceq 'empty text' -or $detail -ceq 'no live process for session' -or
-            $detail -cmatch '^field/selection mismatch'
-        [void](Set-CopilotDecisionAttemptState -SessionId $SessionId -DecisionId $decisionId `
-            -State $(if ($neverStarted) { 'rejected' } else { 'unknown' }) -Detail $detail)
-        if ($neverStarted) {
-            # Nothing was typed, so the question is answerable again - and the attempt
-            # record has to go with it or the next pass would refuse on a stale claim.
-            $attemptPath = Get-CopilotDecisionAttemptPath -SessionId $SessionId -DecisionId $decisionId
-            if (-not [string]::IsNullOrWhiteSpace($decisionId) -and (Test-Path -LiteralPath $attemptPath)) {
-                Remove-Item -LiteralPath $attemptPath -Force -ErrorAction SilentlyContinue
+        $wrote = Test-DaemonDeliveryWrote -Delivery $delivery
+        if ($wrote) {
+            [void](Set-CopilotDecisionAttemptState -SessionId $SessionId -DecisionId $decisionId `
+                -State 'unknown' -Detail $detail)
+        }
+        else {
+            # Nothing was typed, so the question is answerable again - and the record
+            # goes with it, through the transition rather than around it. If the
+            # transition is refused the record stays exactly as it is.
+            if (Set-CopilotDecisionAttemptState -SessionId $SessionId -DecisionId $decisionId `
+                    -State 'rejected' -Detail $detail -NothingWritten) {
+                $attemptPath = Get-CopilotDecisionAttemptPath -SessionId $SessionId -DecisionId $decisionId
+                if (Test-Path -LiteralPath $attemptPath) {
+                    Remove-Item -LiteralPath $attemptPath -Force -ErrorAction SilentlyContinue
+                }
+            }
+            else {
+                Write-DaemonLog -Message "could not release the attempt for $short; leaving it settled"
             }
         }
         try {
             Set-DaemonTransientActivity -SessionId $SessionId -Summary 'Answer NOT sent' `
                 -Extra @{ error = $detail
-                    hint = $(if ($neverStarted) { 'nothing reached the terminal' } else { 'part of it may have reached the terminal - check there' }) } `
+                    hint = $(if ($wrote) { 'part of it may have reached the terminal - check there' } else { 'nothing reached the terminal' }) } `
                 -Headers $Headers
         }
         catch { }
-        Write-DaemonLog -Message "decision answer injection FAILED for $short : $detail (attempt $(if ($neverStarted) { 'rejected' } else { 'unknown' }))"
+        Write-DaemonLog -Message "decision answer injection FAILED for $short : $detail (wrote=$wrote)"
     }
     $delivery.Delivered
 }

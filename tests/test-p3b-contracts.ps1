@@ -635,14 +635,18 @@ function Invoke-WebRequest {
                 StoredBeforeInput = $(if ($before.PSObject.Properties['injectedSelections']) { @($before.injectedSelections).Count } else { 0 })
             })
             if ($fixture.FormDelivered -and $fixture.Kind -eq 'claude') { Add-DeliveryResult }
-            [pscustomobject]@{ Delivered = $fixture.FormDelivered; ProcessId = 0; Detail = 'Synthetic native form boundary' }
+            [pscustomobject]@{ Delivered = $fixture.FormDelivered; ProcessId = 0; Detail = 'Synthetic native form boundary'
+                # This fixture's failing form is a clean pre-write refusal, which is the
+                # case the fallback below exists for. A form that had already written
+                # would not fall back at all.
+                Wrote = $fixture.FormDelivered }
         }
         function Send-CopilotSessionChoice {
             param($SessionId, $Text, $ChoiceCount, $ProcessId)
             $fixture = $script:DeliveryFixture
             $fixture.Inputs.Add([pscustomobject]@{ Route = 'text-choice'; Text = $Text })
             if ($fixture.FallbackDelivered -and $fixture.Kind -eq 'claude') { Add-DeliveryResult }
-            [pscustomobject]@{ Delivered = $fixture.FallbackDelivered; ProcessId = 0; Detail = 'Synthetic native fallback boundary' }
+            [pscustomobject]@{ Delivered = $fixture.FallbackDelivered; ProcessId = 0; Detail = 'Synthetic native fallback boundary'; Wrote = $true }
         }
         function Send-CopilotSessionPrompt {
             param($SessionId, $Text, $ProcessId)
@@ -1000,12 +1004,12 @@ function Invoke-WebRequest {
             $script:A23Inputs.Add([pscustomobject]@{
                 SessionId = $SessionId; Kind = 'form'; Fields = @($Fields); Selections = @($Selections)
             })
-            [pscustomobject]@{ Delivered = $true; ProcessId = $ProcessId; Detail = 'Synthetic native delivery boundary' }
+            [pscustomobject]@{ Delivered = $true; ProcessId = $ProcessId; Detail = 'Synthetic native delivery boundary'; Wrote = $true }
         }
         function Send-CopilotSessionPrompt {
             param($SessionId, $Text, $ProcessId)
             $script:A23Inputs.Add([pscustomobject]@{ SessionId = $SessionId; Kind = 'text'; Text = $Text })
-            [pscustomobject]@{ Delivered = $true; ProcessId = $ProcessId; Detail = 'Synthetic native delivery boundary' }
+            [pscustomobject]@{ Delivered = $true; ProcessId = $ProcessId; Detail = 'Synthetic native delivery boundary'; Wrote = $true }
         }
         function Send-CopilotSessionChoice {
             param($SessionId, $Text, $ChoiceCount, $ProcessId)
