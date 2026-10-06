@@ -392,6 +392,39 @@ async function checkDeferredChoices() {
     check(`'${bad}' ticks nothing rather than guessing`, pickedRows(card) === '', pickedRows(card));
   }
 
+  // A field that offers an option written like a position. For it, '#1' is that
+  // option's own text, so whether the field uses positions has to be asked before the
+  // value's shape is tested. Asking in the other order showed the FIRST option ticked
+  // when the second had been chosen - and the backend had the same bug separately, so
+  // fixing one proved nothing about the other.
+  card = newCard(FIELDS, SUBMIT);
+  env = controlledEnv({ 1: { label: 'Pick', multi: true, options: ['X', '#1'], state: '#1',
+    slotOptions: ['X', '#1', 'X + #1'] } });
+  env.card = card;
+  card.hass = env.hass;
+  check('a literal position is ticked as the option it is, not as a position',
+    pickedRows(card) === '#1', pickedRows(card));
+  buttons(card).find((b) => b.textContent === 'X').click();
+  check('and ticking the other one composes in words, because this field has no positions',
+    env.calls[env.calls.length - 1].data.option === 'X + #1',
+    env.calls.map((c) => c.data.option).join(' / '));
+  env.calls[env.calls.length - 1].settle.resolve();
+  await flush();
+  env.arrive(F(1), 'X + #1');
+  check('and both come back ticked',
+    pickedRows(card) === 'X|#1', pickedRows(card));
+
+  // The same shape where the bridge *did* offer positions: now '#1' is a position.
+  card = newCard(FIELDS, SUBMIT);
+  env = controlledEnv({ 1: { label: 'Features', multi: true, codes: true,
+    options: ['Auth', 'Billing'], state: '#1' } });
+  env.card = card;
+  card.hass = env.hass;
+  check('where the field does use positions, the same text is read as one',
+    pickedRows(card) === 'Auth', pickedRows(card));
+
+  console.log('--- a slot that moves on its own ---');
+
   // A slot that moves after the card has seen it settle. Another viewer answering the
   // same question looks identical to a state arriving out of order, and both end the
   // same way: two rows ticked became one row ticked on its own, Send stayed live, and
