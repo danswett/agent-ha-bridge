@@ -431,20 +431,20 @@ Test-That 'once it is being typed the question is settled, and says why' {
 }
 # This is the crash: stopped after the keys began and before anything was recorded.
 Test-That 'a question left mid-typing is never released for another go' {
-    (Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a1' -State 'rejected') -eq $false -and
+    $null -eq (Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a1' -State 'rejected') -and
     (Test-CopilotDecisionAttemptSettled -SessionId $attemptSid -DecisionId 'a1').Settled
 }
 Test-That 'but it can be resolved either way' {
-    (Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a1' -State 'unknown') -and
+    $null -ne (Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a1' -State 'unknown') -and
     (Test-CopilotDecisionAttemptSettled -SessionId $attemptSid -DecisionId 'a1').Reason -match 'may already have reached'
 }
 Test-That 'and once it is unknown it stays unknown rather than being retried' {
-    (Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a1' -State 'injecting') -eq $false -and
-    (Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a1' -State 'rejected') -eq $false
+    $null -eq (Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a1' -State 'injecting') -and
+    $null -eq (Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a1' -State 'rejected')
 }
 Test-That 'a failure that never reached the keyboard leaves the question answerable' {
     [void](New-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'a2' -Answer 'Yes')
-    (Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a2' -State 'rejected') -and
+    $null -ne (Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a2' -State 'rejected') -and
     -not (Test-CopilotDecisionAttemptSettled -SessionId $attemptSid -DecisionId 'a2').Settled
 }
 Test-That 'a delivered question is settled' {
@@ -459,8 +459,8 @@ Test-That 'a question nobody has attempted is not settled' {
 Test-That 'releasing from mid-typing needs the injector''s own word that nothing was written' {
     [void](New-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'a7' -Answer 'Yes')
     [void](Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a7' -State 'injecting')
-    (Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a7' -State 'rejected') -eq $false -and
-    (Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a7' -State 'rejected' -NothingWritten) -eq $true
+    $null -eq (Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a7' -State 'rejected') -and
+    $null -ne (Set-CopilotDecisionAttemptState -SessionId $attemptSid -DecisionId 'a7' -State 'rejected' -NothingWritten)
 }
 Test-That 'the barrier hands back the claim''s own answer, not the caller''s' {
     [void](New-CopilotDecisionAttempt -SessionId $attemptSid -DecisionId 'a8' -Answer 'what was claimed' -Selections @('#1'))
@@ -523,7 +523,8 @@ Test-That 'and asking again types nothing at all' {
 
 # The crash: a record left mid-typing by a daemon that stopped.
 Remove-CopilotDecisionMarker -SessionId $dispSid -DecisionId 'disp1'
-[void](New-CopilotDecisionAttempt -SessionId $dispSid -DecisionId 'disp1' -Answer 'Auth' -Selections @('Auth'))
+[void](New-CopilotDecisionAttempt -SessionId $dispSid -DecisionId 'disp1' -Answer 'Auth' -Selections @('Auth') `
+    -IsChoice $true -FieldShape (Get-CopilotDecisionFieldShape -Fields @($dispMarker.fields)))
 [void](Set-CopilotDecisionAttemptState -SessionId $dispSid -DecisionId 'disp1' -State 'injecting')
 Test-That 'a question left mid-typing by a stopped daemon is never typed at again' {
     $script:Typed.Clear()
@@ -536,7 +537,8 @@ Test-That 'and the card says it was already answered rather than going quiet' {
 
 # A claim left behind without keys: the next pass must type what was CLAIMED.
 Remove-CopilotDecisionMarker -SessionId $dispSid -DecisionId 'disp1'
-[void](New-CopilotDecisionAttempt -SessionId $dispSid -DecisionId 'disp1' -Answer 'Billing' -Selections @('Billing'))
+[void](New-CopilotDecisionAttempt -SessionId $dispSid -DecisionId 'disp1' -Answer 'Billing' -Selections @('Billing') `
+    -IsChoice $true -FieldShape (Get-CopilotDecisionFieldShape -Fields @($dispMarker.fields)))
 Test-That 'a claim left without keys is honoured, and its own answer is the one typed' {
     $script:Typed.Clear()
     [void](Invoke-Dispatch -Answer 'Auth' -Sel @('Auth'))
@@ -602,6 +604,100 @@ Test-That 'a question with no id is never typed at, rather than slipping past un
         -IsChoice $true -Selections @('Auth') -State @{} -Headers $headers
     -not $r -and $script:Typed.Count -eq 0
 } "typed=$($script:Typed.Count)"
+
+# A claim is a whole execution, not a set of words. Resuming one with another call's
+# context would type the claimed answer down a route the claim never chose, or mark a
+# publish spent that it never used.
+Remove-CopilotDecisionMarker -SessionId $dispSid -DecisionId 'disp1'
+Test-That 'a claim carries the route and the publish it was made for, not just the words' {
+    [void](New-CopilotDecisionAttempt -SessionId $dispSid -DecisionId 'disp1' -Answer 'typed words' `
+        -Selections @() -IsChoice $true -IsFreeText $true -PayloadStamp 'stamp-A' `
+        -FieldShape (Get-CopilotDecisionFieldShape -Fields @($dispMarker.fields)))
+    $script:Typed.Clear()
+    # The caller arrives with a different route and a different publish entirely.
+    [void](Invoke-DaemonDecisionAnswer -SessionId $dispSid -Marker $dispMarker -Answer 'Auth' `
+        -IsChoice $true -IsFreeText $false -Selections @('Auth') -PayloadStamp 'stamp-B' `
+        -State @{} -Headers $headers)
+    # It must do what the claim said: the typed-words route, with the claim's words.
+    $script:Typed.Count -eq 1 -and $script:Typed[0].Route -ceq 'choice' -and $script:Typed[0].Text -ceq 'typed words'
+} "typed=[$(@($script:Typed | ForEach-Object { "$($_.Route):$($_.Text)" }) -join '|')]"
+
+Remove-CopilotDecisionMarker -SessionId $dispSid -DecisionId 'disp1'
+Test-That 'a claim made against different fields is refused rather than walked' {
+    $otherShape = [pscustomobject]@{ decisionId = 'disp1'; mode = 'multiple_choice'; choices = @(); fields = @(
+        [pscustomobject]@{ Label = 'Different'; Options = @('X', 'Y'); IsText = $false }) }
+    [void](New-CopilotDecisionAttempt -SessionId $dispSid -DecisionId 'disp1' -Answer 'X' `
+        -Selections @('X') -IsChoice $true -FieldShape (Get-CopilotDecisionFieldShape -Fields @($otherShape.fields)))
+    $script:Typed.Clear()
+    $r = Invoke-Dispatch
+    -not $r -and $script:Typed.Count -eq 0
+} "typed=$($script:Typed.Count)"
+Test-That 'and that refusal releases it, because nothing was typed' {
+    $null -eq (Get-CopilotDecisionAttempt -SessionId $dispSid -DecisionId 'disp1') -or
+    (Get-DispState) -ceq 'rejected'
+} "state=$(Get-DispState)"
+
+Write-Host '--- the barrier returns the record it changed, not one read beforehand ---'
+# Reading the claim first and acting on that is a different record if the claim is
+# replaced in between: the transition would move the NEW claim to injecting while the
+# caller typed the OLD claim's answer, so the ledger and the keyboard would disagree.
+Test-That 'the barrier hands back the record its own transition wrote' {
+    $abaSid = '11111111-0000-4000-8000-0000000000ba'
+    [void](New-CopilotDecisionAttempt -SessionId $abaSid -DecisionId 'aba' -Answer 'the claim that was there' -Selections @('#1'))
+    $started = Start-CopilotDecisionAttempt -SessionId $abaSid -DecisionId 'aba'
+    $after = Get-CopilotDecisionAttempt -SessionId $abaSid -DecisionId 'aba'
+    # What came back and what is on disk are the same record, in the same state.
+    $started.Started -and $started.Answer -ceq [string]$after.answer -and [string]$after.state -ceq 'injecting'
+}
+Test-That 'and a replaced claim is answered with its own words, never the previous one''s' {
+    $abaSid = '11111111-0000-4000-8000-0000000000bb'
+    [void](New-CopilotDecisionAttempt -SessionId $abaSid -DecisionId 'aba' -Answer 'first claim')
+    # Replaced between a read and a transition, which is the window that mattered.
+    Remove-Item -LiteralPath (Get-CopilotDecisionAttemptPath -SessionId $abaSid -DecisionId 'aba') -Force
+    [void](New-CopilotDecisionAttempt -SessionId $abaSid -DecisionId 'aba' -Answer 'second claim')
+    (Start-CopilotDecisionAttempt -SessionId $abaSid -DecisionId 'aba').Answer -ceq 'second claim'
+}
+
+Write-Host '--- the real senders say whether they reached the keyboard ---'
+# The dispatcher decides whether a question may be answered again on this one fact, so
+# it is checked against the actual senders rather than against stubs of them. They were
+# stubbed above for the dispatcher tests, so the real ones are loaded back first - the
+# file declares no parameters, so dot-sourcing it rebinds nothing.
+. (Join-Path $PSScriptRoot '..\hooks\decision-inject.ps1')
+$script:ConsoleWrites = 0
+function Invoke-BridgeConsoleSend { param($ProcessId, $Text, $Submit, $DelayMs) $script:ConsoleWrites++; 'ok:sent' }
+function Invoke-BridgeConsoleChoice { param($ProcessId, $DownCount, $Text, $StepDelayMs) $script:ConsoleWrites++; 'ok:choice' }
+function Get-CopilotSessionProcessId { param($SessionId) 4242 }
+Test-That 'a prompt that reaches the console says it wrote' {
+    $script:ConsoleWrites = 0
+    $d = Send-CopilotSessionPrompt -SessionId $sid -Text 'hello' -ProcessId 4242
+    $d.Wrote -and $d.Delivered -and $script:ConsoleWrites -eq 1
+} "writes=$($script:ConsoleWrites)"
+Test-That 'and one refused before the console says it did not' {
+    $script:ConsoleWrites = 0
+    $d = Send-CopilotSessionPrompt -SessionId $sid -Text '   ' -ProcessId 4242
+    -not $d.Wrote -and -not $d.Delivered -and $script:ConsoleWrites -eq 0
+}
+Test-That 'a choice that reaches the console says it wrote' {
+    $script:ConsoleWrites = 0
+    $d = Send-CopilotSessionChoice -SessionId $sid -Text 'other words' -ChoiceCount 2 -ProcessId 4242
+    $d.Wrote -and $script:ConsoleWrites -eq 1
+}
+Test-That 'a form that reaches the console says it wrote' {
+    $script:ConsoleWrites = 0
+    $f = @([pscustomobject]@{ Label = 'F'; Options = @('A', 'B'); IsText = $false })
+    $d = Send-CopilotSessionForm -SessionId $sid -Fields $f -Selections @('B') -ProcessId 4242
+    $d.Wrote -and $script:ConsoleWrites -ge 1
+} "writes=$($script:ConsoleWrites)"
+Test-That 'and a form refused before the console says it did not' {
+    # One field, no selection for it: the mismatch the sender refuses before writing.
+    $script:ConsoleWrites = 0
+    $f = @(
+        [pscustomobject]@{ Label = 'F'; Options = @('A', 'B'); IsText = $false }
+        [pscustomobject]@{ Label = 'G'; Options = @('C', 'D'); IsText = $false })
+    $d = Send-CopilotSessionForm -SessionId $sid -Fields $f -Selections @('B') -ProcessId 4242
+    -not $d.Wrote -and -not $d.Delivered -and $script:ConsoleWrites -eq 0
+} "detail=$((Send-CopilotSessionForm -SessionId $sid -Fields @([pscustomobject]@{ Label='F'; Options=@('A','B'); IsText=$false }, [pscustomobject]@{ Label='G'; Options=@('C','D'); IsText=$false }) -Selections @('B') -ProcessId 4242).Detail)"
 Test-That 'an attempt is never read against a different question' {
     $path = Get-CopilotDecisionAttemptPath -SessionId $attemptSid -DecisionId 'a4'
     [IO.File]::WriteAllText($path, '{"decisionId":"somebody-else","state":"injecting"}')
