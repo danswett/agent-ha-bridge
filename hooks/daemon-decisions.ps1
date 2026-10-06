@@ -852,18 +852,35 @@ function Invoke-DaemonDecisionAnswer {
     }
     if ($null -eq (Get-CopilotDecisionAttempt -SessionId $SessionId -DecisionId $decisionId)) {
         [void](New-CopilotDecisionAttempt -SessionId $SessionId -DecisionId $decisionId `
-            -Answer $Answer -Selections ([string[]]@($Selections)))
+            -Answer $Answer -Selections ([string[]]@($Selections)) `
+            -IsChoice $IsChoice -IsFreeText $IsFreeText -PayloadStamp $PayloadStamp `
+            -FieldShape (Get-CopilotDecisionFieldShape -Fields @($Marker.fields)))
     }
-    # The barrier. Nothing is typed unless this call wins it, and what is typed is what
-    # the claim recorded - not this call's own input, which may belong to a different
-    # reading of the card than the claim did.
+    # The barrier. Nothing is typed unless this call wins it, and what comes back is
+    # the record the transition actually wrote.
     $attempt = Start-CopilotDecisionAttempt -SessionId $SessionId -DecisionId $decisionId
     if (-not $attempt.Started) {
         Write-DaemonLog -Message "did not win the attempt barrier for $short; not typing anything"
         return $false
     }
+    # A claim describes a whole execution, not just the words: which route it goes
+    # down, which fields it walks, and which publish it marks as spent. Resuming one
+    # of those with another's context would type the claimed answer through the wrong
+    # route, or mark a publish spent that the claim never used. Where the question is
+    # no longer the one that was claimed, nothing is typed and the uncertainty is
+    # recorded rather than papered over.
+    $shape = Get-CopilotDecisionFieldShape -Fields @($Marker.fields)
+    if ($attempt.FieldShape -cne $shape) {
+        Write-DaemonLog -Message "the claim for $short was made against different fields; not typing anything"
+        [void](Set-CopilotDecisionAttemptState -SessionId $SessionId -DecisionId $decisionId `
+            -State 'rejected' -Detail 'the question changed after it was claimed' -NothingWritten)
+        return $false
+    }
     $Answer = $attempt.Answer
     $Selections = @($attempt.Selections)
+    $IsChoice = $attempt.IsChoice
+    $IsFreeText = $attempt.IsFreeText
+    $PayloadStamp = $attempt.PayloadStamp
 
     if ($IsChoice -and $IsFreeText) {
         # Typed, not chosen. The prompt's own "Other (type your answer)" entry is the
@@ -962,8 +979,8 @@ function Invoke-DaemonDecisionAnswer {
             # Nothing was typed, so the question is answerable again - and the record
             # goes with it, through the transition rather than around it. If the
             # transition is refused the record stays exactly as it is.
-            if (Set-CopilotDecisionAttemptState -SessionId $SessionId -DecisionId $decisionId `
-                    -State 'rejected' -Detail $detail -NothingWritten) {
+            if ($null -ne (Set-CopilotDecisionAttemptState -SessionId $SessionId -DecisionId $decisionId `
+                    -State 'rejected' -Detail $detail -NothingWritten)) {
                 $attemptPath = Get-CopilotDecisionAttemptPath -SessionId $SessionId -DecisionId $decisionId
                 if (Test-Path -LiteralPath $attemptPath) {
                     Remove-Item -LiteralPath $attemptPath -Force -ErrorAction SilentlyContinue

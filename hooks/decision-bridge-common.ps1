@@ -2676,17 +2676,30 @@ function New-CopilotDecisionAttempt {
         [Parameter(Mandatory)][string]$SessionId,
         [Parameter(Mandatory)][AllowEmptyString()][string]$DecisionId,
         [Parameter(Mandatory)][AllowEmptyString()][string]$Answer,
-        [AllowNull()][AllowEmptyCollection()][string[]]$Selections = @()
+        [AllowNull()][AllowEmptyCollection()][string[]]$Selections = @(),
+        # Everything else that decides what actually happens. The answer alone is not
+        # the execution: the route taken, the field shape walked, and the publish
+        # marked as used are all chosen separately, so a claim carrying only the words
+        # can be resumed by a call that types them down a different route or marks a
+        # different publish as spent.
+        [bool]$IsChoice = $false,
+        [bool]$IsFreeText = $false,
+        [AllowEmptyString()][string]$PayloadStamp = '',
+        [AllowEmptyString()][string]$FieldShape = ''
     )
 
     if ([string]::IsNullOrWhiteSpace($DecisionId)) { return $false }
     $path = Get-CopilotDecisionAttemptPath -SessionId $SessionId -DecisionId $DecisionId
     $json = @{
-        decisionId = $DecisionId
-        state      = 'claimed'
-        answer     = $Answer
-        selections = @($Selections)
-        claimedAt  = [DateTimeOffset]::Now.ToString('o')
+        decisionId   = $DecisionId
+        state        = 'claimed'
+        answer       = $Answer
+        selections   = @($Selections)
+        isChoice     = $IsChoice
+        isFreeText   = $IsFreeText
+        payloadStamp = $PayloadStamp
+        fieldShape   = $FieldShape
+        claimedAt    = [DateTimeOffset]::Now.ToString('o')
     } | ConvertTo-Json -Depth 8 -Compress
 
     try {
@@ -2740,8 +2753,10 @@ function Set-CopilotDecisionAttemptState {
         'claimed', so a question can never be released for another try after something
         has been typed at it.
 
-        Returns $true only when this call made the transition. A caller that gets
-        $false has not won it and must not type.
+        Returns the record as it was written, or $null when this call did not make the
+        transition. The record itself rather than a flag, because the caller has to act
+        on the one that was actually transitioned: reading it beforehand and acting on
+        that is a different record if a claim is replaced in between.
     #>
     param(
         [Parameter(Mandatory)][string]$SessionId,
@@ -2757,21 +2772,21 @@ function Set-CopilotDecisionAttemptState {
         [switch]$NothingWritten
     )
 
-    if ([string]::IsNullOrWhiteSpace($DecisionId)) { return $false }
+    if ([string]::IsNullOrWhiteSpace($DecisionId)) { return $null }
     $path = Get-CopilotDecisionAttemptPath -SessionId $SessionId -DecisionId $DecisionId
-    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $false }
+    if (-not (Test-Path -LiteralPath $path -PathType Leaf)) { return $null }
 
     $handle = $null
     try { $handle = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::ReadWrite, [IO.FileShare]::None) }
-    catch { return $false }
+    catch { return $null }
     try {
         $reader = [IO.StreamReader]::new($handle, [Text.UTF8Encoding]::new($false), $false, 1024, $true)
         $text = $reader.ReadToEnd()
         $reader.Dispose()
         $record = $null
-        try { $record = ConvertFrom-DecisionJson -Json $text } catch { return $false }
-        if ($null -eq $record -or -not $record.PSObject.Properties['state']) { return $false }
-        if (-not [StringComparer]::Ordinal.Equals([string]$record.decisionId, $DecisionId)) { return $false }
+        try { $record = ConvertFrom-DecisionJson -Json $text } catch { return $null }
+        if ($null -eq $record -or -not $record.PSObject.Properties['state']) { return $null }
+        if (-not [StringComparer]::Ordinal.Equals([string]$record.decisionId, $DecisionId)) { return $null }
 
         $from = [string]$record.state
         $allowed = switch ($State) {
@@ -2780,7 +2795,7 @@ function Set-CopilotDecisionAttemptState {
             'delivered' { $from -cin @('claimed', 'injecting') }
             'unknown'   { $from -cin @('claimed', 'injecting') }
         }
-        if (-not $allowed) { return $false }
+        if (-not $allowed) { return $null }
 
         $record | Add-Member -NotePropertyName state -NotePropertyValue $State -Force
         $record | Add-Member -NotePropertyName detail -NotePropertyValue $Detail -Force
@@ -2790,45 +2805,80 @@ function Set-CopilotDecisionAttemptState {
         $handle.Position = 0
         $handle.Write($bytes, 0, $bytes.Length)
         $handle.Flush()
-        return $true
+        return $record
     }
     catch {
         Write-DecisionBridgeLog -Message "could not advance a decision attempt: $($_.Exception.Message)"
-        return $false
+        return $null
     }
     finally { if ($null -ne $handle) { $handle.Dispose() } }
 }
 
 function Start-CopilotDecisionAttempt {
     <#
-        Wins the right to type at a question, and says what to type.
+        Wins the right to type at a question, and says exactly what to do.
 
-        This is the barrier. It takes the attempt from 'claimed' to 'injecting' under
-        an exclusive handle, and hands back the answer **recorded in the claim** -
-        never the caller's own. A second pass that finds a claim left by a first used
-        to type its own input against somebody else's claim, which is two different
-        answers sharing one record of having been answered.
+        This is the barrier, and what comes back is the record the transition actually
+        wrote - not one read beforehand. Reading first and acting on that is a
+        different record if the claim is replaced in between: the transition would
+        move a new claim to 'injecting' while the caller typed the old claim's answer,
+        so the ledger and the keyboard would disagree about what had been answered.
 
-        Returns { Started; Answer; Selections }. Started=$false means this call did not
-        win the barrier, and nothing may be typed - not a key.
+        The whole execution comes back, not only the words, because the route, the
+        field shape and the publish to mark as spent are chosen separately. A caller
+        that resumes somebody else's claim must do what that claim said, or do
+        nothing.
+
+        Returns { Started; Answer; Selections; IsChoice; IsFreeText; PayloadStamp;
+        FieldShape }. Started=$false means this call did not win it, and nothing may
+        be typed - not a key.
     #>
     param(
         [Parameter(Mandatory)][string]$SessionId,
         [Parameter(Mandatory)][AllowEmptyString()][string]$DecisionId
     )
 
-    $idle = [pscustomobject]@{ Started = $false; Answer = ''; Selections = @() }
+    $idle = [pscustomobject]@{
+        Started = $false; Answer = ''; Selections = @()
+        IsChoice = $false; IsFreeText = $false; PayloadStamp = ''; FieldShape = ''
+    }
     if ([string]::IsNullOrWhiteSpace($DecisionId)) { return $idle }
-    $record = Get-CopilotDecisionAttempt -SessionId $SessionId -DecisionId $DecisionId
-    if ($null -eq $record -or ([string]$record.state) -cne 'claimed') { return $idle }
-    if (-not (Set-CopilotDecisionAttemptState -SessionId $SessionId -DecisionId $DecisionId -State 'injecting')) {
-        return $idle
+    $record = Set-CopilotDecisionAttemptState -SessionId $SessionId -DecisionId $DecisionId -State 'injecting'
+    if ($null -eq $record) { return $idle }
+    $read = {
+        param($Name, $Default)
+        if ($record.PSObject.Properties[$Name]) { $record.$Name } else { $Default }
     }
     [pscustomobject]@{
-        Started    = $true
-        Answer     = [string]$record.answer
-        Selections = @($record.selections | ForEach-Object { [string]$_ })
+        Started      = $true
+        Answer       = [string](& $read 'answer' '')
+        Selections   = @((& $read 'selections' @()) | ForEach-Object { [string]$_ })
+        IsChoice     = [bool](& $read 'isChoice' $false)
+        IsFreeText   = [bool](& $read 'isFreeText' $false)
+        PayloadStamp = [string](& $read 'payloadStamp' '')
+        FieldShape   = [string](& $read 'fieldShape' '')
     }
+}
+
+function Get-CopilotDecisionFieldShape {
+    <#
+        A short, stable description of the fields an answer will be walked through.
+
+        The claim records it so that a resumed attempt can tell whether the question
+        it is about to type at is still the one that was claimed. The labels and
+        option lists are what the keystroke plan is computed from, so a change in
+        either means the walk would land somewhere else.
+    #>
+    param([AllowNull()][AllowEmptyCollection()][object[]]$Fields)
+
+    $parts = foreach ($field in @($Fields)) {
+        if ($null -eq $field) { continue }
+        $label = if ($field.PSObject.Properties['Label']) { [string]$field.Label } else { '' }
+        $options = if ($field.PSObject.Properties['Options']) { @($field.Options | ForEach-Object { [string]$_ }) } else { @() }
+        $text = if ($field.PSObject.Properties['IsText']) { [bool]$field.IsText } else { $false }
+        "$label`u{0002}$text`u{0002}$($options -join "`u{0001}")"
+    }
+    ($parts -join "`u{0003}")
 }
 
 function Test-CopilotDecisionAttemptSettled {
