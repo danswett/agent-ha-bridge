@@ -42,6 +42,7 @@
         'tests\test-p3b-contracts.ps1'
         'tests\test-p4-worktree-safety.ps1'
         'tests\test-p5-attachment-privacy.ps1'
+        'tests\test-pairing.ps1'
         'tests\test-publication-policy.ps1'
         'tests\test-registration-isolation.ps1'
         'tests\test-reliability.ps1'
