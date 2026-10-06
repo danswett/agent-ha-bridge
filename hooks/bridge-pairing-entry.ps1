@@ -82,7 +82,7 @@ function Invoke-PairingJoin {
     param([Parameter(Mandatory)]$Chosen)
     # Created here, by the person choosing to pair, rather than by any daemon: a helper
     # somebody deleted on purpose stays deleted until somebody pairs again.
-    if (-not (Initialize-BridgePairingHelper)) { throw 'could not create the Pair a machine helper in Home Assistant' }
+    if (-not (Initialize-BridgePairingHelper -Headers $headers)) { throw 'could not create the Pair a machine helper in Home Assistant' }
     Write-Host "    asking $($Chosen.Machine)..."
     $result = Invoke-BridgePairingJoin -Sponsor $Chosen -Headers $headers -ShowCode {
         param($code)
@@ -112,7 +112,7 @@ function Invoke-PairingPaste {
     if ($members.Count -gt 0) {
         Write-Host '    Check it against:'
         $member = Select-PairingMachine -Machines $members -Prompt '    Machine'
-        if (-not (Initialize-BridgePairingHelper)) { throw 'could not create the Pair a machine helper in Home Assistant' }
+        if (-not (Initialize-BridgePairingHelper -Headers $headers)) { throw 'could not create the Pair a machine helper in Home Assistant' }
         if (-not (Test-BridgeFleetSecretWithMember -Secret $pasted -Member $member -Headers $headers)) {
             throw "that is not $($member.Machine)'s fleet secret - nothing was saved"
         }

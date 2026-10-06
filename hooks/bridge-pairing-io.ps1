@@ -19,12 +19,15 @@ $script:BridgePairingLockMinutes = 15
 $script:BridgePairingLockRefusals = 3
 # The attempt this daemon last started a sponsor for, so one request starts one process.
 if (-not (Test-Path variable:script:DaemonPairingAttempt)) { $script:DaemonPairingAttempt = '' }
+# And the process it started, so a sponsor that died can be told from one still waiting
+# for a person. Kept beside the attempt because the two are only meaningful together.
+if (-not (Test-Path variable:script:DaemonPairingSponsor)) { $script:DaemonPairingSponsor = $null }
 
 # ---------------------------------------------------------------------- the helper
 
 function Initialize-BridgePairingHelper {
     <#
-        Makes sure input_text.agent_bridge_pairing exists.
+        Makes sure input_text.agent_bridge_pairing exists and has a state.
 
         Called only when a person chooses to pair - `agent-ha-bridge pair`, or the
         sharing step in configure - and never by a daemon. A daemon that created it at
@@ -33,26 +36,44 @@ function Initialize-BridgePairingHelper {
         is left exactly as it is: one the person renamed keeps its name. Created over the
         WebSocket collection API with the administrator token. Returns $true when the
         helper exists afterwards.
+
+        Storage is not the state machine. A helper can be in the collection and in the
+        entity registry a moment before its state appears, and the very next thing
+        pairing does is read that state - so returning as soon as the create succeeded
+        made a first-ever pairing fail with "the helper is missing" until the person ran
+        it a second time. Waited for here, the same way the Detailed activity switch
+        waits, rather than left for the caller to discover.
     #>
+    param([Parameter(Mandatory)][hashtable]$Headers)
+
     try {
         $existing = (Invoke-CopilotHaWebSocket -Commands @(@{ type = 'input_text/list' }))[0]
-        if (@($existing) | Where-Object { [string]$_.id -eq $script:BridgePairingHelperId }) { return $true }
-        $created = (Invoke-CopilotHaWebSocket -Commands @(@{
-                type = 'input_text/create'; name = $script:BridgePairingHelperName
-                icon = 'mdi:handshake-outline'; min = 0; max = 255; mode = 'text'
-            }))[0]
-        if ([string]$created.id -ne $script:BridgePairingHelperId) {
-            Write-Warning "The pairing helper came back as '$($created.id)', expected '$($script:BridgePairingHelperId)'."
-            return $false
+        if (-not (@($existing) | Where-Object { [string]$_.id -eq $script:BridgePairingHelperId })) {
+            $created = (Invoke-CopilotHaWebSocket -Commands @(@{
+                    type = 'input_text/create'; name = $script:BridgePairingHelperName
+                    icon = 'mdi:handshake-outline'; min = 0; max = 255; mode = 'text'
+                }))[0]
+            if ([string]$created.id -ne $script:BridgePairingHelperId) {
+                Write-Warning "The pairing helper came back as '$($created.id)', expected '$($script:BridgePairingHelperId)'."
+                return $false
+            }
+            try {
+                [void](Invoke-CopilotHaWebSocket -Commands @(@{
+                        type = 'config/entity_registry/update'; entity_id = $script:BridgePairingHelperEntity
+                        name = $script:BridgePairingHelperDisplayName
+                    }))
+            }
+            catch { }
         }
-        try {
-            [void](Invoke-CopilotHaWebSocket -Commands @(@{
-                    type = 'config/entity_registry/update'; entity_id = $script:BridgePairingHelperEntity
-                    name = $script:BridgePairingHelperDisplayName
-                }))
+        # Read through the same path pairing itself uses, so "ready" means the thing
+        # pairing is about to do actually works. '' is a helper that is simply empty,
+        # which is its normal resting state; only $null is "cannot be read".
+        foreach ($attempt in 1..5) {
+            if ($null -ne (Get-BridgePairingHelperValue -Headers $Headers)) { return $true }
+            Start-Sleep -Milliseconds 800
         }
-        catch { }
-        $true
+        Write-Warning "The pairing helper '$($script:BridgePairingHelperEntity)' has no state yet."
+        $false
     }
     catch { $false }
 }
@@ -215,7 +236,17 @@ function Invoke-DaemonPairingRequest {
     if ($null -eq $request -or $request.SponsorSlug -cne $slug) { return 'not-ours' }
     if (-not $membership.Member) { return 'not-a-member' }
     if ($request.FleetId -cne $membership.FleetId) { return 'other-fleet' }
-    if ($script:DaemonPairingAttempt -ceq $request.Attempt) { return 'running' }
+    if ($script:DaemonPairingAttempt -ceq $request.Attempt) {
+        # A sponsor that is gone cannot still be running. Start-Process only establishes
+        # that pwsh was created: an entry point missing mid-update, or a failure during
+        # initialisation, exits straight away, and the attempt stayed recorded so every
+        # later pass answered 'running' for nothing at all while the joiner waited out
+        # its whole timeout. Reaching here means the request is still in the helper, so
+        # the sponsor never answered it, whatever it exited with.
+        if (-not (Test-BridgePairingSponsorGone -Process $script:DaemonPairingSponsor)) { return 'running' }
+        $script:DaemonPairingAttempt = ''
+        $script:DaemonPairingSponsor = $null
+    }
     if (Test-BridgePairingLocked) {
         $script:DaemonPairingAttempt = $request.Attempt
         Set-BridgePairingHelperValue -Headers $Headers -Value "refused:$($request.Joiner)"
@@ -227,16 +258,39 @@ function Invoke-DaemonPairingRequest {
             $entry = Join-Path $PSScriptRoot 'bridge-pairing-entry.ps1'
             $start = @{ FilePath = (Get-BridgePwshPath); ArgumentList = @('-NoProfile', '-NonInteractive', '-File', $entry, '-Sponsor', '-Attempt', $Attempt) }
             if ($script:BridgeIsWindows) { $start.WindowStyle = 'Hidden' }
-            [void](Start-Process @start -PassThru)
+            # Handed back, not discarded, so a child that dies can be told from one that
+            # is waiting for a person.
+            Start-Process @start -PassThru
         }
     }
     # Recorded only once the process has started. Recorded before, a start that threw -
     # a transient resource error, an entry point missing mid-update - left every later
     # pass answering 'running' for a sponsor that did not exist, and the joiner waited
     # out its whole timeout.
-    & $StartSponsor $request.Attempt
+    $sponsor = & $StartSponsor $request.Attempt
+    $script:DaemonPairingSponsor = $sponsor
     $script:DaemonPairingAttempt = $request.Attempt
     'started'
+}
+
+function Test-BridgePairingSponsorGone {
+    <#
+        Whether a started sponsor has determinately exited.
+
+        Only "yes, it has gone" releases the attempt. Nothing to look at - a caller that
+        hands back no process, which is every test that supplies its own starter - and a
+        process that cannot be asked both mean nobody can tell, and the attempt stays
+        recorded: starting a second sponsor for a joiner that already has one is worse
+        than waiting, because both would race to answer the same pairing.
+    #>
+    param([AllowNull()]$Process)
+
+    if ($null -eq $Process) { return $false }
+    try {
+        if (-not $Process.PSObject.Properties['HasExited']) { return $false }
+        [bool]$Process.HasExited
+    }
+    catch { $false }
 }
 
 function Invoke-BridgePairingSponsor {

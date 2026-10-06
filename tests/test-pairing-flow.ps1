@@ -198,6 +198,63 @@ $message = ''
 try { [void](Invoke-BridgePairingJoin -Sponsor $sponsorRecord -Headers $headers -ShowCode { param($c) }) } catch { $message = $_.Exception.Message }
 Test-That 'and says what to do when the helper does not exist' { $message -like '*helper is missing*' } $message
 
+Write-Host '--- the helper pairing reads and writes ---'
+Reset-FakeHa
+# Storage is not the state machine: a helper can be in the collection and the entity
+# registry a moment before its state appears, and the next thing pairing does is read
+# that state. Returning as soon as the create succeeded made a first-ever pairing fail
+# with "the helper is missing" until the person ran it a second time.
+$script:Ws = [Collections.Generic.List[string]]::new()
+$script:HelperListed = $true
+$script:StateAfterSleeps = 0
+$script:Slept = 0
+function Invoke-CopilotHaWebSocket {
+    param($Commands)
+    $type = [string]$Commands[0].type
+    $script:Ws.Add($type)
+    # Assigned, never piped. `$x = if (...) { @() }` yields $null rather than an empty
+    # array, and the caller then indexes a one-element list holding $null - the trap
+    # this repository has hit before, and exactly what a real empty collection must not
+    # look like here.
+    $payload = $null
+    if ($type -ceq 'input_text/list') {
+        $payload = [object[]]::new(0)
+        if ($script:HelperListed) { $payload = @([pscustomobject]@{ id = 'agent_bridge_pairing' }) }
+    }
+    elseif ($type -ceq 'input_text/create') {
+        $script:HelperListed = $true
+        $payload = [pscustomobject]@{ id = 'agent_bridge_pairing' }
+    }
+    # One entry per command, kept intact the way the real client does it: returned bare,
+    # a result that is an empty list unrolls to nothing at all and indexing [0] throws.
+    $results = [object[]]::new(1)
+    $results[0] = $payload
+    Write-Output -NoEnumerate $results
+}
+function Start-Sleep {
+    param([int]$Seconds, [int]$Milliseconds)
+    $script:Slept++
+    if ($script:StateAfterSleeps -gt 0 -and $script:Slept -ge $script:StateAfterSleeps) { $script:HelperExists = $true }
+}
+Test-That 'a helper that is already there is used as it is, and nothing is created' {
+    $script:Ws.Clear()
+    (Initialize-BridgePairingHelper -Headers $headers) -and $script:Ws -notcontains 'input_text/create'
+} "ws=[$($script:Ws -join ',')]"
+$script:Ws.Clear(); $script:HelperListed = $false; $script:HelperExists = $false
+$script:Slept = 0; $script:StateAfterSleeps = 2
+Test-That 'a helper created now is waited for until its state is really there' {
+    (Initialize-BridgePairingHelper -Headers $headers) -and $script:Ws -contains 'input_text/create'
+} "ws=[$($script:Ws -join ',')] slept=$($script:Slept)"
+Test-That 'and pairing can read it the moment this says so' {
+    $null -ne (Get-BridgePairingHelperValue -Headers $headers)
+}
+$script:Ws.Clear(); $script:HelperListed = $false; $script:HelperExists = $false
+$script:Slept = 0; $script:StateAfterSleeps = 0
+Test-That 'a helper whose state never arrives is a failure, not a success to trip over' {
+    -not (Initialize-BridgePairingHelper -Headers $headers)
+} "slept=$($script:Slept)"
+$script:StateAfterSleeps = 0
+
 Write-Host '--- the daemon''s look at the helper ---'
 Reset-FakeHa
 $script:Started = @()
@@ -224,6 +281,38 @@ try { [void](Invoke-DaemonPairingRequest -Headers $headers -StartSponsor $failin
 Test-That 'a sponsor that fails to start is reported, not recorded as running' { $threw -and $script:DaemonPairingAttempt -ceq '' }
 $script:Started = @()
 Test-That 'so the next pass tries again' { (Invoke-DaemonPairingRequest -Headers $headers -StartSponsor $start) -ceq 'started' -and $script:Started -ceq @($req.Attempt) }
+# Start-Process only establishes that pwsh was created. A sponsor that exits straight
+# away - a missing entry point mid-update, a failure during initialisation - left the
+# attempt recorded, so every later pass answered 'running' for nothing while the joiner
+# waited out its whole timeout. The request is still in the helper here, which is itself
+# the evidence that the sponsor never answered it.
+$script:DaemonPairingAttempt = ''
+$script:DaemonPairingSponsor = $null
+$script:Started = @()
+# One object, looked at again each pass, because that is what a real process handle is:
+# an object built per call would answer with whatever was true when it was started.
+$script:Child = [pscustomobject]@{ HasExited = $false }
+$dead = { param($Attempt) $script:Started += $Attempt; $script:Child }
+Test-That 'a sponsor whose process answers is started as usual' {
+    (Invoke-DaemonPairingRequest -Headers $headers -StartSponsor $dead) -ceq 'started' -and $script:Started.Count -eq 1
+}
+Test-That 'and while it is alive the next pass leaves it alone' {
+    (Invoke-DaemonPairingRequest -Headers $headers -StartSponsor $dead) -ceq 'running' -and $script:Started.Count -eq 1
+}
+$script:Child.HasExited = $true
+Test-That 'but once it has gone without answering, the next pass starts another' {
+    (Invoke-DaemonPairingRequest -Headers $headers -StartSponsor $dead) -ceq 'started' -and $script:Started.Count -eq 2
+}
+# A starter that hands nothing back is every caller that cannot say, and two sponsors
+# racing to answer one pairing is worse than waiting for one that may still be there.
+$script:DaemonPairingAttempt = ''
+$script:DaemonPairingSponsor = $null
+$script:Started = @()
+Test-That 'a sponsor nobody can ask about is left running rather than started twice' {
+    [void](Invoke-DaemonPairingRequest -Headers $headers -StartSponsor $start)
+    (Invoke-DaemonPairingRequest -Headers $headers -StartSponsor $start) -ceq 'running' -and $script:Started.Count -eq 1
+}
+$script:DaemonPairingSponsor = $null
 $script:MySecret = ''
 $script:DaemonPairingAttempt = ''
 Test-That 'a machine without the secret cannot sponsor' { (Invoke-DaemonPairingRequest -Headers $headers -StartSponsor $start) -ceq 'not-a-member' }
