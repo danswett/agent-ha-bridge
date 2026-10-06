@@ -554,9 +554,9 @@ function Get-BridgeFormPayloads {
         is not one of its field's options.
 
         Keys is the payload split into the separate writes it has to be delivered in:
-        one entry for most fields, one per toggle plus the walk to Submit for a
-        multi-select one, which cannot be delivered in a single write (see
-        Send-CopilotSessionForm).
+        one entry for most fields, and one per toggle for a multi-select one - the
+        walk to Submit for Claude, the Space presses themselves for Copilot - which
+        cannot be delivered in a single write (see Send-CopilotSessionForm).
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Fields,
@@ -582,21 +582,79 @@ function Get-BridgeFormPayloads {
         $options = @($Fields[$i].Options | ForEach-Object { [string]$_ })
         [void](Get-DecisionSchemaFieldChoices -Field ([pscustomobject]@{ enum = $options }))
 
-        # A multi-select field is a checkbox list, not a cursor. Its options are
-        # numbered on screen and typing a number toggles that one, wherever the cursor
-        # happens to be - which is both simpler and safer than counting Down presses.
-        # Then Down once per row (the options plus the "Type something" row) lands on
-        # Submit, and the caller's Enter presses it.
-        #
-        # Verified live against Claude Code 2.1.273 on two- and three-option questions:
-        # "2" then "3" checked exactly Billing and Search, four Downs highlighted
-        # Submit, and Claude recorded "Billing, Search". Tab was tried as a way to
-        # reach Submit without counting - the decompiled handler ignores it once Submit
-        # has focus - but overshooting with Tab tore the prompt down, so the count is
-        # exact and deliberate.
+        # A multi-select field is a checkbox list, not a cursor, and the two clients
+        # draw a different one (Get-DecisionMultiSelectStyle).
         if (Test-DecisionFieldIsMultiSelect -Field $Fields[$i]) {
             $picked = @(Resolve-DecisionMultiSelectChoice -Field $Fields[$i] -Choice ([string]$Selections[$i]))
             if ($picked.Count -eq 0) { throw "combination '$($Selections[$i])' not found in field $i" }
+
+            if ((Get-DecisionMultiSelectStyle -Field $Fields[$i]) -eq 'space-toggle') {
+                # Copilot CLI: "↑/↓ select · space toggle · enter accept". There is no
+                # Submit row and no numbers - the caller's Enter accepts whatever is
+                # checked - so this walks the list once, top to bottom, pressing Space
+                # only on the rows whose state has to change.
+                #
+                # Which rows those are depends on the schema default, because the
+                # prompt opens with those already checked. Toggling every wanted
+                # option blindly would switch a defaulted one back off, and the result
+                # comes back in selection order rather than display order, so nothing
+                # downstream would make the swap obvious.
+                $wanted = [Collections.Generic.HashSet[int]]::new()
+                foreach ($option in $picked) {
+                    $at = [Array]::IndexOf($options, [string]$option)
+                    if ($at -lt 0) { throw "option '$option' is not in field $i" }
+                    [void]$wanted.Add($at)
+                }
+                $checked = [Collections.Generic.HashSet[int]]::new()
+                foreach ($at in @(Get-DecisionMultiSelectChecked -Field $Fields[$i])) { [void]$checked.Add($at) }
+
+                # The cursor opens on the field's initial focus and only ever moves
+                # down, so the rows are visited in order and no walk can overshoot.
+                $cursor = 0
+                if ($Fields[$i].PSObject.Properties['DefaultIndex']) {
+                    $cursor = $Fields[$i].DefaultIndex
+                    if ($cursor -isnot [int] -and $cursor -isnot [long]) { throw "invalid initial focus in field $i" }
+                    if ($cursor -lt 0 -or $cursor -ge $options.Count) { throw "initial focus outside field $i" }
+                }
+                $keys = New-Object System.Collections.Generic.List[string]
+                # The cursor only moves down, so anything already checked above where
+                # it opens could never be unchecked. That cannot happen while an array
+                # field's focus is its first row, and this is here so it stays a
+                # refusal rather than a quietly wrong answer if that ever changes.
+                foreach ($row in @($checked)) {
+                    if ($row -lt $cursor -and -not $wanted.Contains($row)) {
+                        throw "field $i opens with an option checked above its focus"
+                    }
+                }
+                for ($row = $cursor; $row -lt $options.Count; $row++) {
+                    if ($wanted.Contains($row) -eq $checked.Contains($row)) { continue }
+                    $keys.Add((($esc + '[B') * ($row - $cursor)) + ' ')
+                    $cursor = $row
+                }
+                # Nothing to toggle: the defaults already are the answer, and the
+                # caller's Enter accepts them untouched.
+                if ($keys.Count -eq 0) { $keys.Add('') }
+                [pscustomobject]@{
+                    Payload = ($keys -join '')
+                    Keys    = $keys.ToArray()
+                    IsText  = $false
+                    Index   = -1
+                }
+                continue
+            }
+
+            # Claude Code: its options are numbered on screen and typing a number
+            # toggles that one, wherever the cursor happens to be - which is both
+            # simpler and safer than counting Down presses. Then Down once per row
+            # (the options plus the "Type something" row) lands on Submit, and the
+            # caller's Enter presses it.
+            #
+            # Verified live against Claude Code 2.1.273 on two- and three-option
+            # questions: "2" then "3" checked exactly Billing and Search, four Downs
+            # highlighted Submit, and Claude recorded "Billing, Search". Tab was tried
+            # as a way to reach Submit without counting - the decompiled handler
+            # ignores it once Submit has focus - but overshooting with Tab tore the
+            # prompt down, so the count is exact and deliberate.
             $keys = New-Object System.Collections.Generic.List[string]
             foreach ($option in $picked) {
                 $at = [Array]::IndexOf($options, [string]$option)

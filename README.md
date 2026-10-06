@@ -27,7 +27,7 @@ prompt, so the terminal never stops working and nothing is ever answered twice.
 | **Dual input** | Answer in the terminal *or* Home Assistant. First one wins; the other clears. |
 | **Live activity** | Each session streams its status, current tool, and last response to its card. |
 | **Detailed activity** | Cards carry the model's reasoning and every tool call; fold a session card to keep it short. Off with `detailedActivity: false`. |
-| **Real forms** | Multi-field questions become one dropdown per field plus a Send button. |
+| **Real forms** | Every question becomes rows you tap plus a Send button; multi-select questions take as many options as you like. |
 | **Continuation** | Reply to a finished turn from your phone; it's typed into the session. |
 | **Paste an image** | Paste or attach a screenshot in the reply box and it's attached to the prompt. |
 | **Attach a file** | Attach a document, log or diff the same way; up to 256 KB travels in the reply itself. |
@@ -1353,11 +1353,20 @@ Two `ask_user` argument shapes are handled. Current builds pass **`message`** pl
 (with optional `enumNames`), `oneOf: [{const, title}]`, multi-select `items.enum` /
 `items.anyOf`, and `type: boolean` (Yes/No).
 
-* A **single-field** form becomes one dropdown.
-* A **multi-field** form (up to 4 fields) becomes one dropdown per field plus Send, so
-  every combination stays reachable without a combinatorial option list.
-* Larger forms fall back to freeform, with the question carrying a numbered outline of
-  every field and its options, marking any default.
+* Every form, down to a **single field**, becomes one labelled group of rows per field
+  plus **Send answer**. Nothing sends itself on a tap: picking changes what will be
+  sent, and Send sends it.
+* A **multi-select** field (`type: array`) draws its options as checkboxes - tap to
+  tick, tap again to untick, send as many as you like. Its slot has to enumerate every
+  combination to hold the answer in one Home Assistant select, so six options is the
+  ceiling; beyond that the question says to answer it in the terminal rather than
+  offering a list that could only take one.
+* **Up to 4 fields.** Larger forms fall back to freeform, with the question carrying a
+  numbered outline of every field and its options, marking any default.
+* **Typing is answering.** Every Copilot option list ends in "Other (type your
+  answer)", so words typed into the reply box and sent answer a choice question
+  through that entry. Where they cannot be used - a form with no free-text field, or
+  a choice already tapped - the card says so rather than dropping them.
 * Questions are carried up to 6,000 characters and each choice up to 600; anything
   longer is truncated and the card says so.
 

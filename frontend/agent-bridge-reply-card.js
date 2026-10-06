@@ -23,7 +23,7 @@
  * uploaded image these sit in the sensor's attributes.
  */
 
-const CARD_VERSION = '1.21.1';
+const CARD_VERSION = '1.22.0';
 
 /*
  * How large a non-image attachment may be.
@@ -835,25 +835,62 @@ class AgentBridgeActivityCard extends HTMLElement {
  * sentences for answers ran off the right edge and could not be read at all. And it
  * commits on blur, so answering meant tapping the option, tapping away, and only then
  * pressing Send. Rows wrap onto as many lines as they need, are the same on every
- * screen, and commit on the tap itself.
+ * screen, and are tapped once.
  *
- * A multi-field question publishes one select per field (`fields`), and the main
- * selector (`decision`) then carries only 'Cancel request'. Both are rendered here:
- * a labelled group of rows per armed field, then whatever the main selector offers.
- * Nothing about the answer path changes - a tap is the same `select_option` call the
- * dropdown made, on the same entity the daemon reads when Send is pressed.
+ * A question publishes one select per field (`fields`), and the main selector
+ * (`decision`) then carries only 'Cancel request'. Both are rendered here: a labelled
+ * group of rows per armed field, then whatever the main selector offers. Nothing
+ * about the answer path changes - a tap is the same `select_option` call the dropdown
+ * made, on the same entity the daemon reads when Send is pressed.
  *
  * 'Awaiting answer...' is the parked state the bridge drives the main selector to and
  * 'Choose...' is a field's, so neither is ever offered as an answer. 'Cancel request'
  * is, but as a quieter row at the bottom, because it withdraws the question rather
  * than answering it.
+ *
+ * A field that takes several of its options at once - `type: array` in an ask_user
+ * schema - is drawn as its own options with as many ticked as you like, not as the
+ * list of combinations its slot has to enumerate to hold the answer. Before 1.22.0
+ * it was those combinations, which is why "pick any of these" could only ever be
+ * answered with one of them.
+ *
+ * Picking is never sending. Every question is committed by Send answer, this card's
+ * own row from 1.22.0 - which is also what lets the reply box below stay the reply
+ * card rather than an entity row with a button beside it. Until then a single choice
+ * went the moment it was touched while the form beside it waited for Send, which is
+ * two behaviours for one gesture and no way back from the easier one to tap by
+ * accident. A selector carrying choices with no field behind it - a legacy `choices`
+ * argument, an MCP client - still answers on the tap, because there is no slot for
+ * it to wait in.
  */
 const CHOICE_PLACEHOLDER = 'Awaiting answer...';
 const CHOICE_FIELD_PLACEHOLDER = 'Choose...';
 const CHOICE_CANCEL = 'Cancel request';
+// What the bridge joins a multi-select field's picked options with. Published beside
+// the options so the label written back here is built exactly as the one the daemon
+// takes apart again; this is only the value to use when an older bridge sends none.
+const CHOICE_MULTI_SEPARATOR = ' + ';
 // The states an entity sits in when it is carrying nothing: an unarmed field slot is
 // parked on 'Idle', and a session that has gone leaves its entity behind.
 const CHOICE_UNARMED = ['', 'Idle', 'unknown', 'unavailable'];
+
+/*
+ * Which of a multi-select field's options its slot currently stands for.
+ *
+ * A Home Assistant select holds one value, so the bridge enumerates every
+ * combination and the slot carries whichever one is ticked. Reading it back
+ * regenerates those combinations and matches the label whole, rather than splitting
+ * on the separator: an option's own text may contain " + ", and then two different
+ * answers look identical. The bridge refuses to split for the same reason.
+ */
+function multiSelectPick(options, separator, state) {
+  if (!state || options.length === 0 || options.length > 20) { return []; }
+  for (let mask = 1; mask < (1 << options.length); mask++) {
+    const picked = options.filter((_, i) => mask & (1 << i));
+    if (picked.join(separator) === state) { return picked; }
+  }
+  return [];
+}
 
 class AgentBridgeChoicesCard extends HTMLElement {
   constructor() {
@@ -917,6 +954,12 @@ class AgentBridgeChoicesCard extends HTMLElement {
           color: var(--secondary-text-color); background: none;
           min-height: 36px; font-size: 0.92em;
         }
+        /* Send answer. A form is only sent when this is pressed, so it has to read
+           as the one thing that acts rather than as another option to weigh. */
+        button.send {
+          border-color: var(--primary-color); color: var(--primary-color);
+          font-weight: 600; text-align: center; margin-top: 2px;
+        }
         /* While the answer is on its way, so a second tap cannot send another. */
         .choices.sending button { opacity: 0.5; cursor: default; pointer-events: none; }
         [hidden] { display: none !important; }
@@ -973,11 +1016,32 @@ class AgentBridgeChoicesCard extends HTMLElement {
       const armed = this._armed(entityId);
       if (!armed) { return; }
       armed.label = String(decisionAttrs[`field_${i + 1}_label`] || '');
+      // A multi-select slot can only hold whole combinations, because a Home
+      // Assistant select holds one value. What it is really offering rides on the
+      // decision attributes beside the heading, so the rows drawn here are those
+      // options and the slot is given the one label that stands for what is ticked.
+      if (decisionAttrs[`field_${i + 1}_multi`]) {
+        const base = []
+          .concat(decisionAttrs[`field_${i + 1}_options`] || [])
+          .map(String)
+          .filter(Boolean);
+        if (base.length > 0) {
+          armed.multi = true;
+          armed.separator = String(decisionAttrs[`field_${i + 1}_separator`] || CHOICE_MULTI_SEPARATOR);
+          armed.slotOptions = armed.options;
+          armed.options = base;
+          armed.picked = multiSelectPick(base, armed.separator, armed.chosen);
+        }
+      }
       fields.push(armed);
     });
 
     const decision = this._armed(this._config.decision);
     const groups = fields.slice();
+    // Send answer belongs with the fields it commits, above the quiet cancel row the
+    // main selector draws. Without a form there is nothing to commit: a single choice
+    // is sent by the tap itself.
+    const sends = !!(this._config.submit && fields.length > 0);
     if (decision) { groups.push(Object.assign({}, decision, { isDecision: true })); }
 
     const show = groups.length > 0;
@@ -992,8 +1056,8 @@ class AgentBridgeChoicesCard extends HTMLElement {
     // form and the tick moves. Without it the card short-circuits on an unchanged
     // option list and a tap appears to do nothing at all.
     const signature = groups
-      .map((g) => `${g.entityId}\u0002${g.chosen}\u0002${g.label}\u0002${g.options.join('\u0001')}`)
-      .join('\u0003');
+      .map((g) => `${g.entityId}\u0002${g.chosen}\u0002${g.label}\u0002${g.multi ? 'm' : 's'}\u0002${g.options.join('\u0001')}`)
+      .join('\u0003') + `\u0004${sends}`;
     if (signature === this._last) { return; }
     this._last = signature;
 
@@ -1002,7 +1066,10 @@ class AgentBridgeChoicesCard extends HTMLElement {
       if (group.label) {
         const label = document.createElement('div');
         label.classList.add('label');
-        label.textContent = group.label;
+        // Said on the heading because nothing else on a row can say it: the rows of
+        // a multi-select group look exactly like the rows of a single-choice one
+        // until a second is ticked.
+        label.textContent = group.multi ? `${group.label} (pick any)` : group.label;
         this._els.list.appendChild(label);
       }
       for (const option of group.options) {
@@ -1010,28 +1077,61 @@ class AgentBridgeChoicesCard extends HTMLElement {
         button.type = 'button';
         button.textContent = option;
         if (option === CHOICE_CANCEL) { button.classList.add('cancel'); }
-        else if (option === group.chosen) { button.classList.add('chosen'); }
+        else if (group.multi ? group.picked.indexOf(option) >= 0 : option === group.chosen) {
+          button.classList.add('chosen');
+        }
         button.addEventListener('click', () => this._choose(group, option));
         this._els.list.appendChild(button);
+      }
+      if (sends && group === fields[fields.length - 1]) {
+        const send = document.createElement('button');
+        send.type = 'button';
+        send.classList.add('send');
+        send.textContent = 'Send answer';
+        send.addEventListener('click', () => this._send());
+        this._els.list.appendChild(send);
       }
     }
   }
 
   /*
-   * A tap on the main selector answers the question outright, so the rows are locked
-   * until the daemon clears it. A tap on a field does not: a form is sent by Send,
-   * and every field must stay changeable until then.
+   * A tap on a field changes what will be sent; it does not send. Everything with a
+   * field behind it waits for Send answer, including a single choice, and a
+   * multi-select field's rows tick and untick until they say what you mean.
+   *
+   * A tap on the main selector does answer outright, and the rows lock until the
+   * daemon clears it - but only a selector that is carrying choices itself, which
+   * now means one with no field slot to wait in.
    */
   _choose(group, option) {
     if (this._sent || !this._hass) { return; }
-    if (group.isDecision) {
+    let value = option;
+    if (group.multi) {
+      const picked = group.picked.indexOf(option) >= 0
+        ? group.picked.filter((o) => o !== option)
+        : group.options.filter((o) => group.picked.indexOf(o) >= 0 || o === option);
+      // Nothing ticked is not an answer, so the slot goes back to its placeholder and
+      // the daemon reads the field as still unanswered rather than as an empty set.
+      value = picked.length === 0 ? CHOICE_FIELD_PLACEHOLDER : picked.join(group.separator);
+    }
+    else if (group.isDecision) {
       this._sent = option;
       this._els.list.classList.add('sending');
     }
     this._hass.callService('select', 'select_option', {
       entity_id: group.entityId,
-      option,
+      option: value,
     });
+  }
+
+  /*
+   * Sends a form. Deliberately not locked the way a single choice is: the daemon
+   * refuses an incomplete form and says which field is still waiting, and a row that
+   * had locked itself would leave no way to go and answer it.
+   */
+  _send() {
+    if (this._sent || !this._hass || !this._config.submit) { return; }
+    this._hass.callService('button', 'press', { entity_id: this._config.submit });
   }
 }
 

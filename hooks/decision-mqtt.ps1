@@ -1499,14 +1499,18 @@ function Set-CopilotMqttActivity {
 
 function Publish-CopilotMqttDecisionFields {
     <#
-        Publishes one dropdown per field of a multi-field question, mirroring the
-        native prompt's tabbed form.
+        Publishes one dropdown per field of a question answered through its slots,
+        mirroring the native prompt's tabbed form.
 
         A multi-field form used to be flattened into the cartesian product of every
         field's options on a single dropdown - two fields of 3 and 2 options became 6
         entries, and a real one reached 9 - which is unreadable and scales terribly.
         One dropdown per field keeps each list short and matches what the terminal
         shows. The daemon injects only once every field has a selection.
+
+        A multi-select field is the one case where a slot still carries combinations,
+        because a Home Assistant select holds a single value: the card draws the
+        options as checkboxes and writes back the one label that stands for the set.
 
         Each dropdown starts on a "Choose..." placeholder so "not yet answered" is
         distinguishable from a real choice.
@@ -1832,12 +1836,20 @@ function Set-CopilotMqttDecision {
     $availability = @(@{ topic = $topics.Availability; payload_available = 'online'; payload_not_available = 'offline' })
 
     $fieldList = @($Fields)
-    $isMultiField = $fieldList.Count -gt 1 -and $fieldList.Count -le $script:CopilotMqttMaxFields
+    # Every question with fields is answered through its field slots, and committed
+    # with Send. A single choice used to ride on the main selector and commit on the
+    # tap, which made the dashboard behave two different ways for no reason the
+    # person using it could see: one question sent the moment it was touched, the one
+    # beside it waited for Send. A tap is also the easiest thing to do by accident on
+    # a phone, and there was no way back from it.
+    $usesFieldSlots = $fieldList.Count -ge 1 -and $fieldList.Count -le $script:CopilotMqttMaxFields
 
-    # A multi-field question answers through its per-field dropdowns, so the main
-    # selector carries only Cancel; a single-field one keeps the full option list.
+    # A question answered through its field slots carries only Cancel on the main
+    # selector. Choices with no field behind them - a legacy `choices` argument, an
+    # MCP client, a lone Claude multi-select - still ride on it and still answer on
+    # the tap, because there is no slot to put them in.
     $options = @('Awaiting answer...')
-    if ($isMultiField) {
+    if ($usesFieldSlots) {
         $options = @('Awaiting answer...', 'Cancel request')
     }
     elseif ($Choices.Count -gt 0) {
@@ -1866,9 +1878,9 @@ function Set-CopilotMqttDecision {
     Set-CopilotMqttSelectOption -EntityId "select.${node}_decision" `
         -Option 'Awaiting answer...' -Headers $Headers | Out-Null
 
-    # Publish the per-field dropdowns for a multi-field question, and collapse them
-    # for a single-field one so a previous question's fields never linger.
-    if ($isMultiField) {
+    # Publish the per-field dropdowns for a question answered through its slots, and
+    # collapse them otherwise so a previous question's fields never linger.
+    if ($usesFieldSlots) {
         Publish-CopilotMqttDecisionFields -SessionId $SessionId -SessionName $SessionName `
             -Machine $Machine -Fields $fieldList -Headers $Headers
     }
@@ -1890,19 +1902,29 @@ function Set-CopilotMqttDecision {
         question = $fullQuestion
         choices = @($Choices)
         mode = if ($Choices.Count -gt 0 -or $fieldList.Count -gt 0) { 'multiple_choice' } else { 'freeform' }
-        multi_field = $isMultiField
-        field_count = $(if ($isMultiField) { $fieldList.Count } else { 0 })
+        multi_field = $usesFieldSlots
+        field_count = $(if ($usesFieldSlots) { $fieldList.Count } else { 0 })
         session = $SessionName
         machine = $Machine
         asked_at = [DateTimeOffset]::Now.ToString('o')
     }
     # Field labels ride on the decision attributes so the dashboard can name each
     # dropdown after its field without rebuilding the whole Lovelace config.
-    if ($isMultiField) {
+    if ($usesFieldSlots) {
         for ($fi = 1; $fi -le $fieldList.Count; $fi++) {
-            $lbl = [string]$fieldList[$fi - 1].Label
+            $slotField = $fieldList[$fi - 1]
+            $lbl = [string]$slotField.Label
             if ([string]::IsNullOrWhiteSpace($lbl)) { $lbl = "Field $fi" }
             $questionAttrs["field_${fi}_label"] = $lbl
+            if (-not (Test-DecisionFieldIsMultiSelect -Field $slotField)) { continue }
+            # The slot itself can only offer whole combinations, because a Home
+            # Assistant select holds one value. The options themselves ride here so a
+            # card new enough to draw them as checkboxes does not have to take the
+            # combination list apart again - and the separator rides with them, so the
+            # label the card writes back is built the same way this one was.
+            $questionAttrs["field_${fi}_multi"] = $true
+            $questionAttrs["field_${fi}_options"] = @($slotField.Options | ForEach-Object { [string]$_ })
+            $questionAttrs["field_${fi}_separator"] = $script:DecisionMultiSelectSeparator
         }
     }
     Publish-CopilotMqttMessage -Topic $topics.DecisionAttributes `
