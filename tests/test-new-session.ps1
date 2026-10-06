@@ -554,6 +554,23 @@ $script:FakeProfiles = [pscustomobject]@{ Ok = $true; Profiles = @('work', 'home
 Write-Host ''
 Write-Host '--- model, effort and context ---'
 
+$savedProbeResult = $script:ProbeResult
+$script:BridgeModelCache = $null
+$script:ProbeResult = [pscustomobject]@{
+    Ran = $true; TimedOut = $false; ExitCode = 0; Output = ''
+    StandardOutput = '`model`:' + "`n" + '  - "test-model"' + "`n`n" + '`theme`:' + "`n" + '  - "test-theme"' + "`n"
+}
+Test-That 'model discovery parses the background command output, not other settings' {
+    (@(Get-BridgeCopilotModelList -Path 'C:\fake-copilot.exe') -join ',') -eq 'test-model'
+}
+$script:BridgeModelCache = $null
+$script:ProbeResult.ExitCode = 1
+Test-That 'failed model discovery does not accept partial stdout' {
+    @(Get-BridgeCopilotModelList -Path 'C:\fake-copilot.exe').Count -eq 0
+}
+$script:ProbeResult = $savedProbeResult
+$script:BridgeModelCache = $null
+
 # Three per-launch settings, spelled differently by every agent: Copilot has
 # --reasoning-effort and --context, Claude has --effort and (having no real context
 # switch) --autocompact, Codex has neither and takes both as `-c` overrides. Each was
@@ -917,6 +934,23 @@ Write-Host ''
 Write-Host '--- the resumable session list ---'
 
 # Shadow the one slow, machine-dependent step so the parsing is testable offline.
+$savedProbeResult = $script:ProbeResult
+$savedAgencyPath = ${function:Get-BridgeAgencyPath}
+function Get-BridgeAgencyPath { 'C:\fake-agency.exe' }
+$script:ProbeResult = [pscustomobject]@{
+    Ran = $true; TimedOut = $false; ExitCode = 0; Output = ''
+    StandardOutput = '{"sessions":[]}'
+}
+Test-That 'Agency session discovery preserves the background command JSON' {
+    (Get-BridgeAgencySessionJson) -eq '{"sessions":[]}'
+}
+$script:ProbeResult.TimedOut = $true
+Test-That 'a timed-out Agency listing does not expose incomplete JSON' {
+    (Get-BridgeAgencySessionJson) -eq ''
+}
+$script:ProbeResult = $savedProbeResult
+${function:Get-BridgeAgencyPath} = $savedAgencyPath
+
 $script:AgencyJson = ''
 function Get-BridgeAgencySessionJson { $script:AgencyJson }
 

@@ -68,8 +68,10 @@ function Add-BridgeCompiledType {
             $partial = "$dll.$PID.tmp"
             [IO.File]::WriteAllText($sourceFile, $Source)
             $pwsh = (Get-Process -Id $PID).Path
-            & $pwsh -NoProfile -NonInteractive -Command "Add-Type -TypeDefinition ([IO.File]::ReadAllText('$sourceFile')) -OutputAssembly '$partial' -OutputType Library" 2>$null
-            $global:LASTEXITCODE = 0
+            $command = "Add-Type -TypeDefinition ([IO.File]::ReadAllText('$($sourceFile.Replace("'", "''"))')) -OutputAssembly '$($partial.Replace("'", "''"))' -OutputType Library"
+            $encoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($command))
+            $compile = Invoke-BridgeCommandProbe -Executable $pwsh -Arguments @('-NoProfile', '-NonInteractive', '-EncodedCommand', $encoded) -TimeoutMs 30000
+            if (-not $compile.Ran -or $compile.TimedOut -or $compile.ExitCode -ne 0) { throw "Type compilation failed: $($compile.Output)" }
             Remove-Item -LiteralPath $sourceFile -Force -ErrorAction SilentlyContinue
             # Renamed into place, so another process never loads half a file; if one got
             # there first, its copy is as good.
