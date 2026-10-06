@@ -870,6 +870,9 @@ const CHOICE_CANCEL = 'Cancel request';
 // the options so the label written back here is built exactly as the one the daemon
 // takes apart again; this is only the value to use when an older bridge sends none.
 const CHOICE_MULTI_SEPARATOR = ' + ';
+// Shown while a tap has been sent to Home Assistant but has not come back. Send is
+// held for exactly as long as this is on screen, so the two can never disagree.
+const CHOICE_SAVING_NOTE = 'Saving your choice...';
 // The states an entity sits in when it is carrying nothing: an unarmed field slot is
 // parked on 'Idle', and a session that has gone leaves its entity behind.
 const CHOICE_UNARMED = ['', 'Idle', 'unknown', 'unavailable'];
@@ -899,6 +902,17 @@ class AgentBridgeChoicesCard extends HTMLElement {
     this._last = '';
     this._sent = '';
     this._fields = [];
+    // What has been tapped but not yet seen coming back from Home Assistant.
+    // {} when everything on screen is confirmed.
+    //
+    // Two taps in quick succession used to compute from the same state, because the
+    // second ran before the first had been pushed back: ticking Auth then Search
+    // sent "Auth" and then "Search", losing Auth. Send had the matching problem -
+    // pressed straight after a tap it committed whatever the slot still held. A
+    // service call completing and the state actually arriving are separate events,
+    // so the pending set is what later taps compose from and what holds Send.
+    this._pending = {};
+    this._note = '';
   }
 
   setConfig(config) {
@@ -962,6 +976,15 @@ class AgentBridgeChoicesCard extends HTMLElement {
         }
         /* While the answer is on its way, so a second tap cannot send another. */
         .choices.sending button { opacity: 0.5; cursor: default; pointer-events: none; }
+        /* A tap that Home Assistant has not confirmed yet. The rows stay live so a
+           choice can still be changed, but Send is held until what is on screen is
+           known to be what the daemon will read. */
+        button.send[disabled] { opacity: 0.45; cursor: default; }
+        .note {
+          font-size: 0.82em; color: var(--secondary-text-color);
+          margin: 2px 2px 0 2px; overflow-wrap: anywhere;
+        }
+        .note.err { color: var(--error-color, #ff5252); }
         [hidden] { display: none !important; }
       </style>
       <ha-card><div class="choices"></div></ha-card>`;
@@ -1001,6 +1024,12 @@ class AgentBridgeChoicesCard extends HTMLElement {
 
     const decisionEntity = this._hass ? this._hass.states[this._config.decision] : undefined;
     const decisionAttrs = (decisionEntity && decisionEntity.attributes) || {};
+    // Every pending tap is tied to the question it was made on, so a question that
+    // is replaced or withdrawn can never have a stale selection sent against it.
+    const generation = String(decisionAttrs.decision_id || '');
+    for (const key of Object.keys(this._pending)) {
+      if (this._pending[key].generation !== generation) { delete this._pending[key]; }
+    }
 
     // Fields first, then whatever the main selector offers - which on a form is only
     // 'Cancel request'. A field group is shown only while it is carrying options, so
@@ -1038,15 +1067,32 @@ class AgentBridgeChoicesCard extends HTMLElement {
 
     const decision = this._armed(this._config.decision);
     const groups = fields.slice();
-    // Send answer belongs with the fields it commits, above the quiet cancel row the
-    // main selector draws. Without a form there is nothing to commit: a single choice
-    // is sent by the tap itself.
-    const sends = !!(this._config.submit && fields.length > 0);
     if (decision) { groups.push(Object.assign({}, decision, { isDecision: true })); }
+
+    // Send answer commits whatever is ticked. It is drawn whenever the view has
+    // given this card a submit entity and there is something to commit - a field, or
+    // a main selector carrying its own choices, which is the legacy and lone-Claude
+    // shape. Cancel is not one of those: withdrawing a question is its own act.
+    const commits = fields.length > 0 ||
+      !!(decision && decision.options.some((o) => o !== CHOICE_CANCEL));
+    const sends = !!(this._config.submit && commits);
 
     const show = groups.length > 0;
     this.hidden = !show;
-    if (!show) { this._sent = ''; return; }
+    if (!show) { this._sent = ''; this._pending = {}; this._note = ''; return; }
+
+    // What has been tapped and not yet confirmed. A slot whose state has caught up
+    // with what was asked for is no longer pending; anything else holds Send.
+    for (const group of groups) {
+      const pending = this._pending[group.entityId];
+      if (!pending) { continue; }
+      if (pending.value === group.state) { delete this._pending[group.entityId]; }
+      else if (group.multi) { group.picked = pending.picked.slice(); }
+      else { group.chosen = pending.value; }
+    }
+    const waiting = Object.keys(this._pending).length > 0;
+    if (!waiting && this._note === CHOICE_SAVING_NOTE) { this._note = ''; }
+    if (waiting && !this._note) { this._note = CHOICE_SAVING_NOTE; }
 
     // The answer has landed once the selector is no longer parked on the placeholder.
     if (this._sent && (!decision || decision.state !== CHOICE_PLACEHOLDER)) { this._sent = ''; }
@@ -1054,22 +1100,27 @@ class AgentBridgeChoicesCard extends HTMLElement {
 
     // Every field's current value is in the signature, so picking one redraws the
     // form and the tick moves. Without it the card short-circuits on an unchanged
-    // option list and a tap appears to do nothing at all.
+    // option list and a tap appears to do nothing at all. The pending set and the
+    // note are in it too, so holding Send and saying why are drawn as they happen.
     const signature = groups
-      .map((g) => `${g.entityId}\u0002${g.chosen}\u0002${g.label}\u0002${g.multi ? 'm' : 's'}\u0002${g.options.join('\u0001')}`)
-      .join('\u0003') + `\u0004${sends}`;
+      .map((g) => `${g.entityId}\u0002${g.chosen}\u0002${g.label}\u0002${g.multi ? 'm' : 's'}\u0002${g.options.join('\u0001')}\u0002${g.multi ? g.picked.join('\u0001') : ''}`)
+      .join('\u0003') + `\u0004${sends}\u0004${waiting}\u0004${this._note}`;
     if (signature === this._last) { return; }
     this._last = signature;
 
     this._els.list.textContent = '';
+    let cancel = null;
     for (const group of groups) {
-      if (group.label) {
+      // Only when it says something the rows do not. A lone single-choice group's
+      // heading is the field name, which on its own card only repeats the question
+      // already above it; "(pick any)" is the one thing no row can say.
+      const heading = group.label && (group.multi || fields.length > 1)
+        ? (group.multi ? `${group.label} (pick any)` : group.label)
+        : '';
+      if (heading) {
         const label = document.createElement('div');
         label.classList.add('label');
-        // Said on the heading because nothing else on a row can say it: the rows of
-        // a multi-select group look exactly like the rows of a single-choice one
-        // until a second is ticked.
-        label.textContent = group.multi ? `${group.label} (pick any)` : group.label;
+        label.textContent = heading;
         this._els.list.appendChild(label);
       }
       for (const option of group.options) {
@@ -1081,56 +1132,98 @@ class AgentBridgeChoicesCard extends HTMLElement {
           button.classList.add('chosen');
         }
         button.addEventListener('click', () => this._choose(group, option));
+        // Held back so it stays the quiet last row. Send is the thing being looked
+        // for after a tap; withdrawing the question is not, and putting it in
+        // between would make it the easiest row to hit by mistake.
+        if (option === CHOICE_CANCEL) { cancel = button; continue; }
         this._els.list.appendChild(button);
       }
-      if (sends && group === fields[fields.length - 1]) {
-        const send = document.createElement('button');
-        send.type = 'button';
-        send.classList.add('send');
-        send.textContent = 'Send answer';
-        send.addEventListener('click', () => this._send());
-        this._els.list.appendChild(send);
-      }
+    }
+    if (sends) {
+      const send = document.createElement('button');
+      send.type = 'button';
+      send.classList.add('send');
+      send.textContent = 'Send answer';
+      if (waiting) { send.setAttribute('disabled', 'disabled'); }
+      send.addEventListener('click', () => this._send());
+      this._els.list.appendChild(send);
+    }
+    if (cancel) { this._els.list.appendChild(cancel); }
+    if (this._note) {
+      const note = document.createElement('div');
+      note.className = this._note === CHOICE_SAVING_NOTE ? 'note' : 'note err';
+      note.textContent = this._note;
+      this._els.list.appendChild(note);
     }
   }
 
   /*
-   * A tap on a field changes what will be sent; it does not send. Everything with a
-   * field behind it waits for Send answer, including a single choice, and a
-   * multi-select field's rows tick and untick until they say what you mean.
+   * A tap changes what will be sent; it does not send. Everything waits for Send
+   * answer now - a single choice, a whole form, and a multi-select field's rows,
+   * which tick and untick until they say what you mean. Only Cancel still acts on
+   * the tap, because withdrawing a question is a deliberate act in itself.
    *
-   * A tap on the main selector does answer outright, and the rows lock until the
-   * daemon clears it - but only a selector that is carrying choices itself, which
-   * now means one with no field slot to wait in.
+   * The tap composes from the pending set rather than from the entity, so two taps
+   * in a row build one answer instead of the second overwriting the first.
    */
   _choose(group, option) {
     if (this._sent || !this._hass) { return; }
+    const generation = String(
+      ((this._hass.states[this._config.decision] || {}).attributes || {}).decision_id || '');
     let value = option;
+    let picked = null;
     if (group.multi) {
-      const picked = group.picked.indexOf(option) >= 0
+      picked = group.picked.indexOf(option) >= 0
         ? group.picked.filter((o) => o !== option)
         : group.options.filter((o) => group.picked.indexOf(o) >= 0 || o === option);
       // Nothing ticked is not an answer, so the slot goes back to its placeholder and
       // the daemon reads the field as still unanswered rather than as an empty set.
       value = picked.length === 0 ? CHOICE_FIELD_PLACEHOLDER : picked.join(group.separator);
     }
-    else if (group.isDecision) {
+    else if (group.isDecision && option === CHOICE_CANCEL) {
       this._sent = option;
       this._els.list.classList.add('sending');
     }
-    this._hass.callService('select', 'select_option', {
+
+    if (!(group.isDecision && option === CHOICE_CANCEL)) {
+      this._pending[group.entityId] = { value, picked: picked || [], generation };
+      this._note = CHOICE_SAVING_NOTE;
+      this._last = '';
+      this._render();
+    }
+
+    const call = this._hass.callService('select', 'select_option', {
       entity_id: group.entityId,
       option: value,
     });
+    // A rejected call must take its tick back with it, rather than leaving the card
+    // showing a choice Home Assistant never accepted.
+    if (call && typeof call.then === 'function') {
+      call.then(
+        () => {},
+        (err) => {
+          if (this._pending[group.entityId] &&
+              this._pending[group.entityId].generation === generation) {
+            delete this._pending[group.entityId];
+          }
+          this._note = `Home Assistant would not take that: ${describeThrown(err)}`;
+          this._last = '';
+          this._render();
+        });
+    }
   }
 
   /*
-   * Sends a form. Deliberately not locked the way a single choice is: the daemon
-   * refuses an incomplete form and says which field is still waiting, and a row that
-   * had locked itself would leave no way to go and answer it.
+   * Sends the answer. Held while anything is still unconfirmed, because pressing it
+   * then would commit whatever the slot held before the last tap.
+   *
+   * Deliberately not locked the way Cancel is: the daemon refuses an incomplete form
+   * and says which field is still waiting, and a row that had locked itself would
+   * leave no way to go and answer it.
    */
   _send() {
     if (this._sent || !this._hass || !this._config.submit) { return; }
+    if (Object.keys(this._pending).length > 0) { return; }
     this._hass.callService('button', 'press', { entity_id: this._config.submit });
   }
 }

@@ -44,8 +44,14 @@ function Set-DaemonTransientActivity { param($SessionId, $Summary, $Extra, $Head
 function Write-DaemonLog { param([string]$Message) }
 
 $armedAt = [DateTimeOffset]::Now.AddMinutes(-2)
+# The baselines are what the card already held when the question was armed. Everything
+# after that is "has this changed", never "is this newer" - the payload stamp comes
+# from a browser and armedAt from the daemon, so ordering them compares two unrelated
+# clocks.
+$oldPress = $armedAt.AddMinutes(-1).ToString('o')
 $form = [pscustomobject]@{
     mode = 'form'; decisionId = 'd1'; question = 'Pick'; armedAt = $armedAt.ToString('o'); choices = @(); injectedAnswer = ''
+    payloadBaseline = ''; submitBaseline = $oldPress
     fields = @(
         [pscustomobject]@{ Label = 'Colour'; Options = @('Red', 'Blue') }
         [pscustomobject]@{ Label = 'Size'; Options = @('S', 'L') }
@@ -66,13 +72,30 @@ function Set-Form { param($Colour, $Size, $Notes, $Submit, $Decision = 'Awaiting
 Write-Host '--- a multi-field form ---'
 Set-Form -Colour 'Blue' -Size 'L' -Notes ' ' -Submit $armedAt.AddMinutes(1).ToString('o')
 $r = Read-DaemonFormAnswer -SessionId $sid -Marker $form -State $state -Headers $headers
-Test-That 'every field chosen and Submit pressed after arming sends it' { $r.Answer -eq 'Blue + L + ' -and (@($r.Selections) -join '|') -eq 'Blue|L|' }
+Test-That 'every field chosen and Send pressed since arming sends it' { $r.Answer -eq 'Blue + L + ' -and (@($r.Selections) -join '|') -eq 'Blue|L|' }
 Test-That 'an empty free-text field is a valid answer' { @($r.Selections).Count -eq 3 }
 Test-That 'the press is consumed, so it is not also read as a Send' { $state[$sid].LastSubmitAt -eq $script:Ha["button.${node}_submit"] }
 Test-That 'what a call emits never joins the result' { $r -is [pscustomobject] }
 
-Set-Form -Colour 'Blue' -Size 'L' -Notes '' -Submit $armedAt.AddMinutes(-1).ToString('o')
-Test-That 'a press from before the question was armed does not count' { (Read-DaemonFormAnswer -SessionId $sid -Marker $form -State $state -Headers $headers).Answer -eq '' }
+Set-Form -Colour 'Blue' -Size 'L' -Notes '' -Submit $oldPress
+Test-That 'the press the question was armed against is not a new one' { (Read-DaemonFormAnswer -SessionId $sid -Marker $form -State $state -Headers $headers).Answer -eq '' }
+
+# A Send button whose clock ran ahead of the daemon's used to be the only thing that
+# mattered; now only the identity does, so a press that merely looks older still counts.
+Set-Form -Colour 'Blue' -Size 'L' -Notes '' -Submit $armedAt.AddHours(-9).ToString('o')
+Test-That 'a press is read by what it is, not by whether its clock looks new' {
+    (Read-DaemonFormAnswer -SessionId $sid -Marker $form -State $state -Headers $headers).Answer -eq 'Blue + L + '
+}
+
+$script:Transient = @()
+Set-Form -Colour 'Blue' -Size 'L' -Notes '' -Submit $armedAt.AddMinutes(1).ToString('o')
+$script:Ha.Remove("button.${node}_submit")
+Test-That 'no Send button means nothing is sent, rather than a submit invented from a filled form' {
+    (Read-DaemonFormAnswer -SessionId $sid -Marker $form -State $state -Headers $headers).Answer -eq ''
+}
+Test-That 'and the card says so rather than the form looking ignored' {
+    $script:Transient -contains 'Not sent - no Send button on this session'
+} ($script:Transient -join '|')
 
 $script:Transient = @()
 Set-Form -Colour 'Blue' -Size 'Choose...' -Notes '' -Submit $armedAt.AddMinutes(1).ToString('o')
@@ -83,19 +106,99 @@ Set-Form -Colour 'Choose...' -Size 'Choose...' -Notes '' -Submit 'unknown' -Deci
 Test-That 'Cancel on the main selector cancels the form' { (Read-DaemonFormAnswer -SessionId $sid -Marker $form -State $state -Headers $headers).Answer -eq 'Cancel request' }
 
 Write-Host '--- a single choice, and a free-text answer ---'
-# Markers as Write-CopilotDecisionMarker writes them: injectedAnswer is always there.
-$choice = [pscustomobject]@{ mode = 'multiple_choice'; decisionId = 'd2'; question = 'Pick'; fields = @(); choices = @('Yes', 'No'); injectedAnswer = '' }
-$script:Ha = @{ "select.${node}_decision" = 'Yes' }
-Test-That 'a choice is read from the selector' { $x = Read-DaemonDecisionAnswer -SessionId $sid -Marker $choice -State $state -Headers $headers; $x.Answer -eq 'Yes' -and $x.IsChoice }
-$script:Ha = @{ "select.${node}_decision" = 'Awaiting answer...' }
+# Markers as Write-CopilotDecisionMarker writes them, plus the baselines the daemon
+# records when it first sees the question.
+$choice = [pscustomobject]@{
+    mode = 'multiple_choice'; decisionId = 'd2'; question = 'Pick'; fields = @(); choices = @('Yes', 'No')
+    injectedAnswer = ''; armedAt = $armedAt.ToString('o'); payloadBaseline = ''; submitBaseline = $oldPress
+}
+$script:Ha = @{ "select.${node}_decision" = 'Yes'; "button.${node}_submit" = $oldPress }
+Test-That 'a tapped choice on its own is not an answer, because nothing has been sent' {
+    (Read-DaemonDecisionAnswer -SessionId $sid -Marker $choice -State $state -Headers $headers).Answer -eq ''
+}
+$script:Ha["button.${node}_submit"] = $armedAt.AddMinutes(1).ToString('o')
+Test-That 'a choice is read from the selector once Send has been pressed' {
+    $x = Read-DaemonDecisionAnswer -SessionId $sid -Marker $choice -State $state -Headers $headers
+    $x.Answer -eq 'Yes' -and $x.IsChoice
+}
+$script:Ha = @{ "select.${node}_decision" = 'Cancel request'; "button.${node}_submit" = $oldPress }
+Test-That 'Cancel still withdraws without a Send, because it is not an answer' {
+    (Read-DaemonDecisionAnswer -SessionId $sid -Marker $choice -State $state -Headers $headers).Answer -eq 'Cancel request'
+}
+$script:Ha = @{ "select.${node}_decision" = 'Awaiting answer...'; "button.${node}_submit" = $oldPress }
 Test-That 'the placeholder is not an answer' { (Read-DaemonDecisionAnswer -SessionId $sid -Marker $choice -State $state -Headers $headers).Answer -eq '' }
-$free = [pscustomobject]@{ mode = 'freeform'; decisionId = 'd3'; question = 'Why?'; fields = @(); choices = @(); injectedAnswer = '' }
+$free = [pscustomobject]@{
+    mode = 'freeform'; decisionId = 'd3'; question = 'Why?'; fields = @(); choices = @()
+    injectedAnswer = ''; armedAt = $armedAt.ToString('o'); payloadBaseline = ''; submitBaseline = ''
+}
 $script:Ha = @{ "text.${node}_reply" = 'Because.' }
 Test-That 'a freeform answer is read from the reply box' { (Read-DaemonDecisionAnswer -SessionId $sid -Marker $free -State $state -Headers $headers).Answer -eq 'Because.' }
 $script:Ha = @{ "text.${node}_reply" = ' ' }
 Test-That 'the blank the box is parked on is not an answer' { (Read-DaemonDecisionAnswer -SessionId $sid -Marker $free -State $state -Headers $headers).Answer -eq '' }
 $script:Ha = @{}
 Test-That 'an unreadable card gives nothing, rather than a guess' { $null -eq (Read-DaemonDecisionAnswer -SessionId $sid -Marker $free -State $state -Headers $headers) }
+
+Write-Host '--- the retained reply payload is identity, not a clock ---'
+function New-PayloadState { param([string]$Stamp, [string]$Text)
+    [pscustomobject]@{ state = $Stamp; attributes = [pscustomobject]@{ text = $Text; images = @(); files = @() } }
+}
+# A browser running ahead of the daemon leaves a payload that looks newer than the
+# question. Ordering the two used to let it answer the next question with whatever was
+# last said to the session.
+$stale = [pscustomobject]@{
+    mode = 'freeform'; decisionId = 'd4'; question = 'Why?'; fields = @(); choices = @()
+    injectedAnswer = ''; armedAt = $armedAt.ToString('o')
+    payloadBaseline = 'stamp-from-the-last-reply'; submitBaseline = ''
+}
+$script:Ha = @{
+    "text.${node}_reply" = ' '
+    "sensor.${node}_reply_payload" = New-PayloadState -Stamp 'stamp-from-the-last-reply' -Text 'an answer to the last question'
+}
+Test-That 'a payload the question was armed against never answers it, however its clock reads' {
+    (Read-DaemonDecisionAnswer -SessionId $sid -Marker $stale -State $state -Headers $headers).Answer -eq ''
+}
+# And the other way round: a browser running behind leaves a stamp that looks old,
+# which used to leave the question waiting for ever.
+$script:Ha["sensor.${node}_reply_payload"] = New-PayloadState -Stamp '1999-01-01T00:00:00.000Z' -Text 'typed just now'
+$fresh = Read-DaemonDecisionAnswer -SessionId $sid -Marker $stale -State $state -Headers $headers
+Test-That 'anything that has changed since is the answer, even dated in the last century' {
+    $fresh.Answer -eq 'typed just now' -and $fresh.PayloadStamp -eq '1999-01-01T00:00:00.000Z'
+} "answer=[$($fresh.Answer)]"
+Test-That 'a question with no baseline yet reads nothing off the card at all' {
+    $noBase = [pscustomobject]@{
+        mode = 'freeform'; decisionId = 'd5'; question = 'Why?'; fields = @(); choices = @()
+        injectedAnswer = ''; armedAt = $armedAt.ToString('o')
+    }
+    (Read-DaemonDecisionCardText -SessionId $sid -Marker $noBase -Headers $headers).Text -eq ''
+}
+
+Write-Host '--- a refused test-boundary operation is not a missing answer ---'
+# Absorbing this would turn "a suite tried to reach a real Home Assistant" into a quiet
+# "nothing has been answered", and the suite would pass for exactly the wrong reason.
+function Get-HomeAssistantState { param([string]$EntityId, [hashtable]$Headers)
+    $blocked = [InvalidOperationException]::new('A test suite tried to reach a real Home Assistant.')
+    $blocked.Data['BridgeTestNetworkBlocked'] = $true
+    throw $blocked
+}
+Test-That 'the card-text reader propagates a marked guard rather than returning empty' {
+    $threw = $false
+    try { [void](Read-DaemonDecisionCardText -SessionId $sid -Marker $stale -Headers $headers) }
+    catch { $threw = [bool]$_.Exception.Data['BridgeTestNetworkBlocked'] }
+    $threw
+}
+Test-That 'and so does the answer reader that encloses it' {
+    $threw = $false
+    try { [void](Read-DaemonDecisionAnswer -SessionId $sid -Marker $stale -State $state -Headers $headers) }
+    catch { $threw = [bool]$_.Exception.Data['BridgeTestNetworkBlocked'] }
+    $threw
+}
+function Get-HomeAssistantState {
+    param([string]$EntityId, [hashtable]$Headers)
+    if (-not $script:Ha.ContainsKey($EntityId)) { throw "404 $EntityId" }
+    $v = $script:Ha[$EntityId]
+    if ($v -is [pscustomobject]) { return $v }
+    [pscustomobject]@{ state = [string]$v; attributes = [pscustomobject]@{ question = 'Pick' } }
+}
 
 Write-Host '--- one pass over the pending questions ---'
 $script:Injected = @(); $script:Cleared = @(); $script:Removed = @()
@@ -111,11 +214,24 @@ function Set-CopilotMqttDecision { param($SessionId, $SessionName, $Machine, $Qu
 $live = @{ $sid = [pscustomobject]@{ SessionId = $sid } }
 
 $script:Marker = $choice
-$script:Ha = @{ "select.${node}_decision" = 'No' }
+# With the Send press on the card, because nothing is answered without one now.
+$script:Ha = @{
+    "select.${node}_decision" = 'No'
+    "button.${node}_submit" = $armedAt.AddMinutes(1).ToString('o')
+}
 Invoke-PendingDecisions -Headers $headers -State $state -Live $live
 Test-That 'a pending question with an answer on its card is answered' { ($script:Injected -join ',') -eq 'No' }
 
 $script:Injected = @()
+$script:Ha = @{ "select.${node}_decision" = 'No' }
+Invoke-PendingDecisions -Headers $headers -State $state -Live $live
+Test-That 'the same answer with no Send behind it is not injected' { $script:Injected.Count -eq 0 }
+
+$script:Injected = @()
+$script:Ha = @{
+    "select.${node}_decision" = 'No'
+    "button.${node}_submit" = $armedAt.AddMinutes(1).ToString('o')
+}
 $script:Marker = [pscustomobject]@{ mode = 'multiple_choice'; decisionId = 'd2'; question = 'Pick'; fields = @(); choices = @('Yes', 'No'); injectedAnswer = 'No' }
 Invoke-PendingDecisions -Headers $headers -State $state -Live $live
 Test-That 'an answer already sent is not sent again' { $script:Injected.Count -eq 0 }
