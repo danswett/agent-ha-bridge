@@ -392,9 +392,46 @@ async function checkDeferredChoices() {
     check(`'${bad}' ticks nothing rather than guessing`, pickedRows(card) === '', pickedRows(card));
   }
 
-  // Ticking a row and immediately unticking it asks for the value the slot already
-  // holds. Settling on the state alone made that look confirmed before Home Assistant
-  // had taken it at all, so Send went live over a call still in flight.
+  // A slot that moves after the card has seen it settle. Another viewer answering the
+  // same question looks identical to a state arriving out of order, and both end the
+  // same way: two rows ticked became one row ticked on its own, Send stayed live, and
+  // pressing it sent the one. The rows were never wrong - what was wrong was letting
+  // it go without anybody looking.
+  card = newCard(FIELDS, SUBMIT);
+  env = controlledEnv({ 1: { label: 'Features', multi: true, codes: true, options: ['Auth', 'Billing', 'Search'] } });
+  env.card = card;
+  card.hass = env.hass;
+  buttons(card).find((b) => b.textContent === 'Auth').click();
+  buttons(card).find((b) => b.textContent === 'Search').click();
+  for (const call of env.calls) { call.settle.resolve(); }
+  await flush();
+  env.arrive(F(1), '#1,3');
+  check('both ticks settle and Send is live',
+    pickedRows(card) === 'Auth|Search' && sendRow(card).getAttribute('disabled') === null, pickedRows(card));
+
+  env.arrive(F(1), '#1');
+  check('a slot that moves on its own still shows what is really there',
+    pickedRows(card) === 'Auth', pickedRows(card));
+  check('but Send is held, because that is not what was chosen here',
+    sendRow(card).getAttribute('disabled') === 'disabled', labels(card).join('|'));
+  check('and the card says what happened',
+    labels(card).includes('Changed since you chose - check what is ticked'), labels(card).join('|'));
+  const before = env.calls.length;
+  sendRow(card).click();
+  check('pressing it anyway sends nothing',
+    env.calls.length === before, JSON.stringify(env.calls.slice(before).map((c) => c.domain)));
+
+  // Tapping adopts what is there now and the warning goes.
+  buttons(card).find((b) => b.textContent === 'Search').click();
+  env.calls[env.calls.length - 1].settle.resolve();
+  await flush();
+  env.arrive(F(1), '#1,3');
+  check('tapping adopts it and clears the warning',
+    !labels(card).includes('Changed since you chose - check what is ticked') &&
+    pickedRows(card) === 'Auth|Search' && sendRow(card).getAttribute('disabled') === null,
+    `${pickedRows(card)} / ${labels(card).join('|')}`);
+
+
   card = newCard(FIELDS, SUBMIT);
   env = controlledEnv({ 1: { label: 'Features', multi: true, codes: true, options: ['Auth', 'Billing'], state: '#1' } });
   env.card = card;

@@ -272,6 +272,45 @@ Test-That 'a record naming a different question is never read against this one' 
     [IO.File]::WriteAllText($path, '{"decisionId":"somebody-else","payload":{"state":"absent","value":""},"submit":{"state":"absent","value":""}}')
     -not (Test-CopilotDecisionBaselineRecorded -SessionId $casSid -DecisionId 'cas-wrong')
 }
+# The value is half the record. A channel recorded as holding something, with nothing
+# recorded, compares equal to an empty slot for ever - so a real answer arriving later
+# never reads as a change, and the question waits for ever.
+Test-That 'a record whose value does not match its state is not a baseline' {
+    $bad = @(
+        '{"decisionId":"cas-value","payload":{"state":"present"},"submit":{"state":"absent","value":""}}'
+        '{"decisionId":"cas-value","payload":{"state":"present","value":""},"submit":{"state":"absent","value":""}}'
+        '{"decisionId":"cas-value","payload":{"state":"present","value":null},"submit":{"state":"absent","value":""}}'
+        '{"decisionId":"cas-value","payload":{"state":"absent","value":"something"},"submit":{"state":"absent","value":""}}'
+        '{"decisionId":"cas-value","payload":{"state":"absent","value":""},"submit":{"state":"present"}}'
+    )
+    $path = Get-CopilotDecisionBaselinePath -SessionId $casSid -DecisionId 'cas-value'
+    $accepted = @()
+    foreach ($json in $bad) {
+        [IO.File]::WriteAllText($path, $json)
+        if (Test-CopilotDecisionBaselineRecorded -SessionId $casSid -DecisionId 'cas-value') { $accepted += $json }
+    }
+    Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+    $accepted.Count -eq 0
+}
+Test-That 'and a complete one is' {
+    $path = Get-CopilotDecisionBaselinePath -SessionId $casSid -DecisionId 'cas-good'
+    [IO.File]::WriteAllText($path, '{"decisionId":"cas-good","payload":{"state":"present","value":"stamp"},"submit":{"state":"absent","value":""}}')
+    Test-CopilotDecisionBaselineRecorded -SessionId $casSid -DecisionId 'cas-good'
+}
+# Retiring a whole session is the one case where no replacement question can exist, so
+# it is the one case that may sweep everything - and it has to be asked for by name.
+Test-That 'retiring a session clears every baseline it recorded' {
+    [void](Set-CopilotDecisionMarkerBaseline -SessionId $casSid -DecisionId 'gone-a' `
+        -PayloadState 'present' -PayloadValue 'a' -SubmitState 'absent' -SubmitValue '')
+    [void](Set-CopilotDecisionMarkerBaseline -SessionId $casSid -DecisionId 'gone-b' `
+        -PayloadState 'present' -PayloadValue 'b' -SubmitState 'absent' -SubmitValue '')
+    Remove-CopilotDecisionMarker -SessionId $casSid -AllBaselines
+    -not (Test-CopilotDecisionBaselineRecorded -SessionId $casSid -DecisionId 'gone-a') -and
+    -not (Test-CopilotDecisionBaselineRecorded -SessionId $casSid -DecisionId 'gone-b')
+}
+Test-That 'and still leaves another session''s alone' {
+    Test-CopilotDecisionBaselineRecorded -SessionId $sid -DecisionId 'd4'
+}
 
 # 'absent' and 'unknown' are not the same answer. A channel nobody could read must
 # never compare as changed: a retained old payload becoming readable again would
