@@ -265,9 +265,16 @@ function Get-ClaudeAskUserState {
                 $latestAt = $at
             }
             elseif ([string]$block.type -eq 'tool_result' -and $block.PSObject.Properties['tool_use_id']) {
+                # Not every result block is text: ToolSearch answers with tool_reference
+                # blocks and a screenshot is an image. Reading .text off one of those
+                # threw under StrictMode on every pass while any question was pending,
+                # which stalled the whole reconcile loop, not just this card.
                 $content = if (-not $block.PSObject.Properties['content']) { '' }
                            elseif ($block.content -is [string]) { [string]$block.content }
-                           else { (@($block.content) | ForEach-Object { [string]$_.text }) -join ' ' }
+                           else {
+                               (@($block.content) | Where-Object { $null -ne $_ -and $_.PSObject.Properties['text'] } |
+                                   ForEach-Object { [string]$_.text }) -join ' '
+                           }
                 $answers[[string]$block.tool_use_id] = $content
             }
         }
