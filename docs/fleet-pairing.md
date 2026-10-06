@@ -15,8 +15,10 @@ This describes making it part of setup:
   new machine alone. Nothing is copied by hand.
 * Pasting the secret stays available as a fallback for when pairing cannot run.
 
-> **Design, for review.** No code yet. The cryptography in particular wants a second
-> reader before it is written.
+> **Implemented** in `hooks/bridge-pairing.ps1` (the protocol, pure) and
+> `hooks/bridge-pairing-io.ps1` (Home Assistant, the daemon and the joiner), with
+> `hooks/bridge-pairing-entry.ps1` as the process the daemon and `agent-ha-bridge pair`
+> start. Two refinements made while building it are marked *as built* below.
 
 ## What has to stay true
 
@@ -61,9 +63,14 @@ agent-ha-bridge configure
     Waiting for DSWETT-HOME... paired. Sharing is on.
 ```
 
-On the dashboard, the Fleet card has one HA-native text field, **Pair a machine**. You
-type the six digits and press Enter. That's the only action, and it happens on whatever
-screen you have, phone included.
+The field is one HA-native text helper, **Pair a machine**. You type the six digits and
+press Enter. That's the only action, and it happens on whatever screen you have, phone
+included.
+
+*As built:* the field is the helper itself (Settings > Devices & services > Helpers, or
+the entity on any dashboard), not yet a Fleet card on the shared agent dashboard.
+Changing that dashboard means a renderer version bump under A28's publication fencing,
+which is a release decision of its own, so the card is a follow-up.
 
 The first machine in a fleet has nobody to pair with, so `configure` creates the fleet:
 it generates the secret and a public fleet id, and says so.
@@ -79,8 +86,14 @@ Messages use non-retained MQTT topics under `agent_bridge/pairing/<attempt-id>/`
 no discovery config, so no entity and no recorder state are ever created for them.
 They are received over HA's WebSocket `mqtt/subscribe`, as transfer chunks already are.
 
-1. **J → S: commit.** J makes a key pair (pkJ) and a 32-byte nonce nJ, and publishes
-   `{attempt, fleetId, joiner: name, commit: SHA-256(pkJ ‖ nJ)}` addressed to S.
+1. **J → S: commit.** J makes a key pair (pkJ) and a 32-byte nonce nJ, and writes
+   `request:<S's slug>:<attempt>:<fleet id>:<J>:<SHA-256 commit of pkJ ‖ nJ>` into
+   the helper.
+
+   *As built:* the design first sent this over MQTT. It goes through the helper instead,
+   because the helper is the one channel every machine already watches, the request is
+   then HA-authenticated as well, and it needs no new MQTT entity. Every value in it is
+   public, so the recorder keeping it costs nothing.
 2. **S → J: offer.** S checks that the fleet id is its own and that no other pairing is
    in progress, makes its own key pair (pkS) and nonce nS, and publishes `{pkS, nS}`.
    S has not yet seen pkJ, and that is the point of the commitment.
@@ -99,8 +112,8 @@ They are received over HA's WebSocket `mqtt/subscribe`, as transfer chunks alrea
    If the code differs, it writes `refused:<J>` and abandons the attempt.
 7. **J** reads the helper through HA and checks the acceptance names J and carries *its
    own* transcript hash. It then decrypts the secret, writes it to the protected config,
-   turns on the sharing settings chosen earlier, and restarts its daemon. S then clears
-   the helper.
+   turns on the sharing settings chosen earlier, and restarts its daemon. J clears the
+   helper, whatever the outcome, so the next machine finds it empty.
 
 ### Why each piece is there
 
@@ -163,9 +176,10 @@ v1 keeps this simple and says so:
 
 ## Open items to verify before code
 
-* **AES-GCM under PowerShell on macOS.** `AesGcm.IsSupported` has to be checked on the
-  macOS runners. If it is false, the fallback is AES-CBC with HMAC-SHA256,
-  encrypt-then-MAC, keyed from the same HKDF output.
+* **AES-GCM under PowerShell on macOS.** *As built:* `tests/test-pairing.ps1` asserts
+  `AesGcm.IsSupported`, and the macOS CI job runs it, so the platform answers this
+  rather than an assumption. It holds on Windows. If it ever fails on macOS, the
+  fallback is AES-CBC with HMAC-SHA256, encrypt-then-MAC, from the same HKDF output.
 * **What the recorder keeps from `mqtt.publish` calls.** By the analysis above nothing
   in the pairing messages needs protecting, but it should be confirmed by inspection,
   as the transfer design requires.
