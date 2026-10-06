@@ -34,10 +34,14 @@ process.stdin.on('end', () => {
       calls.push({ domain, service, data });
       // Home Assistant applies the selection and pushes the new state back, which is
       // what lets a form be filled in field by field. Without it every later tap sees
-      // a stale form.
-      const entity = job.states[data.entity_id];
-      if (entity) { entity.state = data.option; }
-      card.hass = hass;
+      // a stale form. Only a selection changes a state: a button press records a
+      // timestamp the daemon reads, and writing `undefined` here would wipe the slot
+      // the press is meant to send.
+      if (domain === 'select' && service === 'select_option') {
+        const entity = job.states[data.entity_id];
+        if (entity) { entity.state = data.option; }
+        card.hass = hass;
+      }
     },
   };
 
@@ -53,7 +57,6 @@ process.stdin.on('end', () => {
     if (!row) { missing.push(label); continue; }
     row.click();
   }
-
   const rows = card.shadowRoot.querySelector('.choices').children.map((r) => ({
     tag: r.tagName,
     text: r.textContent,

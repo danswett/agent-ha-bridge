@@ -103,7 +103,7 @@ $script:Marker = $null
 $script:Ask = @{ Started = $true; Pending = $true }
 function Get-CopilotDecisionMarker { param($SessionId) $script:Marker }
 function Get-DaemonAskUserState { param($Session, $Marker) [pscustomobject]@{ Started = $script:Ask.Started; Pending = $script:Ask.Pending; ResultContent = '' } }
-function Invoke-DaemonDecisionAnswer { param($SessionId, $Marker, $Answer, $IsChoice, $Selections, $Headers) $script:Injected += $Answer; $true }
+function Invoke-DaemonDecisionAnswer { param($SessionId, $Marker, $Answer, $IsChoice, $IsFreeText, $Selections, $PayloadStamp, $State, $Headers) $script:Injected += $Answer; $true }
 function Clear-CopilotMqttDecision { param($SessionId, $SessionName, $Machine, $Headers) $script:Cleared += $SessionId; 'emitted' }
 function Invoke-HomeAssistantService { param($Domain, $Service, $Headers, $Data) }
 function Remove-CopilotDecisionMarker { param($SessionId) $script:Removed += $SessionId }
