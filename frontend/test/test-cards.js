@@ -38,9 +38,12 @@ const { AgentBridgeChoicesCard, AgentBridgeSessionCard, AgentBridgeActivityCard,
 
 const DECISION = 'select.agent_bridge_abc_decision';
 
-function newCard(fields) {
+function newCard(fields, submit) {
   const card = new AgentBridgeChoicesCard();
-  card.setConfig(fields ? { decision: DECISION, fields } : { decision: DECISION });
+  const config = { decision: DECISION };
+  if (fields) { config.fields = fields; }
+  if (submit) { config.submit = submit; }
+  card.setConfig(config);
   return card;
 }
 
@@ -88,25 +91,139 @@ card.hass = { states: {}, callService: () => {} };
 check('an entity that is not there at all shows nothing', card.hidden === true);
 
 console.log('--- answering ---');
-card = newCard();
-let env = hassWith('Awaiting answer...', ['Awaiting answer...', 'Yes - reboot now', 'Cancel request']);
+// Nothing commits on the tap any more. A tap says what the answer will be; Send
+// answer sends it. The two used to be one gesture on a single choice and two on a
+// form, which is the same card behaving differently for no reason you could see,
+// and a tap is the easiest thing to do by accident on a phone.
+const SUBMIT = 'button.agent_bridge_abc_submit';
+const CANCEL_ROW = 'Cancel request';
+
+function hassFor(state, options, { defer = false, reject = false } = {}) {
+  const calls = [];
+  const states = { [DECISION]: { state, attributes: options === undefined ? {} : { options } } };
+  const env = {
+    calls,
+    states,
+    // Applies what a call asked for, the way Home Assistant pushing the new state
+    // back does. Held back when deferring, which is the case the card has to survive:
+    // service completion and the state arriving are two different events.
+    settle() {
+      for (const call of calls.splice(0, calls.length)) {
+        if (call.domain !== 'select') { continue; }
+        if (states[call.data.entity_id]) { states[call.data.entity_id].state = call.data.option; }
+      }
+      env.card.hass = env.hass;
+    },
+    hass: {
+      states,
+      callService: (domain, service, data) => {
+        calls.push({ domain, service, data });
+        if (reject) { return Promise.reject(new Error('not allowed')); }
+        if (!defer && domain === 'select') {
+          if (states[data.entity_id]) { states[data.entity_id].state = data.option; }
+          env.card.hass = env.hass;
+        }
+        return Promise.resolve();
+      },
+    },
+  };
+  return env;
+}
+
+const flush = () => new Promise((r) => setImmediate(r));
+
+card = newCard(undefined, SUBMIT);
+let env = hassFor('Awaiting answer...', ['Awaiting answer...', 'Yes - reboot now', 'Cancel request']);
+env.card = card;
 card.hass = env.hass;
 rows(card)[0].click();
 check('a tap selects that option on the entity', env.calls.length === 1 &&
   env.calls[0].domain === 'select' && env.calls[0].service === 'select_option' &&
   env.calls[0].data.entity_id === DECISION && env.calls[0].data.option === 'Yes - reboot now',
   JSON.stringify(env.calls));
-rows(card)[1].click();
-check('a second tap while the first is in flight sends nothing more', env.calls.length === 1, JSON.stringify(env.calls));
-check('and the rows are marked as sending', card.shadowRoot.querySelector('.choices').classList.contains('sending'));
+check('but it does not send, and the rows stay live',
+  !card.shadowRoot.querySelector('.choices').classList.contains('sending'));
+check('and Send answer is offered, because there is now something to commit',
+  labels(card).includes('Send answer'), labels(card).join('|'));
+env.settle();
+buttons(card).find((b) => b.textContent === 'Send answer').click();
+check('Send answer presses the Send button the daemon waits on',
+  env.calls.length === 1 && env.calls[0].domain === 'button' && env.calls[0].service === 'press' &&
+  env.calls[0].data.entity_id === SUBMIT, JSON.stringify(env.calls));
+
+card = newCard(undefined, SUBMIT);
+env = hassFor('Awaiting answer...', ['Awaiting answer...', 'Yes - reboot now', 'Cancel request'], { defer: true });
+env.card = card;
+card.hass = env.hass;
+buttons(card).find((b) => b.textContent === CANCEL_ROW).click();
+check('Cancel still acts on the tap, because withdrawing is not an answer',
+  env.calls.length === 1 && env.calls[0].data.option === CANCEL_ROW, JSON.stringify(env.calls));
+check('and the rows are marked as sending while it is in flight',
+  card.shadowRoot.querySelector('.choices').classList.contains('sending'));
+check('Send answer sits above it, because that is the row being looked for',
+  labels(card).indexOf('Send answer') < labels(card).indexOf(CANCEL_ROW), labels(card).join('|'));
+rows(card)[0].click();
+check('so a tap behind a cancel sends nothing more', env.calls.length === 1, JSON.stringify(env.calls));
 
 // The daemon clears the question, which is what releases the card for the next one.
-card.hass = hassWith('Idle', ['Idle']).hass;
-env = hassWith('Awaiting answer...', ['Awaiting answer...', 'Another question', 'Cancel request']);
+card.hass = hassFor('Idle', ['Idle']).hass;
+env = hassFor('Awaiting answer...', ['Awaiting answer...', 'Another question', 'Cancel request']);
+env.card = card;
 card.hass = env.hass;
 rows(card)[0].click();
 check('the next question can be answered again',
   env.calls.length === 1 && env.calls[0].data.option === 'Another question', JSON.stringify(env.calls));
+
+console.log('--- a tap that Home Assistant has not confirmed yet ---');
+// Two taps in a row used to compute from the same state, because the second ran
+// before the first had been pushed back: ticking Auth then Search sent "Auth" and
+// then "Search", losing Auth. Send had the matching problem - pressed straight after
+// a tap it committed whatever the slot still held.
+card = newCard(undefined, SUBMIT);
+env = hassFor('Awaiting answer...', ['Awaiting answer...', 'Yes - reboot now', 'No - leave it', 'Cancel request'],
+  { defer: true });
+env.card = card;
+card.hass = env.hass;
+rows(card)[0].click();
+rows(card)[1].click();
+check('a second tap still replaces the first, not the state behind it',  env.calls.length === 2 && env.calls[1].data.option === 'No - leave it', JSON.stringify(env.calls));
+check('the row you last tapped is the one shown as chosen',
+  buttons(card).filter((b) => b.classList.contains('chosen')).map((b) => b.textContent).join('|') === 'No - leave it',
+  buttons(card).filter((b) => b.classList.contains('chosen')).map((b) => b.textContent).join('|'));
+check('Send is held while anything is unconfirmed',
+  buttons(card).find((b) => b.textContent === 'Send answer').getAttribute('disabled') === 'disabled');
+check('and the card says why rather than looking broken',
+  labels(card).includes('Saving your choice...'), labels(card).join('|'));
+buttons(card).find((b) => b.textContent === 'Send answer').click();
+check('pressing Send while unconfirmed sends nothing',
+  env.calls.filter((c) => c.domain === 'button').length === 0, JSON.stringify(env.calls));
+env.settle();
+check('once the state arrives the note goes', !labels(card).includes('Saving your choice...'), labels(card).join('|'));
+check('and Send is released',
+  buttons(card).find((b) => b.textContent === 'Send answer').getAttribute('disabled') === null);
+buttons(card).find((b) => b.textContent === 'Send answer').click();
+check('exactly the confirmed answer is sent, once',
+  env.calls.length === 1 && env.calls[0].domain === 'button', JSON.stringify(env.calls));
+
+async function checkRefusedSelection() {
+  // Local, not the shared `card`/`env`: the rest of this file runs while this is
+  // awaiting, and it reassigns both.
+  const rejectCard = newCard(undefined, SUBMIT);
+  const rejectEnv = hassFor('Awaiting answer...',
+    ['Awaiting answer...', 'Yes - reboot now', 'Cancel request'], { reject: true });
+  rejectEnv.card = rejectCard;
+  rejectCard.hass = rejectEnv.hass;
+  rows(rejectCard)[0].click();
+  await flush();
+  check('a refused call takes its tick back rather than lying about it',
+    buttons(rejectCard).filter((b) => b.classList.contains('chosen')).length === 0,
+    buttons(rejectCard).filter((b) => b.classList.contains('chosen')).map((b) => b.textContent).join('|'));
+  check('and says so where the rows are',
+    labels(rejectCard).some((l) => l.startsWith('Home Assistant would not take that')),
+    labels(rejectCard).join('|'));
+  check('with Send released, so it can be tried again',
+    buttons(rejectCard).find((b) => b.textContent === 'Send answer').getAttribute('disabled') === null);
+}
 
 console.log('--- a whole form, not just one choice ---');
 // A multi-field question publishes one select per field and leaves the main selector
@@ -900,6 +1017,7 @@ check('"machines" is required', (() => {
 // _launch awaits its service calls, so the checks that read them have to await it too.
 (async () => {
   await checkForgetRemoval();
+  await checkRefusedSelection();
 
   const pubEnv = launchEnv({});
   const pubCard = promptCard(pubEnv, { promptTopic: PROMPT_TOPIC });

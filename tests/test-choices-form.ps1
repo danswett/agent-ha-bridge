@@ -285,10 +285,14 @@ $script:HaStates["text.${node}_reply"] = [ordered]@{ state = 'nothing to add'; a
 $script:HaStates["button.${node}_submit"] = [ordered]@{ state = [DateTimeOffset]::Now.ToString('o'); attributes = @{} }
 
 $marker = [pscustomobject]@{
-    decisionId = 'd1'
-    mode       = 'multiple_choice'
-    armedAt    = $armedAt.ToString('o')
-    fields     = $fields
+    decisionId      = 'd1'
+    mode            = 'multiple_choice'
+    armedAt         = $armedAt.ToString('o')
+    fields          = $fields
+    # What the card already held when the question arrived. An answer is anything
+    # that has changed since, never anything that merely looks newer.
+    payloadBaseline = ''
+    submitBaseline  = ''
 }
 $state = @{ $sessionId = [pscustomobject]@{ Name = 'Copilot: a task'; Machine = 'BOX'; LastSubmitAt = '' } }
 $answer = Read-DaemonFormAnswer -SessionId $sessionId -Marker $marker -State $state -Headers $headers
@@ -354,7 +358,8 @@ Test-That 'and the card offers Send answer, because nothing sends itself now' {
 foreach ($call in @($single.calls)) { $script:HaStates[[string]$call.data.entity_id].state = [string]$call.data.option }
 $script:HaStates["text.${node}_reply"] = [ordered]@{ state = ' '; attributes = @{} }
 $script:HaStates["button.${node}_submit"] = [ordered]@{ state = $armedOne.ToString('o'); attributes = @{} }
-$oneMarker = [pscustomobject]@{ decisionId = 'd2'; mode = 'multiple_choice'; armedAt = $armedOne.ToString('o'); fields = $oneField }
+$oneMarker = [pscustomobject]@{ decisionId = 'd2'; mode = 'multiple_choice'; armedAt = $armedOne.ToString('o'); fields = $oneField
+    payloadBaseline = ''; submitBaseline = $armedOne.ToString('o') }
 $oneState = @{ $sessionId = [pscustomobject]@{ Name = 'Copilot: a task'; Machine = 'BOX'; LastSubmitAt = '' } }
 
 Test-That 'a chosen option on its own is not an answer yet' {
@@ -423,7 +428,8 @@ $script:HaStates["select.${node}_f1"].state = 'Auth + Search'
 
 $script:HaStates["text.${node}_reply"] = [ordered]@{ state = ' '; attributes = @{} }
 $script:HaStates["button.${node}_submit"] = [ordered]@{ state = [DateTimeOffset]::Now.ToString('o'); attributes = @{} }
-$multiMarker = [pscustomobject]@{ decisionId = 'd3'; mode = 'multiple_choice'; armedAt = $armedMulti.ToString('o'); fields = $multiField }
+$multiMarker = [pscustomobject]@{ decisionId = 'd3'; mode = 'multiple_choice'; armedAt = $armedMulti.ToString('o'); fields = $multiField
+    payloadBaseline = ''; submitBaseline = '' }
 $multiState = @{ $sessionId = [pscustomobject]@{ Name = 'Copilot: a task'; Machine = 'BOX'; LastSubmitAt = '' } }
 $multiAnswer = Read-DaemonDecisionAnswer -SessionId $sessionId -Marker $multiMarker -State $multiState -Headers $headers
 
@@ -455,7 +461,8 @@ $script:HaStates["sensor.${node}_reply_payload"] = [ordered]@{
     # and the daemon reads it the way it reads every other entity's attributes.
     attributes = [pscustomobject]@{ text = 'DuckDB, actually'; images = @(); files = @() }
 }
-$textMarker = [pscustomobject]@{ decisionId = 'd4'; mode = 'multiple_choice'; armedAt = $armedText.ToString('o'); fields = $oneField }
+$textMarker = [pscustomobject]@{ decisionId = 'd4'; mode = 'multiple_choice'; armedAt = $armedText.ToString('o'); fields = $oneField
+    payloadBaseline = 'what-the-card-held-when-this-was-armed'; submitBaseline = $armedText.ToString('o') }
 $textState = @{ $sessionId = [pscustomobject]@{ Name = 'Copilot: a task'; Machine = 'BOX'; LastSubmitAt = '' } }
 $typed = Read-DaemonDecisionAnswer -SessionId $sessionId -Marker $textMarker -State $textState -Headers $headers
 
@@ -466,9 +473,10 @@ Test-That 'and the publish it came from is named, so it is not sent twice' {
     -not [string]::IsNullOrWhiteSpace($typed.PayloadStamp)
 }
 
-# A payload older than the question belongs to the reply path, not to this question.
-$script:HaStates["sensor.${node}_reply_payload"].state = $armedText.AddMinutes(-1).ToString('o')
-Test-That 'something said before the question was asked is not its answer' {
+# A payload the question was armed against belongs to the reply path, not to this
+# question - whatever its clock says.
+$script:HaStates["sensor.${node}_reply_payload"].state = 'what-the-card-held-when-this-was-armed'
+Test-That 'something the question was armed against is not its answer' {
     [string]::IsNullOrWhiteSpace((Read-DaemonDecisionAnswer -SessionId $sessionId -Marker $textMarker -State $textState -Headers $headers).Answer)
 }
 

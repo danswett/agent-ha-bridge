@@ -2351,6 +2351,36 @@ function Set-CopilotDecisionMarkerInjected {
     Set-Content -LiteralPath $path -Value ($obj | ConvertTo-Json -Depth 8 -Compress) -Encoding UTF8
 }
 
+function Set-CopilotDecisionMarkerBaseline {
+    <#
+        Records what the reply card's payload and the Send button already held when a
+        question was armed, so that "has this changed" replaces "is this newer".
+
+        On the marker rather than in the daemon's memory because it has to survive a
+        restart and a re-arm, and because a replaced question gets a new marker and so
+        starts from its own baseline. Written once; a second call for the same
+        question leaves the first alone, otherwise a reconcile that happened to run
+        after somebody pressed Send would adopt that press as the baseline and the
+        answer would never be read.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$PayloadBaseline,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$SubmitBaseline
+    )
+
+    $marker = Get-CopilotDecisionMarker -SessionId $SessionId
+    if ($null -eq $marker) { return $false }
+    if ($marker.PSObject.Properties['payloadBaseline'] -and $marker.PSObject.Properties['submitBaseline']) { return $true }
+    $path = Get-CopilotDecisionMarkerPath -SessionId $SessionId
+    $obj = @{}
+    foreach ($p in $marker.PSObject.Properties) { $obj[$p.Name] = $p.Value }
+    $obj['payloadBaseline'] = $PayloadBaseline
+    $obj['submitBaseline'] = $SubmitBaseline
+    Set-Content -LiteralPath $path -Value ($obj | ConvertTo-Json -Depth 8 -Compress) -Encoding UTF8
+    $true
+}
+
 function Remove-CopilotDecisionMarker {
     param([Parameter(Mandatory)][string]$SessionId)
     $path = Get-CopilotDecisionMarkerPath -SessionId $SessionId

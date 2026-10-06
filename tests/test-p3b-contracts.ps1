@@ -713,7 +713,17 @@ function Invoke-WebRequest {
                     }
                 }
                 "text.$($topics.Node)_reply" = [pscustomobject]@{ state = 'old reply' }
-                "button.$($topics.Node)_submit" = [pscustomobject]@{ state = ([DateTimeOffset]$marker.armedAt).AddSeconds(1).ToString('o') }
+                # The retained reply payload as it stood when the question arrived.
+                # The daemon records its identity as the baseline; only a different
+                # one is an answer, so this one never is.
+                "sensor.$($topics.Node)_reply_payload" = [pscustomobject]@{
+                    state = 'armed-baseline'
+                    attributes = [pscustomobject]@{ text = ''; images = @(); files = @() }
+                }
+                # No press yet. The press that answers is applied below, after the
+                # baseline is recorded - which is the real order of events and the
+                # only one in which a press means somebody pressed Send.
+                "button.$($topics.Node)_submit" = [pscustomobject]@{ state = 'unknown' }
             }
             for ($index = 1; $index -le $script:CopilotMqttMaxFields; $index++) {
                 $ha[(Get-CopilotMqttFieldEntityId -Node $topics.Node -Index $index)] = [pscustomobject]@{
@@ -731,6 +741,10 @@ function Invoke-WebRequest {
                 FormDelivered = $true; FallbackDelivered = $false; UnexpectedInput = 0
                 DecisionReads = 0; TerminalOnRead = $false; CardClears = 0
             }
+            # Arm, then press - in that order, which is the only one in which a press
+            # is somebody pressing Send rather than something the card already held.
+            [void](Set-CopilotDecisionMarkerBaseline -SessionId $sid -PayloadBaseline 'armed-baseline' -SubmitBaseline '')
+            $ha["button.$($topics.Node)_submit"].state = ([DateTimeOffset]$marker.armedAt).AddSeconds(1).ToString('o')
             $script:DeliveryFixture
         }
         function Invoke-DeliveryPass {
@@ -875,6 +889,14 @@ function Invoke-WebRequest {
                     state = 'Idle'; attributes = [pscustomobject]@{ options = @('Idle'); question = '' }
                 }
                 "text.${node}_reply" = [pscustomobject]@{ state = ''; attributes = [pscustomobject]@{} }
+                # What the reply card had retained when the question arrived. Its
+                # identity is the baseline the daemon records; only a different one
+                # is ever read as an answer.
+                "sensor.${node}_reply_payload" = [pscustomobject]@{
+                    state = 'armed-baseline'; attributes = [pscustomobject]@{ text = ''; images = @(); files = @() }
+                }
+                # Unpressed. Nothing on the card is an answer until this changes.
+                "button.${node}_submit" = [pscustomobject]@{ state = 'unknown' }
             }
             $script:A23Messages = @{}
             $script:A23Inputs = [Collections.Generic.List[object]]::new()
@@ -1039,6 +1061,9 @@ function Invoke-WebRequest {
         Test-That 're-arming a placeholder does not inject an answer' { $script:A23Inputs.Count -eq 0 }
         $script:A23Ha[$fixture.FieldEntity].state = 'No'
         Invoke-PendingDecisions -Headers $headers -State $fixture.State -Live $script:DaemonLive
+        Test-That 'a chosen option with no Send behind it is not delivered' { $script:A23Inputs.Count -eq 0 }
+        $script:A23Ha["button.$($fixture.Topics.Node)_submit"].state = [DateTimeOffset]::Now.ToString('o')
+        Invoke-PendingDecisions -Headers $headers -State $fixture.State -Live $script:DaemonLive
         Invoke-PendingDecisions -Headers $headers -State $fixture.State -Live $script:DaemonLive
         $delivered = Get-CopilotDecisionMarker -SessionId $fixture.SessionId
         Test-That 'the actual no-ID dashboard route delivers its choice exactly once' {
@@ -1075,6 +1100,7 @@ function Invoke-WebRequest {
         }
         Add-A23QuestionResult -Fixture $fixture -Content 'User responded: true'
         $script:A23Ha[$fixture.FieldEntity].state = 'No'
+        $script:A23Ha["button.$($fixture.Topics.Node)_submit"].state = [DateTimeOffset]::Now.ToString('o')
         Invoke-PendingDecisions -Headers $headers -State $fixture.State -Live $script:DaemonLive
         Test-That 'a completed terminal answer prevents a competing dashboard choice from being delivered' {
             $script:A23Inputs.Count -eq 0 -and $null -eq (Get-CopilotDecisionMarker -SessionId $fixture.SessionId) -and

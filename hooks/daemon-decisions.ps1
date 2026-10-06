@@ -54,6 +54,10 @@ function Invoke-PendingDecisions {
 
         Confirm-DaemonDecisionArmed -SessionId $sessionId -Marker $marker -State $State -Headers $Headers
 
+        # What the card already held when this question arrived. Until that is known,
+        # nothing on it can be told apart from an answer, so nothing is read as one.
+        if (-not (Confirm-DaemonDecisionBaseline -SessionId $sessionId -Marker $marker -Headers $Headers)) { continue }
+
         # Some prompts cannot be driven from the dashboard at all - more fields than
         # it publishes dropdowns for, or more than one free-text field. The native
         # prompt is an arrow-key form, and characters typed at it are discarded, so
@@ -209,10 +213,147 @@ function Test-DaemonDecisionUsesFields {
     @($Marker.fields).Count -gt 1
 }
 
+function Test-DaemonMarkedGuardError {
+    <#
+        Whether an error is the test boundary refusing a forbidden operation rather
+        than an ordinary failure.
+
+        These must never be absorbed. A guard violation that comes back as "no
+        answer" or as a cosmetic fallback is a test that passes while proving the
+        opposite of what it claims, which is exactly what the boundary exists to stop.
+    #>
+    param([Parameter(Mandatory)]$ErrorRecord)
+
+    $data = $ErrorRecord.Exception.Data
+    [bool]($data['BridgeTestNetworkBlocked'] -or $data['BridgeTestWriteBlocked'])
+}
+
+function Get-DaemonDecisionPayloadIdentity {
+    <#
+        What the reply card's retained payload is right now, as
+        { Known, Identity }: Known is $false when the sensor could not be read at all,
+        and Identity is '' when it is readable and carrying nothing.
+
+        Identity is the card's own stamp treated as an opaque string. It is never
+        compared against daemon time: the stamp is produced by `new Date()` in a
+        browser and the question's armedAt by the daemon, so ordering them is a
+        comparison between two unrelated clocks. A browser running behind made every
+        freshly typed answer look old and left the question waiting; one running ahead
+        made a retained payload from an earlier reply look new and would answer the
+        next question with stale text. What matters is only whether it has changed
+        since this question was armed.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $node = Get-CopilotMqttNodeId -SessionId $SessionId
+    try {
+        $state = Get-HomeAssistantState -EntityId "sensor.${node}_reply_payload" -Headers $Headers
+    }
+    catch {
+        if (Test-DaemonMarkedGuardError -ErrorRecord $_) { throw }
+        # Unreadable is not absence. Saying so is what keeps "nothing has been sent"
+        # apart from "nobody can tell", and only the first is safe to act on.
+        return [pscustomobject]@{ Known = $false; Identity = '' }
+    }
+    if ($null -eq $state -or -not $state.PSObject.Properties['state']) {
+        return [pscustomobject]@{ Known = $true; Identity = '' }
+    }
+    $identity = [string]$state.state
+    if ([string]::IsNullOrWhiteSpace($identity) -or $identity -in @('unknown', 'unavailable')) {
+        return [pscustomobject]@{ Known = $true; Identity = '' }
+    }
+    [pscustomobject]@{ Known = $true; Identity = $identity }
+}
+
+function Confirm-DaemonDecisionBaseline {
+    <#
+        Records, once per question, what the reply card's payload and the Submit
+        button already held when it was armed. Everything afterwards is "has this
+        changed", never "is this newer".
+
+        Written onto the marker rather than kept in memory so it survives a daemon
+        restart and a re-arm, and so a replaced question starts from its own
+        baseline - a new question writes a new marker. Returns $false when it could
+        not be established, and then nothing is read as an answer this pass: an
+        unreadable card is not consent.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)]$Marker,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    if ($Marker.PSObject.Properties['payloadBaseline'] -and $Marker.PSObject.Properties['submitBaseline']) { return $true }
+
+    $payload = Get-DaemonDecisionPayloadIdentity -SessionId $SessionId -Headers $Headers
+    if (-not $payload.Known) {
+        Write-DaemonLog -Message "no reply-payload baseline for $($SessionId.Substring(0,8)); not reading an answer until the card can be read"
+        return $false
+    }
+
+    $node = Get-CopilotMqttNodeId -SessionId $SessionId
+    $submit = ''
+    try {
+        $button = Get-HomeAssistantState -EntityId "button.${node}_submit" -Headers $Headers
+        $submit = [string]$button.state
+        if ($submit -in @('unknown', 'unavailable')) { $submit = '' }
+    }
+    catch {
+        if (Test-DaemonMarkedGuardError -ErrorRecord $_) { throw }
+        # No Send button to compare against, which is recorded as "nothing pressed"
+        # rather than refused: a typed answer arrives through the reply card's own
+        # Send and needs no button at all. Refusing to submit without one is
+        # Test-DaemonSendPressed's job, and it never reads an unreadable button as
+        # a press.
+        $submit = ''
+    }
+
+    Set-CopilotDecisionMarkerBaseline -SessionId $SessionId -PayloadBaseline $payload.Identity -SubmitBaseline $submit
+    if ($Marker.PSObject.Properties['payloadBaseline']) { $Marker.payloadBaseline = $payload.Identity }
+    else { $Marker | Add-Member -NotePropertyName payloadBaseline -NotePropertyValue $payload.Identity -Force }
+    if ($Marker.PSObject.Properties['submitBaseline']) { $Marker.submitBaseline = $submit }
+    else { $Marker | Add-Member -NotePropertyName submitBaseline -NotePropertyValue $submit -Force }
+    $true
+}
+
+function Test-DaemonSendPressed {
+    <#
+        Whether Send has actually been pressed for this question, as
+        { Pressed, Readable }.
+
+        Pressed means the button's press stamp differs from the one recorded when the
+        question was armed. A missing or unreadable button is Readable=$false and is
+        never Pressed - it used to fall back to "submit as soon as every field is
+        chosen", which manufactures a submission out of somebody filling a form in and
+        is precisely what "every answer needs Send" must not do.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)]$Marker,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $node = Get-CopilotMqttNodeId -SessionId $SessionId
+    try {
+        $button = Get-HomeAssistantState -EntityId "button.${node}_submit" -Headers $Headers
+    }
+    catch {
+        if (Test-DaemonMarkedGuardError -ErrorRecord $_) { throw }
+        return [pscustomobject]@{ Pressed = $false; Readable = $false; At = '' }
+    }
+    $at = [string]$button.state
+    if ($at -in @('unknown', 'unavailable', '')) { return [pscustomobject]@{ Pressed = $false; Readable = $true; At = '' } }
+    $baseline = if ($Marker.PSObject.Properties['submitBaseline']) { [string]$Marker.submitBaseline } else { '' }
+    [pscustomobject]@{ Pressed = (-not [StringComparer]::Ordinal.Equals($at, $baseline)); Readable = $true; At = $at }
+}
+
 function Read-DaemonDecisionCardText {
     <#
         Text the reply card published as an answer to the question now armed, with
-        the stamp identifying that publish, or empty when there is none.
+        the identity of that publish, or empty when there is none.
 
         The reply card is the box every other part of a session card uses, and until
         card 1.22.0 the dashboard swapped it out for a plain entity row the moment a
@@ -221,9 +362,9 @@ function Read-DaemonDecisionCardText {
         a typed answer went nowhere: the box was on screen, Send worked, and nothing
         anywhere recorded that the words had been thrown away.
 
-        Only a payload published after the question was armed counts. An older one
-        belongs to the reply path, which delivers it once the card clears, and reading
-        it here would answer the question with whatever was last said to the session.
+        Only a payload whose identity differs from the one recorded when the question
+        was armed counts (Confirm-DaemonDecisionBaseline). Anything still matching the
+        baseline belongs to the reply path, which delivers it once the card clears.
 
         A payload carrying attachments is left alone entirely. An image cannot be
         typed into an arrow-key prompt, and consuming it here would destroy it; the
@@ -237,26 +378,27 @@ function Read-DaemonDecisionCardText {
 
     $node = Get-CopilotMqttNodeId -SessionId $SessionId
     $empty = [pscustomobject]@{ Text = ''; Stamp = '' }
+    if (-not $Marker.PSObject.Properties['payloadBaseline']) { return $empty }
+    $baseline = [string]$Marker.payloadBaseline
+
+    $current = Get-DaemonDecisionPayloadIdentity -SessionId $SessionId -Headers $Headers
+    if (-not $current.Known -or [string]::IsNullOrEmpty($current.Identity)) { return $empty }
+    if ([StringComparer]::Ordinal.Equals($current.Identity, $baseline)) { return $empty }
+
     $state = $null
     try { $state = Get-HomeAssistantState -EntityId "sensor.${node}_reply_payload" -Headers $Headers }
-    catch { return $empty }
-    if ($null -eq $state -or -not $state.PSObject.Properties['state']) { return $empty }
-
-    $stamp = [string]$state.state
-    if ([string]::IsNullOrWhiteSpace($stamp) -or $stamp -in @('unknown', 'unavailable')) { return $empty }
-    try {
-        if (([datetimeoffset]$stamp) -le ([datetimeoffset][string]$Marker.armedAt)) { return $empty }
+    catch {
+        if (Test-DaemonMarkedGuardError -ErrorRecord $_) { throw }
+        return $empty
     }
-    catch { return $empty }
-
-    $attrs = if ($state.PSObject.Properties['attributes']) { $state.attributes } else { $null }
+    $attrs = if ($null -ne $state -and $state.PSObject.Properties['attributes']) { $state.attributes } else { $null }
     if ($null -eq $attrs) { return $empty }
     foreach ($name in @('images', 'files')) {
         if ($attrs.PSObject.Properties[$name] -and @($attrs.$name).Count -gt 0) { return $empty }
     }
     $text = if ($attrs.PSObject.Properties['text']) { [string]$attrs.text } else { '' }
     if ([string]::IsNullOrWhiteSpace($text)) { return $empty }
-    [pscustomobject]@{ Text = $text; Stamp = $stamp }
+    [pscustomobject]@{ Text = $text; Stamp = $current.Identity }
 }
 
 function Read-DaemonDecisionAnswer {
@@ -304,10 +446,20 @@ function Read-DaemonDecisionAnswer {
         elseif ($isChoice) {
             if ($null -ne $selError) { throw $selError }
             $s = [string]$sel.state
-            if ($s -notin @('Idle', 'Awaiting answer...', 'unknown', 'unavailable', '')) { $answer = $s }
+            if ($s -eq 'Cancel request') { $answer = $s }
+            elseif ($s -notin @('Idle', 'Awaiting answer...', 'unknown', 'unavailable', '')) {
+                # A selector carrying its own choices - a legacy `choices` argument,
+                # a lone Claude question - still needs Send, the same as a field does.
+                # Cancel above is the one exception: withdrawing a question is a
+                # deliberate act in itself, not an answer waiting to be confirmed.
+                $send = Test-DaemonSendPressed -SessionId $SessionId -Marker $Marker -Headers $Headers
+                if ($send.Pressed) { $answer = $s }
+            }
             else {
                 # Nothing tapped, but something typed. Every Copilot option list ends
-                # in "Other (type your answer)", so words are a real answer here.
+                # in "Other (type your answer)", so words are a real answer here. The
+                # reply card only publishes when its own Send is pressed, so the
+                # payload's arrival is itself the explicit send.
                 $card = Read-DaemonDecisionCardText -SessionId $SessionId -Marker $Marker -Headers $Headers
                 if (-not [string]::IsNullOrWhiteSpace($card.Text)) {
                     $answer = $card.Text
@@ -333,6 +485,10 @@ function Read-DaemonDecisionAnswer {
         }
     }
     catch {
+        # A refused test-boundary operation is not an unreadable card. Absorbing it
+        # here would turn "this suite tried to reach a real Home Assistant" into a
+        # quiet "no answer yet", and the suite would pass for the wrong reason.
+        if (Test-DaemonMarkedGuardError -ErrorRecord $_) { throw }
         return $null
     }
     [pscustomobject]@{
@@ -403,7 +559,9 @@ function Read-DaemonFormAnswer {
                     $rep = Get-HomeAssistantState -EntityId "text.${node}_reply" -Headers $Headers
                     $v = [string]$rep.state
                 }
-                catch { }
+                catch {
+                    if (Test-DaemonMarkedGuardError -ErrorRecord $_) { throw }
+                }
                 if ([string]::IsNullOrWhiteSpace($v) -or $v -in @('unknown', 'unavailable')) { $v = '' }
             }
             $picked += $v
@@ -436,32 +594,41 @@ function Read-DaemonFormAnswer {
             Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Sending answer...' `
                 -Extra @{ answer = $card.Text } -Headers $Headers | Out-Null
         }
-        catch { }
+        catch {
+            if (Test-DaemonMarkedGuardError -ErrorRecord $_) { throw }
+        }
         return [pscustomobject]@{
             Answer = $card.Text; Selections = @(); PayloadStamp = $card.Stamp; IsFreeText = $true
         }
     }
 
-    # Every field chosen is not enough: a multi-field answer is only sent when Submit
-    # is pressed, so selections can be reviewed and changed first. An MQTT button's
-    # state is the timestamp of its last press, so a press counts only if it is newer
-    # than the moment this question was armed - otherwise a press left over from a
-    # previous question would fire this one instantly.
+    # Every field chosen is not enough: an answer is only sent when Send is pressed,
+    # so selections can be reviewed and changed first. The press is identified against
+    # the one recorded when the question was armed, not ordered against a clock, and a
+    # missing or unreadable button is never a press - it used to fall back to
+    # "submitted as soon as every field is chosen", which turns somebody filling a
+    # form in into somebody sending it.
     $submitted = $false
-    $pressIsNew = $false
-    $pressedAt = ''
-    try {
-        $btn = Get-HomeAssistantState -EntityId "button.${node}_submit" -Headers $Headers
-        $pressedAt = [string]$btn.state
-        if ($pressedAt -notin @('unknown', 'unavailable', '')) {
-            $armedAt = [datetimeoffset][string]$marker.armedAt
-            $pressIsNew = ([datetimeoffset]$pressedAt) -gt $armedAt
+    $send = Test-DaemonSendPressed -SessionId $sessionId -Marker $marker -Headers $Headers
+    $pressIsNew = $send.Pressed
+    $pressedAt = $send.At
+
+    if (-not $send.Readable) {
+        $entry = $State[$sessionId]
+        $toldKey = "unreadable:$([string]$marker.decisionId)"
+        $toldAt = if ($entry.PSObject.Properties['LastSendNoticeAt']) { [string]$entry.LastSendNoticeAt } else { '' }
+        if ($toldAt -ne $toldKey) {
+            if ($entry.PSObject.Properties['LastSendNoticeAt']) { $entry.LastSendNoticeAt = $toldKey }
+            else { $entry | Add-Member -NotePropertyName LastSendNoticeAt -NotePropertyValue $toldKey -Force }
+            try {
+                Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Not sent - no Send button on this session' `
+                    -Extra @{ answer_in = 'the terminal' } -Headers $Headers | Out-Null
+            }
+            catch {
+                if (Test-DaemonMarkedGuardError -ErrorRecord $_) { throw }
+            }
+            Write-DaemonLog -Message "no readable Send button for $($sessionId.Substring(0,8)); nothing will be injected from the card"
         }
-    }
-    catch {
-        # No button (older session): fall back to submitting as soon as every field is
-        # chosen rather than hanging.
-        $pressIsNew = ($picked.Count -eq $markerFields.Count)
     }
 
     if ($pressIsNew -and $picked.Count -ne $markerFields.Count) {
@@ -495,7 +662,9 @@ function Read-DaemonFormAnswer {
                 Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Not sent - this question takes options' `
                     -Extra @{ typed = $card.Text } -Headers $Headers | Out-Null
             }
-            catch { }
+            catch {
+                if (Test-DaemonMarkedGuardError -ErrorRecord $_) { throw }
+            }
             Write-DaemonLog -Message "reply card text for $($sessionId.Substring(0,8)) is not answerable by this question"
         }
     }
