@@ -430,6 +430,26 @@ Test-Case 'a field whose own options look like positions is never carried as pos
     @(Get-DecisionMultiSelectCodes -Field $odd).Count -eq 0 -and
     @(Get-DecisionMultiSelectChoices -Field $odd).Count -eq 3
 }
+# The exact shape: one plain option and one written like a position, with a schema
+# default naming a single option. Positions are refused outright, the written-out form
+# carries it, and the default still has to come back as that one option.
+Test-Case 'a literal position among the options refuses the position carrier entirely' {
+    $literal = [pscustomobject]@{ Label = 'L'; Options = @('X', '#1'); IsText = $false; MultiSelect = $true
+        MultiSelectStyle = 'space-toggle'; DefaultIndexes = @(1) }
+    @(Get-DecisionMultiSelectCodes -Field $literal).Count -eq 0 -and
+    (@(Get-DecisionMultiSelectChoices -Field $literal) -join ',') -eq 'X,#1,X + #1' -and
+    (@(Get-DecisionMultiSelectChecked -Field $literal) -join ',') -eq '1' -and
+    (Get-DecisionMultiSelectLabel -Field $literal -Indexes ([int[]]@(1))) -ceq '#1'
+}
+Test-Case 'and its singleton default round-trips through the written-out form alone' {
+    $literal = [pscustomobject]@{ Label = 'L'; Options = @('X', '#1'); IsText = $false; MultiSelect = $true
+        MultiSelectStyle = 'space-toggle'; DefaultIndexes = @(1) }
+    # '#1' here is this field's second option written out, not a position - which is
+    # exactly why positions are refused for it.
+    (@(Resolve-DecisionMultiSelectChoice -Field $literal -Choice '#1') -join '|') -ceq '#1' -and
+    (@(Resolve-DecisionMultiSelectIndexes -Field $literal -Value '#1') -join ',') -eq '1' -and
+    (@(Resolve-DecisionMultiSelectChoice -Field $literal -Choice 'X + #1') -join '|') -ceq 'X|#1'
+}
 # A field may offer options that read exactly like two of its others joined. Writing a
 # set out and reading it back then loses which rows were meant, and the terminal gets
 # the wrong ones - silently, which is the whole class of failure this exists to remove.

@@ -1339,8 +1339,11 @@ function Resolve-DecisionMultiSelectIndexes {
     $count = $options.Count
     if ($count -lt 2) { return @() }
 
-    if ($Value -match $script:DecisionMultiSelectCodePattern) {
-        if (-not (Test-DecisionMultiSelectCodeSafe -Field $Field)) { return @() }
+    # Positions first, but only where this field can use them at all. A field with an
+    # option written like a position does not: for it, '#1' is that option's own text
+    # and must be read as words. Testing the pattern before asking whether the field
+    # uses positions made such a field unable to resolve its own option.
+    if ((Test-DecisionMultiSelectCodeSafe -Field $Field) -and $Value -match $script:DecisionMultiSelectCodePattern) {
         $seen = [Collections.Generic.SortedSet[int]]::new()
         foreach ($part in $Value.Substring(1).Split(',')) {
             $position = 0
@@ -2705,6 +2708,14 @@ function Test-CopilotDecisionBaselineJson {
         $entry = $record.$channel
         if ($null -eq $entry -or -not $entry.PSObject.Properties['state']) { return $false }
         if (([string]$entry.state) -cnotin @('present', 'absent')) { return $false }
+        # The value is half the record and was never checked. A channel recorded as
+        # holding something, with nothing recorded, compares equal to an empty slot
+        # for ever - so a real answer arriving later never reads as a change.
+        if (-not $entry.PSObject.Properties['value']) { return $false }
+        $value = $entry.value
+        if ($null -eq $value -or $value -isnot [string]) { return $false }
+        if (([string]$entry.state) -ceq 'present' -and [string]::IsNullOrEmpty($value)) { return $false }
+        if (([string]$entry.state) -ceq 'absent' -and -not [string]::IsNullOrEmpty($value)) { return $false }
     }
     $true
 }

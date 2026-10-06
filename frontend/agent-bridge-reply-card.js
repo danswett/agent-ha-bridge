@@ -883,6 +883,11 @@ const CHOICE_MULTI_SEPARATOR = ' + ';
 // Shown while a tap has been sent to Home Assistant but has not come back. Send is
 // held for exactly as long as this is on screen, so the two can never disagree.
 const CHOICE_SAVING_NOTE = 'Saving your choice...';
+// Shown when a slot has moved away from what this card last saw settle, with nothing
+// of its own outstanding to explain it - another viewer answering the same question,
+// or a state arriving out of order. The rows show what is really there; Send is held
+// until somebody looks, because committing it would send a choice nobody made here.
+const CHOICE_CHANGED_NOTE = 'Changed since you chose - check what is ticked';
 // The states an entity sits in when it is carrying nothing: an unarmed field slot is
 // parked on 'Idle', and a session that has gone leaves its entity behind.
 const CHOICE_UNARMED = ['', 'Idle', 'unknown', 'unavailable'];
@@ -969,6 +974,12 @@ class AgentBridgeChoicesCard extends HTMLElement {
     // acknowledging the second released Send while the first could still land and tick
     // the row back on. Send is held while anything at all is outstanding.
     this._inflight = {};
+    // The last value this card saw a slot actually settle on. A slot that moves away
+    // from it without being asked has been changed by something else - another viewer
+    // answering the same question, or a state arriving out of order - and Send must
+    // not quietly commit that. Without this the card showed two rows ticked, became
+    // one row ticked on its own, kept Send live, and sent the one.
+    this._confirmed = {};
     this._note = '';
   }
 
@@ -1097,6 +1108,9 @@ class AgentBridgeChoicesCard extends HTMLElement {
       }
       if (Object.keys(set).length === 0) { delete this._inflight[key]; }
     }
+    for (const key of Object.keys(this._confirmed)) {
+      if (this._confirmed[key].generation !== generation) { delete this._confirmed[key]; }
+    }
 
     // Fields first, then whatever the main selector offers - which on a form is only
     // 'Cancel request'. A field group is shown only while it is carrying options, so
@@ -1162,13 +1176,42 @@ class AgentBridgeChoicesCard extends HTMLElement {
     for (const group of groups) {
       const pending = this._pending[group.entityId];
       if (!pending) { continue; }
-      if (pending.acked && pending.value === group.state) { delete this._pending[group.entityId]; }
+      if (pending.acked && pending.value === group.state) {
+        delete this._pending[group.entityId];
+        // Seen to land. From here, anything that moves it is something else.
+        this._confirmed[group.entityId] = { value: group.state, generation };
+      }
       else if (group.multi) { group.picked = pending.picked.slice(); }
       else { group.chosen = pending.value; }
     }
+
+    // What a slot held when this card first drew it counts as confirmed too: it is
+    // what the person is looking at, including a schema default that arrived already
+    // ticked.
+    for (const group of groups) {
+      if (this._confirmed[group.entityId]) { continue; }
+      if (this._pending[group.entityId] || this._inflight[group.entityId]) { continue; }
+      this._confirmed[group.entityId] = { value: group.state, generation };
+    }
+
+    // A slot that has moved away from what was confirmed, with nothing of this card's
+    // outstanding to explain it. The rows below show what is really there - that part
+    // was never wrong - but Send is held and says why, because committing it would
+    // send something nobody on this card chose. Tapping adopts it and clears this.
+    const diverged = groups.filter((g) => {
+      const seen = this._confirmed[g.entityId];
+      if (!seen || this._pending[g.entityId] || this._inflight[g.entityId]) { return false; }
+      return seen.value !== g.state;
+    });
     const waiting = Object.keys(this._pending).length > 0 || Object.keys(this._inflight).length > 0;
     if (!waiting && this._note === CHOICE_SAVING_NOTE) { this._note = ''; }
     if (waiting && !this._note) { this._note = CHOICE_SAVING_NOTE; }
+    // Nothing of ours outstanding, so this is the one thing worth saying.
+    if (!waiting) {
+      if (diverged.length > 0) { this._note = CHOICE_CHANGED_NOTE; }
+      else if (this._note === CHOICE_CHANGED_NOTE) { this._note = ''; }
+    }
+    const held = waiting || diverged.length > 0;
 
     // The answer has landed once the selector is no longer parked on the placeholder.
     if (this._sent && (!decision || decision.state !== CHOICE_PLACEHOLDER)) { this._sent = ''; }
@@ -1180,7 +1223,7 @@ class AgentBridgeChoicesCard extends HTMLElement {
     // note are in it too, so holding Send and saying why are drawn as they happen.
     const signature = groups
       .map((g) => `${g.entityId}\u0002${g.chosen}\u0002${g.label}\u0002${g.multi ? 'm' : 's'}\u0002${g.options.join('\u0001')}\u0002${g.multi ? g.picked.join('\u0001') : ''}`)
-      .join('\u0003') + `\u0004${sends}\u0004${waiting}\u0004${this._note}`;
+      .join('\u0003') + `\u0004${sends}\u0004${held}\u0004${this._note}`;
     if (signature === this._last) { return; }
     this._last = signature;
 
@@ -1220,7 +1263,7 @@ class AgentBridgeChoicesCard extends HTMLElement {
       send.type = 'button';
       send.classList.add('send');
       send.textContent = 'Send answer';
-      if (waiting) { send.setAttribute('disabled', 'disabled'); }
+      if (held) { send.setAttribute('disabled', 'disabled'); }
       send.addEventListener('click', () => this._send());
       this._els.list.appendChild(send);
     }
@@ -1340,6 +1383,10 @@ class AgentBridgeChoicesCard extends HTMLElement {
     // still in flight that could land afterwards and change what is about to be sent.
     if (Object.keys(this._pending).length > 0) { return; }
     if (Object.keys(this._inflight).length > 0) { return; }
+    // And nothing has moved under us since we last saw a slot settle. The row is
+    // drawn disabled for this too, but a press can arrive from a keyboard or a stale
+    // click, and sending a choice nobody made here is exactly what must not happen.
+    if (this._note === CHOICE_CHANGED_NOTE) { return; }
     let call;
     try { call = this._hass.callService('button', 'press', { entity_id: this._config.submit }); }
     catch (err) { this._failSend(err); return; }
