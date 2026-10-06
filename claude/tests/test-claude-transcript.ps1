@@ -295,9 +295,24 @@ $q = Get-ClaudeAskUserState -TranscriptPath $qFile
 Test-That 'without a native ID the established latest-question fallback still applies' {
     $q.Started -and $q.Pending -and $q.ToolCallId -ceq 'unrelated-newer'
 }
+
+# A ToolSearch result is a list of tool_reference blocks with no text. One anywhere in
+# the tail threw out of every daemon pass while a question waited, so the card stayed
+# armed after its answer and nothing else on the machine reconciled either.
+Set-Content -LiteralPath $qFile -Value @(
+    (New-Line 'assistant' @(@{ type = 'tool_use'; id = 'search1'; name = 'ToolSearch'; input = @{ query = 'select:Monitor' } }))
+    (New-Line 'user' @(@{ type = 'tool_result'; tool_use_id = 'search1'; content = @(@{ type = 'tool_reference'; tool_name = 'Monitor' }) }))
+    (New-Line 'user' @(@{ type = 'tool_result'; tool_use_id = 'shot1'; content = @(@{ type = 'image'; source = @{ type = 'base64'; data = 'AA==' } }, @{ type = 'text'; text = 'a caption' }) }))
+    (New-Line 'assistant' @(@{ type = 'tool_use'; id = 'ask4'; name = 'AskUserQuestion'; input = @{ questions = @() } }))
+)
+$q = Get-ClaudeAskUserState -TranscriptPath $qFile
+Test-That 'a result made of tool references does not stop a question being found' { $q.Started -and $q.Pending -and $q.ToolCallId -ceq 'ask4' }
+Add-Content -LiteralPath $qFile -Value (New-Line 'user' @(@{ type = 'tool_result'; tool_use_id = 'ask4'; content = @(@{ type = 'text'; text = '"Which?"="SQLite"' }) }))
+$q = Get-ClaudeAskUserState -TranscriptPath $qFile
+Test-That 'and the answer after it still ends the wait' { -not $q.Pending -and $q.ResultContent -ceq '"Which?"="SQLite"' }
 Remove-Item -LiteralPath $qFile -Force -ErrorAction SilentlyContinue
 
-$toolResult = New-Line 'user' @(@{ type = 'tool_result'; tool_use_id = 'x'; content = 'ok' })
+$toolResult =New-Line 'user' @(@{ type = 'tool_result'; tool_use_id = 'x'; content = 'ok' })
 Test-That 'a tool result is not a new turn' {
     -not (Get-ClaudeActivityFromTranscript -Lines @($endOfTurn + $toolResult)).TurnStarted
 }
