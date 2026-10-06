@@ -1351,7 +1351,9 @@ function Complete-DaemonSessionRetirement {
     foreach ($known in @($retirePlan.Retire)) {
         try {
             Remove-CopilotMqttSession -SessionId $known -Headers $Headers
-            Remove-CopilotDecisionMarker -SessionId $known
+            # The session itself is going, so there can be no replacement question to
+            # protect; everything it recorded goes with it.
+            Remove-CopilotDecisionMarker -SessionId $known -AllBaselines
             Write-DaemonLog -Message "retired session $($known.Substring(0, [Math]::Min(8, $known.Length)))"
         }
         catch {

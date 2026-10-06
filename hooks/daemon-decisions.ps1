@@ -142,7 +142,11 @@ function Complete-DaemonAnsweredDecision {
     catch {
         Write-DaemonLog -Message "decision clear failed for $sessionId : $($_.Exception.Message)"
     }
-    Remove-CopilotDecisionMarker -SessionId $sessionId
+    # The question's own baseline goes with its marker. Naming it matters: without an
+    # id the baseline is deliberately left alone, so every answered question would
+    # leave one behind for the life of the session.
+    Remove-CopilotDecisionMarker -SessionId $sessionId `
+        -DecisionId $(if ($null -ne $Marker -and $Marker.PSObject.Properties['decisionId']) { [string]$Marker.decisionId } else { '' })
     $entry = $State[$sessionId]
     if ($entry.PSObject.Properties['LastReply']) { $entry.LastReply = '' }
     Write-DaemonLog -Message "decision answered (either input); cleared card for $($sessionId.Substring(0,8))"
