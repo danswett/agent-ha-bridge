@@ -3,6 +3,7 @@
         'tests\test-agent-launched.ps1'
         'tests\test-answer-match.ps1'
         'tests\test-auth-backoff.ps1'
+        'tests\test-bootstrap-download.ps1'
         'tests\test-bridge-adapter.ps1'
         'tests\test-choices-form.ps1'
         'tests\test-control-policy.ps1'

@@ -149,7 +149,15 @@ The one-liner:
 irm https://raw.githubusercontent.com/danswett/agent-ha-bridge/main/bootstrap.ps1 | iex
 ```
 
-Or from a clone:
+It installs the **latest published release**, never unreleased code. To pin a release,
+or to try a branch before it ships, run the script with an argument:
+
+```powershell
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/danswett/agent-ha-bridge/main/bootstrap.ps1))) -Version 1.32.3
+& ([scriptblock]::Create((irm https://raw.githubusercontent.com/danswett/agent-ha-bridge/main/bootstrap.ps1))) -Branch main
+```
+
+Or from a clone, which installs whatever is checked out:
 
 ```powershell
 git clone https://github.com/danswett/agent-ha-bridge.git
@@ -175,8 +183,9 @@ The one-liner, in Terminal:
 curl -fsSL https://raw.githubusercontent.com/danswett/agent-ha-bridge/main/bootstrap.sh | bash
 ```
 
-It installs what is missing, then hands over to the same installer, which asks the
-same questions. From a clone it is `pwsh ./install.ps1`.
+It installs what is missing, then hands over to the latest release's installer, which
+asks the same questions. Put `BRIDGE_VERSION=1.32.3` or `BRANCH=main` before `bash` to
+pin a release or try a branch. From a clone it is `pwsh ./install.ps1`.
 
 * **Apple silicon:** PowerShell 7 and tmux come from [Homebrew](https://brew.sh),
   which it offers to install first.

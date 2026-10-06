@@ -3,7 +3,7 @@
     One-line installer for the AI coding agent <-> Home Assistant bridge.
 
 .DESCRIPTION
-    Downloads the repository and runs install.ps1:
+    Downloads the latest release and runs its install.ps1:
 
         irm https://raw.githubusercontent.com/danswett/agent-ha-bridge/main/bootstrap.ps1 | iex
 
@@ -15,8 +15,12 @@
     Nothing else needs arguments: install.ps1 is interactive, and once it has run the
     `agent-ha-bridge` command reconfigures the install from anywhere.
 
+.PARAMETER Version
+    A release to install, such as 1.32.3. Defaults to the latest published release.
+
 .PARAMETER Branch
-    Branch to install from. Defaults to main.
+    Install a branch's unreleased code instead of a release, to try a change before
+    it ships. Never the default: see Resolve-BridgeDownload.
 
 .PARAMETER Yes
     Install PowerShell 7 without asking, for an unattended run.
@@ -24,7 +28,8 @@
 
 [CmdletBinding()]
 param(
-    [string]$Branch = 'main',
+    [string]$Version,
+    [string]$Branch,
     [switch]$Yes
 )
 
@@ -38,6 +43,45 @@ $wingetCommand = 'winget install --id Microsoft.PowerShell --source winget --exa
 try { [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 } catch { }
 
 function Write-Step { param([string]$Message) Write-Host "==> $Message" -ForegroundColor Cyan }
+
+function Resolve-BridgeDownload {
+    <#
+        Which archive to install: the latest published release, unless a version or a
+        branch is named.
+
+        It used to default to main, so the one-liner in the README installed whatever
+        had merged that minute - including work deliberately held out of every release -
+        and the machine then reported main's VERSION as though it were a release. A
+        failed lookup stops rather than falling back to main for the same reason.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Repo,
+        [string]$Version,
+        [string]$Branch,
+        [scriptblock]$GetLatestTag = {
+            param($r)
+            # releases/latest never returns a draft or a prerelease.
+            (Invoke-RestMethod -Uri "https://api.github.com/repos/$r/releases/latest").tag_name
+        }
+    )
+    if ($Version -and $Branch) { throw 'Pass -Version or -Branch, not both.' }
+    if ($Branch) {
+        return [pscustomobject]@{
+            Label = "branch $Branch, unreleased"
+            Url   = "https://github.com/$Repo/archive/refs/heads/$Branch.zip"
+        }
+    }
+    if ($Version) { $tag = 'v' + $Version.Trim().TrimStart('v', 'V') }
+    else {
+        $tag = try { [string](& $GetLatestTag $Repo) } catch { '' }
+        if ([string]::IsNullOrWhiteSpace($tag)) {
+            throw ("Could not look up the latest $Repo release. Check the connection and run " +
+                   'this again, or name one with -Version.')
+        }
+        $tag = $tag.Trim()
+    }
+    [pscustomobject]@{ Label = "release $tag"; Url = "https://github.com/$Repo/archive/refs/tags/$tag.zip" }
+}
 
 function Get-PwshPath {
     # Get-Command alone is not enough straight after an install: this process's PATH
@@ -102,14 +146,14 @@ Write-Host "    using $pwsh" -ForegroundColor DarkGray
 $staging = Join-Path ([IO.Path]::GetTempPath()) ('agent-ha-bridge-' + [guid]::NewGuid().ToString('N').Substring(0, 8))
 $zipPath = "$staging.zip"
 
-Write-Step "Downloading $repo ($Branch)"
+$download = Resolve-BridgeDownload -Repo $repo -Version $Version -Branch $Branch
+Write-Step "Downloading $repo ($($download.Label))"
 try {
-    Invoke-WebRequest -Uri "https://github.com/$repo/archive/refs/heads/$Branch.zip" `
-        -OutFile $zipPath -UseBasicParsing
+    Invoke-WebRequest -Uri $download.Url -OutFile $zipPath -UseBasicParsing
     New-Item -ItemType Directory -Path $staging -Force | Out-Null
     Expand-Archive -LiteralPath $zipPath -DestinationPath $staging -Force
 
-    # The archive contains a single <name>-<branch> directory.
+    # The archive contains a single <name>-<branch or version> directory.
     $root = Get-ChildItem -LiteralPath $staging -Directory | Select-Object -First 1
     if (-not $root) { throw 'The downloaded archive did not contain the expected folder.' }
 
