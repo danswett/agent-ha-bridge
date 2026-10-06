@@ -158,14 +158,19 @@ function Invoke-ClaudeAskHook {
     # dropdowns for, cannot be driven by keystroke and is left to the terminal.
     $markerFields = @($parsed.MarkerFields)
     # A multi-select question is answerable from the card as the list of combinations
-    # its options make (Get-DecisionMultiSelectChoices), and delivered by typing each
-    # chosen option's number at the prompt. Only one that makes more combinations than
-    # a dropdown can list is left to the terminal.
+    # its options make, and delivered by typing each chosen option's number at the
+    # prompt. Only one that makes more combinations than a dropdown can list is left
+    # to the terminal.
+    #
+    # Spelled out, deliberately, and not the positions Copilot's cards now use. Here
+    # the combinations are what a person reads off the selector itself - there are no
+    # checkboxes on this path - so '#1,3' would be a row of gibberish rather than an
+    # answer. Claude's prompt is a different contract and stays one.
     $terminalOnly = ($mode -eq 'multiple_choice' -and $markerFields.Count -eq 0)
     $tooManyCombinations = $false
     foreach ($markerField in $markerFields) {
         if ((Test-DecisionFieldIsMultiSelect -Field $markerField) -and
-            @(Get-DecisionMultiSelectChoices -Field $markerField).Count -eq 0) {
+            @(Get-DecisionMultiSelectSpelledChoices -Field $markerField).Count -eq 0) {
             $tooManyCombinations = $true
         }
     }
@@ -193,8 +198,9 @@ function Invoke-ClaudeAskHook {
             (Test-DecisionFieldIsMultiSelect -Field $markerFields[0])) {
         # One multi-select question shows a single dropdown, so its combinations go on
         # that dropdown rather than the bare options - picking one option there would
-        # quietly answer a "choose any" question with exactly one.
-        $choices = @(Get-DecisionMultiSelectChoices -Field $markerFields[0])
+        # quietly answer a "choose any" question with exactly one. Written out, because
+        # these are rows somebody reads and chooses between.
+        $choices = @(Get-DecisionMultiSelectSpelledChoices -Field $markerFields[0])
     }
 
     [void](Get-DecisionSchemaFieldChoices -Field ([pscustomobject]@{ enum = $choices }))

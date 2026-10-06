@@ -44,20 +44,37 @@ function Set-DaemonTransientActivity { param($SessionId, $Summary, $Extra, $Head
 function Write-DaemonLog { param([string]$Message) }
 
 $armedAt = [DateTimeOffset]::Now.AddMinutes(-2)
-# The baselines are what the card already held when the question was armed. Everything
+# The baseline is what the card already held when the question was armed. Everything
 # after that is "has this changed", never "is this newer" - the payload stamp comes
 # from a browser and armedAt from the daemon, so ordering them compares two unrelated
-# clocks.
+# clocks. It lives in a file of its own per question, so these seed real ones rather
+# than putting fields on the marker that nothing reads any more.
+function Set-Baseline {
+    param(
+        [Parameter(Mandatory)][string]$DecisionId,
+        [ValidateSet('present', 'absent', 'unknown')][string]$PayloadState = 'absent',
+        [AllowEmptyString()][string]$PayloadValue = '',
+        [ValidateSet('present', 'absent', 'unknown')][string]$SubmitState = 'absent',
+        [AllowEmptyString()][string]$SubmitValue = ''
+    )
+    $path = Get-CopilotDecisionBaselinePath -SessionId $script:sid -DecisionId $DecisionId
+    if (Test-Path -LiteralPath $path) { Remove-Item -LiteralPath $path -Force }
+    $ok = Set-CopilotDecisionMarkerBaseline -SessionId $script:sid -DecisionId $DecisionId `
+        -PayloadState $PayloadState -PayloadValue $PayloadValue `
+        -SubmitState $SubmitState -SubmitValue $SubmitValue
+    if (-not $ok) { throw "could not seed a baseline for $DecisionId" }
+}
+
 $oldPress = $armedAt.AddMinutes(-1).ToString('o')
 $form = [pscustomobject]@{
     mode = 'form'; decisionId = 'd1'; question = 'Pick'; armedAt = $armedAt.ToString('o'); choices = @(); injectedAnswer = ''
-    payloadBaseline = ''; submitBaseline = $oldPress
     fields = @(
         [pscustomobject]@{ Label = 'Colour'; Options = @('Red', 'Blue') }
         [pscustomobject]@{ Label = 'Size'; Options = @('S', 'L') }
         [pscustomobject]@{ Label = 'Notes'; Options = @(); IsText = $true }
     )
 }
+Set-Baseline -DecisionId 'd1' -SubmitState 'present' -SubmitValue $oldPress
 $state = @{ $sid = [pscustomobject]@{ Name = 'Claude: x'; Machine = 'M'; LastReply = '' } }
 function Set-Form { param($Colour, $Size, $Notes, $Submit, $Decision = 'Awaiting answer...')
     $script:Ha = @{
@@ -110,8 +127,9 @@ Write-Host '--- a single choice, and a free-text answer ---'
 # records when it first sees the question.
 $choice = [pscustomobject]@{
     mode = 'multiple_choice'; decisionId = 'd2'; question = 'Pick'; fields = @(); choices = @('Yes', 'No')
-    injectedAnswer = ''; armedAt = $armedAt.ToString('o'); payloadBaseline = ''; submitBaseline = $oldPress
+    injectedAnswer = ''; armedAt = $armedAt.ToString('o')
 }
+Set-Baseline -DecisionId 'd2' -SubmitState 'present' -SubmitValue $oldPress
 $script:Ha = @{ "select.${node}_decision" = 'Yes'; "button.${node}_submit" = $oldPress }
 Test-That 'a tapped choice on its own is not an answer, because nothing has been sent' {
     (Read-DaemonDecisionAnswer -SessionId $sid -Marker $choice -State $state -Headers $headers).Answer -eq ''
@@ -129,8 +147,9 @@ $script:Ha = @{ "select.${node}_decision" = 'Awaiting answer...'; "button.${node
 Test-That 'the placeholder is not an answer' { (Read-DaemonDecisionAnswer -SessionId $sid -Marker $choice -State $state -Headers $headers).Answer -eq '' }
 $free = [pscustomobject]@{
     mode = 'freeform'; decisionId = 'd3'; question = 'Why?'; fields = @(); choices = @()
-    injectedAnswer = ''; armedAt = $armedAt.ToString('o'); payloadBaseline = ''; submitBaseline = ''
+    injectedAnswer = ''; armedAt = $armedAt.ToString('o')
 }
+Set-Baseline -DecisionId 'd3'
 $script:Ha = @{ "text.${node}_reply" = 'Because.' }
 Test-That 'a freeform answer is read from the reply box' { (Read-DaemonDecisionAnswer -SessionId $sid -Marker $free -State $state -Headers $headers).Answer -eq 'Because.' }
 $script:Ha = @{ "text.${node}_reply" = ' ' }
@@ -148,8 +167,8 @@ function New-PayloadState { param([string]$Stamp, [string]$Text)
 $stale = [pscustomobject]@{
     mode = 'freeform'; decisionId = 'd4'; question = 'Why?'; fields = @(); choices = @()
     injectedAnswer = ''; armedAt = $armedAt.ToString('o')
-    payloadBaseline = 'stamp-from-the-last-reply'; submitBaseline = ''
 }
+Set-Baseline -DecisionId 'd4' -PayloadState 'present' -PayloadValue 'stamp-from-the-last-reply'
 $script:Ha = @{
     "text.${node}_reply" = ' '
     "sensor.${node}_reply_payload" = New-PayloadState -Stamp 'stamp-from-the-last-reply' -Text 'an answer to the last question'
@@ -172,6 +191,85 @@ Test-That 'a question with no baseline yet reads nothing off the card at all' {
     (Read-DaemonDecisionCardText -SessionId $sid -Marker $noBase -Headers $headers).Text -eq ''
 }
 
+Write-Host '--- the baseline belongs to one question, and is written once ---'
+# A session of its own: the last check here clears everything belonging to it, and
+# the questions the rest of this suite answers must survive that.
+$casSid = '11111111-0000-4000-8000-0000000000ca'
+# It used to live on the marker: read it, add to it, write the whole thing back.
+# That is not compare-and-swap however carefully it checks first - a replacement
+# question written in between is destroyed by it, and reading the file back
+# afterwards reports success because what comes back is what was just written over
+# the top.
+Test-That 'a second establishment of the same question leaves the first exactly as it was' {
+    $first = Set-CopilotDecisionMarkerBaseline -SessionId $casSid -DecisionId 'cas' `
+        -PayloadState 'present' -PayloadValue 'first' -SubmitState 'absent' -SubmitValue ''
+    $second = Set-CopilotDecisionMarkerBaseline -SessionId $casSid -DecisionId 'cas' `
+        -PayloadState 'present' -PayloadValue 'second' -SubmitState 'absent' -SubmitValue ''
+    $kept = Get-CopilotDecisionMarkerBaseline -SessionId $casSid -Channel 'payload' `
+        -Marker ([pscustomobject]@{ decisionId = 'cas' })
+    $first -and $second -and $kept.Value -ceq 'first'
+}
+Test-That 'and a replacement question gets its own, rather than overwriting it' {
+    [void](Set-CopilotDecisionMarkerBaseline -SessionId $casSid -DecisionId 'cas-next' `
+        -PayloadState 'present' -PayloadValue 'next' -SubmitState 'absent' -SubmitValue '')
+    $old = Get-CopilotDecisionMarkerBaseline -SessionId $casSid -Channel 'payload' -Marker ([pscustomobject]@{ decisionId = 'cas' })
+    $new = Get-CopilotDecisionMarkerBaseline -SessionId $casSid -Channel 'payload' -Marker ([pscustomobject]@{ decisionId = 'cas-next' })
+    $old.Value -ceq 'first' -and $new.Value -ceq 'next'
+}
+Test-That 'a baseline is never read against a question it was not recorded for' {
+    (Get-CopilotDecisionMarkerBaseline -SessionId $casSid -Channel 'payload' `
+        -Marker ([pscustomobject]@{ decisionId = 'never-armed' })).State -eq 'unknown'
+}
+Test-That 'a question with no id has no baseline, rather than sharing one' {
+    (Set-CopilotDecisionMarkerBaseline -SessionId $casSid -DecisionId '' `
+        -PayloadState 'absent' -PayloadValue '' -SubmitState 'absent' -SubmitValue '') -eq $false
+}
+Test-That 'nothing is readable without being told which session it belongs to' {
+    (Get-CopilotDecisionMarkerBaseline -Marker ([pscustomobject]@{ decisionId = 'cas' }) -Channel 'payload').State -eq 'unknown'
+}
+Test-That 'clearing a session takes its baselines with it' {
+    Remove-CopilotDecisionMarker -SessionId $casSid
+    -not (Test-CopilotDecisionBaselineRecorded -SessionId $casSid -DecisionId 'cas') -and
+    -not (Test-CopilotDecisionBaselineRecorded -SessionId $casSid -DecisionId 'cas-next')
+}
+Test-That 'and leaves another session''s alone' {
+    Test-CopilotDecisionBaselineRecorded -SessionId $sid -DecisionId 'd4'
+}
+
+# 'absent' and 'unknown' are not the same answer. A channel nobody could read must
+# never compare as changed: a retained old payload becoming readable again would
+# otherwise be taken for something freshly typed.
+Test-That 'a channel that could not be read when armed never reads as changed' {
+    -not (Test-DaemonChannelChanged `
+        -Baseline ([pscustomobject]@{ State = 'unknown'; Value = '' }) `
+        -Current ([pscustomobject]@{ State = 'present'; Value = 'something' }))
+}
+Test-That 'but one that was determinately empty does, once something arrives' {
+    Test-DaemonChannelChanged `
+        -Baseline ([pscustomobject]@{ State = 'absent'; Value = '' }) `
+        -Current ([pscustomobject]@{ State = 'present'; Value = 'something' })
+}
+Test-That 'and a channel that has gone unreadable is not a change either' {
+    -not (Test-DaemonChannelChanged `
+        -Baseline ([pscustomobject]@{ State = 'present'; Value = 'old' }) `
+        -Current ([pscustomobject]@{ State = 'unknown'; Value = '' }))
+}
+Test-That 'a button that is simply there and never pressed is not missing' {
+    $script:Ha = @{ "button.${node}_x" = 'unknown' }
+    $seen = Get-DaemonDecisionChannelState -EntityId "button.${node}_x" -Headers $headers
+    $seen.State -eq 'absent' -and $seen.Exists
+}
+Test-That 'one that is not on the card at all is' {
+    $script:Ha = @{}
+    $seen = Get-DaemonDecisionChannelState -EntityId "button.${node}_x" -Headers $headers
+    $seen.State -eq 'absent' -and -not $seen.Exists
+}
+Test-That 'and one whose integration has not come back yet is neither' {
+    $script:Ha = @{ "button.${node}_x" = 'unavailable' }
+    $seen = Get-DaemonDecisionChannelState -EntityId "button.${node}_x" -Headers $headers
+    $seen.State -eq 'unknown' -and $seen.Exists
+}
+
 Write-Host '--- a refused test-boundary operation is not a missing answer ---'
 # Absorbing this would turn "a suite tried to reach a real Home Assistant" into a quiet
 # "nothing has been answered", and the suite would pass for exactly the wrong reason.
@@ -190,6 +288,34 @@ Test-That 'and so does the answer reader that encloses it' {
     $threw = $false
     try { [void](Read-DaemonDecisionAnswer -SessionId $sid -Marker $stale -State $state -Headers $headers) }
     catch { $threw = [bool]$_.Exception.Data['BridgeTestNetworkBlocked'] }
+    $threw
+}
+# Wrapped, which is how it really arrives: the guard throws inside something that
+# catches and rethrows with context, so only the outer exception carries no mark.
+# Looking at that one alone turned a refused network call into a quiet "nothing has
+# been answered" and the suite passed for exactly the wrong reason.
+function Get-HomeAssistantState { param([string]$EntityId, [hashtable]$Headers)
+    $blocked = [InvalidOperationException]::new('A test suite tried to reach a real Home Assistant.')
+    $blocked.Data['BridgeTestNetworkBlocked'] = $true
+    throw [InvalidOperationException]::new('could not read the card', $blocked)
+}
+Test-That 'a guard wrapped in an ordinary failure is still a guard, not an empty answer' {
+    $threw = $false
+    try { [void](Read-DaemonDecisionCardText -SessionId $sid -Marker $stale -Headers $headers) }
+    catch { $threw = $null -ne $_.Exception.InnerException -and [bool]$_.Exception.InnerException.Data['BridgeTestNetworkBlocked'] }
+    $threw
+}
+Test-That 'and the Send check refuses rather than reading an unreadable button as unpressed' {
+    $threw = $false
+    try { [void](Test-DaemonSendPressed -SessionId $sid -Marker $stale -Headers $headers) }
+    catch { $threw = $null -ne $_.Exception.InnerException -and [bool]$_.Exception.InnerException.Data['BridgeTestNetworkBlocked'] }
+    $threw
+}
+Test-That 'and so does establishing a baseline, rather than recording one nobody could read' {
+    $threw = $false
+    $unseen = [pscustomobject]@{ mode = 'freeform'; decisionId = 'd-guard'; question = 'Why?'; fields = @(); choices = @() }
+    try { [void](Confirm-DaemonDecisionBaseline -SessionId $sid -Marker $unseen -Headers $headers) }
+    catch { $threw = $null -ne $_.Exception.InnerException -and [bool]$_.Exception.InnerException.Data['BridgeTestNetworkBlocked'] }
     $threw
 }
 function Get-HomeAssistantState {

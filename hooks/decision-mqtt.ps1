@@ -1589,6 +1589,30 @@ function Publish-CopilotMqttDecisionFields {
         $slotField = if ($i -le $Fields.Count) { $Fields[$i - 1] } else { $null }
         $isChoiceSlot = ($null -ne $slotField) -and -not (Test-DecisionFieldIsText -Field $slotField)
         $start = if ($isChoiceSlot) { 'Choose...' } else { 'Idle' }
+        # A multi-select whose schema already checks rows starts there, because the
+        # prompt in the terminal already does: drawing it empty showed a state the
+        # session was not in, and reaching the default set again meant ticking it all
+        # back by hand. Nothing is sent by this - Send is still the only thing that
+        # answers - and a scalar default is deliberately not treated the same way,
+        # since there it is only where the cursor sits, not what is selected.
+        if ($isChoiceSlot -and (Test-DecisionFieldIsMultiSelect -Field $slotField)) {
+            $checked = @(Get-DecisionMultiSelectChecked -Field $slotField)
+            if ($checked.Count -gt 0) {
+                $offered = @(Get-DecisionMultiSelectChoices -Field $slotField)
+                # Positions first, because they survive options of any length; the
+                # written-out form only when this field has one at all.
+                foreach ($candidate in @(
+                    (Get-DecisionMultiSelectCode -Indexes ([int[]]$checked)),
+                    (Get-DecisionMultiSelectLabel -Field $slotField -Indexes ([int[]]$checked)))) {
+                    # Only if it is really on the list. Selecting a value the dropdown
+                    # does not carry leaves it holding something it never offered.
+                    if (-not [string]::IsNullOrEmpty($candidate) -and $offered -contains $candidate) {
+                        $start = $candidate
+                        break
+                    }
+                }
+            }
+        }
         try {
             Invoke-HomeAssistantService -Domain 'select' -Service 'select_option' -Headers $Headers -Data @{
                 entity_id = (Get-CopilotMqttFieldEntityId -Node $node -Index $i)
@@ -1925,10 +1949,27 @@ function Set-CopilotMqttDecision {
             $questionAttrs["field_${fi}_multi"] = $true
             $questionAttrs["field_${fi}_options"] = @($slotField.Options | ForEach-Object { [string]$_ })
             $questionAttrs["field_${fi}_separator"] = $script:DecisionMultiSelectSeparator
+            # Whether the slot will take the answer as positions. A card old enough
+            # not to know this attribute goes on writing the words, which are still
+            # published whenever they fit; a card that does know it writes positions
+            # and so is not limited by how long somebody's options happen to be.
+            if (@(Get-DecisionMultiSelectCodes -Field $slotField).Count -gt 0) {
+                $questionAttrs["field_${fi}_codes"] = $true
+            }
         }
     }
     Publish-CopilotMqttMessage -Topic $topics.DecisionAttributes `
         -Payload ($questionAttrs | ConvertTo-Json -Depth 8 -Compress) -Headers $Headers -Retain
+
+    # What the answer channels already held, recorded here because here is the
+    # boundary that matters: the hook arms the card before any daemon sweep, so an
+    # answer given in that gap would otherwise be read later and adopted as "what was
+    # already there", losing it. Write-once and keyed by decision id, so arming the
+    # same question twice records it once and a replacement question cannot disturb
+    # it; if it cannot be established the daemon establishes it on a later pass and
+    # reads no answer until it has.
+    [void](Initialize-CopilotDecisionBaseline -SessionId $SessionId -DecisionId $DecisionId `
+        -PayloadEntityId "sensor.${node}_reply_payload" -SubmitEntityId "button.${node}_submit" -Headers $Headers)
 
     $topics
 }

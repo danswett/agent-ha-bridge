@@ -225,6 +225,281 @@ async function checkRefusedSelection() {
     buttons(rejectCard).find((b) => b.textContent === 'Send answer').getAttribute('disabled') === null);
 }
 
+/*
+ * A Home Assistant that does nothing on its own.
+ *
+ * Every call is parked, and the test decides when - and whether - it completes, and
+ * separately when the new state arrives. Those are two events and the card has to
+ * survive them happening in any order; the ordinary harness ties them together, so
+ * the cases that actually went wrong in the field cannot be written with it.
+ */
+function controlledEnv(armed, decisionId) {
+  const calls = [];
+  const attributes = {
+    options: ['Awaiting answer...', 'Cancel request'],
+    decision_id: decisionId || 'q1',
+  };
+  const states = { [DECISION]: { state: 'Awaiting answer...', attributes } };
+  for (let i = 1; i <= 4; i++) {
+    const field = armed[i];
+    if (!field) { states[F(i)] = { state: 'Idle', attributes: { options: ['Idle'] } }; continue; }
+    attributes[`field_${i}_label`] = field.label;
+    if (field.multi) {
+      attributes[`field_${i}_multi`] = true;
+      attributes[`field_${i}_options`] = field.options;
+      attributes[`field_${i}_separator`] = ' + ';
+      // Absent for a bridge old enough to publish only the options written out, which
+      // is what the card has to keep writing back to it.
+      if (field.codes) { attributes[`field_${i}_codes`] = true; }
+    }
+    states[F(i)] = {
+      state: field.state || 'Choose...',
+      attributes: { options: ['Choose...'].concat(field.slotOptions || field.options) },
+    };
+  }
+  const env = {
+    calls,
+    states,
+    push() { env.card.hass = env.hass; },
+    // The state Home Assistant eventually pushes back, on its own schedule.
+    arrive(entityId, value) { states[entityId].state = value; env.push(); },
+    // A question withdrawn and replaced by another, which is what a session does
+    // when it asks something else before the first was answered. The attributes are
+    // rebuilt rather than merged, because the bridge publishes them as one retained
+    // JSON document and Home Assistant replaces the whole set with it - a stale
+    // field_n_multi left behind would draw a single choice as a multi-select.
+    replace(nextId, nextArmed) {
+      for (const key of Object.keys(attributes)) {
+        if (key !== 'options') { delete attributes[key]; }
+      }
+      attributes.decision_id = nextId;
+      for (let i = 1; i <= 4; i++) {
+        const field = nextArmed[i];
+        if (!field) { states[F(i)] = { state: 'Idle', attributes: { options: ['Idle'] } }; continue; }
+        attributes[`field_${i}_label`] = field.label;
+        states[F(i)] = {
+          state: field.state || 'Choose...',
+          attributes: { options: ['Choose...'].concat(field.options) },
+        };
+      }
+      env.push();
+    },
+    hass: {
+      states,
+      callService: (domain, service, data) => {
+        let settle;
+        const promise = new Promise((resolve, reject) => { settle = { resolve, reject }; });
+        // Nothing here is ever unhandled: the card attaches handlers synchronously,
+        // and a test that never completes a call leaves a promise nobody rejects.
+        calls.push({ domain, service, data, settle, promise });
+        return promise;
+      },
+    },
+  };
+  return env;
+}
+
+const pickedRows = (card) =>
+  buttons(card).filter((b) => b.classList.contains('chosen')).map((b) => b.textContent).join('|');
+const sendRow = (card) => buttons(card).find((b) => b.textContent === 'Send answer');
+
+async function checkDeferredChoices() {
+  console.log('--- a set written as positions rather than as words ---');
+  // Six plainly-worded options joined together run to 350 characters, and a Home
+  // Assistant select entry holds 255. That is why a real question on 2026-10-05 was
+  // refused outright and sent to the terminal. Positions are short whatever the
+  // options say.
+  const LONG = [
+    'Restore this VM to release 1.32.2 now',
+    'Leave the branch installed so I can keep testing',
+    'Investigate why the dashboard stopped re-rendering at 19:30',
+    'Fix the Scout headless copilot.exe being counted as a CLI session',
+    'Commit the correction work and report to the coordinator',
+    'Raise the diverged release line (v1.32.2 vs main) with the coordinator',
+  ];
+  let card = newCard(FIELDS, SUBMIT);
+  let env = controlledEnv({ 1: { label: 'Follow-ups', multi: true, codes: true, options: LONG } });
+  env.card = card;
+  card.hass = env.hass;
+  check('every option is drawn in full, however long it is',
+    LONG.every((o) => labels(card).includes(o)), labels(card).join('|'));
+  buttons(card).find((b) => b.textContent === LONG[0]).click();
+  buttons(card).find((b) => b.textContent === LONG[2]).click();
+  buttons(card).find((b) => b.textContent === LONG[5]).click();
+  check('three ticks are written as three positions',
+    env.calls[env.calls.length - 1].data.option === '#1,3,6',
+    env.calls.map((c) => c.data.option).join(' / '));
+  check('and what is written stays far inside what a select entry can hold',
+    env.calls.every((c) => c.data.option.length <= 32),
+    env.calls.map((c) => c.data.option.length).join(','));
+  for (const call of env.calls) { call.settle.resolve(); }
+  env.arrive(F(1), '#1,3,6');
+  await flush();
+  check('positions coming back tick exactly those rows',
+    pickedRows(card) === [LONG[0], LONG[2], LONG[5]].join('|'), pickedRows(card));
+
+  // A bridge that never published positions gets the words back, unchanged.
+  card = newCard(FIELDS, SUBMIT);
+  env = controlledEnv({ 1: { label: 'Features', multi: true, options: ['Auth', 'Billing', 'Search'] } });
+  env.card = card;
+  card.hass = env.hass;
+  buttons(card).find((b) => b.textContent === 'Auth').click();
+  buttons(card).find((b) => b.textContent === 'Search').click();
+  check('an older bridge still gets the options written out',
+    env.calls[env.calls.length - 1].data.option === 'Auth + Search',
+    env.calls.map((c) => c.data.option).join(' / '));
+  for (const call of env.calls) { call.settle.resolve(); }
+  env.arrive(F(1), 'Auth + Search');
+  await flush();
+  check('and the words coming back still tick those rows',
+    pickedRows(card) === 'Auth|Search', pickedRows(card));
+
+  // A slot holding positions this field does not have is not a set to make the best
+  // of: showing one nobody picked is how a wrong answer gets sent.
+  for (const bad of ['#4', '#0', '#1,1', '#1,', '#', '#1,x']) {
+    card = newCard(FIELDS, SUBMIT);
+    env = controlledEnv({ 1: { label: 'Features', multi: true, codes: true, options: ['Auth', 'Billing', 'Search'], state: bad } });
+    env.card = card;
+    card.hass = env.hass;
+    check(`'${bad}' ticks nothing rather than guessing`, pickedRows(card) === '', pickedRows(card));
+  }
+
+  console.log('--- answers given faster than Home Assistant replies ---');
+
+  // Ticking two options and having the first one refused used to untick the second
+  // as well: the card matched a late reply by question id, and two taps on one
+  // question share it. The answer then sent was "Billing" with no sign that
+  // anything had been dropped.
+  card = newCard(FIELDS, SUBMIT);
+  env = controlledEnv({ 1: { label: 'Features', multi: true, options: ['Auth', 'Billing', 'Search'] } });
+  env.card = card;
+  card.hass = env.hass;
+  buttons(card).find((b) => b.textContent === 'Auth').click();
+  buttons(card).find((b) => b.textContent === 'Billing').click();
+  check('a second tick composes on the first rather than replacing it',
+    env.calls.length === 2 && env.calls[1].data.option === 'Auth + Billing', JSON.stringify(env.calls.map((c) => c.data.option)));
+  env.calls[0].settle.reject(new Error('too slow'));
+  await flush();
+  check('an older refusal leaves the newer ticks exactly as they were',
+    pickedRows(card) === 'Auth|Billing', pickedRows(card));
+  check('and Send stays held, because the newer tick is still unconfirmed',
+    sendRow(card).getAttribute('disabled') === 'disabled');
+  env.calls[1].settle.resolve();
+  env.arrive(F(1), 'Auth + Billing');
+  await flush();
+  check('once the slot catches up both ticks are confirmed',
+    pickedRows(card) === 'Auth|Billing' && sendRow(card).getAttribute('disabled') === null, pickedRows(card));
+
+  // Accepted, but the slot already held exactly that. Nothing further arrives, so
+  // completion is the only thing that can release Send.
+  card = newCard(FIELDS, SUBMIT);
+  env = controlledEnv({ 1: { label: 'Features', multi: true, options: ['Auth', 'Billing'], state: 'Auth' } });
+  env.card = card;
+  card.hass = env.hass;
+  buttons(card).find((b) => b.textContent === 'Billing').click();
+  buttons(card).find((b) => b.textContent === 'Billing').click();
+  check('ticking and unticking asks for what the slot already holds',
+    env.calls[env.calls.length - 1].data.option === 'Auth', JSON.stringify(env.calls.map((c) => c.data.option)));
+  for (const call of env.calls) { call.settle.resolve(); }
+  await flush();
+  check('and Send is released on acceptance, not left waiting for a state that will never change',
+    sendRow(card).getAttribute('disabled') === null, labels(card).join('|'));
+
+  // The states arriving out of order. Only the tick that was actually asked for
+  // last may clear; an earlier value turning up afterwards must not look like
+  // confirmation of it.
+  card = newCard(FIELDS, SUBMIT);
+  env = controlledEnv({ 1: { label: 'Features', multi: true, options: ['Auth', 'Billing', 'Search'] } });
+  env.card = card;
+  card.hass = env.hass;
+  buttons(card).find((b) => b.textContent === 'Auth').click();
+  buttons(card).find((b) => b.textContent === 'Search').click();
+  env.arrive(F(1), 'Auth');
+  check('a state from the earlier tap does not confirm the later one',
+    sendRow(card).getAttribute('disabled') === 'disabled' && pickedRows(card) === 'Auth|Search', pickedRows(card));
+  env.arrive(F(1), 'Auth + Search');
+  check('and the one that was actually asked for does',
+    sendRow(card).getAttribute('disabled') === null && pickedRows(card) === 'Auth|Search', pickedRows(card));
+
+  // The question is replaced while a tap is still in flight. Its reply belongs to a
+  // question that is no longer on screen and must not touch the new one.
+  card = newCard(FIELDS, SUBMIT);
+  env = controlledEnv({ 1: { label: 'Features', multi: true, options: ['Auth', 'Billing'] } }, 'q1');
+  env.card = card;
+  card.hass = env.hass;
+  buttons(card).find((b) => b.textContent === 'Auth').click();
+  const orphan = env.calls[0];
+  env.replace('q2', { 1: { label: 'Database', options: ['PostgreSQL', 'SQLite'] } });
+  check('the replacement question is drawn with nothing carried over',
+    labels(card).join('|').includes('PostgreSQL') && pickedRows(card) === '', labels(card).join('|'));
+  orphan.settle.reject(new Error('gone'));
+  await flush();
+  check('and a reply to the question that went does not mark the new one up',
+    pickedRows(card) === '' && !labels(card).some((l) => l.startsWith('Home Assistant would not take that')),
+    labels(card).join('|'));
+  check('nor does it hold the new question\'s Send',
+    sendRow(card).getAttribute('disabled') === null);
+
+  // Send itself refused. It used to be fired and forgotten, so a press Home
+  // Assistant threw away looked exactly like one the session was still thinking
+  // about - and the answer was never sent.
+  card = newCard(FIELDS, SUBMIT);
+  env = controlledEnv({ 1: { label: 'Features', multi: true, options: ['Auth', 'Billing'], state: 'Auth' } });
+  env.card = card;
+  card.hass = env.hass;
+  sendRow(card).click();
+  check('Send presses the button the daemon waits on',
+    env.calls.length === 1 && env.calls[0].domain === 'button' && env.calls[0].service === 'press',
+    JSON.stringify(env.calls.map((c) => `${c.domain}.${c.service}`)));
+  env.calls[0].settle.reject(new Error('nope'));
+  await flush();
+  check('a refused Send says so rather than looking like a session still thinking',
+    labels(card).some((l) => l.startsWith('Send failed')), labels(card).join('|'));
+  check('and leaves the ticks alone, so it can simply be pressed again',
+    pickedRows(card) === 'Auth' && sendRow(card).getAttribute('disabled') === null, pickedRows(card));
+  sendRow(card).click();
+  check('pressing it again really does press it again',
+    env.calls.length === 2 && env.calls[1].domain === 'button', JSON.stringify(env.calls.map((c) => c.domain)));
+  env.calls[1].settle.resolve();
+  await flush();
+
+  // A question with no Send button cannot be answered from the card at all, and
+  // must not quietly offer a row that does nothing.
+  card = newCard(FIELDS);
+  env = controlledEnv({ 1: { label: 'Features', multi: true, options: ['Auth', 'Billing'] } });
+  env.card = card;
+  card.hass = env.hass;
+  check('a card with no submit entity offers no Send row at all',
+    !labels(card).includes('Send answer'), labels(card).join('|'));
+  buttons(card).find((b) => b.textContent === 'Auth').click();
+  check('and a tick on it still only sets the slot, never sends',
+    env.calls.length === 1 && env.calls[0].domain === 'select', JSON.stringify(env.calls.map((c) => c.domain)));
+  env.calls[0].settle.resolve();
+  await flush();
+
+  // The legacy shape: one selector carrying its own options, no fields. It used to
+  // go the instant a row was tapped.
+  card = newCard(undefined, SUBMIT);
+  env = controlledEnv({});
+  env.states[DECISION].attributes.options = ['Awaiting answer...', 'Yes', 'No', 'Cancel request'];
+  env.card = card;
+  card.hass = env.hass;
+  check('a selector carrying its own choices still offers Send',
+    labels(card).includes('Send answer'), labels(card).join('|'));
+  buttons(card).find((b) => b.textContent === 'Yes').click();
+  check('and a tap on it sends nothing on its own',
+    env.calls.length === 1 && env.calls[0].domain === 'select', JSON.stringify(env.calls.map((c) => c.domain)));
+  env.calls[0].settle.resolve();
+  env.arrive(DECISION, 'Yes');
+  await flush();
+  sendRow(card).click();
+  check('it takes an explicit Send, like every other shape',
+    env.calls.length === 2 && env.calls[1].domain === 'button' && env.calls[1].data.entity_id === SUBMIT,
+    JSON.stringify(env.calls.map((c) => `${c.domain}.${c.service}`)));
+  env.calls[1].settle.resolve();
+  await flush();
+}
+
 console.log('--- a whole form, not just one choice ---');
 // A multi-field question publishes one select per field and leaves the main selector
 // carrying only 'Cancel request'. Those fields used to render as Home Assistant's own
@@ -1157,6 +1432,8 @@ check('"machines" is required', (() => {
   check('"topic" is required', (() => {
     try { new AgentBridgeReplyCard().setConfig({}); return false; } catch (e) { return /topic/.test(e.message); }
   })());
+
+  await checkDeferredChoices();
 
   console.log('');
   if (failures) {

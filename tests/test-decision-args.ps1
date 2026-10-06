@@ -387,9 +387,49 @@ $msField = [pscustomobject]@{
     Name = 'Which features?'; Label = 'Features'; Options = @('Auth', 'Billing', 'Search'); IsText = $false; MultiSelect = $true
 }
 Test-Case 'every combination is offered, single picks first' {
-    (@(Get-DecisionMultiSelectChoices -Field $msField) -join ' / ') -eq
+    (@(Get-DecisionMultiSelectSpelledChoices -Field $msField) -join ' / ') -eq
         'Auth / Billing / Search / Auth + Billing / Auth + Search / Billing + Search / Auth + Billing + Search'
-} ((@(Get-DecisionMultiSelectChoices -Field $msField)) -join ' / ')
+} ((@(Get-DecisionMultiSelectSpelledChoices -Field $msField)) -join ' / ')
+# And the same subsets as positions, in the same order. Both are published, because
+# the hook cannot see which card Home Assistant is serving and a select rejects a
+# value outside its list: a card from 1.23.0 writes positions, every earlier one
+# writes the words, and each gets back exactly the set it asked for.
+Test-Case 'and the same combinations as positions, for a card that writes them' {
+    (@(Get-DecisionMultiSelectCodes -Field $msField) -join ' / ') -eq
+        '#1 / #2 / #3 / #1,2 / #1,3 / #2,3 / #1,2,3'
+} ((@(Get-DecisionMultiSelectCodes -Field $msField)) -join ' / ')
+Test-Case 'the slot is allowed to hold either of them' {
+    $all = @(Get-DecisionMultiSelectChoices -Field $msField)
+    $all.Count -eq 14 -and $all[0] -ceq 'Auth' -and $all[7] -ceq '#1'
+} ((@(Get-DecisionMultiSelectChoices -Field $msField)) -join ',')
+Test-Case 'positions resolve to exactly the options they name, in field order' {
+    (@(Resolve-DecisionMultiSelectChoice -Field $msField -Choice '#1,3') -join ',') -eq 'Auth,Search' -and
+    (@(Resolve-DecisionMultiSelectChoice -Field $msField -Choice '#3') -join ',') -eq 'Search'
+}
+Test-Case 'a position outside the field, repeated, or malformed resolves to nothing' {
+    @('#4', '#0', '#1,1', '#1,', '#', '#1,x', '# 1') |
+        ForEach-Object { @(Resolve-DecisionMultiSelectChoice -Field $msField -Choice $_).Count } |
+        Where-Object { $_ -ne 0 } | Measure-Object | ForEach-Object { $_.Count -eq 0 }
+}
+Test-Case 'the two carriers always mean the same thing' {
+    $bad = @()
+    foreach ($code in @(Get-DecisionMultiSelectCodes -Field $msField)) {
+        $viaCode = @(Resolve-DecisionMultiSelectChoice -Field $msField -Choice $code)
+        $spelled = Get-DecisionMultiSelectLabel -Field $msField `
+            -Indexes ([int[]]@(Resolve-DecisionMultiSelectIndexes -Field $msField -Value $code))
+        $viaWords = @(Resolve-DecisionMultiSelectChoice -Field $msField -Choice $spelled)
+        if (($viaCode -join '|') -cne ($viaWords -join '|')) { $bad += $code }
+    }
+    $bad.Count -eq 0
+}
+# An option written like a position would decode as a different answer, so the field
+# keeps the words and nothing else. Absurd wording, cheap to rule out, and guessing
+# would record an answer nobody gave.
+Test-Case 'a field whose own options look like positions is never carried as positions' {
+    $odd = [pscustomobject]@{ Label = 'O'; Options = @('#1', 'Billing'); IsText = $false; MultiSelect = $true }
+    @(Get-DecisionMultiSelectCodes -Field $odd).Count -eq 0 -and
+    @(Get-DecisionMultiSelectChoices -Field $odd).Count -eq 3
+}
 Test-Case 'a combination resolves back to its own options, in field order' {
     (@(Resolve-DecisionMultiSelectChoice -Field $msField -Choice 'Auth + Search') -join ',') -eq 'Auth,Search'
 }
@@ -427,15 +467,56 @@ Test-Case 'a combination the card never offered is refused, not guessed at' {
     $threw
 }
 Test-Case 'too many options to list every combination is refused' {
-    # Seven, not five: the ceiling is every subset of six options, so five now fits.
-    # The refusal still has to bite, because a slot that cannot enumerate the answer
-    # has no control on the card at all.
-    $wide = [pscustomobject]@{ Label = 'W'; Options = @('A','B','C','D','E','F','G'); IsText = $false; MultiSelect = $true }
+    # Eleven, not seven. The limit is now the number of options, not how long anyone
+    # wrote them: a set rides in the slot as positions, so eleven options is 2047
+    # entries and that is where it stops. The refusal still has to bite, because a
+    # slot that cannot enumerate the answer has no control on the card at all.
+    $wide = [pscustomobject]@{ Label = 'W'; Options = @('A','B','C','D','E','F','G','H','I','J','K'); IsText = $false; MultiSelect = $true }
     @(Get-DecisionMultiSelectChoices -Field $wide).Count -eq 0
 }
-Test-Case 'six options still fit, because that is what a real question asks' {
+Test-Case 'ten options fit, because only the count decides now' {
+    $ten = [pscustomobject]@{ Label = 'T'; Options = @('A','B','C','D','E','F','G','H','I','J'); IsText = $false; MultiSelect = $true }
+    @(Get-DecisionMultiSelectCodes -Field $ten).Count -eq 1023
+}
+# The question that actually failed on the dashboard on 2026-10-05: six follow-ups,
+# plainly worded, nothing unusual about any of them. Written out and joined they came
+# to 350 characters against a 255-character select entry, so the bridge offered
+# nothing and sent the whole question to the terminal.
+Test-Case 'six ordinarily-worded options are answerable, which is what sent a real question to the terminal' {
+    $real = [pscustomobject]@{ Label = 'Follow-ups'; IsText = $false; MultiSelect = $true; Options = @(
+        'Restore this VM to release 1.32.2 now',
+        'Leave the branch installed so I can keep testing',
+        'Investigate why the dashboard stopped re-rendering at 19:30',
+        'Fix the Scout headless copilot.exe being counted as a CLI session',
+        'Commit the correction work and report to the coordinator',
+        'Raise the diverged release line (v1.32.2 vs main) with the coordinator') }
+    $offered = @(Get-DecisionMultiSelectChoices -Field $real)
+    # Written out they are far too long to be entries at all, so only positions carry
+    # this one - and every entry stays short whatever the options say.
+    @(Get-DecisionMultiSelectSpelledChoices -Field $real).Count -eq 0 -and
+    $offered.Count -eq 63 -and
+    ($offered | Measure-Object -Property Length -Maximum).Maximum -le 32 -and
+    (@(Resolve-DecisionMultiSelectChoice -Field $real -Choice '#1,3,6') -join '|') -ceq
+        'Restore this VM to release 1.32.2 now|Investigate why the dashboard stopped re-rendering at 19:30|Raise the diverged release line (v1.32.2 vs main) with the coordinator'
+}
+Test-Case 'and such a question really does reach the card instead of the terminal' {
+    $realAsk = @'
+{"message":"Which follow-ups?","requestedSchema":{"properties":{"followups":{
+"type":"array","title":"Follow-ups","items":{"type":"string","enum":[
+"Restore this VM to release 1.32.2 now",
+"Leave the branch installed so I can keep testing",
+"Investigate why the dashboard stopped re-rendering at 19:30",
+"Fix the Scout headless copilot.exe being counted as a CLI session",
+"Commit the correction work and report to the coordinator",
+"Raise the diverged release line (v1.32.2 vs main) with the coordinator"]}}}}}
+'@ | ConvertFrom-Json
+    $parsed = Repair-DecisionToolArguments -ToolArgs $realAsk
+    -not $parsed.TerminalOnly -and @($parsed.Fields).Count -eq 1 -and @($parsed.Fields)[0].MultiSelect
+} "terminalOnly=$((Repair-DecisionToolArguments -ToolArgs ('{"message":"x","requestedSchema":{"properties":{"f":{"type":"array","title":"F","items":{"type":"string","enum":["Restore this VM to release 1.32.2 now","Leave the branch installed so I can keep testing","Investigate why the dashboard stopped re-rendering at 19:30","Fix the Scout headless copilot.exe being counted as a CLI session","Commit the correction work and report to the coordinator","Raise the diverged release line (v1.32.2 vs main) with the coordinator"]}}}}}' | ConvertFrom-Json)).TerminalOnly)"
+Test-Case 'six short options still offer both carriers, so an older card is unaffected' {
     $six = [pscustomobject]@{ Label = 'S'; Options = @('A','B','C','D','E','F'); IsText = $false; MultiSelect = $true }
-    @(Get-DecisionMultiSelectChoices -Field $six).Count -eq 63
+    @(Get-DecisionMultiSelectSpelledChoices -Field $six).Count -eq 63 -and
+    @(Get-DecisionMultiSelectChoices -Field $six).Count -eq 126
 } "count=$(@(Get-DecisionMultiSelectChoices -Field ([pscustomobject]@{ Label = 'S'; Options = @('A','B','C','D','E','F'); IsText = $false; MultiSelect = $true })).Count)"
 Test-Case 'a single-select field is not treated as one' {
     -not (Test-DecisionFieldIsMultiSelect -Field $formFields[0])
@@ -546,6 +627,36 @@ Test-Case 'a default naming an option that is not there is refused, not rounded 
     catch { $threw = $true }
     $threw
 }
+
+# An explicit null is a field declining to name a default, which is not the same as
+# naming one that is not there. Refusing it threw the whole question away: every
+# option on it became unreachable from the dashboard over a field that had only said
+# where the cursor was not. A null that *does* name an option is still that option -
+# a list can offer "Nothing" - which is checked beside this.
+Test-Case 'a null default that names no option means no default, not a question nobody can answer' {
+    $parsed = Repair-DecisionToolArguments -ToolArgs (
+        '{"message":"x","requestedSchema":{"properties":{"w":{"type":"string","title":"W","enum":["A","B"],"default":null}}}}' | ConvertFrom-Json)
+    $f = @($parsed.Fields)[0]
+    (@($f.Options) -join ',') -eq 'A,B' -and $f.DefaultIndex -eq 0 -and -not $f.HasDefault
+}
+Test-Case 'but a null default that does name one still selects it' {
+    $parsed = Repair-DecisionToolArguments -ToolArgs (
+        '{"message":"x","requestedSchema":{"properties":{"w":{"title":"W","default":null,"oneOf":[{"title":"A","const":"a"},{"title":"Nothing","const":null}]}}}}' | ConvertFrom-Json)
+    $f = @($parsed.Fields)[0]
+    $f.HasDefault -and $f.DefaultIndex -eq 1
+}
+Test-Case 'and a null default on a multi-select leaves nothing checked rather than refusing it' {
+    $parsed = Repair-DecisionToolArguments -ToolArgs (
+        '{"message":"x","requestedSchema":{"properties":{"w":{"type":"array","title":"W","items":{"type":"string","enum":["A","B"]},"default":null}}}}' | ConvertFrom-Json)
+    $f = @($parsed.Fields)[0]
+    $f.MultiSelect -and @(Get-DecisionMultiSelectChecked -Field $f).Count -eq 0
+}
+Test-Case 'an empty default list is still none checked, and still every option offered' {
+    $parsed = Repair-DecisionToolArguments -ToolArgs (
+        '{"message":"x","requestedSchema":{"properties":{"w":{"type":"array","title":"W","items":{"type":"string","enum":["A","B"]},"default":[]}}}}' | ConvertFrom-Json)
+    $f = @($parsed.Fields)[0]
+    $f.MultiSelect -and @(Get-DecisionMultiSelectChecked -Field $f).Count -eq 0 -and (@($f.Options) -join ',') -eq 'A,B'
+}
 Test-Case 'the recorded answer is matched as a set, whatever order it comes back in' {
     # Copilot flattens the result in selection order, not display order.
     (Test-CopilotAnswerMatchesSelections -ResultContent '"features"="Search, Billing"' `
@@ -554,7 +665,9 @@ Test-Case 'the recorded answer is matched as a set, whatever order it comes back
         -Fields @($arrayField) -Selections @('Billing + Search'))
 }
 Test-Case 'a multi-select too wide for its slot goes to the terminal, not to one tap' {
-    $wideAsk = '{"message":"Which?","requestedSchema":{"properties":{"w":{"type":"array","title":"W","items":{"type":"string","enum":["A","B","C","D","E","F","G"]}}}}}' | ConvertFrom-Json
+    # Eleven options: beyond what positions can enumerate, so the honest refusal is
+    # still there for the case the card genuinely cannot express.
+    $wideAsk = '{"message":"Which?","requestedSchema":{"properties":{"w":{"type":"array","title":"W","items":{"type":"string","enum":["A","B","C","D","E","F","G","H","I","J","K"]}}}}}' | ConvertFrom-Json
     $wideParsed = Repair-DecisionToolArguments -ToolArgs $wideAsk
     $wideParsed.TerminalOnly -and @($wideParsed.Choices).Count -eq 0 -and @($wideParsed.Fields).Count -eq 0 -and
         $wideParsed.Question -match 'A'
