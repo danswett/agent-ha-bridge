@@ -24,13 +24,15 @@ if (-not (Test-Path variable:script:DaemonPairingAttempt)) { $script:DaemonPairi
 
 function Initialize-BridgePairingHelper {
     <#
-        Makes sure input_text.agent_bridge_pairing exists, without ever recreating it.
+        Makes sure input_text.agent_bridge_pairing exists.
 
-        Created over the WebSocket collection API with the administrator token the
-        daemon already holds, the same way Initialize-CopilotVerboseToggle makes the
-        Detailed activity switch. An existing helper is left exactly as it is - one the
-        person renamed keeps its name - and nothing here deletes one. Returns $true when
-        the helper exists afterwards.
+        Called only when a person chooses to pair - `agent-ha-bridge pair`, or the
+        sharing step in configure - and never by a daemon. A daemon that created it at
+        startup recreated a helper somebody had deleted on purpose; this way a deleted
+        helper stays deleted until somebody deliberately pairs again. An existing helper
+        is left exactly as it is: one the person renamed keeps its name. Created over the
+        WebSocket collection API with the administrator token. Returns $true when the
+        helper exists afterwards.
     #>
     try {
         $existing = (Invoke-CopilotHaWebSocket -Commands @(@{ type = 'input_text/list' }))[0]
@@ -214,8 +216,8 @@ function Invoke-DaemonPairingRequest {
     if (-not $membership.Member) { return 'not-a-member' }
     if ($request.FleetId -cne $membership.FleetId) { return 'other-fleet' }
     if ($script:DaemonPairingAttempt -ceq $request.Attempt) { return 'running' }
-    $script:DaemonPairingAttempt = $request.Attempt
     if (Test-BridgePairingLocked) {
+        $script:DaemonPairingAttempt = $request.Attempt
         Set-BridgePairingHelperValue -Headers $Headers -Value "refused:$($request.Joiner)"
         return 'locked'
     }
@@ -228,7 +230,12 @@ function Invoke-DaemonPairingRequest {
             [void](Start-Process @start -PassThru)
         }
     }
+    # Recorded only once the process has started. Recorded before, a start that threw -
+    # a transient resource error, an entry point missing mid-update - left every later
+    # pass answering 'running' for a sponsor that did not exist, and the joiner waited
+    # out its whole timeout.
     & $StartSponsor $request.Attempt
+    $script:DaemonPairingAttempt = $request.Attempt
     'started'
 }
 

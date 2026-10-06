@@ -213,6 +213,17 @@ $req = New-BridgePairingJoiner -FleetId $fleet -Joiner 'J' -Sponsor 'S' -Sponsor
 $script:Helper = $req.Request
 Test-That 'one for this machine starts a sponsor, by attempt id alone' { (Invoke-DaemonPairingRequest -Headers $headers -StartSponsor $start) -ceq 'started' -and $script:Started -ceq @($req.Attempt) }
 Test-That 'and only once, however many passes see it' { (Invoke-DaemonPairingRequest -Headers $headers -StartSponsor $start) -ceq 'running' -and $script:Started.Count -eq 1 }
+# Recording the attempt before the process started left every later pass answering
+# 'running' for a sponsor that never existed.
+$script:DaemonPairingAttempt = ''
+$req = New-BridgePairingJoiner -FleetId $fleet -Joiner 'J' -Sponsor 'S' -SponsorSlug 'dswett_home'
+$script:Helper = $req.Request
+$failing = { param($Attempt) throw 'could not start the sponsor' }
+$threw = $false
+try { [void](Invoke-DaemonPairingRequest -Headers $headers -StartSponsor $failing) } catch { $threw = $true }
+Test-That 'a sponsor that fails to start is reported, not recorded as running' { $threw -and $script:DaemonPairingAttempt -ceq '' }
+$script:Started = @()
+Test-That 'so the next pass tries again' { (Invoke-DaemonPairingRequest -Headers $headers -StartSponsor $start) -ceq 'started' -and $script:Started -ceq @($req.Attempt) }
 $script:MySecret = ''
 $script:DaemonPairingAttempt = ''
 Test-That 'a machine without the secret cannot sponsor' { (Invoke-DaemonPairingRequest -Headers $headers -StartSponsor $start) -ceq 'not-a-member' }

@@ -671,12 +671,7 @@ function Initialize-DaemonStartup {
         }
     }
     catch { Write-DaemonLog -Message "could not provision the Detailed activity switch: $($_.Exception.Message)" }
-    # The one Home Assistant helper pairing trusts. Shared by every machine, created by
-    # whichever daemon gets there first, and never recreated or deleted.
-    try {
-        if (Initialize-BridgePairingHelper) { Write-DaemonLog -Message "pairing helper ready: $($script:BridgePairingHelperEntity)" }
-    }
-    catch { Write-DaemonLog -Message "could not provision the pairing helper: $($_.Exception.Message)" }
+
     $script:DaemonVerbose = Test-VerboseStreaming
 
     # Sweep the entities published under the old `copilot_cli_*` / `copilot_<hex>`

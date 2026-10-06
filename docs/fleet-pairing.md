@@ -72,8 +72,11 @@ the entity on any dashboard), not yet a Fleet card on the shared agent dashboard
 Changing that dashboard means a renderer version bump under A28's publication fencing,
 which is a release decision of its own, so the card is a follow-up.
 
-The first machine in a fleet has nobody to pair with, so `configure` creates the fleet:
-it generates the secret and a public fleet id, and says so.
+The first machine in a fleet has nobody to pair with, so you create the fleet there:
+`configure` generates the secret and a public fleet id. That is never inferred from
+finding no sponsor online - the members may all be offline, and an untrusted broker can
+hide their status - so it is an explicit choice you type (`NEW`), and skipping is the
+default.
 
 ## Protocol
 
@@ -104,7 +107,9 @@ They are received over HA's WebSocket `mqtt/subscribe`, as transfer chunks alrea
    * the code `SAS = (first 4 bytes of SHA-256("sas" ‖ T)) mod 10⁶`, shown as six digits;
    * the key `K = HKDF-SHA256(ECDH(pk, sk), salt = T, info = "fleet secret")`.
 5. **J** shows the code in its terminal. **You** type it into **Pair a machine**
-   (`input_text.agent_bridge_pairing`, an HA helper the bridge creates at provisioning).
+   (`input_text.agent_bridge_pairing`). The helper is created when someone chooses to
+   pair - `agent-ha-bridge pair` or the sharing step in `configure` - and never by a
+   daemon, so one you delete on purpose stays deleted until you pair again.
 6. **S** reads the helper through HA, never MQTT. If the value equals its own code, S
    * writes an HA-native acceptance into the same helper: `accepted:<J>:<first 16 hex of SHA-256("accept" ‖ T)>`;
    * publishes `{ciphertext: AES-256-GCM(K, secret, aad = T)}`.
@@ -146,10 +151,15 @@ For when pairing cannot run: HA unreachable, or no other machine online.
 
 * `agent-ha-bridge secret show`, run interactively on a member, prints the secret once,
   with a warning. It refuses when its output is redirected.
-* `configure` on the joiner offers "paste the fleet secret instead". Before saving, it
-  checks the pasted value against a member with a signed challenge: J publishes a
-  nonce, members answer with an HMAC over it, and J verifies. So a typo fails
-  immediately, not later as "transfers refused".
+* `configure` on the joiner offers "paste the fleet secret instead". When a member is
+  online, you pick which one, and the pasted value is checked against it with a signed
+  challenge before it is saved: J writes a nonce into the helper, the member answers with
+  an HMAC over it, and J verifies. So a typo fails immediately, not later as "transfers
+  refused".
+* When no member can answer - Home Assistant unreachable, or every member offline, the
+  cases this fallback exists for - the secret can still be saved, but only unchecked and
+  only after you type `SAVE UNCHECKED`, together with the fleet id it belongs to
+  (`secret show` prints both).
 * Sharing is turned on as in the pairing path.
 
 ## Configuration and storage
@@ -167,10 +177,12 @@ offers to import it, and deletes it once the secret is stored.
 
 v1 keeps this simple and says so:
 
-* `agent-ha-bridge secret rotate` makes a new secret on one machine. Every other machine
-  pairs again, and until it does, transfers to and from it refuse, as they do today with
-  mismatched secrets. Pushing a new secret over a channel keyed by the old one is a
-  possible later improvement, not part of v1.
+* `agent-ha-bridge secret rotate` makes a new secret on one machine, keeping the fleet
+  id, after you type `ROTATE`, and restarts its daemon. Every other machine then runs
+  `agent-ha-bridge pair` and answers yes to *re-pair*, choosing that machine; until it
+  does, transfers to and from it refuse, as they do with mismatched secrets. Pushing a
+  new secret over a channel keyed by the old one is a possible later improvement, not
+  part of v1.
 * Removing a machine from the fleet means rotating, because a shared secret cannot be
   un-shared. That is a property of the #77 design, not of pairing.
 
@@ -179,7 +191,11 @@ v1 keeps this simple and says so:
 * **AES-GCM under PowerShell on macOS.** *As built:* `tests/test-pairing.ps1` asserts
   `AesGcm.IsSupported`, and the macOS CI job runs it, so the platform answers this
   rather than an assumption. It holds on Windows. If it ever fails on macOS, the
-  fallback is AES-CBC with HMAC-SHA256, encrypt-then-MAC, from the same HKDF output.
+  fallback is AES-256-CBC with HMAC-SHA256, encrypt-then-MAC, with **independent
+  subkeys**: one HKDF output labelled `fleet secret enc` for AES and one labelled
+  `fleet secret mac` for HMAC, never the same bytes for both. The MAC covers
+  transcript ‖ IV ‖ ciphertext and is checked, in fixed time, before anything is
+  decrypted. Not implemented, because nothing needs it yet.
 * **What the recorder keeps from `mqtt.publish` calls.** By the analysis above nothing
   in the pairing messages needs protecting, but it should be confirmed by inspection,
   as the transfer design requires.

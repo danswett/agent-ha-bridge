@@ -21,6 +21,9 @@
                   Home Assistant, then receives the fleet secret from a machine
                   already in it, and turns session sharing on.
       secret show Print this machine's fleet secret, for the paste fallback.
+      secret rotate
+                  Replace the fleet secret, to remove a machine or after a leak; the
+                  other machines re-pair with agent-ha-bridge pair.
       status      Where everything is, whether the daemon is running, and whether
                   Home Assistant answers.
       restart     Restart the bridge daemon.
@@ -145,6 +148,7 @@ function Show-Help {
     Write-Host '  configure    Re-run the installer, keeping your settings as defaults'
     Write-Host '  pair         Join this machine to the fleet, so sessions can move between machines'
     Write-Host '  secret show  Print the fleet secret, for pasting where pairing cannot run'
+    Write-Host '  secret rotate  Replace the fleet secret; the other machines then re-pair'
     Write-Host '  status       Show the install, the daemon and the Home Assistant connection'
     Write-Host '  restart      Restart the bridge daemon'
     Write-Host '  logs         Tail the daemon log (-Lines N, -Follow)'
@@ -540,9 +544,16 @@ switch ($verb) {
     }
     'secret' {
         $entry = Join-Path $bridgeHome 'hooks/bridge-pairing-entry.ps1'
-        if (@($passthrough).Count -eq 0 -or [string]$passthrough[0] -ne 'show') { throw 'Usage: agent-ha-bridge secret show' }
-        & $pwshHere -NoProfile -File $entry -Show
-        exit $LASTEXITCODE
+        $action = if (@($passthrough).Count) { [string]$passthrough[0] } else { '' }
+        if ($action -eq 'show') { & $pwshHere -NoProfile -File $entry -Show; exit $LASTEXITCODE }
+        if ($action -eq 'rotate') {
+            # Restarted afterwards so this machine signs with the new secret straight away.
+            & $pwshHere -NoProfile -File $entry -Rotate
+            if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+            Invoke-Restart
+            break
+        }
+        throw 'Usage: agent-ha-bridge secret show | agent-ha-bridge secret rotate'
     }
     'status' { Show-Status; break }
     'restart' { Invoke-Restart; break }
