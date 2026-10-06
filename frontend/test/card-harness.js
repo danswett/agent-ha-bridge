@@ -132,7 +132,7 @@ function makeShadow() {
  * Loads the real card file into a sandbox and hands back its classes. A classic
  * script, so a trailing expression is what exposes them.
  */
-function loadCards() {
+function loadCards(sourceFile) {
   const sandboxTimers = [];
   const sandboxIntervals = new Map();
   let intervalId = 0;
@@ -191,7 +191,10 @@ function loadCards() {
   };
   sandbox.globalThis = sandbox;
 
-  const sourcePath = path.join(__dirname, '..', 'agent-bridge-reply-card.js');
+  // Normally the card in the tree. A path may be given instead to run a *released*
+  // card against today's bridge, which is the only way to show that an older one
+  // still works rather than asserting that it does.
+  const sourcePath = sourceFile || path.join(__dirname, '..', 'agent-bridge-reply-card.js');
   const source = fs.readFileSync(sourcePath, 'utf8');
   const context = vm.createContext(sandbox);
   vm.runInContext(

@@ -430,6 +430,32 @@ Test-Case 'a field whose own options look like positions is never carried as pos
     @(Get-DecisionMultiSelectCodes -Field $odd).Count -eq 0 -and
     @(Get-DecisionMultiSelectChoices -Field $odd).Count -eq 3
 }
+# A field may offer options that read exactly like two of its others joined. Writing a
+# set out and reading it back then loses which rows were meant, and the terminal gets
+# the wrong ones - silently, which is the whole class of failure this exists to remove.
+$collide = [pscustomobject]@{ Label = 'X'; IsText = $false; MultiSelect = $true
+    MultiSelectStyle = 'space-toggle'; DefaultIndexes = @(); Options = @('A', 'B', 'A + B') }
+Test-Case 'a set is carried by what was chosen, not by how it reads' {
+    (@(Resolve-DecisionMultiSelectChoice -Field $collide -Choice '#1,2') -join '|') -ceq 'A|B' -and
+    (@(Resolve-DecisionMultiSelectChoice -Field $collide -Choice '#3') -join '|') -ceq 'A + B'
+}
+Test-Case 'and the two reach the prompt as different rows' {
+    $first = @(Get-BridgeFormPayloads -Fields @($collide) -Selections @('#1,2'))[0].Payload
+    $third = @(Get-BridgeFormPayloads -Fields @($collide) -Selections @('#3'))[0].Payload
+    $first -ceq (' ' + $esc + '[B' + ' ') -and $third -ceq ($esc + '[B' + $esc + '[B' + ' ') -and $first -cne $third
+} "first=[$((@(Get-BridgeFormPayloads -Fields @($collide) -Selections @('#1,2'))[0].Payload) -replace [regex]::Escape($esc), '<esc>')] third=[$((@(Get-BridgeFormPayloads -Fields @($collide) -Selections @('#3'))[0].Payload) -replace [regex]::Escape($esc), '<esc>')]"
+Test-Case 'words that could mean either set are refused rather than guessed at' {
+    @(Resolve-DecisionMultiSelectChoice -Field $collide -Choice 'A + B').Count -eq 0
+}
+Test-Case 'and such a field is never offered the written-out carrier at all' {
+    @(Get-DecisionMultiSelectSpelledChoices -Field $collide).Count -eq 0 -and
+    @(Get-DecisionMultiSelectCodes -Field $collide).Count -eq 7
+}
+# The written-out carrier stays exact where it is genuinely unambiguous.
+Test-Case 'an unambiguous field still reads its written-out form back exactly' {
+    (@(Resolve-DecisionMultiSelectChoice -Field $msField -Choice 'Auth + Search') -join ',') -eq 'Auth,Search'
+}
+
 Test-Case 'a combination resolves back to its own options, in field order' {
     (@(Resolve-DecisionMultiSelectChoice -Field $msField -Choice 'Auth + Search') -join ',') -eq 'Auth,Search'
 }

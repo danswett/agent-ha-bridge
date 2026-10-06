@@ -1355,13 +1355,24 @@ function Resolve-DecisionMultiSelectIndexes {
         return [int[]]@($seen)
     }
 
+    # Words are only a carrier for this field if they were published as one. Where they
+    # were not - because two subsets would read identically, or because they were too
+    # long to offer - a value that merely looks like them is not an answer, and taking
+    # the first subset that matches picks one of two readings at random. A field
+    # offering 'A', 'B' and an option named 'A + B' is exactly that.
+    if (@(Get-DecisionMultiSelectSpelledChoices -Field $Field).Count -eq 0) { return @() }
+
+    $found = $null
     foreach ($mask in (Get-DecisionMultiSelectMasks -Count $count)) {
         $these = for ($b = 0; $b -lt $count; $b++) { if ($mask -band (1 -shl $b)) { $options[$b] } }
         if (($these -join $script:DecisionMultiSelectSeparator) -cne $Value) { continue }
-        $indexes = for ($b = 0; $b -lt $count; $b++) { if ($mask -band (1 -shl $b)) { $b } }
-        return [int[]]@($indexes)
+        # A second reading means the words do not identify a set. Refuse rather than
+        # choose between them.
+        if ($null -ne $found) { return @() }
+        $found = for ($b = 0; $b -lt $count; $b++) { if ($mask -band (1 -shl $b)) { $b } }
     }
-    @()
+    if ($null -eq $found) { return @() }
+    [int[]]@($found)
 }
 
 function Get-DecisionMultiSelectMasks {
@@ -2525,6 +2536,52 @@ function Test-DecisionMarkedGuardError {
     $false
 }
 
+function Get-BridgeHttpStatusCode {
+    <#
+        The HTTP status behind a failed call, as a number, or 0 when there is not one.
+
+        Read off the exception rather than its message. PowerShell surfaces a failed
+        web request differently depending on how it was made and on which edition is
+        running - HttpResponseException on 7.x, WebException wrapping an
+        HttpWebResponse on Windows PowerShell - so all of those are unwrapped here,
+        and anything that is not a web failure at all is 0 rather than a guess.
+    #>
+    param([Parameter(Mandatory)]$ErrorRecord)
+
+    if ($ErrorRecord.PSObject.Properties['Exception']) {
+        $exception = $ErrorRecord.Exception
+        $depth = 0
+        while ($null -ne $exception -and $depth -lt 8) {
+            # An explicit status, which is how a stand-in Home Assistant says what it
+            # answered without having to imitate a transport. An integer either way,
+            # never a phrase to be matched.
+            $tagged = $exception.Data['BridgeHttpStatus']
+            if ($tagged -is [int] -and $tagged -gt 0) { return [int]$tagged }
+            $response = $null
+            if ($exception.PSObject.Properties['Response']) { $response = $exception.Response }
+            if ($null -ne $response -and $response.PSObject.Properties['StatusCode']) {
+                $code = $response.StatusCode
+                if ($code -is [int]) { return [int]$code }
+                $parsed = 0
+                if ([int]::TryParse(([string][int]$code), [ref]$parsed) -and $parsed -gt 0) { return $parsed }
+            }
+            if ($exception.PSObject.Properties['StatusCode']) {
+                $direct = $exception.StatusCode
+                if ($direct -is [int] -and $direct -gt 0) { return [int]$direct }
+            }
+            $exception = $exception.InnerException
+            $depth++
+        }
+    }
+    # Where the call was made through something that reports the status on the record
+    # rather than on the exception.
+    if ($ErrorRecord.PSObject.Properties['TargetObject'] -and $null -ne $ErrorRecord.TargetObject) {
+        $target = $ErrorRecord.TargetObject
+        if ($target.PSObject.Properties['StatusCode'] -and $target.StatusCode -is [int]) { return [int]$target.StatusCode }
+    }
+    0
+}
+
 function Get-CopilotDecisionChannelObservation {
     <#
         What one answer channel holds right now, as { State; Value; Snapshot }, where
@@ -2564,9 +2621,14 @@ function Get-CopilotDecisionChannelObservation {
     }
     catch {
         if (Test-DecisionMarkedGuardError -ErrorRecord $_) { throw }
-        # A 404 is the entity genuinely not being there; anything else is Home
-        # Assistant being unable to say, and the two are not interchangeable.
-        if ("$($_.Exception.Message)" -match '(^|\D)404(\D|$)|not found') {
+        # "Not there" is read off the response status, not off the wording of a
+        # message. Matching text makes absence depend on a string nobody controls -
+        # Home Assistant's phrasing, a proxy's error page, a translation - and getting
+        # it wrong either way is silent: a real 404 read as unreadable leaves a
+        # question waiting for ever, and an unreadable channel read as absent lets a
+        # retained old answer count as a new one.
+        $status = Get-BridgeHttpStatusCode -ErrorRecord $_
+        if ($status -eq 404) {
             return [pscustomobject]@{ State = 'absent'; Value = ''; Snapshot = $null; Exists = $false }
         }
         return [pscustomobject]@{ State = 'unknown'; Value = ''; Snapshot = $null; Exists = $false }
@@ -2639,9 +2701,9 @@ function Set-CopilotDecisionMarkerBaseline {
     param(
         [Parameter(Mandatory)][string]$SessionId,
         [Parameter(Mandatory)][AllowEmptyString()][string]$DecisionId,
-        [Parameter(Mandatory)][ValidateSet('present', 'absent', 'unknown')][string]$PayloadState,
+        [Parameter(Mandatory)][ValidateSet('present', 'absent')][string]$PayloadState,
         [Parameter(Mandatory)][AllowEmptyString()][string]$PayloadValue,
-        [Parameter(Mandatory)][ValidateSet('present', 'absent', 'unknown')][string]$SubmitState,
+        [Parameter(Mandatory)][ValidateSet('present', 'absent')][string]$SubmitState,
         [Parameter(Mandatory)][AllowEmptyString()][string]$SubmitValue
     )
 
@@ -2654,20 +2716,33 @@ function Set-CopilotDecisionMarkerBaseline {
     } | ConvertTo-Json -Depth 8 -Compress
 
     try {
-        $bytes = [Text.UTF8Encoding]::new($false).GetBytes($json)
         $directory = [IO.Path]::GetDirectoryName($path)
         if (-not [string]::IsNullOrEmpty($directory) -and -not (Test-Path -LiteralPath $directory -PathType Container)) {
             [void](New-Item -ItemType Directory -Path $directory -Force)
         }
-        $stream = [IO.File]::Open($path, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
-        try { $stream.Write($bytes, 0, $bytes.Length) }
-        finally { $stream.Dispose() }
-        return $true
-    }
-    catch [IO.IOException] {
-        # Already there, which is the normal second call for the same question. Only
-        # an actual readable baseline counts, so it is confirmed rather than assumed.
-        return (Test-Path -LiteralPath $path -PathType Leaf)
+        # Written whole somewhere else, then moved into place. A move that finds the
+        # name taken fails, so it is still a single atomic claim - but unlike writing
+        # into the final name it can never leave a half-written record behind for a
+        # crash to turn into a permanently unanswerable question.
+        $staging = "$path.$([guid]::NewGuid().ToString('N').Substring(0, 8)).tmp"
+        [IO.File]::WriteAllText($staging, $json, [Text.UTF8Encoding]::new($false))
+        try {
+            [IO.File]::Move($staging, $path)
+            return $true
+        }
+        catch [IO.IOException] {
+            # Already claimed, which is the normal second call for the same question.
+            # Only a record that reads back counts; one that does not is this
+            # question's own debris and may be replaced, because the name is the
+            # question's and a replacement question has a different one.
+            if (Test-CopilotDecisionBaselineRecorded -SessionId $SessionId -DecisionId $DecisionId) { return $true }
+            Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue
+            [IO.File]::Move($staging, $path)
+            return (Test-CopilotDecisionBaselineRecorded -SessionId $SessionId -DecisionId $DecisionId)
+        }
+        finally {
+            if (Test-Path -LiteralPath $staging) { Remove-Item -LiteralPath $staging -Force -ErrorAction SilentlyContinue }
+        }
     }
     catch {
         Write-DecisionBridgeLog -Message "could not record a decision baseline: $($_.Exception.Message)"
@@ -2766,33 +2841,48 @@ function Initialize-CopilotDecisionBaseline {
 }
 
 function Test-CopilotDecisionBaselineRecorded {
-    <# Whether this exact question already has a baseline on disk. #>
+    <#
+        Whether this exact question has a baseline that can actually be read back.
+
+        Deliberately not "the file is there". A truncated or half-written record exists
+        without meaning anything, and because the record is write-once, treating it as
+        established would leave the question permanently unanswerable: every later
+        comparison returns unknown and nothing is ever read. It is confirmed by reading
+        it through the same path that will use it.
+    #>
     param(
         [Parameter(Mandatory)][string]$SessionId,
         [Parameter(Mandatory)][AllowEmptyString()][string]$DecisionId
     )
 
     if ([string]::IsNullOrWhiteSpace($DecisionId)) { return $false }
-    Test-Path -LiteralPath (Get-CopilotDecisionBaselinePath -SessionId $SessionId -DecisionId $DecisionId) -PathType Leaf
+    $marker = [pscustomobject]@{ decisionId = $DecisionId }
+    foreach ($channel in @('payload', 'submit')) {
+        $entry = Get-CopilotDecisionMarkerBaseline -Marker $marker -Channel $channel -SessionId $SessionId
+        if ($entry.State -eq 'unknown') { return $false }
+    }
+    $true
 }
 
 function Remove-CopilotDecisionMarker {
-    param([Parameter(Mandatory)][string]$SessionId)
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [AllowEmptyString()][string]$DecisionId = ''
+    )
     $path = Get-CopilotDecisionMarkerPath -SessionId $SessionId
-    # The per-question baselines go with it. They are keyed by decision id, so a
-    # question that has been answered leaves one behind that nothing will ever read;
-    # left alone they would accumulate one file per question for the life of a session.
-    try {
-        $stem = [IO.Path]::GetFileNameWithoutExtension($path)
-        $directory = [IO.Path]::GetDirectoryName($path)
-        if (Test-Path -LiteralPath $directory -PathType Container) {
-            foreach ($stale in @(Get-ChildItem -LiteralPath $directory -Filter "$stem.baseline-*.json" -File -ErrorAction SilentlyContinue)) {
-                Remove-Item -LiteralPath $stale.FullName -Force -ErrorAction SilentlyContinue
-            }
+    # The baseline of the question being retired goes with it, and only that one.
+    #
+    # Sweeping every baseline for the session is not safe: a replacement question may
+    # already have been armed and recorded its own, and deleting that would let the
+    # new question adopt whatever the card holds as "what was always there" - losing
+    # an answer typed in between. Where the caller cannot say which question it is
+    # retiring, the baselines are left alone; they are small, named for their
+    # question, and the session directory goes when the session does.
+    if (-not [string]::IsNullOrWhiteSpace($DecisionId)) {
+        $baseline = Get-CopilotDecisionBaselinePath -SessionId $SessionId -DecisionId $DecisionId
+        if (Test-Path -LiteralPath $baseline) {
+            Remove-Item -LiteralPath $baseline -Force -ErrorAction SilentlyContinue
         }
-    }
-    catch {
-        Write-DecisionBridgeLog -Message "could not clear decision baselines for $SessionId : $($_.Exception.Message)"
     }
     if (Test-Path -LiteralPath $path) {
         Remove-Item -LiteralPath $path -Force -ErrorAction SilentlyContinue

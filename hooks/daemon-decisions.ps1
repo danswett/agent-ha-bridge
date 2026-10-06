@@ -519,6 +519,13 @@ function Read-DaemonFormAnswer {
     $takesText = @($markerFields | Where-Object { Test-DecisionFieldIsText -Field $_ }).Count -gt 0
 
     $picked = @()
+    # What was actually chosen, kept exactly as the slot carried it. The readable form
+    # beside it is for reading, and must never be turned back into a selection: a
+    # field may offer 'A', 'B' and an option literally named 'A + B', and then the
+    # words for "the first two" and the words for "the third" are the same string.
+    # Ticking the first two and delivering the third is precisely the silent
+    # wrong-answer this whole change exists to remove.
+    $identity = @()
     $missingChoice = $false
     for ($fi = 1; $fi -le $markerFields.Count; $fi++) {
         $markerField = $markerFields[$fi - 1]
@@ -545,6 +552,7 @@ function Read-DaemonFormAnswer {
                 if ([string]::IsNullOrWhiteSpace($v) -or $v -in @('unknown', 'unavailable')) { $v = '' }
             }
             $picked += $v
+            $identity += $v
             continue
         }
 
@@ -557,21 +565,22 @@ function Read-DaemonFormAnswer {
         }
         # A multi-select slot may be holding the answer as positions rather than as
         # words - that is what lets a question whose options are ordinary sentences be
-        # answered here at all. Everything downstream, from the recorded answer to the
-        # keystrokes, works in words, so it is turned back into them here and nowhere
-        # else. A slot holding something that is neither reads as unanswered rather
-        # than as a guess.
+        # answered here at all. What the slot holds is kept as the selection; only the
+        # reading of it is turned into words.
         if (Test-DecisionFieldIsMultiSelect -Field $markerField) {
             $indexes = @(Resolve-DecisionMultiSelectIndexes -Field $markerField -Value $v)
             if ($indexes.Count -eq 0) {
                 $missingChoice = $true
                 break
             }
-            $v = Get-DecisionMultiSelectLabel -Field $markerField -Indexes ([int[]]$indexes)
+            $picked += (Get-DecisionMultiSelectLabel -Field $markerField -Indexes ([int[]]$indexes))
+            $identity += $v
+            continue
         }
         $picked += $v
+        $identity += $v
     }
-    if ($missingChoice) { $picked = @() }
+    if ($missingChoice) { $picked = @(); $identity = @() }
 
     # A single choice answered in words rather than by tapping. Every Copilot option
     # list ends in "Other (type your answer)", and that entry is the one place words
@@ -691,7 +700,9 @@ function Read-DaemonFormAnswer {
     }
 
     if ($submitted) {
-        $selections = @($picked)
+        # The selections are what the slots held; the answer is how it reads. Deriving
+        # one from the other is what sent the wrong rows.
+        $selections = @($identity)
         $answer = ($picked -join ' + ')
     }
     # The stamp travels with the answer so the payload is marked as used only once it
