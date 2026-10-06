@@ -88,6 +88,14 @@ function Invoke-RestMethod {
             entity_id = $script:DaemonConfig.VerboseToggle; state = 'off'; attributes = [pscustomobject]@{}
         }
     }
+    elseif ($args.Count -eq 0 -and $Method -eq 'Get' -and
+        $Uri -ceq 'http://publication.invalid:8123/api/states/input_text.agent_bridge_pairing' -and
+        -not $PSBoundParameters.ContainsKey('Body') -and -not $PSBoundParameters.ContainsKey('ContentType')) {
+        # Every pass reads the pairing helper (docs/fleet-pairing.md). Empty is what it
+        # holds whenever no pairing is under way, so the pass goes no further with it.
+        $request.Unexpected = $false
+        return [pscustomobject]@{ entity_id = 'input_text.agent_bridge_pairing'; state = ''; attributes = [pscustomobject]@{} }
+    }
     elseif ($args.Count -eq 0 -and $Method -eq 'Post' -and $Uri -cin @(
         'http://publication.invalid:8123/api/services/select/select_option'
         'http://publication.invalid:8123/api/services/text/set_value'
