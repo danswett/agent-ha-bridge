@@ -513,6 +513,29 @@ $probeMissing = Invoke-BridgeCommandProbe -Executable $missingExe
 Test-That 'a command that cannot be executed at all is not reported as run' { -not $probeMissing.Ran }
 
 if ($IsWindows) {
+    # npm installs its clients as .cmd shims, and Get-BridgeCodexPath falls back to
+    # %APPDATA%\npm\codex.cmd outright - so a probe that could not run a batch file
+    # would report a working client as unrunnable and refuse every launch. Worth
+    # pinning rather than assuming: CreateProcess is often said not to run batch
+    # files, and the probe no longer goes through Start-Process.
+    $shimRoot = Join-Path $env:TEMP "probe-shim-$([guid]::NewGuid().ToString('N'))"
+    [void][IO.Directory]::CreateDirectory($shimRoot)
+    $shimPath = Join-Path $shimRoot 'probe-shim.cmd'
+    [IO.File]::WriteAllText($shimPath, "@echo off`r`necho shim-version 9.9.9`r`nexit /b 0")
+    try {
+        $probeShim = Invoke-BridgeCommandProbe -Executable $shimPath -TimeoutMs 20000
+        Test-That 'a .cmd shim runs and its version is read back' {
+            $probeShim.Ran -and -not $probeShim.TimedOut -and $probeShim.ExitCode -eq 0 -and
+                $probeShim.StandardOutput -match 'shim-version 9\.9\.9'
+        } "ran=$($probeShim.Ran) code=$($probeShim.ExitCode) out=$($probeShim.Output)"
+        Test-That 'and such a client counts as actually runnable' {
+            Test-BridgeCommandRuns -Executable $shimPath -TimeoutMs 20000
+        }
+    }
+    finally { Remove-Item -LiteralPath $shimRoot -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+if ($IsWindows) {
     Write-Host '--- background probes never recreate a detached daemon console ---'
     $consoleRoot = Join-Path $env:TEMP "probe-console-$([guid]::NewGuid().ToString('N'))"
     [void][IO.Directory]::CreateDirectory($consoleRoot)
