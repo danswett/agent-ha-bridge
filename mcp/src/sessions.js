@@ -144,6 +144,10 @@ export async function listSessions(ha) {
  * *previous* answer marked done, and the caller would stop waiting before the new turn
  * had produced anything. Pass the `since` that reply_to_agent_session returned and the
  * answer only counts once the activity has actually moved on.
+ *
+ * A session waiting on background agents it started reports `agents` rather than
+ * `idle`, so it is correctly not done: its own turn has ended, but it will take
+ * another one with what those agents found.
  */
 export async function readSession(ha, sessionId, { since = '' } = {}) {
   const ids = sessionEntities(sessionId);

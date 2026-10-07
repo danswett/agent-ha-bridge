@@ -2679,6 +2679,32 @@ function Get-CopilotTranscriptTailLines {
     $lines
 }
 
+function Test-BridgeSubagentEvent {
+    <#
+        Whether a transcript line is something a subagent did, rather than the session.
+
+        Copilot writes everything its subagents do into the session's own
+        events.jsonl - their task prompts, their turns, their tool calls - stamped
+        with a top-level agentId that the session's own events never carry. Counted
+        over one real transcript: of 7,381 events, every one of the 571 a subagent
+        produced had the field and none of the other 6,810 did.
+
+        It matters most for a background agent, which outlives the turn that started
+        it. Its turn_start said the session was working while the session sat waiting,
+        and its last turn_end then left the card reading idle with the agent still
+        running - the reading the 'agents' status exists to replace.
+
+        The containment test comes first so a session that never delegates - most of
+        them - pays nothing per turn event. The parse behind it is what stops a
+        message quoting the field from being mistaken for a subagent's.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Line)
+
+    if (-not $Line.Contains('"agentId"')) { return $false }
+    try { return [bool]($Line | ConvertFrom-Json).PSObject.Properties['agentId'] }
+    catch { return $false }
+}
+
 function Test-CopilotSessionWorking {
     param(
         [Parameter(Mandatory)]
@@ -2693,24 +2719,27 @@ function Test-CopilotSessionWorking {
         return $false
     }
 
+    # A subagent's turns are written here too, and are not the session's: a background
+    # agent working away would otherwise make a session that had finished its own turn
+    # read as working for as long as the agent ran.
     $turnState = $null
     $lines = @(Get-CopilotTranscriptTailLines -Path $eventsPath)
     foreach ($line in $lines) {
         if ($line.StartsWith('{"type":"assistant.turn_start"')) {
-            $turnState = 'working'
+            if (-not (Test-BridgeSubagentEvent -Line $line)) { $turnState = 'working' }
         }
         elseif ($line.StartsWith('{"type":"assistant.turn_end"')) {
-            $turnState = 'idle'
+            if (-not (Test-BridgeSubagentEvent -Line $line)) { $turnState = 'idle' }
         }
     }
 
     if ($null -eq $turnState) {
         foreach ($line in (Get-Content -LiteralPath $eventsPath)) {
             if ($line.StartsWith('{"type":"assistant.turn_start"')) {
-                $turnState = 'working'
+                if (-not (Test-BridgeSubagentEvent -Line $line)) { $turnState = 'working' }
             }
             elseif ($line.StartsWith('{"type":"assistant.turn_end"')) {
-                $turnState = 'idle'
+                if (-not (Test-BridgeSubagentEvent -Line $line)) { $turnState = 'idle' }
             }
         }
     }

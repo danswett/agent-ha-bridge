@@ -167,6 +167,11 @@ function Get-DaemonStartupStatus {
     if (Test-BridgeSessionWorking -SessionId ([string]$Session.SessionId) -Kind $kind -Transcript $transcript -Status $sessionStatus) {
         return 'working'
     }
+    # A session waiting on background agents writes nothing of its own while it waits,
+    # so the set the entry carries is the only thing that tells it apart from an idle
+    # one. Without this every restart - including every update - said idle, which is
+    # exactly the reading this status exists to correct.
+    if ((Get-DaemonBackgroundAgentCount -Entry $Entry) -gt 0) { return 'agents' }
     'idle'
 }
 
@@ -268,14 +273,44 @@ function Get-ActivityFromEvents {
     $turnStarted = $false
     $model = $null
     $history = New-Object System.Collections.Generic.List[string]
+    $agentsStarted = New-Object System.Collections.Generic.List[string]
+    $agentsFinished = New-Object System.Collections.Generic.List[string]
 
     foreach ($line in $Lines) {
         if ($line -notmatch '"type":"([^"]+)"') { continue }
         $type = $Matches[1]
 
+        if ($type -eq 'subagent.started' -or $type -eq 'subagent.completed') {
+            try {
+                $parsed = $line | ConvertFrom-Json
+                $callId = Get-BridgeEventField -Data $parsed.data -Name 'toolCallId'
+                if ([string]::IsNullOrWhiteSpace($callId)) { continue }
+                if ($type -eq 'subagent.completed') { [void]$agentsFinished.Add($callId) }
+                # Only a background agent outlives the turn that started it. A sync one
+                # holds the parent's tool call open, so the session is plainly working
+                # and needs nothing said about it.
+                elseif ((Get-BridgeEventField -Data $parsed.data -Name 'executionMode') -eq 'background') {
+                    [void]$agentsStarted.Add($callId)
+                }
+            }
+            catch { }
+            continue
+        }
+
+        # A subagent's turns are not the session's; see Test-BridgeSubagentEvent. What
+        # it says and the tools it runs still reach the card below, so a delegated job
+        # is not a silent one - only the turn bookkeeping is the session's own. Checked
+        # inside these three branches rather than per line, so the assistant messages
+        # and tool calls that make up most of a transcript pay nothing for it.
         switch ($type) {
-            'assistant.turn_start' { $status = 'working'; continue }
+            'assistant.turn_start' {
+                if (-not (Test-BridgeSubagentEvent -Line $line)) { $status = 'working' }
+                continue
+            }
             'user.message' {
+                # Copilot writes a subagent's task prompt as one of these too, and it is
+                # neither your message nor the start of a turn of the session's.
+                if (Test-BridgeSubagentEvent -Line $line) { continue }
                 $status = 'working'
                 $summary = 'Reading your message'
                 $history.Add($summary)
@@ -290,7 +325,10 @@ function Get-ActivityFromEvents {
                 $latestIsThinking = $false
                 continue
             }
-            'assistant.turn_end' { $status = 'idle'; continue }
+            'assistant.turn_end' {
+                if (-not (Test-BridgeSubagentEvent -Line $line)) { $status = 'idle' }
+                continue
+            }
         }
 
         if ($type -eq 'tool.execution_start') {
@@ -380,6 +418,11 @@ function Get-ActivityFromEvents {
         # the reasoning and history it has been carrying from the last one, and hands
         # the session back to the person who typed it.
         TurnStarted = $turnStarted
+        # Background agents this batch started and finished, by the tool call that owns
+        # each. The caller keeps the running set across batches, because a background
+        # agent routinely outlives the turn - and many reads - that started it.
+        AgentsStarted = @($agentsStarted)
+        AgentsFinished = @($agentsFinished)
     }
 }
 
@@ -425,6 +468,68 @@ function Set-DaemonTransientActivity {
     foreach ($key in $Extra.Keys) { $attributes[$key] = $Extra[$key] }
 
     Set-CopilotMqttActivity -SessionId $SessionId -Summary $Summary -Detail $attributes -Headers $Headers
+}
+
+function Get-DaemonBackgroundAgentCount {
+    <#
+        How many background agents a session is still waiting on.
+
+        Not @($Entry.BackgroundAgents).Count. A property that is present but null
+        wraps to a one-element array holding $null, so a session that had never
+        delegated anything would have read as waiting on one agent - and parked
+        itself on a status nothing could then take it out of.
+    #>
+    param([Parameter(Mandatory)]$Entry)
+
+    if (-not $Entry.PSObject.Properties['BackgroundAgents']) { return 0 }
+    $value = $Entry.BackgroundAgents
+    if ($null -eq $value) { return 0 }
+    @(@($value) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }).Count
+}
+
+function Update-DaemonBackgroundAgents {
+    <#
+        Folds a batch's background-agent starts and finishes into the set a session is
+        still waiting on, and returns how many are left.
+
+        Kept on the entry rather than in memory, so it survives both the next batch -
+        a start and its finish are usually minutes and many reads apart - and a daemon
+        restart, which is the one moment a waiting session has nothing else to say for
+        itself.
+
+        Ids, not a count. Copilot writes a subagent.completed again for every agent it
+        was still tracking when the session shuts down, so counting down would go
+        negative and leave a session that had finished three agents looking as though
+        it were waiting on agents it never started.
+    #>
+    param(
+        [Parameter(Mandatory)]$Entry,
+        [Parameter(Mandatory)]$Activity
+    )
+
+    $running = New-Object System.Collections.Generic.List[string]
+    $add = {
+        param($Values)
+        foreach ($value in @($Values)) {
+            $text = [string]$value
+            if ($text -and -not $running.Contains($text)) { [void]$running.Add($text) }
+        }
+    }
+
+    if ($Entry.PSObject.Properties['BackgroundAgents']) { & $add $Entry.BackgroundAgents }
+    if ($Activity.PSObject.Properties['AgentsStarted']) { & $add $Activity.AgentsStarted }
+    if ($Activity.PSObject.Properties['AgentsFinished']) {
+        foreach ($value in @($Activity.AgentsFinished)) { [void]$running.Remove([string]$value) }
+    }
+
+    # Written only when there is something to say, or when the session has said
+    # something before. Otherwise every Claude, Codex and never-delegating Copilot
+    # session on the dashboard would grow an empty list in the state file, and the
+    # first pass after an update would rewrite the lot to record nothing.
+    if ($running.Count -gt 0 -or $Entry.PSObject.Properties['BackgroundAgents']) {
+        Set-DaemonSessionProperty -Entry $Entry -Name 'BackgroundAgents' -Value @($running)
+    }
+    $running.Count
 }
 
 function Update-DaemonSessionActivity {
@@ -486,6 +591,24 @@ function Update-DaemonSessionActivity {
         }
     }
 
+    # Background agents outlive the turn that started them: the session's own turn
+    # ends, so the transcript says idle while work it is waiting on is still running.
+    # An idle card invites you to close a session that has not finished, so waiting on
+    # one gets a status of its own.
+    $runningAgents = Update-DaemonBackgroundAgents -Entry $entry -Activity $activity
+    if ($runningAgents -gt 0) {
+        if ($newStatus -eq 'idle' -or
+            ([string]::IsNullOrWhiteSpace($newStatus) -and [string]$entry.Status -eq 'idle')) {
+            $newStatus = 'agents'
+        }
+    }
+    elseif ([string]::IsNullOrWhiteSpace($newStatus) -and [string]$entry.Status -eq 'agents') {
+        # The last one finished and the session has not spoken yet - it is between the
+        # agent's result and its own next turn. Left on 'agents' that is the same lie
+        # the other way up, and nothing else would correct it until the session moved.
+        $newStatus = 'idle'
+    }
+
     # The model the transcript just named. Recorded before the status publish below,
     # so a batch that changes both spends one publish on the pair.
     $modelChanged = $false
@@ -523,7 +646,7 @@ function Update-DaemonSessionActivity {
         # Only from a status Set-CopilotMqttStatus accepts: an entry parked on
         # something else ('ending') is mid-retirement and its card is about to go.
         $current = [string]$entry.Status
-        if ($current -in @('working', 'idle', 'waiting', 'offline')) {
+        if ($current -in @('working', 'idle', 'waiting', 'agents', 'offline')) {
             try {
                 Set-CopilotMqttStatus -SessionId $id -Status $current -Headers $Headers -Attributes (
                     Add-DaemonTuningAttributes -Attributes @{

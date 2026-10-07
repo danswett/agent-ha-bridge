@@ -684,7 +684,8 @@ function Get-DaemonSessionTuning {
 function Add-DaemonTuningAttributes {
     <#
         Adds the three settings to a status attribute set, leaving out any that are
-        empty so the card can tell "not known" from a real value.
+        empty so the card can tell "not known" from a real value, and the number of
+        background agents the session is waiting on when it is waiting on any.
     #>
     param(
         [Parameter(Mandatory)][hashtable]$Attributes,
@@ -698,6 +699,11 @@ function Add-DaemonTuningAttributes {
         if ([string]::IsNullOrWhiteSpace($value)) { continue }
         $Attributes[$pair[0]] = $value
     }
+    # How many, so the card can say "waiting for 3 background agents" rather than
+    # leaving you to guess whether the status means one or six. Omitted at zero, so a
+    # session that never delegates carries nothing new.
+    $running = Get-DaemonBackgroundAgentCount -Entry $Tuning
+    if ($running -gt 0) { $Attributes['background_agents'] = $running }
     $Attributes
 }
 
