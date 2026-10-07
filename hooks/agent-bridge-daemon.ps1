@@ -226,6 +226,11 @@ $script:DaemonPayloadSensorChecked = @{}
 # repeated every reconcile. Cleared for a session as soon as its entity is seen back.
 $script:DaemonEntityRestore = @{}
 
+# Transcripts whose read failure has already been reported, keyed by path, so an
+# unreadable one is described once rather than once per pass. Cleared when it reads
+# again, so a later failure is still news.
+$script:DaemonTranscriptFailureReported = @{}
+
 # Serialised state of the last successful state-file write, so an idle daemon skips
 # rewriting identical JSON every reconcile. Initialised for StrictMode.
 $script:DaemonStateLastWritten = $null
