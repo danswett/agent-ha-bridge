@@ -834,6 +834,41 @@ function Get-BridgeAgentProcesses {
     }
 }
 
+function Test-BridgeAgentEmbeddedProcess {
+    <#
+        Whether an agent CLI process is an embedded, headless instance rather than an
+        interactive session, from its command line.
+
+        Microsoft Scout (Clawpilot) ships the Copilot CLI inside its own app and runs
+        it as `copilot.exe --headless ... --stdio`. That process carries no
+        --session-id and writes no inuse.<pid>.lock, so no session can ever account
+        for it - and discovery, which requires every live agent process to belong to a
+        session, reported UnaccountedProcess on every pass. On one machine that held
+        retirement and startup cleanup all day and refused every launch with "Session
+        discovery is incomplete", while a dead session's card sat on the dashboard
+        with no way to clear it.
+
+        --headless is the CLI's own word for "not a terminal session", which is why it
+        is the signal here rather than the embedding app's install path - that is
+        particular to one product and would miss the next one.
+
+        Two guards against excusing a process that is really a session, because the
+        cost of that is a live session being retired while it is still working:
+
+          - Quoted values are removed before anything is read as an option. A prompt
+            passed as -i "...--headless..." is text, not a flag, and a session asked
+            about this very bug would otherwise have excused itself.
+          - A session carries its id on the command line, new or resumed alike (see
+            Get-BridgeAgentProcessSessionIds), while an embedded CLI is driven over
+            stdio and never given one. So --session-id settles it outright.
+    #>
+    param([string]$CommandLine = '')
+    if ([string]::IsNullOrWhiteSpace($CommandLine)) { return $false }
+    $options = [regex]::Replace($CommandLine, '"[^"]*"', ' ')
+    if ($options -notmatch '(^|\s)--headless(\s|=|$)') { return $false }
+    -not ($options -match '(^|\s)--session-id(\s|=)')
+}
+
 function Get-BridgeAgentProcessSessionIds {
     <#
         Which session each of $Processes is working in, as a pid -> session id map,

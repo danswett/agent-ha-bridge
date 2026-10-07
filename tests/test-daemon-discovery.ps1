@@ -69,6 +69,22 @@ $script:ObservingAgentProcesses = {
 }
 ${function:Get-BridgeAgentProcesses} = $script:ObservingAgentProcesses
 
+# Command lines are read only for a process no session accounted for, to tell an
+# embedded headless CLI from a session that is genuinely missing one. Unknown pids
+# answer as an ordinary interactive CLI, which is what the fixtures mean by default.
+$script:CommandLines = @{}
+$script:CommandLineState = 'Readable'
+$script:DefaultCommandLine = '"C:\Users\u\.copilot-cli\copilot.exe" --banner'
+function Get-BridgeCommandLine {
+    param([int]$ProcessId, [switch]$AsObservation)
+    $text = if ($script:CommandLines.ContainsKey($ProcessId)) { [string]$script:CommandLines[$ProcessId] }
+        else { $script:DefaultCommandLine }
+    [pscustomobject]@{
+        State = $script:CommandLineState; Text = $text
+        ProcessId = $ProcessId; Code = ''; NativeExit = $null
+    }
+}
+
 function New-FixtureSession {
     param([string]$SessionId, [int]$ProcessId, [string]$Kind)
     [pscustomobject]@{ SessionId = $SessionId; ProcessId = $ProcessId; Kind = $Kind; RegistrationPath = '' }
@@ -97,6 +113,8 @@ function Reset-FixtureState {
     $script:ProcessesByAgent = @{}
     $script:ProcessReadKnown = $true
     $script:ProcessDiagnostics = @()
+    $script:CommandLines = @{}
+    $script:CommandLineState = 'Readable'
     $script:SessionsByKind = @{}
     $script:FailingKinds = @{}
     $script:AgentProcessCalls = [Collections.Generic.List[object]]::new()
@@ -238,6 +256,76 @@ Test-That 'a registration whose process is not running is not reported live' {
 Test-That 'and a process with no registration of its own holds absence-based work' {
     (Get-FixtureDiagnosticCodes -Snapshot $unresolved) -contains 'UnaccountedProcess' -and -not $unresolved.Complete
 } "codes: $((Get-FixtureDiagnosticCodes -Snapshot $unresolved) -join ', ')"
+
+# ------------------------------------------------- an embedded, headless CLI ----
+
+Write-Host ''
+Write-Host 'An agent CLI embedded in another app'
+
+# Microsoft Scout ships the Copilot CLI inside its own app and runs it headless, so
+# it carries no --session-id and writes no lock. Nothing can ever account for it, and
+# demanding a session for it held retirement, startup cleanup and every launch on
+# DSWETT-DEV-VM1 for a whole day while a dead card stayed on the dashboard.
+Reset-FixtureState -Kinds @('copilot')
+$script:ProcessesByAgent = @{ copilot = @([pscustomobject]@{ Id = 22400 }) }
+$script:CommandLines = @{ 22400 = '"C:\Apps\Scout\copilot.exe" --headless --no-auto-update --log-level info --stdio' }
+$headless = Get-DaemonSessionDiscovery
+
+Test-That 'an embedded headless CLI does not have to belong to a session' {
+    $headless.Complete -and (Get-FixtureDiagnosticCodes -Snapshot $headless) -notcontains 'UnaccountedProcess'
+} "complete=$($headless.Complete) codes: $((Get-FixtureDiagnosticCodes -Snapshot $headless) -join ', ')"
+
+Reset-FixtureState -Kinds @('copilot')
+$script:ProcessesByAgent = @{ copilot = @([pscustomobject]@{ Id = 22401 }) }
+$script:CommandLines = @{ 22401 = '"C:\Users\u\.copilot-cli\copilot.exe" --banner --allow-all' }
+$ordinary = Get-DaemonSessionDiscovery
+
+Test-That 'while an ordinary session process with no session still holds it' {
+    -not $ordinary.Complete -and (Get-FixtureDiagnosticCodes -Snapshot $ordinary) -contains 'UnaccountedProcess'
+} "codes: $((Get-FixtureDiagnosticCodes -Snapshot $ordinary) -join ', ')"
+
+# A session asked about this very bug carries the word in its prompt. Reading that as
+# the option would excuse a real session and let absence-based work retire it while it
+# was still working.
+Reset-FixtureState -Kinds @('copilot')
+$script:ProcessesByAgent = @{ copilot = @([pscustomobject]@{ Id = 22404 }) }
+$script:CommandLines = @{ 22404 = '"copilot.exe" --session-id 11111111-1111-4111-8111-111111111111 -i "why does --headless stall discovery"' }
+$prompted = Get-DaemonSessionDiscovery
+
+Test-That 'the word in a quoted prompt is text, not the option' {
+    -not $prompted.Complete -and (Get-FixtureDiagnosticCodes -Snapshot $prompted) -contains 'UnaccountedProcess'
+} "codes: $((Get-FixtureDiagnosticCodes -Snapshot $prompted) -join ', ')"
+
+# And a session always carries its id, which settles it even unquoted.
+Reset-FixtureState -Kinds @('copilot')
+$script:ProcessesByAgent = @{ copilot = @([pscustomobject]@{ Id = 22405 }) }
+$script:CommandLines = @{ 22405 = '"copilot.exe" --session-id=11111111-1111-4111-8111-111111111111 --headless' }
+$identified = Get-DaemonSessionDiscovery
+
+Test-That 'a process that names a session of its own is never embedded' {
+    -not $identified.Complete -and (Get-FixtureDiagnosticCodes -Snapshot $identified) -contains 'UnaccountedProcess'
+} "codes: $((Get-FixtureDiagnosticCodes -Snapshot $identified) -join ', ')"
+
+Reset-FixtureState -Kinds @('copilot')
+$script:ProcessesByAgent = @{ copilot = @([pscustomobject]@{ Id = 22402 }) }
+$script:CommandLineState = 'Unknown'
+$script:CommandLines = @{ 22402 = '' }
+$unreadable = Get-DaemonSessionDiscovery
+
+Test-That 'and an unreadable command line is not permission to excuse a process' {
+    -not $unreadable.Complete -and (Get-FixtureDiagnosticCodes -Snapshot $unreadable) -contains 'UnaccountedProcess'
+} "codes: $((Get-FixtureDiagnosticCodes -Snapshot $unreadable) -join ', ')"
+
+Reset-FixtureState -Kinds @('copilot')
+$script:ProcessesByAgent = @{ copilot = @([pscustomobject]@{ Id = 22403 }) }
+$script:CommandLineState = 'Absent'
+$departed = Get-DaemonSessionDiscovery
+
+Test-That 'a process that exits mid-check is absence, not uncertainty' {
+    $departed.Complete -and (Get-FixtureDiagnosticCodes -Snapshot $departed) -notcontains 'UnaccountedProcess'
+} "complete=$($departed.Complete) codes: $((Get-FixtureDiagnosticCodes -Snapshot $departed) -join ', ')"
+
+$script:CommandLineState = 'Readable'
 
 # ------------------------------------------------------- an adapter not there ----
 
