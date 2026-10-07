@@ -177,25 +177,58 @@ class AgentBridgeReplyCard extends HTMLElement {
   }
 
   /*
-   * Whether anything is typed or attached that has not been published yet.
+   * Whether the box holds typed words a form could use as its free-text field.
    *
-   * Asked by the choices card before it presses submit: what this answers decides
-   * whether the form is about to be sent with its free-text field empty.
+   * Attachments deliberately do not count. Read-DaemonDecisionCardText discards any
+   * payload carrying images or files - an image cannot be typed into an arrow-key
+   * prompt, and consuming it there would destroy it - so publishing one on a form's
+   * behalf would submit the field empty anyway and leave the attachment to arrive
+   * afterwards as a stray reply.
    */
-  hasUnsentContent() {
+  hasUnsentFormText() {
     if (!this._built || !this._els || !this._els.textarea) { return false; }
-    return this._els.textarea.value.trim().length > 0 ||
-      this._images.length > 0 || this._files.length > 0;
+    return this._els.textarea.value.trim().length > 0;
   }
 
   /*
-   * Publish whatever is sitting in the box, for a sender other than this card's own
-   * Send. Resolves true when there was nothing to publish, so a caller can treat
-   * "nothing typed" and "published" alike - both mean it is safe to submit.
+   * Publish just the typed words, for a form being submitted from the choices card.
+   *
+   * Anything attached stays in the box on purpose: the reply path stages and
+   * delivers it properly once the question is gone, which is the only route that
+   * can carry it at all.
    */
-  publishPending() {
-    if (!this.hasUnsentContent()) { return Promise.resolve(true); }
-    return Promise.resolve(this._send());
+  async publishFormText() {
+    if (this._busy || !this.hasUnsentFormText()) { return false; }
+    const text = this._els.textarea.value;
+    this._busy = true;
+    this._syncSendState();
+    this._setStatus('Sending...', 'busy');
+    let published = false;
+    try {
+      await this._hass.callService('mqtt', 'publish', {
+        topic: this._config.topic,
+        payload: JSON.stringify({
+          at: new Date().toISOString(),
+          text: text,
+          images: [],
+          files: [],
+          card_version: CARD_VERSION,
+        }),
+        qos: 0,
+        retain: false,
+      });
+      // Only the words. Clearing the chips too would throw away an attachment the
+      // form never received and the reply path has not delivered yet.
+      this._els.textarea.value = '';
+      this._setStatus('Sent', 'ok');
+      published = true;
+    } catch (err) {
+      this._setStatus(`Send failed: ${err.message || err}`, 'err');
+    } finally {
+      this._busy = false;
+      this._syncSendState();
+    }
+    return published;
   }
 
   set hass(hass) {
@@ -560,11 +593,11 @@ class AgentBridgeReplyCard extends HTMLElement {
   }
 
   async _send() {
-    if (this._busy) { return false; }
+    if (this._busy) { return; }
     // Read straight from the element. This is the whole point of the card: the
     // value cannot be stale because nothing had to commit it first.
     const text = this._els.textarea.value;
-    if (!text.trim() && this._images.length === 0 && this._files.length === 0) { return false; }
+    if (!text.trim() && this._images.length === 0 && this._files.length === 0) { return; }
 
     this._busy = true;
     this._syncSendState();
@@ -578,10 +611,6 @@ class AgentBridgeReplyCard extends HTMLElement {
       card_version: CARD_VERSION,
     };
 
-    // Reported so a caller that is about to submit a form can tell a publish that
-    // landed from one that did not. Pressing submit after a failed publish is how
-    // the typed answer went missing in the first place.
-    let published = false;
     try {
       await this._hass.callService('mqtt', 'publish', {
         topic: this._config.topic,
@@ -594,7 +623,6 @@ class AgentBridgeReplyCard extends HTMLElement {
       this._files = [];
       this._renderChips();
       this._setStatus('Sent', 'ok');
-      published = true;
     } catch (err) {
       // Keep the text: losing a long reply because the publish failed would be
       // far worse than an error message.
@@ -603,7 +631,6 @@ class AgentBridgeReplyCard extends HTMLElement {
       this._busy = false;
       this._syncSendState();
     }
-    return published;
   }
 }
 
@@ -1507,8 +1534,7 @@ class AgentBridgeChoicesCard extends HTMLElement {
     // drawn disabled for this too, but a press can arrive from a keyboard or a stale
     // click, and sending a choice nobody made here is exactly what must not happen.
     if (this._note === CHOICE_CHANGED_NOTE) { return; }
-    const generation = String(
-      ((this._hass.states[this._config.decision] || {}).attributes || {}).decision_id || '');
+    const generation = this._generationNow();
     // Frozen as the press is dispatched, not when Home Assistant acknowledges it.
     // callService is a promise, and a tap landing while it was in flight reached the
     // selector before the daemon read it - so the daemon submitted the changed value
@@ -1526,19 +1552,34 @@ class AgentBridgeChoicesCard extends HTMLElement {
     // empty, and an empty free-text field is a valid answer, so the form went to the
     // session with the typed words silently dropped (#93).
     const reply = REPLY_CARDS.get(String(this._config.reply_topic || ''));
-    if (reply && reply.hasUnsentContent()) {
-      reply.publishPending().then(
+    if (reply && reply.hasUnsentFormText()) {
+      reply.publishFormText().then(
         (published) => {
           // Only on a publish that landed. Submitting after a failed one is exactly
           // the loss this exists to prevent, and the reply card keeps the text so it
           // can be sent again.
-          if (published) { this._pressSubmit(); }
-          else { this._failSend(new Error('the reply box could not be sent - try again')); }
+          if (!published) {
+            this._failSend(new Error('the reply box could not be sent - try again'));
+            return;
+          }
+          // And only if this is still the same question. A publish is a round trip,
+          // and the terminal or another dashboard can answer the old question inside
+          // it - pressing the session's submit button then sends a replacement form
+          // nobody here filled in.
+          if (this._generationNow() !== generation) {
+            this._failSend(new Error('the question changed - check it and send again'));
+            return;
+          }
+          this._pressSubmit();
         },
         (err) => this._failSend(err));
       return;
     }
     this._pressSubmit();
+  }
+
+  _generationNow() {
+    return String(((this._hass.states[this._config.decision] || {}).attributes || {}).decision_id || '');
   }
 
   _pressSubmit() {

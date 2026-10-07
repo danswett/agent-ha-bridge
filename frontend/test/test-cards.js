@@ -1687,8 +1687,9 @@ async function checkSendAnswerCarriesTypedText() {
   const TOPIC = 'copilot/cli/session/abc/replypayload';
   const FIELD = 'select.agent_bridge_abc_f1';
 
-  function mixed({ typed = '', publishFails = false, replyTopic = TOPIC } = {}) {
+  function mixed({ typed = '', publishFails = false, replyTopic = TOPIC, holdPublish = false, attach = false } = {}) {
     const calls = [];
+    let releasePublish = null;
     const states = {
       [DECISION]: {
         state: 'Awaiting answer...',
@@ -1701,6 +1702,9 @@ async function checkSendAnswerCarriesTypedText() {
       callService: (domain, service, data) => {
         calls.push({ domain, service, data });
         if (domain === 'mqtt' && publishFails) { return Promise.reject(new Error('refused')); }
+        if (domain === 'mqtt' && holdPublish) {
+          return new Promise((resolve) => { releasePublish = resolve; });
+        }
         return Promise.resolve();
       },
     };
@@ -1708,13 +1712,14 @@ async function checkSendAnswerCarriesTypedText() {
     reply.setConfig({ topic: TOPIC });
     reply.hass = hass;
     reply._els.textarea.value = typed;
+    if (attach) { reply._images = [{ id: 'img1', name: 'shot.png', content_type: 'image/png' }]; }
 
     const config = { decision: DECISION, fields: [FIELD], submit: SUBMIT };
     if (replyTopic) { config.reply_topic = replyTopic; }
     const choices = new AgentBridgeChoicesCard();
     choices.setConfig(config);
     choices.hass = hass;
-    return { calls, reply, choices };
+    return { calls, reply, choices, states, release: () => releasePublish && releasePublish() };
   }
 
   const press = (c) => buttons(c).find((b) => b.textContent === 'Send answer').click();
@@ -1775,6 +1780,35 @@ async function checkSendAnswerCarriesTypedText() {
   await flush();
   check('a reply card that goes away does not unregister the one that replaced it',
     domains(second) === 'mqtt,button', domains(second));
+
+  // An attachment cannot be typed into an arrow-key prompt, and
+  // Read-DaemonDecisionCardText discards any payload carrying one - so publishing it
+  // on the form's behalf would submit the field empty anyway and leave the image to
+  // turn up afterwards as a stray reply. Only the words go.
+  m = mixed({ typed: 'and the log is attached', attach: true });
+  press(m.choices);
+  await flush();
+  check('an attachment is left out of the payload the form is answered with',
+    (published(m) || {}).images && published(m).images.length === 0, JSON.stringify(published(m)));
+  check('while the words still reach the form',
+    (published(m) || {}).text === 'and the log is attached', JSON.stringify(published(m)));
+  check('and the attachment stays in the box for the reply path to deliver',
+    m.reply._images.length === 1, `${m.reply._images.length} image(s)`);
+  check('the form is still submitted', !!pressed(m), domains(m));
+
+  // A publish is a round trip. The terminal, or another dashboard, can answer the old
+  // question inside it - and the session's submit button belongs to whatever question
+  // is armed now, so pressing it then sends a form nobody here filled in.
+  m = mixed({ typed: 'slow one', holdPublish: true });
+  press(m.choices);
+  await flush();
+  m.states[DECISION].attributes.decision_id = 'd2';
+  m.release();
+  await flush();
+  check('a question that changed during the publish is not submitted',
+    m.calls.filter((c) => c.domain === 'button').length === 0, JSON.stringify(m.calls));
+  check('and the card says why rather than looking sent',
+    /question changed/.test(m.choices._note), m.choices._note);
 }
 
 // _launch awaits its service calls, so the checks that read them have to await it too.
