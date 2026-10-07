@@ -110,6 +110,24 @@ function describeThrown(err) {
   return String(err);
 }
 
+/*
+ * Every reply card on the page, by the MQTT topic it publishes to.
+ *
+ * The reply card and the choices card are separate custom elements sitting side by
+ * side in one session card, and on a mixed form only the reply card holds the typed
+ * words: they reach the daemon when - and only when - that card publishes them.
+ * "Send answer" pressed the submit entity and published nothing, so the daemon read
+ * no payload, fell back to a text entity the card never writes, and submitted the
+ * form with that field empty. An empty free-text field is a valid answer, so nothing
+ * refused it and the typed answer was simply gone (#93).
+ *
+ * They are siblings rather than ancestor and descendant, so a bubbling event cannot
+ * carry the words across and the DOM between them is Home Assistant's to arrange.
+ * The topic is already unique per session, which makes it the one name both cards
+ * can be given and agree on.
+ */
+const REPLY_CARDS = new Map();
+
 class AgentBridgeReplyCard extends HTMLElement {
   constructor() {
     super();
@@ -119,6 +137,7 @@ class AgentBridgeReplyCard extends HTMLElement {
     this._files = [];
     this._busy = false;
     this._statusTimer = null;
+    this._registeredTopic = '';
   }
 
   setConfig(config) {
@@ -126,9 +145,57 @@ class AgentBridgeReplyCard extends HTMLElement {
       throw new Error('agent-bridge-reply-card: "topic" is required');
     }
     this._config = Object.assign({ name: 'Reply', placeholder: 'Type a reply...' }, config);
+    this._register();
     if (this._built) {
       this._applyConfig();
     }
+  }
+
+  connectedCallback() {
+    this._register();
+  }
+
+  disconnectedCallback() {
+    // Only if it is still us. Home Assistant rebuilds a view by connecting the
+    // replacement before disconnecting the original, so deleting unconditionally
+    // removed the card that had just taken over and left the topic unclaimed.
+    if (this._registeredTopic && REPLY_CARDS.get(this._registeredTopic) === this) {
+      REPLY_CARDS.delete(this._registeredTopic);
+    }
+    this._registeredTopic = '';
+  }
+
+  _register() {
+    const topic = this._config ? String(this._config.topic || '') : '';
+    if (!topic) { return; }
+    if (this._registeredTopic && this._registeredTopic !== topic &&
+        REPLY_CARDS.get(this._registeredTopic) === this) {
+      REPLY_CARDS.delete(this._registeredTopic);
+    }
+    this._registeredTopic = topic;
+    REPLY_CARDS.set(topic, this);
+  }
+
+  /*
+   * Whether anything is typed or attached that has not been published yet.
+   *
+   * Asked by the choices card before it presses submit: what this answers decides
+   * whether the form is about to be sent with its free-text field empty.
+   */
+  hasUnsentContent() {
+    if (!this._built || !this._els || !this._els.textarea) { return false; }
+    return this._els.textarea.value.trim().length > 0 ||
+      this._images.length > 0 || this._files.length > 0;
+  }
+
+  /*
+   * Publish whatever is sitting in the box, for a sender other than this card's own
+   * Send. Resolves true when there was nothing to publish, so a caller can treat
+   * "nothing typed" and "published" alike - both mean it is safe to submit.
+   */
+  publishPending() {
+    if (!this.hasUnsentContent()) { return Promise.resolve(true); }
+    return Promise.resolve(this._send());
   }
 
   set hass(hass) {
@@ -493,11 +560,11 @@ class AgentBridgeReplyCard extends HTMLElement {
   }
 
   async _send() {
-    if (this._busy) { return; }
+    if (this._busy) { return false; }
     // Read straight from the element. This is the whole point of the card: the
     // value cannot be stale because nothing had to commit it first.
     const text = this._els.textarea.value;
-    if (!text.trim() && this._images.length === 0 && this._files.length === 0) { return; }
+    if (!text.trim() && this._images.length === 0 && this._files.length === 0) { return false; }
 
     this._busy = true;
     this._syncSendState();
@@ -511,6 +578,10 @@ class AgentBridgeReplyCard extends HTMLElement {
       card_version: CARD_VERSION,
     };
 
+    // Reported so a caller that is about to submit a form can tell a publish that
+    // landed from one that did not. Pressing submit after a failed publish is how
+    // the typed answer went missing in the first place.
+    let published = false;
     try {
       await this._hass.callService('mqtt', 'publish', {
         topic: this._config.topic,
@@ -523,6 +594,7 @@ class AgentBridgeReplyCard extends HTMLElement {
       this._files = [];
       this._renderChips();
       this._setStatus('Sent', 'ok');
+      published = true;
     } catch (err) {
       // Keep the text: losing a long reply because the publish failed would be
       // far worse than an error message.
@@ -531,6 +603,7 @@ class AgentBridgeReplyCard extends HTMLElement {
       this._busy = false;
       this._syncSendState();
     }
+    return published;
   }
 }
 
@@ -1447,6 +1520,28 @@ class AgentBridgeChoicesCard extends HTMLElement {
       this._last = '';
       this._render();
     }
+    // Whatever is typed in the reply box has to be published before submit is
+    // pressed. The daemon reads a form's free-text field out of that payload
+    // (Read-DaemonDecisionCardText); a press arriving without one left the field
+    // empty, and an empty free-text field is a valid answer, so the form went to the
+    // session with the typed words silently dropped (#93).
+    const reply = REPLY_CARDS.get(String(this._config.reply_topic || ''));
+    if (reply && reply.hasUnsentContent()) {
+      reply.publishPending().then(
+        (published) => {
+          // Only on a publish that landed. Submitting after a failed one is exactly
+          // the loss this exists to prevent, and the reply card keeps the text so it
+          // can be sent again.
+          if (published) { this._pressSubmit(); }
+          else { this._failSend(new Error('the reply box could not be sent - try again')); }
+        },
+        (err) => this._failSend(err));
+      return;
+    }
+    this._pressSubmit();
+  }
+
+  _pressSubmit() {
     let call;
     try { call = this._hass.callService('button', 'press', { entity_id: this._config.submit }); }
     catch (err) { this._failSend(err); return; }

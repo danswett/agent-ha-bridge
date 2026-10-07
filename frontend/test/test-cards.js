@@ -32,7 +32,7 @@ function cmpVersion(a, b) {
 // --- the card itself, in a DOM small enough to run it (card-harness.js) --------
 
 const { FakeElement, loadCards } = require('./card-harness');
-const { AgentBridgeChoicesCard, AgentBridgeSessionCard, AgentBridgeActivityCard, AgentBridgeUsageCard, CARD_VERSION, sandbox, source } = loadCards();
+const { AgentBridgeChoicesCard, AgentBridgeSessionCard, AgentBridgeActivityCard, AgentBridgeUsageCard, AgentBridgeReplyCard: SharedReplyCard, CARD_VERSION, sandbox, source } = loadCards();
 
 // --- the harness ------------------------------------------------------------------
 
@@ -1669,6 +1669,114 @@ async function checkIncompleteSendStaysLive() {
     JSON.stringify(calls));
 }
 
+/*
+ * Send answer, on a form that also takes typed words.
+ *
+ * Only the reply card holds what was typed, and the daemon reads a form's free-text
+ * field out of the payload that card publishes (Read-DaemonDecisionCardText). Send
+ * answer pressed the submit entity and published nothing, so the daemon found no
+ * payload, fell back to a text entity this card never writes, and submitted the form
+ * with the field empty - which it accepts, an empty free-text field being a valid
+ * answer. Nothing refused it and the typed words were simply gone (#93).
+ *
+ * Both cards come from the one sandbox on purpose: they find each other through a
+ * registry inside the module, so loading two copies would be two registries and the
+ * lookup under test would never happen.
+ */
+async function checkSendAnswerCarriesTypedText() {
+  const TOPIC = 'copilot/cli/session/abc/replypayload';
+  const FIELD = 'select.agent_bridge_abc_f1';
+
+  function mixed({ typed = '', publishFails = false, replyTopic = TOPIC } = {}) {
+    const calls = [];
+    const states = {
+      [DECISION]: {
+        state: 'Awaiting answer...',
+        attributes: { options: ['Awaiting answer...', 'Cancel request'], decision_id: 'd1', field_1_label: 'Colour' },
+      },
+      [FIELD]: { state: 'Red', attributes: { options: ['Choose...', 'Red', 'Blue'] } },
+    };
+    const hass = {
+      states,
+      callService: (domain, service, data) => {
+        calls.push({ domain, service, data });
+        if (domain === 'mqtt' && publishFails) { return Promise.reject(new Error('refused')); }
+        return Promise.resolve();
+      },
+    };
+    const reply = new SharedReplyCard();
+    reply.setConfig({ topic: TOPIC });
+    reply.hass = hass;
+    reply._els.textarea.value = typed;
+
+    const config = { decision: DECISION, fields: [FIELD], submit: SUBMIT };
+    if (replyTopic) { config.reply_topic = replyTopic; }
+    const choices = new AgentBridgeChoicesCard();
+    choices.setConfig(config);
+    choices.hass = hass;
+    return { calls, reply, choices };
+  }
+
+  const press = (c) => buttons(c).find((b) => b.textContent === 'Send answer').click();
+  const domains = (m) => m.calls.map((c) => c.domain).join(',');
+  // Read defensively: a regression here means the publish never happened, and a test
+  // that throws on the missing call reports nothing about the ones after it.
+  const published = (m) => {
+    const call = m.calls.find((c) => c.domain === 'mqtt');
+    if (!call || !call.data) { return null; }
+    try { return JSON.parse(call.data.payload); } catch (err) { return null; }
+  };
+  const pressed = (m) => m.calls.find((c) => c.domain === 'button') || null;
+
+  let m = mixed({ typed: 'and please restart it afterwards' });
+  press(m.choices);
+  await flush();
+  check('what is typed is published before the form is submitted', domains(m) === 'mqtt,button', domains(m));
+  check('and the payload carries the words themselves',
+    (published(m) || {}).text === 'and please restart it afterwards', JSON.stringify(published(m)));
+  check('on the topic both cards were given',
+    !!m.calls.find((c) => c.domain === 'mqtt' && c.data.topic === TOPIC), domains(m));
+  check('submit is still pressed, on the entity it was given',
+    !!pressed(m) && pressed(m).data.entity_id === SUBMIT, JSON.stringify(pressed(m)));
+  check('and the box is emptied, so the next question does not inherit the answer',
+    m.reply._els.textarea.value === '');
+
+  // The usual optional "anything else?", left blank. There is nothing to publish and
+  // an empty free-text field is a valid answer, so this must stay a single press.
+  m = mixed({ typed: '' });
+  press(m.choices);
+  await flush();
+  check('an empty box publishes nothing and goes straight to submit', domains(m) === 'button', domains(m));
+
+  // Pressing submit after a publish that did not land is the original bug exactly:
+  // the form would go without the words, and nothing anywhere would say so.
+  m = mixed({ typed: 'important', publishFails: true });
+  press(m.choices);
+  await flush();
+  check('a publish that fails does not go on to submit the form',
+    m.calls.filter((c) => c.domain === 'button').length === 0, JSON.stringify(m.calls));
+  check('the words are kept, so they can be sent again', m.reply._els.textarea.value === 'important');
+  check('the card says so rather than looking sent', /Send failed/.test(m.choices._note), m.choices._note);
+  check('and its rows are released, so Send can be pressed again', m.choices._committed === false);
+
+  // A dashboard generated for an older card hands over no topic at all. That card
+  // must behave exactly as it did rather than refusing to send.
+  m = mixed({ typed: 'typed anyway', replyTopic: '' });
+  press(m.choices);
+  await flush();
+  check('with no reply topic the card presses submit as it always did', domains(m) === 'button', domains(m));
+
+  // Home Assistant rebuilds a view by connecting the replacement before disconnecting
+  // the original, so an unconditional delete removed the card that had just taken over.
+  const first = mixed({ typed: 'first' });
+  const second = mixed({ typed: 'second' });
+  first.reply.disconnectedCallback();
+  press(second.choices);
+  await flush();
+  check('a reply card that goes away does not unregister the one that replaced it',
+    domains(second) === 'mqtt,button', domains(second));
+}
+
 // _launch awaits its service calls, so the checks that read them have to await it too.
 (async () => {
   await checkForgetRemoval();
@@ -1679,6 +1787,7 @@ async function checkIncompleteSendStaysLive() {
   await checkFrozenWhilePressInFlight();
   await checkRefusedSendReleases();
   await checkIncompleteSendStaysLive();
+  await checkSendAnswerCarriesTypedText();
 
   const pubEnv = launchEnv({});
   const pubCard = promptCard(pubEnv, { promptTopic: PROMPT_TOPIC });

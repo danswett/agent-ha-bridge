@@ -6,14 +6,14 @@
 #>
 
 . (Join-Path $PSScriptRoot 'bridge-secrets.ps1')
-# 1.3.0, not 1.2.0: Save-CopilotSessionDashboard is one of the helpers
-# Get-BridgeRenderArtifact fingerprints, and it now emits the usage card above the
-# session controls, with a standard-card fallback below them for a browser served an
-# older card. Left at 1.2.0 the fence sees a new hash at the same version, which is
-# the definition of a conflict there - so on any installation already fenced at the
-# old renderer, publication is refused and the usage card can never reach the
-# dashboard without an operator pin nobody should have to take.
-$script:BridgeDashboardRenderVersion = '1.3.0'
+# 1.4.0, not 1.3.0: Save-CopilotSessionDashboard is one of the helpers
+# Get-BridgeRenderArtifact fingerprints, and it now hands the choices card the reply
+# box's topic so Send answer can publish what was typed before submitting (#93).
+# Left at 1.3.0 the fence sees a new hash at the same version, which is the
+# definition of a conflict there - so on any installation already fenced at the old
+# renderer, publication is refused and the fix can never reach the dashboard without
+# an operator pin nobody should have to take.
+$script:BridgeDashboardRenderVersion = '1.4.0'
 $script:BridgeDashboardObservation = $null
 
 function Invoke-CopilotHaWebSocket {
@@ -2188,6 +2188,14 @@ ha-select, mwc-select { width: 100%; }
                 )
             }
             if ($cardOwnsSend) { $answerInner.submit = "button.${node}_submit" }
+            # From 1.26.0 Send answer publishes the reply box before pressing submit,
+            # so a mixed form no longer reaches the session with its typed field
+            # dropped (#93). The topic is the only name both cards share, and is how
+            # the choices card finds the reply card beside it. An older card does not
+            # know the key and ignores it.
+            if (Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.26.0') {
+                $answerInner.reply_topic = (Get-CopilotMqttReplyPayloadTopic -Node $node)
+            }
         }
         $answerConditions = @(
             @{ condition = 'state'; entity = $decisionEntity; state_not = 'Idle' }
