@@ -2807,6 +2807,39 @@ if (-not ($selectedClients -contains 'copilot') -and (Test-Path -LiteralPath $ag
     }
 }
 
+# --------------------------------------------------------- configure adapters
+# Claude, Codex and the MCP server reuse the shared layer just installed, so configure
+# them by running their own installers. Each is idempotent and warns rather than fails
+# if the client turns out not to be present.
+#
+# Before the daemon starts, not after. The adapters are dot-sourced into the daemon at
+# startup, so a daemon started first holds the *previous* adapter's functions while the
+# files change underneath it - and keeps holding them until something restarts it. On
+# 2026-10-06 that shipped in 1.33.0, where the core began calling
+# Get-BridgeAgentProcesses -AsObservation: every machine that updated lost all session
+# discovery, reporting only a swallowed "AdapterReadFailed", until its daemon happened
+# to restart.
+foreach ($client in @('claude', 'codex', 'mcp')) {
+    $removing = $persistedClients -contains $client -and $selectedClients -notcontains $client
+    if ($selectedClients -notcontains $client -and -not $removing) { continue }
+    $adapterInstaller = Join-Path $repoRoot "$client\install-$client.ps1"
+    if (-not (Test-Path -LiteralPath $adapterInstaller)) {
+        Write-Warning "The $($script:ClientLabels[$client]) installer was not found at $adapterInstaller; skipping."
+        continue
+    }
+    Write-Step "Configuring $($script:ClientLabels[$client])"
+    try {
+        $adapterArgs = @{ InstallRoot = $bridgeHome }
+        if ($installContext.Isolated) { $adapterArgs.TargetHome = $installHome }
+        if ($removing) { $adapterArgs.Uninstall = $true }
+        & $adapterInstaller @adapterArgs
+    }
+    catch {
+        if ($removing) { throw "The $client adapter could not be removed; its remaining registration requires cleanup before reconfiguration can complete." }
+        Write-Warning "$($script:ClientLabels[$client]) did not configure cleanly: $($_.Exception.Message)"
+    }
+}
+
 # ------------------------------------------------------------- scheduled task
 $taskRegistered = $false
 if (-not $SkipTask -and -not $script:BridgeIsWindows) {
@@ -2919,31 +2952,6 @@ elseif ($script:BridgeIsWindows -and -not $installContext.Isolated) {
     # Turned off, or never on: a task left by an earlier run would keep delaying the
     # stop forever with nothing in the config to explain why.
     Stop-BridgeOwnedService -Context $installContext -Roles devbox-keepawake -Remove
-}
-
-# --------------------------------------------------------- configure adapters
-# Claude, Codex and the MCP server reuse the shared layer just installed, so configure
-# them by running their own installers. Each is idempotent and warns rather than fails
-# if the client turns out not to be present.
-foreach ($client in @('claude', 'codex', 'mcp')) {
-    $removing = $persistedClients -contains $client -and $selectedClients -notcontains $client
-    if ($selectedClients -notcontains $client -and -not $removing) { continue }
-    $adapterInstaller = Join-Path $repoRoot "$client\install-$client.ps1"
-    if (-not (Test-Path -LiteralPath $adapterInstaller)) {
-        Write-Warning "The $($script:ClientLabels[$client]) installer was not found at $adapterInstaller; skipping."
-        continue
-    }
-    Write-Step "Configuring $($script:ClientLabels[$client])"
-    try {
-        $adapterArgs = @{ InstallRoot = $bridgeHome }
-        if ($installContext.Isolated) { $adapterArgs.TargetHome = $installHome }
-        if ($removing) { $adapterArgs.Uninstall = $true }
-        & $adapterInstaller @adapterArgs
-    }
-    catch {
-        if ($removing) { throw "The $client adapter could not be removed; its remaining registration requires cleanup before reconfiguration can complete." }
-        Write-Warning "$($script:ClientLabels[$client]) did not configure cleanly: $($_.Exception.Message)"
-    }
 }
 
 # ----------------------------------------------------- the bridge command

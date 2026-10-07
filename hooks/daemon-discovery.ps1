@@ -395,6 +395,10 @@ function Update-DaemonOwnerCatalogue {
     $script:DaemonOwnerCatalogue = $bounded
 }
 
+# The adapter failures already reported, keyed by adapter and message, so a reason is
+# logged once rather than on every reconcile.
+$script:DaemonAdapterFailureReported = @{}
+
 function Get-DaemonSessionDiscovery {
     param([hashtable]$State = @{})
     $live = @{}
@@ -457,6 +461,16 @@ function Get-DaemonSessionDiscovery {
         }
         catch {
             if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+            # Say what actually failed. "AdapterReadFailed" on its own cost an hour on
+            # 2026-10-06: an adapter left behind by an update was shadowing
+            # Get-BridgeAgentProcesses, so every adapter threw on an unknown
+            # -AsObservation, and the log reported only that discovery was uncertain.
+            $reason = [string]$_.Exception.Message
+            $reportKey = "$kind|$reason"
+            if (-not $script:DaemonAdapterFailureReported.ContainsKey($reportKey)) {
+                $script:DaemonAdapterFailureReported[$reportKey] = $true
+                try { Write-DaemonLog -Message "adapter $kind could not be read: $reason" } catch { }
+            }
             $issues.Add([pscustomobject]@{ Kind = $kind; Path = ''; Code = 'AdapterReadFailed' })
         }
     }

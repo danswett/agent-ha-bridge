@@ -1453,6 +1453,40 @@ finally {
     $script:BridgeInstallContext = $savedEntityContext
 }
 
+Write-Host '--- an update leaves the daemon running the adapters it just installed ---'
+# install.ps1 started the daemon and *then* ran the adapter installers. The daemon
+# dot-sources the adapters at startup, so it held the previous adapter's functions
+# while the files changed underneath it, and kept holding them until something
+# restarted it. 1.33.0 shipped that: the core began calling
+# Get-BridgeAgentProcesses -AsObservation, and every machine that updated lost all
+# session discovery, reporting only a swallowed "AdapterReadFailed".
+$installSource = [IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\install.ps1'))
+$adapterMarker = $installSource.IndexOf('# --------------------------------------------------------- configure adapters')
+$windowsStart = $installSource.IndexOf('Start-ScheduledTask -TaskName $taskName')
+$macStart = $installSource.IndexOf('Register-BridgeLaunchAgent -Label')
+Test-That 'the adapters are configured before anything starts the daemon' {
+    $adapterMarker -gt 0 -and $windowsStart -gt 0 -and $macStart -gt 0 -and
+        $adapterMarker -lt $windowsStart -and $adapterMarker -lt $macStart
+} "adapters=$adapterMarker windows=$windowsStart macOS=$macStart"
+
+Write-Host '--- the Codex adapter is refreshed even when its CLI cannot be reached ---'
+# install-codex.ps1 asked Codex for its marketplace listing before copying the adapter
+# in. A legacy registration left behind by the rename made that exit 1, so the copy
+# never happened, install.ps1 only warned, and the adapter left in place shadowed the
+# core's bridge-platform.ps1 - breaking discovery for every adapter, not just Codex.
+$codexSource = [IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\codex\install-codex.ps1'))
+$codexOwnership = $codexSource.IndexOf("`nAssert-BridgeCodexOwnership")
+$codexCopy = $codexSource.IndexOf('Write-Step "Installing the adapter into $pluginRoot"')
+$codexListing = $codexSource.IndexOf('$existingMarketplace = Get-BridgeCodexMarketplace')
+$codexCliGuard = $codexSource.IndexOf("throw 'Codex CLI was not found")
+Test-That 'the adapter files are copied before the Codex CLI is asked anything' {
+    $codexCopy -gt 0 -and $codexListing -gt 0 -and $codexCliGuard -gt 0 -and
+        $codexCopy -lt $codexListing -and $codexCopy -lt $codexCliGuard
+} "copy=$codexCopy listing=$codexListing cliGuard=$codexCliGuard"
+Test-That 'but never before this installation is confirmed to own the Codex home' {
+    $codexOwnership -gt 0 -and $codexOwnership -lt $codexCopy
+} "ownership=$codexOwnership copy=$codexCopy"
+
 Write-Host ''
 if ($script:Failures) {
     Write-Host "$($script:Failures) check(s) failed" -ForegroundColor Red
