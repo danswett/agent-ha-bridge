@@ -2606,6 +2606,27 @@ if ($isDevBox) {
     Write-Host "    Dev Box      : $(if ($devBoxDecision.Enabled) { "keep-awake on - '$devBoxTaskName' every ${devBoxIntervalMinutes}m" } else { "keep-awake off ($($devBoxDecision.Reason))" })"
 }
 
+# ------------------------------------------------------------- session sharing
+# After the config is written, not before: the step runs as its own process against the
+# installed hooks and writes the fleet secret into the file itself, so nothing here can
+# overwrite it afterwards. Asked every interactive run, with the current answer as the
+# default, and skipped for an unattended or sandboxed install - pairing needs a person
+# to type a code. See docs/fleet-pairing.md.
+$pairingEntry = Join-Path $hooksDir 'bridge-pairing-entry.ps1'
+if ($homeAssistantReady -and -not $NonInteractive -and -not ($installContext -and $installContext.Isolated) -and
+    (Test-BridgeConsoleInteractive) -and (Test-Path -LiteralPath $pairingEntry)) {
+    $pairingPwsh = Join-Path $PSHOME $(if ($script:BridgeIsWindows) { 'pwsh.exe' } else { 'pwsh' })
+    $previousConfigEnv = $env:AGENT_HA_BRIDGE_CONFIG
+    $env:AGENT_HA_BRIDGE_CONFIG = $configPath
+    try {
+        & $pairingPwsh -NoProfile -File $pairingEntry -Configure
+        if ($LASTEXITCODE -ne 0) {
+            Write-Warning 'Session sharing was not set up. Run agent-ha-bridge pair when you are ready.'
+        }
+    }
+    finally { $env:AGENT_HA_BRIDGE_CONFIG = $previousConfigEnv }
+}
+
 function Get-BridgeInstallAgentIdentityWarning {
     <#
         Why an agent-driven session could never be marked as one, or '' when it can.

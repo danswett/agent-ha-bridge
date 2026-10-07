@@ -422,6 +422,18 @@ function Sync-DaemonSessions {
         }
     }
     Publish-DaemonOnlineHeartbeat -Headers $Headers
+    # Outside the discovery gate: pairing is about this machine, not its sessions, so an
+    # incomplete session view is no reason to keep a person waiting at a code prompt.
+    if (Get-Command Invoke-DaemonPairingRequest -ErrorAction SilentlyContinue) {
+        try {
+            $pairing = Invoke-DaemonPairingRequest -Headers $Headers
+            if ($pairing -notin @('idle', 'not-ours', 'running')) { Write-DaemonLog -Message "pairing: $pairing" }
+        }
+        catch {
+            if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+            Write-DaemonLog -Message "pairing check failed: $($_.Exception.Message)"
+        }
+    }
     $dashboardCurrent = if ($Discovery.Complete) {
         Sync-DaemonDashboard -Descriptors $descriptors -Capabilities $capabilities -Headers $Headers
     } else {
@@ -846,6 +858,12 @@ function Get-DaemonLaunchCapabilities {
         # a release is cut, so without this a machine running the source and one
         # running the release show the same number while being days apart.
         dev        = [bool](Get-BridgeSetting 'updates.installedFromSource' $false)
+        # The fleet this machine can let others into. Only a machine holding both the
+        # secret and a fleet id reports one, so a joiner never picks a sponsor that
+        # cannot answer. The id is public; the secret never travels here.
+        fleet      = $(if (Get-Command Get-BridgeFleetMembership -ErrorAction SilentlyContinue) {
+                $m = Get-BridgeFleetMembership; if ($m.Member) { $m.FleetId } else { '' }
+            } else { '' })
     }
 }
 
@@ -890,6 +908,7 @@ function Publish-DaemonGlobalStatus {
 
     $globalSignature = (($Descriptors | ForEach-Object { "$($_.Node)=$($_.Name)=$($_.Machine)" }) -join '|') +
         "#$($Capabilities.newSession)$($Capabilities.profile)$($Capabilities.resume)$($Capabilities.agent)$($Capabilities.tuning)$($Capabilities.detailed)$($Capabilities.dev)" +
+        "#fleet=$(if ($Capabilities.ContainsKey('fleet')) { $Capabilities.fleet } else { '' })" +
         "#$resumeSignature"
     $globalStale = ([DateTimeOffset]::Now - $script:DaemonGlobalLastPublish).TotalSeconds -ge $script:DaemonConfig.GlobalReassertSeconds
     if ($globalSignature -ne $script:DaemonGlobalSignature -or $globalStale) {

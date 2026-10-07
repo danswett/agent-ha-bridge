@@ -51,6 +51,8 @@ $ErrorActionPreference = 'Stop'
 . (Join-Path $PSScriptRoot 'decision-inject.ps1')
 . (Join-Path $PSScriptRoot 'bridge-update.ps1')
 . (Join-Path $PSScriptRoot 'session-launch.ps1')
+. (Join-Path $PSScriptRoot 'bridge-pairing.ps1')
+. (Join-Path $PSScriptRoot 'bridge-pairing-io.ps1')
 # What the hooks do, for events the native hook spools here (daemon-hookspool.ps1).
 . (Join-Path $PSScriptRoot 'bridge-adapter.ps1')
 . (Join-Path $PSScriptRoot 'copilot-hooks.ps1')
@@ -669,6 +671,7 @@ function Initialize-DaemonStartup {
         }
     }
     catch { Write-DaemonLog -Message "could not provision the Detailed activity switch: $($_.Exception.Message)" }
+
     $script:DaemonVerbose = Test-VerboseStreaming
 
     # Sweep the entities published under the old `copilot_cli_*` / `copilot_<hex>`

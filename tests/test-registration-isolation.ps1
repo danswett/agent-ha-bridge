@@ -275,6 +275,13 @@ function Invoke-RestMethod {
         }
         if ($Method -ceq 'Get' -and $Uri.StartsWith('http://publication.invalid:8123/api/states/', [StringComparison]::Ordinal)) {
             $id = $Uri.Substring('http://publication.invalid:8123/api/states/'.Length)
+            # Every reconcile reads the pairing helper (docs/fleet-pairing.md). Answered
+            # here rather than seeded into A14States, which the state-list reads return
+            # whole: the helper's id begins agent_bridge_, so seeding it would change what
+            # those reads count. Empty is what it holds whenever no pairing is under way.
+            if ($id -ceq 'input_text.agent_bridge_pairing') {
+                return [pscustomobject]@{ entity_id = $id; state = ''; attributes = [pscustomobject]@{} }
+            }
             if (-not $script:A14States.ContainsKey($id)) { Stop-A14Boundary 'unlisted state read' -Shape $shape }
             return $script:A14States[$id]
         }
