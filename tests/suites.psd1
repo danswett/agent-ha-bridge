@@ -10,6 +10,7 @@
         'tests\test-copilot-activity.ps1'
         'tests\test-daemon-agents.ps1'
         'tests\test-daemon-decisions.ps1'
+        'tests\test-daemon-discovery.ps1'
         'tests\test-daemon-loop.ps1'
         'tests\test-daemon-replies.ps1'
         'tests\test-daemon-sessions.ps1'
