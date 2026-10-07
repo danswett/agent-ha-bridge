@@ -98,7 +98,7 @@ console.log('--- answering ---');
 const SUBMIT = 'button.agent_bridge_abc_submit';
 const CANCEL_ROW = 'Cancel request';
 
-function hassFor(state, options, { defer = false, reject = false, attrs = undefined } = {}) {
+function hassFor(state, options, { defer = false, reject = false, rejectButton = false, attrs = undefined } = {}) {
   const calls = [];
   const base = options === undefined ? {} : { options };
   const states = { [DECISION]: { state, attributes: Object.assign(base, attrs || {}) } };
@@ -120,6 +120,7 @@ function hassFor(state, options, { defer = false, reject = false, attrs = undefi
       callService: (domain, service, data) => {
         calls.push({ domain, service, data });
         if (reject) { return Promise.reject(new Error('not allowed')); }
+        if (rejectButton && domain === 'button') { return Promise.reject(new Error('not allowed')); }
         if (!defer && domain === 'select') {
           if (states[data.entity_id]) { states[data.entity_id].state = data.option; }
           env.card.hass = env.hass;
@@ -1482,6 +1483,52 @@ async function checkFrozenAfterSend() {
     next.calls.length === 1 && next.calls[0].data.option === 'Another question', JSON.stringify(next.calls));
 }
 
+async function checkFrozenWhilePressInFlight() {
+  // callService is a promise. Freezing only when it resolved left a window in which a
+  // tap reached the selector before the daemon read it, so the daemon submitted the
+  // changed value against a press made for the previous one - and the freeze then
+  // arrived too late and locked in what had already been changed.
+  const c = newCard(undefined, SUBMIT);
+  const e = hassFor('Awaiting answer...', ['Awaiting answer...', 'Yes - reboot now', 'No - leave it', 'Cancel request']);
+  e.card = c;
+  c.hass = e.hass;
+  rows(c)[0].click();
+  await flush();
+  e.calls.length = 0;
+  buttons(c).find((b) => b.textContent === 'Send answer').click();
+  // Deliberately not awaited: the press is dispatched and not yet acknowledged.
+  rows(c)[1].click();
+  check('a row tapped while the press is still in flight sets nothing',
+    e.calls.filter((x) => x.domain === 'select').length === 0, JSON.stringify(e.calls));
+  check('so the only thing sent is the press itself',
+    e.calls.length === 1 && e.calls[0].domain === 'button', JSON.stringify(e.calls));
+  await flush();
+  check('and the rows are still frozen once it is acknowledged',
+    c.shadowRoot.querySelector('.choices').classList.contains('sending'));
+}
+
+async function checkRefusedSendReleases() {
+  // Nothing was sent, so the form has to come back - otherwise a refused press would
+  // leave a question that can never be answered from the card again.
+  const c = newCard(undefined, SUBMIT);
+  const e = hassFor('Awaiting answer...', ['Awaiting answer...', 'Yes - reboot now', 'Cancel request'],
+    { rejectButton: true });
+  e.card = c;
+  c.hass = e.hass;
+  rows(c)[0].click();
+  await flush();
+  e.calls.length = 0;
+  buttons(c).find((b) => b.textContent === 'Send answer').click();
+  await flush();
+  check('a press Home Assistant refuses says so', labels(c).some((l) => l.startsWith('Send failed:')),
+    labels(c).join('|'));
+  check('and unfreezes the rows, because nothing was sent',
+    !c.shadowRoot.querySelector('.choices').classList.contains('sending'));
+  e.calls.length = 0;
+  rows(c)[1].click();
+  check('so the answer can still be changed', e.calls.length === 1, JSON.stringify(e.calls));
+}
+
 async function checkIncompleteSendStaysLive() {
   // The daemon refuses an incomplete form and names the field it is waiting on, so
   // freezing one would leave no way to go and answer it.
@@ -1526,6 +1573,8 @@ async function checkIncompleteSendStaysLive() {
   await checkUnconfirmedTap();
   await checkRefusedSelection();
   await checkFrozenAfterSend();
+  await checkFrozenWhilePressInFlight();
+  await checkRefusedSendReleases();
   await checkIncompleteSendStaysLive();
 
   const pubEnv = launchEnv({});

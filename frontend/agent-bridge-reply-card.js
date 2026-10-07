@@ -1436,34 +1436,25 @@ class AgentBridgeChoicesCard extends HTMLElement {
     if (this._note === CHOICE_CHANGED_NOTE) { return; }
     const generation = String(
       ((this._hass.states[this._config.decision] || {}).attributes || {}).decision_id || '');
-    const complete = this._complete;
+    // Frozen as the press is dispatched, not when Home Assistant acknowledges it.
+    // callService is a promise, and a tap landing while it was in flight reached the
+    // selector before the daemon read it - so the daemon submitted the changed value
+    // against a press made for the previous one, and the freeze then arrived too late
+    // and locked in what had already been changed.
+    if (this._complete) {
+      this._committed = true;
+      this._committedAt = generation;
+      this._last = '';
+      this._render();
+    }
     let call;
     try { call = this._hass.callService('button', 'press', { entity_id: this._config.submit }); }
     catch (err) { this._failSend(err); return; }
-    if (call && typeof call.then === 'function') {
-      call.then(() => this._commitSend(generation, complete), (err) => this._failSend(err));
-    }
-  }
-
-  /*
-   * Freezes the rows once Home Assistant has taken the press.
-   *
-   * Only for a form the daemon will actually accept. An incomplete one is refused
-   * with the field it is waiting on named, and freezing that would leave no way to go
-   * and answer it - while a complete one is going to be read exactly as it stands, so
-   * a row changed between the press and the daemon's sweep would be sent against a
-   * press nobody made for it.
-   */
-  _commitSend(generation, complete) {
-    if (!complete) { return; }
-    this._committed = true;
-    this._committedAt = generation;
-    this._last = '';
-    this._render();
+    if (call && typeof call.then === 'function') { call.then(() => {}, (err) => this._failSend(err)); }
   }
 
   _failSend(err) {
-    // Left unfrozen on purpose, so the press can be tried again.
+    // Released on purpose, so the press can be tried again: nothing was sent.
     this._committed = false;
     this._committedAt = '';
     this._note = `Send failed: ${describeThrown(err)}`;
