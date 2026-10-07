@@ -41,7 +41,12 @@ function Write-PairingLog {
         Add-Content -LiteralPath (Get-BridgeRuntimePath -Name 'agent-bridge-pairing.log') -Encoding utf8 `
             -Value "$([DateTimeOffset]::Now.ToString('o')) $Message"
     }
-    catch { }
+    catch {
+        # Losing a log line is never worth failing a pairing for - but Get-BridgeRuntimePath
+        # is a guarded write boundary, and a refusal from it is a test-boundary violation,
+        # not a full disk.
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+    }
 }
 
 function Read-PairingAnswer {
@@ -142,7 +147,16 @@ if ($Sponsor) {
         $outcome = Invoke-BridgePairingSponsor -Attempt $Attempt -Headers $headers
         Write-PairingLog "sponsor attempt ${Attempt}: $outcome"
     }
-    catch { Write-PairingLog "sponsor attempt $Attempt failed: $($_.Exception.Message)" }
+    catch {
+        # A sponsor runs unattended, so an ordinary failure is a log line and a clean
+        # exit: the request is still in the helper and the daemon starts another. A
+        # transport the Offline guard refused is not that. Making the inner layers
+        # propagate it only moved the problem here, where logging it and exiting 0 left
+        # a forbidden call to a real Home Assistant looking like a sponsor that simply
+        # had nothing to report. It leaves this process with a non-zero exit instead.
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        Write-PairingLog "sponsor attempt $Attempt failed: $($_.Exception.Message)"
+    }
     exit 0
 }
 

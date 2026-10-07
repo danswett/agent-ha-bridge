@@ -225,6 +225,21 @@ v1 keeps this simple and says so:
 * **What the recorder keeps from `mqtt.publish` calls.** By the analysis above nothing
   in the pairing messages needs protecting, but it should be confirmed by inspection,
   as the transfer design requires.
+* **The paste fallback's challenge does not cover the fleet id.** *Known gap, left for
+  after this lands.* The signed challenge authenticates the nonce and the secret, and
+  nothing else: J writes `check:<member slug>:<nonce>`, and the member answers with an
+  HMAC over the nonce alone. The fleet id J saves is the one it read from that member's
+  retained `capabilities.fleet`, and by the table above the broker is not trusted with
+  that. A broker that rewrites a real member's advertised fleet therefore gets an honest
+  answer, J verifies the secret, and J saves a fleet id the broker chose. The
+  consequence is a fragmented fleet - sponsor discovery, rotation and re-pairing all key
+  on the fleet id, so the new machine advertises a fleet nobody else is in while holding
+  the correct secret. It is not a disclosure: the secret never crosses this exchange, and
+  an attacker who cannot already read it gains no way into the fleet. The fix is to carry
+  the fleet id in the challenge and have the member check it against its own membership
+  before answering, with the id inside the MAC rather than only beside it. That changes
+  the wire format on both ends, which is deliberately not done in the same review as the
+  work above. Tracked as #85.
 * **Creating the `input_text` helper** needs the provisioning (administrator) token,
   which the installer already holds. Upgrades must create it once, and leave a helper
   the person renamed or removed alone.

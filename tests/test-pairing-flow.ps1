@@ -462,6 +462,89 @@ Test-That 'and the attempt''s key is disposed of on the way out even so' {
 Set-Item -LiteralPath function:New-BridgePairingJoiner -Value $madeJoiner
 $script:OnHelperRead = $null
 
+Write-Host '--- the sponsor process, and the log it writes ---'
+# Making the inner layers carry a refused transport out only moved the problem: the
+# outermost handlers in this process absorbed it again. Nothing waits on a sponsor, so
+# its exit code is the only evidence anyone gets, and logging the refusal and exiting 0
+# turned a forbidden call to a real Home Assistant back into a quiet nothing-to-report.
+$entryPath = (Resolve-Path (Join-Path $PSScriptRoot '..\hooks\bridge-pairing-entry.ps1')).Path
+$platformPath = (Resolve-Path (Join-Path $PSScriptRoot '..\hooks\bridge-platform.ps1')).Path
+$entrySource = [Management.Automation.Language.Parser]::ParseFile($entryPath, [ref]$null, [ref]$null)
+
+# The real logger, run here against a boundary that refuses, rather than a copy of it.
+$logFunction = $entrySource.Find({
+        param($node)
+        $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Write-PairingLog'
+    }, $true)
+. ([scriptblock]::Create($logFunction.Extent.Text))
+$realRuntimePath = (Get-Command Get-BridgeRuntimePath -CommandType Function).ScriptBlock
+function Get-BridgeRuntimePath {
+    param($Name)
+    $refusal = [InvalidOperationException]::new('a test suite tried to write outside its sandbox')
+    $refusal.Data['BridgeTestWriteBlocked'] = $true
+    throw $refusal
+}
+$caught = $null
+try { Write-PairingLog 'an attempt started' } catch { $caught = $_ }
+Test-That 'a pairing log line the write boundary refused is carried out, not dropped with the rest' {
+    $null -ne $caught -and (Test-BridgeObservationGuardFailure -ErrorRecord $caught)
+}
+function Get-BridgeRuntimePath { param($Name) throw [IO.IOException]::new('the log is unwritable') }
+$caught = $null
+try { Write-PairingLog 'an attempt started' } catch { $caught = $_ }
+Test-That 'while a log that simply cannot be written still costs a pairing nothing' { $null -eq $caught }
+Set-Item -LiteralPath function:Get-BridgeRuntimePath -Value $realRuntimePath
+
+$sponsorBlock = @($entrySource.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.IfStatementAst] -and
+            $node.Clauses[0].Item1.Extent.Text -ceq '$Sponsor'
+        }, $true))
+Test-That 'the sponsor entry point is still one block this can run' { $sponsorBlock.Count -eq 1 }
+$pwshPath = (Get-Process -Id $PID).Path
+
+function Invoke-SponsorEntryProcess {
+    <#
+        Runs the real -Sponsor block as its own process, with the one call it makes
+        failing. Its exit code is the whole point: a function that throws would not have
+        shown the problem, because the block caught it and exited 0 regardless.
+    #>
+    param([Parameter(Mandatory)][ValidateSet('guard', 'ordinary')][string]$Failure)
+
+    $stem = [guid]::NewGuid().ToString('N').Substring(0, 8)
+    $log = (Join-Path $script:Runtime "sponsor-$stem.log").Replace("'", "''")
+    $throw = 'throw [IO.IOException]::new(''the sponsor could not reach the broker'')'
+    if ($Failure -ceq 'guard') {
+        $throw = '$refusal = [InvalidOperationException]::new(''a test suite tried to reach a real Home Assistant'')' +
+        '; $refusal.Data[''BridgeTestNetworkBlocked''] = $true; throw $refusal'
+    }
+    $child = Join-Path $script:Runtime "sponsor-$stem.ps1"
+    @(
+        'Set-StrictMode -Version Latest'
+        '$ErrorActionPreference = ''Stop'''
+        ". '$($platformPath.Replace("'", "''"))'"
+        '$Sponsor = $true'
+        "`$Attempt = '$(New-BridgePairingId)'"
+        '$headers = @{}'
+        "function Write-PairingLog { param([string]`$Message) Add-Content -LiteralPath '$log' -Value `$Message }"
+        "function Invoke-BridgePairingSponsor { param(`$Attempt, `$Headers) $throw }"
+        $sponsorBlock[0].Extent.Text
+    ) | Set-Content -LiteralPath $child -Encoding utf8
+    $run = Start-Process -FilePath $pwshPath -ArgumentList @('-NoProfile', '-NonInteractive', '-File', $child) `
+        -NoNewWindow -Wait -PassThru
+    $written = ''
+    if (Test-Path -LiteralPath $log) { $written = Get-Content -LiteralPath $log -Raw }
+    [pscustomobject]@{ ExitCode = $run.ExitCode; Log = $written }
+}
+
+$refused = Invoke-SponsorEntryProcess -Failure 'guard'
+Test-That 'a sponsor whose transport the guard refused ends its process with a failure' { $refused.ExitCode -ne 0 } "exit=$($refused.ExitCode)"
+Test-That 'and does not write it off as an attempt that merely did not work' { $refused.Log -notlike '*failed:*' } "log: $($refused.Log)"
+$ordinary = Invoke-SponsorEntryProcess -Failure 'ordinary'
+Test-That 'while a sponsor that really failed is logged and left to the next pass' {
+    $ordinary.ExitCode -eq 0 -and $ordinary.Log -like '*failed: the sponsor could not reach the broker*'
+} "exit=$($ordinary.ExitCode) log: $($ordinary.Log)"
+
 Write-Host '--- saving the result ---'
 $cfg = Join-Path $script:Runtime 'config.json'
 '{"homeAssistant":{"baseUrl":"http://ha:8123","token":"t"},"newSession":{"enabled":true,"workspaces":[{"label":"Home","path":"~"}]}}' |
