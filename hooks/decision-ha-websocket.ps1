@@ -2188,12 +2188,17 @@ ha-select, mwc-select { width: 100%; }
                 )
             }
             if ($cardOwnsSend) { $answerInner.submit = "button.${node}_submit" }
-            # From 1.26.0 Send answer publishes the reply box before pressing submit,
-            # so a mixed form no longer reaches the session with its typed field
-            # dropped (#93). The topic is the only name both cards share, and is how
-            # the choices card finds the reply card beside it. An older card does not
-            # know the key and ignores it.
-            if (Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.26.0') {
+            # From 1.27.0 Send answer publishes the reply box before submitting, so a
+            # mixed form no longer reaches the session with its typed field dropped
+            # (#93). The topic is the only name both cards share, and is how the
+            # choices card finds the reply card beside it.
+            #
+            # 1.27.0 and not 1.26.0: #98 had already shipped a different card as
+            # 1.26.0, and handing this key to that one would say the machinery is
+            # there when none of it is - the card would drop the key in silence and
+            # go on losing typed fields. An older card does not know the key either,
+            # and ignores it.
+            if (Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.27.0') {
                 $answerInner.reply_topic = (Get-CopilotMqttReplyPayloadTopic -Node $node)
             }
         }

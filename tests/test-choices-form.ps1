@@ -306,14 +306,14 @@ Test-That 'and keeps the entity pair for whenever a question is armed' {
     @($oldCard.cards | Where-Object { $_.type -eq 'conditional' -and "$($_.card.type)" -eq 'custom:layout-card' }).Count -eq 1
 } "types=[$(@($oldCard.cards | ForEach-Object { if ($_.type -eq 'conditional') { "conditional($($_.card.type))" } else { $_.type } }) -join '|')]"
 
-# The reply-topic gate is its own boundary, one version further on. A 1.25.x card has
-# Send answer and the checkbox rows but no idea what reply_topic is, and a card that
-# does not know a config key drops it silently - so handing it over regardless looks
-# like it worked here while that machine goes on losing typed fields.
-Set-TestPublicationCardUrl -Url '/local/agent-bridge-reply-card.js?v=1.25.0'
+# The reply-topic gate is its own boundary, one version further on. #98 shipped a
+# 1.26.0 card with none of this machinery, and a card that does not know a config key
+# drops it silently - so handing reply_topic to that one looks like it worked here
+# while that machine goes on losing typed fields.
+Set-TestPublicationCardUrl -Url '/local/agent-bridge-reply-card.js?v=1.26.0'
 Save-CopilotSessionDashboard `
     -Sessions @([pscustomobject]@{ Node = $node; Name = 'Copilot: a task'; Machine = 'BOX'; Kind = 'copilot' }) `
-    -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.25.0'
+    -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.26.0'
 $preTopicDash = $script:SavedConfig | ConvertTo-Json -Depth 40 | ConvertFrom-Json -Depth 40
 $preTopicCard = @($preTopicDash.views[0].cards | Where-Object { $_.type -eq 'custom:agent-bridge-session-card' })[0]
 $preTopicChoices = @($preTopicCard.cards | Where-Object {

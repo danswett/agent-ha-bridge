@@ -23,7 +23,7 @@
  * uploaded image these sit in the sensor's attributes.
  */
 
-const CARD_VERSION = '1.26.0';
+const CARD_VERSION = '1.27.0';
 
 /*
  * How large a non-image attachment may be.
@@ -1585,6 +1585,18 @@ class AgentBridgeChoicesCard extends HTMLElement {
             this._failSend(new Error('the question changed - check it and send again'));
             return;
           }
+          // A complete form is submitted by the payload itself - Read-DaemonFormAnswer's
+          // $cardSubmits - so pressing as well would be a race rather than a belt and
+          // braces. mqtt.publish returns when Home Assistant has dispatched the
+          // message, not when sensor.<node>_reply_payload has caught up with it, and a
+          // press read in that gap is a submit with no payload behind it: the form
+          // goes with an empty field, the words arrive too late to be part of it, and
+          // the loss this exists to fix happens anyway.
+          if (this._complete) { return; }
+          // An incomplete form is not submitted by a payload, and the press is what
+          // makes the daemon say which field it is still waiting on. The words stay
+          // published against this question, so finishing the form and sending again
+          // carries them.
           this._pressSubmit();
         },
         (err) => this._failSend(err));

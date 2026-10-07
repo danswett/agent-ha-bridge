@@ -1687,7 +1687,7 @@ async function checkSendAnswerCarriesTypedText() {
   const TOPIC = 'copilot/cli/session/abc/replypayload';
   const FIELD = 'select.agent_bridge_abc_f1';
 
-  function mixed({ typed = '', publishFails = false, replyTopic = TOPIC, holdPublish = false, attach = false } = {}) {
+  function mixed({ typed = '', publishFails = false, replyTopic = TOPIC, holdPublish = false, attach = false, incomplete = false } = {}) {
     const calls = [];
     let releasePublish = null;
     const states = {
@@ -1695,7 +1695,7 @@ async function checkSendAnswerCarriesTypedText() {
         state: 'Awaiting answer...',
         attributes: { options: ['Awaiting answer...', 'Cancel request'], decision_id: 'd1', field_1_label: 'Colour' },
       },
-      [FIELD]: { state: 'Red', attributes: { options: ['Choose...', 'Red', 'Blue'] } },
+      [FIELD]: { state: incomplete ? 'Choose...' : 'Red', attributes: { options: ['Choose...', 'Red', 'Blue'] } },
     };
     const hass = {
       states,
@@ -1731,20 +1731,30 @@ async function checkSendAnswerCarriesTypedText() {
     if (!call || !call.data) { return null; }
     try { return JSON.parse(call.data.payload); } catch (err) { return null; }
   };
-  const pressed = (m) => m.calls.find((c) => c.domain === 'button') || null;
 
   let m = mixed({ typed: 'and please restart it afterwards' });
   press(m.choices);
   await flush();
-  check('what is typed is published before the form is submitted', domains(m) === 'mqtt,button', domains(m));
+  // Publishing is the submission for a complete form - Read-DaemonFormAnswer's
+  // $cardSubmits - so there is deliberately no button press to race the sensor with.
+  check('a complete form is sent by publishing the words, with no press to race it',
+    domains(m) === 'mqtt', domains(m));
   check('and the payload carries the words themselves',
     (published(m) || {}).text === 'and please restart it afterwards', JSON.stringify(published(m)));
   check('on the topic both cards were given',
     !!m.calls.find((c) => c.domain === 'mqtt' && c.data.topic === TOPIC), domains(m));
-  check('submit is still pressed, on the entity it was given',
-    !!pressed(m) && pressed(m).data.entity_id === SUBMIT, JSON.stringify(pressed(m)));
+  check('the rows stay frozen, so the answer cannot be changed under the send',
+    m.choices._committed === true);
   check('and the box is emptied, so the next question does not inherit the answer',
     m.reply._els.textarea.value === '');
+
+  // An incomplete form is not submitted by a payload, so the press still has to go -
+  // it is what makes the daemon say which field it is waiting on.
+  m = mixed({ typed: 'some notes', incomplete: true });
+  press(m.choices);
+  await flush();
+  check('an incomplete form still presses, because that is what reports the gap',
+    domains(m) === 'mqtt,button', domains(m));
 
   // The usual optional "anything else?", left blank. There is nothing to publish and
   // an empty free-text field is a valid answer, so this must stay a single press.
@@ -1779,7 +1789,7 @@ async function checkSendAnswerCarriesTypedText() {
   press(second.choices);
   await flush();
   check('a reply card that goes away does not unregister the one that replaced it',
-    domains(second) === 'mqtt,button', domains(second));
+    domains(second) === 'mqtt', domains(second));
 
   // An attachment cannot be typed into an arrow-key prompt, and
   // Read-DaemonDecisionCardText discards any payload carrying one - so publishing it
@@ -1794,7 +1804,7 @@ async function checkSendAnswerCarriesTypedText() {
     (published(m) || {}).text === 'and the log is attached', JSON.stringify(published(m)));
   check('and the attachment stays in the box for the reply path to deliver',
     m.reply._images.length === 1, `${m.reply._images.length} image(s)`);
-  check('the form is still submitted', !!pressed(m), domains(m));
+  check('the form is still sent, by the payload rather than a press', domains(m) === 'mqtt', domains(m));
 
   // A publish is a round trip. The terminal, or another dashboard, can answer the old
   // question inside it - and the session's submit button belongs to whatever question
