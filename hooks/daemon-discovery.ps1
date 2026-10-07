@@ -469,10 +469,18 @@ function Set-DaemonDiscoveryUncertain {
         [void]$Snapshot.Live.Remove($id)
     }
     if ($matches.Count -eq 0) { $Snapshot.UncertainKinds[$Kind] = $true }
-    $Snapshot.Diagnostics.Add([pscustomobject]@{
-        Kind = $Kind; Path = $Path; Code = $Code; KnownOwners = @($matches); ProcessId = $ProcessId
-    })
-    Write-DaemonLog -Message "session discovery uncertain ($Kind/$Code); absence-based work is held"
+    $Snapshot.Diagnostics.Add([pscustomobject]@{ Kind = $Kind; Path = $Path; Code = $Code; KnownOwners = @($matches); ProcessId = $ProcessId })
+    # Named, because the only remedy an operator has is to deal with the process
+    # responsible, and "session discovery uncertain (copilot/UnaccountedProcess)" does
+    # not say which one. A Copilot started by hand in a terminal is the common case and
+    # cannot be identified from the message at all, so the advice given on 2026-10-07
+    # was to kill processes until the log went quiet - which risks destroying live work.
+    #
+    # Still said every pass, unlike the adapter reason above: the hold is a standing
+    # condition rather than an event, and one line at the moment it began would scroll
+    # away long before anyone came looking for why nothing had retired.
+    $what = if ($ProcessId -gt 0) { "$Kind/$Code pid $ProcessId" } else { "$Kind/$Code" }
+    Write-DaemonLog -Message "session discovery uncertain ($what); absence-based work is held"
 }
 
 function Get-DaemonDiscoveryHoldSummary {

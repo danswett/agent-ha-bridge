@@ -580,16 +580,33 @@ function Sync-DaemonSessions {
     }
 
     $descriptors = @(Get-DaemonSessionDescriptors -State $State -Headers $Headers)
+    # Presence-based, so it runs whether or not the local process view is complete.
+    #
+    # What a session's card says, and that it exists at all, is evidence this machine
+    # has: the descriptors come from $State, which an incomplete pass adds to and never
+    # removes from, so an uncertain session is still described rather than dropped.
+    # Holding these behind Complete made one unidentifiable local process stop the whole
+    # dashboard being written - and the dashboard is shared, so on the writer that froze
+    # it for every machine. Sessions on other hosts stopped appearing, cards stopped
+    # updating, and nothing said why. That is not a fail-safe; a card that has quietly
+    # stopped telling the truth is worse than one that admits it is behind.
+    #
+    # Absence-based work stays held, and is held one decision at a time rather than by
+    # this flag: retirement goes through Test-DaemonRetirementObservation per session,
+    # the orphan sweep refuses an incomplete snapshot outright, and the two below keep
+    # their own gates.
+    $capabilities = Get-DaemonLaunchCapabilities
+    Publish-DaemonGlobalStatus -Descriptors $descriptors -Capabilities $capabilities `
+        -Resumable @($script:DaemonResumeOffered) -Headers $Headers
     if ($Discovery.Complete) {
-        $capabilities = Get-DaemonLaunchCapabilities
-        Publish-DaemonGlobalStatus -Descriptors $descriptors -Capabilities $capabilities `
-            -Resumable @($script:DaemonResumeOffered) -Headers $Headers
         # $live, not $State.Keys: a session whose adoption returned $null is running but
         # absent from state, and bundling one mid-sentence is exactly what this guards.
         # The marked test-boundary throws are re-raised rather than logged, the convention
         # #59 established: a suite that reaches the real transfer without stubbing it would
         # otherwise see a tidy refusal and pass, which is the exact failure that change
-        # exists to close. An incomplete view cannot authorize a transfer.
+        # exists to close. An incomplete view cannot authorize a transfer: a session that
+        # is uncertain is absent from $live, and the refusal that protects a live session
+        # from being bundled reads exactly that set.
         try { Invoke-DaemonTransferRequest -LiveSessionIds @($live.Keys) -Headers $Headers }
         catch {
             if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
@@ -609,11 +626,7 @@ function Sync-DaemonSessions {
             Write-DaemonLog -Message "pairing check failed: $($_.Exception.Message)"
         }
     }
-    $dashboardCurrent = if ($Discovery.Complete) {
-        Sync-DaemonDashboard -Descriptors $descriptors -Capabilities $capabilities -Headers $Headers
-    } else {
-        Sync-DaemonDashboard -Descriptors $descriptors -Capabilities @{} -Headers $Headers -ObserveOnly
-    }
+    $dashboardCurrent = Sync-DaemonDashboard -Descriptors $descriptors -Capabilities $capabilities -Headers $Headers
     Complete-DaemonSessionRetirement -Gone $goneSessions -DashboardCurrent $dashboardCurrent -Headers $Headers -Discovery $Discovery
     Update-DaemonOwnerCatalogue -Snapshot $Discovery -State $State
 }

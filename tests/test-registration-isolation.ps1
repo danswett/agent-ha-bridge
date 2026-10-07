@@ -30,7 +30,7 @@ $script:A14PsCalls = 0
 $script:A14Guard = $null
 $script:A14ActualWindows = $script:BridgeIsWindows
 $expectedGroups = 25
-$expectedChecks = 114
+$expectedChecks = 117
 $primaryFailure = $null
 
 function Test-A14 {
@@ -930,24 +930,41 @@ try {
         Test-A14 'while an unaccounted session process still holds discovery' (-not $stranger.Complete)
     }
 
-    Invoke-A14Group 'publication resumes after completeness without a new unrelated event' {
+    Invoke-A14Group 'uncertainty holds absence-based work without freezing the shared view' {
         Reset-A14Records claude
         [void](Invoke-A14Reconcile)
-        $signature = $script:DaemonGlobalSignature; $dashboard = $script:DaemonDashboardSignature
+        $signature = $script:DaemonGlobalSignature
         Write-A14Json -Path (Get-A14RegistrationPath A) -Value @{ SessionId = $script:A14Ids.A }
         Write-A14Registration D
         $script:A14Processes += [pscustomobject]@{ Id = $script:A14Pids.D; ProcessName = 'claude'; StartTime = [datetime]::UtcNow.AddHours(-1) }
         $script:TestPublication.Commands.Clear()
+        $script:A14Requests.Clear()
         $snapshot = Invoke-A14Reconcile
         Test-A14 'a new validated positive is adopted during uncertainty' ($snapshot.Live.ContainsKey($script:A14Ids.D) -and $script:A14State.ContainsKey($script:A14Ids.D))
-        Test-A14 'held complete publication advances no success signature' (
-            $script:DaemonGlobalSignature -ceq $signature -and $script:DaemonDashboardSignature -ceq $dashboard -and @(Get-TestPublicationWrites).Count -eq 0)
+        # Publishing is presence-based and no longer waits for a complete local process
+        # view. It used to: one unidentifiable process on this machine stopped the shared
+        # dashboard being written at all, and because the writer publishes for everyone,
+        # that froze every machine's sessions on screen with nothing saying why. The
+        # session being published is one this machine can see running; the process it
+        # cannot account for has no bearing on that.
+        Test-A14 'the view is still published, because seeing a session is presence-based evidence' (
+            -not $snapshot.Complete -and $script:DaemonGlobalSignature -cne $signature -and
+            @(Get-TestPublicationWrites).Count -gt 0 -and $script:BridgeDashboardObservation.Verified)
+        # The whole point of separating the two. Making the view current is exactly what
+        # lets Update-DaemonRetireQueue act, so an uncertain owner surviving a pass that
+        # published is the property that has to hold - not an incidental consequence of
+        # never publishing at all.
+        Test-A14HeldOwner 'published under uncertainty' $snapshot
         Write-A14Registration A
         $script:TestPublication.Commands.Clear()
         $snapshot = Invoke-A14Reconcile
-        Test-A14 'completeness resumes held global/view publication without restart' (
-            $snapshot.Complete -and $script:DaemonGlobalSignature -cne $signature -and
-            @(Get-TestPublicationWrites).Count -gt 0 -and $script:BridgeDashboardObservation.Verified)
+        # No publication is expected here: the view was already written during the
+        # uncertain pass and its inputs have not changed, which is the point. What
+        # resumes is the absence-based work, and A being positive-live again is what
+        # says the hold has lifted.
+        Test-A14 'completeness resumes held absence-based work without restart' (
+            $snapshot.Complete -and $snapshot.Live.ContainsKey($script:A14Ids.A) -and
+            $script:BridgeDashboardObservation.Verified)
     }
     Invoke-A14Group 'actual startup session cleanup defers then resumes on reconcile' {
         Reset-A14Records codex
