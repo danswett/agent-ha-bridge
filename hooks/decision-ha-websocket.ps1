@@ -6,13 +6,14 @@
 #>
 
 . (Join-Path $PSScriptRoot 'bridge-secrets.ps1')
-# 1.2.0, not 1.1.0: Save-CopilotSessionDashboard is one of the helpers
-# Get-BridgeRenderArtifact fingerprints, and the choices/send/reply-box configuration
-# it emits changed. Left at 1.1.0 the fence sees a new hash at the same version,
-# which is the definition of a conflict there - so on any installation already fenced
-# at the old renderer, publication is refused and the new card configuration can
-# never reach the dashboard without an operator pin nobody should have to take.
-$script:BridgeDashboardRenderVersion = '1.2.0'
+# 1.3.0, not 1.2.0: Save-CopilotSessionDashboard is one of the helpers
+# Get-BridgeRenderArtifact fingerprints, and it now emits the usage card above the
+# session controls, with a standard-card fallback below them for a browser served an
+# older card. Left at 1.2.0 the fence sees a new hash at the same version, which is
+# the definition of a conflict there - so on any installation already fenced at the
+# old renderer, publication is refused and the usage card can never reach the
+# dashboard without an operator pin nobody should have to take.
+$script:BridgeDashboardRenderVersion = '1.3.0'
 $script:BridgeDashboardObservation = $null
 
 function Invoke-CopilotHaWebSocket {
@@ -642,6 +643,28 @@ function Set-CopilotMqttUpdateEntityIds {
         "agent_bridge_${Slug}_update"         = Get-BridgeMachineEntityId -Domain 'update' -Key 'update' -Slug $Slug
         "agent_bridge_${Slug}_install_update" = Get-BridgeMachineEntityId -Domain 'button' -Key 'install_update' -Slug $Slug
     }
+    Set-CopilotMqttMachineEntityId -Wanted $wanted
+}
+
+function Set-CopilotMqttUsageEntityIds {
+    <#
+        Forces the per-client usage sensors onto deterministic ids.
+
+        Same reason as the update entities, and measured on a live instance before this
+        existed: the sensors arrived as sensor.ai_agent_bridge_dswett_home_github_copilot_usage,
+        built from the device name plus the entity name, while the generated dashboard
+        hands the card sensor.agent_bridge_dswett_home_usage_copilot. Both ends were
+        correct and the card drew nothing.
+    #>
+    param([string]$Slug, [AllowEmptyCollection()][string[]]$Clients = @('copilot', 'claude', 'codex'))
+
+    if (-not $Slug) { $Slug = Get-BridgeMachineSlug }
+    $wanted = @{}
+    foreach ($client in @($Clients)) {
+        $wanted["agent_bridge_${Slug}_usage_$client"] =
+            Get-BridgeMachineEntityId -Domain 'sensor' -Key "usage_$client" -Slug $Slug
+    }
+    if ($wanted.Count -eq 0) { return $false }
     Set-CopilotMqttMachineEntityId -Wanted $wanted
 }
 
@@ -1701,6 +1724,49 @@ function Save-CopilotSessionDashboard {
         }
     }
 
+    # The allowance each agent has left, from card 1.25.0. Every machine's usage
+    # sensors are listed rather than only this machine's, because the card reconciles
+    # them by account: a figure that belongs to a login rather than to a computer
+    # would otherwise appear once per computer signed in to it.
+    $usageCards = @()
+    $usageFallbackCards = @()
+    $usageEntities = @($machineList | ForEach-Object {
+        $slug = $_.Slug
+        foreach ($client in @('copilot', 'claude', 'codex')) {
+            Get-BridgeMachineEntityId -Domain 'sensor' -Key "usage_$client" -Slug $slug
+        }
+    })
+    if ($usageEntities.Count -gt 0) {
+        if (Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.25.0') {
+            $usageCards = @([ordered]@{
+                type     = 'custom:agent-bridge-usage-card'
+                title    = 'Agent usage'
+                entities = @($usageEntities)
+            })
+        }
+        else {
+            # An older card drops config keys it does not know, so the gate above must
+            # fall back to a standard card rather than to the same card with fewer
+            # rows. A conditional keeps it off the dashboard entirely until a sensor
+            # exists, because an entities card draws "Entity not found" for each one.
+            # Rows are objects, not bare ids: everything else the generator emits is
+            # shaped that way, and the helpers that walk a generated view expect it.
+            #
+            # It goes last rather than first. The real card earns the top of the view
+            # by folding to one line; nine entity rows would push the session controls
+            # off a phone screen on exactly the machines least able to afford it.
+            $usageFallbackCards = @(@{
+                type = 'conditional'
+                conditions = @(@{ entity = $usageEntities[0]; state_not = 'unavailable' })
+                card = @{
+                    type = 'entities'
+                    title = 'Agent usage'
+                    entities = @($usageEntities | ForEach-Object { @{ entity = $_ } })
+                }
+            })
+        }
+    }
+
     # The update row and its install button only appear when an update exists. A
     # conditional card is used rather than hiding rows inside the entities card,
     # because an entities row has no condition of its own.
@@ -1897,14 +1963,16 @@ function Save-CopilotSessionDashboard {
         $newSessionCards = @($launchCard)
     }
 
-    # The control panel is a plain card pair at the top of the masonry flow.
-    $controlCards = @()
-    if ($statusCard) { $controlCards = @($statusCard) }
+    # The control panel is a plain card pair at the top of the masonry flow, with the
+    # allowances above it: what is left to spend decides whether to start anything at
+    # all, so it is read before the session list rather than after it.
+    $controlCards = @($usageCards)
+    if ($statusCard) { $controlCards += $statusCard }
     else {
-        $controlCards = @($agentSessionsCard)
+        $controlCards += $agentSessionsCard
         if ($machinesCard) { $controlCards += $machinesCard }
     }
-    $controlCards += $updateCards + $newSessionCards
+    $controlCards += $updateCards + $newSessionCards + $usageFallbackCards
 
     $sessionSections = foreach ($session in $Sessions) {
         $node = $session.Node

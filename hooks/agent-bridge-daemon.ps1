@@ -929,6 +929,7 @@ function Invoke-DaemonReconcile {
         Sync-DaemonUpdateStatus -Headers $headers
         if ($discovery.Complete) { Sync-DaemonNewSession -Headers $headers -Live $live }
         Sync-DaemonClients -Headers $headers
+        [void](Sync-DaemonUsage -Headers $headers)
         Clear-DaemonStaleNote -Headers $headers
         Invoke-DaemonFastActivity -Headers $headers -State $state
         Write-DaemonState -State $state
@@ -1022,6 +1023,7 @@ function Start-BridgeDaemon {
 . (Join-Path $PSScriptRoot 'daemon-decisions.ps1')
 . (Join-Path $PSScriptRoot 'daemon-launch.ps1')
 . (Join-Path $PSScriptRoot 'daemon-maintenance.ps1')
+. (Join-Path $PSScriptRoot 'daemon-usage.ps1')
 . (Join-Path $PSScriptRoot 'daemon-hookspool.ps1')
 
 

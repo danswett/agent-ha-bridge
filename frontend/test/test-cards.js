@@ -32,7 +32,7 @@ function cmpVersion(a, b) {
 // --- the card itself, in a DOM small enough to run it (card-harness.js) --------
 
 const { FakeElement, loadCards } = require('./card-harness');
-const { AgentBridgeChoicesCard, AgentBridgeSessionCard, AgentBridgeActivityCard, CARD_VERSION, sandbox, source } = loadCards();
+const { AgentBridgeChoicesCard, AgentBridgeSessionCard, AgentBridgeActivityCard, AgentBridgeUsageCard, CARD_VERSION, sandbox, source } = loadCards();
 
 // --- the harness ------------------------------------------------------------------
 
@@ -1018,6 +1018,67 @@ check('and unregisters its visibility listener',
   String((doc._listeners.visibilitychange || []).length));
 doc._fire('visibilitychange');
 check('so a later visibility change cannot revive it', timers.size === 0, `size=${timers.size}`);
+
+console.log('');
+console.log('--- the usage card keeps its clock honest without a push ---');
+/*
+ * Home Assistant pushes a state change as it happens, so a bar moves at once. The
+ * relative text does not get pushed: "37m ago" and "resets in 3h" are worked out at
+ * render time, so without a timer they freeze at whatever the last state change said.
+ * Codex's figures can sit unchanged for days, so that card would never redraw at all.
+ *
+ * Same visibility rule as the spinner above, and for the same measured reason.
+ */
+function usageCard() {
+  const card = Object.create(AgentBridgeUsageCard.prototype);
+  card._config = { title: 'Agent usage', entities: ['sensor.a'] };
+  card._open = true;
+  card._built = true;
+  card._renders = 0;
+  card._els = {
+    card: new FakeElement('div'), toggle: new FakeElement('div'),
+    name: new FakeElement('span'), summary: new FakeElement('div'),
+    groups: new FakeElement('div'),
+  };
+  card._hass = { states: {} };
+  card._render = function () { this._renders++; };
+  return card;
+}
+
+doc.hidden = false;
+timers.clear();
+const usage = usageCard();
+usage.connectedCallback();
+check('a visible card arms one interval', timers.size === 1, `size=${timers.size}`);
+
+const ticked = usage._renders;
+for (const timer of timers.values()) { timer.fn(); }
+check('and the tick redraws it, so the ages and resets move on their own',
+  usage._renders === ticked + 1, `renders=${usage._renders}`);
+check('on a half-minute, which cannot leave a stale minute on screen',
+  Array.from(timers.values())[0].ms === 30000, String(Array.from(timers.values())[0].ms));
+
+doc.hidden = true;
+doc._fire('visibilitychange');
+check('hiding the tab clears it rather than waking the main thread for nothing',
+  timers.size === 0, `size=${timers.size}`);
+
+const hiddenUsage = usageCard();
+hiddenUsage.connectedCallback();
+check('and a card built while already hidden arms none at all', timers.size === 0, `size=${timers.size}`);
+hiddenUsage.disconnectedCallback();
+
+const caught = usage._renders;
+doc.hidden = false;
+doc._fire('visibilitychange');
+check('showing it again starts a fresh interval', timers.size === 1, `size=${timers.size}`);
+check('and catches the clock up at once, not half a minute later',
+  usage._renders === caught + 1, `renders=${usage._renders}`);
+
+usage.disconnectedCallback();
+check('a card taken off the view leaves no interval behind', timers.size === 0, `size=${timers.size}`);
+doc._fire('visibilitychange');
+check('and cannot be revived by a later visibility change', timers.size === 0, `size=${timers.size}`);
 
 console.log('');
 console.log('--- the launch card carries model, effort and context ---');

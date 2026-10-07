@@ -109,6 +109,11 @@ function seedStatusParts(slots) {
   }
 }
 
+// The usage card shares the status card's folding head and adds its own body.
+function seedUsageParts(slots) {
+  if (!slots['.groups']) { slots['.groups'] = new FakeElement('div'); }
+}
+
 // The reply card builds an <ha-card>, fills it with markup and then looks its parts
 // up inside it. Seeded for the same reason as the launch card's: a selector the card
 // asks for and the harness does not model comes back null and fails loudly.
@@ -132,6 +137,7 @@ function makeShadow() {
   root._slots = { '.choices': new FakeElement('div'), 'ha-card': new FakeElement('ha-card') };
   const selects = seedLaunchParts(root._slots);
   seedStatusParts(root._slots);
+  seedUsageParts(root._slots);
   root.querySelectorAll = (sel) => (sel === 'select' ? selects.slice() : []);
   Object.defineProperty(root, 'innerHTML', { set() {}, get() { return ''; } });
   return root;
@@ -206,8 +212,16 @@ function loadCards(sourceFile) {
   const sourcePath = sourceFile || path.join(__dirname, '..', 'agent-bridge-reply-card.js');
   const source = fs.readFileSync(sourcePath, 'utf8');
   const context = vm.createContext(sandbox);
+  // Each name is looked up through typeof rather than named directly. A released card
+  // predates every class added after it, and a bare reference to one it does not
+  // declare is a ReferenceError that takes the whole evaluation down - so the driver
+  // writes nothing and the failure arrives as a missing property on an empty result,
+  // three files from the card that actually lacks the class. Absent means undefined.
+  const exported = ['AgentBridgeReplyCard', 'AgentBridgeChoicesCard', 'AgentBridgeSessionCard',
+    'AgentBridgeLaunchCard', 'AgentBridgeStatusCard', 'AgentBridgeActivityCard',
+    'AgentBridgeUsageCard', 'CARD_VERSION'];
   vm.runInContext(
-    `${source}\n;globalThis.__cards = { AgentBridgeReplyCard, AgentBridgeChoicesCard, AgentBridgeSessionCard, AgentBridgeLaunchCard, AgentBridgeStatusCard, AgentBridgeActivityCard, CARD_VERSION };`,
+    `${source}\n;globalThis.__cards = { ${exported.map((n) => `${n}: typeof ${n} === 'undefined' ? undefined : ${n}`).join(', ')} };`,
     context,
     { filename: sourcePath });
   return Object.assign({ sandbox, source }, sandbox.__cards);
