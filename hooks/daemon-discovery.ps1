@@ -441,9 +441,19 @@ function Get-DaemonSessionDiscovery {
                         $accounted[$pidValue] = $true
                     }
                     foreach ($pidValue in $pids.Keys) {
-                        if (-not $accounted.ContainsKey($pidValue)) {
-                            $legacyIssues.Add([pscustomobject]@{ Kind = $kind; Path = ''; Code = 'UnaccountedProcess' })
-                        }
+                        if ($accounted.ContainsKey($pidValue)) { continue }
+                        # Only a process nothing accounted for costs a command-line
+                        # read, which is about 77 ms - normally there are none. An
+                        # embedded CLI (Scout runs copilot.exe --headless) is not a
+                        # session and never will be, so demanding one for it held
+                        # discovery open for as long as that app stayed running.
+                        $command = Get-BridgeCommandLine -ProcessId $pidValue -AsObservation
+                        if ($command.State -eq 'Absent') { continue }
+                        if ($command.State -eq 'Readable' -and
+                            (Test-BridgeAgentEmbeddedProcess -CommandLine $command.Text)) { continue }
+                        # Anything else stays unaccounted: excusing a process takes
+                        # positive identification, never an unreadable command line.
+                        $legacyIssues.Add([pscustomobject]@{ Kind = $kind; Path = ''; Code = 'UnaccountedProcess' })
                     }
                     foreach ($diagnostic in $inventory.Diagnostics) {
                         if ($diagnostic.Code -ne 'ProcessDisappeared') {

@@ -834,6 +834,28 @@ function Get-BridgeAgentProcesses {
     }
 }
 
+function Test-BridgeAgentEmbeddedProcess {
+    <#
+        Whether an agent CLI process is an embedded, headless instance rather than an
+        interactive session, from its command line.
+
+        Microsoft Scout (Clawpilot) ships the Copilot CLI inside its own app and runs
+        it as `copilot.exe --headless ... --stdio`. That process carries no
+        --session-id and writes no inuse.<pid>.lock, so no session can ever account
+        for it - and discovery, which requires every live agent process to belong to a
+        session, reported UnaccountedProcess on every pass. On one machine that held
+        retirement and startup cleanup all day and refused every launch with "Session
+        discovery is incomplete", while a dead session's card sat on the dashboard
+        with no way to clear it.
+
+        --headless is the CLI's own word for "not a terminal session", which is why it
+        is the signal here rather than the embedding app's install path - that is
+        particular to one product and would miss the next one.
+    #>
+    param([string]$CommandLine = '')
+    [bool]($CommandLine -match '(^|\s)--headless(\s|=|$)')
+}
+
 function Get-BridgeAgentProcessSessionIds {
     <#
         Which session each of $Processes is working in, as a pid -> session id map,
