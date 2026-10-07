@@ -191,6 +191,25 @@ class AgentBridgeReplyCard extends HTMLElement {
   }
 
   /*
+   * Take out of the box what has just been published, leaving anything typed since.
+   *
+   * The textarea stays editable while Send is disabled, so a slow publish can finish
+   * against a value that has grown. Clearing it all erased words that were never
+   * sent; keeping it all left the sent ones to go a second time.
+   *
+   * A value that no longer begins with what went is left whole. The published words
+   * cannot be picked out of it any more, and dropping an edit nobody has seen
+   * delivered is the failure all of this exists to remove - a duplicate is visible,
+   * a loss is not.
+   */
+  _trimPublished(text) {
+    if (!this._els || !this._els.textarea) { return; }
+    const now = this._els.textarea.value;
+    if (now === text) { this._els.textarea.value = ''; }
+    else if (text && now.startsWith(text)) { this._els.textarea.value = now.slice(text.length); }
+  }
+
+  /*
    * What is in the box right now, for a caller that may need to put it back.
    */
   formText() {
@@ -250,12 +269,12 @@ class AgentBridgeReplyCard extends HTMLElement {
         qos: 0,
         retain: false,
       });
-      // Only the words, and only the ones that were sent. Clearing the chips would
-      // throw away an attachment the form never received, and clearing unconditionally
-      // would erase anything typed while the publish was in flight - the textarea
-      // stays editable while Send is disabled, so those words were never sent and
-      // would not have been kept either.
-      if (this._els.textarea.value === text) { this._els.textarea.value = ''; }
+      // Only the words, and only the ones that were not sent. Clearing the chips would
+      // throw away an attachment the form never received; clearing unconditionally
+      // would erase anything typed while the publish was in flight, since the textarea
+      // stays editable while Send is disabled. Keeping the whole value was no better -
+      // it left the published words in the box, so the next send carried them twice.
+      this._trimPublished(text);
       this._setStatus('Sent', 'ok');
       published = true;
     } catch (err) {
@@ -654,10 +673,10 @@ class AgentBridgeReplyCard extends HTMLElement {
         qos: 0,
         retain: false,
       });
-      // Only what was actually sent. The textarea stays editable while Send is
-      // disabled, so anything typed during the publish was not in the payload and
-      // must not be erased with it.
-      if (this._els.textarea.value === text) { this._els.textarea.value = ''; }
+      // Only what was not sent. The textarea stays editable while Send is disabled,
+      // so anything typed during the publish was not in the payload and must neither
+      // be erased with it nor left to go a second time.
+      this._trimPublished(text);
       this._images = [];
       this._files = [];
       this._renderChips();

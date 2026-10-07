@@ -1859,9 +1859,22 @@ async function checkSendAnswerCarriesTypedText() {
   m.release();
   await flush();
   check('words typed while the publish was in flight are kept, not erased with it',
-    m.reply._els.textarea.value === 'first thought, and a second', m.reply._els.textarea.value);
+    m.reply._els.textarea.value === ', and a second', m.reply._els.textarea.value);
+  check('and the ones that went are taken out, so they do not go twice',
+    !m.reply._els.textarea.value.startsWith('first thought'), m.reply._els.textarea.value);
   check('and only what was actually sent went', (published(m) || {}).text === 'first thought',
     JSON.stringify(published(m)));
+
+  // An edit that is not an append leaves nothing to subtract. A duplicate is visible;
+  // dropping words nobody has seen delivered is not, so the box is left whole.
+  m = mixed({ typed: 'first thought', holdPublish: true });
+  press(m.choices);
+  await flush();
+  m.reply._els.textarea.value = 'something else entirely';
+  m.release();
+  await flush();
+  check('a rewrite during the publish is kept whole rather than guessed at',
+    m.reply._els.textarea.value === 'something else entirely', m.reply._els.textarea.value);
 }
 
 // _launch awaits its service calls, so the checks that read them have to await it too.
