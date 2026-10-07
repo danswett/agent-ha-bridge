@@ -1561,12 +1561,20 @@ class AgentBridgeChoicesCard extends HTMLElement {
       this._last = '';
       this._render();
     }
-    // Whatever is typed in the reply box has to be published before submit is
-    // pressed. The daemon reads a form's free-text field out of that payload
-    // (Read-DaemonDecisionCardText); a press arriving without one left the field
+    // Whatever is typed in the reply box has to be published before the form is sent.
+    // The daemon reads a form's free-text field out of that payload
+    // (Read-DaemonDecisionCardText); a submit arriving without one left the field
     // empty, and an empty free-text field is a valid answer, so the form went to the
     // session with the typed words silently dropped (#93).
-    const reply = REPLY_CARDS.get(String(this._config.reply_topic || ''));
+    //
+    // Only ever for a complete form. Publishing is itself a submission -
+    // Read-DaemonFormAnswer submits on the payload alone ($cardSubmits) - so words
+    // published for a form that is not finished would sit there and fire the moment
+    // the last choice was ticked, turning a tap into the send, which is the one thing
+    // Send answer exists to prevent. An incomplete form keeps exactly the behaviour it
+    // had: the press, which is what makes the daemon name the field it is waiting on,
+    // and the words stay in the box until there is a finished form to carry them.
+    const reply = this._complete ? REPLY_CARDS.get(String(this._config.reply_topic || '')) : null;
     if (reply && reply.hasUnsentFormText()) {
       reply.publishFormText(generation).then(
         (published) => {
@@ -1579,25 +1587,16 @@ class AgentBridgeChoicesCard extends HTMLElement {
           }
           // And only if this is still the same question. A publish is a round trip,
           // and the terminal or another dashboard can answer the old question inside
-          // it - pressing the session's submit button then sends a replacement form
-          // nobody here filled in.
+          // it; the daemon drops a payload tagged for a question that has gone.
           if (this._generationNow() !== generation) {
             this._failSend(new Error('the question changed - check it and send again'));
             return;
           }
-          // A complete form is submitted by the payload itself - Read-DaemonFormAnswer's
-          // $cardSubmits - so pressing as well would be a race rather than a belt and
-          // braces. mqtt.publish returns when Home Assistant has dispatched the
-          // message, not when sensor.<node>_reply_payload has caught up with it, and a
-          // press read in that gap is a submit with no payload behind it: the form
-          // goes with an empty field, the words arrive too late to be part of it, and
-          // the loss this exists to fix happens anyway.
-          if (this._complete) { return; }
-          // An incomplete form is not submitted by a payload, and the press is what
-          // makes the daemon say which field it is still waiting on. The words stay
-          // published against this question, so finishing the form and sending again
-          // carries them.
-          this._pressSubmit();
+          // Nothing else to do. The payload is the submission, and pressing as well
+          // would race the sensor it depends on: mqtt.publish returns when Home
+          // Assistant has dispatched the message, not when sensor.<node>_reply_payload
+          // has caught up, and a press read in that gap submits the form with an empty
+          // field and the words arrive too late to be part of it.
         },
         (err) => this._failSend(err));
       return;

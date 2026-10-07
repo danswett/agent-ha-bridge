@@ -1748,13 +1748,16 @@ async function checkSendAnswerCarriesTypedText() {
   check('and the box is emptied, so the next question does not inherit the answer',
     m.reply._els.textarea.value === '');
 
-  // An incomplete form is not submitted by a payload, so the press still has to go -
-  // it is what makes the daemon say which field it is waiting on.
+  // An incomplete form must publish nothing at all. A payload is itself a submission,
+  // so words left against an unfinished form would fire the moment the last choice was
+  // ticked - a tap becoming the send, which is what Send answer exists to prevent.
   m = mixed({ typed: 'some notes', incomplete: true });
   press(m.choices);
   await flush();
-  check('an incomplete form still presses, because that is what reports the gap',
-    domains(m) === 'mqtt,button', domains(m));
+  check('an incomplete form publishes nothing, so no tap can later become the send',
+    domains(m) === 'button', domains(m));
+  check('and keeps the words in the box until there is a form to carry them',
+    m.reply._els.textarea.value === 'some notes', m.reply._els.textarea.value);
 
   // The usual optional "anything else?", left blank. There is nothing to publish and
   // an empty free-text field is a valid answer, so this must stay a single press.
