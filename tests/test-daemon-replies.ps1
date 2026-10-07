@@ -200,9 +200,10 @@ function Save-BridgeReplyAttachment {
 function Save-BridgeReplyFile { param($Name, $Base64, $MaxBytes) $script:Wrote += $Name; "C:\att\$Name" }
 function Remove-BridgeHomeAssistantImage { param($ImageId) $script:Removed += $ImageId; 'emitted' }
 function Remove-BridgeStaleAttachment { 'emitted' }
-function Set-Payload { param([string]$Stamp, [string]$Text, [object[]]$Images = @(), [object[]]$Files = @(), [string]$Driver = '')
+function Set-Payload { param([string]$Stamp, [string]$Text, [object[]]$Images = @(), [object[]]$Files = @(), [string]$Driver = '', [string]$DecisionId = '')
     $attrs = [pscustomobject]@{ text = $Text; images = $Images; files = $Files }
     if ($Driver) { $attrs | Add-Member -NotePropertyName driver -NotePropertyValue $Driver }
+    if ($DecisionId) { $attrs | Add-Member -NotePropertyName decision_id -NotePropertyValue $DecisionId }
     $script:Ha = @{ "sensor.${node}_reply_payload" = [pscustomobject]@{ state = $Stamp; attributes = $attrs } }
 }
 function Get-BridgeReplyPayload { param($State)
@@ -225,6 +226,29 @@ Test-That 'what a call emits never joins the result' { $handled -is [bool] }
 
 $script:Replies = @()
 Test-That 'the same payload is not delivered twice' { (Send-DaemonCardPayload -SessionId $sid -Entry $entry -Headers $headers) -eq $false -and $script:Replies.Count -eq 0 }
+
+# Send answer tags its payload with the question the words were typed for. The
+# decision path consumes it while that question is armed and refuses it once the
+# question has gone - and Invoke-PendingDecisions runs first, so by the time a reply
+# is considered the marker has already been cleared. Delivered here, a form's refused
+# answer was typed into the session as a chat reply moments after the card had said it
+# was not sent and emptied the box: a surprise, and a second copy of what the person
+# was about to retype.
+$script:Replies = @()
+Set-Payload -Stamp 'tagged-1' -Text 'Amber, and restart it' -DecisionId 'd9'
+$taggedHandled = Send-DaemonCardPayload -SessionId $sid -Entry $entry -Headers $headers
+Test-That 'words published for a form are never delivered as an ordinary reply' {
+    $taggedHandled -eq $false -and $script:Replies.Count -eq 0
+} "replies=$($script:Replies.Count)"
+Test-That 'and are marked consumed, so they are not reconsidered every reconcile' {
+    [string]$entry.LastReplyPayloadAt -eq 'tagged-1'
+} "last=[$($entry.LastReplyPayloadAt)]"
+
+$script:Replies = @()
+Set-Payload -Stamp 'untagged-1' -Text 'just a reply'
+Test-That 'an untagged payload from the reply box is still delivered' {
+    (Send-DaemonCardPayload -SessionId $sid -Entry $entry -Headers $headers) -eq $true -and $script:Replies.Count -eq 1
+} "replies=$($script:Replies.Count)"
 
 $script:Replies = @(); $script:Removed = @()
 Set-Payload -Stamp 't2' -Text 'read this' -Files @('plan.md')

@@ -521,6 +521,29 @@ function Send-DaemonCardPayload {
     $lastPayload = if ($entry.PSObject.Properties['LastReplyPayloadAt']) { [string]$entry.LastReplyPayloadAt } else { '' }
     if ($stamp -eq $lastPayload) { return $false }
 
+    # Words published for a form, not a reply. Send answer tags its payload with the
+    # question they were typed for: the decision path consumes it while that question
+    # is still armed, and refuses it when the question was answered from the terminal
+    # or another dashboard while the publish was in flight.
+    #
+    # Either way it is never an ordinary reply, and this runs after Invoke-Pending-
+    # Decisions has already cleared the answered question's marker - so without this
+    # the refused words were typed into the session as a chat reply moments after the
+    # card had said they were not sent and emptied the box, which is both a surprise
+    # and a second copy of an answer the person was about to retype.
+    #
+    # Marked consumed rather than merely skipped, so it does not sit there being
+    # reconsidered on every reconcile.
+    $taggedFor = ''
+    if ($payloadState -and $payloadState.PSObject.Properties['attributes'] -and $payloadState.attributes -and
+        $payloadState.attributes.PSObject.Properties['decision_id']) {
+        $taggedFor = [string]$payloadState.attributes.decision_id
+    }
+    if ($taggedFor) {
+        Set-DaemonSessionProperty -Entry $entry -Name 'LastReplyPayloadAt' -Value $stamp
+        return $false
+    }
+
     # Record the stamp before delivering, not after. Delivery types the reply into the
     # console one character at a time, which is long enough for the next reconcile to
     # see the same payload still sitting there and send it a second time.
