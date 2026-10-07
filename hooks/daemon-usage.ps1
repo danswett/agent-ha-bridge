@@ -592,10 +592,10 @@ function Get-BridgeCodexAllowance {
         for ($i = $lines.Count - 1; $i -ge 0; $i--) {
             $line = $lines[$i]
             if ($line -notmatch '"rate_limits"') { continue }
-            $event = $null
-            try { $event = $line | ConvertFrom-Json } catch { continue }
-            if (-not $event -or -not $event.PSObject.Properties['payload']) { continue }
-            $payload = $event.payload
+            $logEvent = $null
+            try { $logEvent = $line | ConvertFrom-Json } catch { continue }
+            if (-not $logEvent -or -not $logEvent.PSObject.Properties['payload']) { continue }
+            $payload = $logEvent.payload
             if (-not $payload -or -not $payload.PSObject.Properties['rate_limits']) { continue }
             $limits = $payload.rate_limits
             if (-not $limits) { continue }
@@ -624,8 +624,8 @@ function Get-BridgeCodexAllowance {
             if ($windows.Count -eq 0) { continue }
 
             $measured = ''
-            if ($event.PSObject.Properties['timestamp']) {
-                $at = ConvertTo-BridgeUsageInstant $event.timestamp
+            if ($logEvent.PSObject.Properties['timestamp']) {
+                $at = ConvertTo-BridgeUsageInstant $logEvent.timestamp
                 if ($null -ne $at) { $measured = $at.ToString('o') }
             }
             return New-BridgeUsageRecord -Client 'codex' -Source 'transcript' -Windows $windows -MeasuredAt $measured `
