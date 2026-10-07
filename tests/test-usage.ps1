@@ -27,6 +27,11 @@ $env:BRIDGE_FRONTEND_NORUN = '1'
 . (Join-Path $PSScriptRoot '..\hooks\bridge-frontend-cards.ps1')
 $script:DecisionBridgeConfig.LogFile = Join-Path ([IO.Path]::GetTempPath()) "test-usage-$([guid]::NewGuid().ToString('N').Substring(0, 8)).log"
 
+# The real backoff is hundreds of milliseconds per attempt, which is right against a
+# vendor and absurd against a scriptblock that throws instantly. Every deliberately
+# failing fetch below would otherwise pay for it three times over.
+$script:BridgeUsageConfig.RetryDelayMs = 1
+
 $script:Failures = 0
 function Test-That {
     param([string]$Name, [scriptblock]$Condition, [string]$Detail = '')
@@ -186,6 +191,85 @@ Test-That 'and it says why it is not live, so a stale bar is not read as a fresh
 Test-That 'the cached reading is dated when it was taken, not when it was read' {
     $fallback.measured_at -match '^2026-10-06T19:32:20'
 } "measured_at=$($fallback.measured_at)"
+
+Write-Host '--- a read that fails once is not a failed reading ---'
+# Measured on DSWETT-HOME on 2026-10-07: api.github.com completed 6 of 14 handshakes
+# while two other hosts managed 14 of 14 from the same machine in the same seconds.
+# A single-shot read reported a failure most of the time with a correct figure one
+# retry away, so the card carried a permanent red line under a true number.
+$script:FlakyCalls = 0
+$flaky = Get-BridgeCopilotAllowance -ConfigPath $copilotConfig -CachePath $copilotCache -ResolveToken { 'stub' } -Fetch {
+    $script:FlakyCalls++
+    if ($script:FlakyCalls -lt 3) { throw 'The SSL connection could not be established, see inner exception.' }
+    New-CopilotBody
+}
+Test-That 'a read that fails twice and then succeeds is a live reading, not a cached one' {
+    $flaky.source -ceq 'api' -and -not $flaky.error
+} "source=$($flaky.source) error=$($flaky.error)"
+Test-That 'and it stops retrying the moment it has an answer' {
+    $script:FlakyCalls -eq 3
+} "calls=$($script:FlakyCalls)"
+
+$script:AlwaysCalls = 0
+$null = Get-BridgeCopilotAllowance -ConfigPath $copilotConfig -CachePath $copilotCache -ResolveToken { 'stub' } -Fetch {
+    $script:AlwaysCalls++
+    throw 'the network is down'
+}
+Test-That 'a read that never succeeds gives up rather than retrying forever' {
+    $script:AlwaysCalls -eq $script:BridgeUsageConfig.RequestAttempts
+} "calls=$($script:AlwaysCalls) attempts=$($script:BridgeUsageConfig.RequestAttempts)"
+
+$chained = Get-BridgeCopilotAllowance -ConfigPath $copilotConfig -CachePath '' -ResolveToken { 'stub' } -Fetch {
+    throw [Net.Http.HttpRequestException]::new(
+        'The SSL connection could not be established, see inner exception.',
+        [IO.IOException]::new('An existing connection was forcibly closed by the remote host.'))
+}
+Test-That 'the reported reason is the cause itself, not a pointer at one' {
+    $chained.error -match 'forcibly closed' -and $chained.error -notmatch 'see inner exception'
+} "error=$($chained.error)"
+
+$script:GuardCalls = 0
+$guardPropagated = $false
+try {
+    $null = Get-BridgeCopilotAllowance -ConfigPath $copilotConfig -CachePath '' -ResolveToken { 'stub' } -Fetch {
+        $script:GuardCalls++
+        $violation = [InvalidOperationException]::new('the offline guard refused this call')
+        $violation.Data['BridgeTestNetworkBlocked'] = $true
+        throw $violation
+    }
+}
+catch { $guardPropagated = $true }
+Test-That 'an offline-guard violation propagates instead of becoming a connection failure' {
+    $guardPropagated
+}
+Test-That 'and is never retried, which would report one violation as three' {
+    $script:GuardCalls -eq 1
+} "calls=$($script:GuardCalls)"
+
+$script:RefusedCalls = 0
+$refused = $null
+try {
+    $null = Invoke-BridgeUsageAttempt -Operation {
+        $script:RefusedCalls++
+        throw 'Response status code does not indicate success: 401 (Unauthorized).'
+    }
+}
+catch { $refused = $_ }
+Test-That 'a refusal is an answer, reported at once rather than retried into the same answer' {
+    $script:RefusedCalls -eq 1 -and $null -ne $refused
+} "calls=$($script:RefusedCalls)"
+
+$script:ThrottledCalls = 0
+try {
+    $null = Invoke-BridgeUsageAttempt -Operation {
+        $script:ThrottledCalls++
+        throw 'Response status code does not indicate success: 429 (Too Many Requests).'
+    }
+}
+catch { }
+Test-That 'but being asked to slow down is about timing, so that one is retried' {
+    $script:ThrottledCalls -eq $script:BridgeUsageConfig.RequestAttempts
+} "calls=$($script:ThrottledCalls)"
 
 $nothing = Get-BridgeCopilotAllowance -ConfigPath $copilotConfig -CachePath '' -ResolveToken { '' } -Fetch { throw 'no token' }
 Test-That 'with neither, the record exists but offers no percentage to draw' {

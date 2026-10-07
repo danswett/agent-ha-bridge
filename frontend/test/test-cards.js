@@ -1081,6 +1081,38 @@ doc._fire('visibilitychange');
 check('and cannot be revived by a later visibility change', timers.size === 0, `size=${timers.size}`);
 
 console.log('');
+console.log('--- a failed read is only news once the reading it replaces has aged ---');
+/*
+ * A vendor read that fails beside a reading taken minutes ago is noise: the bars are
+ * still true and the age already says how true. On a machine whose path to GitHub
+ * dropped most TLS handshakes this painted a permanent red line under a correct
+ * figure, which teaches the eye that the colour means nothing. Once nothing recent
+ * survives, the error becomes the only honest thing left to show.
+ */
+function usageGroup(ageMs, error) {
+  const card = usageCard();
+  return card._renderGroup({
+    key: 'copilot\u0000acct', at: Date.now() - ageMs, percent: 68,
+    label: 'GitHub Copilot', account: 'acct', plan: 'enterprise', machine: 'desk',
+    error, windows: [],
+  });
+}
+const errText = (group) =>
+  (group.children || []).filter((c) => c.className === 'err').map((c) => c.textContent).join('');
+
+const fresh = usageGroup(5 * 60 * 1000, 'The Copilot quota could not be read: forcibly closed');
+check('a fresh reading does not wear the last failed attempt', errText(fresh) === '', errText(fresh));
+
+const aged = usageGroup(3 * 60 * 60 * 1000, 'The Copilot quota could not be read: forcibly closed');
+check('but once it is hours old the reason is shown', /forcibly closed/.test(errText(aged)), errText(aged));
+
+const quiet = usageGroup(3 * 60 * 60 * 1000, '');
+check('and an old reading with nothing wrong says nothing', errText(quiet) === '', errText(quiet));
+
+check('one definition of stale, so the age and the error can never disagree',
+  AgentBridgeUsageCard._isStale(Date.now() - 3600001) && !AgentBridgeUsageCard._isStale(Date.now() - 60000));
+
+console.log('');
 console.log('--- the launch card carries model, effort and context ---');
 /*
  * The three tuning selectors are the launch card's only controls whose options change
