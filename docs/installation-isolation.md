@@ -224,3 +224,8 @@ This prints eligible local folder suggestions without starting a client, changin
 configuration or approving a target. Review the results, add only the desired paths
 to `newSession.workspaces`, and reload the bridge configuration before launching.
 Setting `discoverWorkspaces` to `false` makes this helper return no suggestions.
+
+To approve a folder without editing the configuration by hand, run
+`agent-ha-bridge configure -Workspace <path>` instead. That is an explicit operator
+action which validates the path and rewrites the approved list; this helper only
+reports, and history alone never approves anything.
