@@ -23,7 +23,7 @@
  * uploaded image these sit in the sensor's attributes.
  */
 
-const CARD_VERSION = '1.26.0';
+const CARD_VERSION = '1.27.0';
 
 /*
  * How large a non-image attachment may be.
@@ -110,6 +110,24 @@ function describeThrown(err) {
   return String(err);
 }
 
+/*
+ * Every reply card on the page, by the MQTT topic it publishes to.
+ *
+ * The reply card and the choices card are separate custom elements sitting side by
+ * side in one session card, and on a mixed form only the reply card holds the typed
+ * words: they reach the daemon when - and only when - that card publishes them.
+ * "Send answer" pressed the submit entity and published nothing, so the daemon read
+ * no payload, fell back to a text entity the card never writes, and submitted the
+ * form with that field empty. An empty free-text field is a valid answer, so nothing
+ * refused it and the typed answer was simply gone (#93).
+ *
+ * They are siblings rather than ancestor and descendant, so a bubbling event cannot
+ * carry the words across and the DOM between them is Home Assistant's to arrange.
+ * The topic is already unique per session, which makes it the one name both cards
+ * can be given and agree on.
+ */
+const REPLY_CARDS = new Map();
+
 class AgentBridgeReplyCard extends HTMLElement {
   constructor() {
     super();
@@ -119,6 +137,8 @@ class AgentBridgeReplyCard extends HTMLElement {
     this._files = [];
     this._busy = false;
     this._statusTimer = null;
+    this._registeredTopic = '';
+    this._trimmedPublished = '';
   }
 
   setConfig(config) {
@@ -126,9 +146,149 @@ class AgentBridgeReplyCard extends HTMLElement {
       throw new Error('agent-bridge-reply-card: "topic" is required');
     }
     this._config = Object.assign({ name: 'Reply', placeholder: 'Type a reply...' }, config);
+    this._register();
     if (this._built) {
       this._applyConfig();
     }
+  }
+
+  connectedCallback() {
+    this._register();
+  }
+
+  disconnectedCallback() {
+    // Only if it is still us. Home Assistant rebuilds a view by connecting the
+    // replacement before disconnecting the original, so deleting unconditionally
+    // removed the card that had just taken over and left the topic unclaimed.
+    if (this._registeredTopic && REPLY_CARDS.get(this._registeredTopic) === this) {
+      REPLY_CARDS.delete(this._registeredTopic);
+    }
+    this._registeredTopic = '';
+  }
+
+  _register() {
+    const topic = this._config ? String(this._config.topic || '') : '';
+    if (!topic) { return; }
+    if (this._registeredTopic && this._registeredTopic !== topic &&
+        REPLY_CARDS.get(this._registeredTopic) === this) {
+      REPLY_CARDS.delete(this._registeredTopic);
+    }
+    this._registeredTopic = topic;
+    REPLY_CARDS.set(topic, this);
+  }
+
+  /*
+   * Whether the box holds typed words a form could use as its free-text field.
+   *
+   * Attachments deliberately do not count. Read-DaemonDecisionCardText discards any
+   * payload carrying images or files - an image cannot be typed into an arrow-key
+   * prompt, and consuming it there would destroy it - so publishing one on a form's
+   * behalf would submit the field empty anyway and leave the attachment to arrive
+   * afterwards as a stray reply.
+   */
+  hasUnsentFormText() {
+    if (!this._built || !this._els || !this._els.textarea) { return false; }
+    return this._els.textarea.value.trim().length > 0;
+  }
+
+  /*
+   * Take out of the box what has just been published, leaving anything typed since,
+   * and remember what was taken so it can be put back.
+   *
+   * The textarea stays editable while Send is disabled, so a slow publish can finish
+   * against a value that has grown. Clearing it all erased words that were never
+   * sent; keeping it all left the sent ones to go a second time.
+   *
+   * A value that no longer begins with what went is left whole, and nothing is
+   * remembered: the published words cannot be picked out of it any more, and the
+   * person has deliberately replaced them. Dropping an edit nobody has seen
+   * delivered is the failure all of this exists to remove - a duplicate is visible,
+   * a loss is not.
+   */
+  _trimPublished(text) {
+    this._trimmedPublished = '';
+    if (!this._els || !this._els.textarea) { return; }
+    const now = this._els.textarea.value;
+    if (now === text) {
+      this._els.textarea.value = '';
+      this._trimmedPublished = text;
+    } else if (text && now.startsWith(text)) {
+      this._els.textarea.value = now.slice(text.length);
+      this._trimmedPublished = text;
+    }
+  }
+
+  /*
+   * Put back words that were published for a question which has since gone.
+   *
+   * The daemon deliberately discards a payload tagged for a question it is not
+   * holding, so without this the words exist neither in the session nor in the box
+   * the card has just told the person to send again from.
+   *
+   * Exactly the inverse of the trim, so an answer that was appended to while the
+   * publish was in flight comes back whole. Testing the box for emptiness instead
+   * lost the published half of precisely that case: the tail had been kept, so the
+   * box was not empty, so the words that went were never restored.
+   */
+  restoreFormText() {
+    const text = this._trimmedPublished;
+    if (!text || !this._els || !this._els.textarea) { return; }
+    this._els.textarea.value = text + this._els.textarea.value;
+    this._trimmedPublished = '';
+    this._syncSendState();
+  }
+
+  /*
+   * Publish just the typed words, for a form being submitted from the choices card.
+   *
+   * Anything attached stays in the box on purpose: the reply path stages and
+   * delivers it properly once the question is gone, which is the only route that
+   * can carry it at all.
+   *
+   * The question is named in the payload. A publish is a round trip, and
+   * Read-DaemonFormAnswer treats any new text payload as a submission for a complete
+   * form - so if the question is answered or replaced while this is in flight, an
+   * untagged payload would be consumed by the replacement, answering it with words
+   * typed for something else. The daemon drops one tagged for a question that has
+   * gone.
+   */
+  async publishFormText(decisionId) {
+    if (this._busy || !this.hasUnsentFormText()) { return false; }
+    const text = this._els.textarea.value;
+    this._busy = true;
+    this._syncSendState();
+    this._setStatus('Sending...', 'busy');
+    const payload = {
+      at: new Date().toISOString(),
+      text: text,
+      images: [],
+      files: [],
+      card_version: CARD_VERSION,
+    };
+    if (decisionId) { payload.decision_id = String(decisionId); }
+    let published = false;
+    try {
+      await this._hass.callService('mqtt', 'publish', {
+        topic: this._config.topic,
+        payload: JSON.stringify(payload),
+        qos: 0,
+        retain: false,
+      });
+      // Only the words, and only the ones that were not sent. Clearing the chips would
+      // throw away an attachment the form never received; clearing unconditionally
+      // would erase anything typed while the publish was in flight, since the textarea
+      // stays editable while Send is disabled. Keeping the whole value was no better -
+      // it left the published words in the box, so the next send carried them twice.
+      this._trimPublished(text);
+      this._setStatus('Sent', 'ok');
+      published = true;
+    } catch (err) {
+      this._setStatus(`Send failed: ${err.message || err}`, 'err');
+    } finally {
+      this._busy = false;
+      this._syncSendState();
+    }
+    return published;
   }
 
   set hass(hass) {
@@ -518,7 +678,10 @@ class AgentBridgeReplyCard extends HTMLElement {
         qos: 0,
         retain: false,
       });
-      this._els.textarea.value = '';
+      // Only what was not sent. The textarea stays editable while Send is disabled,
+      // so anything typed during the publish was not in the payload and must neither
+      // be erased with it nor left to go a second time.
+      this._trimPublished(text);
       this._images = [];
       this._files = [];
       this._renderChips();
@@ -974,6 +1137,7 @@ class AgentBridgeChoicesCard extends HTMLElement {
     // daemon, which says which field it is waiting on, and freezing that would leave
     // no way to go and answer it.
     this._complete = false;
+    this._takesText = false;
     this._fields = [];
     // What has been tapped but not yet seen coming back from Home Assistant.
     // {} when everything on screen is confirmed.
@@ -1197,6 +1361,16 @@ class AgentBridgeChoicesCard extends HTMLElement {
     // the fields are the answer and it stays on its placeholder throughout.
     const mustAnswer = groups.filter((g) => g.options.some((o) => o !== CHOICE_CANCEL));
     this._complete = mustAnswer.length > 0 && mustAnswer.every((g) => g.chosen !== '');
+    // Whether this question has a free-text field: a slot the bridge gave a heading
+    // but no options, because it is answered in the reply box rather than by a
+    // dropdown. An unused slot carries no heading, which is what tells the two apart.
+    //
+    // Only such a question can be sent by publishing. Read-DaemonFormAnswer submits on
+    // a payload alone ($cardSubmits) only when $takesText, so publishing for an
+    // options-only form - because a draft happened to be sitting in the reply box -
+    // sent nothing at all while this card had already frozen itself as though it had.
+    this._takesText = this._fields.some((entityId, i) =>
+      !this._armed(entityId) && String(decisionAttrs[`field_${i + 1}_label`] || '') !== '');
 
     const show = groups.length > 0;
     this.hidden = !show;
@@ -1434,8 +1608,7 @@ class AgentBridgeChoicesCard extends HTMLElement {
     // drawn disabled for this too, but a press can arrive from a keyboard or a stale
     // click, and sending a choice nobody made here is exactly what must not happen.
     if (this._note === CHOICE_CHANGED_NOTE) { return; }
-    const generation = String(
-      ((this._hass.states[this._config.decision] || {}).attributes || {}).decision_id || '');
+    const generation = this._generationNow();
     // Frozen as the press is dispatched, not when Home Assistant acknowledges it.
     // callService is a promise, and a tap landing while it was in flight reached the
     // selector before the daemon read it - so the daemon submitted the changed value
@@ -1447,6 +1620,60 @@ class AgentBridgeChoicesCard extends HTMLElement {
       this._last = '';
       this._render();
     }
+    // Whatever is typed in the reply box has to be published before the form is sent.
+    // The daemon reads a form's free-text field out of that payload
+    // (Read-DaemonDecisionCardText); a submit arriving without one left the field
+    // empty, and an empty free-text field is a valid answer, so the form went to the
+    // session with the typed words silently dropped (#93).
+    //
+    // Only ever for a complete form. Publishing is itself a submission -
+    // Read-DaemonFormAnswer submits on the payload alone ($cardSubmits) - so words
+    // published for a form that is not finished would sit there and fire the moment
+    // the last choice was ticked, turning a tap into the send, which is the one thing
+    // Send answer exists to prevent. An incomplete form keeps exactly the behaviour it
+    // had: the press, which is what makes the daemon name the field it is waiting on,
+    // and the words stay in the box until there is a finished form to carry them.
+    const reply = (this._complete && this._takesText)
+      ? REPLY_CARDS.get(String(this._config.reply_topic || ''))
+      : null;
+    if (reply && reply.hasUnsentFormText()) {
+      reply.publishFormText(generation).then(
+        (published) => {
+          // Only on a publish that landed. Submitting after a failed one is exactly
+          // the loss this exists to prevent, and the reply card keeps the text so it
+          // can be sent again.
+          if (!published) {
+            this._failSend(new Error('the reply box could not be sent - try again'));
+            return;
+          }
+          // And only if this is still the same question. A publish is a round trip,
+          // and the terminal or another dashboard can answer the old question inside
+          // it; the daemon drops a payload tagged for a question that has gone.
+          if (this._generationNow() !== generation) {
+            // The daemon discards a payload tagged for a question that has gone, so
+            // telling someone to send again is only honest if the words are back in
+            // the box - all of them, including any that were appended meanwhile.
+            reply.restoreFormText();
+            this._failSend(new Error('the question changed - check it and send again'));
+            return;
+          }
+          // Nothing else to do. The payload is the submission, and pressing as well
+          // would race the sensor it depends on: mqtt.publish returns when Home
+          // Assistant has dispatched the message, not when sensor.<node>_reply_payload
+          // has caught up, and a press read in that gap submits the form with an empty
+          // field and the words arrive too late to be part of it.
+        },
+        (err) => this._failSend(err));
+      return;
+    }
+    this._pressSubmit();
+  }
+
+  _generationNow() {
+    return String(((this._hass.states[this._config.decision] || {}).attributes || {}).decision_id || '');
+  }
+
+  _pressSubmit() {
     let call;
     try { call = this._hass.callService('button', 'press', { entity_id: this._config.submit }); }
     catch (err) { this._failSend(err); return; }

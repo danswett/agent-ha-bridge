@@ -461,6 +461,18 @@ function Read-DaemonDecisionCardText {
     foreach ($name in @('images', 'files')) {
         if ($attrs.PSObject.Properties[$name] -and @($attrs.$name).Count -gt 0) { return $empty }
     }
+    # A payload the card tagged with the question it was typed for. Send answer
+    # publishes the reply box and then submits, and that publish is a round trip: if
+    # the question is answered from the terminal or another dashboard inside it, the
+    # words belong to a question that has gone. Untagged is not a mismatch - the reply
+    # card's own Send carries no tag, and nor does any card before 1.26.0 - but a tag
+    # naming a different question means these words were never meant for this one, and
+    # a complete form would otherwise be submitted with them.
+    if ($attrs.PSObject.Properties['decision_id']) {
+        $taggedFor = [string]$attrs.decision_id
+        $armedFor = if ($null -ne $Marker -and $Marker.PSObject.Properties['decisionId']) { [string]$Marker.decisionId } else { '' }
+        if ($taggedFor -and $taggedFor -ne $armedFor) { return $empty }
+    }
     $text = if ($attrs.PSObject.Properties['text']) { [string]$attrs.text } else { '' }
     if ([string]::IsNullOrWhiteSpace($text)) { return $empty }
     [pscustomobject]@{ Text = $text; Stamp = $current.Value }

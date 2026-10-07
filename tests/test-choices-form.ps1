@@ -264,6 +264,14 @@ Test-That 'and every one of them is an entity the bridge actually published' {
 Test-That 'and the submit button, because Send answer is the card''s row now' {
     $cardConfig.PSObject.Properties['submit'] -and [string]$cardConfig.submit -eq "button.${node}_submit"
 } "submit=[$(if ($null -ne $cardConfig -and $cardConfig.PSObject.Properties['submit']) { $cardConfig.submit } else { '<missing>' })]"
+# Send answer presses the submit entity and publishes nothing of its own, so without
+# the reply box's topic it submitted a mixed form with the free-text field empty -
+# and an empty free-text field is a valid answer, so the typed words were simply
+# dropped (#93). The topic is the only name the two cards share.
+Test-That 'and the reply box''s topic, which is how Send answer reaches what was typed' {
+    $cardConfig.PSObject.Properties['reply_topic'] -and
+        [string]$cardConfig.reply_topic -eq (Get-CopilotMqttReplyPayloadTopic -Node $node)
+} "reply_topic=[$(if ($null -ne $cardConfig -and $cardConfig.PSObject.Properties['reply_topic']) { $cardConfig.reply_topic } else { '<missing>' })]"
 
 # The reply box stops being swapped out the moment a question arrives. That swap
 # existed because the daemon could not read the card's payload while a question was
@@ -297,6 +305,27 @@ Test-That 'an older card is not handed a submit entity it would ignore' {
 Test-That 'and keeps the entity pair for whenever a question is armed' {
     @($oldCard.cards | Where-Object { $_.type -eq 'conditional' -and "$($_.card.type)" -eq 'custom:layout-card' }).Count -eq 1
 } "types=[$(@($oldCard.cards | ForEach-Object { if ($_.type -eq 'conditional') { "conditional($($_.card.type))" } else { $_.type } }) -join '|')]"
+
+# The reply-topic gate is its own boundary, one version further on. #98 shipped a
+# 1.26.0 card with none of this machinery, and a card that does not know a config key
+# drops it silently - so handing reply_topic to that one looks like it worked here
+# while that machine goes on losing typed fields.
+Set-TestPublicationCardUrl -Url '/local/agent-bridge-reply-card.js?v=1.26.0'
+Save-CopilotSessionDashboard `
+    -Sessions @([pscustomobject]@{ Node = $node; Name = 'Copilot: a task'; Machine = 'BOX'; Kind = 'copilot' }) `
+    -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.26.0'
+$preTopicDash = $script:SavedConfig | ConvertTo-Json -Depth 40 | ConvertFrom-Json -Depth 40
+$preTopicCard = @($preTopicDash.views[0].cards | Where-Object { $_.type -eq 'custom:agent-bridge-session-card' })[0]
+$preTopicChoices = @($preTopicCard.cards | Where-Object {
+    $_.type -eq 'conditional' -and "$($_.card.type)" -eq 'custom:agent-bridge-choices-card'
+})[0].card
+
+Test-That 'a card from before the reply topic is not handed one' {
+    -not $preTopicChoices.PSObject.Properties['reply_topic']
+} "reply_topic=[$(if ($preTopicChoices.PSObject.Properties['reply_topic']) { $preTopicChoices.reply_topic } else { '<absent>' })]"
+Test-That 'but still gets the submit entity it does understand' {
+    $preTopicChoices.PSObject.Properties['submit'] -and [string]$preTopicChoices.submit -eq "button.${node}_submit"
+}
 
 # --- 2b. the line beside Send, on the dashboard the bridge really generates --------
 

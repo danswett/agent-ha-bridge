@@ -32,7 +32,7 @@ function cmpVersion(a, b) {
 // --- the card itself, in a DOM small enough to run it (card-harness.js) --------
 
 const { FakeElement, loadCards } = require('./card-harness');
-const { AgentBridgeChoicesCard, AgentBridgeSessionCard, AgentBridgeActivityCard, AgentBridgeUsageCard, CARD_VERSION, sandbox, source } = loadCards();
+const { AgentBridgeChoicesCard, AgentBridgeSessionCard, AgentBridgeActivityCard, AgentBridgeUsageCard, AgentBridgeReplyCard: SharedReplyCard, CARD_VERSION, sandbox, source } = loadCards();
 
 // --- the harness ------------------------------------------------------------------
 
@@ -1669,6 +1669,239 @@ async function checkIncompleteSendStaysLive() {
     JSON.stringify(calls));
 }
 
+/*
+ * Send answer, on a form that also takes typed words.
+ *
+ * Only the reply card holds what was typed, and the daemon reads a form's free-text
+ * field out of the payload that card publishes (Read-DaemonDecisionCardText). Send
+ * answer pressed the submit entity and published nothing, so the daemon found no
+ * payload, fell back to a text entity this card never writes, and submitted the form
+ * with the field empty - which it accepts, an empty free-text field being a valid
+ * answer. Nothing refused it and the typed words were simply gone (#93).
+ *
+ * Both cards come from the one sandbox on purpose: they find each other through a
+ * registry inside the module, so loading two copies would be two registries and the
+ * lookup under test would never happen.
+ */
+async function checkSendAnswerCarriesTypedText() {
+  const TOPIC = 'copilot/cli/session/abc/replypayload';
+  const FIELD = 'select.agent_bridge_abc_f1';
+  const TEXT_FIELD = 'select.agent_bridge_abc_f2';
+
+  function mixed({ typed = '', publishFails = false, replyTopic = TOPIC, holdPublish = false, attach = false, incomplete = false, optionsOnly = false } = {}) {
+    const calls = [];
+    let releasePublish = null;
+    // A free-text field is a slot the bridge gives a heading but no options: it is
+    // answered in the reply box, not by a dropdown. An unused slot has no heading.
+    const attributes = {
+      options: ['Awaiting answer...', 'Cancel request'], decision_id: 'd1', field_1_label: 'Colour',
+    };
+    if (!optionsOnly) { attributes.field_2_label = 'Notes'; }
+    const states = {
+      [DECISION]: { state: 'Awaiting answer...', attributes },
+      [FIELD]: { state: incomplete ? 'Choose...' : 'Red', attributes: { options: ['Choose...', 'Red', 'Blue'] } },
+      [TEXT_FIELD]: { state: 'Idle', attributes: { options: ['Idle'] } },
+    };
+    const hass = {
+      states,
+      callService: (domain, service, data) => {
+        calls.push({ domain, service, data });
+        if (domain === 'mqtt' && publishFails) { return Promise.reject(new Error('refused')); }
+        if (domain === 'mqtt' && holdPublish) {
+          return new Promise((resolve) => { releasePublish = resolve; });
+        }
+        return Promise.resolve();
+      },
+    };
+    const reply = new SharedReplyCard();
+    reply.setConfig({ topic: TOPIC });
+    reply.hass = hass;
+    reply._els.textarea.value = typed;
+    if (attach) { reply._images = [{ id: 'img1', name: 'shot.png', content_type: 'image/png' }]; }
+
+    const config = { decision: DECISION, fields: [FIELD, TEXT_FIELD], submit: SUBMIT };
+    if (replyTopic) { config.reply_topic = replyTopic; }
+    const choices = new AgentBridgeChoicesCard();
+    choices.setConfig(config);
+    choices.hass = hass;
+    return { calls, reply, choices, states, release: () => releasePublish && releasePublish() };
+  }
+
+  const press = (c) => buttons(c).find((b) => b.textContent === 'Send answer').click();
+  const domains = (m) => m.calls.map((c) => c.domain).join(',');
+  // Read defensively: a regression here means the publish never happened, and a test
+  // that throws on the missing call reports nothing about the ones after it.
+  const published = (m) => {
+    const call = m.calls.find((c) => c.domain === 'mqtt');
+    if (!call || !call.data) { return null; }
+    try { return JSON.parse(call.data.payload); } catch (err) { return null; }
+  };
+
+  let m = mixed({ typed: 'and please restart it afterwards' });
+  press(m.choices);
+  await flush();
+  // Publishing is the submission for a complete form - Read-DaemonFormAnswer's
+  // $cardSubmits - so there is deliberately no button press to race the sensor with.
+  check('a complete form is sent by publishing the words, with no press to race it',
+    domains(m) === 'mqtt', domains(m));
+  check('and the payload carries the words themselves',
+    (published(m) || {}).text === 'and please restart it afterwards', JSON.stringify(published(m)));
+  check('on the topic both cards were given',
+    !!m.calls.find((c) => c.domain === 'mqtt' && c.data.topic === TOPIC), domains(m));
+  check('the rows stay frozen, so the answer cannot be changed under the send',
+    m.choices._committed === true);
+  check('and the box is emptied, so the next question does not inherit the answer',
+    m.reply._els.textarea.value === '');
+
+  // An incomplete form must publish nothing at all. A payload is itself a submission,
+  // so words left against an unfinished form would fire the moment the last choice was
+  // ticked - a tap becoming the send, which is what Send answer exists to prevent.
+  m = mixed({ typed: 'some notes', incomplete: true });
+  press(m.choices);
+  await flush();
+  check('an incomplete form publishes nothing, so no tap can later become the send',
+    domains(m) === 'button', domains(m));
+  check('and keeps the words in the box until there is a form to carry them',
+    m.reply._els.textarea.value === 'some notes', m.reply._els.textarea.value);
+
+  // A form of dropdowns alone cannot take words, and Read-DaemonFormAnswer will not
+  // submit on a payload for one ($cardSubmits requires $takesText). A draft left in
+  // the reply box must not divert the send: published instead of pressed, nothing was
+  // sent at all while this card had already frozen itself as though it had.
+  m = mixed({ typed: 'a draft I left lying about', optionsOnly: true });
+  press(m.choices);
+  await flush();
+  check('a form of options alone presses, however much is sitting in the reply box',
+    domains(m) === 'button', domains(m));
+  check('and the draft is left where it was, for the reply path',
+    m.reply._els.textarea.value === 'a draft I left lying about', m.reply._els.textarea.value);
+
+  // The usual optional "anything else?", left blank. There is nothing to publish and
+  // an empty free-text field is a valid answer, so this must stay a single press.
+  m = mixed({ typed: '' });
+  press(m.choices);
+  await flush();
+  check('an empty box publishes nothing and goes straight to submit', domains(m) === 'button', domains(m));
+
+  // Pressing submit after a publish that did not land is the original bug exactly:
+  // the form would go without the words, and nothing anywhere would say so.
+  m = mixed({ typed: 'important', publishFails: true });
+  press(m.choices);
+  await flush();
+  check('a publish that fails does not go on to submit the form',
+    m.calls.filter((c) => c.domain === 'button').length === 0, JSON.stringify(m.calls));
+  check('the words are kept, so they can be sent again', m.reply._els.textarea.value === 'important');
+  check('the card says so rather than looking sent', /Send failed/.test(m.choices._note), m.choices._note);
+  check('and its rows are released, so Send can be pressed again', m.choices._committed === false);
+
+  // A dashboard generated for an older card hands over no topic at all. That card
+  // must behave exactly as it did rather than refusing to send.
+  m = mixed({ typed: 'typed anyway', replyTopic: '' });
+  press(m.choices);
+  await flush();
+  check('with no reply topic the card presses submit as it always did', domains(m) === 'button', domains(m));
+
+  // Home Assistant rebuilds a view by connecting the replacement before disconnecting
+  // the original, so an unconditional delete removed the card that had just taken over.
+  const first = mixed({ typed: 'first' });
+  const second = mixed({ typed: 'second' });
+  first.reply.disconnectedCallback();
+  press(second.choices);
+  await flush();
+  check('a reply card that goes away does not unregister the one that replaced it',
+    domains(second) === 'mqtt', domains(second));
+
+  // An attachment cannot be typed into an arrow-key prompt, and
+  // Read-DaemonDecisionCardText discards any payload carrying one - so publishing it
+  // on the form's behalf would submit the field empty anyway and leave the image to
+  // turn up afterwards as a stray reply. Only the words go.
+  m = mixed({ typed: 'and the log is attached', attach: true });
+  press(m.choices);
+  await flush();
+  check('an attachment is left out of the payload the form is answered with',
+    (published(m) || {}).images && published(m).images.length === 0, JSON.stringify(published(m)));
+  check('while the words still reach the form',
+    (published(m) || {}).text === 'and the log is attached', JSON.stringify(published(m)));
+  check('and the attachment stays in the box for the reply path to deliver',
+    m.reply._images.length === 1, `${m.reply._images.length} image(s)`);
+  check('the form is still sent, by the payload rather than a press', domains(m) === 'mqtt', domains(m));
+
+  // A publish is a round trip. The terminal, or another dashboard, can answer the old
+  // question inside it - and the session's submit button belongs to whatever question
+  // is armed now, so pressing it then sends a form nobody here filled in.
+  m = mixed({ typed: 'slow one', holdPublish: true });
+  press(m.choices);
+  await flush();
+  m.states[DECISION].attributes.decision_id = 'd2';
+  m.release();
+  await flush();
+  check('a question that changed during the publish is not submitted',
+    m.calls.filter((c) => c.domain === 'button').length === 0, JSON.stringify(m.calls));
+  check('and the card says why rather than looking sent',
+    /question changed/.test(m.choices._note), m.choices._note);
+  // The daemon discards a payload tagged for a question it is not holding, so telling
+  // someone to send again is only honest if there is still something there to send.
+  check('the words are put back in the box it told the person to send again from',
+    m.reply._els.textarea.value === 'slow one', m.reply._els.textarea.value);
+
+  // Appending while the publish is in flight and the question changing in the same
+  // interval: the trim had already taken the published half out, so a restore that
+  // refused a non-empty box lost it for good while the card asked for it again.
+  m = mixed({ typed: 'slow one', holdPublish: true });
+  press(m.choices);
+  await flush();
+  m.reply._els.textarea.value = 'slow one and more';
+  m.states[DECISION].attributes.decision_id = 'd2';
+  m.release();
+  await flush();
+  check('an answer appended to while the question went comes back whole',
+    m.reply._els.textarea.value === 'slow one and more', m.reply._els.textarea.value);
+
+  // A rewrite had nothing subtracted from it, so there is nothing to put back - and
+  // resurrecting a draft the person had deliberately replaced is not restoring it.
+  m = mixed({ typed: 'slow one', holdPublish: true });
+  press(m.choices);
+  await flush();
+  m.reply._els.textarea.value = 'actually, something else';
+  m.states[DECISION].attributes.decision_id = 'd2';
+  m.release();
+  await flush();
+  check('a rewrite is not grown back into the draft it replaced',
+    m.reply._els.textarea.value === 'actually, something else', m.reply._els.textarea.value);
+  // Stopping the press is not enough on its own: Read-DaemonFormAnswer treats any new
+  // text payload as a submission for a complete form, so an untagged one would be
+  // consumed by the replacement question - answering it with words typed for the one
+  // that has gone. The daemon drops a payload naming a question it is not holding.
+  check('the payload names the question it was typed for, so the next one cannot eat it',
+    (published(m) || {}).decision_id === 'd1', JSON.stringify(published(m)));
+
+  // The textarea stays editable while Send is disabled, so anything typed during the
+  // publish was never in the payload and must not be cleared along with it.
+  m = mixed({ typed: 'first thought', holdPublish: true });
+  press(m.choices);
+  await flush();
+  m.reply._els.textarea.value = 'first thought, and a second';
+  m.release();
+  await flush();
+  check('words typed while the publish was in flight are kept, not erased with it',
+    m.reply._els.textarea.value === ', and a second', m.reply._els.textarea.value);
+  check('and the ones that went are taken out, so they do not go twice',
+    !m.reply._els.textarea.value.startsWith('first thought'), m.reply._els.textarea.value);
+  check('and only what was actually sent went', (published(m) || {}).text === 'first thought',
+    JSON.stringify(published(m)));
+
+  // An edit that is not an append leaves nothing to subtract. A duplicate is visible;
+  // dropping words nobody has seen delivered is not, so the box is left whole.
+  m = mixed({ typed: 'first thought', holdPublish: true });
+  press(m.choices);
+  await flush();
+  m.reply._els.textarea.value = 'something else entirely';
+  m.release();
+  await flush();
+  check('a rewrite during the publish is kept whole rather than guessed at',
+    m.reply._els.textarea.value === 'something else entirely', m.reply._els.textarea.value);
+}
+
 // _launch awaits its service calls, so the checks that read them have to await it too.
 (async () => {
   await checkForgetRemoval();
@@ -1679,6 +1912,7 @@ async function checkIncompleteSendStaysLive() {
   await checkFrozenWhilePressInFlight();
   await checkRefusedSendReleases();
   await checkIncompleteSendStaysLive();
+  await checkSendAnswerCarriesTypedText();
 
   const pubEnv = launchEnv({});
   const pubCard = promptCard(pubEnv, { promptTopic: PROMPT_TOPIC });
