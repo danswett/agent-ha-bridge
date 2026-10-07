@@ -1089,25 +1089,35 @@ console.log('--- a failed read is only news once the reading it replaces has age
  * figure, which teaches the eye that the colour means nothing. Once nothing recent
  * survives, the error becomes the only honest thing left to show.
  */
-function usageGroup(ageMs, error) {
+function usageGroup(ageMs, error, windows) {
   const card = usageCard();
+  const bars = windows === undefined ? [] : windows;
   return card._renderGroup({
-    key: 'copilot\u0000acct', at: Date.now() - ageMs, percent: 68,
+    key: 'copilot\u0000acct', at: Date.now() - ageMs,
+    percent: bars.length ? 68 : null,
     label: 'GitHub Copilot', account: 'acct', plan: 'enterprise', machine: 'desk',
-    error, windows: [],
+    error, windows: bars,
   });
 }
 const errText = (group) =>
   (group.children || []).filter((c) => c.className === 'err').map((c) => c.textContent).join('');
 
-const fresh = usageGroup(5 * 60 * 1000, 'The Copilot quota could not be read: forcibly closed');
+const bar = [{ key: 'plan', label: 'Plan', percent: 68 }];
+const fresh = usageGroup(5 * 60 * 1000, 'The Copilot quota could not be read: forcibly closed', bar);
 check('a fresh reading does not wear the last failed attempt', errText(fresh) === '', errText(fresh));
 
-const aged = usageGroup(3 * 60 * 60 * 1000, 'The Copilot quota could not be read: forcibly closed');
+const aged = usageGroup(3 * 60 * 60 * 1000, 'The Copilot quota could not be read: forcibly closed', bar);
 check('but once it is hours old the reason is shown', /forcibly closed/.test(errText(aged)), errText(aged));
 
-const quiet = usageGroup(3 * 60 * 60 * 1000, '');
+const quiet = usageGroup(3 * 60 * 60 * 1000, '', bar);
 check('and an old reading with nothing wrong says nothing', errText(quiet) === '', errText(quiet));
+
+// A read that fails with nothing to fall back on still returns a record, stamped with
+// the time of the attempt - so it looks new. Keying off the age alone hid the only
+// diagnostic there was for an hour, precisely when there were no bars to justify it.
+const nothing = usageGroup(5 * 1000, 'The Copilot quota could not be read: forcibly closed', []);
+check('a failure with no reading behind it is reported however new the attempt is',
+  /forcibly closed/.test(errText(nothing)), errText(nothing));
 
 check('one definition of stale, so the age and the error can never disagree',
   AgentBridgeUsageCard._isStale(Date.now() - 3600001) && !AgentBridgeUsageCard._isStale(Date.now() - 60000));

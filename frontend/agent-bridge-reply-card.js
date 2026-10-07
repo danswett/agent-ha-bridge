@@ -2616,9 +2616,16 @@ class AgentBridgeUsageCard extends HTMLElement {
     // above are still true, and the age already says how true. Reporting it anyway
     // put a permanent red line under a correct figure on a machine whose path to one
     // vendor dropped most handshakes, which trains the eye to ignore the colour.
-    // Once nothing recent survives, the error is the only honest thing left to show.
-    const stale = entry.at === 0 || AgentBridgeUsageCard._isStale(entry.at);
-    if (entry.error && stale) {
+    //
+    // The test is what survived, not how recent the record is. A read that fails with
+    // nothing to fall back on still returns a record, and New-BridgeUsageRecord stamps
+    // it with the time of the *attempt* - so an error-only record is always "fresh",
+    // and keying off the age alone hid the one diagnostic there was for an hour, at
+    // exactly the moment there were no bars to justify hiding it.
+    const hasReading = Number.isFinite(entry.percent) ||
+      (Array.isArray(entry.windows) && entry.windows.length > 0);
+    const fresh = entry.at > 0 && !AgentBridgeUsageCard._isStale(entry.at);
+    if (entry.error && !(hasReading && fresh)) {
       const error = document.createElement('div');
       error.className = 'err';
       error.textContent = entry.error;
