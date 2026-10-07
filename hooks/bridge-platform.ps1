@@ -601,12 +601,87 @@ function Stop-BridgeOwnedService {
         }
     }
 }
+function Test-BridgeCodexAppServer {
+    <#
+        Whether a codex process is the shared app-server daemon rather than a session,
+        decided from facts the caller has already read.
+
+        Codex runs its app-server out of ~\.codex\packages\app-server-daemon, and those
+        processes are named codex.exe exactly as the sessions are. They never write a
+        bridge registration, so counting them as sessions made every discovery pass
+        report an UnaccountedProcess: `Known` stayed false, no snapshot was ever
+        Complete, and all absence-based work - retirement, the orphan sweep, startup
+        cleanup - was held indefinitely while launches were refused with "Session
+        discovery is incomplete". One machine sat like that from the moment Codex
+        started shipping the daemon.
+
+        A path is decisive and costs nothing; the command line is the fallback for
+        platforms that report no path. Taking facts rather than a process leaves the
+        decision about an unreadable one to the caller, which reads the two cases
+        differently.
+    #>
+    param([string]$Path = '', [string]$CommandLine = '')
+    if ($Path) { return [bool]($Path -match '[\\/]app-server-daemon[\\/]') }
+    [bool]($CommandLine -match '\sapp-server(\s|$)')
+}
+
+function Test-BridgeCodexAppServerProcess {
+    <#
+        Test-BridgeCodexAppServer for a process object, reading its path, then its
+        command line, fetching one only when nothing already known answers. Callers
+        that must not guess about an unreadable process want
+        Get-BridgeCodexAppServerObservation instead.
+    #>
+    param([Parameter(Mandatory)][AllowNull()]$Process)
+    if ($null -eq $Process) { return $false }
+    $path = ''
+    if ($Process.PSObject.Properties['Path']) { $path = $(try { [string]$Process.Path } catch { '' }) }
+    if ($path) { return Test-BridgeCodexAppServer -Path $path }
+    if ($Process.PSObject.Properties['CommandLine'] -and $Process.CommandLine) {
+        return Test-BridgeCodexAppServer -CommandLine ([string]$Process.CommandLine)
+    }
+    $processId = [int]$(if ($Process.PSObject.Properties['Id']) { $Process.Id } else { $Process.ProcessId })
+    if ($processId -le 0) { return $false }
+    Test-BridgeCodexAppServer -CommandLine (Get-BridgeCommandLine -ProcessId $processId)
+}
+
+function Get-BridgeCodexAppServerObservation {
+    <#
+        Whether a codex process is the shared app-server, as an observation: Readable
+        carries the answer in IsAppServer, Absent means the process has gone, and
+        Unknown means neither its path nor its command line could be read.
+
+        Unknown is deliberately not a reason to hold discovery. Excluding a process
+        takes positive identification, because the alternative is a second way to
+        reach the stall this distinction exists to end - and an unreadable process has
+        always counted as a session, so leaving it as one changes nothing.
+    #>
+    param([Parameter(Mandatory)][int]$ProcessId, [string]$Path = '', [string]$CommandLine = '')
+    $observation = [pscustomobject]@{ State = 'Readable'; IsAppServer = $false; ProcessId = $ProcessId }
+    if ($Path) { $observation.IsAppServer = Test-BridgeCodexAppServer -Path $Path; return $observation }
+    if ($CommandLine) { $observation.IsAppServer = Test-BridgeCodexAppServer -CommandLine $CommandLine; return $observation }
+
+    $command = Get-BridgeCommandLine -ProcessId $ProcessId -AsObservation
+    if ($command.State -eq 'Absent') { $observation.State = 'Absent'; return $observation }
+    if ($command.State -ne 'Readable' -or [string]::IsNullOrWhiteSpace($command.Text)) {
+        $observation.State = 'Unknown'
+        return $observation
+    }
+    $observation.IsAppServer = Test-BridgeCodexAppServer -CommandLine $command.Text
+    $observation
+}
+
 function Test-BridgeAgentProcess {
     <#
         Whether a process (from Get-Process or Get-BridgeProcessInfo) is the named
         agent's CLI: copilot, claude, codex. Exact name on Windows - copilotapp and
         copilotapphost also run there. On macOS the name, or for a CLI that runs under
         node, the package in its command line.
+
+        This says what a process *is*, not whether it is a session: Codex's app-server
+        answers to it, and Get-CodexOwningProcessId needs that to walk past one and to
+        fall back to it. Session sets come from Get-BridgeAgentProcesses, which rules
+        it out separately.
     #>
     param(
         [Parameter(Mandatory)][AllowNull()]$Process,
@@ -645,6 +720,11 @@ function Get-BridgeAgentProcesses {
 
         bun is fetched for the same reason it is accepted below: a CLI run under it
         would otherwise never be a candidate, and the check for it could never fire.
+
+        Codex's shared app-server daemon is named like a session but is not one, and
+        is excluded here (see Test-BridgeCodexAppServer). This set decides which pids
+        a registration must account for and which registrations are still alive, and
+        it is the only place that distinction is needed.
     #>
     param([Parameter(Mandatory)][string]$Agent, [switch]$AsObservation)
     $names = if ($script:BridgeIsWindows) { @($Agent) } else { @($Agent, "$Agent.exe", 'node', 'bun') }
@@ -673,9 +753,18 @@ function Get-BridgeAgentProcesses {
         }
     }
     if (-not $AsObservation) {
-        if ($script:BridgeIsWindows) { return @($candidates.ToArray()) }
-        return @($candidates.ToArray() | Sort-Object -Property Id -Unique |
-            Where-Object { Test-BridgeAgentProcess -Process $_ -Agent $Agent })
+        # Built by direct assignment, never from an if-expression: a branch yielding an
+        # empty array unrolls to $null on its way out, and the filters below would then
+        # run against nothing rather than an empty set.
+        $live = @($candidates.ToArray())
+        if (-not $script:BridgeIsWindows) {
+            $live = @($live | Sort-Object -Property Id -Unique |
+                Where-Object { Test-BridgeAgentProcess -Process $_ -Agent $Agent })
+        }
+        if ($Agent -eq 'codex') {
+            $live = @($live | Where-Object { -not (Test-BridgeCodexAppServerProcess -Process $_) })
+        }
+        return @($live)
     }
 
     $positive = @{}
@@ -715,6 +804,20 @@ function Get-BridgeAgentProcesses {
                 $view.CommandLine = $command.Text
             }
             if (Test-BridgeAgentProcess -Process $view -Agent $Agent) {
+                if ($Agent -eq 'codex') {
+                    $knownPath = ''
+                    if ($candidate.PSObject.Properties['Path']) { $knownPath = $(try { [string]$candidate.Path } catch { '' }) }
+                    $appServer = Get-BridgeCodexAppServerObservation -ProcessId $processId `
+                        -Path $knownPath -CommandLine $view.CommandLine
+                    if ($appServer.State -eq 'Absent') {
+                        $diagnostics.Add([pscustomobject]@{ Agent = $Agent; Operation = 'Identity'; Code = 'ProcessDisappeared'; ProcessId = $processId })
+                        continue
+                    }
+                    # Positively the shared daemon, so no registration will ever account
+                    # for it. Anything else stays a session: an unreadable process must
+                    # not become a second way to hold discovery.
+                    if ($appServer.State -eq 'Readable' -and $appServer.IsAppServer) { continue }
+                }
                 # Return identity facts, not a borrowed/mutated process object or the
                 # command line used locally by the existing identification predicate.
                 $positive[$processId] = [pscustomobject]@{ Id = $processId; ProcessName = $processName }
