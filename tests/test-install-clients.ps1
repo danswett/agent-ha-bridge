@@ -538,6 +538,22 @@ if (-not $probe.Ran -or $probe.ExitCode -ne 3 -or $probe.StandardOutput -notmatc
     throw "Probe output was not preserved: $($probe | ConvertTo-Json -Compress)"
 }
 if ([ProbeConsole]::GetConsoleWindow() -ne [IntPtr]::Zero) { throw 'Probe allocated a console for its detached parent.' }
+# The window the user sees belongs to the *child*. The parent's own
+# GetConsoleWindow() reads zero whether or not one appeared, so the checks above
+# passed for months while every probe from a console-less daemon put a Windows
+# Terminal window on screen and took the focus with it. Ask the child instead.
+$windowCode = @"
+Add-Type -Namespace Probe -Name Win -MemberDefinition '[DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow();'
+[Console]::WriteLine("childConsoleWindow=" + [Probe.Win]::GetConsoleWindow())
+"@
+$windowEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($windowCode))
+$windowProbe = Invoke-BridgeCommandProbe -Executable $pwsh -Arguments @('-NoProfile', '-EncodedCommand', $windowEncoded) -TimeoutMs 60000
+if (-not $windowProbe.Ran -or $windowProbe.ExitCode -ne 0) {
+    throw "The console-window probe did not run: $($windowProbe | ConvertTo-Json -Compress)"
+}
+if ($windowProbe.StandardOutput -notmatch 'childConsoleWindow=0\s*$') {
+    throw "A probe started from a console-less parent gave its child a console window: $($windowProbe.StandardOutput)"
+}
 $slow = Invoke-BridgeCommandProbe -Executable $pwsh -Arguments @('-NoProfile', '-Command', 'Start-Sleep -Seconds 30') -TimeoutMs 1000
 if (-not $slow.TimedOut) { throw 'The background command deadline was not enforced.' }
 if ([ProbeConsole]::GetConsoleWindow() -ne [IntPtr]::Zero) { throw 'Timed-out probe allocated a console.' }

@@ -844,6 +844,64 @@ function Find-BridgeAgentAncestor {
     0
 }
 
+function Start-BridgeWindowlessProcess {
+    <#
+        Starts a child process that never puts a console window on the screen, with
+        all three streams redirected and stdin already closed. The caller must drain
+        the output pipes and dispose the process.
+
+        Neither Start-Process switch achieves this from the daemon.
+
+        -NoNewWindow only declines to open a *new* console: the child inherits the
+        parent's, which stays invisible for as long as the daemon still holds the one
+        the supervisor gave it. Reply injection and the trust-screen reader both end
+        in FreeConsole(), and from then on the daemon has no console to hand down - so
+        Windows gave each child a brand new one, Windows Terminal adopted it as the
+        default terminal, and a console window flashed up and stole focus every time
+        the launch card refreshed its Agency profiles (ten minutes) or its resumable
+        sessions (three).
+
+        -WindowStyle Hidden does not help either: redirecting any stream turns
+        ShellExecute off, and ShellExecute is the only thing the window style reaches,
+        so it is silently ignored exactly where it was being relied on.
+
+        CREATE_NO_WINDOW is the one flag that holds whether or not the parent has a
+        console. Nothing in the parent shows the difference - its own
+        GetConsoleWindow() stays zero either way, which is why a check on it missed
+        this entirely. The window belongs to the child, so that is where it has to be
+        measured.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Executable,
+        [string[]]$Arguments = @(),
+
+        # Ignored when it does not exist, so a caller need not reason about whether
+        # the daemon's own directory is still there.
+        [AllowEmptyString()][AllowNull()][string]$WorkingDirectory = ''
+    )
+
+    $start = [Diagnostics.ProcessStartInfo]::new($Executable)
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    # Closed as soon as it starts: with no console there is no input handle worth
+    # inheriting, and a command that reads stdin would otherwise sit there waiting
+    # rather than answering.
+    $start.RedirectStandardInput = $true
+    foreach ($argument in $Arguments) { [void]$start.ArgumentList.Add($argument) }
+    if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory) -and (Test-Path -LiteralPath $WorkingDirectory)) {
+        $start.WorkingDirectory = $WorkingDirectory
+    }
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $start
+    try { [void]$process.Start() }
+    catch { $process.Dispose(); throw }
+    try { $process.StandardInput.Close() } catch { }
+    $process
+}
+
 function Invoke-BridgeCommandProbe {
     <#
         Runs a command with a deadline and reports what it did: its exit code, what it
@@ -857,9 +915,8 @@ function Invoke-BridgeCommandProbe {
         from inside the daemon: an agent that waits for input rather than answering
         must not hold a launch open.
 
-        Arguments are handed to Start-Process as they are, which does its own quoting
-        on Windows - fine for the plain flags this is for, not for arguments that
-        contain quotes of their own.
+        Each argument is passed separately rather than through a joined command line,
+        so an argument containing spaces or quotes is quoted correctly by the runtime.
     #>
     param(
         [Parameter(Mandatory)][string]$Executable,
@@ -873,27 +930,19 @@ function Invoke-BridgeCommandProbe {
         [AllowEmptyString()][AllowNull()][string]$WorkingDirectory = ''
     )
 
-    $out = [IO.Path]::GetTempFileName()
-    $err = [IO.Path]::GetTempFileName()
     # Output is both streams, flattened, which is what a one-line "why did this fail"
     # message wants. StandardOutput keeps stdout with its lines intact, for the
     # callers that have to parse a listing.
     $result = [pscustomobject]@{ ExitCode = -1; Output = ''; StandardOutput = ''; TimedOut = $false; Ran = $false }
+    $process = $null
     try {
-        $start = @{
-            FilePath               = $Executable
-            ArgumentList           = $Arguments
-            RedirectStandardOutput = $out
-            RedirectStandardError  = $err
-            PassThru               = $true
-            NoNewWindow            = $true
-            ErrorAction            = 'Stop'
-        }
-        if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory) -and (Test-Path -LiteralPath $WorkingDirectory)) {
-            $start.WorkingDirectory = $WorkingDirectory
-        }
-        $process = Start-Process @start
+        $process = Start-BridgeWindowlessProcess -Executable $Executable -Arguments $Arguments -WorkingDirectory $WorkingDirectory
         $result.Ran = $true
+        # Both streams are drained before waiting: a command that fills a pipe buffer
+        # blocks until someone reads it, and `hub list-local-sessions --json` is about
+        # half a megabyte on a working machine.
+        $stdoutTask = $process.StandardOutput.ReadToEndAsync()
+        $stderrTask = $process.StandardError.ReadToEndAsync()
         if ($process.WaitForExit($TimeoutMs)) {
             $result.ExitCode = $process.ExitCode
         }
@@ -901,20 +950,24 @@ function Invoke-BridgeCommandProbe {
             $result.TimedOut = $true
             try { $process.Kill($true) } catch { }
         }
-        $stdout = [string](Get-Content -LiteralPath $out -Raw -ErrorAction SilentlyContinue)
+        # The deadline covers the readers too, rather than the argumentless
+        # WaitForExit() that .NET suggests for flushing them: that overload waits for
+        # the pipes to reach EOF, and a grandchild holding an inherited handle - a
+        # telemetry child outliving the command that forked it, say - keeps them open
+        # indefinitely. An unbounded wait there would hold the whole reconcile pass.
+        $stdout = ''
+        $stderr = ''
+        try { if ($stdoutTask.Wait(5000)) { $stdout = [string]$stdoutTask.Result } } catch { }
+        try { if ($stderrTask.Wait(5000)) { $stderr = [string]$stderrTask.Result } } catch { }
         $result.StandardOutput = $stdout
-        $text = @(
-            $stdout
-            (Get-Content -LiteralPath $err -Raw -ErrorAction SilentlyContinue)
-        ) -join ' '
-        $result.Output = ($text -replace '\s+', ' ').Trim()
+        $result.Output = ((@($stdout, $stderr) -join ' ') -replace '\s+', ' ').Trim()
     }
     catch {
-        # Start-Process throws outright when the file cannot be executed at all.
+        # Starting throws outright when the file cannot be executed at all.
         $result.Output = ($_.Exception.Message -replace '\s+', ' ').Trim()
     }
     finally {
-        Remove-Item -LiteralPath $out, $err -Force -ErrorAction SilentlyContinue
+        if ($null -ne $process) { $process.Dispose() }
     }
     $result
 }
