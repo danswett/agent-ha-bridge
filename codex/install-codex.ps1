@@ -85,12 +85,21 @@ function Invoke-BridgeCodexCommand {
     }
 }
 
-function Get-BridgeCodexMarketplace {
+function Assert-BridgeCodexOwnership {
+    <#
+        That this Codex home belongs to this installation. Read from the owner file, so
+        it still holds when the Codex CLI cannot be reached - the adapter files can then
+        be refreshed safely without asking Codex anything.
+    #>
     $owner = Read-BridgeInstallRecord -Path $ownerFile
     if ($owner -and (-not $owner['bridgeHome'] -or
         -not (Test-BridgeInstallPath ([string]$owner['bridgeHome']) $installContext.BridgeHome))) {
         throw 'This Codex home is registered to another bridge installation.'
     }
+}
+
+function Get-BridgeCodexMarketplace {
+    Assert-BridgeCodexOwnership
     $listing = Invoke-BridgeCodexCommand -Arguments @('plugin', 'marketplace', 'list', '--json') | ConvertFrom-Json
     if (-not $listing -or -not $listing.PSObject.Properties['marketplaces']) {
         throw 'Codex did not return a readable marketplace listing; its registrations were not changed.'
@@ -157,11 +166,15 @@ if (-not (Test-Path -LiteralPath (Join-Path $coreDir 'decision-mqtt.ps1'))) {
     throw ("The main bridge is not installed at $coreDir. Run install.ps1 first - the " +
            'Codex adapter reuses its Home Assistant layer, daemon and dashboard.')
 }
-if (-not $codex) {
-    throw 'Codex CLI was not found. Install it with: npm install -g @openai/codex'
-}
-$existingMarketplace = Get-BridgeCodexMarketplace
+Assert-BridgeCodexOwnership
 
+# The adapter files go in before anything that needs the Codex CLI. These are what the
+# daemon dot-sources, so a release that moves the core must not be able to leave the
+# previous copy behind: on 2026-10-06 a stale marketplace registration made
+# `codex plugin marketplace list` exit 1, this script threw before reaching the copy,
+# install.ps1 only warned - and the 9/30 bridge-platform.ps1 left in place shadowed the
+# core's, removing -AsObservation and killing session discovery for every adapter, not
+# just Codex. Registration still needs the CLI, and still fails loudly below.
 Write-Step "Installing the adapter into $pluginRoot"
 New-Item -ItemType Directory -Path (Join-Path $pluginRoot '.codex-plugin') -Force | Out-Null
 $hooksTarget = Join-Path $pluginRoot 'hooks'
@@ -176,6 +189,11 @@ Get-ChildItem (Join-Path $PSScriptRoot 'hooks') -File | ForEach-Object {
 Copy-Item (Join-Path (Split-Path $PSScriptRoot -Parent) 'hooks/bridge-platform.ps1') $hooksTarget -Force
 Copy-Item (Join-Path (Split-Path $PSScriptRoot -Parent) 'hooks/bridge-install-context.ps1') $hooksTarget -Force
 Write-Host '    bridge-platform.ps1'
+
+if (-not $codex) {
+    throw 'Codex CLI was not found. Install it with: npm install -g @openai/codex'
+}
+$existingMarketplace = Get-BridgeCodexMarketplace
 
 $versionFile = Join-Path (Split-Path $PSScriptRoot -Parent) 'VERSION'
 $version = if (Test-Path -LiteralPath $versionFile) { (Get-Content -LiteralPath $versionFile -Raw).Trim() } else { '1.0.0' }
