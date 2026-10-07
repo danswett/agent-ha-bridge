@@ -1164,6 +1164,109 @@ function Publish-CopilotMqttGlobalStatus {
     } | ConvertTo-Json -Depth 6 -Compress) -Headers $Headers -Retain
 }
 
+function Publish-CopilotMqttUsage {
+    <#
+        Publishes what each coding agent has left to spend on this machine.
+
+        One sensor per client rather than one carrying all of them, so each gets its
+        own history: a single sensor would have to pick one client's percentage for its
+        state, and the others would exist only as attributes, which Home Assistant does
+        not record. The percentage is the state for the same reason - it is the part
+        worth a graph - and everything needed to draw the card rides in the attributes.
+
+        Retained, like every other per-machine sensor, so a machine that is switched
+        off still shows the last allowance it reported instead of vanishing from the
+        card.
+    #>
+    param(
+        [Parameter(Mandatory)]
+        [AllowEmptyCollection()]
+        [object[]]$Records,
+
+        [string]$Slug,
+
+        [string]$MachineName,
+
+        [Parameter(Mandatory)]
+        [hashtable]$Headers
+    )
+
+    if (-not $Slug) { $Slug = Get-BridgeMachineSlug }
+    if (-not $MachineName) { $MachineName = [Environment]::MachineName }
+
+    $node = Get-CopilotMqttMachineNode -Slug $Slug
+    $machineRoot = Get-CopilotMqttMachineTopicRoot -Slug $Slug
+    $device = Get-CopilotMqttMachineDevice -Slug $Slug -MachineName $MachineName
+
+    foreach ($record in @($Records)) {
+        $client = [string]$record.client
+        if ([string]::IsNullOrWhiteSpace($client) -or $client -notmatch '^[a-z0-9]+$') { continue }
+
+        $stateTopic = "$machineRoot/usage/$client/state"
+        $attrTopic = "$machineRoot/usage/$client/attr"
+        $config = @{
+            name = "$($record.label) usage"
+            unique_id = "agent_bridge_${Slug}_usage_$client"
+            object_id = "agent_bridge_${Slug}_usage_$client"
+            state_topic = $stateTopic
+            json_attributes_topic = $attrTopic
+            unit_of_measurement = '%'
+            state_class = 'measurement'
+            icon = 'mdi:gauge'
+            device = $device
+        }
+        Publish-CopilotMqttMessage `
+            -Topic "$($script:CopilotMqttConfig.DiscoveryPrefix)/sensor/$node/usage_$client/config" `
+            -Payload ($config | ConvertTo-Json -Depth 6 -Compress) -Headers $Headers -Retain
+
+        # `unknown` rather than an empty payload or a zero: a client that could not be
+        # read has no percentage, and publishing 0 would draw an empty bar that reads
+        # as "nothing used" - the opposite of what happened.
+        $state = if ($null -eq $record.percent) { 'unknown' } else { [string]$record.percent }
+        Publish-CopilotMqttMessage -Topic $stateTopic -Payload $state -Headers $Headers -Retain
+
+        $attributes = [ordered]@{
+            client       = $client
+            label        = [string]$record.label
+            account      = [string]$record.account
+            plan         = [string]$record.plan
+            source       = [string]$record.source
+            windows      = @($record.windows)
+            error        = [string]$record.error
+            measured_at  = [string]$record.measured_at
+            machine      = $MachineName
+            machine_slug = $Slug
+            updated      = [DateTimeOffset]::Now.ToString('o')
+        }
+        Publish-CopilotMqttMessage -Topic $attrTopic `
+            -Payload ($attributes | ConvertTo-Json -Depth 6 -Compress) -Headers $Headers -Retain
+    }
+}
+
+function Get-CopilotMqttUsageTopics {
+    <#
+        The retained usage topics for one machine, for an uninstall or a forget to
+        clear. Separate from the publisher so the list of what exists is written once.
+    #>
+    param([string]$Slug, [AllowEmptyCollection()][string[]]$Clients = @('copilot', 'claude', 'codex'))
+
+    if (-not $Slug) { $Slug = Get-BridgeMachineSlug }
+    $node = Get-CopilotMqttMachineNode -Slug $Slug
+    $machineRoot = Get-CopilotMqttMachineTopicRoot -Slug $Slug
+    $topics = @()
+    foreach ($client in @($Clients)) {
+        $topics += @(
+            "$($script:CopilotMqttConfig.DiscoveryPrefix)/sensor/$node/usage_$client/config"
+            "$machineRoot/usage/$client/state"
+            "$machineRoot/usage/$client/attr"
+        )
+    }
+    # Emitted as items rather than as one array object. `,@($topics)` would survive
+    # `$x = Get-...`, but every caller here writes `@(Get-...)`, and that wraps the
+    # single array object in another array instead of unwrapping it.
+    $topics
+}
+
 function Publish-CopilotMqttMachineOnlineConfig {
     <#
         Declares this machine's liveness sensor.

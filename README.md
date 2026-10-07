@@ -34,6 +34,7 @@ prompt, so the terminal never stops working and nothing is ever answered twice.
 | **Attach a file** | Attach a document, log or diff the same way; up to 256 KB travels in the reply itself. |
 | **Start a conversation** | A session appears as soon as it opens, so you can send it its first prompt from the dashboard. |
 | **Launch a session** | Pick a workspace, type an opening prompt, press a button — a new CLI session opens on your desktop. |
+| **Allowance left** | An **Agent usage** card: how much of each agent's plan or rate-limit window is gone, with a pace mark showing where an even spend would be by now. |
 | **End a session** | An **End session** row on every card, so sessions don't just accumulate — and a second press to confirm if it isn't idle. |
 | **No polling** | State changes arrive over a Home Assistant WebSocket subscription. |
 
@@ -386,6 +387,8 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `updates.repository` | Repository to check for releases (default `danswett/agent-ha-bridge`) |
 | `updates.checkForUpdates` | Set to `false` to disable the update check |
 | `updates.checkHours` | How often to check GitHub for a release (default `6`, i.e. 4×/day) |
+| `usage.publish` | Set to `false` to stop collecting and publishing each agent's remaining allowance (default `true`). This stops the vendor calls, not just the card |
+| `usage.intervalSeconds` | How often to re-read the allowances (default `120`). Copilot's figure moves continuously while a session runs, so this is a poll rather than a cache read |
 
 Prefer keeping tokens out of a file? Leave `token` / `agentToken` empty and set the
 variables named by `tokenEnvVar` / `agentTokenEnvVar` in the environment of each process
@@ -818,6 +821,40 @@ leave everything else ending a working session on one press.
 Beyond that it is safe to press. The transcript survives either way, so an ended
 session stays in the **Resume** list and can be reopened — a mistaken press costs a
 window, not the work.
+
+---
+
+## Agent usage
+
+Every one of these agents meters you, and each one keeps that figure to the terminal
+it is running in: Copilot's `/usage`, Codex's `/status`, Claude Code's `/usage`. The
+daemon polls them instead and publishes what it finds, so the dashboard answers "how
+much is left" without opening a session to ask.
+
+Each client gets its own sensor per machine —
+`sensor.agent_bridge_<slug>_usage_<client>`, whose state is the percentage used, so
+Home Assistant records the history and you can graph or alert on it like anything
+else. The **Agent usage** card groups them by account, not by machine: an allowance
+belongs to a login, so two machines signed in to the same account are reconciled to
+whichever read it most recently rather than drawn twice.
+
+| | |
+|---|---|
+| **Copilot** | The monthly AI-credit allowance, read live from GitHub using the credential Copilot CLI itself stored. Falls back to the CLI's own cache when there is no credential to hand — and then says so, because a cached figure was measured thirteen minutes stale, and already wrong, during an active session |
+| **Claude** | The session (5-hour) and weekly windows, read with the OAuth token Claude Code keeps beside its settings. Both are drawn whenever Anthropic lists them, including a session window sitting at 0% because none is open — leaving those out made Claude look as though it had only a weekly cap. That token expires about hourly and only Claude Code can refresh it: Anthropic retires a refresh token as it is used, so refreshing from here would either sign Claude Code out or race its own write. An expired token is therefore not spent, and the retained sensor keeps its last reading and ages |
+| **Codex** | The 5-hour and weekly rate-limit windows. Codex has no endpoint to ask — it learns its limits from the replies it gets — so this is the newest figure in its own transcripts, and the card marks it stale once it is over an hour old |
+
+Each bar carries a thin **pace mark** where an even spend would have reached by now,
+with the line underneath naming it: `│ even pace 20% · 48% ahead of pace`. Two thirds
+of a monthly allowance gone means nothing on its own — on the 25th it is thrift, on the
+5th it is a problem, and the bar alone cannot tell you which. Being ahead of the clock
+by more than a tenth of the window is coloured; anything closer is noise. Bars turn
+amber at 75% and red at 90%, and the folded summary line takes the colour of whichever
+window is closest to running out.
+
+Tokens are read, spent on the one request, and dropped — never logged, never
+published, never written anywhere. Turn the whole thing off with `usage.publish:
+false`, which stops the collection rather than merely hiding the result.
 
 ---
 
@@ -1426,6 +1463,7 @@ mid-write. Real arguments always win over recovered ones.
 | `decision-inject.ps1` | `AttachConsole` + `WriteConsoleInput` delivery, with session→pid lookup from `inuse.<pid>.lock` |
 | `session-launch.ps1` | Starting a new CLI session: the workspace allowlist, argument quoting, and the launch itself |
 | `agent-bridge-daemon.ps1` | The loop: reconcile sessions, stream activity, sweep orphans, deliver answers |
+| `daemon-usage.ps1` | Each agent's remaining allowance, normalised from three vendors into one shape |
 | `agent-bridge-supervisor.ps1` | Keeps one daemon alive with backoff; a named mutex prevents a second instance |
 | `route-ask-user-v3.ps1` | The non-blocking `ask_user` router |
 | `notify-agent-response.ps1` | Non-blocking response mirror + card |

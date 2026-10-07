@@ -23,7 +23,7 @@
  * uploaded image these sit in the sensor's attributes.
  */
 
-const CARD_VERSION = '1.24.0';
+const CARD_VERSION = '1.25.0';
 
 /*
  * How large a non-image attachment may be.
@@ -2352,6 +2352,312 @@ class AgentBridgeStatusCard extends HTMLElement {
   }
 }
 
+/*
+ * What each coding agent has left to spend, as a bar per metered window.
+ *
+ * Fed one sensor per client per machine, because that is how the daemon publishes
+ * them, but an allowance belongs to an account rather than to a computer - so two
+ * machines signed in to the same account report the same figure twice. Rows are
+ * therefore keyed by client and account and the freshest wins, which is also what
+ * makes a laptop that has been shut for a week harmless: it is outvoted rather than
+ * averaged in.
+ */
+class AgentBridgeUsageCard extends HTMLElement {
+  constructor() {
+    super();
+    this.attachShadow({ mode: 'open' });
+    this._groups = new Map();
+    try { this._open = localStorage.getItem('agent-bridge-usage-open') !== '0'; } catch (e) { this._open = true; }
+  }
+
+  setConfig(config) {
+    if (!config || !Array.isArray(config.entities) || config.entities.length === 0) {
+      throw new Error('agent-bridge-usage-card: "entities" is required');
+    }
+    this._config = Object.assign({ title: 'Agent usage' }, config);
+    this._built = false;
+    if (this._hass) { this._build(); this._render(); }
+  }
+
+  set hass(hass) {
+    this._hass = hass;
+    if (!this._built) { this._build(); }
+    this._render();
+  }
+
+  getCardSize() { return this._open ? 1 + this._config.entities.length : 1; }
+
+  _build() {
+    this._built = true;
+    this.shadowRoot.innerHTML = `
+      <style>
+        ha-card { padding: 12px 16px; }
+        .head { display: flex; align-items: center; gap: 10px; }
+        .toggle { flex: 1; min-width: 0; cursor: pointer; user-select: none; }
+        .title { font-size: 1.1em; font-weight: 500; display: flex; align-items: center; gap: 6px; }
+        /* An icon rather than a glyph, for the reason the status card records: phones
+           drew the triangle as a colour emoji. */
+        .chev { transition: transform 0.2s ease; color: var(--secondary-text-color); --mdc-icon-size: 20px; display: inline-flex; margin-left: -4px; }
+        .open .chev { transform: rotate(90deg); }
+        .summary { color: var(--secondary-text-color); font-size: 0.9em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .summary.warn { color: var(--warning-color); }
+        .summary.crit { color: var(--error-color, #f44336); }
+        .groups { margin-top: 4px; }
+        .group { padding: 10px 0 4px; border-top: 1px solid var(--divider-color); }
+        .ghead { display: flex; align-items: baseline; gap: 8px; }
+        .gname { font-weight: 500; }
+        .gacct { font-size: 0.85em; color: var(--secondary-text-color); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; flex: 1; min-width: 0; }
+        .gage { font-size: 0.8em; color: var(--secondary-text-color); flex: none; }
+        .gage.stale { color: var(--warning-color); }
+        .win { margin-top: 7px; }
+        .wtop, .wfoot { display: flex; justify-content: space-between; gap: 8px; font-size: 0.85em; }
+        .wtop { color: var(--primary-text-color); }
+        .wfoot { color: var(--secondary-text-color); font-size: 0.8em; margin-top: 3px; }
+        .wpct { font-variant-numeric: tabular-nums; font-weight: 500; }
+        .bar { position: relative; height: 9px; border-radius: 5px; margin-top: 4px; overflow: hidden;
+               background: var(--divider-color, rgba(127,127,127,0.25)); }
+        .fill { position: absolute; left: 0; top: 0; bottom: 0; border-radius: 5px;
+                background: var(--success-color, #4caf50); transition: width 0.4s ease; }
+        .fill.warn { background: var(--warning-color, #ff9800); }
+        .fill.crit { background: var(--error-color, #f44336); }
+        /* Where the spend would be if it were even across the window. A budget two
+           thirds gone means nothing without it: on the 25th that is thrift, on the
+           5th it is a problem, and the bar alone cannot tell you which.
+           The halo is what makes it legible on both sides of the fill - without it
+           the mark read as a gap in the green rather than as a marker, which is
+           exactly how it was first reported. */
+        .pace { position: absolute; top: 0; bottom: 0; width: 2px; background: var(--primary-text-color);
+                box-shadow: 0 0 0 1.5px var(--card-background-color, rgba(0, 0, 0, 0.55)); }
+        /* And the line that says what the mark is, because a dashboard cannot be
+           hovered on a phone and a legend nobody reads is not a legend. */
+        .pacefoot { display: flex; justify-content: space-between; gap: 8px; margin-top: 3px;
+                    font-size: 0.78em; color: var(--secondary-text-color); }
+        .verdict.ahead { color: var(--warning-color, #ff9800); }
+        .err { font-size: 0.8em; color: var(--error-color, #f44336); margin-top: 4px; }
+        [hidden] { display: none !important; }
+      </style>
+      <ha-card>
+        <div class="head">
+          <div class="toggle" role="button" tabindex="0" aria-expanded="true">
+            <div class="title"><ha-icon class="chev" icon="mdi:chevron-right"></ha-icon><span class="name"></span></div>
+            <div class="summary"></div>
+          </div>
+        </div>
+        <div class="groups"></div>
+      </ha-card>`;
+    const $ = (s) => this.shadowRoot.querySelector(s);
+    this._els = { card: $('ha-card'), toggle: $('.toggle'), name: $('.name'), summary: $('.summary'), groups: $('.groups') };
+    this._els.name.textContent = this._config.title;
+
+    const flip = () => {
+      this._open = !this._open;
+      try { localStorage.setItem('agent-bridge-usage-open', this._open ? '1' : '0'); } catch (e) { /* per-viewer nicety only */ }
+      this._render();
+    };
+    this._els.toggle.addEventListener('click', flip);
+    this._els.toggle.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); flip(); }
+    });
+  }
+
+  // One entry per client+account, carrying the freshest reading any machine has.
+  _collect() {
+    const best = new Map();
+    for (const entityId of this._config.entities) {
+      const entity = this._hass ? this._hass.states[entityId] : undefined;
+      if (!entity || !entity.attributes) { continue }
+      const a = entity.attributes;
+      if (!a.client) { continue }
+      const key = `${a.client}\u0000${a.account || ''}`;
+      const at = Date.parse(a.measured_at || a.updated || '') || 0;
+      const prior = best.get(key);
+      if (prior && prior.at >= at) { continue }
+      const percent = Number.parseFloat(entity.state);
+      best.set(key, {
+        key,
+        at,
+        percent: Number.isFinite(percent) ? percent : null,
+        label: a.label || a.client,
+        account: a.account || '',
+        plan: a.plan || '',
+        machine: a.machine || '',
+        error: a.error || '',
+        windows: Array.isArray(a.windows) ? a.windows : [],
+      });
+    }
+    // Closest to running out first: that is the one worth seeing without scrolling.
+    return Array.from(best.values()).sort((x, y) => (y.percent || 0) - (x.percent || 0));
+  }
+
+  static _severity(percent) {
+    if (!Number.isFinite(percent)) { return '' }
+    if (percent >= 90) { return 'crit' }
+    if (percent >= 75) { return 'warn' }
+    return '';
+  }
+
+  // "in 25d" / "in 4h" / "in 12m". Past is "due" rather than a negative: a window
+  // whose reset has gone by has already rolled over, and the figure beside it is the
+  // old one until the agent runs again.
+  static _until(iso) {
+    const at = Date.parse(iso || '');
+    if (!Number.isFinite(at)) { return '' }
+    const seconds = Math.round((at - Date.now()) / 1000);
+    if (seconds <= 0) { return 'due' }
+    if (seconds >= 86400) { return `in ${Math.round(seconds / 86400)}d` }
+    if (seconds >= 3600) { return `in ${Math.round(seconds / 3600)}h` }
+    return `in ${Math.max(1, Math.round(seconds / 60))}m`;
+  }
+
+  static _ago(at) {
+    if (!at) { return '' }
+    const seconds = Math.round((Date.now() - at) / 1000);
+    if (seconds < 90) { return 'just now' }
+    if (seconds < 3600) { return `${Math.round(seconds / 60)}m ago` }
+    if (seconds < 86400) { return `${Math.round(seconds / 3600)}h ago` }
+    return `${Math.round(seconds / 86400)}d ago`;
+  }
+
+  static _amount(value) {
+    return Number.isFinite(value) ? Math.round(value).toLocaleString() : '';
+  }
+
+  _render() {
+    if (!this._built || !this._hass) { return }
+    this._els.card.classList.toggle('open', this._open);
+    this._els.toggle.setAttribute('aria-expanded', this._open ? 'true' : 'false');
+    this._els.groups.hidden = !this._open;
+
+    const entries = this._collect();
+    const worst = entries.length ? entries[0] : null;
+    this._els.summary.textContent = worst && Number.isFinite(worst.percent)
+      ? entries.filter((e) => Number.isFinite(e.percent))
+        .map((e) => `${e.label} ${Math.round(e.percent)}%`).join(' \u00b7 ')
+      : 'No usage reported yet';
+    const severity = worst ? AgentBridgeUsageCard._severity(worst.percent) : '';
+    this._els.summary.classList.toggle('warn', severity === 'warn');
+    this._els.summary.classList.toggle('crit', severity === 'crit');
+
+    if (!this._open) { return }
+    this._els.groups.textContent = '';
+    for (const entry of entries) { this._els.groups.appendChild(this._renderGroup(entry)); }
+  }
+
+  _renderGroup(entry) {
+    const group = document.createElement('div');
+    group.className = 'group';
+
+    const head = document.createElement('div');
+    head.className = 'ghead';
+    const name = document.createElement('span');
+    name.className = 'gname';
+    name.textContent = entry.label;
+    const account = document.createElement('span');
+    account.className = 'gacct';
+    account.textContent = [entry.account, entry.plan].filter(Boolean).join(' \u00b7 ');
+    const age = document.createElement('span');
+    age.className = 'gage';
+    const ago = AgentBridgeUsageCard._ago(entry.at);
+    age.textContent = ago;
+    // An hour old is not a reading, it is a memory - and Codex's only source is its
+    // own last transcript, so this is routine rather than exceptional for it.
+    age.classList.toggle('stale', entry.at > 0 && Date.now() - entry.at > 3600000);
+    head.appendChild(name);
+    head.appendChild(account);
+    head.appendChild(age);
+    group.appendChild(head);
+
+    for (const metered of entry.windows) {
+      if (!metered || !Number.isFinite(Number(metered.percent))) { continue }
+      group.appendChild(this._renderWindow(metered));
+    }
+    if (entry.error) {
+      const error = document.createElement('div');
+      error.className = 'err';
+      error.textContent = entry.error;
+      group.appendChild(error);
+    }
+    return group;
+  }
+
+  _renderWindow(metered) {
+    const percent = Number(metered.percent);
+    const box = document.createElement('div');
+    box.className = 'win';
+
+    const top = document.createElement('div');
+    top.className = 'wtop';
+    const label = document.createElement('span');
+    label.className = 'wlabel';
+    label.textContent = metered.label || metered.key || '';
+    const value = document.createElement('span');
+    value.className = 'wpct';
+    value.textContent = `${percent}%`;
+    top.appendChild(label);
+    top.appendChild(value);
+    box.appendChild(top);
+
+    const bar = document.createElement('div');
+    bar.className = 'bar';
+    const fill = document.createElement('div');
+    fill.className = 'fill';
+    const severity = AgentBridgeUsageCard._severity(percent);
+    if (severity) { fill.classList.add(severity); }
+    fill.style.width = `${Math.min(100, Math.max(0, percent))}%`;
+    bar.appendChild(fill);
+    const elapsed = Number(metered.elapsed);
+    if (Number.isFinite(elapsed)) {
+      const pace = document.createElement('div');
+      pace.className = 'pace';
+      pace.style.left = `${Math.min(100, Math.max(0, elapsed))}%`;
+      pace.setAttribute('title', `${Math.round(elapsed)}% of the period gone`);
+      bar.appendChild(pace);
+    }
+    box.appendChild(bar);
+
+    const detail = AgentBridgeUsageCard._amount(Number(metered.used));
+    const limit = AgentBridgeUsageCard._amount(Number(metered.limit));
+    const resets = AgentBridgeUsageCard._until(metered.resets_at);
+    if (detail || resets) {
+      const foot = document.createElement('div');
+      foot.className = 'wfoot';
+      const left = document.createElement('span');
+      left.className = 'wdetail';
+      left.textContent = detail && limit ? `${detail} / ${limit}${metered.unit ? ` ${metered.unit}` : ''}` : '';
+      const right = document.createElement('span');
+      right.className = 'wreset';
+      right.textContent = resets ? `resets ${resets}` : '';
+      foot.appendChild(left);
+      foot.appendChild(right);
+      box.appendChild(foot);
+    }
+
+    // Names the mark and says what it means. Both halves matter: the number alone
+    // leaves "what is that line", and the verdict alone leaves no way to check it.
+    if (Number.isFinite(elapsed)) {
+      const paceFoot = document.createElement('div');
+      paceFoot.className = 'pacefoot';
+      const mark = document.createElement('span');
+      mark.className = 'pacemark';
+      mark.textContent = `\u2502 even pace ${Math.round(elapsed)}%`;
+      const verdict = document.createElement('span');
+      verdict.className = 'verdict';
+      const ahead = percent - elapsed;
+      // A tenth of the window either way is noise, not a trend worth colouring.
+      if (ahead > 10) {
+        verdict.textContent = `${Math.round(ahead)}% ahead of pace`;
+        verdict.classList.add('ahead');
+      }
+      else if (ahead < -10) { verdict.textContent = `${Math.round(-ahead)}% under pace`; }
+      else { verdict.textContent = 'on pace'; }
+      paceFoot.appendChild(mark);
+      paceFoot.appendChild(verdict);
+      box.appendChild(paceFoot);
+    }
+    return box;
+  }
+}
+
 if (!customElements.get('agent-bridge-reply-card')) {
   customElements.define('agent-bridge-reply-card', AgentBridgeReplyCard);
 }
@@ -2369,6 +2675,9 @@ if (!customElements.get('agent-bridge-activity-card')) {
 }
 if (!customElements.get('agent-bridge-choices-card')) {
   customElements.define('agent-bridge-choices-card', AgentBridgeChoicesCard);
+}
+if (!customElements.get('agent-bridge-usage-card')) {
+  customElements.define('agent-bridge-usage-card', AgentBridgeUsageCard);
 }
 
 window.customCards = window.customCards || [];
@@ -2391,6 +2700,11 @@ window.customCards.push({
   type: 'agent-bridge-choices-card',
   name: 'Agent Bridge Choices',
   description: 'A waiting question or form, as rows that wrap instead of dropdowns.',
+});
+window.customCards.push({
+  type: 'agent-bridge-usage-card',
+  name: 'Agent Bridge Usage',
+  description: 'Plan and rate-limit allowances for each coding agent, with a pace marker per window.',
 });
 
 console.info(`%c AGENT-BRIDGE-REPLY-CARD %c ${CARD_VERSION} `,
