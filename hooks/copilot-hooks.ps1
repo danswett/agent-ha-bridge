@@ -26,10 +26,16 @@ function Get-CopilotMixedFormHint {
                               with that field empty - an empty free-text field being
                               a valid answer. The typed words are gone.
 
-        So this points at Send and warns off Send answer by name. On cards before
-        1.22.0 there is no Send answer: the generator draws one icon-only button
-        beside the "Reply / continue" row, the text lives in text.<node>_reply, and
-        the warning is simply moot.
+        So this points at Send for typed words and at Send answer for a blank field.
+        An unconditional "not Send answer" was wrong in the other direction: the reply
+        card disables its own Send when the textarea and attachments are all empty
+        (_syncSendState), so for the usual optional "anything else?" left blank, Send
+        answer is the only enabled control - and a correct one, since an empty
+        free-text field is a valid answer.
+
+        On cards before 1.22.0 there is no Send answer: the generator draws one
+        icon-only button beside the "Reply / continue" row, the text lives in
+        text.<node>_reply, and that single control is the Send described here.
 
         Reversed once, on 2026-10-07, on the reasoning that "Send answer" must be the
         committing control because it is the one labelled for it. It is not, and the
@@ -43,7 +49,7 @@ function Get-CopilotMixedFormHint {
     #>
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Label)
     "*Type **$Label** in the Reply box, choose the rest above, then press **Send** " +
-        "beside the box. Not **Send answer** - it submits without your text.*"
+        "beside the box - only it carries what you typed. Nothing to add? Press **Send answer**.*"
 }
 
 function Invoke-CopilotAskUserHook {

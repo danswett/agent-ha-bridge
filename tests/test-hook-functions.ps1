@@ -222,11 +222,14 @@ Test-That 'the hint names the free-text field, so the box is not mistaken for a 
 Test-That 'it points at the Send beside the box, which is the one that carries the typed words' {
     $mixedHint -match '\*\*Send\*\* beside the box'
 } $mixedHint
-Test-That 'and warns off Send answer, which submits the form with the text field empty' {
-    $mixedHint -match 'Not \*\*Send answer\*\*'
+Test-That 'and says only that Send carries typed words, which is the loss to avoid' {
+    $mixedHint -like '*only it carries what you typed*'
 } $mixedHint
-Test-That 'the warning says what pressing it costs, not merely that it is wrong' {
-    $mixedHint -like '*without your text*'
+Test-That 'a field left blank is given Send answer, the only control enabled then' {
+    $mixedHint -match 'Nothing to add\?.*\*\*Send answer\*\*'
+} $mixedHint
+Test-That 'and Send answer is never forbidden outright, which would strand a blank field' {
+    $mixedHint -notmatch 'Not \*\*Send answer\*\*'
 } $mixedHint
 Test-That 'an empty label still produces a usable sentence' {
     (Get-CopilotMixedFormHint -Label '') -match '\*\*Send\*\* beside the box'
