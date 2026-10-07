@@ -6,13 +6,14 @@
 #>
 
 . (Join-Path $PSScriptRoot 'bridge-secrets.ps1')
-# 1.2.0, not 1.1.0: Save-CopilotSessionDashboard is one of the helpers
-# Get-BridgeRenderArtifact fingerprints, and the choices/send/reply-box configuration
-# it emits changed. Left at 1.1.0 the fence sees a new hash at the same version,
-# which is the definition of a conflict there - so on any installation already fenced
-# at the old renderer, publication is refused and the new card configuration can
-# never reach the dashboard without an operator pin nobody should have to take.
-$script:BridgeDashboardRenderVersion = '1.2.0'
+# 1.3.0, not 1.2.0: Save-CopilotSessionDashboard is one of the helpers
+# Get-BridgeRenderArtifact fingerprints, and it now emits the usage card above the
+# session controls, with a standard-card fallback below them for a browser served an
+# older card. Left at 1.2.0 the fence sees a new hash at the same version, which is
+# the definition of a conflict there - so on any installation already fenced at the
+# old renderer, publication is refused and the usage card can never reach the
+# dashboard without an operator pin nobody should have to take.
+$script:BridgeDashboardRenderVersion = '1.3.0'
 $script:BridgeDashboardObservation = $null
 
 function Invoke-CopilotHaWebSocket {
