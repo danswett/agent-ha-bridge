@@ -212,8 +212,16 @@ function loadCards(sourceFile) {
   const sourcePath = sourceFile || path.join(__dirname, '..', 'agent-bridge-reply-card.js');
   const source = fs.readFileSync(sourcePath, 'utf8');
   const context = vm.createContext(sandbox);
+  // Each name is looked up through typeof rather than named directly. A released card
+  // predates every class added after it, and a bare reference to one it does not
+  // declare is a ReferenceError that takes the whole evaluation down - so the driver
+  // writes nothing and the failure arrives as a missing property on an empty result,
+  // three files from the card that actually lacks the class. Absent means undefined.
+  const exported = ['AgentBridgeReplyCard', 'AgentBridgeChoicesCard', 'AgentBridgeSessionCard',
+    'AgentBridgeLaunchCard', 'AgentBridgeStatusCard', 'AgentBridgeActivityCard',
+    'AgentBridgeUsageCard', 'CARD_VERSION'];
   vm.runInContext(
-    `${source}\n;globalThis.__cards = { AgentBridgeReplyCard, AgentBridgeChoicesCard, AgentBridgeSessionCard, AgentBridgeLaunchCard, AgentBridgeStatusCard, AgentBridgeActivityCard, AgentBridgeUsageCard, CARD_VERSION };`,
+    `${source}\n;globalThis.__cards = { ${exported.map((n) => `${n}: typeof ${n} === 'undefined' ? undefined : ${n}`).join(', ')} };`,
     context,
     { filename: sourcePath });
   return Object.assign({ sandbox, source }, sandbox.__cards);
