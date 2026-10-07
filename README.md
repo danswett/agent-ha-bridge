@@ -82,8 +82,12 @@ each fill the same three roles — intercept a prompt, stream activity, deliver 
 * **The daemon** tails every session's transcript for activity, publishes it to Home
   Assistant, and watches the cards. When you answer on a card, it types that answer
   into the session's console.
-  On Windows, background CLI discovery and type compilation run without a console;
-  they must not open empty PowerShell or Windows Terminal windows after a reply.
+  On Windows, background CLI discovery and type compilation run without a console:
+  after a reply the daemon has none of its own, so anything it starts must be started
+  windowless through `Start-BridgeWindowlessProcess` rather than relying on
+  `-NoNewWindow` or `-WindowStyle Hidden`. Neither of those survives a console-less
+  parent, and an empty PowerShell or Windows Terminal window then flashes up and
+  takes the focus on every background probe.
 * **The transcript is the source of truth.** A `tool.execution_start` for `ask_user`
   paired with its matching `tool.execution_complete` is the authoritative "answered"
   signal, whichever input produced it — so the two paths can't collide.

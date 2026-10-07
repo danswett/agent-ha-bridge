@@ -513,6 +513,29 @@ $probeMissing = Invoke-BridgeCommandProbe -Executable $missingExe
 Test-That 'a command that cannot be executed at all is not reported as run' { -not $probeMissing.Ran }
 
 if ($IsWindows) {
+    # npm installs its clients as .cmd shims, and Get-BridgeCodexPath falls back to
+    # %APPDATA%\npm\codex.cmd outright - so a probe that could not run a batch file
+    # would report a working client as unrunnable and refuse every launch. Worth
+    # pinning rather than assuming: CreateProcess is often said not to run batch
+    # files, and the probe no longer goes through Start-Process.
+    $shimRoot = Join-Path $env:TEMP "probe-shim-$([guid]::NewGuid().ToString('N'))"
+    [void][IO.Directory]::CreateDirectory($shimRoot)
+    $shimPath = Join-Path $shimRoot 'probe-shim.cmd'
+    [IO.File]::WriteAllText($shimPath, "@echo off`r`necho shim-version 9.9.9`r`nexit /b 0")
+    try {
+        $probeShim = Invoke-BridgeCommandProbe -Executable $shimPath -TimeoutMs 20000
+        Test-That 'a .cmd shim runs and its version is read back' {
+            $probeShim.Ran -and -not $probeShim.TimedOut -and $probeShim.ExitCode -eq 0 -and
+                $probeShim.StandardOutput -match 'shim-version 9\.9\.9'
+        } "ran=$($probeShim.Ran) code=$($probeShim.ExitCode) out=$($probeShim.Output)"
+        Test-That 'and such a client counts as actually runnable' {
+            Test-BridgeCommandRuns -Executable $shimPath -TimeoutMs 20000
+        }
+    }
+    finally { Remove-Item -LiteralPath $shimRoot -Recurse -Force -ErrorAction SilentlyContinue }
+}
+
+if ($IsWindows) {
     Write-Host '--- background probes never recreate a detached daemon console ---'
     $consoleRoot = Join-Path $env:TEMP "probe-console-$([guid]::NewGuid().ToString('N'))"
     [void][IO.Directory]::CreateDirectory($consoleRoot)
@@ -538,6 +561,22 @@ if (-not $probe.Ran -or $probe.ExitCode -ne 3 -or $probe.StandardOutput -notmatc
     throw "Probe output was not preserved: $($probe | ConvertTo-Json -Compress)"
 }
 if ([ProbeConsole]::GetConsoleWindow() -ne [IntPtr]::Zero) { throw 'Probe allocated a console for its detached parent.' }
+# The window the user sees belongs to the *child*. The parent's own
+# GetConsoleWindow() reads zero whether or not one appeared, so the checks above
+# passed for months while every probe from a console-less daemon put a Windows
+# Terminal window on screen and took the focus with it. Ask the child instead.
+$windowCode = @"
+Add-Type -Namespace Probe -Name Win -MemberDefinition '[DllImport("kernel32.dll")] public static extern System.IntPtr GetConsoleWindow();'
+[Console]::WriteLine("childConsoleWindow=" + [Probe.Win]::GetConsoleWindow())
+"@
+$windowEncoded = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($windowCode))
+$windowProbe = Invoke-BridgeCommandProbe -Executable $pwsh -Arguments @('-NoProfile', '-EncodedCommand', $windowEncoded) -TimeoutMs 60000
+if (-not $windowProbe.Ran -or $windowProbe.ExitCode -ne 0) {
+    throw "The console-window probe did not run: $($windowProbe | ConvertTo-Json -Compress)"
+}
+if ($windowProbe.StandardOutput -notmatch 'childConsoleWindow=0\s*$') {
+    throw "A probe started from a console-less parent gave its child a console window: $($windowProbe.StandardOutput)"
+}
 $slow = Invoke-BridgeCommandProbe -Executable $pwsh -Arguments @('-NoProfile', '-Command', 'Start-Sleep -Seconds 30') -TimeoutMs 1000
 if (-not $slow.TimedOut) { throw 'The background command deadline was not enforced.' }
 if ([ProbeConsole]::GetConsoleWindow() -ne [IntPtr]::Zero) { throw 'Timed-out probe allocated a console.' }
