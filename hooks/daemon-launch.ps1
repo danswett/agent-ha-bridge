@@ -1631,8 +1631,11 @@ function Resolve-DaemonLaunchRequest {
 
     if ($workspaces.Count -eq 0) {
         Write-DaemonLog -Message 'new session requested but no workspaces are configured'
+        # Names the repair rather than the config key: this is read on a phone, by
+        # someone who is not at the machine that needs fixing, and the installed
+        # command approves a real folder without any JSON editing.
         Set-CopilotMqttNewSessionResult -Headers $Headers `
-            -Text 'No workspaces configured - add newSession.workspaces to the bridge config' | Out-Null
+            -Text 'No workspaces configured - run "agent-ha-bridge configure" on this machine' | Out-Null
         return $null
     }
 

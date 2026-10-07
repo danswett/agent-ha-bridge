@@ -51,6 +51,14 @@
     Omit it to be asked interactively, or to reuse a previously chosen set on a
     re-run. A non-interactive run with nothing set configures copilot.
 
+.PARAMETER Workspace
+    Folders the dashboard's Launch card may open a session in, replacing whatever is
+    configured. Each must exist. Through the installed command, separate several with
+    commas and no spaces (`-Workspace ~/repos,~/work`), because every argument reaches
+    this script as one literal string. Omit it to keep a working list, or to have the
+    installer check the configured one and approve a real folder when none of it
+    exists on this machine.
+
 .PARAMETER SkipVerify
     Skip the Home Assistant connectivity check. Use for an offline install, or when
     the token comes from an environment variable that is not set yet.
@@ -101,6 +109,7 @@ param(
     [string]$InstallRoot,
     [switch]$RepairOnly,
     [string[]]$Clients,
+    [string[]]$Workspace,
     [switch]$SkipVerify,
     [switch]$SkipDependencies,
     [switch]$SkipPath,
@@ -1285,6 +1294,338 @@ function Read-BridgeClientSelection {
     @($picked | Select-Object -Unique)
 }
 
+# ------------------------------------------------------------ launch workspaces
+# The launch card offers only configured directories that exist on this machine, and
+# that is deliberate: the list is the allowlist, so discovery and an empty config must
+# never approve a directory on their own. The cost is that a config naming a folder
+# this machine does not have is not an error anywhere - it is simply invisible, and
+# the card reports "No workspaces configured" with nothing on it to press.
+#
+# config.example.json seeds ~/repos/agent-ha-bridge and ~/repos, which is a template
+# rather than a statement about the machine being installed on. A machine that keeps
+# its code anywhere else therefore finished a clean install with a launch card that
+# could never launch anything, and the only repair was hand-editing JSON on that
+# machine. These helpers make the installer - which is an explicit operator action,
+# unlike the daemon - check the list against reality and write a real one.
+
+$script:BridgeWorkspaceHomeLabel = 'Home'
+# Checked in order, under the install home. Deliberately a fixed list of conventional
+# code roots rather than session history: what an agent happened to open once is not
+# approval, and an unattended self-update must approve the same thing a watched
+# install does.
+$script:BridgeWorkspaceCommonRoots = @(
+    'repos', 'source', 'src', 'Projects', 'projects', 'dev', 'code', 'git', 'Developer', 'work', 'workspace'
+)
+
+function ConvertTo-BridgeWorkspaceEntries {
+    <#
+        Normalises `newSession.workspaces` into one shape and says which entries point
+        at a directory that is actually here.
+
+        Label derivation mirrors Get-BridgeWorkspaceChoices exactly, because
+        `defaultWorkspace` is matched by label: a label computed differently here would
+        repair the default to a name the card never offers.
+    #>
+    param(
+        [AllowEmptyCollection()][AllowNull()]$Workspaces,
+        [string]$HomePath = $HOME
+    )
+
+    $homeRoot = if ([string]::IsNullOrWhiteSpace($HomePath)) { $HOME } else { $HomePath }
+    $entries = foreach ($entry in @($Workspaces)) {
+        if ($null -eq $entry) { continue }
+        $path = ''
+        $label = ''
+        if ($entry -is [string]) { $path = [string]$entry }
+        elseif ($entry.PSObject.Properties['path']) {
+            $path = [string]$entry.path
+            if ($entry.PSObject.Properties['label']) { $label = [string]$entry.label }
+        }
+        if ([string]::IsNullOrWhiteSpace($path)) { continue }
+
+        $expanded = $path
+        if ($expanded.StartsWith('~')) { $expanded = Join-Path $homeRoot $expanded.Substring(1).TrimStart('\', '/') }
+        try { $expanded = [System.IO.Path]::GetFullPath($expanded) } catch { continue }
+
+        if ([string]::IsNullOrWhiteSpace($label)) { $label = [System.IO.Path]::GetFileName($expanded.TrimEnd('\', '/')) }
+        if ([string]::IsNullOrWhiteSpace($label)) { $label = $expanded }
+
+        # Existence is not the card's only rejection. Get-BridgeWorkspaceChoices also
+        # drops an entry whose `isolate` is not a Boolean - "isolate": "true" is the
+        # ordinary JSON slip - and an installer that counted such an entry as usable
+        # would see a working list where the card sees none, approve no fallback, and
+        # report success over an empty card.
+        $offered = [System.IO.Directory]::Exists($expanded)
+        if ($offered -and $null -ne $entry -and $entry -isnot [string] -and
+            $entry.PSObject.Properties['isolate'] -and $entry.isolate -isnot [bool]) {
+            $offered = $false
+        }
+
+        [pscustomobject]@{
+            Label   = $label
+            Path    = $expanded
+            Exists  = [System.IO.Directory]::Exists($expanded)
+            Offered = $offered
+            Entry   = $entry
+        }
+    }
+    @($entries)
+}
+
+function Get-BridgeWorkspaceOfferedLabel {
+    <#
+        The labels the launch card will actually show, for entries already known to be
+        offerable.
+
+        Mirrors the de-duplication in Get-BridgeWorkspaceChoices: two entries sharing a
+        label would be indistinguishable in a Home Assistant select, so the second and
+        later ones are suffixed with their path. `defaultWorkspace` is matched against
+        these, so a default naming a suffixed label is a real choice - reading it as
+        "no longer on the list" and repointing it would silently move the one-press
+        Launch to a different directory.
+    #>
+    param([AllowEmptyCollection()][AllowNull()]$Entries)
+
+    $seen = @{}
+    $labels = foreach ($entry in @($Entries)) {
+        $label = [string]$entry.Label
+        if ($seen.ContainsKey($label)) { $label = "$label ($($entry.Path))" }
+        if ($seen.ContainsKey($label)) { continue }
+        $seen[$label] = $true
+        $label
+    }
+    @($labels)
+}
+
+function New-BridgeWorkspaceEntry {
+    <#
+        A config entry for a directory the installer approved.
+
+        Written as an absolute path rather than the portable ~ form: this was resolved
+        on this machine, for this machine, and a literal path is one less thing that
+        can resolve somewhere else later.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$Label
+    )
+
+    $full = [System.IO.Path]::GetFullPath($Path)
+    $label = $Label
+    if ([string]::IsNullOrWhiteSpace($label)) { $label = [System.IO.Path]::GetFileName($full.TrimEnd('\', '/')) }
+    if ([string]::IsNullOrWhiteSpace($label)) { $label = $full }
+    [pscustomobject]@{ label = $label; path = $full }
+}
+
+function Get-BridgeWorkspaceFallbacks {
+    <#
+        Directories worth approving when the config names none that exist.
+
+        Home comes last and always: it is the only candidate guaranteed to be there,
+        and it is what the launch card fell back to implicitly before the allowlist
+        became mandatory. Approving it explicitly here restores that behaviour while
+        leaving it visible in the config and on the console.
+    #>
+    param([string]$HomePath = $HOME)
+
+    $homeRoot = if ([string]::IsNullOrWhiteSpace($HomePath)) { $HOME } else { $HomePath }
+    try { $homeRoot = [System.IO.Path]::GetFullPath($homeRoot).TrimEnd('\', '/') } catch { return @() }
+    if (-not [System.IO.Directory]::Exists($homeRoot)) { return @() }
+
+    # Windows and macOS match file names case-insensitively, so 'Projects' and
+    # 'projects' can be the same folder listed twice.
+    $seen = @{}
+    $candidates = @($script:BridgeWorkspaceCommonRoots | ForEach-Object { Join-Path $homeRoot $_ }) + @($homeRoot)
+    $found = foreach ($candidate in $candidates) {
+        if (-not [System.IO.Directory]::Exists($candidate)) { continue }
+        $full = [System.IO.Path]::GetFullPath($candidate).TrimEnd('\', '/')
+        $key = $full.ToLowerInvariant()
+        if ($seen.ContainsKey($key)) { continue }
+        $seen[$key] = $true
+        $full
+    }
+    @($found)
+}
+
+function Resolve-BridgeWorkspaceConfig {
+    <#
+        Works out the workspace list and default label to write back.
+
+        Three rules, in order:
+
+        * An explicit -Workspace replaces the list outright and must name directories
+          that exist. It is a direct statement about this machine, so a typo fails here
+          rather than quietly approving nothing.
+        * A first install drops configured entries that are missing. config.example
+          .json's workspaces are a template, not an answer anyone gave, and leaving a
+          dead entry behind makes an empty card look configured. An upgrade keeps them:
+          a path can be missing because a volume is not mounted today, and losing
+          someone's list is worse than carrying a dead entry.
+        * If nothing in the list exists, approve the fallbacks so the card always has
+          something to offer. Only ever additive.
+    #>
+    param(
+        [AllowEmptyCollection()][AllowNull()]$Configured,
+        [string]$Default = '',
+        [AllowEmptyCollection()][AllowNull()][string[]]$Requested,
+        [AllowEmptyCollection()][AllowNull()][string[]]$Fallbacks,
+        [switch]$FirstInstall,
+        [string]$HomePath = $HOME,
+        [scriptblock]$Prompt
+    )
+
+    $requested = @(@($Requested) |
+        # The installed command reaches install.ps1 through `pwsh -File`, which passes
+        # every argument as a literal string: `-Workspace ~/a,~/b` arrives as one
+        # element, and a space after the comma would bind the second path positionally
+        # to -HomeAssistantUrl instead. Split it here, exactly as -Clients does.
+        ForEach-Object { ([string]$_) -split ',' } |
+        ForEach-Object { $_.Trim() } |
+        Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $fallbacks = @(@($Fallbacks) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    $homeFull = ''
+    try { $homeFull = [System.IO.Path]::GetFullPath($(if ($HomePath) { $HomePath } else { $HOME })).TrimEnd('\', '/') } catch { }
+
+    $labelFor = {
+        param($Path)
+        if ($homeFull -and ([string]$Path).TrimEnd('\', '/') -eq $homeFull) { $script:BridgeWorkspaceHomeLabel }
+        else { '' }
+    }
+
+    if ($requested.Count -gt 0) {
+        $wanted = @(ConvertTo-BridgeWorkspaceEntries -Workspaces $requested -HomePath $HomePath)
+        if ($wanted.Count -ne $requested.Count) {
+            throw '-Workspace was given a path that could not be read as a directory.'
+        }
+        $bad = @($wanted | Where-Object { -not $_.Exists })
+        if ($bad.Count -gt 0) {
+            throw ("-Workspace names a directory that does not exist: " +
+                   (($bad | ForEach-Object { $_.Path }) -join ', '))
+        }
+        $entries = foreach ($w in $wanted) { New-BridgeWorkspaceEntry -Path $w.Path -Label (& $labelFor $w.Path) }
+        # Labels are re-derived from the entries actually written, not from the raw
+        # arguments: New-BridgeWorkspaceEntry names the home directory 'Home', and a
+        # default pointing at a label the card never offers is the bug this repairs.
+        $final = @(ConvertTo-BridgeWorkspaceEntries -Workspaces @($entries) -HomePath $HomePath)
+        $labels = @(Get-BridgeWorkspaceOfferedLabel -Entries $final)
+        $default = [string]$Default
+        if ([string]::IsNullOrWhiteSpace($default) -or $labels -notcontains $default) { $default = $labels[0] }
+        return [pscustomobject]@{
+            Workspaces = @($entries); Default = $default
+            Added = @($final | ForEach-Object { $_.Path })
+            Missing = @(); Rejected = @(); Dropped = @(); Changed = $true
+        }
+    }
+
+    $entries = @(ConvertTo-BridgeWorkspaceEntries -Workspaces $Configured -HomePath $HomePath)
+    # Offered, not merely present: an entry the card rejects has to count towards
+    # "nothing to launch in", or no fallback is approved and the card stays empty.
+    $usable = @($entries | Where-Object { $_.Offered })
+    $missing = @($entries | Where-Object { -not $_.Exists })
+    $rejected = @($entries | Where-Object { $_.Exists -and -not $_.Offered })
+    $keep = @($entries)
+    $dropped = @()
+    $changed = $false
+
+    if ($FirstInstall -and $missing.Count -gt 0) {
+        $keep = @($entries | Where-Object { $_.Exists })
+        $dropped = @($missing | ForEach-Object { $_.Path })
+        $missing = @()
+        $changed = $true
+    }
+
+    $added = @()
+    if ($usable.Count -eq 0) {
+        $chosen = @()
+        if ($Prompt) { $chosen = @(& $Prompt $fallbacks) }
+        if ($chosen.Count -eq 0) { $chosen = $fallbacks }
+
+        $seen = @{}
+        foreach ($k in $keep) { $seen[$k.Path.TrimEnd('\', '/').ToLowerInvariant()] = $true }
+        foreach ($candidate in @(ConvertTo-BridgeWorkspaceEntries -Workspaces $chosen -HomePath $HomePath)) {
+            if (-not $candidate.Offered) { continue }
+            $key = $candidate.Path.TrimEnd('\', '/').ToLowerInvariant()
+            if ($seen.ContainsKey($key)) { continue }
+            $seen[$key] = $true
+            $entry = New-BridgeWorkspaceEntry -Path $candidate.Path -Label (& $labelFor $candidate.Path)
+            # Re-read through the same normaliser so the recorded label is the one the
+            # card will derive, which is what `defaultWorkspace` has to match.
+            $keep = @($keep) + @(ConvertTo-BridgeWorkspaceEntries -Workspaces @($entry) -HomePath $HomePath)
+            $added += $candidate.Path
+            $changed = $true
+        }
+        $usable = @($keep | Where-Object { $_.Offered })
+    }
+
+    $labels = @(Get-BridgeWorkspaceOfferedLabel -Entries $usable)
+    $default = [string]$Default
+    if ($labels.Count -gt 0 -and ([string]::IsNullOrWhiteSpace($default) -or $labels -notcontains $default)) {
+        $default = $labels[0]
+        $changed = $true
+    }
+
+    [pscustomobject]@{
+        Workspaces = @($keep | ForEach-Object { $_.Entry })
+        Default    = $default
+        Added      = @($added)
+        Missing    = @($missing | ForEach-Object { $_.Path })
+        Rejected   = @($rejected | ForEach-Object { $_.Path })
+        Dropped    = @($dropped)
+        Changed    = $changed
+    }
+}
+
+function Read-BridgeWorkspaceSelection {
+    <#
+        Asks which directories the launch card may open a session in, when the config
+        named none that exist. Enter accepts everything suggested, so the common case
+        is one keypress; a path that is not on the list can be typed instead.
+    #>
+    param([AllowEmptyCollection()][AllowNull()][string[]]$Suggestions)
+
+    $suggestions = @(@($Suggestions) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($suggestions.Count -eq 0) { return @() }
+
+    Write-Host ''
+    Write-Host 'Which folders may the dashboard launch a session in?' -ForegroundColor Yellow
+    Write-Host 'None of the configured workspaces exist on this machine, so the Launch card' -ForegroundColor DarkGray
+    Write-Host 'has nothing to offer until one is chosen.' -ForegroundColor DarkGray
+
+    $index = @{}
+    $i = 1
+    foreach ($path in $suggestions) {
+        Write-Host ("  {0}) {1}" -f $i, $path)
+        $index["$i"] = $path
+        $i++
+    }
+    Write-Host 'Enter numbers separated by commas, type a path, or press Enter for all of them.'
+
+    while ($true) {
+        $raw = Read-Host 'Workspaces'
+        if ([string]::IsNullOrWhiteSpace($raw)) { return @($suggestions) }
+
+        $picked = @()
+        $bad = @()
+        foreach ($token in ($raw -split ',')) {
+            $t = $token.Trim().Trim('"')
+            if ([string]::IsNullOrWhiteSpace($t)) { continue }
+            if ($index.ContainsKey($t)) { $picked += $index[$t]; continue }
+            # A typed path is checked here rather than accepted and dropped later: an
+            # approved list that silently lost an entry is the failure being fixed.
+            $expanded = $t
+            if ($expanded.StartsWith('~')) { $expanded = Join-Path $HOME $expanded.Substring(1).TrimStart('\', '/') }
+            try { $expanded = [System.IO.Path]::GetFullPath($expanded) } catch { $bad += $t; continue }
+            if ([System.IO.Directory]::Exists($expanded)) { $picked += $expanded } else { $bad += $t }
+        }
+        if ($bad.Count -gt 0) {
+            Write-Host "    not a directory on this machine: $($bad -join ', ')" -ForegroundColor DarkGray
+            continue
+        }
+        if ($picked.Count -gt 0) { return @($picked | Select-Object -Unique) }
+        Write-Host '    Pick at least one, or press Enter for all of them.' -ForegroundColor DarkGray
+    }
+}
+
 function Test-IsHomeAssistant {
     <#
         True when the URL serves Home Assistant. manifest.json is unauthenticated and
@@ -2375,6 +2716,50 @@ if ($config.PSObject.Properties['updates'] -and $config.updates -and
     [string]$config.updates.repository -eq 'danswett/copilot-ha-bridge') {
     $config.updates.repository = 'danswett/agent-ha-bridge'
     Write-Host '    update repository: danswett/copilot-ha-bridge -> danswett/agent-ha-bridge'
+}
+
+# --------------------------------------------------------- launch workspaces
+# Checked here because the daemon cannot do it: the configured list is the allowlist,
+# so a folder that is missing is simply not offered, and the card ends up saying "No
+# workspaces configured" with no way to fix it from the dashboard. The installer is an
+# explicit operator action and knows what is actually on the disk, so this is the one
+# place that can turn the shipped template into a list that works on this machine.
+Write-Step 'Checking the folders a launch may open'
+$workspacePlan = Resolve-BridgeWorkspaceConfig -Configured $config.newSession.workspaces `
+    -Default ([string]$config.newSession.defaultWorkspace) -Requested $Workspace `
+    -Fallbacks (Get-BridgeWorkspaceFallbacks -HomePath $installHome) `
+    -FirstInstall:(-not $configExisted) -HomePath $installHome `
+    -Prompt $(if (-not $NonInteractive -and -not $Workspace -and (Test-BridgeConsoleInteractive)) {
+        { param($Suggestions) Read-BridgeWorkspaceSelection -Suggestions $Suggestions }
+    } else { $null })
+
+foreach ($path in $workspacePlan.Dropped) {
+    Write-Host "    not on this machine, so not offered: $path" -ForegroundColor DarkGray
+}
+foreach ($path in $workspacePlan.Missing) {
+    Write-Warning "Configured workspace '$path' does not exist, so the Launch card will not offer it."
+}
+foreach ($path in $workspacePlan.Rejected) {
+    Write-Warning ("Configured workspace '$path' has a non-Boolean isolate setting, so the Launch card " +
+                   'will not offer it. Use true or false, without quotes.')
+}
+foreach ($path in $workspacePlan.Added) {
+    Write-Host "    a launch may now open: $path"
+}
+if ($workspacePlan.Changed) {
+    $config.newSession.workspaces = @($workspacePlan.Workspaces)
+    $config.newSession.defaultWorkspace = $workspacePlan.Default
+}
+$workspaceCount = @(ConvertTo-BridgeWorkspaceEntries -Workspaces $workspacePlan.Workspaces -HomePath $installHome |
+    Where-Object { $_.Offered }).Count
+if ($workspaceCount -eq 0) {
+    # Only reachable when even the home directory is unreadable, which is worth
+    # saying out loud rather than discovering on the dashboard later.
+    Write-Warning ('No folder could be approved for launching, so the Launch card will have ' +
+                   'nothing to offer. Set newSession.workspaces in the bridge config.')
+}
+else {
+    Write-Host "    $workspaceCount folder(s) available, default: $($workspacePlan.Default)"
 }
 
 # ------------------------------------------------------------------- clients

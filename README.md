@@ -243,6 +243,15 @@ Choosing **mcp** installs the Node server, writes a paste-ready client config to
 it's present; other MCP clients (Cursor, ChatGPT) use the snippet — see
 [`mcp/README.md`](mcp/README.md).
 
+It also settles **which folders a launch may open**. The dashboard can only start a
+session in a directory the config approves, so it checks the configured list against
+this machine and asks if none of those folders are here, offering the conventional code
+roots under your home. Set it outright with `-Workspace`, which skips the question:
+
+```powershell
+.\install.ps1 -Workspace ~/repos, ~/work
+```
+
 On a first setup it finds Home Assistant: it probes `homeassistant.local:8123` (the hostname Home
 Assistant publishes over mDNS, which Windows resolves natively) and confirms the
 product from its unauthenticated `manifest.json`. **If that works it just uses it** —
@@ -371,7 +380,7 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `newSession.profiles` | Restrict which Agency profiles the dashboard offers, and in what order (default: all of them, read from `agency config profiles`). Names this machine's Agency does not have are dropped |
 | `newSession.defaultProfile` | Profile preselected on the card (default: the first offered) |
 | `newSession.defaultWorkspace` | Workspace label preselected on the card (default: the first in `workspaces`) |
-| `newSession.workspaces` | Explicitly approved launch directories: a path string, or `{ "label": …, "path": … }`. Add the Boolean `"isolate": true` for a separate git worktree on each fresh launch. Discovery and an empty list never implicitly approve another directory, including Home |
+| `newSession.workspaces` | Explicitly approved launch directories: a path string, or `{ "label": …, "path": … }`. Add the Boolean `"isolate": true` for a separate git worktree on each fresh launch. Discovery and an empty list never implicitly approve another directory. The installer checks this list against the disk and approves a real folder when none of it exists here, so a fresh machine never starts with an empty card |
 | `newSession.worktreeRoot` | Where isolated launches get their worktrees (default `~/repos/wt`). A private marker in Git's administration directory identifies managed worktrees; a directory name alone does not grant cleanup ownership |
 | `newSession.worktreeLimit` | Maximum bridge-managed worktrees per repository (default `10`). At the cap, requested isolation refuses the launch with a diagnostic; it never falls back to the primary checkout |
 | `newSession.worktreeIdleHours` | How old a finished worktree must be before it is removed (default `12`) |
@@ -737,7 +746,12 @@ Agency takes `--session-id` itself and uses that UUID for both its own session a
 underlying Copilot one, so the daemon still knows the session id before the process
 starts either way.
 
-Configure the workspace list first, or the card has nothing to offer:
+The installer settles the workspace list, so a new machine has something to launch in
+without any JSON editing. It checks each configured directory against the disk, and if
+none of them are here it asks which folders to approve — offering the conventional code
+roots under your home, and your home itself — then writes the answer to the config. An
+unattended run takes those same folders without asking. So the usual reason to edit this
+by hand is to add a repository the installer did not suggest, or to turn on `isolate`:
 
 ```jsonc
 "newSession": {
@@ -747,6 +761,23 @@ Configure the workspace list first, or the card has nothing to offer:
   ]
 }
 ```
+
+Pass `-Workspace` to set it outright, which skips the question and fails if a folder is
+not there:
+
+```powershell
+agent-ha-bridge configure -Workspace ~/repos/my-app,~/work
+```
+
+Commas with no spaces around them: every argument reaches the installer as one literal
+string, so `~/repos/my-app, ~/work` would arrive as a single mangled path. Running
+`install.ps1` directly from a PowerShell prompt takes an ordinary array
+(`-Workspace ~/repos, ~/work`) because PowerShell parses it before the script sees it.
+
+If the card ever does say **No workspaces configured**, it means every directory in the
+list is missing on that machine — a renamed folder, or an unmounted volume. Run
+`agent-ha-bridge configure` there and it is repaired; a machine you cannot reach can be
+updated from Home Assistant with its **Install update** button instead.
 
 A few deliberate choices:
 
