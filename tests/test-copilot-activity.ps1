@@ -480,6 +480,115 @@ finally {
 }
 
 Write-Host ''
+Write-Host '--- a session whose transcript is not there yet ---'
+# On 2026-10-07 a session between starting and writing its first event logged a read
+# failure about eight times a second. The fast lane runs on every 100 ms tick of the
+# Home Assistant wait and is supposed to skip a session whose transcript has not
+# changed, but both of its guards missed a file that does not exist: FileInfo.Length
+# yields $null rather than throwing, so the catch never fired, and $null never equalled
+# the offset either. 40,667 of that day's 44,348 daemon log lines were this.
+$script:TranscriptScratch = Join-Path ([IO.Path]::GetTempPath()) "fastlane-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+New-Item -ItemType Directory -Path $script:TranscriptScratch -Force | Out-Null
+try {
+    $missing = Join-Path $script:TranscriptScratch 'not-written-yet.jsonl'
+    $present = Join-Path $script:TranscriptScratch 'written.jsonl'
+    [IO.File]::WriteAllText($present, (New-Reply -Text 'hello') + "`n")
+
+    Test-That 'FileInfo.Length answers nothing rather than throwing for a file that is not there' {
+        $probe = $null
+        $threw = $false
+        try { $probe = [IO.FileInfo]::new($missing).Length } catch { $threw = $true }
+        -not $threw -and $null -eq $probe
+    }
+
+    $script:FastStreamed = @()
+    $script:FastLog = @()
+    function Update-DaemonSessionActivity { param($Id, $Entry, $Session, $Headers, $VerboseOn) $script:FastStreamed += $Id }
+    function Update-DaemonPendingLaunch { param($Headers) }
+    function Invoke-DaemonHookSpool { }
+    function Write-DaemonLog { param([string]$Message) $script:FastLog += $Message }
+    $script:DaemonStopArmed = @{}
+    $script:DaemonHookSpoolEvents = @()
+    $script:DaemonHookSpoolAttempts = @{}
+    $script:DaemonHookSpoolSweptAt = [DateTime]::UtcNow
+    $script:DaemonVerbose = $false
+    $script:DaemonDiscoverySnapshot = $null
+
+    function Invoke-FastLane {
+        param([string]$Transcript, [long]$Offset)
+        $id = '77777777-0000-4000-8000-000000000077'
+        $script:FastStreamed = @(); $script:FastLog = @()
+        $entry = [pscustomobject]@{ Name = 'Copilot: fixture'; Machine = 'DESK'; Status = 'working'; Kind = 'copilot'; Offset = $Offset }
+        $script:DaemonLive = @{ $id = [pscustomobject]@{ SessionId = $id; Kind = 'copilot'; Transcript = $Transcript; ProcessId = 1 } }
+        Invoke-DaemonFastActivity -Headers @{ Authorization = '******' } -State @{ $id = $entry }
+        $id
+    }
+
+    $id = Invoke-FastLane -Transcript $missing -Offset 0
+    Test-That 'the fast lane skips a session whose transcript has not been written yet' { $script:FastStreamed -notcontains $id }
+    Test-That 'so a tick costs no read failure at all, let alone one per tick' { $script:FastLog.Count -eq 0 }
+
+    $id = Invoke-FastLane -Transcript $present -Offset ([IO.FileInfo]::new($present).Length)
+    Test-That 'and still skips one whose transcript has not grown' { $script:FastStreamed -notcontains $id }
+
+    $id = Invoke-FastLane -Transcript $present -Offset 0
+    Test-That 'but streams one that has' { $script:FastStreamed -contains $id }
+
+    Write-Host ''
+    Write-Host '--- an unreadable transcript is described once, not once per pass ---'
+    $script:DaemonTranscriptFailureReported = @{}
+    $script:FastLog = @()
+    [void](Read-TranscriptAppend -Path $missing -Offset 0)
+    Test-That 'the first failure is reported' {
+        @($script:FastLog | Where-Object { $_ -like "transcript read failed for '$missing'*" }).Count -eq 1
+    }
+    [void](Read-TranscriptAppend -Path $missing -Offset 0)
+    [void](Read-TranscriptAppend -Path $missing -Offset 0)
+    Test-That 'and repeating it says nothing further, because the first line said it all' {
+        @($script:FastLog | Where-Object { $_ -like "transcript read failed for '$missing'*" }).Count -eq 1
+    }
+    Test-That 'a different transcript is still reported on its own' {
+        $other = Join-Path $script:TranscriptScratch 'another-missing.jsonl'
+        [void](Read-TranscriptAppend -Path $other -Offset 0)
+        @($script:FastLog | Where-Object { $_ -like "transcript read failed for '$other'*" }).Count -eq 1
+    }
+    # Reading again is what makes a later failure news; without this a transcript that
+    # recovered and then broke a second time would never be mentioned again.
+    [void](Read-TranscriptAppend -Path $present -Offset 0)
+    $script:FastLog = @()
+    [IO.File]::Delete($present)
+    [void](Read-TranscriptAppend -Path $present -Offset 0)
+    Test-That 'a transcript that read again and then failed is reported afresh' {
+        @($script:FastLog | Where-Object { $_ -like "transcript read failed for '$present'*" }).Count -eq 1
+    }
+
+    # Recovery has to count even when the read takes the truncation branch, which
+    # returns from inside the try and so never reaches anything placed after the
+    # finally. A session that was reset writes a shorter file than the saved offset,
+    # which is exactly that branch - and leaving the path marked as reported there
+    # swallowed the next genuine failure.
+    $reset = Join-Path $script:TranscriptScratch 'reset.jsonl'
+    $script:DaemonTranscriptFailureReported = @{}
+    $script:FastLog = @()
+    [void](Read-TranscriptAppend -Path $reset -Offset 0)
+    Test-That 'a transcript that is not there yet is reported once before it appears' {
+        @($script:FastLog | Where-Object { $_ -like "transcript read failed for '$reset'*" }).Count -eq 1
+    }
+    [IO.File]::WriteAllText($reset, "x`n")
+    $short = Read-TranscriptAppend -Path $reset -Offset 9999
+    Test-That 'and a file shorter than the saved offset rewinds rather than reading' { $short.Offset -eq 2 }
+    $script:FastLog = @()
+    [IO.File]::Delete($reset)
+    [void](Read-TranscriptAppend -Path $reset -Offset 0)
+    Test-That 'a recovery through that branch still clears the report, so the next failure is said' {
+        @($script:FastLog | Where-Object { $_ -like "transcript read failed for '$reset'*" }).Count -eq 1
+    }
+}
+finally {
+    Remove-Item -LiteralPath $script:TranscriptScratch -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host ''
 if ($script:Failures) {
     Write-Host "$($script:Failures) check(s) failed" -ForegroundColor Red
     exit 1

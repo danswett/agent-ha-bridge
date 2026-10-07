@@ -7,7 +7,7 @@
 
     Part of agent-bridge-daemon.ps1, which dot-sources it into its own scope after
     declaring the shared $script: state; see docs/daemon-split.md.
-    Shared state it changes: DaemonRegistrationStamps.
+    Shared state it changes: DaemonRegistrationStamps, DaemonTranscriptFailureReported.
 #>
 
 function Format-CardText {
@@ -194,6 +194,14 @@ function Read-TranscriptAppend {
         $stream = [IO.File]::Open(
             $Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite
         )
+        # Readable again, so a later failure is news and gets said. Cleared here, at
+        # the moment the open succeeds, rather than after the finally: the truncation
+        # branch below returns from inside this try, and anything past the finally is
+        # skipped for it - which left a recovered transcript still marked as reported,
+        # so the next genuine failure would have been swallowed.
+        if ($script:DaemonTranscriptFailureReported.ContainsKey($Path)) {
+            $script:DaemonTranscriptFailureReported.Remove($Path)
+        }
         $length = $stream.Length
 
         # A shorter file means the session was reset; start over from the end.
@@ -217,7 +225,17 @@ function Read-TranscriptAppend {
         }
         if ($failure -isnot [IO.IOException] -and $failure -isnot [UnauthorizedAccessException] -and
             $failure -isnot [System.Security.SecurityException]) { throw }
-        Write-DaemonLog -Message "transcript read failed for '$Path': $($failure.Message)"
+        # Said once per file until it reads again, the way adapter failures are
+        # (Get-DaemonSessionDiscovery's $script:DaemonAdapterFailureReported). Every
+        # caller here is in a loop, so an unreadable transcript wrote one identical
+        # line per pass for as long as it stayed unreadable - and on 2026-10-07 that
+        # was 40,667 of the daemon log's 44,348 lines, which is most of the reason
+        # nobody reads it. Repeating it adds nothing: the first line says everything
+        # the thousandth does.
+        if (-not $script:DaemonTranscriptFailureReported.ContainsKey($Path)) {
+            $script:DaemonTranscriptFailureReported[$Path] = $true
+            Write-DaemonLog -Message "transcript read failed for '$Path': $($failure.Message)"
+        }
         return $result
     }
     finally {
@@ -1104,9 +1122,19 @@ function Invoke-DaemonFastActivity {
         $transcript = [string]$session.Transcript
         if (-not $changed) {
             if ([string]::IsNullOrWhiteSpace($transcript)) { continue }
-            $length = 0L
+            # FileInfo.Length does not throw for a file that is not there. PowerShell
+            # turns the getter's FileNotFoundException into $null - even under
+            # Set-StrictMode -Version Latest with $ErrorActionPreference 'Stop' - so the
+            # catch below never fires for the commonest case it looks like it covers,
+            # and $null never equals the offset either. Both guards missed, so every
+            # 100 ms tick went on to read a transcript that did not exist: a session
+            # between starting and writing its first event logged a read failure about
+            # eight times a second, for as long as that lasted. Test the value, not just
+            # the throw.
+            $length = $null
             try { $length = [IO.FileInfo]::new($transcript).Length } catch { continue }
-            if ($length -eq [long]$entry.Offset) { continue }
+            if ($null -eq $length) { continue }
+            if ([long]$length -eq [long]$entry.Offset) { continue }
         }
 
         Update-DaemonSessionActivity -Id $id -Entry $entry -Session $session -Headers $Headers -VerboseOn ([bool]$script:DaemonVerbose)
