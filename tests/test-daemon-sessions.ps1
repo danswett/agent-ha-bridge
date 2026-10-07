@@ -704,6 +704,220 @@ Test-That 'the actual reply initializer sends one exact blank byte-JSON service 
 }
 
 Write-Host ''
+Write-Host '--- a live session whose entities were torn down ---'
+# On 2026-10-07 session 69e33875 was alive, working and correctly discovered; its Home
+# Assistant entities were removed at 10:18:52 and never came back. The daemon went on
+# evaluating reply ownership for it for hours, so it still knew the session - it simply
+# had no path that republishes one. Add-DaemonSession is the only publisher and a known
+# session never reaches it again, leaving this the only place that could have healed it,
+# and its probe read "not there" as "could not tell" and skipped.
+$script:DaemonReconcileStates = $null
+$script:DaemonPayloadSensorChecked = @{}
+$script:DaemonEntityRestore = @{}
+$script:RepairLog = @()
+$script:RepairPublished = @()
+$script:RepairFields = @()
+$script:RepairSubmit = @()
+$script:RepairPayload = @()
+$script:RepairStatus = @{}
+$script:RepairActivity = @{}
+$script:RepairArmed = @()
+$script:RepairArmedDetail = @()
+$script:RepairBlanked = @()
+$script:RepairMarker = $null
+$script:RepairPublishFails = $false
+# An explicit status is how a stand-in Home Assistant says what it answered without
+# having to imitate a transport; Get-BridgeHttpStatusCode reads exactly this.
+$script:RepairEntityStatus = 404
+function New-RepairReadFailure {
+    param([int]$Status)
+    $failure = [Exception]::new('stand-in Home Assistant refused the read')
+    if ($Status -gt 0) { $failure.Data['BridgeHttpStatus'] = $Status }
+    $failure
+}
+function Write-DaemonLog { param([string]$Message) $script:RepairLog += $Message }
+function Get-HomeAssistantState {
+    param([string]$EntityId, [hashtable]$Headers)
+    if ($script:RepairEntityStatus -eq 200) {
+        return [pscustomobject]@{ entity_id = $EntityId; state = 'idle'; attributes = [pscustomobject]@{} }
+    }
+    throw (New-RepairReadFailure -Status $script:RepairEntityStatus)
+}
+function Publish-CopilotMqttSession { param($SessionId, $SessionName, $Machine, $Headers)
+    if ($script:RepairPublishFails) { throw 'broker down' }
+    $script:RepairPublished += $SessionId; 'publish-response' }
+function Set-CopilotMqttEntityIds { param($SessionId) $true }
+function Clear-CopilotMqttDecisionFields { param($SessionId, $SessionName, $Machine, $Headers) $script:RepairFields += $SessionId; 'fields-response' }
+function Publish-CopilotMqttSubmitButton { param($SessionId, $SessionName, $Machine, $Headers) $script:RepairSubmit += $SessionId }
+function Publish-CopilotMqttReplyPayloadSensor { param($SessionId, $SessionName, $Machine, $Headers) $script:RepairPayload += $SessionId }
+function Set-CopilotMqttStatus { param($SessionId, $Status, $Headers, $Attributes) $script:RepairStatus[$SessionId] = @{ Status = $Status; Attributes = $Attributes }; 'status-response' }
+function Set-CopilotMqttActivity { param($SessionId, $Summary, $Detail, $Headers) $script:RepairActivity[$SessionId] = @{ Summary = $Summary; Detail = $Detail } }
+function Invoke-HomeAssistantService { param($Domain, $Service, $Headers, $Data) $script:RepairBlanked += $Data.entity_id; @('service', 'response') }
+function Set-CopilotMqttDecision { param($SessionId, $SessionName, $Machine, $Question, $Choices, $Fields, $DecisionId, $Headers, [switch]$PublishWithoutBaseline, [switch]$AnswerOnTap)
+    $script:RepairArmed += $Question
+    $script:RepairArmedDetail += [pscustomobject]@{ Question = $Question; Choices = @($Choices); DecisionId = $DecisionId
+        WithoutBaseline = [bool]$PublishWithoutBaseline; OnTap = [bool]$AnswerOnTap } }
+function Get-CopilotDecisionMarker { param($SessionId, [switch]$RequireReadable) $script:RepairMarker }
+function Test-VerboseStreaming { param($Headers) $false }
+function Start-Sleep { param($Milliseconds, $Seconds) }
+
+$script:TornId = '99999999-0000-4000-8000-000000000099'
+$script:TornNode = Get-CopilotMqttNodeId -SessionId $script:TornId
+function New-TornState {
+    @{ $script:TornId = [pscustomobject]@{
+        Name = 'Copilot: Fix Agent Bridge Session Discovery'; Machine = 'DSWETT-HOME'
+        Status = 'working'; Kind = 'copilot'; Offset = 0; LastSummary = 'Reading the brief' } }
+}
+function New-TornLive { @{ $script:TornId = [pscustomobject]@{ SessionId = $script:TornId; Kind = 'copilot'; ProcessId = 55164 } } }
+function Reset-TornCapture {
+    $script:RepairLog = @(); $script:RepairPublished = @(); $script:RepairFields = @()
+    $script:RepairSubmit = @(); $script:RepairPayload = @(); $script:RepairStatus = @{}
+    $script:RepairActivity = @{}; $script:RepairArmed = @(); $script:RepairArmedDetail = @(); $script:RepairBlanked = @()
+    $script:DaemonEntityRestore = @{}; $script:DaemonPayloadSensorChecked = @{}
+}
+
+Test-That 'Home Assistant answering 404 for an entity is read as absent, not as a failed read' {
+    $script:RepairEntityStatus = 404
+    (Get-DaemonEntityPresence -EntityId "text.$($script:TornNode)_reply" -Headers $headers) -eq 'absent'
+}
+Test-That 'while a read nobody could make says so instead of claiming the entity is gone' {
+    $script:RepairEntityStatus = 0
+    (Get-DaemonEntityPresence -EntityId "text.$($script:TornNode)_reply" -Headers $headers) -eq 'unreadable'
+}
+Test-That 'and a 500 is not absence either' {
+    $script:RepairEntityStatus = 500
+    (Get-DaemonEntityPresence -EntityId "text.$($script:TornNode)_reply" -Headers $headers) -eq 'unreadable'
+}
+Test-That 'an entity that is there is present' {
+    $script:RepairEntityStatus = 200
+    (Get-DaemonEntityPresence -EntityId "text.$($script:TornNode)_reply" -Headers $headers) -eq 'present'
+}
+
+Reset-TornCapture
+$script:RepairEntityStatus = 404
+$script:DaemonPayloadSensorChecked[$script:TornId] = $true
+Repair-CopilotSessionEntities -Headers $headers -State (New-TornState) -Live (New-TornLive)
+Test-That 'a live session whose entities are gone has them republished' { $script:RepairPublished -contains $script:TornId }
+Test-That 'including the slots, Submit and payload sensor the first publish does not cover' {
+    $script:RepairFields -contains $script:TornId -and $script:RepairSubmit -contains $script:TornId -and
+        $script:RepairPayload -contains $script:TornId
+}
+Test-That 'its card comes back carrying what the session was doing, not blanked' {
+    $script:RepairStatus[$script:TornId].Status -eq 'working' -and
+        $script:RepairStatus[$script:TornId].Attributes.session -eq 'Copilot: Fix Agent Bridge Session Discovery' -and
+        $script:RepairActivity[$script:TornId].Summary -eq 'Reading the brief'
+}
+Test-That 'and the operator is told which session it was, once' {
+    @($script:RepairLog | Where-Object { $_ -like 'republished the missing entities for 99999999*' }).Count -eq 1
+}
+Test-That 'the once-per-run payload probe is re-armed, since its answer predates the teardown' {
+    -not $script:DaemonPayloadSensorChecked.ContainsKey($script:TornId)
+}
+Test-That 'and nothing it publishes leaks back out of the repair pass' {
+    $null -eq (Repair-CopilotSessionEntities -Headers $headers -State (New-TornState) -Live (New-TornLive))
+}
+
+Reset-TornCapture
+$script:RepairEntityStatus = 0
+Repair-CopilotSessionEntities -Headers $headers -State (New-TornState) -Live (New-TornLive)
+Test-That 'a read that simply failed republishes nothing, so an outage cannot blank a live question' {
+    $script:RepairPublished.Count -eq 0 -and $script:RepairArmed.Count -eq 0
+}
+
+Reset-TornCapture
+$script:RepairEntityStatus = 404
+Repair-CopilotSessionEntities -Headers $headers -State (New-TornState) -Live (New-TornLive)
+Repair-CopilotSessionEntities -Headers $headers -State (New-TornState) -Live (New-TornLive)
+Repair-CopilotSessionEntities -Headers $headers -State (New-TornState) -Live (New-TornLive)
+Test-That 'a republish Home Assistant never acts on is spaced out rather than repeated every pass' {
+    $script:RepairPublished.Count -eq 1
+}
+Test-That 'and is not re-announced on every pass either' {
+    @($script:RepairLog | Where-Object { $_ -like 'republished the missing entities*' }).Count -eq 1
+}
+
+Reset-TornCapture
+$script:RepairEntityStatus = 404
+$script:RepairMarker = [pscustomobject]@{ question = 'Which branch should I supersede?'; choices = @('a', 'b'); fields = @(); decisionId = 'd1' }
+Repair-CopilotSessionEntities -Headers $headers -State (New-TornState) -Live (New-TornLive)
+Test-That 'a question that was live when the entities went is re-armed, not thrown away' {
+    $script:RepairArmed -contains 'Which branch should I supersede?' -and $script:RepairBlanked.Count -eq 0
+}
+$script:RepairMarker = $null
+
+Reset-TornCapture
+$script:RepairEntityStatus = 404
+Repair-CopilotSessionEntities -Headers $headers -State (New-TornState) -Live (New-TornLive)
+Test-That 'with no question waiting the reply box is primed blank instead' {
+    $script:RepairBlanked -contains "text.$($script:TornNode)_reply" -and $script:RepairArmed.Count -eq 0
+}
+
+# A Codex session blocked on PermissionRequest records its approval through its
+# agent's ApprovalMarker, not the Copilot decision marker. Re-arming only the latter
+# brought the card back idle, and Invoke-PendingCodexApprovals acts only on 'Approve'
+# or 'Deny' - so the command stayed blocked, unanswerable from the dashboard, with
+# nothing left to re-arm it: the Codex hook publishes an approval once and never again.
+$script:CodexApproval = $null
+$script:DaemonAgentCache = @{}
+$script:DaemonAgents['codex'].ApprovalMarker = {
+    param($SessionId, [bool]$RequireReadable = $false)
+    $script:CodexApproval
+}
+function New-CodexTornState {
+    @{ $script:TornId = [pscustomobject]@{
+        Name = 'Codex: fixture'; Machine = 'DSWETT-HOME'
+        Status = 'working'; Kind = 'codex'; Offset = 0; LastSummary = 'Running a command' } }
+}
+function New-CodexTornLive { @{ $script:TornId = [pscustomobject]@{ SessionId = $script:TornId; Kind = 'codex'; ProcessId = 4242 } } }
+
+Reset-TornCapture
+$script:RepairEntityStatus = 404
+$script:CodexApproval = [pscustomobject]@{ SessionId = $script:TornId; DecisionId = 'node-1700000000000'
+    Question = 'Run git push --force?'; Created = '2026-10-07T10:00:00-07:00' }
+Repair-CopilotSessionEntities -Headers $headers -State (New-CodexTornState) -Live (New-CodexTornLive)
+Test-That 'a Codex approval that was waiting is re-armed too, not just a Copilot question' {
+    $script:RepairArmed -contains 'Run git push --force?'
+}
+Test-That 'and it carries Approve and Deny, which is the only thing the daemon acts on' {
+    $script:RepairArmedDetail.Count -eq 1 -and
+        (@($script:RepairArmedDetail[0].Choices) -join ',') -eq 'Approve,Deny' -and
+        $script:RepairArmedDetail[0].DecisionId -eq 'node-1700000000000'
+}
+Test-That 'published on the contract its own hook uses, since nothing will retry it' {
+    $script:RepairArmedDetail[0].WithoutBaseline -and $script:RepairArmedDetail[0].OnTap
+}
+Test-That 'so the reply box is not blanked over a live approval' { $script:RepairBlanked.Count -eq 0 }
+
+Reset-TornCapture
+$script:RepairEntityStatus = 404
+$script:CodexApproval = $null
+Repair-CopilotSessionEntities -Headers $headers -State (New-CodexTornState) -Live (New-CodexTornLive)
+Test-That 'a Codex session with nothing waiting still just gets a blank box' {
+    $script:RepairArmed.Count -eq 0 -and $script:RepairBlanked -contains "text.$($script:TornNode)_reply"
+}
+
+Reset-TornCapture
+$script:RepairEntityStatus = 404
+$script:RepairPublishFails = $true
+Repair-CopilotSessionEntities -Headers $headers -State (New-TornState) -Live (New-TornLive)
+Test-That 'a rebuild that cannot publish says so rather than failing silently' {
+    @($script:RepairLog | Where-Object { $_ -like 'could not rebuild the missing entities for 99999999*' }).Count -eq 1
+}
+$script:RepairPublishFails = $false
+
+Reset-TornCapture
+$script:RepairEntityStatus = 404
+Repair-CopilotSessionEntities -Headers $headers -State (New-TornState) -Live @{}
+Test-That 'a session this machine cannot see running is left alone, since absence is not evidence of presence' {
+    $script:RepairPublished.Count -eq 0
+}
+
+Reset-TornCapture
+$script:RepairEntityStatus = 200
+Repair-CopilotSessionEntities -Headers $headers -State (New-TornState) -Live (New-TornLive)
+Test-That 'and a session whose entities are all there is not republished over' { $script:RepairPublished.Count -eq 0 }
+
+Write-Host ''
 if ($script:Failures) {
     Write-Host "$($script:Failures) check(s) failed" -ForegroundColor Red
     exit 1
