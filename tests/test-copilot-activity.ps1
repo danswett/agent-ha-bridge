@@ -561,6 +561,28 @@ try {
     Test-That 'a transcript that read again and then failed is reported afresh' {
         @($script:FastLog | Where-Object { $_ -like "transcript read failed for '$present'*" }).Count -eq 1
     }
+
+    # Recovery has to count even when the read takes the truncation branch, which
+    # returns from inside the try and so never reaches anything placed after the
+    # finally. A session that was reset writes a shorter file than the saved offset,
+    # which is exactly that branch - and leaving the path marked as reported there
+    # swallowed the next genuine failure.
+    $reset = Join-Path $script:TranscriptScratch 'reset.jsonl'
+    $script:DaemonTranscriptFailureReported = @{}
+    $script:FastLog = @()
+    [void](Read-TranscriptAppend -Path $reset -Offset 0)
+    Test-That 'a transcript that is not there yet is reported once before it appears' {
+        @($script:FastLog | Where-Object { $_ -like "transcript read failed for '$reset'*" }).Count -eq 1
+    }
+    [IO.File]::WriteAllText($reset, "x`n")
+    $short = Read-TranscriptAppend -Path $reset -Offset 9999
+    Test-That 'and a file shorter than the saved offset rewinds rather than reading' { $short.Offset -eq 2 }
+    $script:FastLog = @()
+    [IO.File]::Delete($reset)
+    [void](Read-TranscriptAppend -Path $reset -Offset 0)
+    Test-That 'a recovery through that branch still clears the report, so the next failure is said' {
+        @($script:FastLog | Where-Object { $_ -like "transcript read failed for '$reset'*" }).Count -eq 1
+    }
 }
 finally {
     Remove-Item -LiteralPath $script:TranscriptScratch -Recurse -Force -ErrorAction SilentlyContinue

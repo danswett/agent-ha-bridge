@@ -194,6 +194,14 @@ function Read-TranscriptAppend {
         $stream = [IO.File]::Open(
             $Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite
         )
+        # Readable again, so a later failure is news and gets said. Cleared here, at
+        # the moment the open succeeds, rather than after the finally: the truncation
+        # branch below returns from inside this try, and anything past the finally is
+        # skipped for it - which left a recovered transcript still marked as reported,
+        # so the next genuine failure would have been swallowed.
+        if ($script:DaemonTranscriptFailureReported.ContainsKey($Path)) {
+            $script:DaemonTranscriptFailureReported.Remove($Path)
+        }
         $length = $stream.Length
 
         # A shorter file means the session was reset; start over from the end.
@@ -232,11 +240,6 @@ function Read-TranscriptAppend {
     }
     finally {
         if ($null -ne $stream) { $stream.Dispose() }
-    }
-
-    # Readable again, so a later failure is news and gets said.
-    if ($script:DaemonTranscriptFailureReported.ContainsKey($Path)) {
-        $script:DaemonTranscriptFailureReported.Remove($Path)
     }
 
     $result
