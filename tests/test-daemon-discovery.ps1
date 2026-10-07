@@ -284,6 +284,28 @@ Test-That 'while an ordinary session process with no session still holds it' {
     -not $ordinary.Complete -and (Get-FixtureDiagnosticCodes -Snapshot $ordinary) -contains 'UnaccountedProcess'
 } "codes: $((Get-FixtureDiagnosticCodes -Snapshot $ordinary) -join ', ')"
 
+# A session asked about this very bug carries the word in its prompt. Reading that as
+# the option would excuse a real session and let absence-based work retire it while it
+# was still working.
+Reset-FixtureState -Kinds @('copilot')
+$script:ProcessesByAgent = @{ copilot = @([pscustomobject]@{ Id = 22404 }) }
+$script:CommandLines = @{ 22404 = '"copilot.exe" --session-id 11111111-1111-4111-8111-111111111111 -i "why does --headless stall discovery"' }
+$prompted = Get-DaemonSessionDiscovery
+
+Test-That 'the word in a quoted prompt is text, not the option' {
+    -not $prompted.Complete -and (Get-FixtureDiagnosticCodes -Snapshot $prompted) -contains 'UnaccountedProcess'
+} "codes: $((Get-FixtureDiagnosticCodes -Snapshot $prompted) -join ', ')"
+
+# And a session always carries its id, which settles it even unquoted.
+Reset-FixtureState -Kinds @('copilot')
+$script:ProcessesByAgent = @{ copilot = @([pscustomobject]@{ Id = 22405 }) }
+$script:CommandLines = @{ 22405 = '"copilot.exe" --session-id=11111111-1111-4111-8111-111111111111 --headless' }
+$identified = Get-DaemonSessionDiscovery
+
+Test-That 'a process that names a session of its own is never embedded' {
+    -not $identified.Complete -and (Get-FixtureDiagnosticCodes -Snapshot $identified) -contains 'UnaccountedProcess'
+} "codes: $((Get-FixtureDiagnosticCodes -Snapshot $identified) -join ', ')"
+
 Reset-FixtureState -Kinds @('copilot')
 $script:ProcessesByAgent = @{ copilot = @([pscustomobject]@{ Id = 22402 }) }
 $script:CommandLineState = 'Unknown'
