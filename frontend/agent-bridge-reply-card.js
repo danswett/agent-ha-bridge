@@ -1113,6 +1113,7 @@ class AgentBridgeChoicesCard extends HTMLElement {
     // daemon, which says which field it is waiting on, and freezing that would leave
     // no way to go and answer it.
     this._complete = false;
+    this._takesText = false;
     this._fields = [];
     // What has been tapped but not yet seen coming back from Home Assistant.
     // {} when everything on screen is confirmed.
@@ -1336,6 +1337,16 @@ class AgentBridgeChoicesCard extends HTMLElement {
     // the fields are the answer and it stays on its placeholder throughout.
     const mustAnswer = groups.filter((g) => g.options.some((o) => o !== CHOICE_CANCEL));
     this._complete = mustAnswer.length > 0 && mustAnswer.every((g) => g.chosen !== '');
+    // Whether this question has a free-text field: a slot the bridge gave a heading
+    // but no options, because it is answered in the reply box rather than by a
+    // dropdown. An unused slot carries no heading, which is what tells the two apart.
+    //
+    // Only such a question can be sent by publishing. Read-DaemonFormAnswer submits on
+    // a payload alone ($cardSubmits) only when $takesText, so publishing for an
+    // options-only form - because a draft happened to be sitting in the reply box -
+    // sent nothing at all while this card had already frozen itself as though it had.
+    this._takesText = this._fields.some((entityId, i) =>
+      !this._armed(entityId) && String(decisionAttrs[`field_${i + 1}_label`] || '') !== '');
 
     const show = groups.length > 0;
     this.hidden = !show;
@@ -1598,7 +1609,9 @@ class AgentBridgeChoicesCard extends HTMLElement {
     // Send answer exists to prevent. An incomplete form keeps exactly the behaviour it
     // had: the press, which is what makes the daemon name the field it is waiting on,
     // and the words stay in the box until there is a finished form to carry them.
-    const reply = this._complete ? REPLY_CARDS.get(String(this._config.reply_topic || '')) : null;
+    const reply = (this._complete && this._takesText)
+      ? REPLY_CARDS.get(String(this._config.reply_topic || ''))
+      : null;
     if (reply && reply.hasUnsentFormText()) {
       // Kept so it can be put back. The daemon discards a payload tagged for a
       // question that has gone, so telling someone to send again is only honest if

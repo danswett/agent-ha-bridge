@@ -1686,16 +1686,21 @@ async function checkIncompleteSendStaysLive() {
 async function checkSendAnswerCarriesTypedText() {
   const TOPIC = 'copilot/cli/session/abc/replypayload';
   const FIELD = 'select.agent_bridge_abc_f1';
+  const TEXT_FIELD = 'select.agent_bridge_abc_f2';
 
-  function mixed({ typed = '', publishFails = false, replyTopic = TOPIC, holdPublish = false, attach = false, incomplete = false } = {}) {
+  function mixed({ typed = '', publishFails = false, replyTopic = TOPIC, holdPublish = false, attach = false, incomplete = false, optionsOnly = false } = {}) {
     const calls = [];
     let releasePublish = null;
+    // A free-text field is a slot the bridge gives a heading but no options: it is
+    // answered in the reply box, not by a dropdown. An unused slot has no heading.
+    const attributes = {
+      options: ['Awaiting answer...', 'Cancel request'], decision_id: 'd1', field_1_label: 'Colour',
+    };
+    if (!optionsOnly) { attributes.field_2_label = 'Notes'; }
     const states = {
-      [DECISION]: {
-        state: 'Awaiting answer...',
-        attributes: { options: ['Awaiting answer...', 'Cancel request'], decision_id: 'd1', field_1_label: 'Colour' },
-      },
+      [DECISION]: { state: 'Awaiting answer...', attributes },
       [FIELD]: { state: incomplete ? 'Choose...' : 'Red', attributes: { options: ['Choose...', 'Red', 'Blue'] } },
+      [TEXT_FIELD]: { state: 'Idle', attributes: { options: ['Idle'] } },
     };
     const hass = {
       states,
@@ -1714,7 +1719,7 @@ async function checkSendAnswerCarriesTypedText() {
     reply._els.textarea.value = typed;
     if (attach) { reply._images = [{ id: 'img1', name: 'shot.png', content_type: 'image/png' }]; }
 
-    const config = { decision: DECISION, fields: [FIELD], submit: SUBMIT };
+    const config = { decision: DECISION, fields: [FIELD, TEXT_FIELD], submit: SUBMIT };
     if (replyTopic) { config.reply_topic = replyTopic; }
     const choices = new AgentBridgeChoicesCard();
     choices.setConfig(config);
@@ -1758,6 +1763,18 @@ async function checkSendAnswerCarriesTypedText() {
     domains(m) === 'button', domains(m));
   check('and keeps the words in the box until there is a form to carry them',
     m.reply._els.textarea.value === 'some notes', m.reply._els.textarea.value);
+
+  // A form of dropdowns alone cannot take words, and Read-DaemonFormAnswer will not
+  // submit on a payload for one ($cardSubmits requires $takesText). A draft left in
+  // the reply box must not divert the send: published instead of pressed, nothing was
+  // sent at all while this card had already frozen itself as though it had.
+  m = mixed({ typed: 'a draft I left lying about', optionsOnly: true });
+  press(m.choices);
+  await flush();
+  check('a form of options alone presses, however much is sitting in the reply box',
+    domains(m) === 'button', domains(m));
+  check('and the draft is left where it was, for the reply path',
+    m.reply._els.textarea.value === 'a draft I left lying about', m.reply._els.textarea.value);
 
   // The usual optional "anything else?", left blank. There is nothing to publish and
   // an empty free-text field is a valid answer, so this must stay a single press.
