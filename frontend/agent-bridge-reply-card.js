@@ -2387,6 +2387,43 @@ class AgentBridgeUsageCard extends HTMLElement {
 
   getCardSize() { return this._open ? 1 + this._config.entities.length : 1; }
 
+  /*
+   * Home Assistant pushes a state change the moment one happens, so a bar moves as
+   * soon as the daemon publishes. The clock does not get pushed, though: "37m ago"
+   * and "resets in 3h" are worked out at render time, so on a card nobody is touching
+   * they would freeze at whatever they said when the last state arrived - and Codex,
+   * whose figures can sit unchanged for days, would never redraw at all.
+   *
+   * Stopped outright while the page is hidden rather than returning early from the
+   * tick, for the reason the activity card's spinner records: the timer still fires
+   * and still wakes the main thread, and Home Assistant sits in a pinned tab for days.
+   */
+  connectedCallback() {
+    const hidden = () => typeof document !== 'undefined' && !!document.hidden;
+    const resume = () => {
+      if (this._clock || hidden()) { return; }
+      // Half a minute: the text is minute-granular, so this is the longest interval
+      // that cannot leave a stale minute on the screen.
+      this._clock = setInterval(() => this._render(), 30000);
+    };
+    this._onVisible = () => {
+      if (!hidden()) { this._render(); resume(); return; }
+      if (this._clock) { clearInterval(this._clock); this._clock = null; }
+    };
+    if (typeof document !== 'undefined' && document.addEventListener) {
+      document.addEventListener('visibilitychange', this._onVisible);
+    }
+    resume();
+  }
+
+  disconnectedCallback() {
+    if (this._clock) { clearInterval(this._clock); this._clock = null; }
+    if (this._onVisible && typeof document !== 'undefined' && document.removeEventListener) {
+      document.removeEventListener('visibilitychange', this._onVisible);
+    }
+    this._onVisible = null;
+  }
+
   _build() {
     this._built = true;
     this.shadowRoot.innerHTML = `

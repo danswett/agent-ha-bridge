@@ -856,6 +856,20 @@ Tokens are read, spent on the one request, and dropped — never logged, never
 published, never written anywhere. Turn the whole thing off with `usage.publish:
 false`, which stops the collection rather than merely hiding the result.
 
+### How current it is
+
+The daemon re-reads the allowances every `usage.intervalSeconds` (120 by default) and
+publishes only when a figure has actually moved, since every publish is retained. Home
+Assistant then pushes that change straight to any open dashboard, so **a card you are
+looking at redraws within a second of the daemon publishing** — there is nothing to
+refresh. In practice that means Copilot is never more than two minutes behind, which is
+the point: its figure was measured moving continuously during an active session.
+
+The card also runs a half-minute timer of its own, purely so the relative text —
+`37m ago`, `resets in 3h` — keeps up when nothing is being pushed. Codex's figures can
+sit unchanged for days, so without it that row would never redraw at all. The timer is
+stopped outright while the browser tab is hidden rather than left firing into nothing.
+
 ---
 
 ## Several machines, one Home Assistant
