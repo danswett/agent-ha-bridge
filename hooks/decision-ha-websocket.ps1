@@ -1954,6 +1954,12 @@ function Save-CopilotSessionDashboard {
   {% elif is_state('$statusEntity','working') %}
   border: 1px solid var(--primary-color);
   animation: cpwork 1.6s ease-in-out infinite;
+  {% elif is_state('$statusEntity','agents') %}
+  /* Waiting on background agents: live, but not the session's own work, so the
+     edge is steady rather than breathing. */
+  border: 1px solid var(--primary-color);
+  box-shadow: none;
+  animation: none;
   {% else %}
   border: 1px solid var(--divider-color);
   box-shadow: none;
@@ -2026,8 +2032,8 @@ ha-select, mwc-select { width: 100%; }
             type = 'markdown'
             card_mod = @{ style = $bareChild }
             content = @"
-### {% if state_attr('$decisionEntity','question') %}🟡{% elif is_state('$statusEntity','working') %}🟢{% else %}⚪{% endif %} $($session.Name)
-*$($session.Machine)* &bull; status: **{% if state_attr('$decisionEntity','question') %}waiting for you{% else %}{% set st = states('$statusEntity') %}{{ 'ended' if st in ['unknown', 'unavailable'] else st }}{% endif %}**{% set act = states('$activityEntity') %}{% set body = state_attr('$activityEntity','response') or '' %}{% if not (body and body.startswith(act.rstrip('.'))) %} &bull; {{ act }}{% endif %}
+### {% if state_attr('$decisionEntity','question') %}🟡{% elif is_state('$statusEntity','working') %}🟢{% elif is_state('$statusEntity','agents') %}🔵{% else %}⚪{% endif %} $($session.Name)
+*$($session.Machine)* &bull; status: **{% if state_attr('$decisionEntity','question') %}waiting for you{% else %}{% set st = states('$statusEntity') %}{% if st in ['unknown', 'unavailable'] %}ended{% elif st == 'agents' %}waiting for background agents{% else %}{{ st }}{% endif %}{% endif %}**{% set act = states('$activityEntity') %}{% set body = state_attr('$activityEntity','response') or '' %}{% if not (body and body.startswith(act.rstrip('.'))) %} &bull; {{ act }}{% endif %}
 {% set q = state_attr('$decisionEntity','question') %}{% set resp = state_attr('$activityEntity','response') %}{% if q %}
 
 ---

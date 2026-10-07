@@ -1062,7 +1062,7 @@ function Resolve-DaemonPrimedCard {
     #>
     param(
         [Parameter(Mandatory)]$Entry,
-        [Parameter(Mandatory)][ValidateSet('working', 'waiting', 'idle', 'error')][string]$Status,
+        [Parameter(Mandatory)][ValidateSet('working', 'waiting', 'idle', 'agents', 'error')][string]$Status,
         [bool]$VerboseOn
     )
 
@@ -1070,7 +1070,8 @@ function Resolve-DaemonPrimedCard {
     elseif ($Entry.PSObject.Properties['LastSummary'] -and -not [string]::IsNullOrWhiteSpace([string]$Entry.LastSummary)) {
         [string]$Entry.LastSummary
     }
-    elseif ($Status -eq 'working') { 'Working' } else { 'Idle' }
+    elseif ($Status -eq 'working') { 'Working' }
+    elseif ($Status -eq 'agents') { 'Waiting for background agents' } else { 'Idle' }
 
     $detail = @{
         session = $Entry.Name

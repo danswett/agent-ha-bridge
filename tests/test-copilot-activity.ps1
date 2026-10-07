@@ -158,6 +158,75 @@ Test-That 'and is not marked as thinking' { -not $activity.LatestIsThinking }
 $activity = Get-ActivityFromEvents -Lines @('not json at all', '{"type":"assistant.message"}') -VerboseMode $true
 Test-That 'a malformed line does not throw' { [string]::IsNullOrEmpty([string]$activity.Latest) }
 
+Write-Host ''
+Write-Host "--- a subagent's events are not the session's ---"
+# Copilot writes everything its subagents do into the session's own events.jsonl -
+# their task prompts, their turns, their tool calls - stamped with a top-level
+# agentId. Counted on a real transcript: of 7,381 events, all 571 a subagent produced
+# carried it and none of the other 6,810 did. Reading them as the session's is what
+# made a background agent's last turn_end leave the card saying idle.
+function New-BackgroundAgent {
+    param([string]$Call, [string]$Mode = 'background')
+    (@{ type = 'subagent.started'; agentId = 'sub-1'
+        data = @{ toolCallId = $Call; agentDisplayName = 'review'; executionMode = $Mode } } |
+        ConvertTo-Json -Depth 5 -Compress)
+}
+function New-AgentFinished {
+    param([string]$Call)
+    (@{ type = 'subagent.completed'; agentId = 'sub-1'; data = @{ toolCallId = $Call } } |
+        ConvertTo-Json -Depth 5 -Compress)
+}
+function New-SubagentEvent {
+    param([string]$Type, [string]$Call = 'toolu_a')
+    (@{ type = $Type; agentId = 'sub-1'; data = @{ parentToolCallId = $Call } } |
+        ConvertTo-Json -Depth 5 -Compress)
+}
+
+$activity = Get-ActivityFromEvents -Lines @((New-BackgroundAgent 'toolu_a')) -VerboseMode $false
+Test-That 'a background agent is reported by the tool call that started it' {
+    (@($activity.AgentsStarted) -join ',') -eq 'toolu_a'
+} (@($activity.AgentsStarted) -join ',')
+# A sync agent holds the parent's tool call open, so the session is plainly working
+# and the transcript never claims otherwise; only a background one outlives the turn.
+$activity = Get-ActivityFromEvents -Lines @((New-BackgroundAgent 'toolu_b' 'sync')) -VerboseMode $false
+Test-That 'a sync agent is not, because the turn it belongs to is still open' {
+    @($activity.AgentsStarted).Count -eq 0
+}
+$activity = Get-ActivityFromEvents -Lines @((New-AgentFinished 'toolu_a')) -VerboseMode $false
+Test-That 'and a finish names the same tool call' { (@($activity.AgentsFinished) -join ',') -eq 'toolu_a' }
+
+$activity = Get-ActivityFromEvents -Lines @((New-SubagentEvent 'assistant.turn_start')) -VerboseMode $false
+Test-That 'an agent starting a turn of its own does not say the session is working' {
+    [string]::IsNullOrEmpty([string]$activity.Status)
+} "$($activity.Status)"
+$activity = Get-ActivityFromEvents -Lines @((New-SubagentEvent 'assistant.turn_end')) -VerboseMode $false
+Test-That 'and ending one does not say the session has gone idle' {
+    [string]::IsNullOrEmpty([string]$activity.Status)
+} "$($activity.Status)"
+$activity = Get-ActivityFromEvents -Lines @((New-SubagentEvent 'user.message')) -VerboseMode $false
+Test-That 'the task it was handed is not a turn you typed' { -not $activity.TurnStarted }
+
+# The cheap check in front of the parse is a containment test, so a message that
+# happens to mention the field must still be read as the session's own.
+$quoting = (@{ type = 'user.message'; data = @{ content = 'what is "agentId" for?' } } |
+    ConvertTo-Json -Depth 5 -Compress)
+$activity = Get-ActivityFromEvents -Lines @($quoting) -VerboseMode $false
+Test-That 'a message merely quoting agentId is still yours' { $activity.TurnStarted }
+
+Write-Host ''
+Write-Host '--- the status the publisher is asked for ---'
+# Publishing is wrapped in a catch that logs and swallows, so a status the publisher
+# rejects fails quietly: the card keeps whatever it last said, which here is the idle
+# reading this whole status exists to replace. Stubbed at the transport, so the real
+# parameter contract is the thing under test and nothing leaves the machine.
+$script:MqttPayloads = @()
+function Publish-CopilotMqttMessage { param($Topic, $Payload, $Headers, [switch]$Retain) $script:MqttPayloads += [string]$Payload }
+Set-CopilotMqttStatus -SessionId 'eeeeeeee-1111-2222-3333-444444444444' -Status 'agents' `
+    -Headers @{} -Attributes @{ background_agents = 2 }
+Test-That 'a session waiting on background agents is a status it accepts' {
+    $script:MqttPayloads -contains 'agents'
+} ($script:MqttPayloads -join '|')
+
 Write-Host '--- what reaches the card ---'
 # Everything that would reach Home Assistant is stood in for.
 $script:Published = $null
@@ -306,6 +375,108 @@ try {
 }
 finally {
     Remove-Item -LiteralPath $tailFile -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host ''
+Write-Host '--- waiting for background agents is not idle ---'
+<#
+    A background agent outlives the turn that started it. The session's own turn ends,
+    the transcript says idle, and the card then invites you to close a session whose
+    work is still running - which is how a review that had been going for ten minutes
+    was thrown away. Waiting on one is a status of its own, kept on the entry because
+    a start and its finish are minutes and many reads apart.
+#>
+$agentLog = Join-Path ([IO.Path]::GetTempPath()) "copilot-agents-$([guid]::NewGuid().ToString('N')).jsonl"
+$agentId = 'dddddddd-1111-2222-3333-444444444444'
+$agentEntry = [pscustomobject]@{ Offset = 0; Name = 'Copilot: review'; Machine = 'DESK'; Status = 'working'; Kind = 'copilot' }
+$agentSession = [pscustomobject]@{ SessionId = $agentId; Transcript = $agentLog; ProcessId = 1 }
+function StepAgents {
+    param([string[]]$Lines)
+    Add-Content -LiteralPath $agentLog -Value $Lines -Encoding utf8
+    Update-DaemonSessionActivity -Id $agentId -Entry $agentEntry -Session $agentSession -Headers @{} -VerboseOn $false
+}
+try {
+    $script:StatusPublishes = @()
+    StepAgents -Lines @((New-Tool 'task'), (New-BackgroundAgent 'toolu_a'), '{"type":"assistant.turn_end"}')
+    Test-That 'a turn ending with an agent still running does not read as idle' { $agentEntry.Status -eq 'agents' } "$($agentEntry.Status)"
+    Test-That 'and that is what reaches the card' { $script:StatusPublishes[-1].Status -eq 'agents' }
+    Test-That 'with how many, so the card need not say "some"' {
+        $script:StatusPublishes[-1].Attributes['background_agents'] -eq 1
+    }
+
+    $script:StatusPublishes = @()
+    StepAgents -Lines @((New-SubagentEvent 'assistant.turn_start'), (New-SubagentEvent 'assistant.turn_end'))
+    Test-That 'the agent working away leaves the session where it was' {
+        $agentEntry.Status -eq 'agents' -and @($script:StatusPublishes).Count -eq 0
+    } "$($agentEntry.Status), publishes=$(@($script:StatusPublishes).Count)"
+
+    StepAgents -Lines @((New-BackgroundAgent 'toolu_b'))
+    Test-That 'a second agent joins the first rather than replacing it' {
+        @($agentEntry.BackgroundAgents).Count -eq 2
+    } (@($agentEntry.BackgroundAgents) -join ',')
+
+    StepAgents -Lines @((New-AgentFinished 'toolu_a'))
+    Test-That 'one finishing leaves the session waiting on the other' { $agentEntry.Status -eq 'agents' }
+
+    $script:StatusPublishes = @()
+    StepAgents -Lines @((New-AgentFinished 'toolu_b'))
+    Test-That 'the last one finishing hands the session back to idle' { $agentEntry.Status -eq 'idle' } "$($agentEntry.Status)"
+    Test-That 'and says so, rather than leaving the card waiting on nothing' {
+        $script:StatusPublishes[-1].Status -eq 'idle'
+    }
+
+    # Copilot writes a completion again for every agent it was still tracking when the
+    # session shuts down. Counting down instead of tracking ids went negative here, and
+    # a session that had finished three agents looked like it was waiting on one.
+    StepAgents -Lines @((New-AgentFinished 'toolu_a'), (New-AgentFinished 'toolu_b'))
+    Test-That 'a completion written twice at shutdown leaves no phantom agent' {
+        $agentEntry.Status -eq 'idle' -and @($agentEntry.BackgroundAgents).Count -eq 0
+    } "$($agentEntry.Status), outstanding=$(@($agentEntry.BackgroundAgents).Count)"
+
+    StepAgents -Lines @((New-BackgroundAgent 'toolu_c'), '{"type":"assistant.turn_end"}')
+    Test-That 'and a restart finds it waiting, not idle' {
+        (Get-DaemonStartupStatus -Session $agentSession -Entry $agentEntry) -eq 'agents'
+    } (Get-DaemonStartupStatus -Session $agentSession -Entry $agentEntry)
+
+    # The StrictMode trap this count exists for: a property that is there but null
+    # wraps to a one-element array holding $null, so a session that had never
+    # delegated anything read as waiting on one agent it could never be rid of.
+    Test-That 'a session carrying no agents at all is waiting on none' {
+        (Get-DaemonBackgroundAgentCount -Entry ([pscustomobject]@{ BackgroundAgents = $null })) -eq 0
+    }
+    Test-That 'and neither is one from before the bridge tracked them' {
+        (Get-DaemonBackgroundAgentCount -Entry ([pscustomobject]@{ Status = 'idle' })) -eq 0
+    }
+
+    # Adoption and restart ask the transcript directly whether a turn is open, which
+    # is a second place a background agent's turns could be mistaken for the
+    # session's - and one that would have masked the new status with 'working'.
+    $root = Join-Path ([IO.Path]::GetTempPath()) "copilot-root-$([guid]::NewGuid().ToString('N'))"
+    $events = Join-Path (Join-Path $root (Get-CopilotSafeSessionKey -SessionId $agentId)) 'events.jsonl'
+    [void](New-Item -ItemType Directory -Path (Split-Path -Parent $events) -Force)
+    $savedRoot = $script:DecisionBridgeConfig.SessionStateRoot
+    try {
+        $script:DecisionBridgeConfig.SessionStateRoot = $root
+        Set-Content -LiteralPath $events -Encoding utf8 -Value @(
+            '{"type":"assistant.turn_start"}'
+            '{"type":"assistant.turn_end"}'
+            (New-SubagentEvent 'assistant.turn_start')
+        )
+        Test-That 'an agent''s open turn does not make the session working' {
+            -not (Test-CopilotSessionWorking -SessionId $agentId)
+        }
+        Add-Content -LiteralPath $events -Encoding utf8 -Value '{"type":"assistant.turn_start"}'
+        Test-That 'while the session opening one of its own still does' {
+            Test-CopilotSessionWorking -SessionId $agentId
+        }
+    }
+    finally {
+        $script:DecisionBridgeConfig.SessionStateRoot = $savedRoot
+        Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+finally {
+    Remove-Item -LiteralPath $agentLog -Force -ErrorAction SilentlyContinue
 }
 
 Write-Host ''

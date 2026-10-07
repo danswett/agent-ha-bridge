@@ -61,6 +61,15 @@ class FakeElement {
   }
   get className() { return Array.from(this.classList._set).join(' '); }
   appendChild(child) { child.parentElement = this; this.children.push(child); return child; }
+  // `append` takes strings as well as nodes, which is how the activity card writes its
+  // status line - a machine, a literal, then the status in bold. Without it that line
+  // could not be rendered here at all, so nothing could check what it says.
+  append(...nodes) {
+    for (const node of nodes) {
+      if (typeof node === 'string') { this._text += node; }
+      else { this.appendChild(node); this._text += node.textContent; }
+    }
+  }
   addEventListener(type, fn) { (this._listeners[type] = this._listeners[type] || []).push(fn); }
   setAttribute(name, value) { this.attributes[name] = String(value); }
   getAttribute(name) { return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null; }

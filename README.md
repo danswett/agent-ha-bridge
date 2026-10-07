@@ -26,6 +26,7 @@ prompt, so the terminal never stops working and nothing is ever answered twice.
 |---|---|
 | **Dual input** | Answer in the terminal *or* Home Assistant. First one wins; the other clears. |
 | **Live activity** | Each session streams its status, current tool, and last response to its card. |
+| **Background agents** | A session whose turn has ended while agents it started are still running reads *waiting for N background agents*, not *idle*. |
 | **Detailed activity** | Cards carry the model's reasoning and every tool call; fold a session card to keep it short. Off with `detailedActivity: false`. |
 | **Real forms** | Multi-field questions become one dropdown per field plus a Send button. |
 | **Continuation** | Reply to a finished turn from your phone; it's typed into the session. |
@@ -37,7 +38,8 @@ prompt, so the terminal never stops working and nothing is ever answered twice.
 | **No polling** | State changes arrive over a Home Assistant WebSocket subscription. |
 
 The card glows **blue** while working, **amber** while waiting on you, and not at all
-when idle.
+when idle. A session waiting on background agents it started holds a steady blue edge
+without the pulse: live, but not working itself.
 
 ---
 
@@ -800,8 +802,10 @@ arms: the card's status line changes to *Press End session again to end it*, nam
 what the second press would interrupt, and the session carries on untouched. A second
 press within ten seconds ends it; without one the confirmation lapses, the card says
 *End session NOT confirmed*, and the next press starts over. Only an idle session ends
-on a single press, having nothing in flight to lose. A session whose status the daemon
-has not yet worked out is guarded like any other, precisely because it may well be
+on a single press, having nothing in flight to lose. A session waiting on background
+agents it started is not idle and so takes two presses: its own turn has ended, but
+the work it is waiting on has not. A session whose status the daemon has not yet
+worked out is guarded too, precisely because it may well be
 mid-turn. A press with no process behind it is not guarded, since there is nothing a
 second press could protect: such a session cannot be stopped at all, and the card
 reports that rather than appearing to have worked.

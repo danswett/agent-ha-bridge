@@ -284,6 +284,71 @@ check('and the glow has a colour of its own rather than reusing the working one'
   /\.frame\.agent\.working ~ \.glow[\s\S]{0,160}--agent-bridge-agent-color/.test(source));
 
 console.log('');
+console.log('--- a session waiting on background agents is not idle ---');
+/*
+ * A background agent outlives the turn that started it: the session's own turn ends,
+ * so the transcript says idle while work it is waiting on is still running. An idle
+ * card is an invitation to close a session that has not finished, which is how a code
+ * review ten minutes in was thrown away. The daemon publishes `agents` and how many,
+ * and the card reads them out rather than leaving you to guess.
+ */
+function renderActivity({ status, attributes = {}, question }) {
+  const card = Object.create(AgentBridgeActivityCard.prototype);
+  card._last = {};
+  const el = (tag) => new FakeElement(tag);
+  card._els = {
+    title: el('div'), meta: el('div'), question: el('div'), q: el('div'),
+    response: el('div'), reasoning: el('details'), r: el('div'),
+    history: el('details'), list: el('ul'),
+    working: el('div'), glyph: el('span'), verb: el('span'), elapsed: el('span'),
+  };
+  card._config = {
+    name: 'review', machine: 'DESK', status: S_STATUS, activity: S_ACTIVITY, decision: S_DECISION,
+  };
+  card._hass = {
+    states: {
+      [S_STATUS]: { state: status, attributes },
+      [S_ACTIVITY]: { state: '', attributes: {} },
+      [S_DECISION]: { state: 'Idle', attributes: question ? { question } : {} },
+    },
+  };
+  card._render();
+  return { title: card._els.title.textContent, meta: card._els.meta.textContent };
+}
+
+const twoAgents = renderActivity({ status: 'agents', attributes: { background_agents: 2 } });
+check('the status line says so in words, with how many',
+  twoAgents.meta === 'DESK \u2022 status: waiting for 2 background agents', twoAgents.meta);
+const oneAgent = renderActivity({ status: 'agents', attributes: { background_agents: 1 } });
+check('and one agent is one agent',
+  oneAgent.meta === 'DESK \u2022 status: waiting for 1 background agent', oneAgent.meta);
+// A machine still running a bridge from before the count was published says the true
+// thing it knows rather than "waiting for 0 background agents".
+const noCount = renderActivity({ status: 'agents' });
+check('a card given no count still says what is happening',
+  noCount.meta === 'DESK \u2022 status: waiting for background agents', noCount.meta);
+check('it gets a dot of its own, so a glance tells it from both idle and working',
+  twoAgents.title === '\u{1F535} review', twoAgents.title);
+const plainIdle = renderActivity({ status: 'idle' });
+check('while a genuinely idle session reads exactly as it did',
+  plainIdle.meta === 'DESK \u2022 status: idle' && plainIdle.title === '\u26AA review',
+  `${plainIdle.title} / ${plainIdle.meta}`);
+const asked = renderActivity({ status: 'agents', question: 'Which one?' });
+check('and a question still takes precedence, because that is waiting on you',
+  asked.meta === 'DESK \u2022 status: waiting for you', asked.meta);
+
+check('the frame marks it, rather than leaving it looking closed',
+  renderSession({ status: 'agents' }).contains('delegating'));
+check('without claiming the session itself is working',
+  renderSession({ status: 'agents' }).contains('working') === false);
+// The pulse means "this session is thinking right now", which it is not - it is
+// waiting. The edge is steady so the two are not confused.
+check('its edge is steady, since the glow belongs to a session doing its own work',
+  /\.frame\.delegating \{/.test(source) && !/delegating ~ \.glow/.test(source));
+check('a question arriving over the top of it still reads as waiting on you',
+  renderSession({ status: 'agents', question: 'Which one?' }).contains('waiting'));
+
+console.log('');
 console.log('--- the pulse is composited, never repainted ---');
 /*
  * `box-shadow` is not a property the compositor can animate, so keyframes on it make
