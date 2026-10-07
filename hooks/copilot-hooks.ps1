@@ -10,6 +10,23 @@
     bridge-adapter.ps1, the first decision-mqtt.ps1 and decision-ha-websocket.ps1.
 #>
 
+function Get-CopilotMixedFormHint {
+    <#
+        What to tell someone answering a form that mixes dropdowns with a free-text
+        field: the text goes in the Reply box, but the form is committed by the
+        choices card's own row.
+
+        It names "Send answer" rather than "Send" because the dashboard draws both -
+        the choices card's Send answer, and the reply card's Send immediately beside
+        the box the hint has just told them to type in. Until 2026-10-06 this pointed
+        at the nearer, wrong one. Nothing is lost by pressing it, because a live
+        question owns the reply box and the daemon will not deliver it as a reply
+        (Test-DaemonReplyBoxFree), but it looks like it submitted and nothing happens.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Label)
+    "*Type **$Label** in the Reply box, choose the rest above, then press **Send answer**.*"
+}
+
 function Invoke-CopilotAskUserHook {
     <#
         preToolUse for ask_user - dual-input, non-blocking:
@@ -74,7 +91,7 @@ function Invoke-CopilotAskUserHook {
         # box looks like an unrelated "continue the conversation" field.
         $textField = @($fields | Where-Object { Test-DecisionFieldIsText -Field $_ }) | Select-Object -First 1
         if ($null -ne $textField) {
-            $question = "$question`n`n*Type **$($textField.Label)** in the Reply box, choose the rest above, then press Send.*"
+            $question = "$question`n`n$(Get-CopilotMixedFormHint -Label ([string]$textField.Label))"
         }
     }
 

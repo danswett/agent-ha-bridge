@@ -211,6 +211,24 @@ function Get-HomeAssistantHeaders { @{ Authorization = 'Bearer t' } }
 $out = Invoke-CopilotPermissionHook -HookEvent ([pscustomobject]@{ notification_type = 'permission_prompt'; title = ''; message = '' })
 Test-That 'a permission prompt is pushed with a sensible title' { ($script:Sent -join ',') -eq 'Copilot permission needed' -and $null -eq $out }
 
+Write-Host '--- a mixed form says which Send actually commits it ---'
+# The dashboard draws two: the choices card's Send answer, and the reply card's Send
+# right beside the box this hint tells you to type in. It used to say "press Send",
+# which is the wrong one and the nearer one.
+$mixedHint = Get-CopilotMixedFormHint -Label 'Anything else while I am in here?'
+Test-That 'the hint names the free-text field, so the box is not mistaken for a chat box' {
+    $mixedHint -like '*Anything else while I am in here?*'
+} $mixedHint
+Test-That 'it points at Send answer, not the reply box Send beside it' {
+    $mixedHint -like '*Send answer*'
+} $mixedHint
+Test-That 'and never tells you to press plain Send' {
+    $mixedHint -notmatch 'press\s+\*{0,2}Send\*{0,2}[.,]'
+} $mixedHint
+Test-That 'an empty label still produces a usable sentence' {
+    (Get-CopilotMixedFormHint -Label '') -like '*Send answer*'
+}
+
 Write-Host ''
 if ($script:Failures) {
     Write-Host "$($script:Failures) check(s) failed" -ForegroundColor Red
