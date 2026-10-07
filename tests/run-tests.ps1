@@ -23,15 +23,19 @@ param(
     [string[]]$Suite = @(),
     [switch]$List,
     [switch]$AllowHostTests,
-    # 300, not 180. test-dashboard needs about 168 seconds once the publication
-    # fixtures exist: 48 scenarios that each build a synthetic install, three that
-    # launch a real child process to prove behaviour survives a restart. Measured
-    # 19.4s inside the assertions and 148.3s between them, in setup. At 180 the
-    # margin was smaller than the difference between two machines - one host
-    # recorded 172.9s and passed while another was killed at the wall on every
-    # run, so whether main's CI went green depended on which runner it landed on.
-    # The installer group already passes 300 explicitly for the same reason.
-    [ValidateRange(1, 3600)][int]$TimeoutSeconds = 300,
+    # 900, not 300. 300 was chosen when test-dashboard was the slowest suite at about
+    # 168 seconds. Two suites have since outgrown it: on an idle 32-core Windows dev
+    # box test-p4-worktree-safety takes 360.9s and test-registration-isolation 360.7s,
+    # and both were killed at the wall in a full run while passing on GitHub's runners
+    # inside 300. Neither is hung - they are dominated by spawning real child
+    # processes, and a pwsh start on a developer machine with real-time scanning costs
+    # several times what it does on a clean hosted runner.
+    #
+    # So at 300 the wall had stopped catching hangs and started separating machines,
+    # which is the same failure the 180 to 300 bump was meant to end. A larger wall
+    # costs a passing run nothing; it only delays the report of a suite that really
+    # has hung. 900 leaves roughly two and a half times the slowest measured suite.
+    [ValidateRange(1, 3600)][int]$TimeoutSeconds = 900,
     [string]$ResultsDirectory
 )
 
