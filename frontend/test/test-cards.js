@@ -1843,6 +1843,31 @@ async function checkSendAnswerCarriesTypedText() {
   // someone to send again is only honest if there is still something there to send.
   check('the words are put back in the box it told the person to send again from',
     m.reply._els.textarea.value === 'slow one', m.reply._els.textarea.value);
+
+  // Appending while the publish is in flight and the question changing in the same
+  // interval: the trim had already taken the published half out, so a restore that
+  // refused a non-empty box lost it for good while the card asked for it again.
+  m = mixed({ typed: 'slow one', holdPublish: true });
+  press(m.choices);
+  await flush();
+  m.reply._els.textarea.value = 'slow one and more';
+  m.states[DECISION].attributes.decision_id = 'd2';
+  m.release();
+  await flush();
+  check('an answer appended to while the question went comes back whole',
+    m.reply._els.textarea.value === 'slow one and more', m.reply._els.textarea.value);
+
+  // A rewrite had nothing subtracted from it, so there is nothing to put back - and
+  // resurrecting a draft the person had deliberately replaced is not restoring it.
+  m = mixed({ typed: 'slow one', holdPublish: true });
+  press(m.choices);
+  await flush();
+  m.reply._els.textarea.value = 'actually, something else';
+  m.states[DECISION].attributes.decision_id = 'd2';
+  m.release();
+  await flush();
+  check('a rewrite is not grown back into the draft it replaced',
+    m.reply._els.textarea.value === 'actually, something else', m.reply._els.textarea.value);
   // Stopping the press is not enough on its own: Read-DaemonFormAnswer treats any new
   // text payload as a submission for a complete form, so an untagged one would be
   // consumed by the replacement question - answering it with words typed for the one

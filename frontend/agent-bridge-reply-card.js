@@ -138,6 +138,7 @@ class AgentBridgeReplyCard extends HTMLElement {
     this._busy = false;
     this._statusTimer = null;
     this._registeredTopic = '';
+    this._trimmedPublished = '';
   }
 
   setConfig(config) {
@@ -191,30 +192,30 @@ class AgentBridgeReplyCard extends HTMLElement {
   }
 
   /*
-   * Take out of the box what has just been published, leaving anything typed since.
+   * Take out of the box what has just been published, leaving anything typed since,
+   * and remember what was taken so it can be put back.
    *
    * The textarea stays editable while Send is disabled, so a slow publish can finish
    * against a value that has grown. Clearing it all erased words that were never
    * sent; keeping it all left the sent ones to go a second time.
    *
-   * A value that no longer begins with what went is left whole. The published words
-   * cannot be picked out of it any more, and dropping an edit nobody has seen
+   * A value that no longer begins with what went is left whole, and nothing is
+   * remembered: the published words cannot be picked out of it any more, and the
+   * person has deliberately replaced them. Dropping an edit nobody has seen
    * delivered is the failure all of this exists to remove - a duplicate is visible,
    * a loss is not.
    */
   _trimPublished(text) {
+    this._trimmedPublished = '';
     if (!this._els || !this._els.textarea) { return; }
     const now = this._els.textarea.value;
-    if (now === text) { this._els.textarea.value = ''; }
-    else if (text && now.startsWith(text)) { this._els.textarea.value = now.slice(text.length); }
-  }
-
-  /*
-   * What is in the box right now, for a caller that may need to put it back.
-   */
-  formText() {
-    if (!this._built || !this._els || !this._els.textarea) { return ''; }
-    return this._els.textarea.value;
+    if (now === text) {
+      this._els.textarea.value = '';
+      this._trimmedPublished = text;
+    } else if (text && now.startsWith(text)) {
+      this._els.textarea.value = now.slice(text.length);
+      this._trimmedPublished = text;
+    }
   }
 
   /*
@@ -224,12 +225,16 @@ class AgentBridgeReplyCard extends HTMLElement {
    * holding, so without this the words exist neither in the session nor in the box
    * the card has just told the person to send again from.
    *
-   * Only into an empty box: anything typed since is theirs, and newer.
+   * Exactly the inverse of the trim, so an answer that was appended to while the
+   * publish was in flight comes back whole. Testing the box for emptiness instead
+   * lost the published half of precisely that case: the tail had been kept, so the
+   * box was not empty, so the words that went were never restored.
    */
-  restoreFormText(text) {
-    if (!text || !this._built || !this._els || !this._els.textarea) { return; }
-    if (this._els.textarea.value.trim().length > 0) { return; }
-    this._els.textarea.value = text;
+  restoreFormText() {
+    const text = this._trimmedPublished;
+    if (!text || !this._els || !this._els.textarea) { return; }
+    this._els.textarea.value = text + this._els.textarea.value;
+    this._trimmedPublished = '';
     this._syncSendState();
   }
 
@@ -1632,10 +1637,6 @@ class AgentBridgeChoicesCard extends HTMLElement {
       ? REPLY_CARDS.get(String(this._config.reply_topic || ''))
       : null;
     if (reply && reply.hasUnsentFormText()) {
-      // Kept so it can be put back. The daemon discards a payload tagged for a
-      // question that has gone, so telling someone to send again is only honest if
-      // there is still something in the box to send.
-      const words = reply.formText();
       reply.publishFormText(generation).then(
         (published) => {
           // Only on a publish that landed. Submitting after a failed one is exactly
@@ -1649,7 +1650,10 @@ class AgentBridgeChoicesCard extends HTMLElement {
           // and the terminal or another dashboard can answer the old question inside
           // it; the daemon drops a payload tagged for a question that has gone.
           if (this._generationNow() !== generation) {
-            reply.restoreFormText(words);
+            // The daemon discards a payload tagged for a question that has gone, so
+            // telling someone to send again is only honest if the words are back in
+            // the box - all of them, including any that were appended meanwhile.
+            reply.restoreFormText();
             this._failSend(new Error('the question changed - check it and send again'));
             return;
           }
