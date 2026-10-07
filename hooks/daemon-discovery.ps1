@@ -229,7 +229,15 @@ function Read-DaemonAdapterRegistrations {
     }
     $livePids = @{}
     foreach ($process in $inventory.Processes) { $livePids[[int]$process.Id] = $true }
+    # Shared infrastructure is live but is nobody's session, so it is pre-accounted:
+    # Codex's app-server daemon is named codex.exe and never registers, and requiring
+    # a registration for it left Known false on every pass - no snapshot was ever
+    # Complete, retirement and the orphan sweep were held, and Launch was refused.
+    # Read defensively: an adapter from before Shared existed does not report it.
     $accounted = @{}
+    if ($inventory.PSObject.Properties['Shared']) {
+        foreach ($processId in @($inventory.Shared)) { $accounted[[int]$processId] = $true }
+    }
     $records = [Collections.Generic.List[object]]::new()
     $files = @()
     try {

@@ -162,17 +162,13 @@ function Get-CodexOwningProcessId {
 
 function Test-CodexAppServer {
     <#
-        Whether a codex process is the app-server rather than a terminal window. From
-        its path where that is known (Windows: the daemon runs from
-        ~\.codex\packages\app-server-daemon), which costs nothing; otherwise from its
-        command line, fetched only then.
+        Whether a codex process is the app-server rather than a terminal window.
+
+        The rule itself lives in bridge-platform.ps1, because daemon discovery has to
+        apply it too and runs whether or not this adapter is loaded.
     #>
     param([Parameter(Mandatory)][object]$Process)
-    $path = if ($Process.PSObject.Properties['Path']) { [string]$Process.Path } else { '' }
-    if ($path) { return $path -match '[\\/]app-server-daemon[\\/]' }
-    $commandLine = if ($Process.PSObject.Properties['CommandLine'] -and $Process.CommandLine) { [string]$Process.CommandLine }
-        else { Get-BridgeCommandLine -ProcessId ([int]$Process.ProcessId) }
-    $commandLine -match '\sapp-server(\s|$)'
+    Test-BridgeCodexAppServerProcess -Process $Process
 }
 
 function Get-CodexRecordedProcessId {

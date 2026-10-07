@@ -273,6 +273,113 @@ finally {
     . (Join-Path $PSScriptRoot '../../hooks/bridge-platform.ps1')
 }
 
+Write-Host ''
+Write-Host '--- the app-server is not a session ---'
+
+# Codex runs its app-server from ~\.codex\packages\app-server-daemon, and those
+# processes are named codex.exe exactly as a window is. They never register, so
+# discovery counted them as sessions nothing accounted for: Known stayed false, no
+# snapshot was ever Complete, and every launch was refused with "Session discovery is
+# incomplete" while retirement, the orphan sweep and startup cleanup were all held.
+# Captured on a machine stuck there, with the daemon's pids 13096 and 3132 unaccounted
+# and an ended receipt pinned to 13096 that could never be pruned because the daemon
+# outlives every session.
+$appServerPath = 'C:\Users\u\.codex\packages\app-server-daemon\releases\0.161.0-x86_64-pc-windows-msvc\bin\codex.exe'
+$windowPath = 'C:\Users\u\AppData\Local\Programs\OpenAI\Codex\bin\codex.exe'
+Test-That 'the daemon is known by its path' { Test-BridgeCodexAppServer -Path $appServerPath }
+Test-That 'and by its command line where no path is reported' {
+    Test-BridgeCodexAppServer -CommandLine '"codex" app-server daemon pid-update-loop'
+}
+Test-That 'a terminal window is neither' {
+    -not (Test-BridgeCodexAppServer -Path $windowPath) -and
+        -not (Test-BridgeCodexAppServer -CommandLine '"C:\npm\codex-win32-x64\vendor\codex.exe"')
+}
+Test-That 'a path decides on its own, without reading a command line' {
+    Test-BridgeCodexAppServerProcess -Process ([pscustomobject]@{
+        Id = 13096; ProcessName = 'codex'; Path = $appServerPath; CommandLine = 'codex.exe' })
+}
+
+$wasWindows = $script:BridgeIsWindows
+$script:BridgeIsWindows = $true
+$script:FakeRunning = @(
+    [pscustomobject]@{ Id = 13096; ProcessName = 'codex'; Path = $appServerPath }
+    [pscustomobject]@{ Id = 3132; ProcessName = 'codex'; Path = $appServerPath }
+    [pscustomobject]@{ Id = 59256; ProcessName = 'codex'; Path = $windowPath }
+)
+function Get-Process { param([string]$Name, $ErrorAction) $script:FakeRunning }
+try {
+    $observed = Get-BridgeAgentProcesses -Agent 'codex' -AsObservation
+    Test-That 'the daemon is named as shared infrastructure, not a session' {
+        (@($observed.Shared) -join ',') -eq '3132,13096'
+    } (@($observed.Shared) -join ',')
+    # It stays live: a session that could not identify its own window registers this
+    # pid, and dropping it from Processes would read that session as dead.
+    Test-That 'but it stays a live process, so a session that registered it survives' {
+        @($observed.Processes | ForEach-Object { $_.Id }) -contains 13096
+    } (@($observed.Processes | ForEach-Object { $_.Id }) -join ',')
+    Test-That 'and the window is a session as before' {
+        @($observed.Processes | ForEach-Object { $_.Id }) -contains 59256
+    }
+
+    # Claude has no app-server; the rule must not reach it.
+    $script:FakeRunning = @([pscustomobject]@{ Id = 4242; ProcessName = 'claude'; Path = 'C:\claude\claude.exe' })
+    $other = Get-BridgeAgentProcesses -Agent 'claude' -AsObservation
+    Test-That 'another agent reports nothing as shared' {
+        $other.Known -and @($other.Processes).Count -eq 1 -and @($other.Shared).Count -eq 0
+    }
+
+    # Calling a process shared takes positive identification: without it the daemon
+    # would stop expecting a registration for a real session.
+    $script:FakeRunning = @([pscustomobject]@{ Id = 7001; ProcessName = 'codex'; Path = '' })
+    function Get-BridgeCommandLine {
+        param([int]$ProcessId, [switch]$AsObservation)
+        [pscustomobject]@{ State = 'Unknown'; Text = ''; ProcessId = $ProcessId; Code = 'CommandIdentityUnreadable'; NativeExit = $null }
+    }
+    $unreadable = Get-BridgeAgentProcesses -Agent 'codex' -AsObservation
+    Test-That 'a codex process that cannot be identified stays an ordinary session' {
+        $unreadable.Known -and @($unreadable.Processes).Count -eq 1 -and @($unreadable.Shared).Count -eq 0
+    } (@($unreadable.Shared) -join ',')
+
+    function Get-BridgeCommandLine {
+        param([int]$ProcessId, [switch]$AsObservation)
+        [pscustomobject]@{ State = 'Absent'; Text = ''; ProcessId = $ProcessId; Code = 'ProcessNotFound'; NativeExit = $null }
+    }
+    $departed = Get-BridgeAgentProcesses -Agent 'codex' -AsObservation
+    Test-That 'a codex process that exits mid-scan is an answer, not an unreadable one' {
+        $departed.Known -and @($departed.Processes).Count -eq 0
+    }
+    Remove-Item function:Get-BridgeCommandLine
+
+    # The window is found from the command line where no path is known, as on macOS.
+    $script:FakeCommandLines = @{
+        60 = 'codex.exe app-server'
+        80 = 'C:\npm\codex-win32-x64\vendor\codex.exe'
+    }
+    function Get-BridgeCommandLine {
+        param([int]$ProcessId, [switch]$AsObservation)
+        [pscustomobject]@{
+            State = 'Readable'; Text = [string]$script:FakeCommandLines[$ProcessId]
+            ProcessId = $ProcessId; Code = ''; NativeExit = $null
+        }
+    }
+    $script:FakeRunning = @(
+        [pscustomobject]@{ Id = 60; ProcessName = 'codex'; Path = '' }
+        [pscustomobject]@{ Id = 80; ProcessName = 'codex'; Path = '' }
+    )
+    $byCommandLine = Get-BridgeAgentProcesses -Agent 'codex' -AsObservation
+    Test-That 'with no path, the command line is fetched and tells the two apart' {
+        $byCommandLine.Known -and (@($byCommandLine.Shared) -join ',') -eq '60' -and
+            @($byCommandLine.Processes).Count -eq 2
+    } (@($byCommandLine.Shared) -join ',')
+    Remove-Item function:Get-BridgeCommandLine
+}
+finally {
+    Remove-Item function:Get-Process -ErrorAction SilentlyContinue
+    if (Test-Path function:Get-BridgeCommandLine) { Remove-Item function:Get-BridgeCommandLine }
+    $script:BridgeIsWindows = $wasWindows
+    . (Join-Path $PSScriptRoot '../../hooks/bridge-platform.ps1')
+}
+
 Write-Host '--- Codex registration commands are bound to their installation ---'
 . (Join-Path $PSScriptRoot '..\..\hooks\bridge-secrets.ps1')
 $installerRoot = Join-Path $env:TEMP ('codex-install-roots-' + [guid]::NewGuid().ToString('N'))
