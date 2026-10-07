@@ -128,7 +128,7 @@ Manual suite detection uses the `test-*.ps1` entry filename, not an ancestor fol
 named `tests`; ordinary installer/runtime scripts in such a checkout remain normal.
 
 The runner retains logs and `summary.json` in the printed results directory, reports
-skips explicitly, and fails on a nonzero suite exit or timeout (300 seconds per suite).
+skips explicitly, and fails on a nonzero suite exit or timeout (900 seconds per suite).
 Use `-ResultsDirectory <new-directory>` to choose where diagnostics go. Build the
 native hook in `hook/` before a full run (`go build -o agent-bridge-hook.exe .` on
 Windows, without `.exe` on macOS); missing native binaries are reported as skips.

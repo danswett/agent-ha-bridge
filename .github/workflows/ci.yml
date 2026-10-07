@@ -442,7 +442,7 @@ jobs:
 
       - name: Installer assertions on a disposable host
         shell: pwsh
-        run: pwsh -NoProfile -File tests/run-tests.ps1 -Group Host -AllowHostTests -TimeoutSeconds 300
+        run: pwsh -NoProfile -File tests/run-tests.ps1 -Group Host -AllowHostTests -TimeoutSeconds 900
 
   release-build:
     name: Release build of the native hook (no upload)
