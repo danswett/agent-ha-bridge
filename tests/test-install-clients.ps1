@@ -601,12 +601,17 @@ if ([ProbeConsole]::GetConsoleWindow() -ne [IntPtr]::Zero) { throw 'Type compila
         $consoleProcess.StandardInput.Close()
         $consoleOut = $consoleProcess.StandardOutput.ReadToEndAsync()
         $consoleErr = $consoleProcess.StandardError.ReadToEndAsync()
-        $consoleFinished = $consoleProcess.WaitForExit(15000)
+        # 90 seconds, not 15. This child compiles C# three times over - its own
+        # P/Invoke block, the console-window probe's, and Add-BridgeCompiledType's
+        # separate pwsh - and on a cold hosted runner those cost far more than they do
+        # warm. At 15 the child was killed mid-compile, which surfaced as a bare
+        # assertion failure with no output at all rather than as the timeout it was.
+        $consoleFinished = $consoleProcess.WaitForExit(90000)
         if (-not $consoleFinished) { $consoleProcess.Kill($true); $consoleProcess.WaitForExit() }
         $consoleText = $consoleOut.GetAwaiter().GetResult() + $consoleErr.GetAwaiter().GetResult()
         Test-That 'a detached background process preserves output and deadlines without a console' {
             $consoleFinished -and $consoleProcess.ExitCode -eq 0 -and $consoleText -match 'console-free'
-        } $consoleText
+        } "finished=$consoleFinished exit=$(if ($consoleFinished) { $consoleProcess.ExitCode } else { 'killed' }) output=$consoleText"
     }
     finally {
         $consoleProcess.Dispose()
