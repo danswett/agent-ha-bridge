@@ -6,9 +6,10 @@
 
     Part of agent-bridge-daemon.ps1, which dot-sources it into its own scope after
     declaring the shared $script: state; see docs/daemon-split.md.
-    Shared state it changes: DaemonDashboardSignature, DaemonGlobalLastPublish,
-    DaemonGlobalSignature, DaemonLive, DaemonOnlineLastPublish,
-    DaemonPayloadSensorChecked, DaemonPendingRetire, DaemonVerbose.
+    Shared state it changes: DaemonDashboardSignature, DaemonEntityRestore,
+    DaemonGlobalLastPublish, DaemonGlobalSignature, DaemonLive,
+    DaemonOnlineLastPublish, DaemonPayloadSensorChecked, DaemonPendingRetire,
+    DaemonVerbose.
 #>
 
 function Repair-CopilotSessionEntities {
@@ -72,6 +73,30 @@ function Repair-CopilotSessionEntities {
         }
 
         $needsRepair = $false
+        # Whether the card is there at all, before asking what it holds. A live session
+        # whose entities were torn down reads as absent here, and absence is repaired by
+        # republishing the entities rather than by driving state onto ones that are gone.
+        #
+        # On 2026-10-07 session 69e33875 was alive, working and correctly discovered;
+        # its entities were removed from Home Assistant at 10:18:52 and never came
+        # back. The daemon went on evaluating reply ownership for it for hours, so it
+        # plainly still knew the session - it simply had no path that republishes one.
+        # Add-DaemonSession is the only publisher and a known session never reaches it
+        # again, which left this loop - the one function that exists to heal a
+        # session's entities - as the only place that could, and its probe read
+        # "not there" as "could not tell" and skipped it.
+        $presence = Get-DaemonEntityPresence -EntityId "text.${node}_reply" -Headers $Headers
+        if ($presence -eq 'unreadable') { continue }
+        if ($presence -eq 'absent') {
+            # Discarded like every other publish here: this function returns nothing to
+            # the reconcile, and anything a call emits would ride out with it.
+            [void](Restore-DaemonSessionEntities -SessionId $sessionId -Entry $State[$sessionId] -Headers $Headers)
+            continue
+        }
+        # Seen back, so forget what it took to get here: a session torn down a second
+        # time should report and be spaced from scratch, not inherit the first run's
+        # attempt count and go quiet.
+        if ($script:DaemonEntityRestore.ContainsKey($sessionId)) { $script:DaemonEntityRestore.Remove($sessionId) }
         try {
             # Check both optimistic entities: a session whose reply box happens to hold
             # a value can still have an unknown decision selector, so keying off the
@@ -84,6 +109,7 @@ function Repair-CopilotSessionEntities {
             }
         }
         catch {
+            if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
             continue
         }
         if (-not $needsRepair) { continue }
@@ -114,6 +140,117 @@ function Repair-CopilotSessionEntities {
             Write-DaemonLog -Message "entity repair failed for $sessionId : $($_.Exception.Message)"
         }
     }
+}
+
+function Restore-DaemonSessionEntities {
+    <#
+        Republishes the whole entity set for a live session whose entities are gone from
+        Home Assistant, and puts its card back the way a restart would.
+
+        Presence-based and therefore safe: it runs only for a session this machine can
+        see running right now, and only when Home Assistant has determinately answered
+        that the entity is not there. It publishes nothing on a read it could not make
+        sense of, because a republish resets the optimistic decision selector to Idle
+        and would blank a live question - which is why Add-DaemonSession refuses to
+        re-publish over an existing set at all.
+
+        Retirement is the opposite case and is deliberately not touched here: "I cannot
+        prove this session is gone" still holds work, while "I can see this session is
+        here" is evidence enough to publish it.
+
+        Attempts are spaced so that a session whose entities never take - a broker that
+        accepts a publish Home Assistant never acts on - costs one publish a minute
+        rather than one every reconcile, and says so once instead of every pass.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)]$Entry,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $id = $SessionId
+    $entry = $Entry
+    $node = Get-CopilotMqttNodeId -SessionId $id
+    $now = [DateTimeOffset]::Now
+
+    $attempt = 1
+    if ($script:DaemonEntityRestore.ContainsKey($id)) {
+        $record = $script:DaemonEntityRestore[$id]
+        if (($now - $record.At).TotalSeconds -lt $script:DaemonConfig.EntityRestoreSeconds) { return $false }
+        $attempt = [int]$record.Count + 1
+    }
+    $script:DaemonEntityRestore[$id] = @{ At = $now; Count = $attempt }
+
+    $name = [string]$entry.Name
+    $machine = [string]$entry.Machine
+    try {
+        Publish-CopilotMqttSession -SessionId $id -SessionName $name -Machine $machine -Headers $Headers | Out-Null
+        # Discovery needs a moment to register before the ids can be forced, exactly as
+        # the first publish does; without it the entities land under names derived from
+        # the device and every later read of sensor.<node>_* finds nothing.
+        Start-Sleep -Milliseconds 1500
+        [void](Set-CopilotMqttEntityIds -SessionId $id)
+        # The set the first publish does not cover. Each is published unconditionally
+        # rather than probed: the card referencing any one of them renders an "Entity
+        # not found" box, and we already know this session's entities were missing.
+        Clear-CopilotMqttDecisionFields -SessionId $id -SessionName $name -Machine $machine -Headers $Headers | Out-Null
+        Publish-CopilotMqttSubmitButton -SessionId $id -SessionName $name -Machine $machine -Headers $Headers | Out-Null
+        Publish-CopilotMqttReplyPayloadSensor -SessionId $id -SessionName $name -Machine $machine -Headers $Headers | Out-Null
+        [void](Set-CopilotMqttEntityIds -SessionId $id)
+    }
+    catch {
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        Write-DaemonLog -Message "could not rebuild the missing entities for $($id.Substring(0,8)): $($_.Exception.Message)"
+        return $false
+    }
+
+    # The payload sensor is probed once per session per run; that answer was taken
+    # before the entities went away and would stop the probe re-running for this one.
+    if ($script:DaemonPayloadSensorChecked.ContainsKey($id)) { $script:DaemonPayloadSensorChecked.Remove($id) }
+
+    # Put the card back from persisted display state rather than blanking it, for the
+    # same reason a restart does: the summary, reasoning, last response and history the
+    # operator was looking at are all still in the entry.
+    $status = [string]$entry.Status
+    if ($status -notin @('working', 'waiting', 'idle', 'agents', 'error')) { $status = 'idle' }
+    try {
+        $card = Resolve-DaemonPrimedCard -Entry $entry -Status $status -VerboseOn (Test-VerboseStreaming -Headers $Headers)
+        Set-CopilotMqttStatus -SessionId $id -Status $status -Headers $Headers -Attributes @{
+            session = $name
+            machine = $machine
+            updated = $now.ToString('o')
+        } | Out-Null
+        Set-CopilotMqttActivity -SessionId $id -Summary $card.Summary -Detail $card.Detail -Headers $Headers | Out-Null
+
+        # A question that was live when the entities went is still waiting on an answer
+        # the operator can no longer give, so re-arm it from its marker; otherwise prime
+        # the reply box blank so the restored card shows an empty field, not 'unknown'.
+        $marker = Get-CopilotDecisionMarker -SessionId $id
+        if ($null -ne $marker) {
+            Set-CopilotMqttDecision -SessionId $id -SessionName $name -Machine $machine `
+                -Question ([string]$marker.question) -Choices @($marker.choices) `
+                -Fields @($marker.fields) -DecisionId ([string]$marker.decisionId) -Headers $Headers | Out-Null
+        }
+        else {
+            Invoke-HomeAssistantService -Domain 'text' -Service 'set_value' -Headers $Headers `
+                -Data @{ entity_id = "text.${node}_reply"; value = $script:DaemonConfig.ReplyBlankValue } | Out-Null
+        }
+    }
+    catch {
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        Write-DaemonLog -Message "rebuilt the entities for $($id.Substring(0,8)) but could not restore its card: $($_.Exception.Message)"
+        return $true
+    }
+
+    # Said once, then only when it keeps happening: a session that heals on the first
+    # attempt should not be indistinguishable in the log from one stuck in a loop.
+    if ($attempt -eq 1) {
+        Write-DaemonLog -Message "republished the missing entities for $($id.Substring(0,8)) ('$name'), which is live here"
+    }
+    elseif ($attempt % 10 -eq 0) {
+        Write-DaemonLog -Message "still rebuilding the missing entities for $($id.Substring(0,8)) ('$name') after $attempt attempts"
+    }
+    $true
 }
 
 function Clear-CopilotMqttOrphans {

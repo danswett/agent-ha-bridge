@@ -731,6 +731,42 @@ function Get-DaemonEntityState {
     Get-HomeAssistantState -EntityId $EntityId -Headers $Headers
 }
 
+function Get-DaemonEntityPresence {
+    <#
+        Whether one entity is there at all: 'present', 'absent' or 'unreadable'.
+
+        An entity that does not exist is an ordinary state, not a failure, but the read
+        above cannot say so on its own: it throws for a Home Assistant that answered
+        "no such entity" and for one that could not be reached alike. The two call for
+        opposite responses - rebuild the entity, or keep hands off until Home Assistant
+        can be read again - so collapsing them is not safe in either direction. A live
+        session whose card was torn down stayed torn down for hours because absence was
+        swallowed as a read failure; republishing on an outage instead would reset the
+        optimistic selector and blank a question somebody is waiting on.
+
+        Absence is read off the response status, never off the wording of a message,
+        for the reason Get-CopilotDecisionChannelObservation gives at length: the
+        phrasing belongs to Home Assistant, a proxy or a translation, and matching it
+        fails silently in both directions.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$EntityId,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $state = $null
+    try { $state = Get-DaemonEntityState -EntityId $EntityId -Headers $Headers }
+    catch {
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        if ((Get-BridgeHttpStatusCode -ErrorRecord $_) -eq 404) { return 'absent' }
+        return 'unreadable'
+    }
+    # A reader that answers with nothing rather than throwing is saying the same thing
+    # a 404 says; the publish probes in Add-DaemonSession already read it that way.
+    if ($null -eq $state) { return 'absent' }
+    'present'
+}
+
 function Get-DaemonPeerMachines {
     <#
         The other machines running the bridge against this Home Assistant, with

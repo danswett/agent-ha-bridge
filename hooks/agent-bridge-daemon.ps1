@@ -129,6 +129,11 @@ $script:DaemonConfig = @{
     # A single space renders as a genuinely blank field instead, so the reply box looks
     # ready to type in. Everything that reads the box treats whitespace as empty.
     ReplyBlankValue = ' '
+    # How long to wait before trying again to rebuild a live session's entities after
+    # Home Assistant answered that they are not there. A publish Home Assistant never
+    # acts on would otherwise be repeated every reconcile for as long as the session
+    # runs; a minute heals a torn-down card promptly without becoming a loop.
+    EntityRestoreSeconds = 60
     # The resumable-session list comes from an Agency call that reads every session
     # on the machine, so it is cached for this long instead of being repeated on
     # every reconcile.
@@ -215,6 +220,11 @@ try { $script:DaemonDefaultAgent = ([System.IO.File]::ReadAllText($script:Daemon
 # Sessions whose reply-payload sensor has been checked this run, so the probe costs
 # one Home Assistant read per session rather than one per reconcile.
 $script:DaemonPayloadSensorChecked = @{}
+
+# When each live session's missing entities were last rebuilt, and how many times, so
+# a republish Home Assistant never acts on is spaced out and reported once rather than
+# repeated every reconcile. Cleared for a session as soon as its entity is seen back.
+$script:DaemonEntityRestore = @{}
 
 # Serialised state of the last successful state-file write, so an idle daemon skips
 # rewriting identical JSON every reconcile. Initialised for StrictMode.
