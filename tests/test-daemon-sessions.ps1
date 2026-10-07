@@ -722,6 +722,7 @@ $script:RepairPayload = @()
 $script:RepairStatus = @{}
 $script:RepairActivity = @{}
 $script:RepairArmed = @()
+$script:RepairArmedDetail = @()
 $script:RepairBlanked = @()
 $script:RepairMarker = $null
 $script:RepairPublishFails = $false
@@ -752,7 +753,10 @@ function Publish-CopilotMqttReplyPayloadSensor { param($SessionId, $SessionName,
 function Set-CopilotMqttStatus { param($SessionId, $Status, $Headers, $Attributes) $script:RepairStatus[$SessionId] = @{ Status = $Status; Attributes = $Attributes }; 'status-response' }
 function Set-CopilotMqttActivity { param($SessionId, $Summary, $Detail, $Headers) $script:RepairActivity[$SessionId] = @{ Summary = $Summary; Detail = $Detail } }
 function Invoke-HomeAssistantService { param($Domain, $Service, $Headers, $Data) $script:RepairBlanked += $Data.entity_id; @('service', 'response') }
-function Set-CopilotMqttDecision { param($SessionId, $SessionName, $Machine, $Question, $Choices, $Fields, $DecisionId, $Headers) $script:RepairArmed += $Question }
+function Set-CopilotMqttDecision { param($SessionId, $SessionName, $Machine, $Question, $Choices, $Fields, $DecisionId, $Headers, [switch]$PublishWithoutBaseline, [switch]$AnswerOnTap)
+    $script:RepairArmed += $Question
+    $script:RepairArmedDetail += [pscustomobject]@{ Question = $Question; Choices = @($Choices); DecisionId = $DecisionId
+        WithoutBaseline = [bool]$PublishWithoutBaseline; OnTap = [bool]$AnswerOnTap } }
 function Get-CopilotDecisionMarker { param($SessionId, [switch]$RequireReadable) $script:RepairMarker }
 function Test-VerboseStreaming { param($Headers) $false }
 function Start-Sleep { param($Milliseconds, $Seconds) }
@@ -768,7 +772,7 @@ function New-TornLive { @{ $script:TornId = [pscustomobject]@{ SessionId = $scri
 function Reset-TornCapture {
     $script:RepairLog = @(); $script:RepairPublished = @(); $script:RepairFields = @()
     $script:RepairSubmit = @(); $script:RepairPayload = @(); $script:RepairStatus = @{}
-    $script:RepairActivity = @{}; $script:RepairArmed = @(); $script:RepairBlanked = @()
+    $script:RepairActivity = @{}; $script:RepairArmed = @(); $script:RepairArmedDetail = @(); $script:RepairBlanked = @()
     $script:DaemonEntityRestore = @{}; $script:DaemonPayloadSensorChecked = @{}
 }
 
@@ -846,6 +850,50 @@ $script:RepairEntityStatus = 404
 Repair-CopilotSessionEntities -Headers $headers -State (New-TornState) -Live (New-TornLive)
 Test-That 'with no question waiting the reply box is primed blank instead' {
     $script:RepairBlanked -contains "text.$($script:TornNode)_reply" -and $script:RepairArmed.Count -eq 0
+}
+
+# A Codex session blocked on PermissionRequest records its approval through its
+# agent's ApprovalMarker, not the Copilot decision marker. Re-arming only the latter
+# brought the card back idle, and Invoke-PendingCodexApprovals acts only on 'Approve'
+# or 'Deny' - so the command stayed blocked, unanswerable from the dashboard, with
+# nothing left to re-arm it: the Codex hook publishes an approval once and never again.
+$script:CodexApproval = $null
+$script:DaemonAgentCache = @{}
+$script:DaemonAgents['codex'].ApprovalMarker = {
+    param($SessionId, [bool]$RequireReadable = $false)
+    $script:CodexApproval
+}
+function New-CodexTornState {
+    @{ $script:TornId = [pscustomobject]@{
+        Name = 'Codex: fixture'; Machine = 'DSWETT-HOME'
+        Status = 'working'; Kind = 'codex'; Offset = 0; LastSummary = 'Running a command' } }
+}
+function New-CodexTornLive { @{ $script:TornId = [pscustomobject]@{ SessionId = $script:TornId; Kind = 'codex'; ProcessId = 4242 } } }
+
+Reset-TornCapture
+$script:RepairEntityStatus = 404
+$script:CodexApproval = [pscustomobject]@{ SessionId = $script:TornId; DecisionId = 'node-1700000000000'
+    Question = 'Run git push --force?'; Created = '2026-10-07T10:00:00-07:00' }
+Repair-CopilotSessionEntities -Headers $headers -State (New-CodexTornState) -Live (New-CodexTornLive)
+Test-That 'a Codex approval that was waiting is re-armed too, not just a Copilot question' {
+    $script:RepairArmed -contains 'Run git push --force?'
+}
+Test-That 'and it carries Approve and Deny, which is the only thing the daemon acts on' {
+    $script:RepairArmedDetail.Count -eq 1 -and
+        (@($script:RepairArmedDetail[0].Choices) -join ',') -eq 'Approve,Deny' -and
+        $script:RepairArmedDetail[0].DecisionId -eq 'node-1700000000000'
+}
+Test-That 'published on the contract its own hook uses, since nothing will retry it' {
+    $script:RepairArmedDetail[0].WithoutBaseline -and $script:RepairArmedDetail[0].OnTap
+}
+Test-That 'so the reply box is not blanked over a live approval' { $script:RepairBlanked.Count -eq 0 }
+
+Reset-TornCapture
+$script:RepairEntityStatus = 404
+$script:CodexApproval = $null
+Repair-CopilotSessionEntities -Headers $headers -State (New-CodexTornState) -Live (New-CodexTornLive)
+Test-That 'a Codex session with nothing waiting still just gets a blank box' {
+    $script:RepairArmed.Count -eq 0 -and $script:RepairBlanked -contains "text.$($script:TornNode)_reply"
 }
 
 Reset-TornCapture

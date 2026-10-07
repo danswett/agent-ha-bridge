@@ -117,17 +117,12 @@ function Repair-CopilotSessionEntities {
         $entry = $State[$sessionId]
         $name = [string]$entry.Name
         $machine = [string]$entry.Machine
-        $marker = Get-CopilotDecisionMarker -SessionId $sessionId
 
         try {
             Invoke-HomeAssistantService -Domain 'text' -Service 'set_value' -Headers $Headers `
                 -Data @{ entity_id = "text.${node}_reply"; value = $script:DaemonConfig.ReplyBlankValue }
 
-            if ($null -ne $marker) {
-                # A question was live when Home Assistant went away - put it back.
-                Set-CopilotMqttDecision -SessionId $sessionId -SessionName $name -Machine $machine `
-                    -Question ([string]$marker.question) -Choices @($marker.choices) `
-                    -Fields @($marker.fields) -DecisionId ([string]$marker.decisionId) -Headers $Headers | Out-Null
+            if (Restore-DaemonSessionQuestion -SessionId $sessionId -Entry $entry -Headers $Headers) {
                 Write-DaemonLog -Message "re-armed live decision for $($sessionId.Substring(0,8)) after Home Assistant restart"
             }
             else {
@@ -140,6 +135,54 @@ function Repair-CopilotSessionEntities {
             Write-DaemonLog -Message "entity repair failed for $sessionId : $($_.Exception.Message)"
         }
     }
+}
+
+function Restore-DaemonSessionQuestion {
+    <#
+        Puts back whatever question a session was waiting on, and says whether there
+        was one.
+
+        Two kinds of question can be live, and they are recorded in different places.
+        Copilot's ask_user writes a decision marker; Codex's PermissionRequest hook
+        writes an approval marker through its agent's ApprovalMarker slot. Re-arming
+        only the first is what this got wrong: a Codex session blocked on an approval
+        came back showing an idle selector, and Invoke-PendingCodexApprovals acts only
+        on 'Approve' or 'Deny', so the command stayed blocked with no way to answer it
+        from the dashboard and nothing left to re-arm it - the Codex hook publishes an
+        approval once and never again.
+
+        An approval is republished on the contract its hook uses, not the ordinary
+        one: -PublishWithoutBaseline, because nothing will retry a question that is
+        answered by its own tap, and -AnswerOnTap, so the card does not draw a Send
+        beside it that the daemon never reads.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)]$Entry,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $name = [string]$Entry.Name
+    $machine = [string]$Entry.Machine
+
+    $marker = Get-CopilotDecisionMarker -SessionId $SessionId
+    if ($null -ne $marker) {
+        Set-CopilotMqttDecision -SessionId $SessionId -SessionName $name -Machine $machine `
+            -Question ([string]$marker.question) -Choices @($marker.choices) `
+            -Fields @($marker.fields) -DecisionId ([string]$marker.decisionId) -Headers $Headers | Out-Null
+        return $true
+    }
+
+    $readApproval = (Get-DaemonAgent -Kind (Get-DaemonEntryKind -Entry $Entry)).ApprovalMarker
+    if (-not $readApproval) { return $false }
+    $approval = & $readApproval $SessionId $false
+    if ($null -eq $approval) { return $false }
+
+    Set-CopilotMqttDecision -SessionId $SessionId -SessionName $name -Machine $machine `
+        -Question ([string]$approval.Question) -Choices @('Approve', 'Deny') `
+        -Fields @() -DecisionId ([string]$approval.DecisionId) -Headers $Headers `
+        -PublishWithoutBaseline -AnswerOnTap | Out-Null
+    $true
 }
 
 function Restore-DaemonSessionEntities {
@@ -223,15 +266,10 @@ function Restore-DaemonSessionEntities {
         Set-CopilotMqttActivity -SessionId $id -Summary $card.Summary -Detail $card.Detail -Headers $Headers | Out-Null
 
         # A question that was live when the entities went is still waiting on an answer
-        # the operator can no longer give, so re-arm it from its marker; otherwise prime
-        # the reply box blank so the restored card shows an empty field, not 'unknown'.
-        $marker = Get-CopilotDecisionMarker -SessionId $id
-        if ($null -ne $marker) {
-            Set-CopilotMqttDecision -SessionId $id -SessionName $name -Machine $machine `
-                -Question ([string]$marker.question) -Choices @($marker.choices) `
-                -Fields @($marker.fields) -DecisionId ([string]$marker.decisionId) -Headers $Headers | Out-Null
-        }
-        else {
+        # the operator can no longer give, so re-arm it - whichever kind it is - and
+        # otherwise prime the reply box blank so the restored card shows an empty
+        # field, not 'unknown'.
+        if (-not (Restore-DaemonSessionQuestion -SessionId $id -Entry $entry -Headers $Headers)) {
             Invoke-HomeAssistantService -Domain 'text' -Service 'set_value' -Headers $Headers `
                 -Data @{ entity_id = "text.${node}_reply"; value = $script:DaemonConfig.ReplyBlankValue } | Out-Null
         }
