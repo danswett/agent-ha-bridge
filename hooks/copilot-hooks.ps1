@@ -10,6 +10,48 @@
     bridge-adapter.ps1, the first decision-mqtt.ps1 and decision-ha-websocket.ps1.
 #>
 
+function Get-CopilotMixedFormHint {
+    <#
+        What to tell someone answering a form that mixes dropdowns with a free-text
+        field. On a current card the dashboard draws two send controls, and only one
+        of them carries the typed words:
+
+          Send (reply card)   publishes the textarea, and that publish submits a
+                              complete form on its own - Read-DaemonFormAnswer's
+                              $cardSubmits. One press, text included.
+          Send answer         presses the submit entity and nothing else. The
+                              textarea is never published, so Read-DaemonFormAnswer
+                              finds no payload, falls back to text.<node>_reply,
+                              which the card does not write, and submits the form
+                              with that field empty - an empty free-text field being
+                              a valid answer. The typed words are gone.
+
+        So this points at Send for typed words and at Send answer for a blank field.
+        An unconditional "not Send answer" was wrong in the other direction: the reply
+        card disables its own Send when the textarea and attachments are all empty
+        (_syncSendState), so for the usual optional "anything else?" left blank, Send
+        answer is the only enabled control - and a correct one, since an empty
+        free-text field is a valid answer.
+
+        On cards before 1.22.0 there is no Send answer: the generator draws one
+        icon-only button beside the "Reply / continue" row, the text lives in
+        text.<node>_reply, and that single control is the Send described here.
+
+        Reversed once, on 2026-10-07, on the reasoning that "Send answer" must be the
+        committing control because it is the one labelled for it. It is not, and the
+        review that caught it was right: naming the wrong button here does not merely
+        misdirect, it loses what was typed.
+
+        An instruction is mitigation, not a guard. The fix is for Send answer to
+        publish the textarea before pressing submit, which is a card change - new
+        CARD_VERSION, gated in the generator, both shapes tested - and is tracked
+        on #93.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Label)
+    "*Type **$Label** in the Reply box, choose the rest above, then press **Send** " +
+        "beside the box - only it carries what you typed. Nothing to add? Press **Send answer**.*"
+}
+
 function Invoke-CopilotAskUserHook {
     <#
         preToolUse for ask_user - dual-input, non-blocking:
@@ -74,7 +116,7 @@ function Invoke-CopilotAskUserHook {
         # box looks like an unrelated "continue the conversation" field.
         $textField = @($fields | Where-Object { Test-DecisionFieldIsText -Field $_ }) | Select-Object -First 1
         if ($null -ne $textField) {
-            $question = "$question`n`n*Type **$($textField.Label)** in the Reply box, choose the rest above, then press Send.*"
+            $question = "$question`n`n$(Get-CopilotMixedFormHint -Label ([string]$textField.Label))"
         }
     }
 
