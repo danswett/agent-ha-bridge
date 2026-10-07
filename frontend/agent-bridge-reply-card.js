@@ -23,7 +23,7 @@
  * uploaded image these sit in the sensor's attributes.
  */
 
-const CARD_VERSION = '1.25.0';
+const CARD_VERSION = '1.26.0';
 
 /*
  * How large a non-image attachment may be.
@@ -2526,6 +2526,12 @@ class AgentBridgeUsageCard extends HTMLElement {
     return Array.from(best.values()).sort((x, y) => (y.percent || 0) - (x.percent || 0));
   }
 
+  // An hour old is not a reading, it is a memory - and Codex's only source is its
+  // own last transcript, so this is routine rather than exceptional for it. One
+  // definition, used both for greying the age and for deciding whether a failed
+  // read is still worth reporting, so the two can never disagree on screen.
+  static _isStale(at) { return Date.now() - at > 3600000 }
+
   static _severity(percent) {
     if (!Number.isFinite(percent)) { return '' }
     if (percent >= 90) { return 'crit' }
@@ -2596,9 +2602,7 @@ class AgentBridgeUsageCard extends HTMLElement {
     age.className = 'gage';
     const ago = AgentBridgeUsageCard._ago(entry.at);
     age.textContent = ago;
-    // An hour old is not a reading, it is a memory - and Codex's only source is its
-    // own last transcript, so this is routine rather than exceptional for it.
-    age.classList.toggle('stale', entry.at > 0 && Date.now() - entry.at > 3600000);
+    age.classList.toggle('stale', entry.at > 0 && AgentBridgeUsageCard._isStale(entry.at));
     head.appendChild(name);
     head.appendChild(account);
     head.appendChild(age);
@@ -2608,7 +2612,20 @@ class AgentBridgeUsageCard extends HTMLElement {
       if (!metered || !Number.isFinite(Number(metered.percent))) { continue }
       group.appendChild(this._renderWindow(metered));
     }
-    if (entry.error) {
+    // A failed read beside a reading taken minutes ago is noise, not news: the bars
+    // above are still true, and the age already says how true. Reporting it anyway
+    // put a permanent red line under a correct figure on a machine whose path to one
+    // vendor dropped most handshakes, which trains the eye to ignore the colour.
+    //
+    // The test is what survived, not how recent the record is. A read that fails with
+    // nothing to fall back on still returns a record, and New-BridgeUsageRecord stamps
+    // it with the time of the *attempt* - so an error-only record is always "fresh",
+    // and keying off the age alone hid the one diagnostic there was for an hour, at
+    // exactly the moment there were no bars to justify hiding it.
+    const hasReading = Number.isFinite(entry.percent) ||
+      (Array.isArray(entry.windows) && entry.windows.length > 0);
+    const fresh = entry.at > 0 && !AgentBridgeUsageCard._isStale(entry.at);
+    if (entry.error && !(hasReading && fresh)) {
       const error = document.createElement('div');
       error.className = 'err';
       error.textContent = entry.error;

@@ -905,6 +905,25 @@ The card also runs a half-minute timer of its own, purely so the relative text �
 sit unchanged for days, so without it that row would never redraw at all. The timer is
 stopped outright while the browser tab is hidden rather than left firing into nothing.
 
+### When a read fails
+
+Each poll retries a few times before giving up, and a failure never overwrites a good
+figure: the retained sensor keeps its last reading and visibly ages instead.
+
+A failed read is therefore only *reported* on the card once the reading it was meant
+to replace is more than an hour old. That rule exists because the opposite was worse.
+On a machine whose path to `api.github.com` dropped most of its TLS handshakes, a
+single-shot read failed more often than it succeeded, and the card carried a permanent
+red line underneath a figure that was both current and correct — which teaches you to
+ignore the colour. The age beside each client is the honest signal while a reading is
+fresh; the error is what is left when nothing recent survived.
+
+The reason shown is the whole exception chain rather than its head, because .NET's
+outer message for a failed HTTPS call is *"The SSL connection could not be established,
+see inner exception"* — which names no cause and points at something a card cannot
+show. The cause (*"An existing connection was forcibly closed by the remote host"*) is
+always a level or two further down.
+
 ---
 
 ## Several machines, one Home Assistant

@@ -25,6 +25,13 @@ $script:BridgeUsageConfig = @{
     # asking three vendors for it from every machine that runs a bridge.
     IntervalSeconds = 120
     RequestTimeout  = 15
+    # One attempt is not a reading, it is a coin toss on any path that is less than
+    # perfect. Measured on DSWETT-HOME on 2026-10-07: api.github.com completed 6 of 14
+    # handshakes while two other hosts managed 14 of 14 from the same machine in the
+    # same seconds, so a single-shot read reported a failure most of the time while a
+    # correct figure was sitting one retry away.
+    RequestAttempts = 3
+    RetryDelayMs    = 400
     UserAgent       = 'agent-ha-bridge'
     # Enough to refuse a file that is not the small state document it should be,
     # without a judgement about how large those documents are allowed to grow.
@@ -167,6 +174,84 @@ function New-BridgeUsageRecord {
         error       = $Problem
         measured_at = if ($MeasuredAt) { $MeasuredAt } else { [DateTimeOffset]::UtcNow.ToString('o') }
     }
+}
+
+function Get-BridgeUsageFailureText {
+    <#
+        The whole exception chain, not just its head.
+
+        .NET's outer message for a failed HTTPS request is "The SSL connection could
+        not be established, see inner exception." - which is worse than useless on a
+        card, because it names no cause and points at something the card cannot show.
+        The cause ("An existing connection was forcibly closed by the remote host")
+        is always a level or two down, and that is the part worth reading.
+    #>
+    param([Parameter(Mandatory)][System.Management.Automation.ErrorRecord]$ErrorRecord)
+
+    $parts = [System.Collections.Generic.List[string]]::new()
+    $exception = $ErrorRecord.Exception
+    while ($exception) {
+        $message = ([string]$exception.Message).Trim()
+        # The pointer is dropped rather than printed: the thing it points at is the
+        # next item in this list.
+        $message = [regex]::Replace($message, ',?\s*see inner exception\.?$', '', 'IgnoreCase')
+        $message = $message.Trim()
+        if ($message -and -not $parts.Contains($message)) { [void]$parts.Add($message) }
+        $exception = $exception.InnerException
+    }
+    if ($parts.Count -eq 0) { return 'The reason was not reported.' }
+    ($parts -join ' - ')
+}
+
+function Invoke-BridgeUsageAttempt {
+    <#
+        One vendor read, retried past a transient failure.
+
+        The retry is deliberately short and small. It exists to ride out a reset
+        handshake between two polls, not to hammer a vendor that is genuinely down -
+        the next poll is only two minutes away, and a failed read already falls back
+        to the retained sensor rather than to a wrong figure.
+    #>
+    param(
+        [Parameter(Mandatory)][scriptblock]$Operation,
+        [int]$Attempts = $script:BridgeUsageConfig.RequestAttempts
+    )
+
+    if ($Attempts -lt 1) { $Attempts = 1 }
+    $last = $null
+    for ($attempt = 1; $attempt -le $Attempts; $attempt++) {
+        try { return (& $Operation) }
+        catch {
+            # The offline guard is the test boundary, not a blip. Retrying it would
+            # turn one violation into three and then report it as an ordinary
+            # connection failure, which is the exact disguise it exists to prevent.
+            if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+
+            # A refusal is an answer. 401 will still be 401 in 400 ms, so retrying it
+            # only spends three times as long reaching the same place - and for Claude
+            # it would delay the expiry path that keeps the retained reading. 408 and
+            # 429 are the exceptions, being explicitly about timing.
+            #
+            # Both shapes are read: Invoke-RestMethod raises an exception carrying the
+            # response, but the status is only in the message once that has been
+            # re-thrown as a plain error, which is what the callers above do.
+            $status = 0
+            if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response -and
+                $_.Exception.Response.PSObject.Properties['StatusCode']) {
+                $status = [int]$_.Exception.Response.StatusCode
+            }
+            if ($status -eq 0 -and "$($_.Exception.Message)" -match 'status code does not indicate success:\s*(\d{3})') {
+                $status = [int]$Matches[1]
+            }
+            if ($status -ge 400 -and $status -lt 500 -and $status -notin @(408, 429)) { throw }
+
+            $last = $_
+            if ($attempt -lt $Attempts) {
+                Start-Sleep -Milliseconds ($script:BridgeUsageConfig.RetryDelayMs * $attempt)
+            }
+        }
+    }
+    throw $last
 }
 
 function Invoke-BridgeUsageRequest {
@@ -431,13 +516,14 @@ function Get-BridgeCopilotAllowance {
     }
     if ($token) {
         try {
-            $record = ConvertFrom-BridgeCopilotQuota -Response (& $Fetch $token) -Source 'api'
+            $response = Invoke-BridgeUsageAttempt -Operation { & $Fetch $token }
+            $record = ConvertFrom-BridgeCopilotQuota -Response $response -Source 'api'
             if ($record) { return $record }
             $failure = 'GitHub returned no premium-interaction quota for this account.'
         }
         catch {
             if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
-            $failure = "The Copilot quota could not be read: $($_.Exception.Message)"
+            $failure = "The Copilot quota could not be read: $(Get-BridgeUsageFailureText -ErrorRecord $_)"
         }
     }
 
@@ -520,7 +606,7 @@ function Get-BridgeClaudeAllowance {
     }
 
     try {
-        $response = & $Fetch ([string]$oauth.accessToken)
+        $response = Invoke-BridgeUsageAttempt -Operation { & $Fetch ([string]$oauth.accessToken) }
     }
     catch {
         if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
@@ -528,7 +614,7 @@ function Get-BridgeClaudeAllowance {
         # report: the retained reading carries on and ages.
         if ("$($_.Exception.Message)" -match '\b401\b|Unauthorized') { return $null }
         return New-BridgeUsageRecord -Client 'claude' -Plan $plan -Source 'none' `
-            -Problem "The Claude usage could not be read: $($_.Exception.Message)"
+            -Problem "The Claude usage could not be read: $(Get-BridgeUsageFailureText -ErrorRecord $_)"
     }
 
     # `limits` is the list Claude Code itself draws, and every entry in it applies to
