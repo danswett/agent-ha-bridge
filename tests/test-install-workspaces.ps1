@@ -55,6 +55,54 @@ $script:BareHome = Join-Path $script:Root 'bare'
 New-Item -ItemType Directory -Path $script:BareHome -Force | Out-Null
 $script:Missing = Join-Path $script:Root 'gone'
 
+function Invoke-CardCheck {
+    <#
+        Runs the daemon's real Get-BridgeWorkspaceChoices and
+        Get-BridgeDefaultWorkspaceLabel over a config the installer would write, in a
+        child process so the hook stack cannot be influenced by the installer functions
+        dot-sourced here.
+
+        This is what stops the two sides drifting. The installer decides whether an
+        entry will be offered and what label it will carry; the card decides the same
+        things independently, and a disagreement is invisible until a dashboard is
+        empty or the default names a folder nobody is shown.
+    #>
+    param([Parameter(Mandatory)]$Plan)
+
+    $configDir = Join-Path $script:Root "cfg-$([guid]::NewGuid().ToString('N'))"
+    New-Item -ItemType Directory -Path $configDir -Force | Out-Null
+    $configPath = Join-Path $configDir 'config.json'
+    @{ newSession = @{
+            workspaces         = @($Plan.Workspaces)
+            defaultWorkspace   = $Plan.Default
+            discoverWorkspaces = $false
+    } } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $configPath -Encoding utf8
+
+    $common = (Resolve-Path (Join-Path $PSScriptRoot '..\hooks\decision-bridge-common.ps1')).Path
+    $launch = (Resolve-Path (Join-Path $PSScriptRoot '..\hooks\session-launch.ps1')).Path
+    $scriptPath = Join-Path $configDir 'check.ps1'
+    @"
+Set-StrictMode -Version Latest
+`$ErrorActionPreference = 'Stop'
+. '$($common -replace "'", "''")'
+. '$($launch -replace "'", "''")'
+# The real reader, pointed at the config the installer would have written. Replacing
+# the loaded config rather than Get-BridgeSetting keeps the function under test real.
+`$script:BridgeUserConfig = Get-Content -LiteralPath '$($configPath -replace "'", "''")' -Raw |
+    ConvertFrom-Json
+`$choices = @(Get-BridgeWorkspaceChoices)
+@{
+    Labels  = @(`$choices | ForEach-Object { `$_.Label })
+    Paths   = @(`$choices | ForEach-Object { `$_.Path })
+    Default = [string](Get-BridgeDefaultWorkspaceLabel)
+} | ConvertTo-Json -Depth 5 -Compress
+"@ | Set-Content -LiteralPath $scriptPath -Encoding utf8
+
+    $output = & (Get-Process -Id $PID).Path -NoProfile -NonInteractive -File $scriptPath 2>&1
+    if ($LASTEXITCODE -ne 0) { throw "card check failed: $($output -join "`n")" }
+    ($output | Where-Object { "$_".TrimStart().StartsWith('{') } | Select-Object -Last 1) | ConvertFrom-Json
+}
+
 try {
     Write-Host '--- reading the configured list ---'
     Test-That 'expands ~ against the install home rather than the real one' {
@@ -158,6 +206,29 @@ try {
             -Requested @($script:Bridge) -HomePath $script:FakeHome
         @($plan.Workspaces).Count -eq 1 -and $plan.Workspaces[0].path -eq ([System.IO.Path]::GetFullPath($script:Bridge))
     }
+    # The installed command runs install.ps1 through `pwsh -File`, which hands every
+    # argument over as one literal string - so several folders arrive comma-joined in a
+    # single element, exactly as -Clients does. A space after the comma is worse than
+    # useless: the second path binds positionally to -HomeAssistantUrl instead.
+    Test-That 'splits several folders out of one comma-joined argument' {
+        $plan = Resolve-BridgeWorkspaceConfig -Configured @() -HomePath $script:FakeHome `
+            -Requested @("$script:Repos,$script:Bridge")
+        @($plan.Workspaces).Count -eq 2
+    }
+    Test-That 'tolerates spaces around those commas' {
+        $plan = Resolve-BridgeWorkspaceConfig -Configured @() -HomePath $script:FakeHome `
+            -Requested @("$script:Repos , $script:Bridge")
+        @($plan.Workspaces).Count -eq 2
+    }
+    Test-That 'still refuses a missing folder inside a comma-joined argument' {
+        $threw = $false
+        try {
+            Resolve-BridgeWorkspaceConfig -Configured @() -HomePath $script:FakeHome `
+                -Requested @("$script:Repos,$script:Missing")
+        }
+        catch { $threw = $_.Exception.Message -match 'does not exist' }
+        $threw
+    }
     Test-That 'refuses a folder that is not on this machine' {
         $threw = $false
         try {
@@ -174,6 +245,71 @@ try {
         }
         catch { $threw = $true }
         $threw
+    }
+
+    Write-Host '--- an entry the card rejects for a reason other than absence ---'
+    # "isolate": "true" is the ordinary JSON slip, and Get-BridgeWorkspaceChoices drops
+    # the whole entry over it. An installer that counted such an entry as usable would
+    # see a working list where the card sees none: no fallback approved, a cheerful
+    # success line, and a dashboard still saying "No workspaces configured" - with the
+    # new message telling you to run a repair that changes nothing.
+    $script:BadIsolate = @([pscustomobject]@{ label = 'Repos'; path = $script:Repos; isolate = 'true' })
+    Test-That 'does not count a non-Boolean isolate entry as something to launch in' {
+        $plan = Resolve-BridgeWorkspaceConfig -Configured $script:BadIsolate -Default 'Repos' `
+            -Fallbacks (Get-BridgeWorkspaceFallbacks -HomePath $script:BareHome) -HomePath $script:BareHome
+        $plan.Changed -and $plan.Added.Count -eq 1 -and $plan.Rejected -contains ([System.IO.Path]::GetFullPath($script:Repos))
+    }
+    Test-That 'keeps the operator''s broken entry rather than rewriting it' {
+        $plan = Resolve-BridgeWorkspaceConfig -Configured $script:BadIsolate -Default 'Repos' `
+            -Fallbacks (Get-BridgeWorkspaceFallbacks -HomePath $script:BareHome) -HomePath $script:BareHome
+        @($plan.Workspaces | Where-Object { $_.PSObject.Properties['isolate'] }).Count -eq 1
+    }
+    Test-That 'a valid Boolean isolate is still offered' {
+        $plan = Resolve-BridgeWorkspaceConfig -HomePath $script:FakeHome -Default 'Repos' `
+            -Configured @([pscustomobject]@{ label = 'Repos'; path = $script:Repos; isolate = $true }) `
+            -Fallbacks (Get-BridgeWorkspaceFallbacks -HomePath $script:FakeHome)
+        $plan.Added.Count -eq 0 -and $plan.Rejected.Count -eq 0 -and -not $plan.Changed
+    }
+    Test-That 'the card really does reject it, which is why the installer must' {
+        # Pins the parity rather than assuming it: if session-launch ever stopped
+        # dropping these, the installer would be approving a fallback for nothing.
+        $check = Invoke-CardCheck -Plan ([pscustomobject]@{
+            Workspaces = $script:BadIsolate; Default = 'Repos'
+        })
+        @($check.Labels).Count -eq 0
+    }
+    Test-That 'and the repaired config gives that machine a card again' {
+        $plan = Resolve-BridgeWorkspaceConfig -Configured $script:BadIsolate -Default 'Repos' `
+            -Fallbacks (Get-BridgeWorkspaceFallbacks -HomePath $script:BareHome) -HomePath $script:BareHome
+        $check = Invoke-CardCheck -Plan $plan
+        @($check.Labels).Count -ge 1 -and @($check.Labels) -contains $check.Default
+    }
+
+    Write-Host '--- two folders sharing a label ---'
+    # The card suffixes the second with its path, because a Home Assistant select
+    # cannot show two identical options. defaultWorkspace is matched against those
+    # labels, so reading a suffixed default as "no longer on the list" would silently
+    # move the one-press Launch to the other directory.
+    $script:DupA = Join-Path $script:Root 'dup\a\repos'
+    $script:DupB = Join-Path $script:Root 'dup\b\repos'
+    New-Item -ItemType Directory -Path $script:DupA, $script:DupB -Force | Out-Null
+    $script:DupConfig = @($script:DupA, $script:DupB)
+    $script:DupSuffixed = "repos ($([System.IO.Path]::GetFullPath($script:DupB)))"
+    Test-That 'leaves a default naming the suffixed duplicate alone' {
+        $plan = Resolve-BridgeWorkspaceConfig -Configured $script:DupConfig -Default $script:DupSuffixed `
+            -HomePath $script:FakeHome -Fallbacks (Get-BridgeWorkspaceFallbacks -HomePath $script:FakeHome)
+        $plan.Default -eq $script:DupSuffixed -and -not $plan.Changed
+    }
+    Test-That 'the card offers exactly that suffixed label' {
+        $check = Invoke-CardCheck -Plan ([pscustomobject]@{
+            Workspaces = $script:DupConfig; Default = $script:DupSuffixed
+        })
+        @($check.Labels) -contains $script:DupSuffixed -and $check.Default -eq $script:DupSuffixed
+    }
+    Test-That 'a default naming no offered label is still repaired' {
+        $plan = Resolve-BridgeWorkspaceConfig -Configured $script:DupConfig -Default 'nothing-like-this' `
+            -HomePath $script:FakeHome -Fallbacks (Get-BridgeWorkspaceFallbacks -HomePath $script:FakeHome)
+        $plan.Changed -and $plan.Default -eq 'repos'
     }
 
     Write-Host '--- the shipped template against a machine without ~/repos ---'
@@ -193,48 +329,10 @@ try {
 
     Write-Host '--- what the launch card itself makes of the written config ---'
     # The check above only asks the installer to grade its own homework. This one runs
-    # the daemon's real Get-BridgeWorkspaceChoices and Get-BridgeDefaultWorkspaceLabel
-    # over the config the installer would write, in a child process so the hook stack
-    # cannot be influenced by the installer functions loaded here. If the two ever
-    # derive a label differently, the card offers a folder the default does not name,
-    # which is the half-working state being fixed.
+    # the daemon's real chooser over the config the installer would write. If the two
+    # ever derive a label differently, or disagree about what is offerable, the card
+    # offers a folder the default does not name - the half-working state being fixed.
     $script:CardCheck = $null
-    function Invoke-CardCheck {
-        param([Parameter(Mandatory)]$Plan)
-
-        $configDir = Join-Path $script:Root "cfg-$([guid]::NewGuid().ToString('N'))"
-        New-Item -ItemType Directory -Path $configDir -Force | Out-Null
-        $configPath = Join-Path $configDir 'config.json'
-        @{ newSession = @{
-                workspaces        = @($Plan.Workspaces)
-                defaultWorkspace  = $Plan.Default
-                discoverWorkspaces = $false
-        } } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $configPath -Encoding utf8
-
-        $common = (Resolve-Path (Join-Path $PSScriptRoot '..\hooks\decision-bridge-common.ps1')).Path
-        $launch = (Resolve-Path (Join-Path $PSScriptRoot '..\hooks\session-launch.ps1')).Path
-        $scriptPath = Join-Path $configDir 'check.ps1'
-        @"
-Set-StrictMode -Version Latest
-`$ErrorActionPreference = 'Stop'
-. '$($common -replace "'", "''")'
-. '$($launch -replace "'", "''")'
-# The real reader, pointed at the config the installer would have written. Replacing
-# the loaded config rather than Get-BridgeSetting keeps the function under test real.
-`$script:BridgeUserConfig = Get-Content -LiteralPath '$($configPath -replace "'", "''")' -Raw |
-    ConvertFrom-Json
-`$choices = @(Get-BridgeWorkspaceChoices)
-@{
-    Labels  = @(`$choices | ForEach-Object { `$_.Label })
-    Paths   = @(`$choices | ForEach-Object { `$_.Path })
-    Default = [string](Get-BridgeDefaultWorkspaceLabel)
-} | ConvertTo-Json -Depth 5 -Compress
-"@ | Set-Content -LiteralPath $scriptPath -Encoding utf8
-
-        $output = & (Get-Process -Id $PID).Path -NoProfile -NonInteractive -File $scriptPath 2>&1
-        if ($LASTEXITCODE -ne 0) { throw "card check failed: $($output -join "`n")" }
-        ($output | Where-Object { "$_".TrimStart().StartsWith('{') } | Select-Object -Last 1) | ConvertFrom-Json
-    }
 
     $script:BarePlan = Resolve-BridgeWorkspaceConfig -Configured @('~/repos', '~/repos/agent-ha-bridge') `
         -Default 'Bridge' -Fallbacks (Get-BridgeWorkspaceFallbacks -HomePath $script:BareHome) `

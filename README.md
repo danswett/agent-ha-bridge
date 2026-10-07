@@ -755,12 +755,17 @@ by hand is to add a repository the installer did not suggest, or to turn on `iso
 }
 ```
 
-Pass `-Workspace` to set it outright, which is the unattended equivalent of that prompt
-and fails if a folder is not there:
+Pass `-Workspace` to set it outright, which skips the question and fails if a folder is
+not there:
 
 ```powershell
-agent-ha-bridge configure -Workspace ~/repos/my-app, ~/work
+agent-ha-bridge configure -Workspace ~/repos/my-app,~/work
 ```
+
+Commas with no spaces around them: every argument reaches the installer as one literal
+string, so `~/repos/my-app, ~/work` would arrive as a single mangled path. Running
+`install.ps1` directly from a PowerShell prompt takes an ordinary array
+(`-Workspace ~/repos, ~/work`) because PowerShell parses it before the script sees it.
 
 If the card ever does say **No workspaces configured**, it means every directory in the
 list is missing on that machine — a renamed folder, or an unmounted volume. Run

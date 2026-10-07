@@ -17,7 +17,9 @@
       configure   Re-run the installer interactively, keeping your current settings
                   as the defaults. Extra arguments are passed straight through, so
                   `agent-ha-bridge configure -Clients copilot,claude` and
-                  `agent-ha-bridge configure -Workspace ~/repos` work too.
+                  `agent-ha-bridge configure -Workspace ~/repos,~/work` work too.
+                  Separate several values with commas and no spaces: arguments arrive
+                  here as literal strings, so a space would start a new one.
       pair        Join this machine to the fleet: shows a six-digit code to type into
                   Home Assistant, then receives the fleet secret from a machine
                   already in it, and turns session sharing on.
@@ -161,8 +163,7 @@ function Show-Help {
     Write-Host 'Examples:' -ForegroundColor Yellow
     Write-Host '  agent-ha-bridge configure'
     Write-Host '  agent-ha-bridge configure -Clients copilot,claude'
-    Write-Host '  agent-ha-bridge configure -Workspace ~/repos'
-    Write-Host '  agent-ha-bridge logs -Follow'
+    Write-Host '  agent-ha-bridge configure -Workspace ~/repos,~/work'    Write-Host '  agent-ha-bridge logs -Follow'
 }
 
 function Show-HomeAssistantStatus {
