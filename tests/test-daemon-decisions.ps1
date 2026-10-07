@@ -255,6 +255,32 @@ Test-That 'a question with no baseline yet reads nothing off the card at all' {
     (Read-DaemonDecisionCardText -SessionId $sid -Marker $noBase -Headers $headers).Text -eq ''
 }
 
+# Send answer publishes the reply box and then submits, and that publish is a round
+# trip. A question answered from the terminal or another dashboard inside it leaves
+# words tagged for a question that has gone - and because any new text payload submits
+# a complete form, the replacement would otherwise be answered with them.
+function New-TaggedPayloadState {
+    param([string]$Stamp, [string]$Text, [string]$DecisionId)
+    [pscustomobject]@{
+        state = $Stamp
+        attributes = [pscustomobject]@{ text = $Text; images = @(); files = @(); decision_id = $DecisionId }
+    }
+}
+$script:Ha["sensor.${node}_reply_payload"] = New-TaggedPayloadState -Stamp 'tagged-for-a-ghost' -Text 'meant for the last one' -DecisionId 'd-gone'
+Test-That 'words tagged for a question that has gone never answer the one now armed' {
+    (Read-DaemonDecisionCardText -SessionId $sid -Marker $stale -Headers $headers).Text -eq ''
+}
+$script:Ha["sensor.${node}_reply_payload"] = New-TaggedPayloadState -Stamp 'tagged-for-this' -Text 'meant for this one' -DecisionId 'd4'
+Test-That 'and words tagged for this question still do' {
+    (Read-DaemonDecisionCardText -SessionId $sid -Marker $stale -Headers $headers).Text -eq 'meant for this one'
+}
+# The reply card's own Send carries no tag, and nor does any card before 1.26.0, so an
+# untagged payload is not a mismatch.
+$script:Ha["sensor.${node}_reply_payload"] = New-PayloadState -Stamp 'untagged' -Text 'typed in the box'
+Test-That 'an untagged payload is still read, so the reply box and older cards keep working' {
+    (Read-DaemonDecisionCardText -SessionId $sid -Marker $stale -Headers $headers).Text -eq 'typed in the box'
+}
+
 Write-Host '--- the baseline belongs to one question, and is written once ---'
 # A session of its own: the last check here clears everything belonging to it, and
 # the questions the rest of this suite answers must survive that.

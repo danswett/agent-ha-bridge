@@ -196,30 +196,42 @@ class AgentBridgeReplyCard extends HTMLElement {
    * Anything attached stays in the box on purpose: the reply path stages and
    * delivers it properly once the question is gone, which is the only route that
    * can carry it at all.
+   *
+   * The question is named in the payload. A publish is a round trip, and
+   * Read-DaemonFormAnswer treats any new text payload as a submission for a complete
+   * form - so if the question is answered or replaced while this is in flight, an
+   * untagged payload would be consumed by the replacement, answering it with words
+   * typed for something else. The daemon drops one tagged for a question that has
+   * gone.
    */
-  async publishFormText() {
+  async publishFormText(decisionId) {
     if (this._busy || !this.hasUnsentFormText()) { return false; }
     const text = this._els.textarea.value;
     this._busy = true;
     this._syncSendState();
     this._setStatus('Sending...', 'busy');
+    const payload = {
+      at: new Date().toISOString(),
+      text: text,
+      images: [],
+      files: [],
+      card_version: CARD_VERSION,
+    };
+    if (decisionId) { payload.decision_id = String(decisionId); }
     let published = false;
     try {
       await this._hass.callService('mqtt', 'publish', {
         topic: this._config.topic,
-        payload: JSON.stringify({
-          at: new Date().toISOString(),
-          text: text,
-          images: [],
-          files: [],
-          card_version: CARD_VERSION,
-        }),
+        payload: JSON.stringify(payload),
         qos: 0,
         retain: false,
       });
-      // Only the words. Clearing the chips too would throw away an attachment the
-      // form never received and the reply path has not delivered yet.
-      this._els.textarea.value = '';
+      // Only the words, and only the ones that were sent. Clearing the chips would
+      // throw away an attachment the form never received, and clearing unconditionally
+      // would erase anything typed while the publish was in flight - the textarea
+      // stays editable while Send is disabled, so those words were never sent and
+      // would not have been kept either.
+      if (this._els.textarea.value === text) { this._els.textarea.value = ''; }
       this._setStatus('Sent', 'ok');
       published = true;
     } catch (err) {
@@ -618,7 +630,10 @@ class AgentBridgeReplyCard extends HTMLElement {
         qos: 0,
         retain: false,
       });
-      this._els.textarea.value = '';
+      // Only what was actually sent. The textarea stays editable while Send is
+      // disabled, so anything typed during the publish was not in the payload and
+      // must not be erased with it.
+      if (this._els.textarea.value === text) { this._els.textarea.value = ''; }
       this._images = [];
       this._files = [];
       this._renderChips();
@@ -1553,7 +1568,7 @@ class AgentBridgeChoicesCard extends HTMLElement {
     // session with the typed words silently dropped (#93).
     const reply = REPLY_CARDS.get(String(this._config.reply_topic || ''));
     if (reply && reply.hasUnsentFormText()) {
-      reply.publishFormText().then(
+      reply.publishFormText(generation).then(
         (published) => {
           // Only on a publish that landed. Submitting after a failed one is exactly
           // the loss this exists to prevent, and the reply card keeps the text so it

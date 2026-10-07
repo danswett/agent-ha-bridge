@@ -1809,6 +1809,25 @@ async function checkSendAnswerCarriesTypedText() {
     m.calls.filter((c) => c.domain === 'button').length === 0, JSON.stringify(m.calls));
   check('and the card says why rather than looking sent',
     /question changed/.test(m.choices._note), m.choices._note);
+  // Stopping the press is not enough on its own: Read-DaemonFormAnswer treats any new
+  // text payload as a submission for a complete form, so an untagged one would be
+  // consumed by the replacement question - answering it with words typed for the one
+  // that has gone. The daemon drops a payload naming a question it is not holding.
+  check('the payload names the question it was typed for, so the next one cannot eat it',
+    (published(m) || {}).decision_id === 'd1', JSON.stringify(published(m)));
+
+  // The textarea stays editable while Send is disabled, so anything typed during the
+  // publish was never in the payload and must not be cleared along with it.
+  m = mixed({ typed: 'first thought', holdPublish: true });
+  press(m.choices);
+  await flush();
+  m.reply._els.textarea.value = 'first thought, and a second';
+  m.release();
+  await flush();
+  check('words typed while the publish was in flight are kept, not erased with it',
+    m.reply._els.textarea.value === 'first thought, and a second', m.reply._els.textarea.value);
+  check('and only what was actually sent went', (published(m) || {}).text === 'first thought',
+    JSON.stringify(published(m)));
 }
 
 // _launch awaits its service calls, so the checks that read them have to await it too.
