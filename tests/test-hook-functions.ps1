@@ -219,17 +219,17 @@ $mixedHint = Get-CopilotMixedFormHint -Label 'Anything else while I am in here?'
 Test-That 'the hint names the free-text field, so the box is not mistaken for a chat box' {
     $mixedHint -like '*Anything else while I am in here?*'
 } $mixedHint
-Test-That 'it points at Send answer, not the reply box Send beside it' {
-    $mixedHint -like '*Send answer*'
+Test-That 'it points at the Send beside the box, which is the one that carries the typed words' {
+    $mixedHint -match '\*\*Send\*\* beside the box'
 } $mixedHint
-Test-That 'and never directs anyone to the reply card''s own Send' {
-    $mixedHint -notmatch '\*\*Send\*\*'
+Test-That 'and warns off Send answer, which submits the form with the text field empty' {
+    $mixedHint -match 'Not \*\*Send answer\*\*'
 } $mixedHint
-Test-That 'a card too old for Send answer is told which control to look for instead' {
-    $mixedHint -like '*send arrow*'
+Test-That 'the warning says what pressing it costs, not merely that it is wrong' {
+    $mixedHint -like '*without your text*'
 } $mixedHint
 Test-That 'an empty label still produces a usable sentence' {
-    (Get-CopilotMixedFormHint -Label '') -like '*Send answer*'
+    (Get-CopilotMixedFormHint -Label '') -match '\*\*Send\*\* beside the box'
 }
 
 Write-Host ''
