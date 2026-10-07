@@ -13,18 +13,32 @@
 function Get-CopilotMixedFormHint {
     <#
         What to tell someone answering a form that mixes dropdowns with a free-text
-        field: the text goes in the Reply box, but the form is committed by the
-        choices card's own row.
+        field: the text goes in the Reply box, but the form is committed elsewhere.
 
-        It names "Send answer" rather than "Send" because the dashboard draws both -
-        the choices card's Send answer, and the reply card's Send immediately beside
-        the box the hint has just told them to type in. Until 2026-10-06 this pointed
-        at the nearer, wrong one. Nothing is lost by pressing it, because a live
-        question owns the reply box and the daemon will not deliver it as a reply
-        (Test-DaemonReplyBoxFree), but it looks like it submitted and nothing happens.
+        Two layouts have to be right at once, because the dashboard is version-gated
+        on the card Home Assistant actually serves (Save-CopilotSessionDashboard):
+
+          card >= 1.22.0  the choices card carries a labelled "Send answer", and the
+                          reply card draws its own "Send" immediately beside the box
+                          the hint has just told them to type in. Until 2026-10-06
+                          this pointed at the nearer, wrong one.
+          card <  1.22.0  there is no such label. The generator draws an icon-only
+                          button-card (mdi:send, show_name = $false) next to the
+                          "Reply / continue" row, and it is the only send control.
+
+        So both are named. The served version is not read here on purpose: it comes
+        from the Lovelace resource list over the WebSocket
+        (Get-BridgeServedReplyCardUrl), and this runs in the ask_user hook, which
+        writes its marker before any network work so the terminal prompt is not held
+        up. A round-trip for a sentence is the wrong trade.
+
+        Pressing the wrong one loses nothing - a live question owns the reply box and
+        the daemon will not deliver it as a reply (Test-DaemonReplyBoxFree) - but it
+        looks like it submitted and nothing happens.
     #>
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Label)
-    "*Type **$Label** in the Reply box, choose the rest above, then press **Send answer**.*"
+    "*Type **$Label** in the Reply box, choose the rest above, then submit the form " +
+        "with **Send answer** - or the send arrow beside the box, on older cards.*"
 }
 
 function Invoke-CopilotAskUserHook {

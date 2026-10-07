@@ -222,8 +222,11 @@ Test-That 'the hint names the free-text field, so the box is not mistaken for a 
 Test-That 'it points at Send answer, not the reply box Send beside it' {
     $mixedHint -like '*Send answer*'
 } $mixedHint
-Test-That 'and never tells you to press plain Send' {
-    $mixedHint -notmatch 'press\s+\*{0,2}Send\*{0,2}[.,]'
+Test-That 'and never directs anyone to the reply card''s own Send' {
+    $mixedHint -notmatch '\*\*Send\*\*'
+} $mixedHint
+Test-That 'a card too old for Send answer is told which control to look for instead' {
+    $mixedHint -like '*send arrow*'
 } $mixedHint
 Test-That 'an empty label still produces a usable sentence' {
     (Get-CopilotMixedFormHint -Label '') -like '*Send answer*'
