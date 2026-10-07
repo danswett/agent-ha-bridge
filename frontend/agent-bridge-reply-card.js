@@ -888,6 +888,7 @@ const CHOICE_SAVING_NOTE = 'Saving your choice...';
 // or a state arriving out of order. The rows show what is really there; Send is held
 // until somebody looks, because committing it would send a choice nobody made here.
 const CHOICE_CHANGED_NOTE = 'Changed since you chose - check what is ticked';
+const CHOICE_SENT_NOTE = 'Sent - waiting for the session';
 // The states an entity sits in when it is carrying nothing: an unarmed field slot is
 // parked on 'Idle', and a session that has gone leaves its entity behind.
 const CHOICE_UNARMED = ['', 'Idle', 'unknown', 'unavailable'];
@@ -959,6 +960,20 @@ class AgentBridgeChoicesCard extends HTMLElement {
     this.attachShadow({ mode: 'open' });
     this._last = '';
     this._sent = '';
+    // Whether an accepted Send has committed this question's answer, and which
+    // question that was. Rows are frozen while it is set: Home Assistant had taken
+    // the press but the daemon had not yet swept, and a row changed in that window
+    // was read against the press already made - so the new value went to the session
+    // without anyone pressing Send for it, which is the one thing Send exists to
+    // prevent. The question is kept separately from the flag because a question may
+    // legitimately have no id, and '' is then the id it was committed at.
+    this._committed = false;
+    this._committedAt = '';
+    // Whether every slot that must be answered is answered, as of the last render.
+    // Only a complete form is frozen on Send: an incomplete one is refused by the
+    // daemon, which says which field it is waiting on, and freezing that would leave
+    // no way to go and answer it.
+    this._complete = false;
     this._fields = [];
     // What has been tapped but not yet seen coming back from Home Assistant.
     // {} when everything on screen is confirmed.
@@ -1103,6 +1118,12 @@ class AgentBridgeChoicesCard extends HTMLElement {
     for (const key of Object.keys(this._pending)) {
       if (this._pending[key].generation !== generation) { delete this._pending[key]; }
     }
+    // A commit belongs to the question it answered. A replacement question must be
+    // answerable, and the press that settled the previous one says nothing about it.
+    if (this._committed && this._committedAt !== generation) {
+      this._committed = false;
+      this._committedAt = '';
+    }
     // A write still in flight for a question that has been replaced cannot answer the
     // one now on screen, so it must not hold its Send either. Home Assistant refuses
     // a value the republished slot no longer offers, so it cannot quietly land in it.
@@ -1171,10 +1192,19 @@ class AgentBridgeChoicesCard extends HTMLElement {
     // tap somebody made expecting to review it first.
     const tapAnswers = decisionAttrs.answer_on_tap === true;
     const sends = !!(this._config.submit && commits && !tapAnswers);
+    // Which groups have to be answered before the daemon will take the form. The
+    // decision selector carrying only Cancel is not one of them - on a form question
+    // the fields are the answer and it stays on its placeholder throughout.
+    const mustAnswer = groups.filter((g) => g.options.some((o) => o !== CHOICE_CANCEL));
+    this._complete = mustAnswer.length > 0 && mustAnswer.every((g) => g.chosen !== '');
 
     const show = groups.length > 0;
     this.hidden = !show;
-    if (!show) { this._sent = ''; this._pending = {}; this._inflight = {}; this._note = ''; return; }
+    if (!show) {
+      this._sent = ''; this._committed = false; this._committedAt = '';
+      this._pending = {}; this._inflight = {}; this._note = '';
+      return;
+    }
 
     // What has been tapped and not yet confirmed. A slot is only settled once Home
     // Assistant has both accepted the call and shown the value it was asked for.
@@ -1222,11 +1252,17 @@ class AgentBridgeChoicesCard extends HTMLElement {
       if (diverged.length > 0) { this._note = CHOICE_CHANGED_NOTE; }
       else if (this._note === CHOICE_CHANGED_NOTE) { this._note = ''; }
     }
-    const held = waiting || diverged.length > 0;
+    const held = waiting || diverged.length > 0 || this._committed;
 
     // The answer has landed once the selector is no longer parked on the placeholder.
     if (this._sent && (!decision || decision.state !== CHOICE_PLACEHOLDER)) { this._sent = ''; }
-    this._els.list.classList.toggle('sending', !!this._sent);
+    // Committed says the press was taken and the rows are no longer yours to change.
+    // Not released by the selector moving, the way Cancel is: on a form question the
+    // selector never leaves its placeholder, and the thing that ends this question is
+    // the daemon clearing it, which hides the card and resets this with it.
+    if (this._committed) { this._note = CHOICE_SENT_NOTE; }
+    else if (this._note === CHOICE_SENT_NOTE) { this._note = ''; }
+    this._els.list.classList.toggle('sending', !!this._sent || this._committed);
 
     // Every field's current value is in the signature, so picking one redraws the
     // form and the tick moves. Without it the card short-circuits on an unchanged
@@ -1234,7 +1270,7 @@ class AgentBridgeChoicesCard extends HTMLElement {
     // note are in it too, so holding Send and saying why are drawn as they happen.
     const signature = groups
       .map((g) => `${g.entityId}\u0002${g.chosen}\u0002${g.label}\u0002${g.multi ? 'm' : 's'}\u0002${g.options.join('\u0001')}\u0002${g.multi ? g.picked.join('\u0001') : ''}`)
-      .join('\u0003') + `\u0004${sends}\u0004${held}\u0004${this._note}`;
+      .join('\u0003') + `\u0004${sends}\u0004${held}\u0004${this._note}\u0004${this._committed}`;
     if (signature === this._last) { return; }
     this._last = signature;
 
@@ -1297,7 +1333,7 @@ class AgentBridgeChoicesCard extends HTMLElement {
    * in a row build one answer instead of the second overwriting the first.
    */
   _choose(group, option) {
-    if (this._sent || !this._hass) { return; }
+    if (this._sent || this._committed || !this._hass) { return; }
     const generation = String(
       ((this._hass.states[this._config.decision] || {}).attributes || {}).decision_id || '');
     // Each tap is its own operation. The question id alone is not enough to tell
@@ -1389,7 +1425,7 @@ class AgentBridgeChoicesCard extends HTMLElement {
    * from one the session is still thinking about.
    */
   _send() {
-    if (this._sent || !this._hass || !this._config.submit) { return; }
+    if (this._sent || this._committed || !this._hass || !this._config.submit) { return; }
     // Nothing outstanding, in either sense: no tap waiting to be shown, and no write
     // still in flight that could land afterwards and change what is about to be sent.
     if (Object.keys(this._pending).length > 0) { return; }
@@ -1398,13 +1434,38 @@ class AgentBridgeChoicesCard extends HTMLElement {
     // drawn disabled for this too, but a press can arrive from a keyboard or a stale
     // click, and sending a choice nobody made here is exactly what must not happen.
     if (this._note === CHOICE_CHANGED_NOTE) { return; }
+    const generation = String(
+      ((this._hass.states[this._config.decision] || {}).attributes || {}).decision_id || '');
+    const complete = this._complete;
     let call;
     try { call = this._hass.callService('button', 'press', { entity_id: this._config.submit }); }
     catch (err) { this._failSend(err); return; }
-    if (call && typeof call.then === 'function') { call.then(() => {}, (err) => this._failSend(err)); }
+    if (call && typeof call.then === 'function') {
+      call.then(() => this._commitSend(generation, complete), (err) => this._failSend(err));
+    }
+  }
+
+  /*
+   * Freezes the rows once Home Assistant has taken the press.
+   *
+   * Only for a form the daemon will actually accept. An incomplete one is refused
+   * with the field it is waiting on named, and freezing that would leave no way to go
+   * and answer it - while a complete one is going to be read exactly as it stands, so
+   * a row changed between the press and the daemon's sweep would be sent against a
+   * press nobody made for it.
+   */
+  _commitSend(generation, complete) {
+    if (!complete) { return; }
+    this._committed = true;
+    this._committedAt = generation;
+    this._last = '';
+    this._render();
   }
 
   _failSend(err) {
+    // Left unfrozen on purpose, so the press can be tried again.
+    this._committed = false;
+    this._committedAt = '';
     this._note = `Send failed: ${describeThrown(err)}`;
     this._last = '';
     this._render();

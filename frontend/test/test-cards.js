@@ -1447,12 +1447,86 @@ check('"machines" is required', (() => {
   try { new AgentBridgeStatusCard().setConfig({}); return false; } catch (e) { return /machines/.test(e.message); }
 })());
 
+async function checkFrozenAfterSend() {
+  // Home Assistant took the press, but the daemon sweeps on its own schedule. A row
+  // changed in that window was read against the press already made, so the new value
+  // reached the session without anyone pressing Send for it.
+  const c = newCard(undefined, SUBMIT);
+  const e = hassFor('Awaiting answer...', ['Awaiting answer...', 'Yes - reboot now', 'No - leave it', 'Cancel request']);
+  e.card = c;
+  c.hass = e.hass;
+  rows(c)[0].click();
+  await flush();
+  e.calls.length = 0;
+  buttons(c).find((b) => b.textContent === 'Send answer').click();
+  await flush();
+  check('an accepted Send presses the button once',
+    e.calls.length === 1 && e.calls[0].domain === 'button', JSON.stringify(e.calls));
+  check('and the rows are frozen afterwards, not left live until the daemon sweeps',
+    c.shadowRoot.querySelector('.choices').classList.contains('sending'));
+  check('and the card says the answer has gone', labels(c).includes('Sent - waiting for the session'),
+    labels(c).join('|'));
+  e.calls.length = 0;
+  rows(c)[1].click();
+  check('so changing a row after Send sends nothing', e.calls.length === 0, JSON.stringify(e.calls));
+  buttons(c).find((b) => b.textContent === 'Send answer').click();
+  check('and Send cannot be pressed a second time either', e.calls.length === 0, JSON.stringify(e.calls));
+
+  // The daemon clearing the question is what ends it, and the card has to come back.
+  c.hass = hassFor('Idle', ['Idle']).hass;
+  const next = hassFor('Awaiting answer...', ['Awaiting answer...', 'Another question', 'Cancel request']);
+  next.card = c;
+  c.hass = next.hass;
+  rows(c)[0].click();
+  check('the question after it is answerable again',
+    next.calls.length === 1 && next.calls[0].data.option === 'Another question', JSON.stringify(next.calls));
+}
+
+async function checkIncompleteSendStaysLive() {
+  // The daemon refuses an incomplete form and names the field it is waiting on, so
+  // freezing one would leave no way to go and answer it.
+  const c = newCard(['select.agent_bridge_abc_f1', 'select.agent_bridge_abc_f2'], SUBMIT);
+  const calls = [];
+  const states = {
+    [DECISION]: {
+      state: 'Awaiting answer...',
+      attributes: { options: ['Awaiting answer...', 'Cancel request'], decision_id: 'd1', field_1_label: 'A', field_2_label: 'B' },
+    },
+    'select.agent_bridge_abc_f1': { state: 'Red', attributes: { options: ['Choose...', 'Red', 'Blue'] } },
+    'select.agent_bridge_abc_f2': { state: 'Choose...', attributes: { options: ['Choose...', 'S', 'L'] } },
+  };
+  const hass = {
+    states,
+    callService: (domain, service, data) => {
+      calls.push({ domain, service, data });
+      if (domain === 'select' && states[data.entity_id]) {
+        states[data.entity_id].state = data.option;
+        c.hass = hass;
+      }
+      return Promise.resolve();
+    },
+  };
+  c.hass = hass;
+  buttons(c).find((b) => b.textContent === 'Send answer').click();
+  await flush();
+  check('an incomplete form still presses Send, because the daemon is what refuses it',
+    calls.filter((x) => x.domain === 'button').length === 1, JSON.stringify(calls));
+  check('but its rows stay live, so the missing field can still be answered',
+    !c.shadowRoot.querySelector('.choices').classList.contains('sending'));
+  calls.length = 0;
+  buttons(c).find((b) => b.textContent === 'L').click();
+  check('and answering it really does set the slot', calls.length === 1 && calls[0].data.option === 'L',
+    JSON.stringify(calls));
+}
+
 // _launch awaits its service calls, so the checks that read them have to await it too.
 (async () => {
   await checkForgetRemoval();
   await checkTapThenSend();
   await checkUnconfirmedTap();
   await checkRefusedSelection();
+  await checkFrozenAfterSend();
+  await checkIncompleteSendStaysLive();
 
   const pubEnv = launchEnv({});
   const pubCard = promptCard(pubEnv, { promptTopic: PROMPT_TOPIC });

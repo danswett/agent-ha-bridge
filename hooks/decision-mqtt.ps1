@@ -1599,11 +1599,20 @@ function Publish-CopilotMqttDecisionFields {
             $checked = @(Get-DecisionMultiSelectChecked -Field $slotField)
             if ($checked.Count -gt 0) {
                 $offered = @(Get-DecisionMultiSelectChoices -Field $slotField)
-                # Positions first, because they survive options of any length; the
-                # written-out form only when this field has one at all.
-                foreach ($candidate in @(
-                    (Get-DecisionMultiSelectCode -Indexes ([int[]]$checked)),
-                    (Get-DecisionMultiSelectLabel -Field $slotField -Indexes ([int[]]$checked)))) {
+                # Positions first, because they survive options of any length - but
+                # only where this field can carry positions at all. A field with an
+                # option written like a position does not publish codes, and the code
+                # generated here can be that option's own text: options 'A', 'B' and
+                # '#1,2' with 'A' and 'B' checked generate '#1,2', which is on the
+                # list as the third option's label, so the slot opened holding that
+                # option and Send submitted an answer nobody chose. The written-out
+                # form is the only carrier such a field has.
+                $candidates = @()
+                if (Test-DecisionMultiSelectCodeSafe -Field $slotField) {
+                    $candidates += (Get-DecisionMultiSelectCode -Indexes ([int[]]$checked))
+                }
+                $candidates += (Get-DecisionMultiSelectLabel -Field $slotField -Indexes ([int[]]$checked))
+                foreach ($candidate in $candidates) {
                     # Only if it is really on the list. Selecting a value the dropdown
                     # does not carry leaves it holding something it never offered.
                     if (-not [string]::IsNullOrEmpty($candidate) -and $offered -contains $candidate) {

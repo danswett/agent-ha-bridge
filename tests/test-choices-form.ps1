@@ -710,6 +710,26 @@ Test-That 'a field with too many combinations to list starts on the placeholder,
     $state -eq 'Choose...' -or @($script:HaStates["select.${node}_f1"].attributes.options) -contains $state
 } "state=[$($script:HaStates["select.${node}_f1"].state)] options=$(@($script:HaStates["select.${node}_f1"].attributes.options).Count)"
 
+# An option written like a position disables that carrier for the whole field, but the
+# code generated for the default was still tried - and 'A' plus 'B' generates '#1,2',
+# which is on the list as the third option's own label. The slot opened holding that
+# option, the card drew it ticked, and Send submitted an answer nobody chose.
+$script:HaStates = @{}
+$literalCodeField = @([pscustomobject]@{
+    Label = 'Rows'; Options = @('A', 'B', '#1,2'); IsText = $false
+    MultiSelect = $true; MultiSelectStyle = 'space-toggle'; DefaultIndexes = @(0, 1)
+})
+Set-CopilotMqttDecision -SessionId $sessionId -SessionName 'Copilot: a task' -Machine 'BOX' `
+    -Question 'Which rows?' -Choices @() -Fields $literalCodeField `
+    -DecisionId 'd3d' -Headers $headers | Out-Null
+Test-That 'a field that cannot carry positions starts on the words, not on an option that reads like one' {
+    [string]$script:HaStates["select.${node}_f1"].state -ceq 'A + B'
+} "state=[$($script:HaStates["select.${node}_f1"].state)]"
+Test-That 'so what it starts on really does mean those two rows' {
+    (@(Resolve-DecisionMultiSelectChoice -Field $literalCodeField[0] `
+        -Choice ([string]$script:HaStates["select.${node}_f1"].state)) -join '|') -eq 'A|B'
+} "resolves=[$(@(Resolve-DecisionMultiSelectChoice -Field $literalCodeField[0] -Choice ([string]$script:HaStates["select.${node}_f1"].state)) -join '|')]"
+
 # --- 6c. the question that actually failed on the dashboard ---------------------
 
 Write-Host ''
