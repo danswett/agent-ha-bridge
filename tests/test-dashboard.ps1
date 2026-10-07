@@ -700,7 +700,11 @@ Publish-CopilotMqttDecisionFields -SessionId 'abc123de-f456-7890-abcd-ef12345678
     -SessionName 'S' -Machine 'BOX' -Fields $msFields -Headers @{ Authorization = '******' }
 
 Test-That 'a multi-select slot lists every combination' {
-    (@($script:FieldOptions['f1']) -join ' / ') -eq 'Choose... / Staging / Production / Staging + Production'
+    # Written out for any card up to 1.22.0, then the same subsets as positions for
+    # 1.23.0 and later. Both, because the hook publishing this cannot see which card
+    # Home Assistant is serving and a select rejects a value outside its own list.
+    (@($script:FieldOptions['f1']) -join ' / ') -eq
+        'Choose... / Staging / Production / Staging + Production / #1 / #2 / #1,2'
 } (@($script:FieldOptions['f1']) -join ' / ')
 Test-That 'a single-select slot beside it is unchanged' {
     (@($script:FieldOptions['f2']) -join ' / ') -eq 'Choose... / One / Two'
@@ -1118,7 +1122,10 @@ Write-Host '--- explicit policy generations, rollback and real failure paths ---
         $newSource = New-TestPublicationCard '3.0.0'
         $oldTarget = Get-BridgePublicationTarget -CardSourcePath $oldSource
         Test-That 'the composed renderer target advances independently of the card version' {
-            $oldTarget.render.version -ceq '1.1.0' -and $oldTarget.card.version -ceq '2.0.0' -and
+            # The composed renderer, not a literal: the two versions move for different
+            # reasons, and pinning one here made a generator change look like a test
+            # failure rather than the fence advance it is.
+            $oldTarget.render.version -ceq (Get-BridgeRenderArtifact).version -and $oldTarget.card.version -ceq '2.0.0' -and
                 $oldTarget.render.hash -ceq (Get-BridgeRenderArtifact).hash
         }
         Set-TestPublicationCardUrl -Url (Get-BridgeInlineReplyCardUrl -SourcePath $newSource -Version '3.0.0')

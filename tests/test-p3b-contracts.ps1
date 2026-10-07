@@ -504,6 +504,15 @@ function Invoke-WebRequest {
             $script:P3bPublished.Add([pscustomobject]@{ Topic = $Topic; Payload = (ConvertFrom-DecisionJson -Json $Payload) })
         }
         function Invoke-HomeAssistantService { param($Domain, $Service, $Headers, $Data) }
+        # Arming now reads what the answer channels already hold, so that an answer
+        # given before the first daemon sweep is not later mistaken for what was
+        # always there. Nothing exists yet on this synthetic card, which is what Home
+        # Assistant says with a 404.
+        function Get-HomeAssistantState { param($EntityId, $Headers)
+            $notFound = [InvalidOperationException]::new("Response status code does not indicate success: 404 (Not Found). [$EntityId]")
+            $notFound.Data['BridgeHttpStatus'] = 404
+            throw $notFound
+        }
         function Set-CopilotMqttEntityIds { param($SessionId) }
         function Start-Sleep { param($Milliseconds, $Seconds) }
         $sid = 'a3000000-0000-4000-8000-000000000049'
@@ -626,14 +635,18 @@ function Invoke-WebRequest {
                 StoredBeforeInput = $(if ($before.PSObject.Properties['injectedSelections']) { @($before.injectedSelections).Count } else { 0 })
             })
             if ($fixture.FormDelivered -and $fixture.Kind -eq 'claude') { Add-DeliveryResult }
-            [pscustomobject]@{ Delivered = $fixture.FormDelivered; ProcessId = 0; Detail = 'Synthetic native form boundary' }
+            [pscustomobject]@{ Delivered = $fixture.FormDelivered; ProcessId = 0; Detail = 'Synthetic native form boundary'
+                # This fixture's failing form is a clean pre-write refusal, which is the
+                # case the fallback below exists for. A form that had already written
+                # would not fall back at all.
+                Wrote = $fixture.FormDelivered }
         }
         function Send-CopilotSessionChoice {
             param($SessionId, $Text, $ChoiceCount, $ProcessId)
             $fixture = $script:DeliveryFixture
             $fixture.Inputs.Add([pscustomobject]@{ Route = 'text-choice'; Text = $Text })
             if ($fixture.FallbackDelivered -and $fixture.Kind -eq 'claude') { Add-DeliveryResult }
-            [pscustomobject]@{ Delivered = $fixture.FallbackDelivered; ProcessId = 0; Detail = 'Synthetic native fallback boundary' }
+            [pscustomobject]@{ Delivered = $fixture.FallbackDelivered; ProcessId = 0; Detail = 'Synthetic native fallback boundary'; Wrote = $true }
         }
         function Send-CopilotSessionPrompt {
             param($SessionId, $Text, $ProcessId)
@@ -698,17 +711,36 @@ function Invoke-WebRequest {
                            if ($MultiField) { $answer += ', "Region?"="East"' }
                            "Your questions have been answered: $answer."
                        }
+            # Where the answer sits is where Set-CopilotMqttDecision puts the controls:
+            # in the field slots for anything published with fields, which is every
+            # Copilot question and any multi-field Claude one, and on the main selector
+            # for a lone Claude question, whose parser publishes its options there and
+            # keeps the field only in the marker for the keystrokes.
+            $usesSlots = $MultiField -or ($Kind -eq 'copilot')
             $ha = @{
                 "select.$($topics.Node)_decision" = [pscustomobject]@{
-                    state = $(if ($MultiField) { 'Awaiting answer...' } else { $Selection })
-                    attributes = [pscustomobject]@{ question = $marker.question; options = @($marker.choices); decision_id = $marker.decisionId }
+                    state = $(if ($usesSlots) { 'Awaiting answer...' } else { $Selection })
+                    attributes = [pscustomobject]@{
+                        question = $marker.question; options = @($marker.choices)
+                        decision_id = $marker.decisionId; multi_field = $usesSlots
+                    }
                 }
                 "text.$($topics.Node)_reply" = [pscustomobject]@{ state = 'old reply' }
-                "button.$($topics.Node)_submit" = [pscustomobject]@{ state = ([DateTimeOffset]$marker.armedAt).AddSeconds(1).ToString('o') }
+                # The retained reply payload as it stood when the question arrived.
+                # The daemon records its identity as the baseline; only a different
+                # one is an answer, so this one never is.
+                "sensor.$($topics.Node)_reply_payload" = [pscustomobject]@{
+                    state = 'armed-baseline'
+                    attributes = [pscustomobject]@{ text = ''; images = @(); files = @() }
+                }
+                # No press yet. The press that answers is applied below, after the
+                # baseline is recorded - which is the real order of events and the
+                # only one in which a press means somebody pressed Send.
+                "button.$($topics.Node)_submit" = [pscustomobject]@{ state = 'unknown' }
             }
             for ($index = 1; $index -le $script:CopilotMqttMaxFields; $index++) {
                 $ha[(Get-CopilotMqttFieldEntityId -Node $topics.Node -Index $index)] = [pscustomobject]@{
-                    state = $(if ($MultiField -and $index -eq 1) { $Selection } elseif ($MultiField -and $index -eq 2) { 'East' } else { 'Idle' })
+                    state = $(if ($usesSlots -and $index -eq 1) { $Selection } elseif ($MultiField -and $index -eq 2) { 'East' } else { 'Idle' })
                 }
             }
             $script:DeliveryFixture = [pscustomobject]@{
@@ -717,10 +749,20 @@ function Invoke-WebRequest {
                 State = @{ $sid = [pscustomobject]@{ Name = 'Synthetic'; Machine = 'TEST'; LastReply = 'old reply' } }
                 Ha = $ha; Inputs = [Collections.Generic.List[object]]::new(); Activity = [Collections.Generic.List[string]]::new()
                 ExpectedSelections = $(if ($MultiField) { @($Selection, 'East') } else { @($Selection) })
+                UsesSlots = $usesSlots
                 ResultKind = $ResultKind; Content = $content; ResultWritten = $false
                 FormDelivered = $true; FallbackDelivered = $false; UnexpectedInput = 0
                 DecisionReads = 0; TerminalOnRead = $false; CardClears = 0
             }
+            # Arm, then press - in that order, which is the only one in which a press
+            # is somebody pressing Send rather than something the card already held.
+            $baselinePath = Get-CopilotDecisionBaselinePath -SessionId $sid -DecisionId ([string]$marker.decisionId)
+            if (Test-Path -LiteralPath $baselinePath) { Remove-Item -LiteralPath $baselinePath -Force }
+            if (-not (Set-CopilotDecisionMarkerBaseline -SessionId $sid -DecisionId ([string]$marker.decisionId) `
+                -PayloadState 'present' -PayloadValue 'armed-baseline' -SubmitState 'absent' -SubmitValue '')) {
+                throw "could not seed a baseline for $($marker.decisionId)"
+            }
+            $ha["button.$($topics.Node)_submit"].state = ([DateTimeOffset]$marker.armedAt).AddSeconds(1).ToString('o')
             $script:DeliveryFixture
         }
         function Invoke-DeliveryPass {
@@ -745,7 +787,7 @@ function Invoke-WebRequest {
                     $read = Read-DaemonDecisionAnswer -SessionId $fixture.SessionId -Marker $marker -State $fixture.State -Headers @{}
                     Test-That "$label reads the ordinary dashboard selection without seeding the marker" {
                         $read.IsChoice -and $read.Answer -ceq ($fixture.ExpectedSelections -join ' + ') -and
-                            @($read.Selections).Count -eq $(if ($case.Multi) { 2 } else { 0 }) -and
+                            @($read.Selections).Count -eq $(if ($fixture.UsesSlots) { @($fixture.ExpectedSelections).Count } else { 0 }) -and
                             (-not $marker.PSObject.Properties['injectedSelections'] -or @($marker.injectedSelections).Count -eq 0)
                     }
                     Test-That "$label preserves the actual client hook identity" {
@@ -805,9 +847,16 @@ function Invoke-WebRequest {
                     Invoke-DeliveryPass
                     Invoke-DeliveryPass
                     Test-That "$kind terminal answer $timing prevents input and removes the pending marker" {
+                        # A form acknowledges the Send before it injects, and from the
+                        # moment a single choice became a field that is every question
+                        # - so the acknowledgement can land in the instant between the
+                        # card being read and the terminal answer arriving. What must
+                        # not happen is input, or a warning: nothing was delivered and
+                        # nothing differs.
                         $fixture.ResultWritten -and $fixture.Inputs.Count -eq 0 -and $fixture.UnexpectedInput -eq 0 -and
                             $null -eq (Get-CopilotDecisionMarker -SessionId $fixture.SessionId) -and
-                            $fixture.CardClears -eq 1 -and $fixture.Activity.Count -eq 0
+                            $fixture.CardClears -eq 1 -and
+                            @($fixture.Activity | Where-Object { $_ -notlike 'Sending answer*' }).Count -eq 0
                     }
                 }
                 foreach ($fallback in @($false, $true)) {
@@ -858,6 +907,14 @@ function Invoke-WebRequest {
                     state = 'Idle'; attributes = [pscustomobject]@{ options = @('Idle'); question = '' }
                 }
                 "text.${node}_reply" = [pscustomobject]@{ state = ''; attributes = [pscustomobject]@{} }
+                # What the reply card had retained when the question arrived. Its
+                # identity is the baseline the daemon records; only a different one
+                # is ever read as an answer.
+                "sensor.${node}_reply_payload" = [pscustomobject]@{
+                    state = 'armed-baseline'; attributes = [pscustomobject]@{ text = ''; images = @(); files = @() }
+                }
+                # Unpressed. Nothing on the card is an answer until this changes.
+                "button.${node}_submit" = [pscustomobject]@{ state = 'unknown' }
             }
             $script:A23Messages = @{}
             $script:A23Inputs = [Collections.Generic.List[object]]::new()
@@ -876,6 +933,9 @@ function Invoke-WebRequest {
                 Transcript = $transcript
                 CallId = $CallId
                 DecisionEntity = "select.${node}_decision"
+                # Where a published choice is actually answered: its field slot, which
+                # is what Set-CopilotMqttDecision puts every option list into now.
+                FieldEntity = "select.${node}_f1"
                 ReplyEntity = "text.${node}_reply"
                 Topics = $script:A23Topics
             }
@@ -944,12 +1004,12 @@ function Invoke-WebRequest {
             $script:A23Inputs.Add([pscustomobject]@{
                 SessionId = $SessionId; Kind = 'form'; Fields = @($Fields); Selections = @($Selections)
             })
-            [pscustomobject]@{ Delivered = $true; ProcessId = $ProcessId; Detail = 'Synthetic native delivery boundary' }
+            [pscustomobject]@{ Delivered = $true; ProcessId = $ProcessId; Detail = 'Synthetic native delivery boundary'; Wrote = $true }
         }
         function Send-CopilotSessionPrompt {
             param($SessionId, $Text, $ProcessId)
             $script:A23Inputs.Add([pscustomobject]@{ SessionId = $SessionId; Kind = 'text'; Text = $Text })
-            [pscustomobject]@{ Delivered = $true; ProcessId = $ProcessId; Detail = 'Synthetic native delivery boundary' }
+            [pscustomobject]@{ Delivered = $true; ProcessId = $ProcessId; Detail = 'Synthetic native delivery boundary'; Wrote = $true }
         }
         function Send-CopilotSessionChoice {
             param($SessionId, $Text, $ChoiceCount, $ProcessId)
@@ -1017,7 +1077,10 @@ function Invoke-WebRequest {
             (@($attributes.choices) -join '|') -ceq 'Yes|No' -and $attributes.mode -ceq 'multiple_choice'
         }
         Test-That 're-arming a placeholder does not inject an answer' { $script:A23Inputs.Count -eq 0 }
-        $script:A23Ha[$fixture.DecisionEntity].state = 'No'
+        $script:A23Ha[$fixture.FieldEntity].state = 'No'
+        Invoke-PendingDecisions -Headers $headers -State $fixture.State -Live $script:DaemonLive
+        Test-That 'a chosen option with no Send behind it is not delivered' { $script:A23Inputs.Count -eq 0 }
+        $script:A23Ha["button.$($fixture.Topics.Node)_submit"].state = [DateTimeOffset]::Now.ToString('o')
         Invoke-PendingDecisions -Headers $headers -State $fixture.State -Live $script:DaemonLive
         Invoke-PendingDecisions -Headers $headers -State $fixture.State -Live $script:DaemonLive
         $delivered = Get-CopilotDecisionMarker -SessionId $fixture.SessionId
@@ -1054,7 +1117,8 @@ function Invoke-WebRequest {
             $null -ne (Get-CopilotDecisionMarker -SessionId $fixture.SessionId) -and $script:A23Inputs.Count -eq 0
         }
         Add-A23QuestionResult -Fixture $fixture -Content 'User responded: true'
-        $script:A23Ha[$fixture.DecisionEntity].state = 'No'
+        $script:A23Ha[$fixture.FieldEntity].state = 'No'
+        $script:A23Ha["button.$($fixture.Topics.Node)_submit"].state = [DateTimeOffset]::Now.ToString('o')
         Invoke-PendingDecisions -Headers $headers -State $fixture.State -Live $script:DaemonLive
         Test-That 'a completed terminal answer prevents a competing dashboard choice from being delivered' {
             $script:A23Inputs.Count -eq 0 -and $null -eq (Get-CopilotDecisionMarker -SessionId $fixture.SessionId) -and

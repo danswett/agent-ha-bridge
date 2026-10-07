@@ -157,6 +157,56 @@ foreach ($component in @('render', 'card')) {
     }
 }
 
+Write-Host '--- the render fence admits a bumped renderer, not a changed one at the same version ---'
+# A generator change that leaves $script:BridgeDashboardRenderVersion alone is a new
+# hash at the old version, which is the definition of a conflict here. An installation
+# already fenced at the previous renderer then refuses to publish at all, and the new
+# card configuration can never reach the dashboard without an operator pin nobody
+# should have to take. This is the gate that catches it.
+Initialize-TestPublicationStore
+$renderCard = New-TestPublicationCard '1.1.0'
+$renderUrl = Get-BridgeInlineReplyCardUrl -SourcePath $renderCard -Version '1.1.0'
+Initialize-TestPublicationAuthority -CardSource $renderCard -CardUrl $renderUrl
+$fenced = Read-BridgePublicationState
+$fencedRender = $fenced.Policy.render
+
+Test-That 'the established fence is the renderer this build actually composes' {
+    (ConvertTo-BridgePublicationJson $fencedRender) -ceq (ConvertTo-BridgePublicationJson (Get-BridgeRenderArtifact))
+}
+
+# An installation fenced at the renderer before this change, as one that has been
+# running the previous release is.
+$olderFence = @{ version = '1.1.0'; hash = ('a' * 64) }
+$fenced.Policy.render = $olderFence
+$fenced.Policy.highRender = $olderFence
+Test-That 'the current renderer crosses a fence established at the older version' {
+    Assert-BridgePublicationWriter -State $fenced -Component render -Artifact (Get-BridgeRenderArtifact)
+    $true
+}
+Test-That 'and the version it crosses with is genuinely ahead of that fence' {
+    [version](Get-BridgeRenderArtifact).version -gt [version]$olderFence.version
+} "render=$((Get-BridgeRenderArtifact).version) fence=$($olderFence.version)"
+
+# The other half, which must stay refused: same version, different content.
+$sameVersionFence = @{ version = (Get-BridgeRenderArtifact).version; hash = ('b' * 64) }
+$fenced.Policy.render = $sameVersionFence
+$fenced.Policy.highRender = $sameVersionFence
+Test-That 'an equal version with different content is still a conflict, not an advance' {
+    $refused = $null
+    try { Assert-BridgePublicationWriter -State $fenced -Component render -Artifact (Get-BridgeRenderArtifact) }
+    catch { $refused = $_ }
+    $null -ne $refused -and $refused.Exception.Data['BridgePublicationRefused'] -eq $true -and
+        $refused.Exception.Message -match 'conflicting content'
+}
+Test-That 'and an older renderer still cannot cross a newer fence' {
+    $refused = $null
+    try {
+        Assert-BridgePublicationWriter -State $fenced -Component render -Artifact @{ version = '1.0.0'; hash = ('c' * 64) }
+    }
+    catch { $refused = $_ }
+    $null -ne $refused -and $refused.Exception.Message -match 'cannot cross the publication version fence'
+}
+
 if ($script:Failures) {
     Write-Host "$($script:Failures) publication policy checks failed"
     exit 1

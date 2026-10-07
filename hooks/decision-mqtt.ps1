@@ -1499,14 +1499,18 @@ function Set-CopilotMqttActivity {
 
 function Publish-CopilotMqttDecisionFields {
     <#
-        Publishes one dropdown per field of a multi-field question, mirroring the
-        native prompt's tabbed form.
+        Publishes one dropdown per field of a question answered through its slots,
+        mirroring the native prompt's tabbed form.
 
         A multi-field form used to be flattened into the cartesian product of every
         field's options on a single dropdown - two fields of 3 and 2 options became 6
         entries, and a real one reached 9 - which is unreadable and scales terribly.
         One dropdown per field keeps each list short and matches what the terminal
         shows. The daemon injects only once every field has a selection.
+
+        A multi-select field is the one case where a slot still carries combinations,
+        because a Home Assistant select holds a single value: the card draws the
+        options as checkboxes and writes back the one label that stands for the set.
 
         Each dropdown starts on a "Choose..." placeholder so "not yet answered" is
         distinguishable from a real choice.
@@ -1585,6 +1589,39 @@ function Publish-CopilotMqttDecisionFields {
         $slotField = if ($i -le $Fields.Count) { $Fields[$i - 1] } else { $null }
         $isChoiceSlot = ($null -ne $slotField) -and -not (Test-DecisionFieldIsText -Field $slotField)
         $start = if ($isChoiceSlot) { 'Choose...' } else { 'Idle' }
+        # A multi-select whose schema already checks rows starts there, because the
+        # prompt in the terminal already does: drawing it empty showed a state the
+        # session was not in, and reaching the default set again meant ticking it all
+        # back by hand. Nothing is sent by this - Send is still the only thing that
+        # answers - and a scalar default is deliberately not treated the same way,
+        # since there it is only where the cursor sits, not what is selected.
+        if ($isChoiceSlot -and (Test-DecisionFieldIsMultiSelect -Field $slotField)) {
+            $checked = @(Get-DecisionMultiSelectChecked -Field $slotField)
+            if ($checked.Count -gt 0) {
+                $offered = @(Get-DecisionMultiSelectChoices -Field $slotField)
+                # Positions first, because they survive options of any length - but
+                # only where this field can carry positions at all. A field with an
+                # option written like a position does not publish codes, and the code
+                # generated here can be that option's own text: options 'A', 'B' and
+                # '#1,2' with 'A' and 'B' checked generate '#1,2', which is on the
+                # list as the third option's label, so the slot opened holding that
+                # option and Send submitted an answer nobody chose. The written-out
+                # form is the only carrier such a field has.
+                $candidates = @()
+                if (Test-DecisionMultiSelectCodeSafe -Field $slotField) {
+                    $candidates += (Get-DecisionMultiSelectCode -Indexes ([int[]]$checked))
+                }
+                $candidates += (Get-DecisionMultiSelectLabel -Field $slotField -Indexes ([int[]]$checked))
+                foreach ($candidate in $candidates) {
+                    # Only if it is really on the list. Selecting a value the dropdown
+                    # does not carry leaves it holding something it never offered.
+                    if (-not [string]::IsNullOrEmpty($candidate) -and $offered -contains $candidate) {
+                        $start = $candidate
+                        break
+                    }
+                }
+            }
+        }
         try {
             Invoke-HomeAssistantService -Domain 'select' -Service 'select_option' -Headers $Headers -Data @{
                 entity_id = (Get-CopilotMqttFieldEntityId -Node $node -Index $i)
@@ -1814,7 +1851,20 @@ function Set-CopilotMqttDecision {
         [string]$DecisionId,
 
         [Parameter(Mandatory)]
-        [hashtable]$Headers
+        [hashtable]$Headers,
+
+        # Published even when the answer channels could not be read first. Only for a
+        # question nothing will re-arm later - a Codex approval, answered by its own
+        # Approve/Deny tap rather than through Send or the reply card - because for
+        # everything else an unshown question is retried by the daemon, and a shown
+        # one without a snapshot cannot tell an answer from what was already there.
+        [switch]$PublishWithoutBaseline,
+
+        # The tap is the answer, so the card must not offer Send beside it. Separate
+        # from -PublishWithoutBaseline, which happens to be set by the same caller
+        # today: one is about what the daemon can verify, the other about what the
+        # card draws, and a later question could want either on its own.
+        [switch]$AnswerOnTap
     )
 
     [void](Get-DecisionSchemaFieldChoices -Field ([pscustomobject]@{ enum = @($Choices) }))
@@ -1828,16 +1878,44 @@ function Set-CopilotMqttDecision {
     }
     $topics = Get-CopilotMqttTopics -SessionId $SessionId
     $node = $topics.Node
+
+    # What the answer channels already held, recorded before anything about this
+    # question is published - not after. Once the question is on screen somebody can
+    # answer it, and an answer given before the snapshot was taken would be recorded as
+    # "what was already there" and never accepted, while the card showed it as sent.
+    # Recording first means everything the snapshot holds predates the question.
+    # Write-once and keyed by decision id, so arming the same question twice records it
+    # once and a replacement question cannot disturb it; if it cannot be established the
+    # daemon establishes it on a later pass and reads no answer until it has.
+    $baseline = Initialize-CopilotDecisionBaseline -SessionId $SessionId -DecisionId $DecisionId `
+        -PayloadEntityId "sensor.${node}_reply_payload" -SubmitEntityId "button.${node}_submit" -Headers $Headers
+    # No snapshot, no question on screen. Publishing anyway is how an answer given in
+    # the gap came to be recorded as the snapshot by the daemon's later pass and never
+    # accepted. The marker is already written, so Confirm-DaemonDecisionArmed retries
+    # both on its next pass; $null tells a caller nothing was shown. A question with no
+    # id can never have a snapshot, so it is shown as it always was.
+    if (-not $baseline.Recorded -and -not [string]::IsNullOrWhiteSpace($DecisionId) -and -not $PublishWithoutBaseline) {
+        return $null
+    }
+
     $device = New-CopilotMqttDeviceBlock -Node $node -SessionName $SessionName -Machine $Machine
     $availability = @(@{ topic = $topics.Availability; payload_available = 'online'; payload_not_available = 'offline' })
 
     $fieldList = @($Fields)
-    $isMultiField = $fieldList.Count -gt 1 -and $fieldList.Count -le $script:CopilotMqttMaxFields
+    # Every question with fields is answered through its field slots, and committed
+    # with Send. A single choice used to ride on the main selector and commit on the
+    # tap, which made the dashboard behave two different ways for no reason the
+    # person using it could see: one question sent the moment it was touched, the one
+    # beside it waited for Send. A tap is also the easiest thing to do by accident on
+    # a phone, and there was no way back from it.
+    $usesFieldSlots = $fieldList.Count -ge 1 -and $fieldList.Count -le $script:CopilotMqttMaxFields
 
-    # A multi-field question answers through its per-field dropdowns, so the main
-    # selector carries only Cancel; a single-field one keeps the full option list.
+    # A question answered through its field slots carries only Cancel on the main
+    # selector. Choices with no field behind them - a legacy `choices` argument, an
+    # MCP client, a lone Claude multi-select - still ride on it and still answer on
+    # the tap, because there is no slot to put them in.
     $options = @('Awaiting answer...')
-    if ($isMultiField) {
+    if ($usesFieldSlots) {
         $options = @('Awaiting answer...', 'Cancel request')
     }
     elseif ($Choices.Count -gt 0) {
@@ -1866,9 +1944,9 @@ function Set-CopilotMqttDecision {
     Set-CopilotMqttSelectOption -EntityId "select.${node}_decision" `
         -Option 'Awaiting answer...' -Headers $Headers | Out-Null
 
-    # Publish the per-field dropdowns for a multi-field question, and collapse them
-    # for a single-field one so a previous question's fields never linger.
-    if ($isMultiField) {
+    # Publish the per-field dropdowns for a question answered through its slots, and
+    # collapse them otherwise so a previous question's fields never linger.
+    if ($usesFieldSlots) {
         Publish-CopilotMqttDecisionFields -SessionId $SessionId -SessionName $SessionName `
             -Machine $Machine -Fields $fieldList -Headers $Headers
     }
@@ -1890,19 +1968,42 @@ function Set-CopilotMqttDecision {
         question = $fullQuestion
         choices = @($Choices)
         mode = if ($Choices.Count -gt 0 -or $fieldList.Count -gt 0) { 'multiple_choice' } else { 'freeform' }
-        multi_field = $isMultiField
-        field_count = $(if ($isMultiField) { $fieldList.Count } else { 0 })
+        multi_field = $usesFieldSlots
+        field_count = $(if ($usesFieldSlots) { $fieldList.Count } else { 0 })
         session = $SessionName
         machine = $Machine
         asked_at = [DateTimeOffset]::Now.ToString('o')
     }
+    # Whether the tap itself is the answer. A Codex approval is published without the
+    # snapshot Send is checked against, so the daemon cannot honour a press and never
+    # looks for one; drawing Send there offered a confirmation that did not exist, and
+    # invited exactly the accidental approval it looked like it prevented. A card old
+    # enough not to know this attribute goes on drawing Send, as it did before.
+    if ($AnswerOnTap) { $questionAttrs['answer_on_tap'] = $true }
     # Field labels ride on the decision attributes so the dashboard can name each
     # dropdown after its field without rebuilding the whole Lovelace config.
-    if ($isMultiField) {
+    if ($usesFieldSlots) {
         for ($fi = 1; $fi -le $fieldList.Count; $fi++) {
-            $lbl = [string]$fieldList[$fi - 1].Label
+            $slotField = $fieldList[$fi - 1]
+            $lbl = [string]$slotField.Label
             if ([string]::IsNullOrWhiteSpace($lbl)) { $lbl = "Field $fi" }
             $questionAttrs["field_${fi}_label"] = $lbl
+            if (-not (Test-DecisionFieldIsMultiSelect -Field $slotField)) { continue }
+            # The slot itself can only offer whole combinations, because a Home
+            # Assistant select holds one value. The options themselves ride here so a
+            # card new enough to draw them as checkboxes does not have to take the
+            # combination list apart again - and the separator rides with them, so the
+            # label the card writes back is built the same way this one was.
+            $questionAttrs["field_${fi}_multi"] = $true
+            $questionAttrs["field_${fi}_options"] = @($slotField.Options | ForEach-Object { [string]$_ })
+            $questionAttrs["field_${fi}_separator"] = $script:DecisionMultiSelectSeparator
+            # Whether the slot will take the answer as positions. A card old enough
+            # not to know this attribute goes on writing the words, which are still
+            # published whenever they fit; a card that does know it writes positions
+            # and so is not limited by how long somebody's options happen to be.
+            if (@(Get-DecisionMultiSelectCodes -Field $slotField).Count -gt 0) {
+                $questionAttrs["field_${fi}_codes"] = $true
+            }
         }
     }
     Publish-CopilotMqttMessage -Topic $topics.DecisionAttributes `

@@ -23,7 +23,7 @@
  * uploaded image these sit in the sensor's attributes.
  */
 
-const CARD_VERSION = '1.21.2';
+const CARD_VERSION = '1.24.0';
 
 /*
  * How large a non-image attachment may be.
@@ -845,25 +845,114 @@ class AgentBridgeActivityCard extends HTMLElement {
  * sentences for answers ran off the right edge and could not be read at all. And it
  * commits on blur, so answering meant tapping the option, tapping away, and only then
  * pressing Send. Rows wrap onto as many lines as they need, are the same on every
- * screen, and commit on the tap itself.
+ * screen, and are tapped once.
  *
- * A multi-field question publishes one select per field (`fields`), and the main
- * selector (`decision`) then carries only 'Cancel request'. Both are rendered here:
- * a labelled group of rows per armed field, then whatever the main selector offers.
- * Nothing about the answer path changes - a tap is the same `select_option` call the
- * dropdown made, on the same entity the daemon reads when Send is pressed.
+ * A question publishes one select per field (`fields`), and the main selector
+ * (`decision`) then carries only 'Cancel request'. Both are rendered here: a labelled
+ * group of rows per armed field, then whatever the main selector offers. Nothing
+ * about the answer path changes - a tap is the same `select_option` call the dropdown
+ * made, on the same entity the daemon reads when Send is pressed.
  *
  * 'Awaiting answer...' is the parked state the bridge drives the main selector to and
  * 'Choose...' is a field's, so neither is ever offered as an answer. 'Cancel request'
  * is, but as a quieter row at the bottom, because it withdraws the question rather
  * than answering it.
+ *
+ * A field that takes several of its options at once - `type: array` in an ask_user
+ * schema - is drawn as its own options with as many ticked as you like, not as the
+ * list of combinations its slot has to enumerate to hold the answer. Before 1.22.0
+ * it was those combinations, which is why "pick any of these" could only ever be
+ * answered with one of them.
+ *
+ * Picking is never sending. Every question is committed by Send answer, this card's
+ * own row from 1.22.0 - which is also what lets the reply box below stay the reply
+ * card rather than an entity row with a button beside it. Until then a single choice
+ * went the moment it was touched while the form beside it waited for Send, which is
+ * two behaviours for one gesture and no way back from the easier one to tap by
+ * accident. A selector carrying choices with no field behind it - a legacy `choices`
+ * argument, an MCP client - still answers on the tap, because there is no slot for
+ * it to wait in.
  */
 const CHOICE_PLACEHOLDER = 'Awaiting answer...';
 const CHOICE_FIELD_PLACEHOLDER = 'Choose...';
 const CHOICE_CANCEL = 'Cancel request';
+// What the bridge joins a multi-select field's picked options with. Published beside
+// the options so the label written back here is built exactly as the one the daemon
+// takes apart again; this is only the value to use when an older bridge sends none.
+const CHOICE_MULTI_SEPARATOR = ' + ';
+// Shown while a tap has been sent to Home Assistant but has not come back. Send is
+// held for exactly as long as this is on screen, so the two can never disagree.
+const CHOICE_SAVING_NOTE = 'Saving your choice...';
+// Shown when a slot has moved away from what this card last saw settle, with nothing
+// of its own outstanding to explain it - another viewer answering the same question,
+// or a state arriving out of order. The rows show what is really there; Send is held
+// until somebody looks, because committing it would send a choice nobody made here.
+const CHOICE_CHANGED_NOTE = 'Changed since you chose - check what is ticked';
+const CHOICE_SENT_NOTE = 'Sent - waiting for the session';
 // The states an entity sits in when it is carrying nothing: an unarmed field slot is
 // parked on 'Idle', and a session that has gone leaves its entity behind.
 const CHOICE_UNARMED = ['', 'Idle', 'unknown', 'unavailable'];
+// The short form a slot can hold instead of the picked options written out: '#1,3' is
+// the first and third option, one-based and ascending.
+//
+// Writing the words out is what used to cap this. A Home Assistant select holds one
+// value from a published list, so a set has to be one entry in that list, and six
+// ordinary sentence-length options joined together ran to 350 characters against a
+// 255-character entry - at which point the bridge refused the field and sent the whole
+// question to the terminal. Positions are 22 characters for all ten.
+const CHOICE_CODE_PATTERN = /^#[1-9][0-9]*(,[1-9][0-9]*)*$/;
+
+/*
+ * The picked options as positions: '#1,3'. Ascending, because that is the only order
+ * the bridge accepts and the only one it writes.
+ */
+function multiSelectCode(options, picked) {
+  const indexes = picked
+    .map((option) => options.indexOf(option))
+    .filter((i) => i >= 0)
+    .sort((a, b) => a - b);
+  if (indexes.length === 0) { return ''; }
+  return `#${indexes.map((i) => i + 1).join(',')}`;
+}
+
+/*
+ * Which of a multi-select field's options its slot currently stands for.
+ *
+ * Two carriers mean the same thing. Positions are what this card writes when the
+ * bridge says the slot will take them. The options written out and joined are what
+ * every earlier card writes, and are still published whenever they fit, so both have
+ * to read back here.
+ *
+ * Whether this field uses positions is asked *before* the value's shape, and that
+ * order matters: a field may offer an option written like a position, and for that
+ * field '#1' is the option's own text. Testing the shape first showed the first
+ * option ticked when the second was chosen.
+ *
+ * The joined form is matched whole rather than split on the separator: an option's
+ * own text may contain " + ", and then two different answers look identical. The
+ * bridge refuses to split for the same reason.
+ */
+function multiSelectPick(options, separator, state, useCodes) {
+  if (!state || options.length === 0 || options.length > 20) { return []; }
+  if (useCodes && CHOICE_CODE_PATTERN.test(state)) {
+    const seen = new Set();
+    const picked = [];
+    for (const part of state.slice(1).split(',')) {
+      const index = Number(part) - 1;
+      // Out of range or repeated is malformed, not something to make the best of:
+      // showing a set nobody picked is how a wrong answer gets sent.
+      if (!(index >= 0 && index < options.length) || seen.has(index)) { return []; }
+      seen.add(index);
+    }
+    for (const index of Array.from(seen).sort((a, b) => a - b)) { picked.push(options[index]); }
+    return picked;
+  }
+  for (let mask = 1; mask < (1 << options.length); mask++) {
+    const picked = options.filter((_, i) => mask & (1 << i));
+    if (picked.join(separator) === state) { return picked; }
+  }
+  return [];
+}
 
 class AgentBridgeChoicesCard extends HTMLElement {
   constructor() {
@@ -871,7 +960,47 @@ class AgentBridgeChoicesCard extends HTMLElement {
     this.attachShadow({ mode: 'open' });
     this._last = '';
     this._sent = '';
+    // Whether an accepted Send has committed this question's answer, and which
+    // question that was. Rows are frozen while it is set: Home Assistant had taken
+    // the press but the daemon had not yet swept, and a row changed in that window
+    // was read against the press already made - so the new value went to the session
+    // without anyone pressing Send for it, which is the one thing Send exists to
+    // prevent. The question is kept separately from the flag because a question may
+    // legitimately have no id, and '' is then the id it was committed at.
+    this._committed = false;
+    this._committedAt = '';
+    // Whether every slot that must be answered is answered, as of the last render.
+    // Only a complete form is frozen on Send: an incomplete one is refused by the
+    // daemon, which says which field it is waiting on, and freezing that would leave
+    // no way to go and answer it.
+    this._complete = false;
     this._fields = [];
+    // What has been tapped but not yet seen coming back from Home Assistant.
+    // {} when everything on screen is confirmed.
+    //
+    // Two taps in quick succession used to compute from the same state, because the
+    // second ran before the first had been pushed back: ticking Auth then Search
+    // sent "Auth" and then "Search", losing Auth. Send had the matching problem -
+    // pressed straight after a tap it committed whatever the slot still held. A
+    // service call completing and the state actually arriving are separate events,
+    // so the pending set is what later taps compose from and what holds Send.
+    this._pending = {};
+    // Counts taps, so a reply arriving late can be matched to the one that caused
+    // it. The question id cannot do that job: two taps on one question share it.
+    this._op = 0;
+    // Every write still outstanding, by entity. The pending set holds only the
+    // *latest* value asked for, so an earlier write that has not come back is
+    // invisible to it: ticking a row and unticking it leaves two calls in flight, and
+    // acknowledging the second released Send while the first could still land and tick
+    // the row back on. Send is held while anything at all is outstanding.
+    this._inflight = {};
+    // The last value this card saw a slot actually settle on. A slot that moves away
+    // from it without being asked has been changed by something else - another viewer
+    // answering the same question, or a state arriving out of order - and Send must
+    // not quietly commit that. Without this the card showed two rows ticked, became
+    // one row ticked on its own, kept Send live, and sent the one.
+    this._confirmed = {};
+    this._note = '';
   }
 
   setConfig(config) {
@@ -927,8 +1056,23 @@ class AgentBridgeChoicesCard extends HTMLElement {
           color: var(--secondary-text-color); background: none;
           min-height: 36px; font-size: 0.92em;
         }
+        /* Send answer. A form is only sent when this is pressed, so it has to read
+           as the one thing that acts rather than as another option to weigh. */
+        button.send {
+          border-color: var(--primary-color); color: var(--primary-color);
+          font-weight: 600; text-align: center; margin-top: 2px;
+        }
         /* While the answer is on its way, so a second tap cannot send another. */
         .choices.sending button { opacity: 0.5; cursor: default; pointer-events: none; }
+        /* A tap that Home Assistant has not confirmed yet. The rows stay live so a
+           choice can still be changed, but Send is held until what is on screen is
+           known to be what the daemon will read. */
+        button.send[disabled] { opacity: 0.45; cursor: default; }
+        .note {
+          font-size: 0.82em; color: var(--secondary-text-color);
+          margin: 2px 2px 0 2px; overflow-wrap: anywhere;
+        }
+        .note.err { color: var(--error-color, #ff5252); }
         [hidden] { display: none !important; }
       </style>
       <ha-card><div class="choices"></div></ha-card>`;
@@ -968,6 +1112,31 @@ class AgentBridgeChoicesCard extends HTMLElement {
 
     const decisionEntity = this._hass ? this._hass.states[this._config.decision] : undefined;
     const decisionAttrs = (decisionEntity && decisionEntity.attributes) || {};
+    // Every pending tap is tied to the question it was made on, so a question that
+    // is replaced or withdrawn can never have a stale selection sent against it.
+    const generation = String(decisionAttrs.decision_id || '');
+    for (const key of Object.keys(this._pending)) {
+      if (this._pending[key].generation !== generation) { delete this._pending[key]; }
+    }
+    // A commit belongs to the question it answered. A replacement question must be
+    // answerable, and the press that settled the previous one says nothing about it.
+    if (this._committed && this._committedAt !== generation) {
+      this._committed = false;
+      this._committedAt = '';
+    }
+    // A write still in flight for a question that has been replaced cannot answer the
+    // one now on screen, so it must not hold its Send either. Home Assistant refuses
+    // a value the republished slot no longer offers, so it cannot quietly land in it.
+    for (const key of Object.keys(this._inflight)) {
+      const set = this._inflight[key];
+      for (const op of Object.keys(set)) {
+        if (set[op] !== generation) { delete set[op]; }
+      }
+      if (Object.keys(set).length === 0) { delete this._inflight[key]; }
+    }
+    for (const key of Object.keys(this._confirmed)) {
+      if (this._confirmed[key].generation !== generation) { delete this._confirmed[key]; }
+    }
 
     // Fields first, then whatever the main selector offers - which on a form is only
     // 'Cancel request'. A field group is shown only while it is carrying options, so
@@ -983,6 +1152,26 @@ class AgentBridgeChoicesCard extends HTMLElement {
       const armed = this._armed(entityId);
       if (!armed) { return; }
       armed.label = String(decisionAttrs[`field_${i + 1}_label`] || '');
+      // A multi-select slot can only hold whole combinations, because a Home
+      // Assistant select holds one value. What it is really offering rides on the
+      // decision attributes beside the heading, so the rows drawn here are those
+      // options and the slot is given the one label that stands for what is ticked.
+      if (decisionAttrs[`field_${i + 1}_multi`]) {
+        const base = []
+          .concat(decisionAttrs[`field_${i + 1}_options`] || [])
+          .map(String)
+          .filter(Boolean);
+        if (base.length > 0) {
+          armed.multi = true;
+          armed.separator = String(decisionAttrs[`field_${i + 1}_separator`] || CHOICE_MULTI_SEPARATOR);
+          // Whether this slot will take positions. Absent from an older bridge, which
+          // only ever published the options written out, so the words stay the default.
+          armed.codes = !!decisionAttrs[`field_${i + 1}_codes`];
+          armed.slotOptions = armed.options;
+          armed.options = base;
+          armed.picked = multiSelectPick(base, armed.separator, armed.chosen, armed.codes);
+        }
+      }
       fields.push(armed);
     });
 
@@ -990,29 +1179,114 @@ class AgentBridgeChoicesCard extends HTMLElement {
     const groups = fields.slice();
     if (decision) { groups.push(Object.assign({}, decision, { isDecision: true })); }
 
+    // Send answer commits whatever is ticked. It is drawn whenever the view has
+    // given this card a submit entity and there is something to commit - a field, or
+    // a main selector carrying its own choices, which is the legacy and lone-Claude
+    // shape. Cancel is not one of those: withdrawing a question is its own act.
+    const commits = fields.length > 0 ||
+      !!(decision && decision.options.some((o) => o !== CHOICE_CANCEL));
+    // Unless the tap is itself the answer. A Codex approval is published without the
+    // snapshot a press is checked against, so the daemon acts on Approve or Deny the
+    // moment it sees it and never looks for a press. Drawing Send beside that offered
+    // a confirmation step that did not exist: the command was already approved by the
+    // tap somebody made expecting to review it first.
+    const tapAnswers = decisionAttrs.answer_on_tap === true;
+    const sends = !!(this._config.submit && commits && !tapAnswers);
+    // Which groups have to be answered before the daemon will take the form. The
+    // decision selector carrying only Cancel is not one of them - on a form question
+    // the fields are the answer and it stays on its placeholder throughout.
+    const mustAnswer = groups.filter((g) => g.options.some((o) => o !== CHOICE_CANCEL));
+    this._complete = mustAnswer.length > 0 && mustAnswer.every((g) => g.chosen !== '');
+
     const show = groups.length > 0;
     this.hidden = !show;
-    if (!show) { this._sent = ''; return; }
+    if (!show) {
+      this._sent = ''; this._committed = false; this._committedAt = '';
+      this._pending = {}; this._inflight = {}; this._note = '';
+      return;
+    }
+
+    // What has been tapped and not yet confirmed. A slot is only settled once Home
+    // Assistant has both accepted the call and shown the value it was asked for.
+    //
+    // Matching the state alone released it too early in two ways. Toggling a row on
+    // and straight back off asks for the value the slot already holds, so it looked
+    // settled before the untick had been accepted at all - and if that call then
+    // failed, Send went with the row still ticked underneath. An older acknowledgement
+    // arriving after a newer tap did the same thing from the other direction.
+    for (const group of groups) {
+      const pending = this._pending[group.entityId];
+      if (!pending) { continue; }
+      if (pending.acked && pending.value === group.state) {
+        delete this._pending[group.entityId];
+        // Seen to land. From here, anything that moves it is something else.
+        this._confirmed[group.entityId] = { value: group.state, generation };
+      }
+      else if (group.multi) { group.picked = pending.picked.slice(); }
+      else { group.chosen = pending.value; }
+    }
+
+    // What a slot held when this card first drew it counts as confirmed too: it is
+    // what the person is looking at, including a schema default that arrived already
+    // ticked.
+    for (const group of groups) {
+      if (this._confirmed[group.entityId]) { continue; }
+      if (this._pending[group.entityId] || this._inflight[group.entityId]) { continue; }
+      this._confirmed[group.entityId] = { value: group.state, generation };
+    }
+
+    // A slot that has moved away from what was confirmed, with nothing of this card's
+    // outstanding to explain it. The rows below show what is really there - that part
+    // was never wrong - but Send is held and says why, because committing it would
+    // send something nobody on this card chose. Tapping adopts it and clears this.
+    const diverged = groups.filter((g) => {
+      const seen = this._confirmed[g.entityId];
+      if (!seen || this._pending[g.entityId] || this._inflight[g.entityId]) { return false; }
+      return seen.value !== g.state;
+    });
+    const waiting = Object.keys(this._pending).length > 0 || Object.keys(this._inflight).length > 0;
+    if (!waiting && this._note === CHOICE_SAVING_NOTE) { this._note = ''; }
+    if (waiting && !this._note) { this._note = CHOICE_SAVING_NOTE; }
+    // Nothing of ours outstanding, so this is the one thing worth saying.
+    if (!waiting) {
+      if (diverged.length > 0) { this._note = CHOICE_CHANGED_NOTE; }
+      else if (this._note === CHOICE_CHANGED_NOTE) { this._note = ''; }
+    }
+    const held = waiting || diverged.length > 0 || this._committed;
 
     // The answer has landed once the selector is no longer parked on the placeholder.
     if (this._sent && (!decision || decision.state !== CHOICE_PLACEHOLDER)) { this._sent = ''; }
-    this._els.list.classList.toggle('sending', !!this._sent);
+    // Committed says the press was taken and the rows are no longer yours to change.
+    // Not released by the selector moving, the way Cancel is: on a form question the
+    // selector never leaves its placeholder, and the thing that ends this question is
+    // the daemon clearing it, which hides the card and resets this with it.
+    if (this._committed) { this._note = CHOICE_SENT_NOTE; }
+    else if (this._note === CHOICE_SENT_NOTE) { this._note = ''; }
+    this._els.list.classList.toggle('sending', !!this._sent || this._committed);
 
     // Every field's current value is in the signature, so picking one redraws the
     // form and the tick moves. Without it the card short-circuits on an unchanged
-    // option list and a tap appears to do nothing at all.
+    // option list and a tap appears to do nothing at all. The pending set and the
+    // note are in it too, so holding Send and saying why are drawn as they happen.
     const signature = groups
-      .map((g) => `${g.entityId}\u0002${g.chosen}\u0002${g.label}\u0002${g.options.join('\u0001')}`)
-      .join('\u0003');
+      .map((g) => `${g.entityId}\u0002${g.chosen}\u0002${g.label}\u0002${g.multi ? 'm' : 's'}\u0002${g.options.join('\u0001')}\u0002${g.multi ? g.picked.join('\u0001') : ''}`)
+      .join('\u0003') + `\u0004${sends}\u0004${held}\u0004${this._note}\u0004${this._committed}`;
     if (signature === this._last) { return; }
     this._last = signature;
 
     this._els.list.textContent = '';
+    let cancel = null;
     for (const group of groups) {
-      if (group.label) {
+      // Only when it says something the rows do not. A lone single-choice group's
+      // heading is the field name, which on its own card only repeats the question
+      // already above it; "(pick any)" is the one thing no row can say.
+      const heading = group.label && (group.multi || fields.length > 1)
+        ? (group.multi ? `${group.label} (pick any)` : group.label)
+        : '';
+      if (heading) {
         const label = document.createElement('div');
         label.classList.add('label');
-        label.textContent = group.label;
+        label.textContent = heading;
         this._els.list.appendChild(label);
       }
       for (const option of group.options) {
@@ -1020,28 +1294,172 @@ class AgentBridgeChoicesCard extends HTMLElement {
         button.type = 'button';
         button.textContent = option;
         if (option === CHOICE_CANCEL) { button.classList.add('cancel'); }
-        else if (option === group.chosen) { button.classList.add('chosen'); }
+        else if (group.multi ? group.picked.indexOf(option) >= 0 : option === group.chosen) {
+          button.classList.add('chosen');
+        }
         button.addEventListener('click', () => this._choose(group, option));
+        // Held back so it stays the quiet last row. Send is the thing being looked
+        // for after a tap; withdrawing the question is not, and putting it in
+        // between would make it the easiest row to hit by mistake.
+        if (option === CHOICE_CANCEL) { cancel = button; continue; }
         this._els.list.appendChild(button);
       }
+    }
+    if (sends) {
+      const send = document.createElement('button');
+      send.type = 'button';
+      send.classList.add('send');
+      send.textContent = 'Send answer';
+      if (held) { send.setAttribute('disabled', 'disabled'); }
+      send.addEventListener('click', () => this._send());
+      this._els.list.appendChild(send);
+    }
+    if (cancel) { this._els.list.appendChild(cancel); }
+    if (this._note) {
+      const note = document.createElement('div');
+      note.className = this._note === CHOICE_SAVING_NOTE ? 'note' : 'note err';
+      note.textContent = this._note;
+      this._els.list.appendChild(note);
     }
   }
 
   /*
-   * A tap on the main selector answers the question outright, so the rows are locked
-   * until the daemon clears it. A tap on a field does not: a form is sent by Send,
-   * and every field must stay changeable until then.
+   * A tap changes what will be sent; it does not send. Everything waits for Send
+   * answer now - a single choice, a whole form, and a multi-select field's rows,
+   * which tick and untick until they say what you mean. Only Cancel still acts on
+   * the tap, because withdrawing a question is a deliberate act in itself.
+   *
+   * The tap composes from the pending set rather than from the entity, so two taps
+   * in a row build one answer instead of the second overwriting the first.
    */
   _choose(group, option) {
-    if (this._sent || !this._hass) { return; }
-    if (group.isDecision) {
+    if (this._sent || this._committed || !this._hass) { return; }
+    const generation = String(
+      ((this._hass.states[this._config.decision] || {}).attributes || {}).decision_id || '');
+    // Each tap is its own operation. The question id alone is not enough to tell
+    // them apart: two taps on the same question share it, so a rejection arriving
+    // late for the first used to delete the second's tick and send the answer
+    // without it.
+    const op = ++this._op;
+    let value = option;
+    let picked = null;
+    if (group.multi) {
+      picked = group.picked.indexOf(option) >= 0
+        ? group.picked.filter((o) => o !== option)
+        : group.options.filter((o) => group.picked.indexOf(o) >= 0 || o === option);
+      // Nothing ticked is not an answer, so the slot goes back to its placeholder and
+      // the daemon reads the field as still unanswered rather than as an empty set.
+      if (picked.length === 0) { value = CHOICE_FIELD_PLACEHOLDER; }
+      // Positions where the bridge said the slot will take them, because the options
+      // written out may be far longer than a select entry can hold - which is what
+      // used to send an ordinarily-worded question to the terminal instead.
+      else if (group.codes) { value = multiSelectCode(group.options, picked); }
+      else { value = picked.join(group.separator); }
+    }
+    else if (group.isDecision && option === CHOICE_CANCEL) {
       this._sent = option;
       this._els.list.classList.add('sending');
     }
-    this._hass.callService('select', 'select_option', {
-      entity_id: group.entityId,
-      option,
-    });
+
+    if (!(group.isDecision && option === CHOICE_CANCEL)) {
+      this._pending[group.entityId] = { value, picked: picked || [], generation, op, acked: false };
+      this._note = CHOICE_SAVING_NOTE;
+      this._last = '';
+      this._render();
+    }
+
+    let call;
+    try { call = this._hass.callService('select', 'select_option', { entity_id: group.entityId, option: value }); }
+    catch (err) { this._failPending(group.entityId, op, err); return; }
+    if (!call || typeof call.then !== 'function') { return; }
+    this._track(group.entityId, op, true, generation);
+    call.then(
+      () => {
+        // Accepted. Only this tap's own acknowledgement counts: an older one arriving
+        // after a newer tap must not settle the newer one. Usually the new state
+        // arrives separately and clears it, but when the slot already held the value
+        // nothing further is coming, so this redraw is what stops Send being held for
+        // ever.
+        this._track(group.entityId, op, false);
+        const pending = this._pending[group.entityId];
+        if (pending && pending.op === op) { pending.acked = true; }
+        this._last = '';
+        this._render();
+      },
+      // A rejected call must take its own tick back with it, and only its own.
+      (err) => { this._track(group.entityId, op, false); this._failPending(group.entityId, op, err); });
+  }
+
+  /* Adds or removes one outstanding write, tied to the question it was made on. */
+  _track(entityId, op, outstanding, generation) {
+    const set = this._inflight[entityId] || (this._inflight[entityId] = {});
+    if (outstanding) { set[op] = generation; }
+    else { delete set[op]; }
+    if (Object.keys(set).length === 0) { delete this._inflight[entityId]; }
+  }
+
+  /*
+   * Drops a tap Home Assistant would not take, and says so.
+   *
+   * Only if that exact tap is still the pending one. An older failure arriving after
+   * a newer tap must leave the newer tick alone: clearing it would show the answer
+   * as saved while the card quietly held something else.
+   */
+  _failPending(entityId, op, err) {
+    const pending = this._pending[entityId];
+    if (!pending || pending.op !== op) { return; }
+    delete this._pending[entityId];
+    this._note = `Home Assistant would not take that: ${describeThrown(err)}`;
+    this._last = '';
+    this._render();
+  }
+
+  /*
+   * Sends the answer. Held while anything is still unconfirmed, because pressing it
+   * then would commit whatever the slot held before the last tap.
+   *
+   * Deliberately not locked the way Cancel is: the daemon refuses an incomplete form
+   * and says which field is still waiting, and a row that had locked itself would
+   * leave no way to go and answer it. A press Home Assistant refuses is said out
+   * loud for the same reason - a Send that silently did nothing is indistinguishable
+   * from one the session is still thinking about.
+   */
+  _send() {
+    if (this._sent || this._committed || !this._hass || !this._config.submit) { return; }
+    // Nothing outstanding, in either sense: no tap waiting to be shown, and no write
+    // still in flight that could land afterwards and change what is about to be sent.
+    if (Object.keys(this._pending).length > 0) { return; }
+    if (Object.keys(this._inflight).length > 0) { return; }
+    // And nothing has moved under us since we last saw a slot settle. The row is
+    // drawn disabled for this too, but a press can arrive from a keyboard or a stale
+    // click, and sending a choice nobody made here is exactly what must not happen.
+    if (this._note === CHOICE_CHANGED_NOTE) { return; }
+    const generation = String(
+      ((this._hass.states[this._config.decision] || {}).attributes || {}).decision_id || '');
+    // Frozen as the press is dispatched, not when Home Assistant acknowledges it.
+    // callService is a promise, and a tap landing while it was in flight reached the
+    // selector before the daemon read it - so the daemon submitted the changed value
+    // against a press made for the previous one, and the freeze then arrived too late
+    // and locked in what had already been changed.
+    if (this._complete) {
+      this._committed = true;
+      this._committedAt = generation;
+      this._last = '';
+      this._render();
+    }
+    let call;
+    try { call = this._hass.callService('button', 'press', { entity_id: this._config.submit }); }
+    catch (err) { this._failSend(err); return; }
+    if (call && typeof call.then === 'function') { call.then(() => {}, (err) => this._failSend(err)); }
+  }
+
+  _failSend(err) {
+    // Released on purpose, so the press can be tried again: nothing was sent.
+    this._committed = false;
+    this._committedAt = '';
+    this._note = `Send failed: ${describeThrown(err)}`;
+    this._last = '';
+    this._render();
   }
 }
 

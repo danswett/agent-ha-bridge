@@ -28,7 +28,7 @@ prompt, so the terminal never stops working and nothing is ever answered twice.
 | **Live activity** | Each session streams its status, current tool, and last response to its card. |
 | **Background agents** | A session whose turn has ended while agents it started are still running reads *waiting for N background agents*, not *idle*. |
 | **Detailed activity** | Cards carry the model's reasoning and every tool call; fold a session card to keep it short. Off with `detailedActivity: false`. |
-| **Real forms** | Multi-field questions become one dropdown per field plus a Send button. |
+| **Real forms** | Every question becomes rows you tap plus a Send button; multi-select questions take as many options as you like. |
 | **Continuation** | Reply to a finished turn from your phone; it's typed into the session. |
 | **Paste an image** | Paste or attach a screenshot in the reply box and it's attached to the prompt. |
 | **Attach a file** | Attach a document, log or diff the same way; up to 256 KB travels in the reply itself. |
@@ -1368,13 +1368,46 @@ Two `ask_user` argument shapes are handled. Current builds pass **`message`** pl
 (with optional `enumNames`), `oneOf: [{const, title}]`, multi-select `items.enum` /
 `items.anyOf`, and `type: boolean` (Yes/No).
 
-* A **single-field** form becomes one dropdown.
-* A **multi-field** form (up to 4 fields) becomes one dropdown per field plus Send, so
-  every combination stays reachable without a combinatorial option list.
-* Larger forms fall back to freeform, with the question carrying a numbered outline of
-  every field and its options, marking any default.
+* Every form, down to a **single field**, becomes one labelled group of rows per field
+  plus **Send answer**. Nothing sends itself on a tap: picking changes what will be
+  sent, and Send sends it.
+* A **multi-select** field (`type: array`) draws its options as checkboxes - tap to
+  tick, tap again to untick, send as many as you like. A schema default arrives with
+  those rows already ticked, exactly as the terminal shows them, and sending it
+  untouched types nothing at all. A Home Assistant select holds one value, so the slot
+  behind it has to enumerate every combination: up to **ten options**. Beyond that the
+  question says to answer it in the terminal rather than offering a list that could
+  only take one.
+* **The set rides as positions, not as words.** A slot carries `#1,3` rather than the
+  picked options joined together. Spelling them out meant a select entry had to hold
+  every chosen option's full text, and six ordinarily-worded options ran to 350
+  characters against Home Assistant's 255 - so perfectly normal questions were refused
+  and sent to the terminal. Positions are 22 characters for all ten, so how long
+  somebody's options happen to be no longer decides whether the question is answerable.
+  Both forms are published while they fit, so a card older than 1.23.0 goes on writing
+  the words and is understood; where the words are too long to be offered at all, an
+  older card cannot answer that one question and says so rather than failing silently.
+* **One rough edge, written down rather than smoothed over.** On a question whose
+  options are too long for the written-out form, a card older than 1.22.0 draws the
+  slot's own entries - so it shows `#1`, `#2`, `#1,2` and so on, which mean nothing to
+  read. Anything tapped there still answers correctly, and before this change the
+  question did not reach the dashboard at all, so it is a gain; but the readable fix
+  is to serve a current card.
+* **Up to 4 fields.** Larger forms fall back to freeform, with the question carrying a
+  numbered outline of every field and its options, marking any default.
+* **Typing is answering.** Every Copilot option list ends in "Other (type your
+  answer)", so words typed into the reply box and sent answer a choice question
+  through that entry. Where they cannot be used - a form with no free-text field, or
+  a choice already tapped - the card says so rather than dropping them.
 * Questions are carried up to 6,000 characters and each choice up to 600; anything
   longer is truncated and the card says so.
+* **An answer is read by identity, never by a clock.** As a question is armed the
+  bridge records what the reply card and the Send button already held, in a file of
+  its own named for that question, written once. Only something determinately
+  different from that counts as an answer: a channel nobody could read is not an
+  empty one, and nothing is read until it can be. Comparing timestamps instead meant
+  a browser running behind left every typed answer looking old, and one running
+  ahead answered the next question with the last one's text.
 
 A malformed `ask_user` call is repaired before publishing. When a model fails to close
 the tool-call markup, the closing tag and later parameters get swallowed into the

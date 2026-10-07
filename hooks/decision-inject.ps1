@@ -39,7 +39,9 @@ function Invoke-BridgeConsoleSend {
     if (-not $script:BridgeIsWindows) {
         return Send-BridgeTmuxText -ProcessId $ProcessId -Text $Text -Submit:$Submit -SubmitDelayMs $DelayMs
     }
-    Initialize-CopilotConsoleInjector
+    # A failed compile has typed nothing, so it says so rather than throwing past the
+    # caller's write boundary as though a key might have gone.
+    try { Initialize-CopilotConsoleInjector } catch { return "init-failed:$($_.Exception.Message)" }
     [string][CopilotCli.ConsoleInjector]::Send([uint32]$ProcessId, $Text, $Submit, $DelayMs)
 }
 
@@ -54,8 +56,29 @@ function Invoke-BridgeConsoleChoice {
     if (-not $script:BridgeIsWindows) {
         return Send-BridgeTmuxChoice -ProcessId $ProcessId -DownCount $DownCount -Text $Text -StepDelayMs $StepDelayMs
     }
-    Initialize-CopilotConsoleInjector
+    try { Initialize-CopilotConsoleInjector } catch { return "init-failed:$($_.Exception.Message)" }
     [string][CopilotCli.ConsoleInjector]::SendChoice([uint32]$ProcessId, $DownCount, $Text, $StepDelayMs)
+}
+
+function Test-BridgeConsoleOutcomeBeforeWrite {
+    <#
+        Whether a console send failed before it wrote anything.
+
+        Only the outcomes each transport returns ahead of its first write count:
+        compiling the injector, attaching to the console and opening its input on
+        Windows; finding tmux and the session's pane on macOS. Anything else - a
+        failure part-way through, a partial write, an exception - is read as possibly
+        written, because releasing a question that was half typed is what lets a second
+        answer land on top of the first.
+
+        Without this every failure with a live target pid read as written, so a console
+        that could not even be attached settled the attempt as 'unknown' and the
+        question was never retried, though no key had reached it.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Outcome)
+
+    if ([string]::IsNullOrEmpty($Outcome)) { return $false }
+    ($Outcome -match '^(init-failed|attach-failed|conin-failed)(:|$)') -or ($Outcome -cin @('no-tmux', 'not-in-tmux'))
 }
 
 function Initialize-CopilotConsoleInjector {
@@ -498,6 +521,12 @@ function Send-CopilotSessionPrompt {
         Delivered = $false
         ProcessId = $null
         Detail = ''
+        # Whether anything was written to the console. Set at the write boundary, not
+        # worked out afterwards from the wording of a failure: once a key has gone
+        # nobody can say how much of the answer landed, and the difference between
+        # "nothing happened" and "something may have" is what decides whether the
+        # question may be answered again.
+        Wrote = $false
     }
 
     if ([string]::IsNullOrWhiteSpace($Text)) {
@@ -521,8 +550,13 @@ function Send-CopilotSessionPrompt {
     $clean = Get-CopilotInjectableText -Text $Text
 
     try {
+        # From here nobody can say how much landed, so it is recorded before the write
+        # rather than worked out afterwards from how it failed - except for the outcomes
+        # the transport only ever returns ahead of its first write.
+        $result.Wrote = $true
         $outcome = Invoke-BridgeConsoleSend -ProcessId $targetPid -Text $clean `
             -Submit (-not $NoSubmit.IsPresent) -DelayMs $SubmitDelayMs
+        if (Test-BridgeConsoleOutcomeBeforeWrite -Outcome $outcome) { $result.Wrote = $false }
         $result.Detail = $outcome
         $result.Delivered = $outcome.StartsWith('ok:')
     }
@@ -554,9 +588,9 @@ function Get-BridgeFormPayloads {
         is not one of its field's options.
 
         Keys is the payload split into the separate writes it has to be delivered in:
-        one entry for most fields, one per toggle plus the walk to Submit for a
-        multi-select one, which cannot be delivered in a single write (see
-        Send-CopilotSessionForm).
+        one entry for most fields, and one per toggle for a multi-select one - the
+        walk to Submit for Claude, the Space presses themselves for Copilot - which
+        cannot be delivered in a single write (see Send-CopilotSessionForm).
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Fields,
@@ -582,21 +616,79 @@ function Get-BridgeFormPayloads {
         $options = @($Fields[$i].Options | ForEach-Object { [string]$_ })
         [void](Get-DecisionSchemaFieldChoices -Field ([pscustomobject]@{ enum = $options }))
 
-        # A multi-select field is a checkbox list, not a cursor. Its options are
-        # numbered on screen and typing a number toggles that one, wherever the cursor
-        # happens to be - which is both simpler and safer than counting Down presses.
-        # Then Down once per row (the options plus the "Type something" row) lands on
-        # Submit, and the caller's Enter presses it.
-        #
-        # Verified live against Claude Code 2.1.273 on two- and three-option questions:
-        # "2" then "3" checked exactly Billing and Search, four Downs highlighted
-        # Submit, and Claude recorded "Billing, Search". Tab was tried as a way to
-        # reach Submit without counting - the decompiled handler ignores it once Submit
-        # has focus - but overshooting with Tab tore the prompt down, so the count is
-        # exact and deliberate.
+        # A multi-select field is a checkbox list, not a cursor, and the two clients
+        # draw a different one (Get-DecisionMultiSelectStyle).
         if (Test-DecisionFieldIsMultiSelect -Field $Fields[$i]) {
             $picked = @(Resolve-DecisionMultiSelectChoice -Field $Fields[$i] -Choice ([string]$Selections[$i]))
             if ($picked.Count -eq 0) { throw "combination '$($Selections[$i])' not found in field $i" }
+
+            if ((Get-DecisionMultiSelectStyle -Field $Fields[$i]) -eq 'space-toggle') {
+                # Copilot CLI: "↑/↓ select · space toggle · enter accept". There is no
+                # Submit row and no numbers - the caller's Enter accepts whatever is
+                # checked - so this walks the list once, top to bottom, pressing Space
+                # only on the rows whose state has to change.
+                #
+                # Which rows those are depends on the schema default, because the
+                # prompt opens with those already checked. Toggling every wanted
+                # option blindly would switch a defaulted one back off, and the result
+                # comes back in selection order rather than display order, so nothing
+                # downstream would make the swap obvious.
+                $wanted = [Collections.Generic.HashSet[int]]::new()
+                foreach ($option in $picked) {
+                    $at = [Array]::IndexOf($options, [string]$option)
+                    if ($at -lt 0) { throw "option '$option' is not in field $i" }
+                    [void]$wanted.Add($at)
+                }
+                $checked = [Collections.Generic.HashSet[int]]::new()
+                foreach ($at in @(Get-DecisionMultiSelectChecked -Field $Fields[$i])) { [void]$checked.Add($at) }
+
+                # The cursor opens on the field's initial focus and only ever moves
+                # down, so the rows are visited in order and no walk can overshoot.
+                $cursor = 0
+                if ($Fields[$i].PSObject.Properties['DefaultIndex']) {
+                    $cursor = $Fields[$i].DefaultIndex
+                    if ($cursor -isnot [int] -and $cursor -isnot [long]) { throw "invalid initial focus in field $i" }
+                    if ($cursor -lt 0 -or $cursor -ge $options.Count) { throw "initial focus outside field $i" }
+                }
+                $keys = New-Object System.Collections.Generic.List[string]
+                # The cursor only moves down, so anything already checked above where
+                # it opens could never be unchecked. That cannot happen while an array
+                # field's focus is its first row, and this is here so it stays a
+                # refusal rather than a quietly wrong answer if that ever changes.
+                foreach ($row in @($checked)) {
+                    if ($row -lt $cursor -and -not $wanted.Contains($row)) {
+                        throw "field $i opens with an option checked above its focus"
+                    }
+                }
+                for ($row = $cursor; $row -lt $options.Count; $row++) {
+                    if ($wanted.Contains($row) -eq $checked.Contains($row)) { continue }
+                    $keys.Add((($esc + '[B') * ($row - $cursor)) + ' ')
+                    $cursor = $row
+                }
+                # Nothing to toggle: the defaults already are the answer, and the
+                # caller's Enter accepts them untouched.
+                if ($keys.Count -eq 0) { $keys.Add('') }
+                [pscustomobject]@{
+                    Payload = ($keys -join '')
+                    Keys    = $keys.ToArray()
+                    IsText  = $false
+                    Index   = -1
+                }
+                continue
+            }
+
+            # Claude Code: its options are numbered on screen and typing a number
+            # toggles that one, wherever the cursor happens to be - which is both
+            # simpler and safer than counting Down presses. Then Down once per row
+            # (the options plus the "Type something" row) lands on Submit, and the
+            # caller's Enter presses it.
+            #
+            # Verified live against Claude Code 2.1.273 on two- and three-option
+            # questions: "2" then "3" checked exactly Billing and Search, four Downs
+            # highlighted Submit, and Claude recorded "Billing, Search". Tab was tried
+            # as a way to reach Submit without counting - the decompiled handler
+            # ignores it once Submit has focus - but overshooting with Tab tore the
+            # prompt down, so the count is exact and deliberate.
             $keys = New-Object System.Collections.Generic.List[string]
             foreach ($option in $picked) {
                 $at = [Array]::IndexOf($options, [string]$option)
@@ -675,7 +767,7 @@ function Send-CopilotSessionForm {
         [int]$ProcessId = 0
     )
 
-    $result = [pscustomobject]@{ Delivered = $false; ProcessId = $null; Detail = '' }
+    $result = [pscustomobject]@{ Delivered = $false; ProcessId = $null; Detail = ''; Wrote = $false }
 
     if ($Fields.Count -eq 0 -or $Selections.Count -ne $Fields.Count) {
         $result.Detail = "field/selection mismatch ($($Fields.Count)/$($Selections.Count))"
@@ -726,6 +818,10 @@ function Send-CopilotSessionForm {
         # committing Enter delivered together - the same shape Send already uses for a
         # reply, which is the delivery path with a long record of working.
         $outcome = 'ok:form'
+        # Whether any earlier write in this walk may have landed. A pre-write failure
+        # only means nothing was typed when it is the very first write of the walk;
+        # after that the earlier fields are on the screen whatever this one did.
+        $earlier = $false
         for ($i = 0; $i -lt $steps.Count; $i++) {
             # A multi-select field needs each toggle in its own attach-write-detach.
             # Delivered as one write - the digits and the walk to Submit together -
@@ -737,7 +833,10 @@ function Send-CopilotSessionForm {
             $failed = $false
             for ($k = 0; $k -lt $keys.Count; $k++) {
                 $isLast = ($k -eq ($keys.Count - 1))
+                $result.Wrote = $true
                 $r = Invoke-BridgeConsoleSend -ProcessId $targetPid -Text $keys[$k] -Submit $isLast -DelayMs $StepDelayMs
+                if (-not $earlier -and (Test-BridgeConsoleOutcomeBeforeWrite -Outcome $r)) { $result.Wrote = $false }
+                $earlier = $true
                 if (-not $r.StartsWith('ok')) { $outcome = "field${i}:$r"; $failed = $true; break }
                 if (-not $isLast) { Start-Sleep -Milliseconds $script:BridgeFormKeyGapMs }
             }
@@ -793,6 +892,12 @@ function Send-CopilotSessionChoice {
         Delivered = $false
         ProcessId = $null
         Detail = ''
+        # Whether anything was written to the console. Set at the write boundary, not
+        # worked out afterwards from the wording of a failure: once a key has gone
+        # nobody can say how much of the answer landed, and the difference between
+        # "nothing happened" and "something may have" is what decides whether the
+        # question may be answered again.
+        Wrote = $false
     }
 
     if ([string]::IsNullOrWhiteSpace($Text)) {
@@ -814,7 +919,12 @@ function Send-CopilotSessionChoice {
     $downs = [Math]::Max(1, $ChoiceCount + 2)
 
     try {
+        # From here nobody can say how much landed, so it is recorded before the write
+        # rather than worked out afterwards from how it failed - except for the outcomes
+        # the transport only ever returns ahead of its first write.
+        $result.Wrote = $true
         $outcome = Invoke-BridgeConsoleChoice -ProcessId $targetPid -DownCount $downs -Text $clean -StepDelayMs $StepDelayMs
+        if (Test-BridgeConsoleOutcomeBeforeWrite -Outcome $outcome) { $result.Wrote = $false }
         $result.Detail = $outcome
         $result.Delivered = $outcome.StartsWith('ok:')
     }

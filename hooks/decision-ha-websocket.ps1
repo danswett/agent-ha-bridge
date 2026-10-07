@@ -6,7 +6,13 @@
 #>
 
 . (Join-Path $PSScriptRoot 'bridge-secrets.ps1')
-$script:BridgeDashboardRenderVersion = '1.1.0'
+# 1.2.0, not 1.1.0: Save-CopilotSessionDashboard is one of the helpers
+# Get-BridgeRenderArtifact fingerprints, and the choices/send/reply-box configuration
+# it emits changed. Left at 1.1.0 the fence sees a new hash at the same version,
+# which is the definition of a conflict there - so on any installation already fenced
+# at the old renderer, publication is refused and the new card configuration can
+# never reach the dashboard without an operator pin nobody should have to take.
+$script:BridgeDashboardRenderVersion = '1.2.0'
 $script:BridgeDashboardObservation = $null
 
 function Invoke-CopilotHaWebSocket {
@@ -2092,6 +2098,10 @@ ha-select, mwc-select { width: 100%; }
         # order, which is what lines each group up with the field_<n>_label attribute
         # carrying its heading and with the slot Read-DaemonFormAnswer reads.
         $formCard = Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.15.0'
+        # From 1.22.0 the card also draws a multi-select field as checkboxes and owns
+        # Send answer, which is what lets the reply box below stay the reply card even
+        # while a question is waiting (see $replyCard).
+        $cardOwnsSend = Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.22.0'
         $answerInner = @{
             type = 'entities'
             show_header_toggle = $false
@@ -2109,6 +2119,7 @@ ha-select, mwc-select { width: 100%; }
                     1..$script:CopilotMqttMaxFields | ForEach-Object { Get-CopilotMqttFieldEntityId -Node $node -Index $_ }
                 )
             }
+            if ($cardOwnsSend) { $answerInner.submit = "button.${node}_submit" }
         }
         $answerConditions = @(
             @{ condition = 'state'; entity = $decisionEntity; state_not = 'Idle' }
@@ -2254,8 +2265,7 @@ ha-card {
             'hui-generic-entity-row$' = 'state-badge { display: none !important; } .info { display: none !important; }'
         }
 
-        # Two shapes of reply box, chosen by whether Home Assistant is serving the
-        # bridge's own card.
+        # The reply box, in two shapes, chosen by which card Home Assistant serves.
         #
         # The card is much the better of the two: it reads the textarea at the moment
         # Send is pressed, so one press is always enough, it publishes over MQTT so a
@@ -2263,25 +2273,20 @@ ha-card {
         # can carry pasted images. The text box below is kept as a fallback because a
         # view referencing a custom card that is not installed renders an error box
         # instead of a reply box, which would leave no way to reply at all.
-        # The reply box, in two shapes.
         #
-        # The card is much the better of the two for an ordinary reply: it reads the
-        # textarea at the moment Send is pressed, so one press is always enough, it
-        # publishes over MQTT so a reply is not limited to the 255 characters an entity
-        # state allows, and it can carry pasted images.
+        # Until card 1.22.0 the entity pair was also what every armed question got,
+        # and that was not a styling detail. A question was answered through the
+        # entities - the daemon read the free-text field from text.<node>_reply and
+        # waited for a press on button.<node>_submit - and the card wrote neither: its
+        # Send publishes an MQTT payload, which the reply path deliberately ignores
+        # while a question owns the box. Its Send also returns early on an empty
+        # textarea, so a form whose only text field is optional could not be sent at
+        # all. The result was a form that looked ready, took every dropdown, and did
+        # nothing whatsoever on Send - silently, with not one line in the daemon log,
+        # because nothing ever arrived to log.
         #
-        # It cannot answer a question, though, and that is not a styling detail. A
-        # question is answered through the entities - the daemon reads the free-text
-        # field from text.<node>_reply and waits for a press on button.<node>_submit -
-        # and the card writes neither: its Send publishes an MQTT payload, which the
-        # reply path deliberately ignores while a question owns the box. Its Send also
-        # returns early on an empty textarea, so a form whose only text field is
-        # optional could not be sent at all. The result was a form that looked ready,
-        # took every dropdown, and did nothing whatsoever on Send - silently, with not
-        # one line in the daemon log, because nothing ever arrived to log.
-        #
-        # So the entity pair is not only a fallback for a Home Assistant that is not
-        # serving the card; it is what is shown whenever a question is armed.
+        # Both halves of that are now fixed on the daemon side, so from 1.22.0 this is
+        # a fallback for an old card and nothing else.
         $fallbackReplyCard = @{
             type = 'custom:layout-card'
             # The layout card draws its own surface. That went unnoticed while every
@@ -2353,7 +2358,24 @@ ha-card {
         # With the card served, the two swap on whether a question is waiting: the card
         # for ordinary replies, the entity pair for anything that has to be answered.
         # Without it, the pair is all there is and is always shown.
-        $replyCard = if (-not [string]::IsNullOrWhiteSpace($ReplyCardUrl)) {
+        #
+        # From card 1.22.0 there is no swap. Both halves of why there had to be one
+        # are gone: the daemon now reads a question's free text off the reply card's
+        # own payload (Read-DaemonDecisionCardText), and Send answer moved onto the
+        # choices card, so nothing is left that only the entity pair could do. What
+        # replaced it is the box the rest of the session card uses - one that reads
+        # the textarea at the moment Send is pressed, is not capped at 255 characters,
+        # and does not need the question cleared before it works.
+        $replyCard = if ($cardOwnsSend) {
+            @(@{
+                type = 'custom:agent-bridge-reply-card'
+                card_mod = @{ style = $bareChild }
+                name = ''
+                topic = (Get-CopilotMqttReplyPayloadTopic -Node $node)
+                placeholder = 'Reply, or type an answer...'
+            })
+        }
+        elseif (-not [string]::IsNullOrWhiteSpace($ReplyCardUrl)) {
             @(
                 @{
                     type = 'conditional'
@@ -2395,7 +2417,17 @@ ha-card {
             'Reply sent', 'Reply NOT sent'
             'Answer sent', 'Answer NOT sent'
             'Not sent - answer every field'
+            'Not sent - choose an option'
+            'Not sent - this question takes options'
+            'Not sent - no Send button on this session'
             'Answer may be wrong - check the terminal'
+            # The two the completion check emits. They were produced and never listed,
+            # so the one line that sits beside Send - the line still on screen once a
+            # long response has scrolled the header away - stayed empty for exactly the
+            # two outcomes worth reading. The header did show them, so this was never
+            # wholly silent, but the actionable place was.
+            'Answer differs - check the terminal'
+            'Answer unconfirmed - check the terminal'
             'Ending session...', 'Could not end session'
             # End session asking for its second press, and giving up on one. Taken from
             # the constants the daemon publishes rather than written out again here: a
@@ -2410,9 +2442,15 @@ ha-card {
             card = @{
                 type = 'markdown'
                 card_mod = @{ style = $bareChild }
+                # The glyph is chosen from the state, and it used to be chosen badly:
+                # it looked for an uppercase NOT and then for a lowercase 'sent', so
+                # every "Not sent - ..." refusal matched the second test and was drawn
+                # with a success tick. The card said a thing had been sent, in green,
+                # at the moment it was refusing to send it. Refusals are matched on
+                # their actual prefix now, and the two verification warnings by name.
                 content = @"
 {% set a = states('$activityEntity') %}{% set d = state_attr('$activityEntity','error') %}{% set h = state_attr('$activityEntity','hint') %}{% set w = state_attr('$activityEntity','waiting_on') %}
-<span style="font-size:0.9em">{% if a == '$($script:CopilotEndSessionConfirmNote)' or 'NOT' in a or 'Could not' in a or 'may be wrong' in a %}⚠️ {% elif 'sent' in a %}✅ {% else %}⏳ {% endif %}**{{ a }}**{% if w %} — {{ w }}{% elif h %} — {{ h }}{% elif d %} — {{ d }}{% endif %}</span>
+<span style="font-size:0.9em">{% if a == '$($script:CopilotEndSessionConfirmNote)' or a.startswith('Not sent') or 'NOT' in a or 'Could not' in a or 'may be wrong' in a or a == 'Answer differs - check the terminal' or a == 'Answer unconfirmed - check the terminal' %}⚠️ {% elif 'sent' in a %}✅ {% else %}⏳ {% endif %}**{{ a }}**{% if w %} — {{ w }}{% elif h %} — {{ h }}{% elif d %} — {{ d }}{% endif %}</span>
 "@
             }
         }
