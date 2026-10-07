@@ -173,6 +173,26 @@ For when pairing cannot run: HA unreachable, or no other machine online.
 The carry file (`transfer-secret.txt`) is retired: `configure` reads one if present,
 offers to import it, and deletes it once the secret is stored.
 
+## Upgrading machines that already share a secret
+
+Before pairing, the secret was generated once and carried to every other machine by
+hand, and no machine had a fleet id. So an upgrade finds several machines already
+holding the *same* secret, and `configure` runs on each of them separately with no way
+for one to tell the others what it chose.
+
+`configure` therefore does not invent a fleet id for a machine that already holds a
+secret. It derives one from the secret - the first 16 bytes of
+`SHA-256("fleet id" ‖ secret)`, in the same 32-hex-character shape `pair` generates -
+so every machine holding that secret arrives at the same fleet on its own, in any
+order, with nothing to coordinate. The fleet id is public and the secret is 32 random
+bytes behind a one-way hash, so deriving it gives nothing away. Only this migration
+derives an id: a fleet started with `NEW` gets a random one, because `secret rotate`
+deliberately keeps the fleet id while replacing the secret.
+
+A machine that took a random id from an earlier build, and so sits in a fleet of its
+own, is put back with `agent-ha-bridge pair` on it, answering yes to *re-pair* and
+choosing a machine from the fleet it belongs to.
+
 ## Rotation and removal
 
 v1 keeps this simple and says so:
@@ -190,11 +210,17 @@ v1 keeps this simple and says so:
 
 * **AES-GCM under PowerShell on macOS.** *As built:* `tests/test-pairing.ps1` asserts
   `AesGcm.IsSupported`, and the macOS CI job runs it, so the platform answers this
-  rather than an assumption. It holds on Windows. If it ever fails on macOS, the
-  fallback is AES-256-CBC with HMAC-SHA256, encrypt-then-MAC, with **independent
-  subkeys**: one HKDF output labelled `fleet secret enc` for AES and one labelled
-  `fleet secret mac` for HMAC, never the same bytes for both. The MAC covers
-  transcript ‖ IV ‖ ciphertext and is checked, in fixed time, before anything is
+  rather than an assumption. It holds on Windows. *Also as built:* `IsSupported` answers
+  for the algorithm and not for either constructor, and the two differ by runtime -
+  `AesGcm(byte[], int)` exists only on .NET 8 and later, while `AesGcm(byte[])` is the
+  only one on .NET 6 and 7 and is obsolete on .NET 8. PowerShell 7.2 and 7.3 meet the
+  documented PowerShell 7 requirement and run .NET 6 and 7, so
+  `New-BridgePairingAesGcm` looks the constructors up on the runtime that is running
+  and uses whichever is there; the tag is 16 bytes either way. If the algorithm itself
+  ever fails on macOS, the fallback is AES-256-CBC with HMAC-SHA256, encrypt-then-MAC,
+  with **independent subkeys**: one HKDF output labelled `fleet secret enc` for AES and
+  one labelled `fleet secret mac` for HMAC, never the same bytes for both. The MAC
+  covers transcript ‖ IV ‖ ciphertext and is checked, in fixed time, before anything is
   decrypted. Not implemented, because nothing needs it yet.
 * **What the recorder keeps from `mqtt.publish` calls.** By the analysis above nothing
   in the pairing messages needs protecting, but it should be confirmed by inspection,

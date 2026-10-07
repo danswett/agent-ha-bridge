@@ -63,7 +63,7 @@ function Initialize-BridgePairingHelper {
                         name = $script:BridgePairingHelperDisplayName
                     }))
             }
-            catch { }
+            catch { if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw } }
         }
         # Read through the same path pairing itself uses, so "ready" means the thing
         # pairing is about to do actually works. '' is a helper that is simply empty,
@@ -75,7 +75,10 @@ function Initialize-BridgePairingHelper {
         Write-Warning "The pairing helper '$($script:BridgePairingHelperEntity)' has no state yet."
         $false
     }
-    catch { $false }
+    catch {
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        $false
+    }
 }
 
 function Get-BridgePairingHelperValue {
@@ -91,7 +94,14 @@ function Get-BridgePairingHelperValue {
         if ($value -in @('unknown', 'unavailable')) { return '' }
         $value
     }
-    catch { $null }
+    catch {
+        # An Offline suite that fails to mock this read reaches the transport guard, and
+        # reading that as "no helper" turned a forbidden request to a real Home Assistant
+        # into a quiet 'idle' from Invoke-DaemonPairingRequest - the guard violation then
+        # looked exactly like a machine with nothing to do.
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        $null
+    }
 }
 
 function Set-BridgePairingHelperValue {
@@ -142,6 +152,27 @@ function Save-BridgeFleetMembership {
         & $set 'transferResumable' ([bool]$Share)
     }
     Write-BridgeSecretFile -Path $ConfigPath -Content ($config | ConvertTo-Json -Depth 32)
+}
+
+function Save-BridgeFleetIdForHeldSecret {
+    <#
+        Settles the fleet id of a machine that already holds a fleet secret but has no
+        fleet id - an installation from before pairing existed, where the secret was
+        copied from machine to machine by hand. Returns the id it saved.
+
+        The id comes from the secret, so every machine holding that same secret settles
+        on the same fleet without any of them having to go first. Drawing a random one
+        as each machine ran configure split a fleet that already shared membership into
+        one-machine fleets, and sponsor selection, rotation and re-pairing all work on
+        the fleet id.
+    #>
+    param([Parameter(Mandatory)][string]$ConfigPath, [switch]$Share)
+
+    $secret = Get-BridgeTransferSecret
+    if ([string]::IsNullOrEmpty($secret)) { throw 'this machine holds no fleet secret to take a fleet id from' }
+    $fleet = Get-BridgeFleetIdFromSecret -Secret $secret
+    Save-BridgeFleetMembership -ConfigPath $ConfigPath -FleetId $fleet -Share ([bool]$Share)
+    $fleet
 }
 
 function Get-BridgePairingSponsors {
@@ -290,7 +321,10 @@ function Test-BridgePairingSponsorGone {
         if (-not $Process.PSObject.Properties['HasExited']) { return $false }
         [bool]$Process.HasExited
     }
-    catch { $false }
+    catch {
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        $false
+    }
 }
 
 function Invoke-BridgePairingSponsor {
@@ -421,14 +455,23 @@ function Invoke-BridgePairingJoin {
     }
     finally {
         # Whatever happened, our request does not stay in the helper.
+        $refused = $null
         try {
             $left = Get-BridgePairingHelperValue -Headers $Headers
             if ($left -ceq $state.Request -or $left -like "accepted:$($state.Joiner):*" -or $left -ceq "refused:$($state.Joiner)") {
                 Set-BridgePairingHelperValue -Headers $Headers -Value ''
             }
         }
-        catch { }
+        catch {
+            # A tidy-up that cannot reach Home Assistant is not worth failing a join
+            # over - but a transport the Offline guard refused is not a failed tidy-up,
+            # and swallowing it here would let the join report success. Held back until
+            # the ephemeral key has been disposed of: a guard violation is no reason to
+            # leave that and the session key behind.
+            if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { $refused = $_ }
+        }
         Close-BridgePairingState -State $state
+        if ($refused) { throw $refused }
     }
 }
 
@@ -459,6 +502,6 @@ function Test-BridgeFleetSecretWithMember {
             $left = Get-BridgePairingHelperValue -Headers $Headers
             if ($left -like "check:$($Member.Slug):$nonce" -or $left -like "checked:$($Member.Slug):${nonce}:*") { Set-BridgePairingHelperValue -Headers $Headers -Value '' }
         }
-        catch { }
+        catch { if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw } }
     }
 }

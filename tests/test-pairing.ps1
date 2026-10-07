@@ -52,6 +52,69 @@ Test-That 'AES-GCM is available on this platform' { [Security.Cryptography.AesGc
 Test-That 'a fleet secret is 32 random bytes' { [Convert]::FromBase64String((New-BridgeFleetSecret)).Length -eq 32 }
 Test-That 'two fleet secrets differ' { (New-BridgeFleetSecret) -cne (New-BridgeFleetSecret) }
 
+Write-Host '--- which AES-GCM constructor a pairing is built on ---'
+# PowerShell 7.2 and 7.3 meet the documented PowerShell 7 requirement and run .NET 6
+# and 7, where AesGcm(byte[], int) does not exist - so pairing threw there at the
+# moment the person had just typed the code, and IsSupported above says nothing about
+# it. AesGcm(byte[]) is in turn obsolete on .NET 8. These two stand in for the runtime
+# this machine is not.
+class PairingAesNetSix {
+    [byte[]]$Key
+    [int]$TagBytes
+    PairingAesNetSix([byte[]]$key) { $this.Key = $key; $this.TagBytes = 0 }
+}
+class PairingAesNetEight {
+    [byte[]]$Key
+    [int]$TagBytes
+    PairingAesNetEight([byte[]]$key) { $this.Key = $key; $this.TagBytes = 0 }
+    PairingAesNetEight([byte[]]$key, [int]$tagBytes) { $this.Key = $key; $this.TagBytes = $tagBytes }
+}
+$aesKey = [Security.Cryptography.RandomNumberGenerator]::GetBytes(32)
+Test-That 'a runtime that has only the key-only constructor still gets its AES-GCM' {
+    $made = New-BridgePairingAesGcm -Key $aesKey -Implementation ([PairingAesNetSix])
+    $made -is [PairingAesNetSix] -and [Security.Cryptography.CryptographicOperations]::FixedTimeEquals($made.Key, $aesKey)
+}
+Test-That 'a runtime that has the tagged constructor is asked for the same 16-byte tag' {
+    (New-BridgePairingAesGcm -Key $aesKey -Implementation ([PairingAesNetEight])).TagBytes -eq 16
+}
+Test-Throws 'and a runtime with neither says so instead of failing inside an exchange' {
+    [void](New-BridgePairingAesGcm -Key $aesKey -Implementation ([datetime]))
+} '*no constructor pairing can use*'
+Test-That 'whichever this runtime has, a secret seals and opens again' {
+    $k = [Security.Cryptography.RandomNumberGenerator]::GetBytes(32)
+    $t = Get-BridgePairingHash -Values @('a transcript')
+    (Unprotect-BridgePairingSecret -SessionKey $k -Transcript $t `
+            -Ciphertext (Protect-BridgePairingSecret -SessionKey $k -Secret $secret -Transcript $t)) -ceq $secret
+}
+Test-That 'and nothing in the hooks reaches for a constructor of its own' {
+    @(Select-String -Path (Join-Path $PSScriptRoot '..\hooks\*.ps1') -Pattern 'AesGcm\]::new').Count -eq 0
+}
+
+Write-Host '--- the fleet a shared secret belongs to ---'
+# Upgrading an installation from before pairing: every machine holds the same
+# hand-copied secret and none has a fleet id, and configure then runs on each of them
+# separately. A fleet id drawn at random on each left machines that share membership
+# advertising unrelated fleets, so a joiner saw several one-machine fleets.
+$carried = New-BridgeFleetSecret
+Test-That 'two machines holding the same secret settle on one fleet, neither going first' {
+    (Get-BridgeFleetIdFromSecret -Secret $carried) -ceq (Get-BridgeFleetIdFromSecret -Secret $carried)
+}
+Test-That 'a machine holding a different secret settles on a different fleet' {
+    (Get-BridgeFleetIdFromSecret -Secret $carried) -cne (Get-BridgeFleetIdFromSecret -Secret (New-BridgeFleetSecret))
+}
+Test-That 'what it settles on is a fleet id a request and a sponsor both accept' {
+    (Get-BridgeFleetIdFromSecret -Secret $carried) -match '^[0-9a-f]{32}$'
+}
+Test-That 'it is named for what it is, so no other hash of the secret can collide with it' {
+    (Get-BridgeFleetIdFromSecret -Secret $carried) -cne
+        (ConvertTo-BridgePairingHex -Bytes (Get-BridgePairingHash -Values @('code', $carried))).Substring(0, 32)
+}
+Test-That 'and a public fleet id gives nothing away about the secret it came from' {
+    $id = Get-BridgeFleetIdFromSecret -Secret $carried
+    -not $carried.Contains($id) -and
+    -not ([Convert]::ToHexString([Convert]::FromBase64String($carried)).ToLowerInvariant().Contains($id))
+}
+
 Write-Host '--- an honest pairing ---'
 $p = New-HonestPair
 Test-That 'both ends arrive at the same six-digit code' { $p.Joiner.Code -match '^\d{6}$' -and $p.Joiner.Code -ceq $p.Sponsor.Code }

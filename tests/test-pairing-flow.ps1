@@ -14,6 +14,8 @@
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
+. (Join-Path $PSScriptRoot '..\hooks\bridge-platform.ps1')
+. (Join-Path $PSScriptRoot '..\hooks\bridge-test-guard.ps1')
 . (Join-Path $PSScriptRoot '..\hooks\bridge-pairing.ps1')
 . (Join-Path $PSScriptRoot '..\hooks\bridge-pairing-io.ps1')
 
@@ -208,10 +210,14 @@ $script:Ws = [Collections.Generic.List[string]]::new()
 $script:HelperListed = $true
 $script:StateAfterSleeps = 0
 $script:Slept = 0
+# Lets one command be made to fail the way a real transport would; everything else
+# answers as usual.
+$script:OnWebSocket = $null
 function Invoke-CopilotHaWebSocket {
     param($Commands)
     $type = [string]$Commands[0].type
     $script:Ws.Add($type)
+    if ($script:OnWebSocket) { & $script:OnWebSocket $type }
     # Assigned, never piped. `$x = if (...) { @() }` yields $null rather than an empty
     # array, and the caller then indexes a one-element list holding $null - the trap
     # this repository has hit before, and exactly what a real empty collection must not
@@ -353,6 +359,109 @@ Test-That 'and the answer reveals nothing usable about the secret' {
     $tag -match '^[0-9a-f]{32}$' -and -not $secret.Contains($tag)
 }
 
+Write-Host '--- a Home Assistant call the offline guard refuses ---'
+# A suite that fails to mock one of these reaches the transport guard. Read as "the
+# helper cannot be read", that became $null here and 'idle' from the daemon's pass, so
+# an attempt to reach a real Home Assistant looked exactly like a machine with nothing
+# to do and nobody ever saw it.
+Reset-FakeHa
+$script:OnWebSocket = $null
+$script:Started = @()
+$start = { param($Attempt) $script:Started += $Attempt }
+$blockedRead = { Assert-BridgeHttpAllowed -Uri 'http://home-assistant.invalid/api/states/input_text.agent_bridge_pairing' -Transport 'Rest' }
+$req = New-BridgePairingJoiner -FleetId $fleet -Joiner 'J' -Sponsor 'S' -SponsorSlug 'dswett_home'
+$script:Helper = $req.Request
+$script:OnHelperRead = $blockedRead
+$caught = $null
+try { [void](Get-BridgePairingHelperValue -Headers $headers) } catch { $caught = $_ }
+Test-That 'an unmocked helper read raises the guard rather than reading as a helper that is not there' {
+    $null -ne $caught -and (Test-BridgeObservationGuardFailure -ErrorRecord $caught)
+} "caught: $(if ($caught) { $caught.Exception.Message } else { '(nothing)' })"
+$caught = $null
+$answer = '(the daemon answered nothing)'
+try { $answer = Invoke-DaemonPairingRequest -Headers $headers -StartSponsor $start } catch { $caught = $_ }
+Test-That 'so the daemon''s pass carries it out instead of reporting an idle machine' {
+    $null -ne $caught -and (Test-BridgeObservationGuardFailure -ErrorRecord $caught) -and $answer -cne 'idle'
+} "answer=$answer"
+$caught = $null
+$script:HelperListed = $true
+try { [void](Initialize-BridgePairingHelper -Headers $headers) } catch { $caught = $_ }
+Test-That 'and creating the helper carries it out instead of reporting a state that never arrived' {
+    $null -ne $caught -and (Test-BridgeObservationGuardFailure -ErrorRecord $caught)
+}
+# The rename after a create is best-effort - a helper the person renamed keeps its name
+# - but a refused transport is not a rename that did not take.
+$script:OnHelperRead = $null
+$script:HelperListed = $false
+$script:StateAfterSleeps = 0
+$script:OnWebSocket = {
+    param($type)
+    if ($type -ceq 'config/entity_registry/update') {
+        Assert-BridgeHttpAllowed -Uri 'http://home-assistant.invalid/api/websocket' -Transport 'WebSocket'
+    }
+}
+$caught = $null
+try { [void](Initialize-BridgePairingHelper -Headers $headers) } catch { $caught = $_ }
+Test-That 'naming the new helper carries it out too, rather than passing for a rename that did not take' {
+    $null -ne $caught -and (Test-BridgeObservationGuardFailure -ErrorRecord $caught)
+}
+$script:OnWebSocket = $null
+# The tidy-up that clears the helper is deliberately forgiving: a join is not failed
+# because Home Assistant could not be reached afterwards. A refused transport is not
+# that, and swallowing it let the whole check report success.
+Reset-FakeHa
+$guardMember = [pscustomobject]@{ Machine = 'DSWETT-HOME'; Slug = 'dswett_home'; FleetId = $fleet }
+$script:OnHelperRead = {
+    if ($script:Helper -match '^check:dswett_home:([0-9a-f]{32})$') {
+        $script:OnHelperRead = $null
+        [void](Invoke-DaemonPairingRequest -Headers $headers -StartSponsor $start)
+        $script:OnHelperRead = $blockedRead
+    }
+}
+$caught = $null
+try { [void](Test-BridgeFleetSecretWithMember -Secret $secret -Member $guardMember -Headers $headers) } catch { $caught = $_ }
+Test-That 'a refused tidy-up read fails the check instead of letting a pasted secret through' {
+    $null -ne $caught -and (Test-BridgeObservationGuardFailure -ErrorRecord $caught)
+} "caught: $(if ($caught) { $caught.Exception.Message } else { '(nothing)' })"
+$script:OnHelperRead = $null
+# The same tidy-up at the end of a join. The ephemeral key still has to be disposed of
+# on the way out: a refused transport is no reason to leave one and a session key behind.
+Reset-FakeHa
+$script:Shown = ''
+$guardSponsor = [pscustomobject]@{ Machine = 'DSWETT-HOME'; Slug = 'dswett_home'; FleetId = $fleet }
+function Read-BridgeHaMqttSubscription {
+    param($Topic, $Until, $TimeoutSeconds, $OnReady)
+    & $OnReady
+    $sponsor = New-BridgePairingSponsor -Request (ConvertFrom-BridgePairingRequest -Value $script:Helper) `
+        -FleetId $fleet -Sponsor 'DSWETT-HOME' -SponsorSlug 'dswett_home'
+    [void](& $Until @($sponsor.Offer))
+    Receive-BridgePairingReveal -State $sponsor.State -Message @(Get-Sent 'reveal')[-1]
+    $verdict = Resolve-BridgePairingCode -State $sponsor.State -Typed $script:Shown -Secret $secret
+    $script:Helper = $verdict.Helper
+    [void](& $Until @($sponsor.Offer, $verdict.Message))
+}
+$madeJoiner = (Get-Command New-BridgePairingJoiner -CommandType Function).ScriptBlock
+$script:JoinState = $null
+function New-BridgePairingJoiner {
+    param($FleetId, $Joiner, $Sponsor, $SponsorSlug)
+    $script:JoinState = & $madeJoiner -FleetId $FleetId -Joiner $Joiner -Sponsor $Sponsor -SponsorSlug $SponsorSlug
+    $script:JoinState
+}
+# Armed on the read that hands back the acceptance, so the join itself is complete and
+# the only read left is the one clearing the helper.
+$script:OnHelperRead = { if ($script:Helper -like 'accepted:*') { $script:OnHelperRead = $blockedRead } }
+$caught = $null
+try { [void](Invoke-BridgePairingJoin -Sponsor $guardSponsor -Headers $headers -ShowCode { param($code) $script:Shown = $code }) }
+catch { $caught = $_ }
+Test-That 'a refused tidy-up read after a join carries the guard out rather than reporting a machine that joined' {
+    $null -ne $caught -and (Test-BridgeObservationGuardFailure -ErrorRecord $caught)
+} "caught: $(if ($caught) { $caught.Exception.Message } else { '(nothing)' })"
+Test-That 'and the attempt''s key is disposed of on the way out even so' {
+    $null -ne $script:JoinState -and $null -eq $script:JoinState.Key -and $null -eq $script:JoinState.SessionKey
+}
+Set-Item -LiteralPath function:New-BridgePairingJoiner -Value $madeJoiner
+$script:OnHelperRead = $null
+
 Write-Host '--- saving the result ---'
 $cfg = Join-Path $script:Runtime 'config.json'
 '{"homeAssistant":{"baseUrl":"http://ha:8123","token":"t"},"newSession":{"enabled":true,"workspaces":[{"label":"Home","path":"~"}]}}' |
@@ -368,6 +477,57 @@ Test-That 'and it goes through the protected writer' { $script:SecretWrites -eq 
 Save-BridgeFleetMembership -ConfigPath $cfg -Share $false
 $saved = Get-Content -LiteralPath $cfg -Raw | ConvertFrom-Json
 Test-That 'turning sharing off leaves the membership alone' { $saved.newSession.shareResumable -eq $false -and $saved.newSession.transferSecret -ceq $secret }
+
+Write-Host '--- upgrading machines that already share a secret ---'
+# Before pairing there was no fleet id and the secret was carried from machine to
+# machine by hand, so an upgrade runs configure on several machines that already hold
+# the same one. A fleet id drawn at random on each left them advertising unrelated
+# fleets while sharing membership, which split sponsor selection and rotation across
+# fleets of one machine each.
+$carried = New-BridgeFleetSecret
+$first = Join-Path $script:Runtime 'config-first.json'
+$second = Join-Path $script:Runtime 'config-second.json'
+foreach ($path in @($first, $second)) {
+    '{"homeAssistant":{"baseUrl":"http://ha:8123","token":"t"},"newSession":{"transferSecret":"carried by hand"}}' |
+        Set-Content -LiteralPath $path -Encoding utf8
+}
+$script:MySecret = $carried
+$firstId = Save-BridgeFleetIdForHeldSecret -ConfigPath $first -Share
+$secondId = Save-BridgeFleetIdForHeldSecret -ConfigPath $second -Share
+Test-That 'both machines settle into one fleet, with neither of them having to go first' { $firstId -ceq $secondId } "$firstId vs $secondId"
+Test-That 'and each is a member of it, so either can sponsor the next machine' {
+    $script:MyFleet = $firstId
+    $m = Get-BridgeFleetMembership
+    $m.Member -and $m.FleetId -ceq $firstId
+}
+Test-That 'the fleet id and the sharing settings are written into the config' {
+    $upgraded = Get-Content -LiteralPath $first -Raw | ConvertFrom-Json
+    $upgraded.newSession.fleetId -ceq $firstId -and $upgraded.newSession.shareResumable -eq $true -and
+    $upgraded.newSession.transferSecret -ceq 'carried by hand'
+}
+$script:MySecret = New-BridgeFleetSecret
+Test-That 'a machine whose secret nobody else holds is a fleet of its own' {
+    (Save-BridgeFleetIdForHeldSecret -ConfigPath $second -Share) -cne $firstId
+}
+$script:MySecret = ''
+$message = ''
+try { [void](Save-BridgeFleetIdForHeldSecret -ConfigPath $first -Share) } catch { $message = $_.Exception.Message }
+Test-That 'and a machine holding no secret is told so rather than joining an empty fleet' { $message -like '*no fleet secret*' } $message
+$script:MySecret = $secret
+$script:MyFleet = $fleet
+# Configure itself cannot be run from here, so what is checked is the one thing about
+# that branch which matters: that it no longer invents an id of its own.
+$entryAst = [Management.Automation.Language.Parser]::ParseFile(
+    (Join-Path $PSScriptRoot '..\hooks\bridge-pairing-entry.ps1'), [ref]$null, [ref]$null)
+$heldBranch = @($entryAst.FindAll({
+            param($node)
+            $node -is [Management.Automation.Language.IfStatementAst] -and
+            $node.Clauses[0].Item1.Extent.Text -ceq '$membership.HasSecret'
+        }, $true))
+Test-That 'configure settles an already-held secret into the fleet that secret belongs to' {
+    $heldBranch.Count -eq 1 -and $heldBranch[0].Extent.Text -match 'Save-BridgeFleetIdForHeldSecret' -and
+    $heldBranch[0].Extent.Text -notmatch 'New-BridgePairingId'
+} "matched $($heldBranch.Count) branch(es)"
 
 Remove-Item -LiteralPath $script:Runtime -Recurse -Force -ErrorAction SilentlyContinue
 Write-Host ''

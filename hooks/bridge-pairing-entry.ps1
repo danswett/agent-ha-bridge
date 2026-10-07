@@ -62,7 +62,11 @@ function Read-PairingYesNo {
 function Get-PairingSponsorsOrNone {
     # Discovery fails when Home Assistant cannot be reached, which is exactly when the
     # paste fallback has to keep working, so a failure here is "nobody to ask", not fatal.
-    try { @(Get-BridgePairingSponsors -Headers $headers) } catch { @() }
+    try { @(Get-BridgePairingSponsors -Headers $headers) }
+    catch {
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        [object[]]::new(0)
+    }
 }
 
 function Select-PairingMachine {
@@ -217,10 +221,12 @@ if (-not (Read-PairingYesNo -Prompt '    Share and resume sessions across machin
 }
 
 # A machine that already holds a secret - set up by hand before pairing existed - only
-# needs a fleet id to start sponsoring others.
+# needs a fleet id to start sponsoring others. It is derived from that secret rather
+# than drawn at random, because an upgrade runs configure on every machine: a random id
+# on each left machines that already share one secret advertising unrelated fleets, so
+# a joiner was offered several one-machine fleets and a rotation had nobody to re-pair.
 if ($membership.HasSecret) {
-    $fleet = New-BridgePairingId
-    Save-BridgeFleetMembership -ConfigPath $configPath -FleetId $fleet -Share $true
+    $fleet = Save-BridgeFleetIdForHeldSecret -ConfigPath $configPath -Share
     Write-Host "    using the fleet secret already on this machine; fleet $($fleet.Substring(0, 8))"
     Write-Host '    sharing is on'
     exit 0
