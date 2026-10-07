@@ -721,10 +721,11 @@ function Get-BridgeAgentProcesses {
         bun is fetched for the same reason it is accepted below: a CLI run under it
         would otherwise never be a candidate, and the check for it could never fire.
 
-        Codex's shared app-server daemon is named like a session but is not one, and
-        is excluded here (see Test-BridgeCodexAppServer). This set decides which pids
-        a registration must account for and which registrations are still alive, and
-        it is the only place that distinction is needed.
+        An observation also reports Shared: live processes that are the agent's shared
+        infrastructure rather than sessions, currently Codex's app-server daemon. They
+        stay in Processes, because liveness is read from that set and a session can
+        have registered one as its owner; Shared only says that no registration is
+        expected to account for them.
     #>
     param([Parameter(Mandatory)][string]$Agent, [switch]$AsObservation)
     $names = if ($script:BridgeIsWindows) { @($Agent) } else { @($Agent, "$Agent.exe", 'node', 'bun') }
@@ -753,21 +754,13 @@ function Get-BridgeAgentProcesses {
         }
     }
     if (-not $AsObservation) {
-        # Built by direct assignment, never from an if-expression: a branch yielding an
-        # empty array unrolls to $null on its way out, and the filters below would then
-        # run against nothing rather than an empty set.
-        $live = @($candidates.ToArray())
-        if (-not $script:BridgeIsWindows) {
-            $live = @($live | Sort-Object -Property Id -Unique |
-                Where-Object { Test-BridgeAgentProcess -Process $_ -Agent $Agent })
-        }
-        if ($Agent -eq 'codex') {
-            $live = @($live | Where-Object { -not (Test-BridgeCodexAppServerProcess -Process $_) })
-        }
-        return @($live)
+        if ($script:BridgeIsWindows) { return @($candidates.ToArray()) }
+        return @($candidates.ToArray() | Sort-Object -Property Id -Unique |
+            Where-Object { Test-BridgeAgentProcess -Process $_ -Agent $Agent })
     }
 
     $positive = @{}
+    $shared = @{}
     $seenNames = @{}
     $conflicted = @{}
     foreach ($candidate in $candidates) {
@@ -813,10 +806,11 @@ function Get-BridgeAgentProcesses {
                         $diagnostics.Add([pscustomobject]@{ Agent = $Agent; Operation = 'Identity'; Code = 'ProcessDisappeared'; ProcessId = $processId })
                         continue
                     }
-                    # Positively the shared daemon, so no registration will ever account
-                    # for it. Anything else stays a session: an unreadable process must
-                    # not become a second way to hold discovery.
-                    if ($appServer.State -eq 'Readable' -and $appServer.IsAppServer) { continue }
+                    # Noted, not dropped. It stays a live process, because a session
+                    # that could not identify its window registers this pid and would
+                    # otherwise be read as dead; it is only excused from needing a
+                    # registration of its own.
+                    if ($appServer.State -eq 'Readable' -and $appServer.IsAppServer) { $shared[$processId] = $true }
                 }
                 # Return identity facts, not a borrowed/mutated process object or the
                 # command line used locally by the existing identification predicate.
@@ -832,6 +826,10 @@ function Get-BridgeAgentProcesses {
     [pscustomobject]@{
         Known = $known
         Processes = @($positive.Values | Sort-Object Id)
+        # Live agent processes that are shared infrastructure rather than sessions, so
+        # no registration will ever name them as its owner. Separate from Processes
+        # because they are still live: see the app-server note above.
+        Shared = @($shared.Keys | Sort-Object)
         Diagnostics = @($diagnostics.ToArray())
     }
 }

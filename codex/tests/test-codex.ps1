@@ -308,37 +308,37 @@ $script:FakeRunning = @(
 )
 function Get-Process { param([string]$Name, $ErrorAction) $script:FakeRunning }
 try {
-    $gathered = @(Get-BridgeAgentProcesses -Agent 'codex')
-    Test-That 'only the window counts as a running codex session' {
-        $gathered.Count -eq 1 -and [int]$gathered[0].Id -eq 59256
-    } (@($gathered | ForEach-Object { $_.Id }) -join ',')
-
     $observed = Get-BridgeAgentProcesses -Agent 'codex' -AsObservation
-    Test-That 'an observation leaves the daemon out instead of calling it unaccounted' {
-        @($observed.Processes).Count -eq 1 -and [int]@($observed.Processes)[0].Id -eq 59256
+    Test-That 'the daemon is named as shared infrastructure, not a session' {
+        (@($observed.Shared) -join ',') -eq '3132,13096'
+    } (@($observed.Shared) -join ',')
+    # It stays live: a session that could not identify its own window registers this
+    # pid, and dropping it from Processes would read that session as dead.
+    Test-That 'but it stays a live process, so a session that registered it survives' {
+        @($observed.Processes | ForEach-Object { $_.Id }) -contains 13096
     } (@($observed.Processes | ForEach-Object { $_.Id }) -join ',')
-    Test-That 'so the observation is complete and held work can run again' { $observed.Known }
+    Test-That 'and the window is a session as before' {
+        @($observed.Processes | ForEach-Object { $_.Id }) -contains 59256
+    }
 
     # Claude has no app-server; the rule must not reach it.
     $script:FakeRunning = @([pscustomobject]@{ Id = 4242; ProcessName = 'claude'; Path = 'C:\claude\claude.exe' })
-    Test-That 'another agent keeps every process it finds' {
-        $other = Get-BridgeAgentProcesses -Agent 'claude' -AsObservation
-        $other.Known -and @($other.Processes).Count -eq 1
+    $other = Get-BridgeAgentProcesses -Agent 'claude' -AsObservation
+    Test-That 'another agent reports nothing as shared' {
+        $other.Known -and @($other.Processes).Count -eq 1 -and @($other.Shared).Count -eq 0
     }
 
-    # Neither a path nor a readable command line is not a reason to hold discovery:
-    # excluding a process takes positive identification, or an unreadable one becomes
-    # a second way to reach the stall this whole distinction exists to end.
+    # Calling a process shared takes positive identification: without it the daemon
+    # would stop expecting a registration for a real session.
     $script:FakeRunning = @([pscustomobject]@{ Id = 7001; ProcessName = 'codex'; Path = '' })
     function Get-BridgeCommandLine {
         param([int]$ProcessId, [switch]$AsObservation)
         [pscustomobject]@{ State = 'Unknown'; Text = ''; ProcessId = $ProcessId; Code = 'CommandIdentityUnreadable'; NativeExit = $null }
     }
     $unreadable = Get-BridgeAgentProcesses -Agent 'codex' -AsObservation
-    Test-That 'a codex process that cannot be identified stays a session' {
-        @($unreadable.Processes).Count -eq 1 -and [int]@($unreadable.Processes)[0].Id -eq 7001
-    } (@($unreadable.Processes | ForEach-Object { $_.Id }) -join ',')
-    Test-That 'and does not hold the observation on its own' { $unreadable.Known }
+    Test-That 'a codex process that cannot be identified stays an ordinary session' {
+        $unreadable.Known -and @($unreadable.Processes).Count -eq 1 -and @($unreadable.Shared).Count -eq 0
+    } (@($unreadable.Shared) -join ',')
 
     function Get-BridgeCommandLine {
         param([int]$ProcessId, [switch]$AsObservation)
@@ -368,9 +368,9 @@ try {
     )
     $byCommandLine = Get-BridgeAgentProcesses -Agent 'codex' -AsObservation
     Test-That 'with no path, the command line is fetched and tells the two apart' {
-        $byCommandLine.Known -and @($byCommandLine.Processes).Count -eq 1 -and
-            [int]@($byCommandLine.Processes)[0].Id -eq 80
-    } (@($byCommandLine.Processes | ForEach-Object { $_.Id }) -join ',')
+        $byCommandLine.Known -and (@($byCommandLine.Shared) -join ',') -eq '60' -and
+            @($byCommandLine.Processes).Count -eq 2
+    } (@($byCommandLine.Shared) -join ',')
     Remove-Item function:Get-BridgeCommandLine
 }
 finally {

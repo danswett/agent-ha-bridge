@@ -29,8 +29,8 @@ $script:A14PsExit = 0
 $script:A14PsCalls = 0
 $script:A14Guard = $null
 $script:A14ActualWindows = $script:BridgeIsWindows
-$expectedGroups = 24
-$expectedChecks = 108
+$expectedGroups = 25
+$expectedChecks = 112
 $primaryFailure = $null
 
 function Test-A14 {
@@ -872,6 +872,44 @@ try {
         }
     }
 
+    Invoke-A14Group 'Codex app-server does not need a registration of its own' {
+        # Codex's app-server daemon is named codex.exe and never registers, so
+        # requiring a registration for it left Known false on every pass: no snapshot
+        # was ever Complete, retirement and the orphan sweep were held, and Launch was
+        # refused with "Session discovery is incomplete". Captured on a machine stuck
+        # there with the daemon's pids unaccounted for.
+        Reset-A14Records codex
+        $daemonPid = 81090
+        $script:A14Processes = @(@($script:A14Processes) + [pscustomobject]@{
+            Id = $daemonPid; ProcessName = 'codex'
+            Path = (Join-Path ([IO.Path]::GetTempPath()) 'codex\packages\app-server-daemon\bin\codex.exe')
+            StartTime = [datetime]::UtcNow.AddHours(-2)
+        })
+        $snapshot = Invoke-A14Reconcile
+        Test-A14 'an unregistered app-server leaves the snapshot complete' (
+            $snapshot.Complete -and $snapshot.Live.Count -eq 3)
+
+        # It is excused a registration, not treated as dead: Get-CodexOwningProcessId
+        # falls back to the app-server when it cannot identify a window of its own, so
+        # a live session really does register this pid, and reading it as gone would
+        # delete that session's record while it is still answering.
+        $script:A14Processes = @(@($script:A14Processes) | Where-Object { [int]$_.Id -ne $script:A14Pids.A })
+        Write-A14Registration A -ProcessId $daemonPid
+        $owned = Invoke-A14Reconcile
+        Test-A14 'a session that registered the app-server is still live' (
+            $owned.Complete -and $owned.Live.ContainsKey($script:A14Ids.A))
+        Test-A14 'and its registration was not pruned' ([IO.File]::Exists((Get-A14RegistrationPath A)))
+
+        # An ordinary codex process with no registration is still a real gap.
+        Reset-A14Records codex
+        $script:A14Processes = @(@($script:A14Processes) + [pscustomobject]@{
+            Id = 81091; ProcessName = 'codex'; Path = (Join-Path ([IO.Path]::GetTempPath()) 'codex\bin\codex.exe')
+            StartTime = [datetime]::UtcNow.AddHours(-2)
+        })
+        $stranger = Invoke-A14Reconcile
+        Test-A14 'while an unaccounted session process still holds discovery' (-not $stranger.Complete)
+    }
+
     Invoke-A14Group 'publication resumes after completeness without a new unrelated event' {
         Reset-A14Records claude
         [void](Invoke-A14Reconcile)
@@ -965,7 +1003,7 @@ try {
         }
         finally { $script:ClaudeStateRoot = $oldRoot }
     }
-    Test-A14 'the fixed twenty-four source groups were reached' ($script:A14Groups -eq $expectedGroups)
+    Test-A14 'the fixed twenty-five source groups were reached' ($script:A14Groups -eq $expectedGroups)
     Test-A14 'the fixed assertion inventory was reached' ($script:A14Checks -eq ($expectedChecks - 1))
 }
 catch {
