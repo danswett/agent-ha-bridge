@@ -1822,6 +1822,10 @@ async function checkSendAnswerCarriesTypedText() {
     m.calls.filter((c) => c.domain === 'button').length === 0, JSON.stringify(m.calls));
   check('and the card says why rather than looking sent',
     /question changed/.test(m.choices._note), m.choices._note);
+  // The daemon discards a payload tagged for a question it is not holding, so telling
+  // someone to send again is only honest if there is still something there to send.
+  check('the words are put back in the box it told the person to send again from',
+    m.reply._els.textarea.value === 'slow one', m.reply._els.textarea.value);
   // Stopping the press is not enough on its own: Read-DaemonFormAnswer treats any new
   // text payload as a submission for a complete form, so an untagged one would be
   // consumed by the replacement question - answering it with words typed for the one

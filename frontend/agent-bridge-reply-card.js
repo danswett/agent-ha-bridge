@@ -191,6 +191,30 @@ class AgentBridgeReplyCard extends HTMLElement {
   }
 
   /*
+   * What is in the box right now, for a caller that may need to put it back.
+   */
+  formText() {
+    if (!this._built || !this._els || !this._els.textarea) { return ''; }
+    return this._els.textarea.value;
+  }
+
+  /*
+   * Put back words that were published for a question which has since gone.
+   *
+   * The daemon deliberately discards a payload tagged for a question it is not
+   * holding, so without this the words exist neither in the session nor in the box
+   * the card has just told the person to send again from.
+   *
+   * Only into an empty box: anything typed since is theirs, and newer.
+   */
+  restoreFormText(text) {
+    if (!text || !this._built || !this._els || !this._els.textarea) { return; }
+    if (this._els.textarea.value.trim().length > 0) { return; }
+    this._els.textarea.value = text;
+    this._syncSendState();
+  }
+
+  /*
    * Publish just the typed words, for a form being submitted from the choices card.
    *
    * Anything attached stays in the box on purpose: the reply path stages and
@@ -1576,6 +1600,10 @@ class AgentBridgeChoicesCard extends HTMLElement {
     // and the words stay in the box until there is a finished form to carry them.
     const reply = this._complete ? REPLY_CARDS.get(String(this._config.reply_topic || '')) : null;
     if (reply && reply.hasUnsentFormText()) {
+      // Kept so it can be put back. The daemon discards a payload tagged for a
+      // question that has gone, so telling someone to send again is only honest if
+      // there is still something in the box to send.
+      const words = reply.formText();
       reply.publishFormText(generation).then(
         (published) => {
           // Only on a publish that landed. Submitting after a failed one is exactly
@@ -1589,6 +1617,7 @@ class AgentBridgeChoicesCard extends HTMLElement {
           // and the terminal or another dashboard can answer the old question inside
           // it; the daemon drops a payload tagged for a question that has gone.
           if (this._generationNow() !== generation) {
+            reply.restoreFormText(words);
             this._failSend(new Error('the question changed - check it and send again'));
             return;
           }
