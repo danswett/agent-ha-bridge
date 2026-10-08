@@ -134,7 +134,13 @@ $script:DaemonConfig = @{
     # acts on would otherwise be repeated every reconcile for as long as the session
     # runs; a minute heals a torn-down card promptly without becoming a loop.
     EntityRestoreSeconds = 60
-    # The resumable-session list comes from an Agency call that reads every session
+    # How long a peer's last-read session list may stand in for one that has not been
+    # restored yet. Twice GlobalReassertSeconds, so a machine that is actually running
+    # will have republished at least twice inside the window: past that, not having
+    # read a list is about the machine rather than about Home Assistant still starting,
+    # and standing in would let one installation's sessions be drawn for the next one
+    # to take the same name.
+    PeerSessionsStandInSeconds = 600    # The resumable-session list comes from an Agency call that reads every session
     # on the machine, so it is cached for this long instead of being repeated on
     # every reconcile.
     # How long to keep polling the reply box after Send is pressed, waiting for Home
@@ -252,6 +258,11 @@ $script:DaemonMcpCacheAt = [DateTimeOffset]::MinValue
 $script:DaemonStatesCache = $null
 $script:DaemonStatesCacheAt = [DateTimeOffset]::MinValue
 $script:DaemonPeerCache = $null
+# The last session list actually read from each peer, by slug. A peer's sensor can be
+# restored before its attributes are, and an attribute that has not arrived reads as
+# an empty list - so without this a Home Assistant restart rebuilds the shared
+# dashboard with other machines' cards emptied of sessions that are still running.
+$script:DaemonPeerSessions = @{}
 # Sessions whose cards have been removed from the dashboard but whose entities are
 # held back a pass, so the frontend has time to stop pointing at them.
 $script:DaemonPendingRetire = @()

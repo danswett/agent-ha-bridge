@@ -7,7 +7,7 @@
     Part of agent-bridge-daemon.ps1, which dot-sources it into its own scope after
     declaring the shared $script: state; see docs/daemon-split.md.
     Shared state it changes: DaemonMcpCache, DaemonMcpCacheAt, DaemonPeerCache,
-    DaemonStatesCache, DaemonStatesCacheAt.
+    DaemonPeerSessions, DaemonStatesCache, DaemonStatesCacheAt.
 #>
 
 function Get-LiveCopilotSessions {
@@ -965,6 +965,23 @@ function Get-DaemonPeerMachines {
         A failed scan falls back to the last known set rather than to none, so a
         transient Home Assistant error does not make every other machine's sessions
         blink out of the dashboard and back in.
+
+        A scan that succeeds can still come back partial, and that one is worse because
+        nothing about it looks wrong. Home Assistant restores a retained sensor's
+        config, state and attributes separately, so after a restart a peer's entity can
+        be present and online while its sessions attribute is not - and an attribute
+        that has not arrived reads as an empty list, exactly like a machine that is
+        running nothing. The dashboard would then be rebuilt with that peer's card
+        showing no sessions at all, while they were still running on it.
+
+        So a session list is only replaced by one that was actually read.
+        SessionsKnown is what says it was, and the last read list stands in until a
+        real one arrives - but only for a bounded while. A slug is a machine name, so
+        it comes back when a host is reinstalled, and a stand-in kept indefinitely
+        would draw the previous installation's sessions for the new one. Peers whose
+        sensor is missing entirely are left alone: their liveness rides on a separate
+        unretained sensor that will have expired too, and a machine that has genuinely
+        gone needs to be able to disappear.
     #>
     param([Parameter(Mandatory)][hashtable]$Headers)
 
@@ -974,7 +991,29 @@ function Get-DaemonPeerMachines {
         return @()
     }
 
+    # Expired first, so anything left is young enough to speak for its machine. Done
+    # on every scan rather than when a slug happens to reappear, so a machine that was
+    # removed and never came back does not sit here for the life of the daemon.
+    $window = [double]$script:DaemonConfig.PeerSessionsStandInSeconds
+    foreach ($slug in @($script:DaemonPeerSessions.Keys)) {
+        if (([DateTimeOffset]::Now - $script:DaemonPeerSessions[$slug].At).TotalSeconds -lt $window) { continue }
+        [void]$script:DaemonPeerSessions.Remove($slug)
+    }
+
     $peers = @(Get-BridgePeerMachine -States $states -ExcludeSelf)
+    foreach ($peer in $peers) {
+        $slug = [string]$peer.Slug
+        if ($peer.SessionsKnown) {
+            $script:DaemonPeerSessions[$slug] = [pscustomobject]@{
+                Sessions = @($peer.Sessions); At = [DateTimeOffset]::Now
+            }
+            continue
+        }
+        if (-not $script:DaemonPeerSessions.ContainsKey($slug)) { continue }
+        # Left as not known: it was not read this pass, and saying otherwise would let
+        # the next pass treat a stale list as fresh evidence.
+        $peer.Sessions = @($script:DaemonPeerSessions[$slug].Sessions)
+    }
     $script:DaemonPeerCache = $peers
     $peers
 }

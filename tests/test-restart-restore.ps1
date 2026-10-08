@@ -167,6 +167,67 @@ Test-That 'an expired cache triggers a fresh scan' { $script:McpScanCalls -eq 2 
 $null = Get-DaemonPeerMachines -Headers $mcpHeaders
 Test-That 'a peer scan reuses that snapshot rather than reading it again' { $script:McpScanCalls -eq 2 }
 
+Write-Host '--- a half-restored peer sensor does not empty its card ---'
+# Home Assistant restores a retained sensor's config, state and attributes separately.
+# After a restart a peer's entity can therefore be back and online while its sessions
+# attribute is not - and an attribute that has not arrived reads as an empty list,
+# exactly like a machine running nothing. The shared dashboard was rebuilt from that:
+# other machines' cards kept their place and lost every session on them.
+function New-PeerStates {
+    param([switch]$WithSessions, [switch]$EmptySessions)
+    $attributes = [ordered]@{ machine = 'LAPTOP'; machine_slug = 'laptop' }
+    if ($WithSessions) {
+        $attributes['sessions'] = @([pscustomobject]@{ name = 'Claude: a'; machine = 'LAPTOP'; node = 'agent_bridge_l1'; kind = 'claude' })
+    }
+    if ($EmptySessions) { $attributes['sessions'] = @() }
+    @(
+        [pscustomobject]@{ entity_id = 'binary_sensor.agent_bridge_laptop_online'; state = 'on'; attributes = [pscustomobject]@{} }
+        [pscustomobject]@{ entity_id = 'sensor.agent_bridge_laptop_sessions'; state = '1'; attributes = [pscustomobject]$attributes }
+    )
+}
+function Reset-PeerScan {
+    $script:DaemonStatesCache = $null
+    $script:DaemonStatesCacheAt = [DateTimeOffset]::MinValue
+}
+$script:DaemonPeerSessions = @{}
+$script:PeerStates = New-PeerStates -WithSessions
+function Invoke-DecisionHttpRequest { param($Parameters) $script:PeerStates }
+Reset-PeerScan
+$read = @(Get-DaemonPeerMachines -Headers $mcpHeaders)
+Test-That 'a peer whose list was read reports it' {
+    $read.Count -eq 1 -and $read[0].SessionsKnown -and @($read[0].Sessions).Count -eq 1 -and
+    [string]$read[0].Sessions[0].node -ceq 'agent_bridge_l1'
+}
+$script:PeerStates = New-PeerStates
+Reset-PeerScan
+$partial = @(Get-DaemonPeerMachines -Headers $mcpHeaders)
+Test-That 'and keeps it when the attribute has not come back yet' {
+    $partial.Count -eq 1 -and -not $partial[0].SessionsKnown -and
+    @($partial[0].Sessions).Count -eq 1 -and [string]$partial[0].Sessions[0].node -ceq 'agent_bridge_l1'
+}
+# The stand-in must not outlive the evidence. A machine that really has finished its
+# last session publishes an empty list, and that is a read, so it wins.
+$script:PeerStates = New-PeerStates -EmptySessions
+Reset-PeerScan
+$emptied = @(Get-DaemonPeerMachines -Headers $mcpHeaders)
+Test-That 'but a list that was read empty is believed' {
+    $emptied.Count -eq 1 -and $emptied[0].SessionsKnown -and @($emptied[0].Sessions).Count -eq 0
+}
+# A slug is a machine name, so it comes back when a host is reinstalled. Standing in
+# indefinitely would draw the previous installation's sessions for the next machine to
+# take the name, during the moment before it first publishes its own list.
+$script:PeerStates = New-PeerStates -WithSessions
+Reset-PeerScan
+$null = Get-DaemonPeerMachines -Headers $mcpHeaders
+$script:DaemonPeerSessions['laptop'].At = [DateTimeOffset]::Now.AddSeconds(-($script:DaemonConfig.PeerSessionsStandInSeconds + 1))
+$script:PeerStates = New-PeerStates
+Reset-PeerScan
+$reused = @(Get-DaemonPeerMachines -Headers $mcpHeaders)
+Test-That 'a stand-in too old to speak for the machine is dropped rather than drawn' {
+    $reused.Count -eq 1 -and -not $reused[0].SessionsKnown -and @($reused[0].Sessions).Count -eq 0 -and
+    -not $script:DaemonPeerSessions.ContainsKey('laptop')
+}
+
 Write-Host '--- state persistence survives console detachment ---'
 # Regression. Reply injection does FreeConsole -> AttachConsole -> FreeConsole, and
 # once a daemon has done that, any cmdlet emitting a progress record throws from the
