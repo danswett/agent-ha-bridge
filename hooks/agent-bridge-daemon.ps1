@@ -252,6 +252,11 @@ $script:DaemonMcpCacheAt = [DateTimeOffset]::MinValue
 $script:DaemonStatesCache = $null
 $script:DaemonStatesCacheAt = [DateTimeOffset]::MinValue
 $script:DaemonPeerCache = $null
+# The last session list actually read from each peer, by slug. A peer's sensor can be
+# restored before its attributes are, and an attribute that has not arrived reads as
+# an empty list - so without this a Home Assistant restart rebuilds the shared
+# dashboard with other machines' cards emptied of sessions that are still running.
+$script:DaemonPeerSessions = @{}
 # Sessions whose cards have been removed from the dashboard but whose entities are
 # held back a pass, so the frontend has time to stop pointing at them.
 $script:DaemonPendingRetire = @()
