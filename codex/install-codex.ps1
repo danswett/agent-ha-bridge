@@ -45,6 +45,12 @@ $pluginRoot = Join-Path $bridgeRoot "plugins\$pluginName"
 $coreDir = $installContext.HooksDir
 $ownerFile = Join-Path $installContext.CodexHome 'agent-ha-bridge-owner.json'
 $legacyBridgeRoot = Join-Path $installContext.CopilotHome 'codex-bridge'
+# What the marketplace and plugin were called before the rename. The bridge removed
+# the directory and left these registered, which is a state Codex cannot recover from
+# on its own: see Remove-BridgeCodexLegacyRegistration.
+$legacyMarketplaceName = 'copilot-ha-bridge'
+$legacyPluginName = 'copilot-ha-bridge'
+$codexConfigFile = Join-Path $installContext.CodexHome 'config.toml'
 
 function Write-Step { param([string]$Message) Write-Host "==> $Message" -ForegroundColor Cyan }
 
@@ -85,9 +91,108 @@ function Invoke-BridgeCodexCommand {
     }
 }
 
-function Assert-BridgeCodexOwnership {
+function Get-BridgeCodexLegacyRegistration {
+    <#        That this Codex home belongs to this installation. Read from the owner file, so
+        The legacy marketplace and plugin registration, when this Codex still carries
+        one and it is ours to remove: { Text, Present, Owned, Source }.
+
+        Ours means the recorded source is the directory this installer used to put the
+        adapter in, or a directory that is no longer there at all. A marketplace of
+        that name pointing somewhere else belongs to something else and is left alone.
+    #>
+    if (-not (Test-Path -LiteralPath $codexConfigFile)) {
+        return [pscustomobject]@{ Text = ''; Present = $false; Owned = $false; Source = '' }
+    }
+    $text = Get-Content -LiteralPath $codexConfigFile -Raw -ErrorAction Stop
+    $pattern = '(?m)^\[marketplaces\.' + [regex]::Escape($legacyMarketplaceName) + '\]\s*$'
+    if ($text -notmatch $pattern) {
+        return [pscustomobject]@{ Text = $text; Present = $false; Owned = $false; Source = '' }
+    }
+    # The source line belongs to the block that follows the header, so read only as
+    # far as the next section rather than the first source= anywhere in the file.
+    $start = [regex]::Match($text, $pattern).Index
+    $rest = $text.Substring($start)
+    $next = [regex]::Match($rest.Substring(1), '(?m)^\[')
+    $block = if ($next.Success) { $rest.Substring(0, $next.Index + 1) } else { $rest }
+    $source = ''
+    $sourceMatch = [regex]::Match($block, "(?m)^\s*source\s*=\s*['`"](.*?)['`"]\s*$")
+    if ($sourceMatch.Success) { $source = $sourceMatch.Groups[1].Value }
+    # Codex records the extended-length form on Windows; the bridge's own paths never
+    # carry it, so comparing without stripping it never matches.
+    $plain = $source -replace '^\\\\\?\\', ''
+    $owned = $false
+    if ($plain) {
+        $owned = (Test-BridgeInstallPath $plain $legacyBridgeRoot) -or -not (Test-Path -LiteralPath $plain)
+    }
+    [pscustomobject]@{ Text = $text; Present = $true; Owned = $owned; Source = $plain }
+}
+
+function Remove-BridgeCodexTomlSection {
+    <# One TOML section and its body, from its header to the next one. #>
+    param([Parameter(Mandatory)][string]$Text, [Parameter(Mandatory)][string]$Header)
+
+    $pattern = '(?m)^' + [regex]::Escape($Header) + '\s*$'
+    $match = [regex]::Match($Text, $pattern)
+    if (-not $match.Success) { return $Text }
+    $rest = $Text.Substring($match.Index)
+    $next = [regex]::Match($rest.Substring(1), '(?m)^\[')
+    $length = if ($next.Success) { $next.Index + 1 } else { $rest.Length }
+    $Text.Remove($match.Index, $length)
+}
+
+function Remove-BridgeCodexLegacyRegistration {
     <#
-        That this Codex home belongs to this installation. Read from the owner file, so
+        Takes the pre-rename marketplace and plugin registration out of Codex.
+
+        The installer used to delete the legacy adapter directory and leave it
+        registered. Codex loads every configured marketplace, so that one dead entry
+        failed the whole plugin subsystem:
+
+            Error: failed to load marketplace(s):
+            - `copilot-ha-bridge` at ...\.copilot\codex-bridge: marketplace root does
+              not contain a supported manifest
+
+        which broke every `codex plugin` command - including the ones this installer
+        needs, so each run reported "Codex registration command failed (exit 1)" after
+        installing correctly, and `agent-ha-bridge update` exited non-zero on a healthy
+        install. Worse, plugin hooks could no longer be resolved, so Codex sessions
+        stopped registering and simply never appeared on the dashboard.
+
+        It is self-perpetuating: the entry breaks the very commands that would remove
+        it. So the supported commands are tried first, and the config file is rewritten
+        only when they could not do it - which, once this state is reached, is always.
+    #>
+    $legacy = Get-BridgeCodexLegacyRegistration
+    if (-not $legacy.Present) { return }
+    if (-not $legacy.Owned) {
+        Write-Host "    left '$legacyMarketplaceName' alone: it points at $($legacy.Source)" -ForegroundColor Yellow
+        return
+    }
+
+    Write-Step "Removing the pre-rename '$legacyMarketplaceName' registration"
+    foreach ($arguments in @(
+            @('plugin', 'remove', "$legacyPluginName@$legacyMarketplaceName"),
+            @('plugin', 'marketplace', 'remove', $legacyMarketplaceName))) {
+        try { [void](Invoke-BridgeCodexCommand -Arguments $arguments) } catch { }
+    }
+
+    $after = Get-BridgeCodexLegacyRegistration
+    if (-not $after.Present) {
+        Write-Host '    removed' -ForegroundColor Green
+        return
+    }
+    # Codex could not do it, because this is the state that stops it doing anything.
+    $text = $after.Text
+    $text = Remove-BridgeCodexTomlSection -Text $text -Header "[marketplaces.$legacyMarketplaceName]"
+    $text = Remove-BridgeCodexTomlSection -Text $text -Header "[plugins.`"$legacyPluginName@$legacyMarketplaceName`"]"
+    if ($text -eq $after.Text) { return }
+    Copy-Item -LiteralPath $codexConfigFile -Destination "$codexConfigFile.agent-ha-bridge.bak" -Force
+    Set-Content -LiteralPath $codexConfigFile -Value $text -Encoding utf8 -NoNewline
+    Write-Host "    removed from config.toml (backup: $(Split-Path "$codexConfigFile.agent-ha-bridge.bak" -Leaf))" -ForegroundColor Green
+}
+
+function Assert-BridgeCodexOwnership {
+    <#        That this Codex home belongs to this installation. Read from the owner file, so
         it still holds when the Codex CLI cannot be reached - the adapter files can then
         be refreshed safely without asking Codex anything.
     #>
@@ -193,6 +298,9 @@ Write-Host '    bridge-platform.ps1'
 if (-not $codex) {
     throw 'Codex CLI was not found. Install it with: npm install -g @openai/codex'
 }
+# Before anything asks Codex a question: a stale pre-rename registration makes every
+# plugin command fail, including the read below.
+Remove-BridgeCodexLegacyRegistration
 $existingMarketplace = Get-BridgeCodexMarketplace
 
 $versionFile = Join-Path (Split-Path $PSScriptRoot -Parent) 'VERSION'
