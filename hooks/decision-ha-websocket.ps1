@@ -125,6 +125,68 @@ function Invoke-CopilotHaWebSocket {
     Write-Output -NoEnumerate $results
 }
 
+function Get-BridgeStateTriggerHit {
+    <#
+        The change a subscribe_trigger message describes, or $null if it describes
+        nothing this wait should act on.
+
+        Separated from the receive loop because everything that can go wrong here is
+        about the shape of a message rather than about the socket, and the loop cannot
+        be reached without one.
+
+        Home Assistant reports a watched entity being *removed* through this same
+        state trigger, as a hit whose to_state is null. Reading .state off that is a
+        PropertyNotFoundException under Set-StrictMode -Version Latest, and it was
+        thrown out of the entire wait - where the daemon's only catch treats any throw
+        as a dropped socket. So a session's entities being torn down was logged as
+        "watch failed", counted towards the reconnect backoff and slept off for 2s,
+        then 4s, then 8s, up to a minute, with nothing wrong with the connection and
+        every button press on the dashboard ignored meanwhile. Seen live on 2026-10-07,
+        where the throw is timestamped in the same second as the teardown that caused it.
+
+        A removal is skipped rather than returned. Every consumer of a hit reads it as
+        a press - Invoke-DaemonHit dispatches on the entity id suffix - and an entity
+        that has just ceased to exist must not be delivered as a reply or a stop. The
+        scheduled reconcile is what notices it has gone, and it is now reached on time
+        rather than after a backoff.
+    #>
+    param(
+        [AllowNull()]$Message,
+        [AllowEmptyCollection()][string[]]$IgnoreStates = @()
+    )
+
+    # By name throughout: this is parsed from whatever arrived on the socket, and a
+    # field that is simply not there is the ordinary case rather than the odd one.
+    if ($null -eq $Message -or $null -eq $Message.PSObject.Properties['type'] -or
+        [string]$Message.type -cne 'event') { return $null }
+    if ($null -eq $Message.PSObject.Properties['event']) { return $null }
+    $payload = $Message.event
+    if ($null -eq $payload -or $null -eq $payload.PSObject.Properties['variables']) { return $null }
+    $variables = $payload.variables
+    if ($null -eq $variables -or $null -eq $variables.PSObject.Properties['trigger']) { return $null }
+    $trigger = $variables.trigger
+    if ($null -eq $trigger -or $null -eq $trigger.PSObject.Properties['entity_id']) { return $null }
+
+    $entityId = [string]$trigger.entity_id
+    if ([string]::IsNullOrWhiteSpace($entityId)) { return $null }
+
+    if ($null -eq $trigger.PSObject.Properties['to_state']) { return $null }
+    $toState = $trigger.to_state
+    if ($null -eq $toState -or $null -eq $toState.PSObject.Properties['state']) { return $null }
+
+    $newState = [string]$toState.state
+    if ($IgnoreStates -contains $newState) { return $null }
+
+    $attributes = $null
+    if ($null -ne $toState.PSObject.Properties['attributes']) { $attributes = $toState.attributes }
+
+    [pscustomobject]@{
+        EntityId = $entityId
+        State = $newState
+        Attributes = $attributes
+    }
+}
+
 function Wait-CopilotHaStateChange {
     <#
         Blocks until one of the watched entities changes to a state other than the
@@ -283,19 +345,9 @@ function Wait-CopilotHaStateChange {
             [void]$text.Clear()
             try { $message = $raw | ConvertFrom-Json } catch { continue }
 
-            if ($message.type -ne 'event') { continue }
-            $trigger = $message.event.variables.trigger
-            $entityId = [string]$trigger.entity_id
-            if ([string]::IsNullOrWhiteSpace($entityId)) { continue }
-
-            $newState = [string]$trigger.to_state.state
-            if ($IgnoreStates -contains $newState) { continue }
-
-            return [pscustomobject]@{
-                EntityId = $entityId
-                State = $newState
-                Attributes = $trigger.to_state.attributes
-            }
+            $hit = Get-BridgeStateTriggerHit -Message $message -IgnoreStates $IgnoreStates
+            if ($null -eq $hit) { continue }
+            return $hit
         }
 
         $null

@@ -96,6 +96,37 @@ $script:DaemonWatchFailures = 20
 $null = Wait-DaemonChange -Headers $headers -State $state -WatchEntities @('text.a')
 Test-That 'up to a minute' { $script:Slept -eq 60 }
 
+Write-Host '--- what arrives on the socket ---'
+# Parsed from JSON rather than built as objects: the shapes below are what Home
+# Assistant actually sends, and the bug this covers is only reachable through a
+# field that is literally null in the message.
+function New-TriggerMessage { param([string]$Json) $Json | ConvertFrom-Json }
+$changed = New-TriggerMessage '{"type":"event","event":{"variables":{"trigger":{"platform":"state","entity_id":"button.agent_bridge_x_stop","to_state":{"entity_id":"button.agent_bridge_x_stop","state":"Pressed","attributes":{"friendly_name":"Stop"}}}}}}'
+$hit = Get-BridgeStateTriggerHit -Message $changed -IgnoreStates @('unknown', 'unavailable', '')
+Test-That 'a state change is reported with its entity, state and attributes' {
+    $hit.EntityId -ceq 'button.agent_bridge_x_stop' -and $hit.State -ceq 'Pressed' -and
+    $hit.Attributes.friendly_name -ceq 'Stop'
+}
+$placeholder = New-TriggerMessage '{"type":"event","event":{"variables":{"trigger":{"entity_id":"sensor.a","to_state":{"state":"unavailable"}}}}}'
+Test-That 'a placeholder state is not a change worth waking for' {
+    $null -eq (Get-BridgeStateTriggerHit -Message $placeholder -IgnoreStates @('unknown', 'unavailable', ''))
+}
+# The live failure on 2026-10-07. A session's entities were torn down while it was
+# still working; Home Assistant reports a removal through the same state trigger,
+# with to_state null. Reading .state off that threw out of the whole wait, where the
+# daemon's only catch cannot tell a message it did not expect from a socket that has
+# dropped - so it logged "watch failed", slept 2s, then 4s, then 8s, and ignored
+# every press on the dashboard while nothing at all was wrong with the connection.
+$removed = New-TriggerMessage '{"type":"event","event":{"variables":{"trigger":{"entity_id":"sensor.agent_bridge_x_status","from_state":{"state":"working"},"to_state":null}}}}'
+Test-That 'an entity being removed is not a change, and is not a socket failure either' {
+    $null -eq (Get-BridgeStateTriggerHit -Message $removed -IgnoreStates @('unknown', 'unavailable', ''))
+}
+Test-That 'a message that is not a trigger event is ignored rather than read' {
+    $null -eq (Get-BridgeStateTriggerHit -Message (New-TriggerMessage '{"type":"result","success":true}')) -and
+    $null -eq (Get-BridgeStateTriggerHit -Message (New-TriggerMessage '{"type":"event","event":{}}')) -and
+    $null -eq (Get-BridgeStateTriggerHit -Message $null)
+}
+
 Write-Host '--- the reconcile ---'
 $script:Calls.Clear()
 Invoke-DaemonReconcile -Headers $headers -State $state
