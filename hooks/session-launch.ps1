@@ -100,6 +100,11 @@ function ConvertTo-BridgeArgumentString {
 $script:BridgeDiscoveredWorkspaceCache = $null
 $script:BridgeDiscoveredWorkspaceCacheAt = [DateTimeOffset]::MinValue
 
+# Build outputs this repository's own instructions tell contributors to produce, which
+# are therefore the ignored files a finished worktree is most likely to contain. Exact
+# relative paths, because reclaiming one is a deletion: see Test-BridgeWorktreeBuildOutput.
+$script:BridgeWorktreeBuildOutputs = @('hook/agent-bridge-hook', 'hook/agent-bridge-hook.exe')
+
 function Test-BridgeSystemDirectory {
     <#
         True for a directory no session should be launched into.
@@ -760,6 +765,45 @@ function Get-BridgeWorktreeTrackedPath {
     }
 }
 
+function Test-BridgeWorktreeBuildOutput {
+    <#
+        Whether one ignored `git status` entry is a build output this repository tells
+        people to produce, and nothing else.
+
+        The reclaimer refuses a tree with any ignored file, on the sound reasoning that
+        an ignored file can be real local data - a `.env`, a config.json - that nobody
+        authorized deleting. The cost was that **following the documented test
+        procedure made a worktree permanently unreclaimable**: AGENTS.md says to build
+        the native hook before a full run, .gitignore ignores the binary, and from then
+        on the tree was retained for ever. The managed cap (10) then fills and every
+        launch is refused with no fallback - dev_vm1 sat at 10/10 refusing all of them
+        (#143).
+
+        So this is an exact allowlist of reproducible outputs, not a pattern and not a
+        directory: anything matched here can be rebuilt by the command that made it,
+        and everything else still retains the tree. Ignored *directories* - node_modules,
+        hook/dist - are deliberately absent, because reclaiming one means a recursive
+        delete, which this code never does.
+
+        That it is reproducible rests on the caller, not on the filename. A tree only
+        reaches cleanup with no modified tracked file, so hook/ holds exactly the
+        committed source and the documented `go build` reproduces this binary from it.
+        Someone building an instrumented hook modifies that source, which retains the
+        tree, and their binary is never reached. AGENTS.md and the README state this as
+        the one exception to "ignored data keeps the tree"; it is a deliberate revision
+        of that contract rather than an oversight (#143, and review on #149).
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Entry)
+
+    # A path git had to quote contains characters none of these have, and decoding its
+    # escapes to compare is a way to get it subtly wrong. Treated as not-an-output, so
+    # the tree is retained.
+    if ($Entry.StartsWith('"', [StringComparison]::Ordinal)) { return $false }
+    $relative = $Entry.Trim().Replace('\', '/')
+    if (-not $relative) { return $false }
+    $script:BridgeWorktreeBuildOutputs -contains $relative
+}
+
 function Test-BridgeWorktreeFinished {
     <#
         Whether a managed worktree holds nothing worth keeping.
@@ -800,7 +844,15 @@ function Test-BridgeWorktreeFinished {
 
     # --no-optional-locks so asking the question cannot itself write to the index.
     $status = Invoke-BridgeGit -Directory $WorktreePath -Arguments @('--no-optional-locks', 'status', '--porcelain', '--untracked-files=all', '--ignored=matching')
-    if (-not $status.Ok -or $status.Output) { return $false }
+    if (-not $status.Ok) { return $false }
+    foreach ($entry in @($status.Output -split "`n")) {
+        $line = $entry.TrimEnd("`r")
+        if (-not $line) { continue }
+        # Anything that is not an ignored entry is uncommitted or untracked work and
+        # retains the tree, exactly as before.
+        if (-not $line.StartsWith('!! ', [StringComparison]::Ordinal)) { return $false }
+        if (-not (Test-BridgeWorktreeBuildOutput -Entry $line.Substring(3))) { return $false }
+    }
 
     $branch = Invoke-BridgeGit -Directory $WorktreePath -Arguments @('symbolic-ref', '--quiet', 'HEAD')
     if ($branch.Ok -or $branch.Code -ne 1) { return $false }
@@ -864,6 +916,25 @@ function Remove-BridgeWorktreeFiles {
             $removedTracked = $true
             $files = Invoke-BridgeGit -Directory $WorktreePath -Arguments @('rm', '-r', '--quiet', '--', '.') -IndexFile $temporaryIndex
             if (-not $files.Ok) { throw "Tracked-file cleanup was refused: $($files.Output)" }
+        }
+        # Deleted by exact path, after the tracked files and before the directories, so
+        # hook/ can actually become empty. Test-BridgeWorktreeFinished has already
+        # established that these are the only ignored entries present; this re-checks
+        # each one rather than trusting that, because it is the step that deletes.
+        foreach ($relative in $script:BridgeWorktreeBuildOutputs) {
+            if (-not (Test-BridgeWorktreeBuildOutput -Entry $relative)) { continue }
+            $output = [System.IO.Path]::GetFullPath($relative, $WorktreePath)
+            if (-not (Test-BridgeInstallDescendant -Path $output -Root $WorktreePath)) { continue }
+            if (-not [System.IO.File]::Exists($output)) { continue }
+            # A link here would delete whatever it points at, which is somebody else's
+            # file. Only a regular file in the tree is a build output.
+            Assert-BridgeInstallPayload -Root $WorktreePath -RelativePaths @($relative)
+            [System.IO.File]::Delete($output)
+            $parent = Split-Path $output -Parent
+            while (Test-BridgeInstallDescendant -Path $parent -Root $WorktreePath) {
+                [void]$directories.Add($parent)
+                $parent = Split-Path $parent -Parent
+            }
         }
         foreach ($directory in @($directories | Sort-Object Length -Descending)) {
             if ([System.IO.Directory]::Exists($directory)) { [System.IO.Directory]::Delete($directory, $false) }
