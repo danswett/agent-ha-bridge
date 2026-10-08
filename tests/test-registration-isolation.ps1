@@ -34,7 +34,7 @@ $script:A14PsCalls = 0
 $script:A14Guard = $null
 $script:A14ActualWindows = $script:BridgeIsWindows
 $expectedGroups = 26
-$expectedChecks = 124
+$expectedChecks = 125
 $primaryFailure = $null
 
 function Test-A14 {
@@ -1058,6 +1058,17 @@ try {
             Test-A14 'and publication is held rather than overwriting what it could not read' (
                 -not $held.Complete -and $script:DaemonGlobalSignature -ceq 'stale-on-purpose' -and
                 @(Get-TestPublicationWrites).Count -eq 0)
+            # And a state read can succeed while simply not containing this machine's
+            # own sensor at all - Home Assistant restarting, MQTT discovery not yet
+            # restored. Recovering nothing then is not evidence that there was nothing
+            # to recover.
+            $machineState = $script:A14States[$machineEntity]
+            [void]$script:A14States.Remove($machineEntity)
+            $script:DaemonStatesCache = $null
+            try { $missing = Add-DaemonUnaccountedDescriptors -Descriptors @() -Gone @() -Headers @{} }
+            finally { $script:A14States[$machineEntity] = $machineState; $script:DaemonStatesCache = $null }
+            Test-A14 'an inventory that is simply not there yet is unreadable rather than empty' (
+                -not $missing.Readable)
         }
         finally {
             $script:A14States[$machineEntity].attributes.sessions = $retained

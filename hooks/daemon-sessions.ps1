@@ -1061,7 +1061,9 @@ function Add-DaemonUnaccountedDescriptors {
 
         Readable says whether the retained inventory could actually be read. An
         unreadable one is not an empty one, and the caller must not publish over the
-        very thing it would need to recover from next pass.
+        very thing it would need to recover from next pass. A state read that simply
+        does not contain this machine's own sensor counts as unreadable for the same
+        reason: not having seen it is not having seen it empty.
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Descriptors,
@@ -1098,8 +1100,10 @@ function Add-DaemonUnaccountedDescriptors {
         if ($null -eq $Source.PSObject.Properties[$Name]) { return '' }
         [string]$Source.PSObject.Properties[$Name].Value
     }
+    $sawSelf = $false
     foreach ($machine in @(Get-BridgePeerMachine -States $states)) {
         if (-not $machine.IsSelf) { continue }
+        $sawSelf = $true
         foreach ($session in @($machine.Sessions)) {
             if ($null -eq $session) { continue }
             $node = & $field $session 'node'
@@ -1116,6 +1120,18 @@ function Add-DaemonUnaccountedDescriptors {
                 Kind = $(if ($kind) { $kind } else { 'copilot' })
             }
         }
+    }
+
+    # A state read can succeed and still not contain this machine's own sensor - Home
+    # Assistant restarting, MQTT discovery not yet restored, which is the case the
+    # orphan sweep above already describes as "the picture is incomplete". Recovering
+    # nothing then is not evidence that there was nothing to recover, and publishing
+    # would replace a retained inventory this pass never actually saw. The cost of
+    # being wrong the other way is one new machine's card waiting for its first
+    # complete discovery pass, which is where it waited before any of this.
+    if (-not $sawSelf) {
+        Write-DaemonLog -Message 'retained inventory for this machine is absent while session ownership is incomplete'
+        return [pscustomobject]@{ Descriptors = $carried; Readable = $false }
     }
 
     if ($recovered.Count -gt 0) {
