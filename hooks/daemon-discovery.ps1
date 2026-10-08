@@ -233,11 +233,12 @@ function Read-DaemonRegistrationFile {
 # session mid-registration must never be read as absent.
 $script:DaemonUnaccountedGraceMinutes = 2
 
-# When each unaccounted process was first seen, and which have already been reported
-# as carried on without. Keyed by kind, pid and start time, so a reused pid starts its
-# own clock rather than inheriting the silence of whatever held that number before.
+# When each unaccounted process was first seen, and which have already had something
+# said about them, so neither message repeats on every pass. Keyed by kind, pid and
+# start time, so a reused pid starts its own clock rather than inheriting the silence
+# of whatever held that number before.
 $script:DaemonUnaccountedSince = @{}
-$script:DaemonUnaccountedExcused = @{}
+$script:DaemonUnaccountedReported = @{}
 
 function Select-DaemonHoldingProcesses {
     <#
@@ -265,8 +266,8 @@ function Select-DaemonHoldingProcesses {
         $processId = [int]$process.Id
         $name = if ($process.PSObject.Properties['ProcessName']) { [string]$process.ProcessName } else { '' }
         # Read defensively: an adapter carrying its own older copy of
-        # bridge-platform.ps1 reports no start time, and a pid whose start time could
-        # not be read carries 0. Both simply key on less, rather than never ageing.
+        # bridge-platform.ps1 reports no start time, and a denied StartTime read
+        # carries 0.
         $started = 0
         if ($process.PSObject.Properties['StartedUtcTicks']) { $started = [long]$process.StartedUtcTicks }
         $key = '{0}{1}/{2}/{3}' -f $prefix, $processId, $name, $started
@@ -274,13 +275,29 @@ function Select-DaemonHoldingProcesses {
         if (-not $script:DaemonUnaccountedSince.ContainsKey($key)) {
             $script:DaemonUnaccountedSince[$key] = $now
         }
+        # Without a start time there is nothing to tell one generation of a pid from
+        # the next. An excused process that exits between passes, replaced by a new
+        # session that happens to get the same pid and name, would inherit the elapsed
+        # clock and be excused on sight - discovery going Complete while that session
+        # was still registering, which is the one outcome the grace exists to prevent.
+        # Excusing takes positive identification here as it does everywhere else, so an
+        # unidentifiable generation keeps holding.
+        if ($started -le 0) {
+            $holding.Add($process)
+            if (-not $script:DaemonUnaccountedReported.ContainsKey($key)) {
+                $script:DaemonUnaccountedReported[$key] = $true
+                Write-DaemonLog -Message ("holding for $Kind process $processId ($name): it has no readable start " +
+                    'time, so it cannot be told apart from a new session reusing its pid')
+            }
+            continue
+        }
         $waited = $now - $script:DaemonUnaccountedSince[$key]
         if ($waited.TotalMinutes -lt $script:DaemonUnaccountedGraceMinutes) {
             $holding.Add($process)
             continue
         }
-        if (-not $script:DaemonUnaccountedExcused.ContainsKey($key)) {
-            $script:DaemonUnaccountedExcused[$key] = $true
+        if (-not $script:DaemonUnaccountedReported.ContainsKey($key)) {
+            $script:DaemonUnaccountedReported[$key] = $true
             Write-DaemonLog -Message ("carrying on without $Kind process $processId ($name): unaccounted for " +
                 "$([int]$waited.TotalMinutes) min, so it is not a session that is still starting up")
         }
@@ -288,7 +305,7 @@ function Select-DaemonHoldingProcesses {
     foreach ($key in @($script:DaemonUnaccountedSince.Keys)) {
         if ($key.StartsWith($prefix, [StringComparison]::Ordinal) -and -not $seen.ContainsKey($key)) {
             [void]$script:DaemonUnaccountedSince.Remove($key)
-            [void]$script:DaemonUnaccountedExcused.Remove($key)
+            [void]$script:DaemonUnaccountedReported.Remove($key)
         }
     }
     , @($holding.ToArray())

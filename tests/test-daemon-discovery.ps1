@@ -127,7 +127,7 @@ function Reset-FixtureState {
     # way out of holding discovery - so a group that does not clear it inherits the
     # previous group's clock and stops testing what it says it does.
     $script:DaemonUnaccountedSince = @{}
-    $script:DaemonUnaccountedExcused = @{}
+    $script:DaemonUnaccountedReported = @{}
     $script:ClaudeAdapterLoaded = $false
     $script:CodexAdapterLoaded = $false
     if (Test-Path -LiteralPath $script:DaemonConfig.LogFile) {
@@ -503,6 +503,27 @@ Test-That 'and a discovery that is holding nothing says nothing' {
     }
     (Get-DaemonDiscoveryHoldSummary -Snapshot (Get-DaemonSessionDiscovery)) -eq ''
 }
+
+# A process whose start time cannot be read - an older adapter's copy of the platform
+# layer reports none, and a denied read carries 0 - has no generation to tell it apart
+# from a new session that reuses its pid and name between passes. That newcomer would
+# inherit the elapsed clock and be excused on sight, and discovery would go Complete
+# while it was still registering. Excusing takes positive identification here too.
+Reset-FixtureState -Kinds @('copilot')
+$script:ProcessesByAgent = @{ copilot = @([pscustomobject]@{ Id = 31005; ProcessName = 'copilot' }) }
+[void](Get-DaemonSessionDiscovery)
+foreach ($key in @($script:DaemonUnaccountedSince.Keys)) {
+    $script:DaemonUnaccountedSince[$key] = [DateTimeOffset]::Now.AddMinutes(-10)
+}
+$noGeneration = Get-DaemonSessionDiscovery
+
+Test-That 'a process with no readable start time is never aged out, however long it waits' {
+    -not $noGeneration.Complete -and (Get-FixtureDiagnosticCodes -Snapshot $noGeneration) -contains 'UnaccountedProcess'
+} "complete=$($noGeneration.Complete) codes: $((Get-FixtureDiagnosticCodes -Snapshot $noGeneration) -join ', ')"
+
+Test-That 'and says why, so a machine held for that reason can be diagnosed' {
+    (Get-FixtureLogText) -match 'holding for copilot process 31005 .*no readable start time'
+} (Get-FixtureLogText)
 
 # ------------------------------------------------------------- the test guard ----
 
