@@ -58,7 +58,15 @@ function Get-CodexExecutable {
     $command = Get-Command codex -ErrorAction SilentlyContinue
     if ($command) { return $command.Source }
     if (-not $script:BridgeIsWindows) {
-        foreach ($candidate in @('/opt/homebrew/bin/codex', '/usr/local/bin/codex', (Join-Path $HOME '.local/bin/codex'))) {
+        # The same places the launcher's Find-BridgeUnixCommand looks. They drifted:
+        # MacPorts installs to /opt/local/bin, which the launcher knew about and this
+        # did not, so on a MacPorts machine the installer reported Codex as missing
+        # and skipped registering the adapter - while the launcher went on finding
+        # the CLI and starting sessions that had no bridge adapter to report through
+        # (#125).
+        foreach ($candidate in @('/opt/homebrew/bin/codex', '/usr/local/bin/codex', '/opt/local/bin/codex',
+                (Join-Path $HOME '.local/bin/codex'), (Join-Path $HOME '.npm-global/bin/codex'),
+                (Join-Path $HOME '.bun/bin/codex'))) {
             if (Test-Path -LiteralPath $candidate) { return $candidate }
         }
         return $null
