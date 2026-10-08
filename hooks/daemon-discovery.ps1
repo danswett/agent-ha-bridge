@@ -233,12 +233,30 @@ function Read-DaemonRegistrationFile {
 # session mid-registration must never be read as absent.
 $script:DaemonUnaccountedGraceMinutes = 2
 
-# When each unaccounted process was first seen, and which have already had something
-# said about them, so neither message repeats on every pass. Keyed by kind, pid and
-# start time, so a reused pid starts its own clock rather than inheriting the silence
-# of whatever held that number before.
+# When each unaccounted process was first seen, when it was last seen, and which have
+# already had something said about them, so neither message repeats on every pass.
+# Keyed by kind, pid and start time, so a reused pid starts its own clock rather than
+# inheriting the silence of whatever held that number before.
 $script:DaemonUnaccountedSince = @{}
+$script:DaemonUnaccountedLastSeen = @{}
 $script:DaemonUnaccountedReported = @{}
+
+# How long a record outlives the last pass that saw it.
+#
+# Forgetting on the first pass that missed a process looked tidy and quietly made the
+# grace above unreachable. A process only has to drop out of the candidate set for one
+# pass - an intermittently unreadable command line is enough - for its record to be
+# deleted and its clock to restart from zero on the pass after. Something flickering
+# on a ninety-second cycle therefore never reaches two minutes, and holds discovery
+# open for ever in short bursts while never being old enough to excuse.
+#
+# Observed on a Mac: 207 holds in six hours on one pid, no process ever reported as
+# unidentifiable, and exactly one excused in the whole log.
+#
+# The key already carries the start time, so re-seeing it is proof of the same process
+# rather than a new one wearing its pid. There is no correctness reason to restart the
+# clock; retention only stops the table growing without end.
+$script:DaemonUnaccountedRetentionMinutes = 30
 
 function Select-DaemonHoldingProcesses {
     <#
@@ -254,12 +272,25 @@ function Select-DaemonHoldingProcesses {
     #>
     param(
         [Parameter(Mandatory)][string]$Kind,
-        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Unaccounted
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Unaccounted,
+
+        # Everything the pass looked at, so "not here" can be told from "here and
+        # accounted for". Without it both look identical and a process that registered
+        # normally keeps the clock it ran before registering - see the retention loop.
+        [AllowEmptyCollection()][object[]]$Candidates = @()
     )
 
     $now = [DateTimeOffset]::Now
     $prefix = "$Kind/"
     $seen = @{}
+    $present = @{}
+    foreach ($process in $Candidates) {
+        if ($null -eq $process) { continue }
+        $candidateName = if ($process.PSObject.Properties['ProcessName']) { [string]$process.ProcessName } else { '' }
+        $candidateStart = 0
+        if ($process.PSObject.Properties['StartedUtcTicks']) { $candidateStart = [long]$process.StartedUtcTicks }
+        $present['{0}{1}/{2}/{3}' -f $prefix, [int]$process.Id, $candidateName, $candidateStart] = $true
+    }
     $holding = [Collections.Generic.List[object]]::new()
     foreach ($process in $Unaccounted) {
         if ($null -eq $process) { continue }
@@ -275,6 +306,7 @@ function Select-DaemonHoldingProcesses {
         if (-not $script:DaemonUnaccountedSince.ContainsKey($key)) {
             $script:DaemonUnaccountedSince[$key] = $now
         }
+        $script:DaemonUnaccountedLastSeen[$key] = $now
         # Without a start time there is nothing to tell one generation of a pid from
         # the next. An excused process that exits between passes, replaced by a new
         # session that happens to get the same pid and name, would inherit the elapsed
@@ -303,10 +335,29 @@ function Select-DaemonHoldingProcesses {
         }
     }
     foreach ($key in @($script:DaemonUnaccountedSince.Keys)) {
-        if ($key.StartsWith($prefix, [StringComparison]::Ordinal) -and -not $seen.ContainsKey($key)) {
+        if (-not $key.StartsWith($prefix, [StringComparison]::Ordinal)) { continue }
+        if ($seen.ContainsKey($key)) { continue }
+        # Still running, but accounted for: it registered. Its record goes now rather
+        # than ageing quietly in the background, because should that registration be
+        # lost later the process has to earn a fresh grace - inheriting the minutes it
+        # ran before registering would excuse it on sight and let retirement and
+        # cleanup run against a session that is only part-way through registering
+        # again. Found by review on #140.
+        if ($present.ContainsKey($key)) {
             [void]$script:DaemonUnaccountedSince.Remove($key)
+            [void]$script:DaemonUnaccountedLastSeen.Remove($key)
             [void]$script:DaemonUnaccountedReported.Remove($key)
+            continue
         }
+        # Gone from this pass entirely. Kept for a while, so one missed pass does not
+        # restart the clock, and dropped once it is old enough to have really gone.
+        $lastSeen = if ($script:DaemonUnaccountedLastSeen.ContainsKey($key)) {
+            $script:DaemonUnaccountedLastSeen[$key]
+        } else { $script:DaemonUnaccountedSince[$key] }
+        if (($now - $lastSeen).TotalMinutes -lt $script:DaemonUnaccountedRetentionMinutes) { continue }
+        [void]$script:DaemonUnaccountedSince.Remove($key)
+        [void]$script:DaemonUnaccountedLastSeen.Remove($key)
+        [void]$script:DaemonUnaccountedReported.Remove($key)
     }
     , @($holding.ToArray())
 }
@@ -394,7 +445,7 @@ function Read-DaemonAdapterRegistrations {
     foreach ($process in $inventory.Processes) {
         if (-not $accounted.ContainsKey([int]$process.Id)) { $unaccounted.Add($process) }
     }
-    foreach ($process in (Select-DaemonHoldingProcesses -Kind $Kind -Unaccounted @($unaccounted.ToArray()))) {
+    foreach ($process in (Select-DaemonHoldingProcesses -Kind $Kind -Unaccounted @($unaccounted.ToArray()) -Candidates @($inventory.Processes))) {
         $known = $false
         $diagnostics.Add([pscustomobject]@{
             Kind = $Kind; Path = $Root; Code = 'UnaccountedProcess'; ProcessId = [int]$process.Id
@@ -595,9 +646,15 @@ function Get-DaemonSessionDiscovery {
                         $accounted[$pidValue] = $true
                     }
                     $stillUnaccounted = [Collections.Generic.List[object]]::new()
+                    # Only processes this pass positively resolved - registered, or
+                    # identified as something that is not a session. A process that
+                    # exited mid-query is neither: it is simply unknown, so it must
+                    # fall through to absence retention rather than having its clock
+                    # reset by a pass that learned nothing about it.
+                    $resolved = [Collections.Generic.List[object]]::new()
                     foreach ($process in $inventory.Processes) {
                         $pidValue = [int]$process.Id
-                        if ($accounted.ContainsKey($pidValue)) { continue }
+                        if ($accounted.ContainsKey($pidValue)) { $resolved.Add($process); continue }
                         # Only a process nothing accounted for costs a command-line
                         # read, which is about 77 ms - normally there are none. An
                         # embedded CLI (Scout runs copilot.exe --headless) is not a
@@ -606,14 +663,17 @@ function Get-DaemonSessionDiscovery {
                         $command = Get-BridgeCommandLine -ProcessId $pidValue -AsObservation
                         if ($command.State -eq 'Absent') { continue }
                         if ($command.State -eq 'Readable' -and
-                            (Test-BridgeAgentEmbeddedProcess -CommandLine $command.Text)) { continue }
+                            (Test-BridgeAgentEmbeddedProcess -CommandLine $command.Text)) {
+                            $resolved.Add($process)
+                            continue
+                        }
                         # Anything else stays unaccounted: excusing a process on sight
                         # takes positive identification, never an unreadable command
                         # line. What it does not do any more is hold discovery open
                         # for ever - Select-DaemonHoldingProcesses ages it out.
                         $stillUnaccounted.Add($process)
                     }
-                    foreach ($process in (Select-DaemonHoldingProcesses -Kind $kind -Unaccounted @($stillUnaccounted.ToArray()))) {
+                    foreach ($process in (Select-DaemonHoldingProcesses -Kind $kind -Unaccounted @($stillUnaccounted.ToArray()) -Candidates @($resolved.ToArray()))) {
                         $legacyIssues.Add([pscustomobject]@{
                             Kind = $kind; Path = ''; Code = 'UnaccountedProcess'; ProcessId = [int]$process.Id
                         })

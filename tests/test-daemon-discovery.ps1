@@ -127,7 +127,8 @@ function Reset-FixtureState {
     # way out of holding discovery - so a group that does not clear it inherits the
     # previous group's clock and stops testing what it says it does.
     $script:DaemonUnaccountedSince = @{}
-    $script:DaemonUnaccountedReported = @{}
+        $script:DaemonUnaccountedLastSeen = @{}
+        $script:DaemonUnaccountedReported = @{}
     $script:ClaudeAdapterLoaded = $false
     $script:CodexAdapterLoaded = $false
     if (Test-Path -LiteralPath $script:DaemonConfig.LogFile) {
@@ -473,6 +474,82 @@ $again = Get-DaemonSessionDiscovery
 Test-That 'saying it once, not on every pass for as long as the process runs' {
     ([regex]::Matches((Get-FixtureLogText), 'carrying on without copilot process 31001')).Count -eq 1 -and $again.Complete
 } "occurrences: $(([regex]::Matches((Get-FixtureLogText), 'carrying on without copilot process 31001')).Count)"
+
+# The grace counts elapsed time, not consecutive passes. A process only has to drop
+# out of the candidate set once - an intermittently unreadable command line is enough -
+# and deleting its record there restarted the clock, so anything flickering faster than
+# the grace never matured and held discovery open for ever in short bursts. Seen on a
+# Mac as 207 holds on one pid in six hours with exactly one process ever excused.
+Reset-FixtureState -Kinds @('copilot')
+$flicker = [pscustomobject]@{ Id = 31010; ProcessName = 'copilot'; StartedUtcTicks = 777 }
+$script:ProcessesByAgent = @{ copilot = @($flicker) }
+[void](Get-DaemonSessionDiscovery)
+# Gone for one pass, exactly as a failed read of its command line would look.
+$script:ProcessesByAgent = @{ copilot = @() }
+[void](Get-DaemonSessionDiscovery)
+$script:ProcessesByAgent = @{ copilot = @($flicker) }
+[void](Get-DaemonSessionDiscovery)
+
+Test-That 'a process that vanished for one pass keeps the clock it had already run' {
+    $key = @($script:DaemonUnaccountedSince.Keys | Where-Object { $_ -like 'copilot/31010/*' })
+    $key.Count -eq 1
+} "keys: $(@($script:DaemonUnaccountedSince.Keys) -join ', ')"
+
+foreach ($key in @($script:DaemonUnaccountedSince.Keys)) {
+    $script:DaemonUnaccountedSince[$key] = [DateTimeOffset]::Now.AddMinutes(-10)
+}
+$script:ProcessesByAgent = @{ copilot = @() }
+[void](Get-DaemonSessionDiscovery)
+$script:ProcessesByAgent = @{ copilot = @($flicker) }
+$matured = Get-DaemonSessionDiscovery
+
+Test-That 'so it is eventually excused instead of holding everything open for ever' {
+    $matured.Complete -and (Get-FixtureDiagnosticCodes -Snapshot $matured) -notcontains 'UnaccountedProcess'
+} "complete=$($matured.Complete) codes: $((Get-FixtureDiagnosticCodes -Snapshot $matured) -join ', ')"
+
+# Retention is bookkeeping, not amnesia: a record that really has gone is dropped, so
+# the table cannot grow without end on a machine that starts many short-lived agents.
+Reset-FixtureState -Kinds @('copilot')
+$script:ProcessesByAgent = @{ copilot = @([pscustomobject]@{ Id = 31011; ProcessName = 'copilot'; StartedUtcTicks = 888 }) }
+[void](Get-DaemonSessionDiscovery)
+foreach ($key in @($script:DaemonUnaccountedLastSeen.Keys)) {
+    $script:DaemonUnaccountedLastSeen[$key] = [DateTimeOffset]::Now.AddMinutes(-($script:DaemonUnaccountedRetentionMinutes + 5))
+}
+$script:ProcessesByAgent = @{ copilot = @() }
+[void](Get-DaemonSessionDiscovery)
+
+Test-That 'a record is forgotten once the process has been gone long enough' {
+    @($script:DaemonUnaccountedSince.Keys | Where-Object { $_ -like 'copilot/31011/*' }).Count -eq 0
+} "keys: $(@($script:DaemonUnaccountedSince.Keys) -join ', ')"
+
+# Keeping a record through absence must not keep it through success. A process is
+# normally unaccounted for the moment before its session registers, so it always has a
+# little time on the clock; if that survived registration, then losing the registration
+# later - an unreadable adapter, a session file still being written - would excuse the
+# process on sight and let retirement and cleanup run against a session that is only
+# part-way through registering again. Found by review on #140.
+Reset-FixtureState -Kinds @('copilot')
+$settler = [pscustomobject]@{ Id = 31012; ProcessName = 'copilot'; StartedUtcTicks = 999 }
+$script:ProcessesByAgent = @{ copilot = @($settler) }
+[void](Get-DaemonSessionDiscovery)
+foreach ($key in @($script:DaemonUnaccountedSince.Keys)) {
+    $script:DaemonUnaccountedSince[$key] = [DateTimeOffset]::Now.AddMinutes(-10)
+}
+$script:SessionsByKind = @{
+    copilot = @{ 'copilot-settled' = New-FixtureSession -SessionId 'copilot-settled' -ProcessId 31012 -Kind 'copilot' }
+}
+[void](Get-DaemonSessionDiscovery)
+
+Test-That 'registering clears the clock the process ran before it registered' {
+    @($script:DaemonUnaccountedSince.Keys | Where-Object { $_ -like 'copilot/31012/*' }).Count -eq 0
+} "keys: $(@($script:DaemonUnaccountedSince.Keys) -join ', ')"
+
+$script:SessionsByKind = @{ copilot = @{} }
+$lost = Get-DaemonSessionDiscovery
+
+Test-That 'so losing that registration earns a fresh grace rather than instant excusal' {
+    -not $lost.Complete -and (Get-FixtureDiagnosticCodes -Snapshot $lost) -contains 'UnaccountedProcess'
+} "complete=$($lost.Complete) codes: $((Get-FixtureDiagnosticCodes -Snapshot $lost) -join ', ')"
 
 # A pid is reused, and the number alone cannot tell a process that has been silent for
 # minutes from a new one that has just inherited it. Excusing the newcomer on the old
