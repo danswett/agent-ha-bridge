@@ -1603,6 +1603,34 @@ Test-That 'whitespace around a configured id does not stop it matching' {
 $script:AgentIds = @('', '   ')
 Test-That 'and a blank entry never matches a blank user' { -not (Test-BridgeAgentUserId -UserId '') }
 
+# Twice now a change to one of the fingerprinted renderer helpers has shipped without
+# a matching version bump (#93, then #131), and each time the publication fence did
+# exactly what it should: refused every write, because an equal version with different
+# content is a conflict by definition. The shared dashboard then freezes, silently and
+# fleet-wide, until someone reads a daemon log. Nothing failed in CI either time - the
+# fence is well covered, but the *pairing* of a renderer change with a bump was not.
+#
+# This pins the pair. Change any of the four helpers Get-BridgeRenderArtifact
+# fingerprints and this fails, saying to bump the version and update both constants
+# together. It is deliberately a hash of source text: that is precisely what the fence
+# compares, so anything that would conflict there fails here first.
+$script:ExpectedRenderVersion = '1.5.0'
+$script:ExpectedRenderHash = '61a847f420a3e04275ed1695136264172d5e50177c1a1d736db05a23a63618d4'
+$artifact = Get-BridgeRenderArtifact
+
+Test-That 'the renderer is still the one this version was pinned to' {
+    $artifact.version -eq $script:ExpectedRenderVersion -and $artifact.hash -eq $script:ExpectedRenderHash
+} @"
+renderer fingerprint moved without a version bump.
+  pinned : $($script:ExpectedRenderVersion) / $($script:ExpectedRenderHash)
+  actual : $($artifact.version) / $($artifact.hash)
+If you changed Save-CopilotSessionDashboard, Test-BridgeActivityCardServed,
+Get-BridgeDashboardInputSignature or ConvertTo-BridgePublicationJson, bump
+`$script:BridgeDashboardRenderVersion in hooks/decision-ha-websocket.ps1 and update
+both constants above. Shipping the change without the bump freezes publication on
+every already-fenced machine.
+"@
+
 Remove-Item -LiteralPath $script:DecisionBridgeConfig.LogFile -Force -ErrorAction SilentlyContinue
 
 Write-Host ''
