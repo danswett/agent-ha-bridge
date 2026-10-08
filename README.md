@@ -402,6 +402,7 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `updates.checkHours` | How often to check GitHub for a release (default `6`, i.e. 4×/day) |
 | `usage.publish` | Set to `false` to stop collecting and publishing each agent's remaining allowance (default `true`). This stops the vendor calls, not just the card |
 | `usage.intervalSeconds` | How often to re-read the allowances (default `120`). Copilot's figure moves continuously while a session runs, so this is a poll rather than a cache read |
+| `usage.keychain` | Set to `true` to let the Copilot allowance read its token from the macOS login keychain (default `false`). Off because the read raises an authorization panel that **Always Allow** cannot silence — the CLI replaces the item on every token refresh, so each grant outlives its item by minutes. `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN` get the same figure without prompting. No effect on Windows, which reads the credential store silently |
 
 Prefer keeping tokens out of a file? Leave `token` / `agentToken` empty and set the
 variables named by `tokenEnvVar` / `agentTokenEnvVar` in the environment of each process
@@ -890,6 +891,19 @@ window is closest to running out.
 Tokens are read, spent on the one request, and dropped — never logged, never
 published, never written anywhere. Turn the whole thing off with `usage.publish:
 false`, which stops the collection rather than merely hiding the result.
+
+On macOS the Copilot figure needs a token the CLI keeps in the login keychain, and
+reading it is **off by default** (`usage.keychain`). Nothing the bridge can do makes
+that read quiet: the keychain item does not trust `/usr/bin/security`, so every read
+raises an authorization panel, and pressing **Always Allow** does not settle it,
+because the CLI replaces the item whenever it refreshes its token and the replacement
+carries a new ACL that the earlier grant does not belong to. With a two-minute poll
+behind it, that was enough panels to make a Mac unusable.
+
+Set `usage.keychain: true` to allow the read anyway. A machine that wants the live
+Copilot figure without any of that can export `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or
+`GITHUB_TOKEN` instead — those are read first and prompt for nothing. Otherwise the
+allowance falls back to its cached reading, and the other agents are unaffected.
 
 ### How current it is
 

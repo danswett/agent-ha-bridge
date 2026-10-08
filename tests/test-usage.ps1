@@ -733,6 +733,78 @@ Test-That 'and turning it off stops the collecting, not just the showing' {
     (Sync-DaemonUsage -Headers $headers -Now $clock.AddHours(1)) -eq $false -and $script:Collected -eq $before
 }
 
+# --- 7. the keychain the Copilot token comes from ---------------------------------
+
+Write-Host ''
+Write-Host '--- reading the Copilot token on macOS ---'
+
+# A Mac was made unusable by authorization panels while the bridge asked, every two
+# minutes, for a number that decorates a gauge (#122). The reason pressing "Always
+# Allow" never settled it is that the CLI replaces its keychain item whenever it
+# refreshes the token, and the replacement carries a new ACL - so the grant belongs to
+# an item that no longer exists. A prompt that cannot be stopped by answering it is
+# not something to raise by default.
+$script:BridgeIsWindows = $false
+$script:Probes = 0
+$script:ProbeResult = [pscustomobject]@{ Ran = $true; TimedOut = $false; ExitCode = 0; Output = 'gho_fromkeychain' }
+function Invoke-BridgeCommandProbe {
+    param([string]$Executable, [string[]]$Arguments, [int]$TimeoutMs)
+    $script:Probes++
+    $script:ProbeResult
+}
+
+foreach ($name in @('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')) {
+    Set-Item -LiteralPath "env:$name" -Value '' -ErrorAction SilentlyContinue
+}
+
+$script:Settings = @{}
+$script:BridgeKeychainToken = ''
+$script:BridgeKeychainUnavailable = $false
+
+Test-That 'the keychain is left alone unless it was deliberately turned on' {
+    $token = Get-BridgeCopilotToken -Login 'octocat'
+    $token -eq '' -and $script:Probes -eq 0
+} "probes: $($script:Probes)"
+
+$script:Settings['usage.keychain'] = $true
+Test-That 'turning it on reads the token the CLI stored' {
+    (Get-BridgeCopilotToken -Login 'octocat') -eq 'gho_fromkeychain'
+}
+
+Test-That 'and having read it once, does not ask a second time' {
+    $before = $script:Probes
+    (Get-BridgeCopilotToken -Login 'octocat') -eq 'gho_fromkeychain' -and $script:Probes -eq $before
+} "probes: $($script:Probes)"
+
+# Being refused is the same storm by another route: the poll comes back in two minutes
+# and raises the panel again, for as long as the machine is on.
+$script:BridgeKeychainToken = ''
+$script:BridgeKeychainUnavailable = $false
+$script:ProbeResult = [pscustomobject]@{ Ran = $true; TimedOut = $false; ExitCode = 44; Output = '' }
+$script:Probes = 0
+
+Test-That 'a refusal is taken as an answer, not retried on the next poll' {
+    $first = Get-BridgeCopilotToken -Login 'octocat'
+    $second = Get-BridgeCopilotToken -Login 'octocat'
+    $first -eq '' -and $second -eq '' -and $script:Probes -eq 1
+} "probes: $($script:Probes)"
+
+Test-That 'an unanswered prompt is described as nobody having answered it' {
+    (Get-BridgeKeychainRefusal -Probe ([pscustomobject]@{ Ran = $true; TimedOut = $true; ExitCode = 0; Output = '' })) -match 'went unanswered'
+}
+
+Test-That 'and a denied one as access refused, which is a different thing to fix' {
+    (Get-BridgeKeychainRefusal -Probe ([pscustomobject]@{ Ran = $true; TimedOut = $false; ExitCode = 44; Output = '' })) -match 'denied'
+}
+
+# The way out that costs no interruption at all.
+$script:Probes = 0
+$env:COPILOT_GITHUB_TOKEN = 'gho_fromenvironment'
+Test-That 'an environment token is used without going near the keychain' {
+    (Get-BridgeCopilotToken -Login 'octocat') -eq 'gho_fromenvironment' -and $script:Probes -eq 0
+} "probes: $($script:Probes)"
+$env:COPILOT_GITHUB_TOKEN = ''
+
 Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host ''

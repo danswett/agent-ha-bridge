@@ -18,6 +18,30 @@
     Shared state it changes: DaemonUsageCheckedAt, DaemonUsageSignature.
 #>
 
+# Asked once per daemon, then left alone - see the macOS branch of
+# Get-BridgeCopilotToken for why a second ask is a user-visible problem rather than
+# just a wasted call.
+$script:BridgeKeychainToken = ''
+$script:BridgeKeychainUnavailable = $false
+
+function Get-BridgeKeychainRefusal {
+    <#
+        Why the keychain read did not produce a token, in words that say whether the
+        person at the machine did something or the item simply is not there.
+
+        Worth distinguishing: a denied prompt means the gauge can be restored by
+        granting access, while a missing item means this machine never stored one and
+        no amount of clicking will help.
+    #>
+    param($Probe)
+
+    if ($null -eq $Probe) { return 'the keychain could not be reached' }
+    if (-not $Probe.Ran) { return 'the security command could not be run' }
+    if ($Probe.TimedOut) { return 'the authorization prompt went unanswered' }
+    if ($Probe.ExitCode -ne 0) { return 'access was denied, or no stored item matched' }
+    'the stored item was empty'
+}
+
 $script:BridgeUsageConfig = @{
     # The figures move continuously while a session runs - Copilot's remaining credits
     # were measured changing inside three minutes - so this is a poll, not a cache
@@ -357,6 +381,7 @@ function Get-BridgeCopilotToken {
         if (-not [string]::IsNullOrWhiteSpace($value)) { return $value }
     }
     if ([string]::IsNullOrWhiteSpace($Login)) { return '' }
+    if (-not [string]::IsNullOrWhiteSpace($script:BridgeKeychainToken)) { return $script:BridgeKeychainToken }
 
     # Stored by the CLI under the account it belongs to, so a machine signed in to two
     # accounts hands back the right one rather than whichever was written last.
@@ -410,12 +435,42 @@ public static class BridgeCredentialStore
             if (-not [string]::IsNullOrWhiteSpace($stored)) { return $stored }
         }
         else {
+            # Not asked at all unless it was turned on deliberately, because this
+            # prompt cannot be made to stop by answering it.
+            #
+            # The CLI's keychain item does not trust /usr/bin/security, so reading it
+            # puts an authorization panel in front of whoever is at the machine. The
+            # obvious answer - press "Always Allow" once - does not hold: the CLI
+            # replaces the item when it refreshes its token, and a replacement is a new
+            # item with a default ACL, so every grant given before it belongs to an
+            # item that no longer exists. The quota poll then asks again two minutes
+            # later, and the approval it was just given has already been invalidated.
+            #
+            # A Mac was made unusable by the volume of those panels while the bridge
+            # asked, over and over, for a number that decorates a gauge (#122). An
+            # allowance is not worth an interruption that the person cannot switch off
+            # by answering it, so the default is to leave the keychain alone and let
+            # the allowance fall back to its cache. COPILOT_GITHUB_TOKEN, GH_TOKEN and
+            # GITHUB_TOKEN above are read first and prompt for nothing, so a machine
+            # that wants the live figure has a way to it that costs no interruption.
+            if (-not [bool](Get-BridgeSetting 'usage.keychain' $false)) { return '' }
+            if ($script:BridgeKeychainUnavailable) { return '' }
             $found = Invoke-BridgeCommandProbe -Executable 'security' `
                 -Arguments @('find-generic-password', '-s', 'copilot-cli', '-a', $account, '-w') -TimeoutMs 5000
             if ($found.Ran -and -not $found.TimedOut -and $found.ExitCode -eq 0) {
                 $value = ([string]$found.Output).Trim()
-                if (-not [string]::IsNullOrWhiteSpace($value)) { return $value }
+                if (-not [string]::IsNullOrWhiteSpace($value)) {
+                    # Held for the daemon's life rather than re-read: asking twice is
+                    # the whole complaint, and the token outlives the poll by hours.
+                    $script:BridgeKeychainToken = $value
+                    return $value
+                }
             }
+            # Once is enough even when it was allowed to ask. A refusal repeated every
+            # two minutes is the same storm by another route.
+            $script:BridgeKeychainUnavailable = $true
+            Write-DaemonLog -Message ("the Copilot allowance will not be read from the keychain again this run: " +
+                "$(Get-BridgeKeychainRefusal -Probe $found)")
         }
     }
     catch {
