@@ -1903,6 +1903,143 @@ async function checkSendAnswerCarriesTypedText() {
 }
 
 /*
+ * An answer published for a form is held, not forgotten, until the daemon says which
+ * publish it used.
+ *
+ * mqtt.publish resolves when Home Assistant has dispatched the message, not when the
+ * daemon has read it as the answer. The terminal - or another dashboard - can answer
+ * the same question inside that gap, and the daemon then discards a payload tagged
+ * for a question it is no longer holding, by design. The card had already reported
+ * Sent and emptied the box, so the words were gone from the session and from the box
+ * it was telling the person to send again from (#104).
+ */
+async function checkAnswerConsumedStamp() {
+  const TOPIC = 'copilot/cli/session/abc/replypayload';
+  const FIELD = 'select.agent_bridge_abc_f1';
+  const TEXT_FIELD = 'select.agent_bridge_abc_f2';
+  const ACTIVITY = 'sensor.agent_bridge_abc_activity';
+
+  function armed({ withActivity = true } = {}) {
+    const calls = [];
+    const states = {
+      [DECISION]: {
+        state: 'Awaiting answer...',
+        attributes: {
+          options: ['Awaiting answer...', 'Cancel request'], decision_id: 'd1',
+          field_1_label: 'Colour', field_2_label: 'Notes',
+        },
+      },
+      [FIELD]: { state: 'Red', attributes: { options: ['Choose...', 'Red', 'Blue'] } },
+      [TEXT_FIELD]: { state: 'Idle', attributes: { options: ['Idle'] } },
+      [ACTIVITY]: { state: 'Working', attributes: {} },
+    };
+    const hass = {
+      states,
+      callService: (domain, service, data) => {
+        calls.push({ domain, service, data });
+        return Promise.resolve();
+      },
+    };
+    const reply = new SharedReplyCard();
+    const config = { topic: TOPIC };
+    if (withActivity) { config.activity = ACTIVITY; }
+    reply.setConfig(config);
+    reply.hass = hass;
+    reply._els.textarea.value = 'and please restart it afterwards';
+
+    const choices = new AgentBridgeChoicesCard();
+    choices.setConfig({ decision: DECISION, fields: [FIELD, TEXT_FIELD], submit: SUBMIT, reply_topic: TOPIC });
+    choices.hass = hass;
+    // Each state change is delivered the way Home Assistant delivers one.
+    const update = () => { reply.hass = hass; };
+    return { calls, reply, choices, states, hass, update };
+  }
+
+  const press = (c) => buttons(c).find((b) => b.textContent === 'Send answer').click();
+  const stampOf = (m) => {
+    const call = m.calls.find((c) => c.domain === 'mqtt');
+    if (!call || !call.data) { return ''; }
+    try { return JSON.parse(call.data.payload).at; } catch (err) { return ''; }
+  };
+  const clearQuestion = (m) => {
+    m.states[DECISION] = { state: 'Idle', attributes: { options: ['Idle'] } };
+  };
+
+  // The normal path. The daemon reads the payload, answers the question with it, and
+  // names the publish it used - so the words are delivered and can go for good.
+  let m = armed();
+  press(m.choices);
+  await flush();
+  check('an answer published for a form empties the box', m.reply._els.textarea.value === '');
+  check('but the words are held until the daemon says what became of them',
+    m.reply._trimmedPublished === 'and please restart it afterwards', m.reply._trimmedPublished);
+  m.states[ACTIVITY] = { state: 'Working', attributes: { answer_consumed_at: stampOf(m) } };
+  clearQuestion(m);
+  m.update();
+  check('the daemon naming our publish settles it as delivered',
+    m.reply._els.textarea.value === '', m.reply._els.textarea.value);
+  check('and the held copy is released, so a later question cannot inherit it',
+    m.reply._trimmedPublished === '' && m.reply._pendingAnswer === null);
+
+  // The race this exists for: the question goes, and no publish of ours was named as
+  // its answer. The words were discarded by the daemon and must come back.
+  m = armed();
+  press(m.choices);
+  await flush();
+  clearQuestion(m);
+  m.update();
+  check('a question that goes without using our publish puts the words back',
+    m.reply._els.textarea.value === 'and please restart it afterwards', m.reply._els.textarea.value);
+  check('and says so, rather than leaving Sent standing over a loss',
+    /not sent/i.test(m.reply._els.status.textContent), m.reply._els.status.textContent);
+
+  // A different publish being consumed is not ours. Matching on "something was
+  // consumed" rather than on the stamp would call every lost race a success.
+  m = armed();
+  press(m.choices);
+  await flush();
+  m.states[ACTIVITY] = { state: 'Working', attributes: { answer_consumed_at: '2020-01-01T00:00:00.000Z' } };
+  clearQuestion(m);
+  m.update();
+  check('a publish that was not ours does not count as our answer being delivered',
+    m.reply._els.textarea.value === 'and please restart it afterwards', m.reply._els.textarea.value);
+
+  // While the question still stands the daemon simply has not read the payload yet.
+  // Restoring on that would put the words on screen twice over.
+  m = armed();
+  press(m.choices);
+  await flush();
+  m.update();
+  check('while the question still stands nothing is claimed either way',
+    m.reply._els.textarea.value === '' && m.reply._pendingAnswer !== null);
+
+  // Anything typed after the publish is not part of it, and must survive a restore
+  // that puts the published words back in front of it.
+  m = armed();
+  press(m.choices);
+  await flush();
+  m.reply._els.textarea.value = ' - and check the logs';
+  clearQuestion(m);
+  m.update();
+  check('words typed during the race are kept, with the restored answer before them',
+    m.reply._els.textarea.value === 'and please restart it afterwards - and check the logs',
+    m.reply._els.textarea.value);
+
+  // A dashboard generated before the daemon published the stamp gives the card no
+  // activity sensor to watch. It cannot tell delivered from discarded, so it must
+  // keep the behaviour it had: arming the watch blind would restore the words after
+  // every successful answer, and a duplicate typed into a prompt is its own damage.
+  m = armed({ withActivity: false });
+  press(m.choices);
+  await flush();
+  clearQuestion(m);
+  m.update();
+  check('without an activity sensor to watch, the old behaviour is kept exactly',
+    m.reply._els.textarea.value === '' && m.reply._pendingAnswer === null,
+    m.reply._els.textarea.value);
+}
+
+/*
  * Which card draws the Send while a question is waiting.
  *
  * Both cards drew one. The choices card's "Send answer" commits the picked options
@@ -2054,6 +2191,7 @@ async function checkReplySendStandsDown() {
   await checkRefusedSendReleases();
   await checkIncompleteSendStaysLive();
   await checkSendAnswerCarriesTypedText();
+  await checkAnswerConsumedStamp();
   await checkReplySendStandsDown();
 
   const pubEnv = launchEnv({});

@@ -2506,6 +2506,11 @@ ha-card {
                 name = ''
                 topic = (Get-CopilotMqttReplyPayloadTopic -Node $node)
                 placeholder = 'Reply, or type an answer...'
+                # Watched only to learn the fate of an answer published for a form:
+                # the daemon names the payload it consumed in answer_consumed_at, and
+                # without somewhere to read that the card cannot tell a delivered
+                # answer from one discarded by a race it reported as sent (#104).
+                activity = $activityEntity
             })
         }
         elseif (-not [string]::IsNullOrWhiteSpace($ReplyCardUrl)) {

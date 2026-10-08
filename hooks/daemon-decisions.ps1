@@ -1080,8 +1080,17 @@ function Invoke-DaemonDecisionAnswer {
         try {
             $shown = ($Answer -replace '\s+', ' ').Trim()
             if ($shown.Length -gt 60) { $shown = $shown.Substring(0, 57) + '...' }
+            # answer_consumed_at names the reply-card publish these words came from, so
+            # the card that sent them can tell "my payload was the one used" from "the
+            # question was answered by the terminal while my publish was in flight".
+            # Without it the card cleared the box on a success it could not verify, and
+            # a lost race discarded the words with nothing left on screen (#104).
+            $consumedExtra = @{ answer = $shown; at = [DateTimeOffset]::Now.ToString('HH:mm:ss') }
+            if (-not [string]::IsNullOrWhiteSpace($PayloadStamp)) {
+                $consumedExtra['answer_consumed_at'] = $PayloadStamp
+            }
             Set-DaemonTransientActivity -SessionId $SessionId -Summary 'Answer sent' `
-                -Extra @{ answer = $shown; at = [DateTimeOffset]::Now.ToString('HH:mm:ss') } -Headers $Headers
+                -Extra $consumedExtra -Headers $Headers
         }
         catch { }
         Write-DaemonLog -Message "decision answer injected to $short (pid $($delivery.ProcessId)): $($delivery.Detail)"

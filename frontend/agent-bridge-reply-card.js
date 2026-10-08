@@ -44,8 +44,16 @@
  * so whenever a question armed the choices card beside it, both were on screen at
  * once and only one of them could answer. The reply card now stands its Send down
  * while the form is holding one - see FORM_SENDS.
+ *
+ * 1.30.0 stops a form's typed answer being lost to a race it reported as sent. The
+ * publish resolving only means Home Assistant dispatched it; if the question is
+ * answered from the terminal in the gap before the daemon reads it, the daemon
+ * discards the payload by design. The card said Sent and emptied the box, so the
+ * words were gone from everywhere. The daemon now publishes answer_consumed_at
+ * naming the publish it used, and the card holds the words until it sees that name
+ * or sees the question go without it - see _checkAnswerConsumed (#104).
  */
-const CARD_VERSION = '1.29.0';
+const CARD_VERSION = '1.30.0';
 
 /*
  * How large a non-image attachment may be.
@@ -185,6 +193,7 @@ class AgentBridgeReplyCard extends HTMLElement {
     this._statusTimer = null;
     this._registeredTopic = '';
     this._trimmedPublished = '';
+    this._pendingAnswer = null;
   }
 
   setConfig(config) {
@@ -257,6 +266,9 @@ class AgentBridgeReplyCard extends HTMLElement {
    */
   _trimPublished(text) {
     this._trimmedPublished = '';
+    // Any earlier publish is settled by this one: its words are no longer the ones
+    // held in reserve, so a late verdict on it must not put them back.
+    this._pendingAnswer = null;
     if (!this._els || !this._els.textarea) { return; }
     const now = this._els.textarea.value;
     if (now === text) {
@@ -282,6 +294,8 @@ class AgentBridgeReplyCard extends HTMLElement {
    */
   restoreFormText() {
     const text = this._trimmedPublished;
+    // Nothing is held any more either way, so no later verdict can act on it.
+    this._pendingAnswer = null;
     if (!text || !this._els || !this._els.textarea) { return; }
     this._els.textarea.value = text + this._els.textarea.value;
     this._trimmedPublished = '';
@@ -302,7 +316,7 @@ class AgentBridgeReplyCard extends HTMLElement {
    * typed for something else. The daemon drops one tagged for a question that has
    * gone.
    */
-  async publishFormText(decisionId) {
+  async publishFormText(decisionId, decisionEntity) {
     if (this._busy || !this.hasUnsentFormText()) { return false; }
     const text = this._els.textarea.value;
     this._busy = true;
@@ -330,6 +344,9 @@ class AgentBridgeReplyCard extends HTMLElement {
       // stays editable while Send is disabled. Keeping the whole value was no better -
       // it left the published words in the box, so the next send carried them twice.
       this._trimPublished(text);
+      // Held, not forgotten, until the daemon says which publish it consumed. The
+      // words are off screen but recoverable; see _checkAnswerConsumed (#104).
+      this._armAnswerWatch(payload.at, decisionId, decisionEntity);
       this._setStatus('Sent', 'ok');
       published = true;
     } catch (err) {
@@ -341,14 +358,79 @@ class AgentBridgeReplyCard extends HTMLElement {
     return published;
   }
 
+  /*
+   * Start watching for the fate of a publish made on a form's behalf.
+   *
+   * Only when there is an activity sensor to watch and a question to watch it
+   * against. A dashboard generated before the daemon published answer_consumed_at
+   * has neither, and must keep exactly the behaviour it has: no watch, no restore.
+   * Arming without a way to see confirmation would put the words back every time -
+   * including after an answer that was delivered perfectly - and a duplicated answer
+   * typed into an arrow-key prompt is its own kind of damage.
+   */
+  _armAnswerWatch(stamp, decisionId, decisionEntity) {
+    this._pendingAnswer = null;
+    const activity = this._config ? String(this._config.activity || '') : '';
+    const decision = String(decisionEntity || '');
+    if (!activity || !decision || !stamp) { return; }
+    this._pendingAnswer = {
+      stamp: String(stamp),
+      activity: activity,
+      decision: decision,
+      generation: String(decisionId || ''),
+    };
+  }
+
+  /*
+   * Settle an answer published for a form, once the daemon says what became of it.
+   *
+   * Publishing is a round trip, and for a form the payload *is* the submission. The
+   * publish resolving proves only that Home Assistant dispatched the message - not
+   * that the daemon read it as the answer. The terminal, or another dashboard, can
+   * answer the same question inside that gap, and the daemon then deliberately
+   * discards a payload tagged for a question it is no longer holding. The card had
+   * already said Sent and taken the words out of the box, so they survived nowhere:
+   * not in the session, and not in the box it was telling the person to use (#104).
+   *
+   * answer_consumed_at names the publish the daemon actually consumed. Matching it
+   * is the only proof the words were delivered. The question going without it is
+   * proof that they were not.
+   */
+  _checkAnswerConsumed() {
+    const pending = this._pendingAnswer;
+    if (!pending || !this._hass || !this._hass.states) { return; }
+    const states = this._hass.states;
+    const consumed = String(
+      ((states[pending.activity] || {}).attributes || {}).answer_consumed_at || '');
+    if (consumed === pending.stamp) {
+      // Delivered, and known to be. The words can go for good.
+      this._pendingAnswer = null;
+      this._trimmedPublished = '';
+      return;
+    }
+    const generation = String(
+      ((states[pending.decision] || {}).attributes || {}).decision_id || '');
+    // Still the same question: the daemon has not read the payload yet. Waiting is
+    // correct - the words stay held and off screen, and nothing is claimed either way.
+    if (generation === pending.generation) { return; }
+    // The question has gone and no publish of ours was named as its answer. Put the
+    // words back: telling someone to send again is only honest if there is something
+    // left to send.
+    this._pendingAnswer = null;
+    this.restoreFormText();
+    this._setStatus('Not sent - the question was answered elsewhere. Send again.', 'err');
+  }
+
   set hass(hass) {
     this._hass = hass;
     if (!this._built) {
       this._build();
     }
-    // Deliberately nothing else. Re-rendering on every state update would wipe
-    // whatever is half-typed in the textarea, which is exactly the failure this
-    // card is meant to remove.
+    // Deliberately almost nothing else. Re-rendering on every state update would
+    // wipe whatever is half-typed in the textarea, which is exactly the failure this
+    // card is meant to remove. The one exception touches the textarea only to put
+    // back words an answer lost, which is the same failure seen from the other side.
+    this._checkAnswerConsumed();
   }
 
   getCardSize() {
@@ -1768,7 +1850,7 @@ class AgentBridgeChoicesCard extends HTMLElement {
       ? REPLY_CARDS.get(String(this._config.reply_topic || ''))
       : null;
     if (reply && reply.hasUnsentFormText()) {
-      reply.publishFormText(generation).then(
+      reply.publishFormText(generation, this._config.decision).then(
         (published) => {
           // Only on a publish that landed. Submitting after a failed one is exactly
           // the loss this exists to prevent, and the reply card keeps the text so it
