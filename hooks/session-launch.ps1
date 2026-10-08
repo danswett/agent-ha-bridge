@@ -784,6 +784,14 @@ function Test-BridgeWorktreeBuildOutput {
         and everything else still retains the tree. Ignored *directories* - node_modules,
         hook/dist - are deliberately absent, because reclaiming one means a recursive
         delete, which this code never does.
+
+        That it is reproducible rests on the caller, not on the filename. A tree only
+        reaches cleanup with no modified tracked file, so hook/ holds exactly the
+        committed source and the documented `go build` reproduces this binary from it.
+        Someone building an instrumented hook modifies that source, which retains the
+        tree, and their binary is never reached. AGENTS.md and the README state this as
+        the one exception to "ignored data keeps the tree"; it is a deliberate revision
+        of that contract rather than an oversight (#143, and review on #149).
     #>
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Entry)
 

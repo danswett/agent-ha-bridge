@@ -796,11 +796,19 @@ A few deliberate choices:
   missing or revoked targets are refused, not redirected.
 - **Nothing unmerged is ever cleaned up.** Finished worktrees are removed before each
   launch only when ownership, Git state and all-adapter liveness are readable: no
-  uncommitted, untracked or ignored files, no checked-out branch or detached commits
+  uncommitted or untracked files, no ignored files beyond the native hook binary the
+  project tells you to build, no checked-out branch or detached commits
   ahead of the base, no live session at or below the directory, and sufficient
   `newSession.worktreeIdleHours`. Locked, uncertain and linked/submodule trees remain.
-  Cleanup removes only clean tracked files and empty directories, never recursively
-  deleting ignored user data; Git retains prunable administration for normal maintenance.
+  Cleanup removes only clean tracked files, that one named build output and empty
+  directories, never recursively deleting ignored user data; Git retains prunable
+  administration for normal maintenance.
+  A `.env`, a `config.json`, `node_modules` or any other ignored file still keeps the
+  whole tree. The hook binary is the single exception because a tree only qualifies
+  when no tracked file is modified, so its source is exactly what is committed and the
+  documented `go build` reproduces it; build it from modified source and those
+  modifications keep the tree. Without the exception, following the project's own test
+  instructions made a worktree unreclaimable for ever and the launch cap filled.
   Pending launches hold a Git lock until registration. If isolation cannot be provided,
   the launch stops with a useful error instead of using the original checkout.
 - **Tools are not auto-approved.** Launched sessions get no `--allow-all` unless

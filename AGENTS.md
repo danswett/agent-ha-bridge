@@ -38,11 +38,27 @@ still marks an install from one as `(dev)` (a worktree's `.git` is a file, and
 ### What happens to it afterwards
 
 The bridge cleans only marked, unlocked worktrees with readable ownership, Git and
-all-adapter liveness: no uncommitted, untracked or ignored data, no checked-out branch,
-no detached commit ahead of the base, no live session at or below the directory, and
-at least `newSession.worktreeIdleHours` (12) old. Unknown state and linked/submodule
-trees are retained. Only clean tracked files and empty directories are removed;
-pending launches stay Git-locked until registration. Anything unmerged or uncommitted stays.
+all-adapter liveness: no uncommitted or untracked data, no ignored data other than the
+build outputs below, no checked-out branch, no detached commit ahead of the base, no
+live session at or below the directory, and at least `newSession.worktreeIdleHours`
+(12) old. Unknown state and linked/submodule trees are retained. Only clean tracked
+files, those build outputs and empty directories are removed; pending launches stay
+Git-locked until registration. Anything unmerged or uncommitted stays.
+
+The one exception to "ignored data retains the tree" is the native hook this file
+tells you to build - `hook/agent-bridge-hook`, or `.exe` on Windows. It is named
+exactly, in `$script:BridgeWorktreeBuildOutputs`, and it is the only ignored path
+cleanup will delete. The claim that it is disposable rests on the other checks rather
+than on its name: a tree is only a candidate when no tracked file is modified, so its
+`hook/` source is exactly what is committed and `go build` reproduces the binary from
+it. Build with local modifications and those modifications retain the tree, so the
+instrumented binary goes nowhere.
+
+Everything else ignored - a `.env`, a `config.json`, `mcp/node_modules`, `hook/dist` -
+still retains the tree, and a build output sitting beside any of it excuses nothing.
+Without that exception, following the test procedure below made a worktree
+permanently unreclaimable, the cap filled, and launches were refused with no fallback
+(#143).
 
 So leaving a branch behind is safe, and is the right thing to do if the work is not
 finished. If it *is* finished, leave the worktree clean and detached and it will be
