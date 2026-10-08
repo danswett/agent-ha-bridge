@@ -386,6 +386,11 @@ class AgentBridgeReplyCard extends HTMLElement {
         box-sizing: border-box;
       }
       textarea:focus { outline: none; border-color: var(--primary-color, #03a9f4); }
+      /* Author styles beat the user agent's [hidden] rule, and the display below is
+         one: without this, standing the Send down left it on screen and merely
+         disabled, which is the duplicate control it is there to remove. The other
+         cards in this file carry the same rule for the same reason. */
+      [hidden] { display: none !important; }
       button {
         /* Fixed height on both, so the pair match each other and the textarea's
            bottom edge. Left to their content they differ, because an icon and a
@@ -1234,6 +1239,9 @@ class AgentBridgeChoicesCard extends HTMLElement {
     // one row ticked on its own, kept Send live, and sent the one.
     this._confirmed = {};
     this._note = '';
+    // The reply topic whose Send this card is holding down, if any. Kept apart from
+    // _config so a reconfiguration cannot lose track of it.
+    this._heldTopic = '';
   }
 
   setConfig(config) {
@@ -1259,28 +1267,49 @@ class AgentBridgeChoicesCard extends HTMLElement {
     // Home Assistant's conditional card removes this one outright once the question
     // is gone, so _render is never called again to release the hold - without this
     // the reply card's Send would stay hidden for the rest of the session.
-    this._holdReplySend(false);
+    //
+    // Released by the topic actually held rather than the one the config names now,
+    // for the reason _holdReplySend gives.
+    this._releaseHold(this._heldTopic);
   }
 
   /*
    * Take or release the hold on the reply card's own Send.
    *
-   * Only released when this card is still the holder: Home Assistant rebuilds a view
-   * by connecting the replacement before disconnecting the original, so an
-   * unconditional release here would drop a hold the successor had just taken and
-   * put the second Send back on screen.
+   * The topic held is remembered rather than read back off the config, because
+   * setConfig can repoint this element at another session: _config is replaced
+   * before anything here runs, so a release that trusted it would free the new
+   * topic and leave the old one held by a card that can no longer name it - the
+   * first session's Send and Ctrl+Enter disabled for good.
    */
   _holdReplySend(held) {
     const topic = String((this._config && this._config.reply_topic) || '');
+    if (this._heldTopic && this._heldTopic !== topic) { this._releaseHold(this._heldTopic); }
     if (!topic) { return; }
-    const holder = FORM_SENDS.get(topic);
-    if (held) {
-      if (holder === this) { return; }
-      FORM_SENDS.set(topic, this);
-    } else {
-      if (holder !== this) { return; }
-      FORM_SENDS.delete(topic);
-    }
+    if (!held) { this._releaseHold(topic); return; }
+    if (FORM_SENDS.get(topic) === this) { return; }
+    FORM_SENDS.set(topic, this);
+    this._heldTopic = topic;
+    this._notifyReply(topic);
+  }
+
+  /*
+   * Give a topic's Send back, if this card is what is holding it.
+   *
+   * Home Assistant rebuilds a view by connecting the replacement before
+   * disconnecting the original, so an unconditional release would drop a hold the
+   * successor had just taken and put the second Send back on screen.
+   */
+  _releaseHold(topic) {
+    const held = String(topic || '');
+    if (!held) { return; }
+    if (this._heldTopic === held) { this._heldTopic = ''; }
+    if (FORM_SENDS.get(held) !== this) { return; }
+    FORM_SENDS.delete(held);
+    this._notifyReply(held);
+  }
+
+  _notifyReply(topic) {
     const reply = REPLY_CARDS.get(topic);
     if (reply && reply.noteFormSendChanged) { reply.noteFormSendChanged(); }
   }

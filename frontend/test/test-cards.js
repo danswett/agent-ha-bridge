@@ -2007,6 +2007,40 @@ async function checkReplySendStandsDown() {
   original.choices.disconnectedCallback();
   check('and a card that has been replaced does not release its successor\'s hold',
     replacement.reply._els.send.hidden === true);
+
+  // Hiding is done with the hidden property, and author styles beat the user agent's
+  // [hidden] rule - this stylesheet sets every button to display: inline-flex. Without
+  // a rule of its own the Send stayed on screen and merely disabled, which is the
+  // duplicate control this is all for. The harness has no CSS, so only the sheet
+  // itself can say.
+  const replyCardSource = (() => {
+    const at = source.indexOf('class AgentBridgeReplyCard');
+    const next = source.indexOf('\nclass AgentBridge', at + 1);
+    return at < 0 ? '' : source.slice(at, next < 0 ? source.length : next);
+  })();
+  check('the reply card\'s own stylesheet really hides a hidden element',
+    /\[hidden\] \{ display: none !important; \}/.test(replyCardSource));
+  check('and it overrides the display rule that would otherwise keep Send on screen',
+    replyCardSource.indexOf('[hidden]') < replyCardSource.indexOf('display: inline-flex'));
+
+  // Home Assistant can hand an existing element a different session. _config is
+  // replaced before anything else runs, so a release that read the topic back off it
+  // would free the new one and strand the old - leaving a session whose Send and
+  // Ctrl+Enter never came back.
+  const moved = pair();
+  const stranded = moved.reply;
+  const elsewhere = pair();
+  moved.choices.setConfig({
+    decision: DECISION,
+    fields: [FIELD, TEXT_FIELD],
+    submit: SUBMIT,
+    reply_topic: elsewhere.reply._config.topic,
+  });
+  moved.choices.hass = moved.hass;
+  check('a choices card pointed at another session gives the first one its Send back',
+    stranded._els.send.hidden === false);
+  check('and holds down the Send of the session it was pointed at',
+    elsewhere.reply._els.send.hidden === true);
 }
 
 // _launch awaits its service calls, so the checks that read them have to await it too.
