@@ -3,11 +3,13 @@
  * wiring test in tests/test-status-card.ps1.
  *
  * Reads a job on stdin:
- *   { config, states, open, flips: [<machine name>, ...], forgets: [<machine name>, ...] }
+ *   { config, states, open, flips: [<machine name>, ...], forgets: [<machine name>, ...],
+ *     installs: [<machine name>, ...] }
  * where `config` is the card config Save-CopilotSessionDashboard generated and
  * `states` are the entity states the bridge's own publishers produce. Each flip is
  * the name of the machine whose Detail switch to move, in order; each forget is a
- * machine whose X to press twice - once to arm it, once to remove it.
+ * machine whose X to press twice - once to arm it, once to remove it; each install
+ * is a machine whose Update button to press.
  *
  * Writes on stdout:
  *   { summary, waiting, hidden, size, rows: [...], calls: [...], missing: [...] }
@@ -62,6 +64,12 @@ process.stdin.on('end', async () => {
     await card._forget(entry);
   }
 
+  for (const name of (job.installs || [])) {
+    const entry = card._rows.find((r) => r.machine.machine === name);
+    if (!entry || !entry.update || entry.update.hidden || entry.updateButton.hidden) { missing.push(name); continue; }
+    entry.updateButton.click();
+  }
+
   const rows = card._rows.map((entry) => ({
     machine: entry.machine.machine,
     meta: entry.meta.textContent,
@@ -70,6 +78,23 @@ process.stdin.on('end', async () => {
     toggle: entry.toggle ? { checked: !!entry.toggle.checked, disabled: !!entry.toggle.disabled } : null,
     detail: entry.detail ? { hidden: !!entry.detail.hidden } : null,
     forget: entry.forget ? { hidden: !!entry.forget.hidden } : null,
+    update: entry.update ? {
+      hidden: !!entry.update.hidden,
+      button: {
+        hidden: !!entry.updateButton.hidden,
+        disabled: !!entry.updateButton.disabled,
+        text: entry.updateButton.textContent,
+        title: entry.updateButton.getAttribute('title') || '',
+      },
+      note: {
+        hidden: !!entry.updateNote.hidden,
+        text: entry.updateNote.textContent,
+        tone: entry.updateNote.classList.contains('good') ? 'good'
+          : (entry.updateNote.classList.contains('bad') ? 'bad' : ''),
+        title: entry.updateNote.getAttribute('title') || '',
+      },
+      bar: { hidden: !!entry.updateBar.hidden, width: entry.updateFill.style.width },
+    } : null,
   }));
 
   process.stdout.write(JSON.stringify({

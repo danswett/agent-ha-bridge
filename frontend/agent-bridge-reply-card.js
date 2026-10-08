@@ -53,7 +53,7 @@
  * naming the publish it used, and the card holds the words until it sees that name
  * or sees the question go without it - see _checkAnswerConsumed (#104).
  */
-const CARD_VERSION = '1.30.0';
+const CARD_VERSION = '1.31.0';
 
 /*
  * How large a non-image attachment may be.
@@ -2477,6 +2477,30 @@ const STATUS_TOGGLE_GRACE = 5000;
 // machine is not undoable from the dashboard, and the X sits where a Detail switch
 // sits on every other row, so it asks once before doing anything.
 const STATUS_FORGET_CONFIRM = 6000;
+// How long a pressed Update button reports "Starting..." before it goes back to
+// what the entity says. The daemon notices the press on its next maintenance pass
+// and only then publishes a stage, so without this the button sits there still
+// offering an update that is already being installed - and the natural response to
+// that is to press it again.
+const STATUS_UPDATE_GRACE = 120000;
+// The stages the updater reports while it is working, in the words to show for
+// them. Anything outside this and the terminal verdicts below means no update is
+// running, which is also what an older bridge publishing no stage at all reports.
+const STATUS_UPDATE_RUNNING = {
+  checking: 'Checking',
+  downloading: 'Downloading',
+  installing: 'Installing',
+  restarting: 'Restarting',
+  verifying: 'Verifying',
+};
+// How an attempt ended. `current` is deliberately not an error: a press that found
+// the release already installed did nothing wrong, and reporting it as a failure is
+// what sent people to a shell to find out what had broken.
+const STATUS_UPDATE_DONE = {
+  completed: { text: 'Updated', tone: 'good' },
+  current: { text: 'Already current', tone: '' },
+  failed: { text: 'Update failed', tone: 'bad' },
+};
 
 class AgentBridgeStatusCard extends HTMLElement {
   constructor() {
@@ -2538,6 +2562,24 @@ class AgentBridgeStatusCard extends HTMLElement {
         .forget button:hover { color: var(--error-color, #f44336); }
         .forget button.confirm { color: var(--error-color, #f44336); border-color: var(--error-color, #f44336); }
         .forget ha-icon { --mdc-icon-size: 20px; }
+        /* The update control sits where the Detail switch does, for the same reason
+           the X does: it belongs to the machine named on this row, and it is only
+           ever there when there is something to say. */
+        .update { flex: none; display: flex; align-items: center; gap: 6px; min-width: 0; font-size: 0.85em; }
+        .update button {
+          display: inline-flex; align-items: center; cursor: pointer;
+          font: inherit; padding: 3px 10px; border-radius: 14px; white-space: nowrap;
+          background: none; border: 1px solid var(--primary-color, #03a9f4); color: var(--primary-color, #03a9f4);
+        }
+        .update button[disabled] { cursor: default; border-color: var(--divider-color); color: var(--secondary-text-color); }
+        .update button.bad { border-color: var(--error-color, #f44336); color: var(--error-color, #f44336); }
+        .update .note { color: var(--secondary-text-color); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+        .update .note.good { color: var(--success-color, #4caf50); }
+        .update .note.bad { color: var(--error-color, #f44336); }
+        /* A proportion only, never a substitute for the stage: a bar alone is the
+           spinner this replaced. It is drawn beside the word, not instead of it. */
+        .update .bar { flex: none; width: 48px; height: 4px; border-radius: 2px; background: var(--divider-color); overflow: hidden; }
+        .update .bar span { display: block; height: 100%; width: 0; background: var(--primary-color, #03a9f4); transition: width 0.3s ease; }
         [hidden] { display: none !important; }
       </style>
       <ha-card>
@@ -2587,7 +2629,7 @@ class AgentBridgeStatusCard extends HTMLElement {
       who.appendChild(meta);
       row.appendChild(dot);
       row.appendChild(who);
-      const entry = { machine, row, meta, toggle: null, detail: null, forget: null, pendingAt: 0, pendingFrom: '' };
+      const entry = { machine, row, meta, toggle: null, detail: null, forget: null, update: null, pendingAt: 0, pendingFrom: '' };
       // A machine running a bridge from before the switch existed reports no entity
       // for it and gets no switch - drawing one anyway would point at nothing.
       if (machine.detailed) {
@@ -2625,6 +2667,33 @@ class AgentBridgeStatusCard extends HTMLElement {
         entry.forgetIcon = icon;
         entry.forgetArmedAt = 0;
         entry.forgetBusy = false;
+      }
+      // The update control, from card 1.31.0. A machine whose dashboard was drawn by
+      // an older bridge reports no install button and gets none, the same rule the
+      // Detail switch and the X follow.
+      if (machine.install) {
+        const box = document.createElement('div');
+        box.className = 'update';
+        const button = document.createElement('button');
+        button.addEventListener('click', () => this._install(entry));
+        const bar = document.createElement('div');
+        bar.className = 'bar';
+        const fill = document.createElement('span');
+        bar.appendChild(fill);
+        const note = document.createElement('span');
+        note.className = 'note';
+        box.appendChild(button);
+        box.appendChild(bar);
+        box.appendChild(note);
+        box.hidden = true;
+        row.appendChild(box);
+        entry.update = box;
+        entry.updateButton = button;
+        entry.updateBar = bar;
+        entry.updateFill = fill;
+        entry.updateNote = note;
+        entry.pressedAt = 0;
+        entry.pressedFrom = '';
       }
       host.appendChild(row);
       return entry;
@@ -2669,6 +2738,133 @@ class AgentBridgeStatusCard extends HTMLElement {
     entry.pendingAt = Date.now();
     entry.pendingFrom = this._state(entityId);
     this._hass.callService(entityId.split('.')[0], 'toggle', { entity_id: entityId });
+  }
+
+  /*
+   * Starts the update on that machine, and nothing else.
+   *
+   * The press is recorded locally because the daemon only sees the button on its
+   * next maintenance pass: until then the entity still says an update is available,
+   * so the button would sit there offering again what is already being installed.
+   * Pressing twice is exactly what people did when the only feedback was a spinner
+   * (#129), and a second press is a second installer.
+   *
+   * What the entity said at the moment of the press is kept with it, so the local
+   * claim is given up the instant the machine's own report moves on - not after a
+   * fixed wait that could outlast the whole update.
+   */
+  _install(entry) {
+    const entityId = entry.machine.install;
+    if (!entityId || !this._hass || !entry.update) { return; }
+    entry.pressedAt = Date.now();
+    entry.pressedFrom = this._progressSignature(entry);
+    this._hass.callService('button', 'press', { entity_id: entityId });
+    this._render();
+  }
+
+  // What the machine currently reports about an update, as one string: the press
+  // grace ends when this changes, whichever part of it moved.
+  _progressSignature(entry) {
+    const version = entry.machine.version;
+    return [
+      this._state(version),
+      this._attr(version, 'in_progress'),
+      this._attr(version, 'stage'),
+      this._attr(version, 'stage_detail'),
+      this._attr(version, 'latest_version'),
+    ].join('|');
+  }
+
+  /*
+   * What the update control should say, from the machine's own update entity.
+   *
+   * `kind` is what the row does with it: `running` wins over the X, because a
+   * machine part-way through an update is not one to forget and its liveness sensor
+   * may well have expired during the restart - which is one of the stages.
+   */
+  _updateState(entry, online) {
+    const version = entry.machine.version;
+    const state = this._state(version);
+    const stage = this._attr(version, 'stage');
+    const latest = this._attr(version, 'latest_version');
+    const detail = this._attr(version, 'stage_detail');
+    const running = STATUS_UPDATE_RUNNING[stage];
+    const done = STATUS_UPDATE_DONE[stage];
+    // A press whose effect has not reached the entity yet. Held only while nothing
+    // the machine reports has changed, and never once a stage is actually running.
+    const claimed = entry.pressedAt &&
+      Date.now() - entry.pressedAt < STATUS_UPDATE_GRACE &&
+      this._progressSignature(entry) === entry.pressedFrom;
+    if (!claimed) { entry.pressedAt = 0; }
+
+    if (running) {
+      let text = running;
+      const share = this._proportion(version);
+      if (share !== null) { text = `${running} ${Math.round(share * 100)}%`; }
+      return { kind: 'running', text, share, title: detail };
+    }
+    if (claimed) { return { kind: 'running', text: 'Starting', share: null, title: '' }; }
+    if (done) {
+      // A failure is the one terminal state you can act on, so it stays a button -
+      // with the reason on it, because "it failed" on its own sent people to a log.
+      if (stage === 'failed') { return { kind: 'retry', text: 'Update failed', title: detail }; }
+      return { kind: 'done', text: detail || done.text, tone: done.tone, title: detail };
+    }
+    if (state === 'on') {
+      return { kind: 'offer', text: latest ? `Update to ${latest}` : 'Update', title: '' };
+    }
+    // An online machine whose update entity exists but cannot say what the latest
+    // release is has not been found to be up to date - its check failed. Saying
+    // nothing there is what made a rate-limited check look like "nothing to
+    // install" (#92). A machine with no update entity at all is not making a claim
+    // either way: update checks can be switched off, and a machine that opted out
+    // must not be reported as broken.
+    if (online && this._has(version) && (state === 'unavailable' || state === 'unknown' || !latest)) {
+      return { kind: 'unknown', text: 'Update check failed', title: this._attr(version, 'release_summary') };
+    }
+    return { kind: 'none' };
+  }
+
+  _has(entityId) {
+    return !!(entityId && this._hass && this._hass.states[entityId]);
+  }
+
+  // The published proportion, or null unless it is a number between 0 and 1. It is
+  // empty for every stage that is not a transfer, and a bar drawn at an arbitrary
+  // place is worse than no bar. Read from the state rather than through _attr,
+  // which reports a genuine 0 as no value at all.
+  _proportion(entityId) {
+    const s = entityId && this._hass ? this._hass.states[entityId] : undefined;
+    const raw = s && s.attributes ? s.attributes.stage_proportion : undefined;
+    if (raw === undefined || raw === null || raw === '') { return null; }
+    const value = Number(raw);
+    return Number.isFinite(value) && value >= 0 && value <= 1 ? value : null;
+  }
+
+  _drawUpdate(entry, verdict) {
+    const box = entry.update;
+    if (!box) { return; }
+    box.hidden = verdict.kind === 'none';
+    if (box.hidden) { return; }
+    const asButton = verdict.kind === 'offer' || verdict.kind === 'retry';
+    entry.updateButton.hidden = !asButton;
+    entry.updateButton.disabled = !asButton;
+    entry.updateButton.classList.toggle('bad', verdict.kind === 'retry');
+    if (asButton) {
+      entry.updateButton.textContent = verdict.text;
+      entry.updateButton.setAttribute('title', verdict.title || verdict.text);
+      entry.updateButton.setAttribute('aria-label', `${verdict.text} on ${entry.machine.machine || 'this machine'}`);
+    }
+    entry.updateNote.hidden = asButton;
+    if (!asButton) {
+      entry.updateNote.textContent = verdict.text;
+      entry.updateNote.classList.toggle('good', verdict.tone === 'good');
+      entry.updateNote.classList.toggle('bad', verdict.tone === 'bad' || verdict.kind === 'unknown');
+      entry.updateNote.setAttribute('title', verdict.title || verdict.text);
+    }
+    const share = typeof verdict.share === 'number' ? verdict.share : null;
+    entry.updateBar.hidden = share === null;
+    entry.updateFill.style.width = share === null ? '0' : `${Math.round(share * 100)}%`;
   }
 
   // The X's label: the icon when it is idle, a word while it is armed or working.
@@ -2778,11 +2974,21 @@ class AgentBridgeStatusCard extends HTMLElement {
       // a machine that is not running is the ability to say it is not coming back.
       // A row with no X keeps its switch, which is every dashboard drawn by a bridge
       // older than this.
+      //
+      // One control at a time, in this order: an update that is running, then the X
+      // on a machine that is not, then anything else the update control has to say,
+      // then the Detail switch. A machine mid-update is not one to forget, and its
+      // liveness sensor expires while the daemon restarts - which is a stage of the
+      // update, so an X is precisely the wrong thing to offer at that moment.
+      const verdict = entry.update ? this._updateState(entry, online) : { kind: 'none' };
+      const updating = verdict.kind === 'running';
+      const showUpdate = verdict.kind !== 'none' && (updating || online);
       if (entry.forget) {
-        entry.forget.hidden = online;
-        if (online) { this._resetForget(entry); }
+        entry.forget.hidden = online || updating;
+        if (entry.forget.hidden) { this._resetForget(entry); }
       }
-      if (entry.detail) { entry.detail.hidden = !online && !!entry.forget; }
+      this._drawUpdate(entry, showUpdate ? verdict : { kind: 'none' });
+      if (entry.detail) { entry.detail.hidden = showUpdate || (!online && !!entry.forget); }
     }
 
     const pending = (this._config.decisions || [])
