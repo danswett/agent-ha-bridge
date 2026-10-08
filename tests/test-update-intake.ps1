@@ -23,11 +23,16 @@ Assert-UpdateIntake 'unavailable is distinct from current and available' ($unrea
 foreach ($code in @(401, 403, 404, 429, 500)) {
     $fixtureState.Fixture.Lookup = "http-$code"
     $status = Get-BridgeUpdateStatus -Force
-    $expected = if ($code -eq 404) { 'NotFound' } else { 'Unavailable' }
+    # 429 is a rate limit by definition, and is now named as one so the operator is
+    # told to wait rather than to go looking for a broken release. A bare 403 carries
+    # no rate-limit headers here and stays Unavailable, because 403 on its own is also
+    # what a private repository and a bad token return.
+    $expected = if ($code -eq 404) { 'NotFound' } elseif ($code -eq 429) { 'RateLimited' } else { 'Unavailable' }
     Assert-UpdateIntake "HTTP $code has no invented latest version" ($status.State -eq $expected -and $null -eq $status.Latest)
     $refused = Invoke-BridgeSelfUpdate -Force
     Assert-UpdateIntake "Force cannot turn HTTP $code into an install target" (-not $refused.Started -and $refused.State -eq $expected -and $fixtureState.Launches -eq 0)
     if ($code -eq 404) { Assert-UpdateIntake '404 does not assert repository existence or access' ($status.Detail -match 'existence and access are not confirmed') }
+    if ($code -eq 429) { Assert-UpdateIntake '429 says the install is fine and the limit will reset' ($status.Detail -match 'rate limiting' -and $status.Detail -match 'install is fine') }
 }
 $fixtureState.Fixture.Lookup = 'invalid'
 $invalid = Invoke-BridgeSelfUpdate -Force

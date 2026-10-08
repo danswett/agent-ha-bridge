@@ -130,6 +130,103 @@ function ConvertTo-BridgeUpdateTime {
     throw [FormatException]::new('The update timestamp is invalid.')
 }
 
+function Get-BridgeRateLimitWait {
+    <#
+        Whether a failed GitHub call was refused for rate limiting, and when it can be
+        tried again: { Limited, RetryAt, Suffix }.
+
+        403 alone does not mean rate limiting - it is also what a private repository
+        and a bad token return - so the headers decide. GitHub sends
+        X-RateLimit-Remaining: 0 with the reset as epoch seconds, and 429 with
+        Retry-After for secondary limits.
+
+        Worth distinguishing because the remedy is the opposite of the usual one: a
+        refused check reads as the machine being broken, so the operator presses the
+        button again, which spends more of the allowance that was already exhausted.
+    #>
+    param([AllowNull()]$Response, [int]$Status = 0)
+
+    $none = [pscustomobject]@{ Limited = $false; RetryAt = $null; Suffix = '' }
+    if ($Status -ne 403 -and $Status -ne 429) { return $none }
+
+    $header = {
+        param([string]$Name)
+        if ($null -eq $Response) { return '' }
+        $bag = $null
+        try { $bag = $Response.Headers } catch { return '' }
+        if ($null -eq $bag) { return '' }
+        # HttpResponseMessage carries HttpResponseHeaders, which has no indexer at all -
+        # reading it like a dictionary throws, and the whole rate-limit signal would
+        # then be silently missed on the one status that matters most, a 403 carrying
+        # X-RateLimit-Remaining: 0. Other transports hand back something dictionary-like
+        # with no TryGetValues, so both are tried.
+        try {
+            $values = $null
+            if ($bag.PSObject.Methods['TryGetValues'] -and $bag.TryGetValues($Name, [ref]$values)) {
+                return [string](@($values) | Select-Object -First 1)
+            }
+        }
+        catch { }
+        try {
+            $direct = $bag[$Name]
+            if ($null -ne $direct) { return [string](@($direct) | Select-Object -First 1) }
+        }
+        catch { }
+        ''
+    }
+
+    $remaining = & $header 'X-RateLimit-Remaining'
+    $retryAfter = & $header 'Retry-After'
+    $reset = & $header 'X-RateLimit-Reset'
+
+    # A secondary limit answers 429 with Retry-After and no remaining count, so either
+    # signal on its own is enough.
+    $limited = ($remaining -eq '0') -or ($Status -eq 429) -or ($retryAfter -ne '')
+    if (-not $limited) { return $none }
+
+    $retryAt = $null
+    $seconds = 0
+    if ($retryAfter -and [int]::TryParse($retryAfter, [ref]$seconds) -and $seconds -gt 0) {
+        $retryAt = [DateTimeOffset]::Now.AddSeconds($seconds)
+    }
+    else {
+        $epoch = 0L
+        if ($reset -and [long]::TryParse($reset, [ref]$epoch) -and $epoch -gt 0) {
+            $retryAt = [DateTimeOffset]::FromUnixTimeSeconds($epoch).ToLocalTime()
+        }
+    }
+
+    $suffix = if ($null -ne $retryAt) { " until $($retryAt.ToString('HH:mm'))" } else { '' }
+    [pscustomobject]@{ Limited = $true; RetryAt = $retryAt; Suffix = $suffix }
+}
+
+function Get-BridgeReleaseRequestHeaders {
+    <#
+        The headers for a GitHub release lookup, with an optional token.
+
+        Unauthenticated callers get 60 requests an hour per IP. A Dev Box, or anything
+        else behind shared egress, can exhaust that without the bridge having made a
+        single request of its own - and then every machine behind that address is
+        unable to take any release at all (#92).
+
+        The token is read from configuration or the environment and is never logged;
+        only whether one was used is ever reported.
+    #>
+    $headers = @{
+        'User-Agent' = $script:BridgeUpdateConfig.UserAgent
+        Accept       = 'application/vnd.github+json'
+    }
+    $token = ''
+    try { $token = [string](Get-BridgeSetting 'updates.token' '') } catch { $token = '' }
+    if ([string]::IsNullOrWhiteSpace($token)) {
+        $token = [string][Environment]::GetEnvironmentVariable('AGENT_HA_BRIDGE_UPDATE_TOKEN')
+    }
+    if (-not [string]::IsNullOrWhiteSpace($token)) {
+        $headers['Authorization'] = "Bearer $($token.Trim())"
+    }
+    $headers
+}
+
 function Get-BridgeLatestRelease {
     <#
         The newest published release, cached so a restart loop cannot hammer GitHub.
@@ -194,7 +291,7 @@ function Get-BridgeLatestRelease {
         $uri = "https://api.github.com/repos/$repository/releases/latest"
         Assert-BridgeHttpAllowed -Uri $uri -Transport Rest
         $response = Invoke-RestMethod -Uri $uri `
-            -Headers @{ 'User-Agent' = $script:BridgeUpdateConfig.UserAgent; Accept = 'application/vnd.github+json' } `
+            -Headers (Get-BridgeReleaseRequestHeaders) `
             -TimeoutSec $script:BridgeUpdateConfig.RequestTimeout
 
         $release = [pscustomobject]@{
@@ -212,20 +309,37 @@ function Get-BridgeLatestRelease {
     }
     catch {
         if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
-        $status = 0
+        $httpStatus = 0
+        $failureResponse = $null
         if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
-            $status = [int]$_.Exception.Response.StatusCode
+            $failureResponse = $_.Exception.Response
+            $httpStatus = [int]$failureResponse.StatusCode
         }
-        if ($status -eq 404) {
+        $rateLimit = Get-BridgeRateLimitWait -Response $failureResponse -Status $httpStatus
+        if ($httpStatus -eq 404) {
             $lookup.State = 'NotFound'
             $lookup.Detail = 'GitHub returned 404 for the latest-release endpoint; repository existence and access are not confirmed.'
+        }
+        elseif ($rateLimit.Limited) {
+            # Not a failure of this machine, and not something retrying will fix. An
+            # unauthenticated caller gets 60 requests an hour per IP, so anything behind
+            # shared egress can be refused without the bridge having done anything at
+            # all - and the bare 403 that used to be reported read as the release being
+            # broken rather than as a queue to wait in (#109, #92).
+            $lookup.State = 'RateLimited'
+            $lookup.Detail = "GitHub is rate limiting this machine's release checks$($rateLimit.Suffix). " +
+                'The install is fine; the check will work again once the limit resets. ' +
+                'Setting updates.token raises the limit.'
         }
         else { $lookup.Detail = "The latest release could not be established: $($_.Exception.Message)" }
     }
 
+    # A 404 is authoritative - GitHub answered - so it is allowed to clear what was
+    # known. Anything else never reached GitHub, and Reached=false already stops the
+    # cached release being served as a current finding on the next pass.
     [pscustomobject]@{
         CheckedAt = [DateTimeOffset]::Now.ToString('o')
-        Reached   = ($lookup.State -ne 'Unavailable')
+        Reached   = ($lookup.State -in @('Found', 'NotFound'))
         Release   = $lookup.Release
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
 

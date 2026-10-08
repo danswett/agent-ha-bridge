@@ -216,6 +216,66 @@ try {
     }
     function Invoke-RestMethod { throw 'network disabled in test' }
 
+    # A refused request is not a broken install. 403 alone is ambiguous - a private
+    # repository answers the same way - so the rate-limit headers are what decide,
+    # and getting that wrong left the machine looking dead on the dashboard while the
+    # operator pressed a button that spent more of an allowance already at zero.
+    Write-Host '--- a rate-limited check says so, rather than looking like a failure ---'
+    function New-RateLimitedResponse {
+        param([int]$Code = 403, [string]$Remaining = '0', [string]$Reset = '', [string]$RetryAfter = '')
+        $response = [System.Net.Http.HttpResponseMessage]::new([System.Net.HttpStatusCode]$Code)
+        if ($Remaining -ne '') { [void]$response.Headers.TryAddWithoutValidation('X-RateLimit-Remaining', $Remaining) }
+        if ($Reset -ne '') { [void]$response.Headers.TryAddWithoutValidation('X-RateLimit-Reset', $Reset) }
+        if ($RetryAfter -ne '') { [void]$response.Headers.TryAddWithoutValidation('Retry-After', $RetryAfter) }
+        $response
+    }
+
+    $resetAt = [DateTimeOffset]::Now.AddMinutes(37)
+    function Invoke-RestMethod {
+        $response = New-RateLimitedResponse -Code 403 -Remaining '0' -Reset ([string]$resetAt.ToUnixTimeSeconds())
+        throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('rate limit exceeded', $response)
+    }
+    Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+    $limited = Get-BridgeUpdateStatus -Force
+    Test-That 'a rate-limited check is reported as rate limiting, not as a bare failure' {
+        $limited.State -eq 'RateLimited'
+    } $limited.State
+    Test-That 'and says the install is fine, so nobody goes looking for a broken release' {
+        $limited.Detail -match 'rate limiting' -and $limited.Detail -match 'install is fine'
+    } $limited.Detail
+    Test-That 'and names the time it can be tried again, from X-RateLimit-Reset' {
+        $limited.Detail -match $resetAt.ToString('HH:mm')
+    } $limited.Detail
+    Test-That 'it still reports the installed version while rate limited' {
+        $limited.Installed -match '^\d+\.\d+'
+    } $limited.Installed
+    Test-That 'a rate-limited check is never recorded as having reached GitHub' {
+        ((Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json).Reached) -eq $false
+    }
+
+    # 429 for a secondary limit carries Retry-After and no remaining count.
+    function Invoke-RestMethod {
+        $response = New-RateLimitedResponse -Code 429 -Remaining '' -RetryAfter '120'
+        throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('too many requests', $response)
+    }
+    Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+    Test-That 'a secondary limit answering 429 with Retry-After is recognised too' {
+        (Get-BridgeUpdateStatus -Force).State -eq 'RateLimited'
+    }
+
+    # The ambiguous case. A 403 with an allowance left is a permission problem, and
+    # calling it rate limiting would tell someone to wait for something that will
+    # never clear on its own.
+    function Invoke-RestMethod {
+        $response = New-RateLimitedResponse -Code 403 -Remaining '57'
+        throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('Forbidden', $response)
+    }
+    Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+    Test-That 'a 403 with allowance left is not called rate limiting' {
+        (Get-BridgeUpdateStatus -Force).State -eq 'Unavailable'
+    }
+    function Invoke-RestMethod { throw 'network disabled in test' }
+
     Write-Host '--- failure is survivable ---'
     Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
     $script:DecisionBridgeConfig.UpdateRepositoryOverride = $null

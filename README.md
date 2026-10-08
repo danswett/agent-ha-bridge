@@ -400,6 +400,7 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `updates.repository` | Repository to check for releases (default `danswett/agent-ha-bridge`) |
 | `updates.checkForUpdates` | Set to `false` to disable the update check |
 | `updates.checkHours` | How often to check GitHub for a release (default `6`, i.e. 4×/day) |
+| `updates.token` | Optional GitHub token for release checks only, sent to `api.github.com` and never logged. Unauthenticated callers share **60 requests an hour per IP**, so a Dev Box or anything else behind shared egress can be refused without the bridge having made a request of its own. `AGENT_HA_BRIDGE_UPDATE_TOKEN` works too, and wins if the setting is empty. A read-only token with no scopes is enough for public releases |
 | `usage.publish` | Set to `false` to stop collecting and publishing each agent's remaining allowance (default `true`). This stops the vendor calls, not just the card |
 | `usage.intervalSeconds` | How often to re-read the allowances (default `120`). Copilot's figure moves continuously while a session runs, so this is a poll rather than a cache read |
 
@@ -1273,6 +1274,14 @@ agent's hook command:
 action, because this software types into terminals and registers scheduled tasks. Set
 `updates.checkForUpdates` to `false` to turn the check off entirely, or point
 `updates.repository` at your own fork.
+
+**If the check is refused.** GitHub allows unauthenticated callers 60 requests an hour
+per IP, so a machine behind shared egress can be rate limited without having made a
+request of its own. That is reported as rate limiting, with the time the limit resets -
+not as a failed update - and the machine keeps publishing its installed version rather
+than going blank, because the fault is neither in the install nor in the release.
+Pressing the install button again does not help and spends more of the same allowance;
+set `updates.token` to raise the limit.
 
 ---
 
