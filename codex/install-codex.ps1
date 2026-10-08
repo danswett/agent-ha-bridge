@@ -84,10 +84,23 @@ function Invoke-BridgeCodexCommand {
     if (-not $codex) { throw 'Codex CLI is unavailable; its registration could not be verified and the adapter was preserved.' }
     $previousHome = $env:CODEX_HOME
     $previousConfig = $env:AGENT_HA_BRIDGE_CONFIG
+    $previousPath = $env:PATH
     Push-Location $installContext.Home
     try {
         $env:CODEX_HOME = $installContext.CodexHome
         $env:AGENT_HA_BRIDGE_CONFIG = $installContext.ConfigPath
+        # Knowing where Codex is is not the same as being able to run it. Whenever it
+        # was found by absolute path above, it is by definition not on PATH - and
+        # /opt/local/bin/codex is a `#!/usr/bin/env node` script whose node is in that
+        # same directory, so invoking it here would fail with "env: node: No such file
+        # or directory" and leave the adapter unregistered. Prepending the directory it
+        # was found in is the same remedy Get-BridgeSessionPath applies at launch.
+        if (-not $script:BridgeIsWindows -and $codex -match '^(.*)/[^/]+$') {
+            $codexDir = $Matches[1]
+            if (@($previousPath -split ':') -notcontains $codexDir) {
+                $env:PATH = "${codexDir}:$previousPath"
+            }
+        }
         $output = & $codex @Arguments 2>&1 | Out-String
         if ($LASTEXITCODE -ne 0) { throw "Codex registration command failed (exit $LASTEXITCODE); no further adapter cleanup was performed." }
         $output
@@ -95,6 +108,7 @@ function Invoke-BridgeCodexCommand {
     finally {
         $env:CODEX_HOME = $previousHome
         $env:AGENT_HA_BRIDGE_CONFIG = $previousConfig
+        $env:PATH = $previousPath
         Pop-Location
     }
 }
