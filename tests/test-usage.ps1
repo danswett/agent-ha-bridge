@@ -805,6 +805,36 @@ Test-That 'an environment token is used without going near the keychain' {
 } "probes: $($script:Probes)"
 $env:COPILOT_GITHUB_TOKEN = ''
 
+# Copilot's lastLoggedInUser can change under a running daemon, and the allowance then
+# belongs to a different account. Reusing the token read for the previous one went on
+# publishing the old account's figure until restart - a wrong number, which is worse
+# than no number at all. Found by review on #141.
+function Invoke-BridgeCommandProbe {
+    param([string]$Executable, [string[]]$Arguments, [int]$TimeoutMs)
+    $script:Probes++
+    $account = ''
+    for ($i = 0; $i -lt $Arguments.Count - 1; $i++) {
+        if ($Arguments[$i] -eq '-a') { $account = [string]$Arguments[$i + 1] }
+    }
+    [pscustomobject]@{ Ran = $true; TimedOut = $false; ExitCode = 0; Output = "gho_for_$account" }
+}
+$script:BridgeKeychainToken = ''
+$script:BridgeKeychainAccount = ''
+$script:BridgeKeychainUnavailable = $false
+
+Test-That 'signing in as someone else re-reads rather than reusing the last token' {
+    $first = Get-BridgeCopilotToken -Login 'octocat'
+    $second = Get-BridgeCopilotToken -Login 'hubot'
+    $first -eq 'gho_for_https://github.com:octocat' -and $second -eq 'gho_for_https://github.com:hubot'
+}
+
+Test-That 'and a refusal for one account does not silence the next' {
+    $script:BridgeKeychainToken = ''
+    $script:BridgeKeychainAccount = 'https://github.com:octocat'
+    $script:BridgeKeychainUnavailable = $true
+    (Get-BridgeCopilotToken -Login 'hubot') -eq 'gho_for_https://github.com:hubot'
+}
+
 Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host ''

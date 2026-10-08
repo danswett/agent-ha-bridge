@@ -20,8 +20,10 @@
 
 # Asked once per daemon, then left alone - see the macOS branch of
 # Get-BridgeCopilotToken for why a second ask is a user-visible problem rather than
-# just a wasted call.
+# just a wasted call. Held per account, because a token read for one login says
+# nothing about what another is spending.
 $script:BridgeKeychainToken = ''
+$script:BridgeKeychainAccount = ''
 $script:BridgeKeychainUnavailable = $false
 
 function Get-BridgeKeychainRefusal {
@@ -381,11 +383,23 @@ function Get-BridgeCopilotToken {
         if (-not [string]::IsNullOrWhiteSpace($value)) { return $value }
     }
     if ([string]::IsNullOrWhiteSpace($Login)) { return '' }
-    if (-not [string]::IsNullOrWhiteSpace($script:BridgeKeychainToken)) { return $script:BridgeKeychainToken }
 
     # Stored by the CLI under the account it belongs to, so a machine signed in to two
     # accounts hands back the right one rather than whichever was written last.
     $account = "${HostUrl}:$Login"
+
+    # Anything remembered belongs to the account it was read for. Copilot's
+    # lastLoggedInUser can change under a running daemon, and reusing the previous
+    # account's token would go on publishing the old account's allowance until the
+    # next restart - a wrong number, which is worse than no number. Signing in as
+    # someone else is also reason enough to ask the keychain once more. Found by
+    # review on #141.
+    if ($script:BridgeKeychainAccount -ne $account) {
+        $script:BridgeKeychainAccount = $account
+        $script:BridgeKeychainToken = ''
+        $script:BridgeKeychainUnavailable = $false
+    }
+    if (-not [string]::IsNullOrWhiteSpace($script:BridgeKeychainToken)) { return $script:BridgeKeychainToken }
     try {
         if ($script:BridgeIsWindows) {
             Add-BridgeCompiledType -TypeName 'BridgeCredentialStore' -Source @'
