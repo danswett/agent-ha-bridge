@@ -49,9 +49,9 @@ function Invoke-DaemonUpdateOutcome {
         The updater has no Home Assistant publishing client loaded. It drops an outcome
         file instead, and whichever daemon runs next turns that into a visible
         notification and the currently recorded installed version. Reading it every
-        reconcile - not only at startup - means the announcement fires whether the
-        daemon was restarted by a successful update or kept running through a failed
-        one.
+        reconcile - not only at startup - means the announcement fires whether a
+        successful update's restart request replaced the daemon or it kept running
+        through a failed one.
     #>
     param([Parameter(Mandatory)][hashtable]$Headers)
 
@@ -80,7 +80,12 @@ function Invoke-DaemonUpdateOutcome {
         $script:DaemonUpdatePublished = $true
         $script:DaemonUpdateSignature = ''
         if ($outcome.Success) {
-            $message = "The bridge installer completed for **$($outcome.Version)**; currently recorded version: **$installed**. Required local installation health is not certified by this result."
+            # Matches the updater's own wording, and for the same reason: the child
+            # stops the daemon so the supervisor relaunches it, and nothing looks at
+            # the install after that. "asked to restart" because Stop-BridgeOwnedRuntime
+            # stops a process or finds none - it never starts or waits for the
+            # replacement, so a restart is requested, not observed. Review on #152.
+            $message = "The bridge updated to **$($outcome.Version)**; currently recorded version: **$installed**. The daemon was asked to restart, so nothing has checked the install since."
             if ($outcome.ReleaseUrl) { $message += " [Release notes]($($outcome.ReleaseUrl))" }
             Invoke-HomeAssistantService -Domain 'persistent_notification' -Service 'create' `
                 -Data @{ title = "Bridge installer completed on $($script:DaemonMachineName)"; message = $message; notification_id = "agent_bridge_update_$($script:DaemonMachineSlug)" } `

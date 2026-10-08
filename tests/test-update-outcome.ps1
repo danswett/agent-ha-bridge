@@ -151,7 +151,11 @@ Write-Marker @{ success = $true; version = '1.2.0'; releaseUrl = 'https://exampl
 [void](Invoke-DaemonUpdateOutcome -Headers $headers)
 Receive-UpdatePayload $consumer
 Assert-UpdateOutcome 'the attempted release is not substituted for the recorded version' ($consumer.installed_version -eq '1.3.0' -and $consumer.latest_version -eq '1.2.0' -and $consumer.state -eq 'off')
-Assert-UpdateOutcome 'completion notification names both observations without certifying health' ($script:Notified.Count -eq 1 -and $script:Notified[0].message -match '1\.2\.0.*1\.3\.0.*not certified')
+Assert-UpdateOutcome 'completion notification names both observations without certifying health' ($script:Notified.Count -eq 1 -and $script:Notified[0].message -match '1\.2\.0.*1\.3\.0.*nothing has checked the install since')
+# The updater requests a restart and does not wait for one, so the notification
+# must not assert a running daemon. Review, #152.
+Assert-UpdateOutcome 'completion notification does not claim a restart it only requested' (
+    $script:Notified[0].message -match 'asked to restart' -and $script:Notified[0].message -notmatch 'was restarted')
 Assert-UpdateOutcome 'the notification is scoped to this machine' ($script:Notified[0].notification_id -eq "agent_bridge_update_$(Get-BridgeMachineSlug)")
 Assert-UpdateOutcome 'the claimed marker is consumed' (-not (Test-Path -LiteralPath $outcomeFile))
 

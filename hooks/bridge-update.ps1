@@ -652,7 +652,7 @@ try {
     . '$((Join-Path $updateContext.HooksDir 'bridge-platform.ps1').Replace("'", "''"))'
     `$ownedContext = Resolve-BridgeInstallContext -BridgeHome '$($updateContext.BridgeHome.Replace("'", "''"))'$contextArgument
     Stop-BridgeOwnedRuntime -Context `$ownedContext -Roles daemon
-    Write-UpdateLog 'installer and restart request complete; local installation health is not certified'
+    Write-UpdateLog 'installer complete; the daemon was asked to restart, so nothing has checked the install since'
     `$outcome.success = `$true
     `$outcome.exitCode = 0
 }
@@ -748,7 +748,27 @@ exit `$outcome.exitCode
         }
         $result.Success = $true
         $result.State = 'Completed'
-        $result.Detail = "installer completed for $($status.Latest); currently recorded version $($result.InstalledVersion); required local installation health is not certified"
+        # Leads with what happened, and names the one thing it cannot vouch for.
+        #
+        # This used to end on "required local installation health is not certified",
+        # printed seconds after the installer's own check had listed every probe green
+        # and said "All good: the bridge is installed, running and connected". A
+        # successful update therefore finished on a sentence that reads as a failure,
+        # which is the tell #124 is about: people went hunting for an updater fault
+        # while `status` reported the new version with everything green.
+        #
+        # The caution is still right, because the child stops the daemon after that
+        # check so the supervisor relaunches it - nothing has looked at the install
+        # since. That is a narrow, nameable gap rather than a blanket disclaimer, and
+        # it comes with the one command that closes it.
+        #
+        # "asked to restart", not "restarted": Stop-BridgeOwnedRuntime stops a process
+        # or finds none, and never starts or waits for the replacement. Saying the
+        # daemon was restarted would claim a running daemon on exactly the occasions
+        # it is not - a stopped or missing supervisor - which is the same overclaiming
+        # this change exists to remove. Found by review on #152.
+        $result.Detail = "updated to $($status.Latest); recorded version $($result.InstalledVersion); " +
+            "the daemon was asked to restart, so nothing has checked the install since - run 'agent-ha-bridge status' to confirm"
     }
     catch {
         if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
