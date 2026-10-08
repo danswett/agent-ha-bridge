@@ -32,14 +32,20 @@
  * card indefinitely.
  *
  * The dashboard generator gates on the served version alone, so it offered that
- * card 1.27.0 features it did not have: the answer form drew a second Send, and
- * Send answer never published the reply box, so every answer came back "Answer
- * unconfirmed - check the terminal".
+ * card 1.27.0 features it did not have: Send answer never published the reply box,
+ * so every answer came back "Answer unconfirmed - check the terminal".
  *
  * Skipping the number is the fence's own first remedy, and what was done when
- * #98 contaminated 1.26.0 the same way. The card itself is unchanged.
+ * #98 contaminated 1.26.0 the same way. The card itself was unchanged.
+ *
+ * 1.29.0 is the second half of that report. Installing 1.28.0 fixed the
+ * unconfirmed answers but left the two Send buttons, which showed that they were
+ * never the contamination at all: the reply card draws its own Send unconditionally,
+ * so whenever a question armed the choices card beside it, both were on screen at
+ * once and only one of them could answer. The reply card now stands its Send down
+ * while the form is holding one - see FORM_SENDS.
  */
-const CARD_VERSION = '1.28.0';
+const CARD_VERSION = '1.29.0';
 
 /*
  * How large a non-image attachment may be.
@@ -144,6 +150,30 @@ function describeThrown(err) {
  */
 const REPLY_CARDS = new Map();
 
+/*
+ * The reply topics whose Send is currently being held by the choices card beside
+ * them, by the choices card holding it.
+ *
+ * Two Send buttons were on screen together for every question that armed a form:
+ * the choices card's "Send answer" and the reply card's own "Send", which is drawn
+ * whenever there is text to send and knows nothing about the question. Only "Send
+ * answer" can answer - it commits the picked options and publishes the typed words
+ * with them - so the other one was an invitation to lose the picks, and the daemon
+ * had to defend against it after the fact ("Not sent - this question takes
+ * options").
+ *
+ * Held by the choices card rather than decided by the reply card because only the
+ * choices card knows whether it drew a Send at all. It does not draw one for a
+ * question answered purely in free text - there is nothing to commit but the words -
+ * and there the reply card's Send is the only way to answer, so a reply card that
+ * simply stood down whenever a question was armed would leave no way to send it.
+ *
+ * Keyed by reply topic, which is already the one name both cards are given and
+ * agree on, and holding the element so a card that has been replaced cannot release
+ * a hold its successor now owns - the same reason REPLY_CARDS checks identity.
+ */
+const FORM_SENDS = new Map();
+
 class AgentBridgeReplyCard extends HTMLElement {
   constructor() {
     super();
@@ -191,6 +221,10 @@ class AgentBridgeReplyCard extends HTMLElement {
     }
     this._registeredTopic = topic;
     REPLY_CARDS.set(topic, this);
+    // The choices card may already hold this topic's Send - it renders independently
+    // and may have got there first, and nothing will tell this card again until the
+    // hold next changes.
+    this._syncSendState();
   }
 
   /*
@@ -352,6 +386,11 @@ class AgentBridgeReplyCard extends HTMLElement {
         box-sizing: border-box;
       }
       textarea:focus { outline: none; border-color: var(--primary-color, #03a9f4); }
+      /* Author styles beat the user agent's [hidden] rule, and the display below is
+         one: without this, standing the Send down left it on screen and merely
+         disabled, which is the duplicate control it is there to remove. The other
+         cards in this file carry the same rule for the same reason. */
+      [hidden] { display: none !important; }
       button {
         /* Fixed height on both, so the pair match each other and the textarea's
            bottom edge. Left to their content they differ, because an icon and a
@@ -655,8 +694,24 @@ class AgentBridgeReplyCard extends HTMLElement {
   _syncSendState() {
     if (!this._els) { return; }
     const hasText = this._els.textarea.value.trim().length > 0;
-    this._els.send.disabled = this._busy
+    // Hidden rather than disabled: a greyed-out Send beside a live "Send answer"
+    // reads as something that ought to work, and the thing to do is to use the
+    // other one.
+    const held = this._formHoldsSend();
+    this._els.send.hidden = held;
+    this._els.send.disabled = held || this._busy
       || (!hasText && this._images.length === 0 && this._files.length === 0);
+  }
+
+  /* Whether the choices card beside this one is drawing the Send for this question. */
+  _formHoldsSend() {
+    const topic = this._config ? String(this._config.topic || '') : '';
+    return !!topic && FORM_SENDS.has(topic);
+  }
+
+  /* The choices card beside this one took or released the Send. */
+  noteFormSendChanged() {
+    this._syncSendState();
   }
 
   _setStatus(text, kind) {
@@ -670,6 +725,9 @@ class AgentBridgeReplyCard extends HTMLElement {
 
   async _send() {
     if (this._busy) { return; }
+    // Ctrl+Enter reaches here with the button hidden, and sending the words alone
+    // would answer the question with the picks left behind.
+    if (this._formHoldsSend()) { return; }
     // Read straight from the element. This is the whole point of the card: the
     // value cannot be stale because nothing had to commit it first.
     const text = this._els.textarea.value;
@@ -1181,6 +1239,9 @@ class AgentBridgeChoicesCard extends HTMLElement {
     // one row ticked on its own, kept Send live, and sent the one.
     this._confirmed = {};
     this._note = '';
+    // The reply topic whose Send this card is holding down, if any. Kept apart from
+    // _config so a reconfiguration cannot lose track of it.
+    this._heldTopic = '';
   }
 
   setConfig(config) {
@@ -1201,6 +1262,57 @@ class AgentBridgeChoicesCard extends HTMLElement {
   }
 
   getCardSize() { return 2; }
+
+  disconnectedCallback() {
+    // Home Assistant's conditional card removes this one outright once the question
+    // is gone, so _render is never called again to release the hold - without this
+    // the reply card's Send would stay hidden for the rest of the session.
+    //
+    // Released by the topic actually held rather than the one the config names now,
+    // for the reason _holdReplySend gives.
+    this._releaseHold(this._heldTopic);
+  }
+
+  /*
+   * Take or release the hold on the reply card's own Send.
+   *
+   * The topic held is remembered rather than read back off the config, because
+   * setConfig can repoint this element at another session: _config is replaced
+   * before anything here runs, so a release that trusted it would free the new
+   * topic and leave the old one held by a card that can no longer name it - the
+   * first session's Send and Ctrl+Enter disabled for good.
+   */
+  _holdReplySend(held) {
+    const topic = String((this._config && this._config.reply_topic) || '');
+    if (this._heldTopic && this._heldTopic !== topic) { this._releaseHold(this._heldTopic); }
+    if (!topic) { return; }
+    if (!held) { this._releaseHold(topic); return; }
+    if (FORM_SENDS.get(topic) === this) { return; }
+    FORM_SENDS.set(topic, this);
+    this._heldTopic = topic;
+    this._notifyReply(topic);
+  }
+
+  /*
+   * Give a topic's Send back, if this card is what is holding it.
+   *
+   * Home Assistant rebuilds a view by connecting the replacement before
+   * disconnecting the original, so an unconditional release would drop a hold the
+   * successor had just taken and put the second Send back on screen.
+   */
+  _releaseHold(topic) {
+    const held = String(topic || '');
+    if (!held) { return; }
+    if (this._heldTopic === held) { this._heldTopic = ''; }
+    if (FORM_SENDS.get(held) !== this) { return; }
+    FORM_SENDS.delete(held);
+    this._notifyReply(held);
+  }
+
+  _notifyReply(topic) {
+    const reply = REPLY_CARDS.get(topic);
+    if (reply && reply.noteFormSendChanged) { reply.noteFormSendChanged(); }
+  }
 
   _build() {
     this._built = true;
@@ -1389,6 +1501,9 @@ class AgentBridgeChoicesCard extends HTMLElement {
       !this._armed(entityId) && String(decisionAttrs[`field_${i + 1}_label`] || '') !== '');
 
     const show = groups.length > 0;
+    // Before the early return below, so a question that has gone releases the reply
+    // card's Send on the same pass that stops drawing this one.
+    this._holdReplySend(show && sends);
     this.hidden = !show;
     if (!show) {
       this._sent = ''; this._committed = false; this._committedAt = '';

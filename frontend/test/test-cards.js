@@ -1902,6 +1902,147 @@ async function checkSendAnswerCarriesTypedText() {
     m.reply._els.textarea.value === 'something else entirely', m.reply._els.textarea.value);
 }
 
+/*
+ * Which card draws the Send while a question is waiting.
+ *
+ * Both cards drew one. The choices card's "Send answer" commits the picked options
+ * and publishes the typed words with them; the reply card's own Send knows nothing
+ * about the question and sends the words alone, losing the picks - so the daemon had
+ * to turn it away after the fact ("Not sent - this question takes options"). Two
+ * buttons, one of which could not answer, and nothing on screen saying which (#110).
+ *
+ * The reply card cannot decide this for itself: a question answered purely in free
+ * text has nothing to commit, so the choices card draws no Send at all and the reply
+ * card's is the only way to answer it. Standing down whenever a question was armed
+ * would have left that question unanswerable.
+ */
+async function checkReplySendStandsDown() {
+  const TOPIC = 'copilot/cli/session/abc/replypayload';
+  const FIELD = 'select.agent_bridge_abc_f1';
+  const TEXT_FIELD = 'select.agent_bridge_abc_f2';
+  // The hold is keyed by reply topic in a registry inside the module, and a topic is
+  // unique per session, so each pair gets its own rather than inheriting the last
+  // one's hold. The replacement case below passes a shared topic on purpose.
+  let seq = 0;
+
+  function pair({ freeTextOnly = false, typed = 'some words', topic = '' } = {}) {
+    const replyTopic = topic || `${TOPIC}/${++seq}`;
+    const calls = [];
+    const attributes = { options: ['Awaiting answer...', 'Cancel request'], decision_id: 'd1' };
+    if (!freeTextOnly) {
+      attributes.field_1_label = 'Colour';
+      attributes.field_2_label = 'Notes';
+    }
+    const states = {
+      [DECISION]: { state: 'Awaiting answer...', attributes },
+      [FIELD]: { state: 'Red', attributes: { options: ['Choose...', 'Red', 'Blue'] } },
+      [TEXT_FIELD]: { state: 'Idle', attributes: { options: ['Idle'] } },
+    };
+    const hass = {
+      states,
+      callService: (domain, service, data) => { calls.push({ domain, service, data }); return Promise.resolve(); },
+    };
+    const reply = new SharedReplyCard();
+    reply.setConfig({ topic: replyTopic });
+    reply.hass = hass;
+    reply._els.textarea.value = typed;
+    const choices = new AgentBridgeChoicesCard();
+    choices.setConfig({
+      decision: DECISION,
+      fields: freeTextOnly ? [] : [FIELD, TEXT_FIELD],
+      submit: SUBMIT,
+      reply_topic: replyTopic,
+    });
+    choices.hass = hass;
+    return { calls, reply, choices, states, hass };
+  }
+
+  const form = pair();
+  check('a form that draws Send answer takes the reply card\'s Send off the screen',
+    form.reply._els.send.hidden === true);
+  check('and the choices card is the one still offering to send',
+    !!buttons(form.choices).find((b) => b.textContent === 'Send answer'));
+
+  // Ctrl+Enter reaches _send directly, so hiding the button alone would leave the
+  // picks losable by the keyboard.
+  await form.reply._send();
+  await flush();
+  check('and the keyboard shortcut will not send the words without the picks either',
+    form.calls.length === 0, JSON.stringify(form.calls));
+
+  // The regression that a blunter fix would have caused: nothing to commit but the
+  // words, so the choices card draws no Send and this one has to.
+  const freeText = pair({ freeTextOnly: true });
+  check('a question answered purely in free text draws no Send answer',
+    !buttons(freeText.choices).find((b) => b.textContent === 'Send answer'));
+  check('so the reply card keeps its own Send, which is the only way to answer it',
+    freeText.reply._els.send.hidden === false);
+  await freeText.reply._send();
+  await flush();
+  check('and it really does still send',
+    freeText.calls.some((c) => c.domain === 'mqtt'), JSON.stringify(freeText.calls));
+
+  // The hold has to be given back, or the box stays unusable for the rest of the
+  // session - the reply path is how everything after the question is answered. The
+  // daemon parks the whole question, selector and fields alike, not just the one.
+  const answered = pair();
+  answered.states[DECISION].state = 'Idle';
+  answered.states[FIELD].state = 'Idle';
+  answered.choices.hass = answered.hass;
+  check('once the question is answered the reply card has its Send back',
+    answered.reply._els.send.hidden === false);
+
+  // Home Assistant's conditional card removes the choices card outright rather than
+  // re-rendering it, so _render never runs again to release the hold.
+  const removed = pair();
+  removed.choices.disconnectedCallback();
+  check('a choices card taken off the dashboard releases the Send as it goes',
+    removed.reply._els.send.hidden === false);
+
+  // Connected before the original is disconnected, exactly as REPLY_CARDS documents.
+  // One topic, deliberately: this is the same session's card being rebuilt.
+  const shared = `${TOPIC}/rebuilt`;
+  const original = pair({ topic: shared });
+  const replacement = pair({ topic: shared });
+  original.choices.disconnectedCallback();
+  check('and a card that has been replaced does not release its successor\'s hold',
+    replacement.reply._els.send.hidden === true);
+
+  // Hiding is done with the hidden property, and author styles beat the user agent's
+  // [hidden] rule - this stylesheet sets every button to display: inline-flex. Without
+  // a rule of its own the Send stayed on screen and merely disabled, which is the
+  // duplicate control this is all for. The harness has no CSS, so only the sheet
+  // itself can say.
+  const replyCardSource = (() => {
+    const at = source.indexOf('class AgentBridgeReplyCard');
+    const next = source.indexOf('\nclass AgentBridge', at + 1);
+    return at < 0 ? '' : source.slice(at, next < 0 ? source.length : next);
+  })();
+  check('the reply card\'s own stylesheet really hides a hidden element',
+    /\[hidden\] \{ display: none !important; \}/.test(replyCardSource));
+  check('and it overrides the display rule that would otherwise keep Send on screen',
+    replyCardSource.indexOf('[hidden]') < replyCardSource.indexOf('display: inline-flex'));
+
+  // Home Assistant can hand an existing element a different session. _config is
+  // replaced before anything else runs, so a release that read the topic back off it
+  // would free the new one and strand the old - leaving a session whose Send and
+  // Ctrl+Enter never came back.
+  const moved = pair();
+  const stranded = moved.reply;
+  const elsewhere = pair();
+  moved.choices.setConfig({
+    decision: DECISION,
+    fields: [FIELD, TEXT_FIELD],
+    submit: SUBMIT,
+    reply_topic: elsewhere.reply._config.topic,
+  });
+  moved.choices.hass = moved.hass;
+  check('a choices card pointed at another session gives the first one its Send back',
+    stranded._els.send.hidden === false);
+  check('and holds down the Send of the session it was pointed at',
+    elsewhere.reply._els.send.hidden === true);
+}
+
 // _launch awaits its service calls, so the checks that read them have to await it too.
 (async () => {
   await checkForgetRemoval();
@@ -1913,6 +2054,7 @@ async function checkSendAnswerCarriesTypedText() {
   await checkRefusedSendReleases();
   await checkIncompleteSendStaysLive();
   await checkSendAnswerCarriesTypedText();
+  await checkReplySendStandsDown();
 
   const pubEnv = launchEnv({});
   const pubCard = promptCard(pubEnv, { promptTopic: PROMPT_TOPIC });
