@@ -35,6 +35,8 @@ function Assert-UpdateOutcome {
 $script:MqttMsgs = @()
 $script:Notified = @()
 $script:Lookup = 'current'
+# What the install button reports. Unpressed unless a case says otherwise.
+$script:ButtonState = 'unavailable'
 function Invoke-RestMethod {
     param($Uri, $Method, $Headers, $Body, $ContentType, $TimeoutSec, $WebSession)
     if ($Uri -like 'https://api.github.com/repos/*/releases/latest') {
@@ -49,7 +51,7 @@ function Invoke-RestMethod {
             html_url = "https://example.test/releases/$tag"; zipball_url = "https://example.test/archive/$tag.zip"
         }
     }
-    if ($Uri -like 'http://127.0.0.1:1/api/states/button.*') { return [pscustomobject]@{ state = 'unavailable' } }
+    if ($Uri -like 'http://127.0.0.1:1/api/states/button.*') { return [pscustomobject]@{ state = $script:ButtonState } }
     $data = if ($Body -is [byte[]]) { [Text.Encoding]::UTF8.GetString($Body) | ConvertFrom-Json } else { $Body | ConvertFrom-Json }
     if ($Uri -eq 'http://127.0.0.1:1/api/services/mqtt/publish') {
         $script:MqttMsgs += [pscustomobject]@{ Topic = $data.topic; Payload = $data.payload }
@@ -250,6 +252,44 @@ foreach ($lookup in $lookups) {
     }
     $index++
 }
+
+# A release check that fails used to `return` before the install button was read, so
+# a press from Home Assistant was silently discarded - and pressing again only spent
+# more of the rate-limit allowance that had refused the check in the first place. The
+# entity was never published either, so the machine read as dead on the dashboard
+# while its daemon was alive and heartbeating (#92, #109).
+Write-Host '--- a failed release check neither hides the machine nor eats the press ---'
+Reset-UpdateCapture
+$script:Lookup = 'unavailable'
+$script:ButtonState = [DateTimeOffset]::Now.AddMinutes(1).ToString('o')
+$script:DaemonUpdateLastPress = ''
+$script:DaemonUpdateSignature = ''
+$script:DaemonUpdatePublished = $false
+$script:SelfUpdateCalls = 0
+$realSelfUpdate = (Get-Item Function:\Invoke-BridgeSelfUpdate).ScriptBlock
+function Invoke-BridgeSelfUpdate {
+    param([switch]$Detached, [switch]$Force, [switch]$ScriptOnly)
+    $script:SelfUpdateCalls++
+    [pscustomobject]@{
+        Started = $false; Success = $false; State = 'Unavailable'; AttemptId = ''
+        AttemptedVersion = $null; InstalledVersion = '1.1.0'; Detail = 'synthetic refusal'
+    }
+}
+Remove-Item -LiteralPath $script:BridgeUpdateConfig.CacheFile -Force -ErrorAction SilentlyContinue
+try { Sync-DaemonUpdateStatus -Headers $headers }
+finally { Set-Item Function:\Invoke-BridgeSelfUpdate -Value $realSelfUpdate }
+Assert-UpdateOutcome 'the press is still acted on when the release check failed' ($script:SelfUpdateCalls -eq 1)
+$failedWire = Get-StatePayload | ConvertFrom-Json -AsHashtable
+Assert-UpdateOutcome 'and the entity still carries the installed version rather than going blank' (
+    $failedWire.Contains('installed_version') -and [string]$failedWire.installed_version -match '^\d+\.\d+')
+# Any of the publishes from this pass: the point is that the machine explained itself
+# instead of going quiet, not which message carried it.
+$explained = @($script:MqttMsgs | Where-Object { $_.Topic -match '/update/state$' } |
+    Where-Object { [string]$_.Payload -match 'could not be established' })
+Assert-UpdateOutcome 'and says why the latest is unknown, instead of looking like a dead machine' (
+    $explained.Count -ge 1)
+$script:ButtonState = 'unavailable'
+$script:Lookup = 'current'
 
 Write-Host '--- marked guard failures propagate through daemon outcome and status consumers ---'
 Reset-UpdateCapture

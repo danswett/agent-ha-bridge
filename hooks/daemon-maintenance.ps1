@@ -141,10 +141,47 @@ function Sync-DaemonUpdateStatus {
     # checked before anything else happens.
     if (-not (Get-BridgeSetting 'updates.checkForUpdates' $true)) { return }
 
+    # What the check found, or what is still true without it. A failed check used to
+    # `return` here, which had two consequences that cost an extended debugging
+    # session each: the update entity was never published, so it went unavailable with
+    # no installed_version and the machine read as dead on the dashboard (#109); and
+    # the install-button handling below was never reached, so a press made from Home
+    # Assistant was silently discarded and pressing again only burned more of the same
+    # rate-limit budget (#92).
+    #
+    # The installed version is local and is known whatever GitHub says, so there is
+    # always something honest to publish.
+    $status = $null
+    $checkFailure = ''
+    try { $status = Get-BridgeUpdateStatus }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        $checkFailure = [string]$_.Exception.Message
+        Write-DaemonLog -Message "update check failed: $checkFailure"
+    }
+    if ($null -eq $status) {
+        $status = [pscustomobject]@{
+            Installed = (Get-BridgeInstalledVersion -Refresh)
+            Latest = $null
+            Available = $false
+            LookupState = 'Unavailable'
+            State = 'Unavailable'
+            Detail = if ($checkFailure) { "The latest release could not be established: $checkFailure" }
+                     else { 'The latest release could not be established.' }
+            Url = "https://github.com/$(Get-BridgeUpdateRepository)/releases"
+            Notes = ''
+            Zip = ''
+        }
+    }
+
+    # Computed once, before anything can throw, because the press handler below
+    # publishes the same two values on its spinner. It used to pass $status.Notes
+    # there, which is empty whenever the check failed - so the explanation shown a
+    # moment earlier was wiped by the spinner that followed it.
+    $latest = $status.Latest
+    $notes = if ($status.State -in @('Unavailable', 'NotFound', 'RateLimited')) { $status.Detail } else { $status.Notes }
+
     try {
-        $status = Get-BridgeUpdateStatus
-        $latest = $status.Latest
-        $notes = if ($status.State -in @('Unavailable', 'NotFound')) { $status.Detail } else { $status.Notes }
         $signature = @($status.State, $status.Installed, $latest, $status.Url, $notes) | ConvertTo-Json -Compress
         if (-not $outcomeHandled -and ($signature -cne $script:DaemonUpdateSignature -or -not $script:DaemonUpdatePublished)) {
             Publish-CopilotMqttUpdate -InstalledVersion $status.Installed -LatestVersion $latest `
@@ -158,13 +195,14 @@ function Sync-DaemonUpdateStatus {
                     Write-DaemonLog -Message "update available: $($status.Installed) -> $($status.Latest)"
                 }
             }
-            if ($status.State -in @('Unavailable', 'NotFound')) { Write-DaemonLog -Message $status.Detail }
+            if ($status.State -in @('Unavailable', 'NotFound', 'RateLimited')) { Write-DaemonLog -Message $status.Detail }
         }
     }
     catch {
         if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
-        Write-DaemonLog -Message "update check failed: $($_.Exception.Message)"
-        return
+        # Publishing failed, which says nothing about whether a press is waiting. Going
+        # on to read the button is the whole point of not returning here.
+        Write-DaemonLog -Message "update status publish failed: $($_.Exception.Message)"
     }
 
     # The install button is a press timestamp, like the per-session Submit button.
@@ -188,7 +226,7 @@ function Sync-DaemonUpdateStatus {
         # updater is about to restart, and the next daemon clears it.
         try {
             Publish-CopilotMqttUpdate -InstalledVersion $status.Installed -LatestVersion $latest `
-                -ReleaseUrl $status.Url -ReleaseNotes $status.Notes -InProgress -Headers $Headers
+                -ReleaseUrl $status.Url -ReleaseNotes $notes -InProgress -Headers $Headers
         }
         catch {
             if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
