@@ -213,6 +213,20 @@ $emptied = @(Get-DaemonPeerMachines -Headers $mcpHeaders)
 Test-That 'but a list that was read empty is believed' {
     $emptied.Count -eq 1 -and $emptied[0].SessionsKnown -and @($emptied[0].Sessions).Count -eq 0
 }
+# A slug is a machine name, so it comes back when a host is reinstalled. Standing in
+# indefinitely would draw the previous installation's sessions for the next machine to
+# take the name, during the moment before it first publishes its own list.
+$script:PeerStates = New-PeerStates -WithSessions
+Reset-PeerScan
+$null = Get-DaemonPeerMachines -Headers $mcpHeaders
+$script:DaemonPeerSessions['laptop'].At = [DateTimeOffset]::Now.AddSeconds(-($script:DaemonConfig.PeerSessionsStandInSeconds + 1))
+$script:PeerStates = New-PeerStates
+Reset-PeerScan
+$reused = @(Get-DaemonPeerMachines -Headers $mcpHeaders)
+Test-That 'a stand-in too old to speak for the machine is dropped rather than drawn' {
+    $reused.Count -eq 1 -and -not $reused[0].SessionsKnown -and @($reused[0].Sessions).Count -eq 0 -and
+    -not $script:DaemonPeerSessions.ContainsKey('laptop')
+}
 
 Write-Host '--- state persistence survives console detachment ---'
 # Regression. Reply injection does FreeConsole -> AttachConsole -> FreeConsole, and

@@ -134,7 +134,13 @@ $script:DaemonConfig = @{
     # acts on would otherwise be repeated every reconcile for as long as the session
     # runs; a minute heals a torn-down card promptly without becoming a loop.
     EntityRestoreSeconds = 60
-    # The resumable-session list comes from an Agency call that reads every session
+    # How long a peer's last-read session list may stand in for one that has not been
+    # restored yet. Twice GlobalReassertSeconds, so a machine that is actually running
+    # will have republished at least twice inside the window: past that, not having
+    # read a list is about the machine rather than about Home Assistant still starting,
+    # and standing in would let one installation's sessions be drawn for the next one
+    # to take the same name.
+    PeerSessionsStandInSeconds = 600    # The resumable-session list comes from an Agency call that reads every session
     # on the machine, so it is cached for this long instead of being repeated on
     # every reconcile.
     # How long to keep polling the reply box after Send is pressed, waiting for Home
