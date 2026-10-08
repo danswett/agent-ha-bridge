@@ -111,7 +111,17 @@ if ($IsWindows) {
                 $result.Detail.Contains($receipt.error) -and $result.Detail -match 'child exit 1' -and
                 $result.Detail -notmatch 'invalid release or failure details')
         }
-        if ($success) { Assert-UpdateIntake "$case does not certify required local health" ($result.Detail -match 'health is not certified') }
+        if ($success) {
+            Assert-UpdateIntake "$case does not certify required local health" ($result.Detail -match 'health is not certified')
+            # Declining to certify is right; ending on it was not. The installer's own
+            # check prints every probe green and "All good" seconds earlier, so a
+            # successful update that finishes on a disclaimer reads as a failure and
+            # sends people hunting for an updater fault (#124). It leads with what
+            # happened, and names the command that closes the gap.
+            Assert-UpdateIntake "$case leads with the update succeeding, not with the caveat" (
+                $result.Detail -match '^updated to ' -and $result.Detail -notmatch '^installer completed')
+            Assert-UpdateIntake "$case says how to certify what it will not" ($result.Detail -match 'agent-ha-bridge status')
+        }
         $observed = if ($case -eq 'record-race') { '1.3.0' }
             elseif ($case -in @('partial-failure', 'restart-denied', 'missing-proof', 'wrong-attempt', 'wrong-version-proof', 'stale-proof', 'string-true-proof', 'string-false-proof', 'valid', 'daemon-race')) { '1.2.0' }
             else { '1.1.0' }

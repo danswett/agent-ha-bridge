@@ -80,7 +80,7 @@ function Invoke-DaemonUpdateOutcome {
         $script:DaemonUpdatePublished = $true
         $script:DaemonUpdateSignature = ''
         if ($outcome.Success) {
-            $message = "The bridge installer completed for **$($outcome.Version)**; currently recorded version: **$installed**. Required local installation health is not certified by this result."
+            $message = "The bridge updated to **$($outcome.Version)**; currently recorded version: **$installed**. The daemon was restarted, so health after that restart is not certified by this result."
             if ($outcome.ReleaseUrl) { $message += " [Release notes]($($outcome.ReleaseUrl))" }
             Invoke-HomeAssistantService -Domain 'persistent_notification' -Service 'create' `
                 -Data @{ title = "Bridge installer completed on $($script:DaemonMachineName)"; message = $message; notification_id = "agent_bridge_update_$($script:DaemonMachineSlug)" } `

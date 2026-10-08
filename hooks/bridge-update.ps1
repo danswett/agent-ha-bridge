@@ -652,7 +652,7 @@ try {
     . '$((Join-Path $updateContext.HooksDir 'bridge-platform.ps1').Replace("'", "''"))'
     `$ownedContext = Resolve-BridgeInstallContext -BridgeHome '$($updateContext.BridgeHome.Replace("'", "''"))'$contextArgument
     Stop-BridgeOwnedRuntime -Context `$ownedContext -Roles daemon
-    Write-UpdateLog 'installer and restart request complete; local installation health is not certified'
+    Write-UpdateLog 'installer and restart request complete; the daemon was restarted, so health after that restart is not certified here'
     `$outcome.success = `$true
     `$outcome.exitCode = 0
 }
@@ -748,7 +748,21 @@ exit `$outcome.exitCode
         }
         $result.Success = $true
         $result.State = 'Completed'
-        $result.Detail = "installer completed for $($status.Latest); currently recorded version $($result.InstalledVersion); required local installation health is not certified"
+        # Leads with what happened, and names the one thing it cannot vouch for.
+        #
+        # This used to end on "required local installation health is not certified",
+        # printed seconds after the installer's own check had listed every probe green
+        # and said "All good: the bridge is installed, running and connected". A
+        # successful update therefore finished on a sentence that reads as a failure,
+        # which is the tell #124 is about: people went hunting for an updater fault
+        # while `status` reported the new version with everything green.
+        #
+        # The caution is still right, because the child stops the daemon after that
+        # check so the supervisor relaunches it - nothing has looked at the install
+        # since. That is a narrow, nameable gap rather than a blanket disclaimer, and
+        # it comes with the one command that closes it.
+        $result.Detail = "updated to $($status.Latest); recorded version $($result.InstalledVersion); " +
+            "the daemon was restarted, so health after that restart is not certified here - run 'agent-ha-bridge status' to confirm"
     }
     catch {
         if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
