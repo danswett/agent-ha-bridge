@@ -1500,7 +1500,10 @@ Write-Host '--- the pre-rename registration is cleaned up, not tripped over ---'
 # non-zero, and plugin hooks stopped resolving - Codex sessions simply never appeared
 # on the dashboard. It is self-perpetuating, because the entry breaks the very
 # commands that would remove it (#119).
-$codexCleanup = $codexSource.IndexOf('Remove-BridgeCodexLegacyRegistration' + [Environment]::NewLine)
+# Line-ending agnostic: the checkout is CRLF on one CI runner and LF on the other, so
+# matching on [Environment]::NewLine found nothing on macOS and failed a passing fix.
+$codexCleanupMatch = [regex]::Match($codexSource, '(?m)^Remove-BridgeCodexLegacyRegistration\s*$')
+$codexCleanup = if ($codexCleanupMatch.Success) { $codexCleanupMatch.Index } else { -1 }
 Test-That 'the stale registration is removed before Codex is asked anything' {
     $codexCleanup -gt 0 -and $codexCleanup -lt $codexListing
 } "cleanup=$codexCleanup listing=$codexListing"
