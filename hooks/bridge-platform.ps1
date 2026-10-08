@@ -163,7 +163,19 @@ function Get-BridgeCommandLine {
             $observation.Code = 'CommandQueryFailed'
             return $observation
         }
-        if (-not $AsObservation) { return [string]$row.CommandLine }
+        if (-not $AsObservation) {
+            # "or ''", as the doc comment above promises. Get-CimInstance answers
+            # nothing for a process that has exited, and $null.CommandLine throws
+            # PropertyNotFound under Set-StrictMode -Version Latest rather than giving
+            # back the empty string this contract is written around. Every caller of
+            # this path is walking a process list or a parent chain - exactly where a
+            # process exiting between being enumerated and being asked about is
+            # ordinary - so the throw escaped into hook and installer code that had no
+            # reason to expect one. The observation path below was already careful
+            # about the same row; this one was not.
+            if ($null -eq $row -or -not $row.PSObject.Properties['CommandLine']) { return '' }
+            return [string]$row.CommandLine
+        }
         foreach ($readError in $readErrors) {
             if (Test-BridgeObservationGuardFailure -ErrorRecord $readError) { throw $readError }
         }
