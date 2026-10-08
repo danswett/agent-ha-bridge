@@ -128,7 +128,12 @@ if ($FixtureMode -eq 'Updater') {
         param($Uri, $OutFile, $Headers, [switch]$UseBasicParsing)
         $fixtureState = Get-UpdateFixtureState
         Assert-BridgeTestPath -Path @($OutFile, $fixtureState.Fixture.Archive)
-        if ($Uri -cne "https://example.test/archive/v$($fixtureState.Fixture.Target).zip") { throw 'Unexpected download fixture endpoint.' }
+        # The archive now comes from codeload rather than the API's zipball_url, so
+        # that pressing Update neither spends nor is refused by the 60-an-hour API
+        # allowance. Still asserted exactly: a download that went anywhere else - in
+        # particular back to api.github.com - is the regression this guards.
+        $expected = "https://codeload.github.com/fixture-owner/fixture-bridge/zip/refs/tags/v$($fixtureState.Fixture.Target)"
+        if ($Uri -cne $expected) { throw "Unexpected download fixture endpoint: $Uri" }
         Copy-Item -LiteralPath $fixtureState.Fixture.Archive -Destination $OutFile
         if ($fixtureState.Fixture.Case -eq 'guard-child-write') {
             # The real post-extraction path guard sees the corrupted environment.

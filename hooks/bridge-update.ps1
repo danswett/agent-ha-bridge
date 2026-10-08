@@ -218,8 +218,13 @@ function Get-BridgeReleaseRequestHeaders {
     }
     $token = ''
     try { $token = [string](Get-BridgeSetting 'updates.token' '') } catch { $token = '' }
-    if ([string]::IsNullOrWhiteSpace($token)) {
-        $token = [string][Environment]::GetEnvironmentVariable('AGENT_HA_BRIDGE_UPDATE_TOKEN')
+    foreach ($name in @('AGENT_HA_BRIDGE_UPDATE_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')) {
+        if (-not [string]::IsNullOrWhiteSpace($token)) { break }
+        # The machine very often already holds one of these, and a release check only
+        # needs public read. Taking one that is already there is the difference between
+        # 60 requests an hour shared with everything else behind the same address and
+        # 5,000 of this machine's own - without asking anyone to configure anything.
+        $token = [string][Environment]::GetEnvironmentVariable($name)
     }
     if (-not [string]::IsNullOrWhiteSpace($token)) {
         $headers['Authorization'] = "Bearer $($token.Trim())"
@@ -227,10 +232,98 @@ function Get-BridgeReleaseRequestHeaders {
     $headers
 }
 
+function Get-BridgeReleaseArchiveUri {
+    <#
+        Where to download a release's source archive from, avoiding the API.
+
+        api.github.com/repos/<r>/zipball/<tag> - what the latest-release response
+        offers - is itself an API request, so an unauthenticated download spends the
+        same 60-an-hour-per-IP allowance the check does, and is refused with a 403
+        once it is gone. Pressing Update in Home Assistant then failed for a reason
+        that had nothing to do with this machine and nothing the operator could act on.
+
+        codeload.github.com serves the identical archive and is not part of that
+        allowance. Checked against v1.33.8: one root folder, with VERSION and
+        install.ps1 inside it, which is exactly what the installer below asserts.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Repository,
+        [Parameter(Mandatory)][string]$Tag
+    )
+
+    if ($Repository -notmatch '^[\w.-]+/[\w.-]+$') { return '' }
+    if ($Tag -notmatch '^[\w.+-]+$') { return '' }
+    "https://codeload.github.com/$Repository/zip/refs/tags/$Tag"
+}
+
+function Get-BridgeLatestReleaseWithoutApi {
+    <#
+        The newest release tag from the repository's Atom feed, for when the API has
+        refused the check.
+
+        github.com/<r>/releases.atom is not part of the API allowance - measured while
+        the unauthenticated pool sat at 41/60, which it still did afterwards - so this
+        can answer when the request that matters cannot. It carries no usable release
+        notes, the entries being HTML, so this is deliberately only enough to know
+        which release is current and where to get it. A correct version with no notes
+        beats a stale one presented as current.
+    #>
+    param([Parameter(Mandatory)][string]$Repository)
+
+    if ($Repository -notmatch '^[\w.-]+/[\w.-]+$') { return $null }
+    $uri = "https://github.com/$Repository/releases.atom"
+    Assert-BridgeHttpAllowed -Uri $uri -Transport Rest
+    $feed = Invoke-RestMethod -Uri $uri -Headers @{ 'User-Agent' = $script:BridgeUpdateConfig.UserAgent } `
+        -TimeoutSec $script:BridgeUpdateConfig.RequestTimeout
+
+    # Entries come newest first. Taken by position rather than by parsing dates: the
+    # feed is already ordered, and a malformed date must not promote an older release.
+    $entry = @($feed) | Select-Object -First 1
+    if ($null -eq $entry) { return $null }
+
+    # Only the two structured fields are read. <title> is the release *name*, and on
+    # this repository that is "v1.33.8 - A dashboard that publishes, and a Mac you can
+    # use": the tag is at the front, and any number a human puts at the end of a
+    # release name would be taken for a version. That is the one failure worth
+    # designing against here, because the answer is fed straight to the downloader -
+    # a wrong version installs the wrong release, where no version merely leaves the
+    # rate-limit verdict standing.
+    $tag = ''
+    # Read through PSObject.Properties, not $entry.link directly: under StrictMode an
+    # absent property throws rather than yielding $null, and a feed entry missing a
+    # field is precisely the case this fallback exists to survive. Six separate live
+    # crashes in this repository have had exactly that shape.
+    $readField = {
+        param($Name)
+        if ($null -eq $entry.PSObject.Properties[$Name]) { return $null }
+        $entry.$Name
+    }
+    $href = @(& $readField 'link') | Where-Object { $null -ne $_ } |
+        ForEach-Object { if ($null -ne $_.PSObject.Properties['href']) { [string]$_.href } } |
+        Where-Object { $_ -match '/releases/tag/' } | Select-Object -First 1
+    foreach ($candidate in @($href, [string](& $readField 'id'))) {
+        if ($tag) { break }
+        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
+        # tag:github.com,2008:Repository/<id>/<tag> and .../releases/tag/<tag> both end
+        # in the tag, so the last segment is it - no searching inside free text.
+        $last = ($candidate -split '/')[-1]
+        if ($last -match '^[vV]?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?$') { $tag = $last }
+    }
+    if (-not $tag) { return $null }
+
+    [pscustomobject]@{
+        Tag       = $tag
+        Name      = $tag
+        Url       = "https://github.com/$Repository/releases/tag/$tag"
+        Zip       = (Get-BridgeReleaseArchiveUri -Repository $Repository -Tag $tag)
+        Notes     = ''
+        Published = ''
+    }
+}
+
 function Get-BridgeLatestRelease {
     <#
         The newest published release, cached so a restart loop cannot hammer GitHub.
-
         -IncludeStatus retains the lookup result; release/null alone cannot distinguish
         a failed lookup from a latest-release endpoint that answered 404. The default
         release/null interface remains available to older callers.
@@ -321,6 +414,10 @@ function Get-BridgeLatestRelease {
             Notes     = [string]$response.body
             Published = [string]$response.published_at
         }
+        # Prefer the archive that is not an API request, so that pressing Update does
+        # not spend - or get refused by - the same allowance the check competes for.
+        $archive = Get-BridgeReleaseArchiveUri -Repository $repository -Tag $release.Tag
+        if ($archive) { $release.Zip = $archive }
         if (-not (Test-BridgeUpdateRelease $release)) { throw 'The latest-release response has invalid version or download metadata.' }
         $lookup.State = 'Found'
         $lookup.Release = $release
@@ -345,11 +442,31 @@ function Get-BridgeLatestRelease {
             # shared egress can be refused without the bridge having done anything at
             # all - and the bare 403 that used to be reported read as the release being
             # broken rather than as a queue to wait in (#109, #92).
+            #
+            # Being refused is not the same as not knowing, though. The Atom feed is
+            # outside that allowance, so it is asked before the refusal is accepted as
+            # an answer. Without this the machine kept publishing whatever version it
+            # last managed to read, with the update entity sitting at "off" - a machine
+            # days behind looked exactly like one that was current.
             $lookup.State = 'RateLimited'
             $lookup.RetryAt = if ($rateLimit.RetryAt) { $rateLimit.RetryAt.ToString('o') } else { $null }
             $lookup.Detail = "GitHub is rate limiting this machine's release checks$($rateLimit.Suffix). " +
                 'The install is fine; the check will work again once the limit resets. ' +
                 'Setting updates.token raises the limit.'
+            try {
+                $fallback = Get-BridgeLatestReleaseWithoutApi -Repository $repository
+                if (Test-BridgeUpdateRelease $fallback) {
+                    $lookup.State = 'Found'
+                    $lookup.Release = $fallback
+                    $lookup.RetryAt = $null
+                    $lookup.Detail = ''
+                }
+            }
+            catch {
+                if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+                # Keep the rate-limit verdict; the feed is a second chance, not a
+                # second thing to report as broken.
+            }
         }
         else { $lookup.Detail = "The latest release could not be established: $($_.Exception.Message)" }
     }

@@ -308,6 +308,174 @@ try {
     }
     function Invoke-RestMethod { throw 'network disabled in test' }
 
+    # Being refused is not the same as not knowing. Pressing Update in Home Assistant
+    # has to work on a machine behind shared egress, where the 60-an-hour allowance is
+    # routinely gone through no fault of this machine - measured here going 39 -> 0 in
+    # ninety seconds. Two things follow: the archive must not come from the API, and a
+    # refused check must ask somewhere outside the allowance before giving up.
+    Write-Host '--- a release can still be found when the API allowance is gone ---'
+
+    $archiveUri = ''
+    try { $archiveUri = Get-BridgeReleaseArchiveUri -Repository 'owner/repo' -Tag 'v1.2.3' }
+    catch { $archiveUri = "threw: $($_.Exception.Message)" }
+    Test-That 'the archive is fetched from codeload, which is outside the API allowance' {
+        $archiveUri -ceq 'https://codeload.github.com/owner/repo/zip/refs/tags/v1.2.3'
+    } $archiveUri
+
+    Test-That 'a malformed repository or tag yields no archive rather than a built URL' {
+        (Get-BridgeReleaseArchiveUri -Repository 'owner/repo/extra' -Tag 'v1.2.3') -eq '' -and
+        (Get-BridgeReleaseArchiveUri -Repository 'owner repo' -Tag 'v1.2.3') -eq '' -and
+        (Get-BridgeReleaseArchiveUri -Repository 'owner/repo' -Tag '../../../etc') -eq '' -and
+        (Get-BridgeReleaseArchiveUri -Repository 'owner/repo' -Tag 'v1 2 3') -eq ''
+    }
+
+    # The zipball the API hands back is itself an API request, so an unauthenticated
+    # download both spends the allowance the check needs and is refused once it is
+    # gone. That was the actual reason pressing Update failed: not a broken release,
+    # but the download being the thing that ran out of quota.
+    function Invoke-RestMethod {
+        param($Uri, $Headers, $TimeoutSec)
+        if ($Uri -notlike 'https://api.github.com/*') { throw "unexpected lookup URI: $Uri" }
+        [pscustomobject]@{
+            tag_name = 'v9.9.9'; name = 'synthetic'; body = ''; published_at = ''
+            html_url = 'https://github.com/danswett/agent-ha-bridge/releases/tag/v9.9.9'
+            zipball_url = 'https://api.github.com/repos/danswett/agent-ha-bridge/zipball/v9.9.9'
+        }
+    }
+    Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+    $viaApi = Get-BridgeUpdateStatus -Force
+    Test-That 'a successful lookup still downloads from codeload, never from the API' {
+        $viaApi.Zip -ceq 'https://codeload.github.com/danswett/agent-ha-bridge/zip/refs/tags/v9.9.9'
+    } $viaApi.Zip
+    Test-That 'and the API zipball is not what the press would fetch' {
+        $viaApi.Zip -notmatch 'api\.github\.com'
+    } $viaApi.Zip
+
+    # The Atom feed is not part of the API allowance - measured while the pool sat at
+    # 41/60, which it still did afterwards. Without this the machine kept republishing
+    # whatever version it last managed to read, with the update entity at "off": one
+    # days behind looked exactly like one that was current.
+    function New-AtomEntry {
+        param([string]$Tag)
+        [pscustomobject]@{
+            id    = "tag:github.com,2008:Repository/1380937967/$Tag"
+            link  = [pscustomobject]@{ href = "https://github.com/danswett/agent-ha-bridge/releases/tag/$Tag" }
+            title = "$Tag - a release whose name is not a version"
+        }
+    }
+    $resetAt = [DateTimeOffset]::Now.AddMinutes(37)
+    function Invoke-RestMethod {
+        param($Uri, $Headers, $TimeoutSec)
+        if ($Uri -like 'https://github.com/*/releases.atom') {
+            return @((New-AtomEntry -Tag 'v9.9.9'), (New-AtomEntry -Tag 'v9.9.8'))
+        }
+        $response = New-RateLimitedResponse -Code 403 -Remaining '0' -Reset ([string]$resetAt.ToUnixTimeSeconds())
+        throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('rate limit exceeded', $response)
+    }
+    Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+    $rescued = Get-BridgeUpdateStatus -Force
+    Test-That 'a refused check that the feed can answer reports the release, not the refusal' {
+        $rescued.State -eq 'Available' -or $rescued.Available
+    } "$($rescued.State): $($rescued.Detail)"
+    Test-That 'and names the version the feed gave, rather than the last one it managed to read' {
+        $rescued.Latest -eq '9.9.9'
+    } $rescued.Latest
+    Test-That 'and offers an archive that can actually be downloaded while refused' {
+        $rescued.Zip -ceq 'https://codeload.github.com/danswett/agent-ha-bridge/zip/refs/tags/v9.9.9'
+    } $rescued.Zip
+    Test-That 'a release found through the feed is recorded as having reached GitHub' {
+        ((Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json).Reached) -eq $true
+    }
+
+    # <title> is the release *name*. On this repository it reads "v1.33.8 - A dashboard
+    # that publishes, and a Mac you can use", so the tag is at the front, and any
+    # version a human mentions at the end would be read as the release. This answer is
+    # handed straight to the downloader, so taking it from the name installs a real but
+    # wrong release - a silent downgrade. Only the structured id and link are trusted,
+    # and when neither carries a tag the refusal stands instead.
+    function Invoke-RestMethod {
+        param($Uri, $Headers, $TimeoutSec)
+        if ($Uri -like 'https://github.com/*/releases.atom') {
+            return @([pscustomobject]@{
+                id    = 'tag:github.com,2008:Repository/1380937967'
+                link  = [pscustomobject]@{ href = 'https://github.com/danswett/agent-ha-bridge/releases' }
+                title = 'A dashboard that publishes - rolls up every fix since 1.2.3'
+            })
+        }
+        $response = New-RateLimitedResponse -Code 403 -Remaining '0' -Reset ([string]$resetAt.ToUnixTimeSeconds())
+        throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('rate limit exceeded', $response)
+    }
+    Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+    $fromName = Get-BridgeUpdateStatus -Force
+    Test-That 'a version merely mentioned in a release name is never taken as the release' {
+        $fromName.Latest -ne '1.2.3' -and $fromName.State -eq 'RateLimited'
+    } "$($fromName.State): latest=$($fromName.Latest)"
+
+    # A feed entry missing the fields is the case this fallback exists to survive, and
+    # under StrictMode reading an absent property throws rather than yielding null -
+    # the single most common live crash in this repository.
+    function Invoke-RestMethod {
+        param($Uri, $Headers, $TimeoutSec)
+        if ($Uri -like 'https://github.com/*/releases.atom') {
+            return @([pscustomobject]@{ title = 'a release with no id and no link' })
+        }
+        $response = New-RateLimitedResponse -Code 403 -Remaining '0' -Reset ([string]$resetAt.ToUnixTimeSeconds())
+        throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('rate limit exceeded', $response)
+    }
+    Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+    $unusable = Get-BridgeUpdateStatus -Force
+    Test-That 'a feed entry with no usable tag leaves the rate-limit verdict standing' {
+        $unusable.State -eq 'RateLimited' -and $unusable.Detail -match 'install is fine'
+    } "$($unusable.State): $($unusable.Detail)"
+
+    # And when the feed is unreachable too, the verdict and its reset time survive
+    # exactly as before. The fallback is a second chance, never a second failure to
+    # report (#109, #92).
+    function Invoke-RestMethod {
+        param($Uri, $Headers, $TimeoutSec)
+        if ($Uri -like 'https://github.com/*/releases.atom') { throw 'the feed is unreachable too' }
+        $response = New-RateLimitedResponse -Code 403 -Remaining '0' -Reset ([string]$resetAt.ToUnixTimeSeconds())
+        throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('rate limit exceeded', $response)
+    }
+    Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+    $stillLimited = Get-BridgeUpdateStatus -Force
+    Test-That 'a refused check the feed cannot answer either is still reported as rate limiting' {
+        $stillLimited.State -eq 'RateLimited' -and $stillLimited.Detail -match $resetAt.ToString('HH:mm')
+    } "$($stillLimited.State): $($stillLimited.Detail)"
+
+    # A token the machine already holds turns 60 requests an hour shared with
+    # everything behind the same address into 5,000 of this machine's own. Nobody has
+    # ever been offered a place to configure updates.token (#153), so the ones that
+    # are already in the environment are what there is to use.
+    Write-Host '--- a token already on the machine is used ---'
+    foreach ($tokenVar in @('GH_TOKEN', 'GITHUB_TOKEN', 'AGENT_HA_BRIDGE_UPDATE_TOKEN')) {
+        $priorTokens = @{}
+        foreach ($name in @('GH_TOKEN', 'GITHUB_TOKEN', 'AGENT_HA_BRIDGE_UPDATE_TOKEN')) {
+            $priorTokens[$name] = [Environment]::GetEnvironmentVariable($name)
+            Set-Item -LiteralPath "Env:$name" -Value ''
+        }
+        try {
+            Set-Item -LiteralPath "Env:$tokenVar" -Value 'synthetic-token-value'
+            $headers = Get-BridgeReleaseRequestHeaders
+            Test-That "a release check authenticates with $tokenVar when the machine already has one" {
+                $headers.ContainsKey('Authorization') -and
+                    [string]$headers['Authorization'] -match 'synthetic-token-value'
+            } $(if ($headers.ContainsKey('Authorization')) { 'present' } else { 'absent' })
+        }
+        finally {
+            foreach ($name in $priorTokens.Keys) {
+                if ($null -eq $priorTokens[$name]) { Remove-Item -LiteralPath "Env:$name" -ErrorAction SilentlyContinue }
+                else { Set-Item -LiteralPath "Env:$name" -Value $priorTokens[$name] }
+            }
+        }
+    }
+    $noTokenHeaders = Get-BridgeReleaseRequestHeaders
+    Test-That 'and sends no empty Authorization header when the machine has no token' {
+        -not $noTokenHeaders.ContainsKey('Authorization')
+    }
+
+    function Invoke-RestMethod { throw 'network disabled in test' }
+
     Write-Host '--- failure is survivable ---'
     Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
     $script:DecisionBridgeConfig.UpdateRepositoryOverride = $null
