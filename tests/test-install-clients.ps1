@@ -1630,6 +1630,13 @@ function New-DaemonLogLine {
     "$([DateTimeOffset]::Now.AddMinutes(-$AgeMinutes).ToString('o')) $Message"
 }
 
+# A hold is only a fault when it does not stop, so the fixtures for those markers have
+# to be sustained to mean anything. One of them is what a working machine writes.
+function New-SustainedLogLines {
+    param([string]$Message, [int]$AgeMinutes = 5, [int]$Count = 25)
+    @(1..$Count | ForEach-Object { New-DaemonLogLine -Message $Message -AgeMinutes $AgeMinutes })
+}
+
 Test-That 'a machine with no daemon log yet claims nothing either way' {
     $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe { @() }
     $health.Ok -and $health.Detail -match 'no daemon log'
@@ -1667,17 +1674,74 @@ Test-That 'launches being refused for incomplete discovery is reported' {
 
 Test-That 'discovery held on a process it cannot account for is reported' {
     $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
-        @(New-DaemonLogLine 'holding for codex process 4412 (node): it has no readable start time')
+        New-SustainedLogLines 'holding for codex process 4412 (node): it has no readable start time'
     }
     (-not $health.Ok) -and $health.Detail -match 'cannot account for'
 }
 
+# #120 put the kind and pid on these lines, and #128 the adapter's reason, precisely
+# because a bare code sent people hunting. Collapsing it back to a fixed sentence here
+# would throw that away again on the screen most likely to be read.
+Test-That 'the held kind and pid are carried through, not collapsed into a fixed phrase' {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+        New-SustainedLogLines 'session discovery uncertain (codex/UnaccountedProcess pid 4412); absence-based work is held'
+    }
+    $health.Detail -match 'codex/UnaccountedProcess pid 4412'
+}
+
+Test-That 'an adapter reason survives to the status line too' {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+        New-SustainedLogLines 'session discovery uncertain (copilot/AdapterReadFailed: Registration directory is unreadable.); absence-based work is held'
+    }
+    $health.Detail -match 'AdapterReadFailed: Registration directory is unreadable\.'
+}
+
+# The reason comes straight from an exception message, so it can contain anything -
+# a path, or a command with arguments. Ending the capture at the first ")" truncated
+# it exactly where it got interesting. Found by review on #138.
+Test-That 'a reason containing brackets is carried whole, not cut at the first one' {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+        New-SustainedLogLines 'session discovery uncertain (codex/AdapterReadFailed: cannot read /Users/d/Library/Application Support (sandboxed) registrations); absence-based work is held'
+    }
+    $health.Detail -match 'Application Support \(sandboxed\) registrations'
+}
+
+# One pass writes a line per issue, so several processes can hold at once. Naming only
+# the last left "(x4)" standing over a single process while the others went unmentioned
+# - and they have to be dealt with too. Found by review on #138.
+Test-That 'several processes holding at once are all named, not just the last' {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+        @((New-SustainedLogLines 'session discovery uncertain (copilot/UnaccountedProcess pid 11); absence-based work is held' -Count 11),
+          (New-SustainedLogLines 'session discovery uncertain (codex/UnaccountedProcess pid 22); absence-based work is held' -Count 11)) |
+            ForEach-Object { $_ }
+    }
+    $health.Detail -match 'pid 11' -and $health.Detail -match 'pid 22'
+}
+
+Test-That 'which agent died before registering is named' {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+        @(New-DaemonLogLine 'launched Codex (pid 31857) exited before registering')
+    }
+    $health.Detail -match 'Codex \(pid 31857\)'
+}
+
+# The cause can change while the hold persists, and every one of them is something
+# that was holding - so they are all named rather than only whichever was last.
+Test-That 'a cause that has changed over the window keeps both, newest first' {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+        @((New-SustainedLogLines 'session discovery uncertain (claude/UnaccountedProcess pid 1); absence-based work is held' -AgeMinutes 90),
+          (New-SustainedLogLines 'session discovery uncertain (codex/UnaccountedProcess pid 2); absence-based work is held' -AgeMinutes 2)) |
+            ForEach-Object { $_ }
+    }
+    $health.Detail -match 'codex/UnaccountedProcess pid 2' -and $health.Detail -match 'claude/UnaccountedProcess pid 1'
+}
+
 Test-That 'several different faults are all named, not just the first' {
     $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
-        @((New-DaemonLogLine 'launched Codex (pid 1) exited before registering'),
-          (New-DaemonLogLine 'session discovery uncertain (codex/AdapterReadFailed); absence-based work is held'))
+        @((New-DaemonLogLine 'launched Codex (pid 1) exited before registering')) +
+            (New-SustainedLogLines 'session discovery uncertain (codex/AdapterReadFailed); absence-based work is held')
     }
-    $health.Detail -match 'died before it could register' -and $health.Detail -match 'uncertain'
+    $health.Detail -match 'died before it could register' -and $health.Detail -match 'discovery is held'
 }
 
 Test-That 'a fault repeating is counted rather than listed twice' {
@@ -1687,6 +1751,41 @@ Test-That 'a fault repeating is counted rather than listed twice' {
           (New-DaemonLogLine 'launched Codex (pid 3) exited before registering'))
     }
     $health.Detail -match 'x3'
+}
+
+# DSWETT-HOME wrote six uncertainty lines in nine hours while registering sessions
+# perfectly well - a process is briefly unaccounted for, discovery waits a pass, and it
+# heals. Reporting that as NOT registering was read as the bridge being broken on a
+# machine that was fine, which is worse than saying nothing at all.
+Test-That 'a hold that happened and healed is not reported as a fault' {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+        New-SustainedLogLines 'session discovery uncertain (copilot/UnaccountedProcess pid 81696); absence-based work is held' -Count 6
+    }
+    $health.Ok -and $health.Detail -match 'nothing wrong'
+}
+
+Test-That 'but one that keeps happening is' {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+        New-SustainedLogLines 'session discovery uncertain (copilot/UnaccountedProcess pid 32741); absence-based work is held' -Count 207
+    }
+    (-not $health.Ok) -and $health.Detail -match 'discovery is held'
+}
+
+# A blip alongside a real fault must not date the verdict: "last 2 min ago" drawn from
+# something that was never worth reporting is a worse answer than the fault's own age.
+Test-That 'a blip does not lend its timestamp to a fault found elsewhere' {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+        @((New-DaemonLogLine 'launched Codex (pid 1) exited before registering' -AgeMinutes 40),
+          (New-DaemonLogLine 'session discovery uncertain (codex/UnaccountedProcess pid 2); absence-based work is held' -AgeMinutes 1))
+    }
+    $health.Detail -match 'last (39|40|41) min ago' -and $health.Detail -notmatch 'discovery is held'
+}
+
+Test-That 'a session that died before registering still counts from the first one' {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+        @(New-DaemonLogLine 'launched Codex (pid 31857) exited before registering')
+    }
+    -not $health.Ok
 }
 
 # A fault that was fixed yesterday must not keep the verdict red today, or the check

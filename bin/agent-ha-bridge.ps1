@@ -330,7 +330,12 @@ function Show-Status {
             Write-Host "    sessions   : registering normally - $($registration.Detail)" -ForegroundColor Green
         }
         elseif ($registration) {
-            Write-Host "    sessions   : NOT registering - $($registration.Detail)" -ForegroundColor Red
+            # Not "NOT registering": a held discovery stops retirement, cleanup and new
+            # launches while sessions that are already registered carry on reporting
+            # perfectly well. Saying otherwise contradicts the machine list printed a
+            # few lines further down, and a status that argues with itself is the thing
+            # this check exists to stop.
+            Write-Host "    sessions   : needs attention - $($registration.Detail)" -ForegroundColor Red
             if ($daemonLog) { Write-Host "                 see $daemonLog" -ForegroundColor Yellow }
         }
     }
