@@ -220,6 +220,66 @@ try {
     Test-That 'and the repository itself is never a candidate' { -not (Test-Listed -List $after -Path $repo) }
 
     Write-Host ''
+    Write-Host '--- a build output does not strand a worktree, other ignored data still does ---'
+    # Following the documented test procedure made a worktree permanently
+    # unreclaimable: AGENTS.md says to build the native hook before a full run,
+    # .gitignore ignores the binary, and the reclaimer refused any tree with any
+    # ignored file. The managed cap then fills and every launch is refused with no
+    # fallback - dev_vm1 sat at 10/10 refusing all of them (#143).
+    Set-Content -LiteralPath (Join-Path $repo '.gitignore') -Value @('hook/agent-bridge-hook.exe', 'hook/agent-bridge-hook', '.env') -Encoding UTF8
+    Invoke-Git $repo @('add', '.gitignore')
+    Invoke-Git $repo @('commit', '-m', 'ignore build output and local config')
+    Invoke-Git $repo @('push', 'origin', 'main')
+    $ignoreBase = Get-BridgeRepositoryBaseRef -RepositoryPath $repo
+
+    $built = (New-BridgeSessionWorktree -RepositoryPath $repo).Path
+    [void][System.IO.Directory]::CreateDirectory((Join-Path $built 'hook'))
+    Set-Content -LiteralPath (Join-Path $built 'hook\agent-bridge-hook.exe') -Value 'a compiled hook' -Encoding UTF8
+    Set-Aged -Path $built -Hours 48
+    Test-That 'a tree holding only a built hook is finished, not kept for ever' {
+        Test-BridgeWorktreeFinished -WorktreePath $built -BaseRef $ignoreBase -IdleHours 12
+    }
+
+    # An ignored file can be real local data nobody authorized deleting, so the
+    # allowlist is exact: this must still retain the tree.
+    $localData = (New-BridgeSessionWorktree -RepositoryPath $repo).Path
+    Set-Content -LiteralPath (Join-Path $localData '.env') -Value 'TOKEN=secret' -Encoding UTF8
+    Set-Aged -Path $localData -Hours 48
+    Test-That 'but an ignored .env is still work worth keeping' {
+        -not (Test-BridgeWorktreeFinished -WorktreePath $localData -BaseRef $ignoreBase -IdleHours 12)
+    }
+
+    $both = (New-BridgeSessionWorktree -RepositoryPath $repo).Path
+    [void][System.IO.Directory]::CreateDirectory((Join-Path $both 'hook'))
+    Set-Content -LiteralPath (Join-Path $both 'hook\agent-bridge-hook.exe') -Value 'a compiled hook' -Encoding UTF8
+    Set-Content -LiteralPath (Join-Path $both '.env') -Value 'TOKEN=secret' -Encoding UTF8
+    Set-Aged -Path $both -Hours 48
+    Test-That 'and one build output does not excuse the data sitting beside it' {
+        -not (Test-BridgeWorktreeFinished -WorktreePath $both -BaseRef $ignoreBase -IdleHours 12)
+    }
+
+    # Being judged finished is only half of it: the remover deletes tracked files and
+    # empty directories, so the binary has to go too or hook/ never empties. The usage
+    # snapshot is a real-machine read - live processes, session locks - and is stubbed
+    # here for the same reason the in-use test below stubs it: this is about what
+    # cleanup does once authorized, not about authorizing it.
+    $realUsageForBuild = ${function:Get-BridgeWorktreeUsage}
+    try {
+        function Get-BridgeWorktreeUsage { [pscustomobject]@{ Known = $true; Directories = @(); Detail = '' } }
+        [void](Remove-BridgeWorktreeFiles -WorktreePath $built -BaseRef $ignoreBase -IdleHours 12)
+        [void](Remove-BridgeWorktreeFiles -WorktreePath $localData -BaseRef $ignoreBase -IdleHours 12)
+    }
+    finally { ${function:Get-BridgeWorktreeUsage} = $realUsageForBuild }
+
+    Test-That 'and the built hook goes with the tree, so hook/ can empty and the directory go' {
+        -not [System.IO.Directory]::Exists($built)
+    } "built still present: $([System.IO.Directory]::Exists($built))"
+
+    Test-That 'while the tree holding local data keeps both it and the directory' {
+        [System.IO.Directory]::Exists($localData) -and [System.IO.File]::Exists((Join-Path $localData '.env'))
+    }
+
+    Write-Host ''
     Write-Host '--- a session in a folder is left alone whatever git says about it ---'
     $busyWorktree = (New-BridgeSessionWorktree -RepositoryPath $repo).Path
         Set-Aged -Path $busyWorktree -Hours 48
