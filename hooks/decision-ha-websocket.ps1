@@ -6,6 +6,15 @@
 #>
 
 . (Join-Path $PSScriptRoot 'bridge-secrets.ps1')
+# 1.5.0, not 1.4.0: the same trap as below, walked into a second time by #131, which
+# gave the choices card an activity sensor to watch so a form's typed answer is held
+# until the daemon confirms it was used (#104). That changed what
+# Save-CopilotSessionDashboard renders while the version stayed at 1.4.0, so from
+# 2026-10-08T08:13 every publication on an already-fenced machine was refused -
+# "Equal render versions have conflicting content" - and the shared dashboard froze
+# with peers showing no sessions. The tests cover the fence, not the pairing of a
+# renderer change with a bump, so nothing failed; it is the diff that has to say it.
+#
 # 1.4.0, not 1.3.0: Save-CopilotSessionDashboard is one of the helpers
 # Get-BridgeRenderArtifact fingerprints, and it now hands the choices card the reply
 # box's topic so Send answer can publish what was typed before submitting (#93).
@@ -13,7 +22,7 @@
 # definition of a conflict there - so on any installation already fenced at the old
 # renderer, publication is refused and the fix can never reach the dashboard without
 # an operator pin nobody should have to take.
-$script:BridgeDashboardRenderVersion = '1.4.0'
+$script:BridgeDashboardRenderVersion = '1.5.0'
 $script:BridgeDashboardObservation = $null
 
 function Invoke-CopilotHaWebSocket {
