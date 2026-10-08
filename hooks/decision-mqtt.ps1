@@ -603,6 +603,9 @@ function Publish-CopilotMqttUpdate {
         # (#129). Empty when no attempt is running.
         [string]$Stage = '',
         [AllowNull()][object]$Proportion = $null,
+        # Why that stage, in words, for the stages where "failed" alone is useless.
+        # Same always-published rule as the stage itself.
+        [string]$StageDetail = '',
         [string]$Slug,
         [Parameter(Mandatory)][hashtable]$Headers
     )
@@ -645,8 +648,14 @@ function Publish-CopilotMqttUpdate {
         # instead of "working". Empty string rather than omitted: an omitted key is
         # retained from the previous publish, which would leave a finished update
         # showing the stage it was at when it finished.
+        #
+        # The progress stages come from the updater itself; `completed`, `failed` and
+        # `current` are the three terminal verdicts the daemon reports, and they are
+        # kept apart deliberately - a release that was already installed is not a
+        # failure, which is the conflation #92 is about.
         stage             = [string]$Stage
         stage_proportion  = $(if ($null -eq $Proportion) { '' } else { [double]$Proportion })
+        stage_detail      = [string]$StageDetail
     }
     # Stock MQTT update rejects JSON null versions and retains an omitted version.
     # Availability therefore carries "not established", without inventing a version

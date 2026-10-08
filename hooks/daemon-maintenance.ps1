@@ -8,12 +8,80 @@
     declaring the shared $script: state; see docs/daemon-split.md.
     Shared state it changes: DaemonClientSetup, DaemonRestartRequested,
     DaemonUpdateAvailable, DaemonUpdateLastPress, DaemonUpdatePublished,
-    DaemonMemoryTrimmedAt.
+    DaemonMemoryTrimmedAt, DaemonUpdateVerdict.
 #>
 
 $script:DaemonMemoryTrimmedAt = [DateTimeOffset]::MinValue
 $script:DaemonUpdateSignature = ''
 $script:DaemonUpdatePendingAttempt = ''
+
+# How an attempt ended, when no progress file says - the two outcomes where the
+# updater never started and so never wrote one: a release already installed, and a
+# launch that failed. Held in memory because neither restarts the daemon.
+$script:DaemonUpdateVerdict = $null
+
+# How long a terminal verdict stays on the entity. Long enough to be read by someone
+# who pressed the button and looked away, short enough that it is plainly about the
+# press they just made rather than one from yesterday.
+$script:DaemonUpdateVerdictMinutes = 10
+
+# How stale a progress record may be and still be published. The reader is bound to
+# the attempt, but a daemon that restarted mid-update has no attempt id to bind to
+# and accepts any - so a file from an update that finished days ago would otherwise
+# leave the card reporting it forever.
+$script:DaemonUpdateProgressHours = 1
+
+function Set-DaemonUpdateVerdict {
+    <# Records how an attempt ended, for the publish that follows. #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('completed', 'failed', 'current')][string]$Stage,
+        [string]$Detail = '',
+        [DateTimeOffset]$At = [DateTimeOffset]::Now
+    )
+    $script:DaemonUpdateVerdict = [pscustomobject]@{ Stage = $Stage; Detail = $Detail; At = $At }
+    # The verdict is part of what is published, so the last signature no longer
+    # describes what the entity should say.
+    $script:DaemonUpdateSignature = ''
+}
+
+function Get-DaemonUpdateProgress {
+    <#
+        What to publish as the update's stage: the updater's own progress record while
+        there is a current one, and otherwise the verdict of an attempt that never got
+        far enough to write one.
+
+        Returns stage/detail/proportion with empty values when neither applies, so the
+        caller always publishes something and never retains a stale stage.
+    #>
+    param([DateTimeOffset]$Now = [DateTimeOffset]::Now)
+
+    $blank = [pscustomobject]@{ Stage = ''; Detail = ''; Proportion = $null }
+    $progress = $null
+    try {
+        $progress = Read-BridgeUpdateStage -Path $script:BridgeUpdateConfig.ProgressFile `
+            -AttemptId ([string]$script:DaemonUpdatePendingAttempt) `
+            -NotBefore $Now.AddHours(-$script:DaemonUpdateProgressHours)
+    }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        $progress = $null
+    }
+    if ($progress) {
+        return [pscustomobject]@{
+            Stage      = [string]$progress.Stage
+            Detail     = [string]$progress.Detail
+            Proportion = $progress.Proportion
+        }
+    }
+
+    $verdict = $script:DaemonUpdateVerdict
+    if (-not $verdict) { return $blank }
+    if (($Now - $verdict.At).TotalMinutes -gt $script:DaemonUpdateVerdictMinutes) {
+        $script:DaemonUpdateVerdict = $null
+        return $blank
+    }
+    [pscustomobject]@{ Stage = [string]$verdict.Stage; Detail = [string]$verdict.Detail; Proportion = $null }
+}
 
 function Invoke-DaemonMemoryTrim {
     <#
@@ -73,8 +141,18 @@ function Invoke-DaemonUpdateOutcome {
         if (([DateTimeOffset]::Now - $outcome.At).TotalHours -gt 6) { return $false }
         if ($script:DaemonUpdatePendingAttempt -eq $outcome.AttemptId) { $script:DaemonUpdatePendingAttempt = '' }
         $installed = Get-BridgeInstalledVersion -Refresh
+        # The same verdict the notification carries, on the entity, so the dashboard
+        # says how the update ended rather than only that it is no longer running.
+        # Worked out before publishing because the publish is what shows it.
+        $verdictStage = if ($outcome.Success) { 'completed' } else { 'failed' }
+        $verdictDetail = if ($outcome.Success) {
+            if ($outcome.Version) { "Updated to $($outcome.Version)" } else { 'Updated' }
+        }
+        else { [string]$outcome.Error }
+        Set-DaemonUpdateVerdict -Stage $verdictStage -Detail $verdictDetail
         Publish-CopilotMqttUpdate -InstalledVersion $installed -LatestVersion $outcome.Version `
-            -ReleaseUrl $outcome.ReleaseUrl -InProgress:([bool]$script:DaemonUpdatePendingAttempt) -Headers $Headers
+            -ReleaseUrl $outcome.ReleaseUrl -InProgress:([bool]$script:DaemonUpdatePendingAttempt) `
+            -Stage $verdictStage -StageDetail $verdictDetail -Headers $Headers
         [void](Set-CopilotMqttUpdateEntityIds)
         $script:DaemonUpdateAvailable = (ConvertTo-BridgeVersion $outcome.Version) -gt (ConvertTo-BridgeVersion $installed)
         $script:DaemonUpdatePublished = $true
@@ -191,19 +269,15 @@ function Sync-DaemonUpdateStatus {
         # update does - and because the daemon restarting mid-update is one of the
         # stages, so this may be the first pass of a daemon that has never seen the
         # attempt start.
-        $progress = $null
-        try {
-            $progress = Read-BridgeUpdateStage -Path $script:BridgeUpdateConfig.ProgressFile `
-                -AttemptId ([string]$script:DaemonUpdatePendingAttempt)
-        }
-        catch { $progress = $null }
-        $stage = if ($progress) { [string]$progress.Stage } else { '' }
-        $proportion = if ($progress) { $progress.Proportion } else { $null }
-        $signature = @($status.State, $status.Installed, $latest, $status.Url, $notes, $stage, $proportion) | ConvertTo-Json -Compress
+        $progress = Get-DaemonUpdateProgress
+        $stage = [string]$progress.Stage
+        $proportion = $progress.Proportion
+        $stageDetail = [string]$progress.Detail
+        $signature = @($status.State, $status.Installed, $latest, $status.Url, $notes, $stage, $proportion, $stageDetail) | ConvertTo-Json -Compress
         if (-not $outcomeHandled -and ($signature -cne $script:DaemonUpdateSignature -or -not $script:DaemonUpdatePublished)) {
             Publish-CopilotMqttUpdate -InstalledVersion $status.Installed -LatestVersion $latest `
                 -ReleaseUrl $status.Url -ReleaseNotes $notes -InProgress:([bool]$script:DaemonUpdatePendingAttempt) `
-                -Stage $stage -Proportion $proportion -Headers $Headers
+                -Stage $stage -Proportion $proportion -StageDetail $stageDetail -Headers $Headers
             [void](Set-CopilotMqttUpdateEntityIds)
             $script:DaemonUpdateSignature = $signature
             $script:DaemonUpdatePublished = $true
@@ -242,9 +316,14 @@ function Sync-DaemonUpdateStatus {
         Write-DaemonLog -Message 'install update requested from Home Assistant'
         # Spinner up front. The retained in_progress=true outlives the daemon that the
         # updater is about to restart, and the next daemon clears it.
+        #
+        # `checking` rather than a bare spinner: the press has to answer for itself
+        # immediately, and checking the release is genuinely what happens next. Any
+        # stale verdict goes with it - the press being answered is this one.
+        $script:DaemonUpdateVerdict = $null
         try {
             Publish-CopilotMqttUpdate -InstalledVersion $status.Installed -LatestVersion $latest `
-                -ReleaseUrl $status.Url -ReleaseNotes $notes -InProgress -Headers $Headers
+                -ReleaseUrl $status.Url -ReleaseNotes $notes -InProgress -Stage 'checking' -Headers $Headers
         }
         catch {
             if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
@@ -272,7 +351,12 @@ function Sync-DaemonUpdateStatus {
             try {
                 $current = $result.PSObject.Properties['State'] -and $result.State -eq 'Current'
                 $knownTarget = if ($result.PSObject.Properties['AttemptedVersion']) { $result.AttemptedVersion } else { $null }
-                Publish-CopilotMqttUpdate -InstalledVersion (Get-BridgeInstalledVersion -Refresh) -LatestVersion $knownTarget -Headers $Headers
+                # A release that is already installed is not a failure. Conflating the
+                # two is what #92 was: a press that found nothing to do looked exactly
+                # like a press that broke.
+                Set-DaemonUpdateVerdict -Stage $(if ($current) { 'current' } else { 'failed' }) -Detail ([string]$result.Detail)
+                Publish-CopilotMqttUpdate -InstalledVersion (Get-BridgeInstalledVersion -Refresh) -LatestVersion $knownTarget `
+                    -Stage $script:DaemonUpdateVerdict.Stage -StageDetail $script:DaemonUpdateVerdict.Detail -Headers $Headers
                 $script:DaemonUpdateSignature = ''
                 Invoke-HomeAssistantService -Domain 'persistent_notification' -Service 'create' `
                     -Data @{

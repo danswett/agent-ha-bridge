@@ -157,6 +157,12 @@ Assert-UpdateOutcome 'completion notification names both observations without ce
 Assert-UpdateOutcome 'completion notification does not claim a restart it only requested' (
     $script:Notified[0].message -match 'asked to restart' -and $script:Notified[0].message -notmatch 'was restarted')
 Assert-UpdateOutcome 'the notification is scoped to this machine' ($script:Notified[0].notification_id -eq "agent_bridge_update_$(Get-BridgeMachineSlug)")
+# The notification is a one-shot; the entity is what the dashboard reads on every
+# pass. Without the verdict there, an update that finished looked exactly like one
+# that was never pressed - which is the silence #129 is about.
+$terminal = Get-StatePayload | ConvertFrom-Json -AsHashtable
+Assert-UpdateOutcome 'the entity carries how the attempt ended, not only that it stopped' (
+    $terminal['stage'] -ceq 'completed' -and $terminal['stage_detail'] -match '1\.2\.0')
 Assert-UpdateOutcome 'the claimed marker is consumed' (-not (Test-Path -LiteralPath $outcomeFile))
 
 Write-Host '--- a failure marker clears the spinner and reports the error ---'
@@ -167,6 +173,9 @@ Write-Marker @{ schemaVersion = 1; attemptId = ('a' * 32); success = $false; exi
 Receive-UpdatePayload $consumer
 Assert-UpdateOutcome 'retry availability is established by both actual JSON versions and the consumer' ($consumer.state -eq 'on' -and $consumer.installed_version -eq '1.1.0' -and $consumer.latest_version -eq '1.2.0' -and -not $consumer.in_progress)
 Assert-UpdateOutcome 'failure reports the error without claiming rollback' ($script:Notified.Count -eq 1 -and $script:Notified[0].message -match 'disk full.*no rollback is claimed')
+$terminal = Get-StatePayload | ConvertFrom-Json -AsHashtable
+Assert-UpdateOutcome 'and the entity says it failed, and why' (
+    $terminal['stage'] -ceq 'failed' -and $terminal['stage_detail'] -ceq 'disk full')
 
 Reset-UpdateCapture
 Set-RecordedVersion '1.2.0'
@@ -294,6 +303,67 @@ Assert-UpdateOutcome 'and says why the latest is unknown, instead of looking lik
     $explained.Count -ge 1)
 $script:ButtonState = 'unavailable'
 $script:Lookup = 'current'
+
+# A press that found the release already installed is not a press that broke.
+# Reporting the two the same way is what sent people to a log to find out which had
+# happened - and then to a shell, which is where tonight's damage came from (#129).
+Write-Host '--- a press with nothing to install says so, and is not a failure ---'
+Reset-UpdateCapture
+$script:DaemonUpdateVerdict = $null
+$script:ButtonState = [DateTimeOffset]::Now.AddMinutes(2).ToString('o')
+$script:DaemonUpdateLastPress = ''
+$script:DaemonUpdateSignature = ''
+$script:DaemonUpdatePublished = $false
+$realSelfUpdate = (Get-Item Function:\Invoke-BridgeSelfUpdate).ScriptBlock
+function Invoke-BridgeSelfUpdate {
+    param([switch]$Detached, [switch]$Force, [switch]$ScriptOnly)
+    [pscustomobject]@{
+        Started = $false; Success = $true; State = 'Current'; AttemptId = ''
+        AttemptedVersion = $null; InstalledVersion = '1.1.0'
+        Detail = 'no newer release found; nothing installed'
+    }
+}
+try { Sync-DaemonUpdateStatus -Headers $headers }
+finally { Set-Item Function:\Invoke-BridgeSelfUpdate -Value $realSelfUpdate }
+$currentWire = Get-StatePayload | ConvertFrom-Json -AsHashtable
+Assert-UpdateOutcome 'it is reported as already current, not as a failed update' (
+    $currentWire['stage'] -ceq 'current' -and $currentWire['stage_detail'] -match 'no newer release')
+
+# The verdict has to outlive the pass that made it, because nothing else records it:
+# the updater never started, so there is no progress file to read it back from.
+Write-Host '--- and the verdict stays readable for long enough to be read ---'
+Assert-UpdateOutcome 'a fresh verdict is what the next pass would publish' (
+    (Get-DaemonUpdateProgress).Stage -ceq 'current')
+Assert-UpdateOutcome 'and it is not kept so long that it describes yesterday' (
+    (Get-DaemonUpdateProgress -Now ([DateTimeOffset]::Now.AddHours(1))).Stage -eq '')
+$script:DaemonUpdateVerdict = $null
+Assert-UpdateOutcome 'with no verdict and no progress file, nothing is claimed' (
+    (Get-DaemonUpdateProgress).Stage -eq '' -and $null -eq (Get-DaemonUpdateProgress).Proportion)
+
+# The reader accepts any attempt once the daemon has restarted, because a daemon that
+# came up mid-update has no attempt id to match. Age is then the only thing keeping a
+# file from a finished update out of today's dashboard.
+$progressFile = $script:BridgeUpdateConfig.ProgressFile
+@{ schemaVersion = 1; attemptId = ('b' * 32); stage = 'downloading'; proportion = 0.5
+   at = [DateTimeOffset]::Now.ToString('o') } | ConvertTo-Json -Compress |
+    Set-Content -LiteralPath $progressFile -Encoding UTF8
+Assert-UpdateOutcome 'a current progress record is published as the stage it names' (
+    (Get-DaemonUpdateProgress).Stage -ceq 'downloading' -and (Get-DaemonUpdateProgress).Proportion -eq 0.5)
+Assert-UpdateOutcome 'and the progress file wins over any verdict, being the newer truth' (
+    $(
+        Set-DaemonUpdateVerdict -Stage 'failed' -Detail 'stale'
+        (Get-DaemonUpdateProgress).Stage -ceq 'downloading'
+    ))
+@{ schemaVersion = 1; attemptId = ('b' * 32); stage = 'completed'
+   at = [DateTimeOffset]::Now.AddHours(-26).ToString('o') } | ConvertTo-Json -Compress |
+    Set-Content -LiteralPath $progressFile -Encoding UTF8
+$script:DaemonUpdateVerdict = $null
+Assert-UpdateOutcome 'an old record is not replayed as an update that just finished' (
+    (Get-DaemonUpdateProgress).Stage -eq '')
+Remove-Item -LiteralPath $progressFile -Force -ErrorAction SilentlyContinue
+$script:ButtonState = 'unavailable'
+$script:DaemonUpdateVerdict = $null
+$script:DaemonUpdateSignature = ''
 
 Write-Host '--- marked guard failures propagate through daemon outcome and status consumers ---'
 Reset-UpdateCapture
