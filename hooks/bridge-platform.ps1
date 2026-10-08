@@ -1405,15 +1405,29 @@ function Get-BridgeRegistrationHealth {
     # precisely because the bare code sent people hunting; collapsing it back to a
     # fixed sentence here would throw that away again on the one screen most likely
     # to be read.
+    #
+    # Least names how many it takes to mean something. The claim above - that no
+    # healthy machine writes these - turned out to be true of only two of them. A
+    # momentarily unaccounted process is ordinary and heals itself within a pass or
+    # two, so DSWETT-HOME wrote six uncertainty lines in nine hours while registering
+    # sessions perfectly well, and this reported it as NOT registering on the strength
+    # of one of them seventeen minutes old. That is the crying wolf the comment above
+    # warns about, arrived at from the other direction, and it is worse than silence:
+    # it was read as the bridge being broken on a machine that was fine.
+    #
+    # What distinguishes a real fault is that it does not stop. Dans-MBP wrote 207 in
+    # six hours. The two markers that genuinely cannot happen on a working machine - a
+    # session that died before registering, and a launch actually refused - still count
+    # from one.
     $symptoms = @(
         @{ Match = 'exited before registering'; Says = 'a launched session died before it could register'
-           Capture = 'launched\s+(.+?)\s+exited before registering' }
+           Capture = 'launched\s+(.+?)\s+exited before registering'; Least = 1 }
         @{ Match = 'Session discovery is incomplete'; Says = 'launches are being refused: session discovery is incomplete'
-           Capture = '' }
+           Capture = ''; Least = 1 }
         @{ Match = 'session discovery uncertain'; Says = 'session discovery is held, so retirement and cleanup wait'
-           Capture = 'session discovery uncertain \(([^)]*)\)' }
+           Capture = 'session discovery uncertain \(([^)]*)\)'; Least = 20 }
         @{ Match = 'holding for '; Says = 'session discovery is held by a process it cannot account for'
-           Capture = 'holding for ([^:]+?)(?::|$)' }
+           Capture = 'holding for ([^:]+?)(?::|$)'; Least = 20 }
     )
 
     $lines = @()
@@ -1422,7 +1436,8 @@ function Get-BridgeRegistrationHealth {
     $cutoff = [DateTimeOffset]::Now.AddHours(-$WithinHours)
     $found = [ordered]@{}
     $named = @{}
-    $latest = $null
+    $least = @{}
+    $seenAt = @{}
     foreach ($line in $lines) {
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
         # Every line is written as "<round-trip timestamp> <message>". One that does
@@ -1438,12 +1453,28 @@ function Get-BridgeRegistrationHealth {
             $says = [string]$symptom.Says
             if (-not $found.Contains($says)) { $found[$says] = 0 }
             $found[$says] = [int]$found[$says] + 1
+            $least[$says] = [int]$symptom.Least
             # The newest line wins, because a hold that has changed cause should be
             # described by the cause it has now.
             $capture = [string]$symptom.Capture
             if ($capture -and $line -match $capture) { $named[$says] = $Matches[1].Trim() }
-            if ($null -eq $latest -or $when -gt $latest) { $latest = $when }
+            if (-not $seenAt.ContainsKey($says) -or $when -gt $seenAt[$says]) { $seenAt[$says] = $when }
         }
+    }
+
+    # Anything that did not reach its threshold happened, healed, and is not worth
+    # saying - and must not drag the "last seen" time with it, or a single blip would
+    # still date a verdict drawn entirely from other evidence.
+    foreach ($says in @($found.Keys)) {
+        if ([int]$found[$says] -lt [int]$least[$says]) {
+            $found.Remove($says)
+            [void]$named.Remove($says)
+            [void]$seenAt.Remove($says)
+        }
+    }
+    $latest = $null
+    foreach ($says in $found.Keys) {
+        if ($null -eq $latest -or $seenAt[$says] -gt $latest) { $latest = $seenAt[$says] }
     }
 
     $detail = ''
