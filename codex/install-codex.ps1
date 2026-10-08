@@ -173,7 +173,13 @@ function Remove-BridgeCodexLegacyRegistration {
     foreach ($arguments in @(
             @('plugin', 'remove', "$legacyPluginName@$legacyMarketplaceName"),
             @('plugin', 'marketplace', 'remove', $legacyMarketplaceName))) {
-        try { [void](Invoke-BridgeCodexCommand -Arguments $arguments) } catch { }
+        # Failure is expected and survivable here - the config rewrite below is the
+        # fallback - but a test guard is not an ordinary failure and must propagate
+        # rather than become a quiet fallback that looks like it worked.
+        try { [void](Invoke-BridgeCodexCommand -Arguments $arguments) }
+        catch {
+            if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        }
     }
 
     $after = Get-BridgeCodexLegacyRegistration
