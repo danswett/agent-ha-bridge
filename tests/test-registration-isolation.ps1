@@ -30,7 +30,7 @@ $script:A14PsCalls = 0
 $script:A14Guard = $null
 $script:A14ActualWindows = $script:BridgeIsWindows
 $expectedGroups = 25
-$expectedChecks = 113
+$expectedChecks = 114
 $primaryFailure = $null
 
 function Test-A14 {
@@ -741,6 +741,15 @@ try {
         $script:A14CommandMode = 'absent'
         Test-A14 'the default string API answers nothing rather than throwing once the process has gone' (
             (Get-BridgeCommandLine -ProcessId 90003) -ceq '')
+        # But only when the query itself succeeded. A denied or provider-failed read
+        # returns no row either, and letting that collapse into the same empty string
+        # would be cached against pid and start time by Get-BridgeAgentProcessSessionIds
+        # - hiding a live session for as long as that process ran. The macOS branch
+        # already separates them; this keeps Windows honest about the difference.
+        $script:A14CommandMode = 'denied'
+        $deniedThrew = $false
+        try { [void](Get-BridgeCommandLine -ProcessId 90003) } catch { $deniedThrew = $true }
+        Test-A14 'a failed command query is raised rather than answered as a vanished process' $deniedThrew
         $script:A14CommandMode = 'readable'
         $script:BridgeIsWindows = $false
         $script:A14PsExit = 0; $script:A14CommandMode = 'empty'

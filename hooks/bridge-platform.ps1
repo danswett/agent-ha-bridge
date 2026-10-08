@@ -173,6 +173,17 @@ function Get-BridgeCommandLine {
             # ordinary - so the throw escaped into hook and installer code that had no
             # reason to expect one. The observation path below was already careful
             # about the same row; this one was not.
+            #
+            # A failed query is not a vanished process, and the two must not collapse
+            # into the same empty string: Get-BridgeAgentProcessSessionIds caches this
+            # result against pid and start time, so one denied or provider-failed read
+            # would hide a live session for as long as that process ran. Only a
+            # *nonterminating* error reaches here - the call sets
+            # -ErrorAction SilentlyContinue - so it has to be re-raised deliberately.
+            # A genuinely exited process produces no error at all, which is what makes
+            # the two distinguishable; a filter matching nothing is not a failure.
+            # This is what the macOS branch below already does with $query.Failure.
+            if ($readErrors.Count) { throw $readErrors[0] }
             if ($null -eq $row -or -not $row.PSObject.Properties['CommandLine']) { return '' }
             return [string]$row.CommandLine
         }
