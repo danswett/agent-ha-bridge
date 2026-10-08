@@ -652,7 +652,7 @@ try {
     . '$((Join-Path $updateContext.HooksDir 'bridge-platform.ps1').Replace("'", "''"))'
     `$ownedContext = Resolve-BridgeInstallContext -BridgeHome '$($updateContext.BridgeHome.Replace("'", "''"))'$contextArgument
     Stop-BridgeOwnedRuntime -Context `$ownedContext -Roles daemon
-    Write-UpdateLog 'installer and restart request complete; the daemon was restarted, so health after that restart is not certified here'
+    Write-UpdateLog 'installer complete; the daemon was asked to restart, so nothing has checked the install since'
     `$outcome.success = `$true
     `$outcome.exitCode = 0
 }
@@ -761,8 +761,14 @@ exit `$outcome.exitCode
         # check so the supervisor relaunches it - nothing has looked at the install
         # since. That is a narrow, nameable gap rather than a blanket disclaimer, and
         # it comes with the one command that closes it.
+        #
+        # "asked to restart", not "restarted": Stop-BridgeOwnedRuntime stops a process
+        # or finds none, and never starts or waits for the replacement. Saying the
+        # daemon was restarted would claim a running daemon on exactly the occasions
+        # it is not - a stopped or missing supervisor - which is the same overclaiming
+        # this change exists to remove. Found by review on #152.
         $result.Detail = "updated to $($status.Latest); recorded version $($result.InstalledVersion); " +
-            "the daemon was restarted, so health after that restart is not certified here - run 'agent-ha-bridge status' to confirm"
+            "the daemon was asked to restart, so nothing has checked the install since - run 'agent-ha-bridge status' to confirm"
     }
     catch {
         if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }

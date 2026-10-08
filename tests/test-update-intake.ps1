@@ -112,7 +112,12 @@ if ($IsWindows) {
                 $result.Detail -notmatch 'invalid release or failure details')
         }
         if ($success) {
-            Assert-UpdateIntake "$case does not certify required local health" ($result.Detail -match 'not certified')
+            Assert-UpdateIntake "$case does not certify required local health" ($result.Detail -match 'nothing has checked the install since')
+            # Stop-BridgeOwnedRuntime stops a process or finds none; it never starts or
+            # waits for the replacement. Claiming the daemon restarted would assert a
+            # running daemon on exactly the occasions there is not one. Review, #152.
+            Assert-UpdateIntake "$case does not claim a restart it only requested" (
+                $result.Detail -match 'asked to restart' -and $result.Detail -notmatch 'was restarted')
             # Declining to certify is right; ending on it was not. The installer's own
             # check prints every probe green and "All good" seconds earlier, so a
             # successful update that finishes on a disclaimer reads as a failure and
