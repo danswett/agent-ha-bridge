@@ -896,7 +896,13 @@ function Invoke-DaemonHit {
     if ($hit.EntityId -eq $script:DaemonEntity.NewSession) {
         try {
             if ($null -eq $script:DaemonDiscoverySnapshot -or -not $script:DaemonDiscoverySnapshot.Complete) {
-                Set-CopilotMqttNewSessionResult -Headers $headers -Text 'Session discovery is incomplete; launch is temporarily held.'
+                # Name what is holding it. "Session discovery is incomplete" alone sent
+                # somebody through the daemon log to find the process responsible, on a
+                # machine where every launch had been refused all day.
+                $held = Get-DaemonDiscoveryHoldSummary -Snapshot $script:DaemonDiscoverySnapshot
+                $text = if ($held) { "Launch held: waiting on $held." }
+                    else { 'Session discovery is incomplete; launch is temporarily held.' }
+                Set-CopilotMqttNewSessionResult -Headers $headers -Text $text
                 return
             }
             $liveNow = if ($script:DaemonLive -is [hashtable]) { $script:DaemonLive } else { @{} }

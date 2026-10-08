@@ -1127,6 +1127,12 @@ function Publish-CopilotMqttGlobalStatus {
 
         [string]$MachineName,
 
+        # What is holding absence-based work on this machine, in words, or empty when
+        # nothing is. Published because a held machine refuses launches and cannot
+        # retire a dead card, and until now the only way to discover that was to read
+        # the daemon log on the machine itself.
+        [string]$DiscoveryHeld = '',
+
         [Parameter(Mandatory)]
         [hashtable]$Headers
     )
@@ -1160,6 +1166,7 @@ function Publish-CopilotMqttGlobalStatus {
         machine_slug = $Slug
         capabilities = $Capabilities
         resumable = @($Resumable)
+        discovery_held = $DiscoveryHeld
         updated = [DateTimeOffset]::Now.ToString('o')
     } | ConvertTo-Json -Depth 6 -Compress) -Headers $Headers -Retain
 }

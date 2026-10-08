@@ -216,6 +216,84 @@ function Read-DaemonRegistrationFile {
     }
 }
 
+# How long a live agent process may go unaccounted for before discovery stops letting
+# it hold everything else up.
+#
+# Discovery requires every live agent process to belong to a session, and anything it
+# cannot match sets Known false - which held retirement, the orphan sweep and startup
+# cleanup, and refused every Launch, for as long as that process ran. Twice in one day
+# a program that is not a session and never registers (Codex's app-server, Scout's
+# embedded `copilot --headless`) wedged a machine until the specific case was
+# identified and allowed for in code. Each fix was an entry on a list; the next
+# program to embed or rename an agent binary would have wedged it again the same way.
+#
+# A session registers within seconds of starting, so a process still unaccounted for
+# minutes later is positive evidence that it is not one. Holding for that long first
+# is what keeps the caution that matters: absence-based work deletes things, and a
+# session mid-registration must never be read as absent.
+$script:DaemonUnaccountedGraceMinutes = 2
+
+# When each unaccounted process was first seen, and which have already been reported
+# as carried on without. Keyed by kind, pid and start time, so a reused pid starts its
+# own clock rather than inheriting the silence of whatever held that number before.
+$script:DaemonUnaccountedSince = @{}
+$script:DaemonUnaccountedExcused = @{}
+
+function Select-DaemonHoldingProcesses {
+    <#
+        Of this pass's unaccounted processes, those that still hold discovery open.
+
+        Anything unaccounted for longer than the grace above is dropped from the
+        result and carried on without, once, with a line saying so. Records for
+        processes that have gone or have since been accounted for are forgotten here,
+        so a process that registers late, or exits and returns, starts over.
+
+        Returns comma-wrapped: a bare empty array yields $null under Set-StrictMode,
+        and the caller counts what comes back.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Kind,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Unaccounted
+    )
+
+    $now = [DateTimeOffset]::Now
+    $prefix = "$Kind/"
+    $seen = @{}
+    $holding = [Collections.Generic.List[object]]::new()
+    foreach ($process in $Unaccounted) {
+        if ($null -eq $process) { continue }
+        $processId = [int]$process.Id
+        $name = if ($process.PSObject.Properties['ProcessName']) { [string]$process.ProcessName } else { '' }
+        # Read defensively: an adapter carrying its own older copy of
+        # bridge-platform.ps1 reports no start time, and a pid whose start time could
+        # not be read carries 0. Both simply key on less, rather than never ageing.
+        $started = 0
+        if ($process.PSObject.Properties['StartedUtcTicks']) { $started = [long]$process.StartedUtcTicks }
+        $key = '{0}{1}/{2}/{3}' -f $prefix, $processId, $name, $started
+        $seen[$key] = $true
+        if (-not $script:DaemonUnaccountedSince.ContainsKey($key)) {
+            $script:DaemonUnaccountedSince[$key] = $now
+        }
+        $waited = $now - $script:DaemonUnaccountedSince[$key]
+        if ($waited.TotalMinutes -lt $script:DaemonUnaccountedGraceMinutes) {
+            $holding.Add($process)
+            continue
+        }
+        if (-not $script:DaemonUnaccountedExcused.ContainsKey($key)) {
+            $script:DaemonUnaccountedExcused[$key] = $true
+            Write-DaemonLog -Message ("carrying on without $Kind process $processId ($name): unaccounted for " +
+                "$([int]$waited.TotalMinutes) min, so it is not a session that is still starting up")
+        }
+    }
+    foreach ($key in @($script:DaemonUnaccountedSince.Keys)) {
+        if ($key.StartsWith($prefix, [StringComparison]::Ordinal) -and -not $seen.ContainsKey($key)) {
+            [void]$script:DaemonUnaccountedSince.Remove($key)
+            [void]$script:DaemonUnaccountedExcused.Remove($key)
+        }
+    }
+    , @($holding.ToArray())
+}
+
 function Read-DaemonAdapterRegistrations {
     param([Parameter(Mandatory)][ValidateSet('claude', 'codex')][string]$Kind, [Parameter(Mandatory)][string]$Root)
     if (Test-BridgeTestExecution) { Assert-BridgeTestPath -Path $Root }
@@ -295,11 +373,15 @@ function Read-DaemonAdapterRegistrations {
             }
         }
     }
-    foreach ($processId in $livePids.Keys) {
-        if (-not $accounted.ContainsKey($processId)) {
-            $known = $false
-            $diagnostics.Add([pscustomobject]@{ Kind = $Kind; Path = $Root; Code = 'UnaccountedProcess' })
-        }
+    $unaccounted = [Collections.Generic.List[object]]::new()
+    foreach ($process in $inventory.Processes) {
+        if (-not $accounted.ContainsKey([int]$process.Id)) { $unaccounted.Add($process) }
+    }
+    foreach ($process in (Select-DaemonHoldingProcesses -Kind $Kind -Unaccounted @($unaccounted.ToArray()))) {
+        $known = $false
+        $diagnostics.Add([pscustomobject]@{
+            Kind = $Kind; Path = $Root; Code = 'UnaccountedProcess'; ProcessId = [int]$process.Id
+        })
     }
     [pscustomobject]@{ Known = $known; Records = @($records.ToArray()); Diagnostics = @($diagnostics.ToArray()) }
 }
@@ -343,7 +425,7 @@ function New-DaemonDiscoverySnapshot {
 function Set-DaemonDiscoveryUncertain {
     param(
         [AllowNull()]$Snapshot = $null, [string]$Kind = '', [string]$Path = '',
-        [string]$SessionId = '', [string]$Code = 'RecordUnreadable'
+        [string]$SessionId = '', [string]$Code = 'RecordUnreadable', [int]$ProcessId = 0
     )
     if ($null -eq $Snapshot) {
         $current = Get-Variable -Name DaemonDiscoverySnapshot -Scope Script -ErrorAction SilentlyContinue
@@ -370,8 +452,42 @@ function Set-DaemonDiscoveryUncertain {
         [void]$Snapshot.Live.Remove($id)
     }
     if ($matches.Count -eq 0) { $Snapshot.UncertainKinds[$Kind] = $true }
-    $Snapshot.Diagnostics.Add([pscustomobject]@{ Kind = $Kind; Path = $Path; Code = $Code; KnownOwners = @($matches) })
+    $Snapshot.Diagnostics.Add([pscustomobject]@{
+        Kind = $Kind; Path = $Path; Code = $Code; KnownOwners = @($matches); ProcessId = $ProcessId
+    })
     Write-DaemonLog -Message "session discovery uncertain ($Kind/$Code); absence-based work is held"
+}
+
+function Get-DaemonDiscoveryHoldSummary {
+    <#
+        What is holding absence-based work, in words, for a person rather than a log.
+
+        "Session discovery is incomplete" on its own sent somebody looking through the
+        daemon log to find which process was responsible, on a machine where Launch
+        had been refused all day. The press that was refused can say so itself.
+
+        Empty when nothing is holding, so a caller can use it as the condition too.
+    #>
+    param([AllowNull()]$Snapshot)
+
+    if ($null -eq $Snapshot -or -not $Snapshot.PSObject.Properties['Diagnostics']) { return '' }
+    if ([bool]$Snapshot.Complete) { return '' }
+    $seen = [Collections.Generic.List[string]]::new()
+    foreach ($diagnostic in @($Snapshot.Diagnostics)) {
+        if ($null -eq $diagnostic) { continue }
+        $kind = [string]$diagnostic.Kind
+        $code = [string]$diagnostic.Code
+        $processId = 0
+        if ($diagnostic.PSObject.Properties['ProcessId']) { $processId = [int]$diagnostic.ProcessId }
+        $text = if ($code -eq 'UnaccountedProcess' -and $processId -gt 0) {
+            "an unrecognised $kind process (pid $processId)"
+        }
+        elseif ($kind) { "$kind/$code" }
+        else { $code }
+        if (-not $seen.Contains($text)) { $seen.Add($text) }
+    }
+    if ($seen.Count -eq 0) { return '' }
+    ($seen.ToArray() -join ', ')
 }
 
 function Test-DaemonRetirementObservation {
@@ -440,7 +556,9 @@ function Get-DaemonSessionDiscovery {
                         $validated[$id] = $session
                         $accounted[$pidValue] = $true
                     }
-                    foreach ($pidValue in $pids.Keys) {
+                    $stillUnaccounted = [Collections.Generic.List[object]]::new()
+                    foreach ($process in $inventory.Processes) {
+                        $pidValue = [int]$process.Id
                         if ($accounted.ContainsKey($pidValue)) { continue }
                         # Only a process nothing accounted for costs a command-line
                         # read, which is about 77 ms - normally there are none. An
@@ -451,9 +569,16 @@ function Get-DaemonSessionDiscovery {
                         if ($command.State -eq 'Absent') { continue }
                         if ($command.State -eq 'Readable' -and
                             (Test-BridgeAgentEmbeddedProcess -CommandLine $command.Text)) { continue }
-                        # Anything else stays unaccounted: excusing a process takes
-                        # positive identification, never an unreadable command line.
-                        $legacyIssues.Add([pscustomobject]@{ Kind = $kind; Path = ''; Code = 'UnaccountedProcess' })
+                        # Anything else stays unaccounted: excusing a process on sight
+                        # takes positive identification, never an unreadable command
+                        # line. What it does not do any more is hold discovery open
+                        # for ever - Select-DaemonHoldingProcesses ages it out.
+                        $stillUnaccounted.Add($process)
+                    }
+                    foreach ($process in (Select-DaemonHoldingProcesses -Kind $kind -Unaccounted @($stillUnaccounted.ToArray()))) {
+                        $legacyIssues.Add([pscustomobject]@{
+                            Kind = $kind; Path = ''; Code = 'UnaccountedProcess'; ProcessId = [int]$process.Id
+                        })
                     }
                     foreach ($diagnostic in $inventory.Diagnostics) {
                         if ($diagnostic.Code -ne 'ProcessDisappeared') {
@@ -504,7 +629,10 @@ function Get-DaemonSessionDiscovery {
     }
     foreach ($issue in $issues) {
         $id = if ($issue.PSObject.Properties['SessionId']) { [string]$issue.SessionId } else { '' }
-        Set-DaemonDiscoveryUncertain -Snapshot $snapshot -Kind $issue.Kind -Path $issue.Path -Code $issue.Code -SessionId $id
+        $issuePid = 0
+        if ($issue.PSObject.Properties['ProcessId']) { $issuePid = [int]$issue.ProcessId }
+        Set-DaemonDiscoveryUncertain -Snapshot $snapshot -Kind $issue.Kind -Path $issue.Path -Code $issue.Code `
+            -SessionId $id -ProcessId $issuePid
     }
     foreach ($group in @($snapshot.OwnerCatalogue.Values | Where-Object Path | Group-Object Path -CaseSensitive:(-not $script:BridgeIsWindows))) {
         if ($group.Count -le 1) { continue }
