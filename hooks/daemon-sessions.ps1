@@ -1103,6 +1103,13 @@ function Add-DaemonUnaccountedDescriptors {
     $sawSelf = $false
     foreach ($machine in @(Get-BridgePeerMachine -States $states)) {
         if (-not $machine.IsSelf) { continue }
+        # SessionsKnown, not merely the record existing. Home Assistant restores a
+        # retained sensor's config, state and attributes separately, so the entity can
+        # be back while its sessions attribute is not - and an attribute that has not
+        # arrived reads as an empty list, which is the same shape as a machine that
+        # genuinely runs nothing. Only an attribute actually present counts as having
+        # read the inventory.
+        if (-not $machine.SessionsKnown) { continue }
         $sawSelf = $true
         foreach ($session in @($machine.Sessions)) {
             if ($null -eq $session) { continue }
@@ -1130,7 +1137,7 @@ function Add-DaemonUnaccountedDescriptors {
     # being wrong the other way is one new machine's card waiting for its first
     # complete discovery pass, which is where it waited before any of this.
     if (-not $sawSelf) {
-        Write-DaemonLog -Message 'retained inventory for this machine is absent while session ownership is incomplete'
+        Write-DaemonLog -Message 'retained inventory for this machine is unreadable while session ownership is incomplete'
         return [pscustomobject]@{ Descriptors = $carried; Readable = $false }
     }
 

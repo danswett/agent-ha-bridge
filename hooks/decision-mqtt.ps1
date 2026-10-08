@@ -1394,11 +1394,21 @@ function Get-BridgePeerMachine {
         $attributes = $state.attributes
         $machine = ''
         $sessions = @()
+        # Whether the list was actually read, as opposed to defaulted. Home Assistant
+        # restores a retained sensor's config, state and attributes separately, so
+        # there is a window after a restart where the entity exists and its sessions
+        # attribute does not - and "no attribute yet" and "no sessions" flatten to the
+        # same empty list. A caller deciding whether it is safe to publish over this
+        # machine's own inventory has to be able to tell those apart.
+        $sessionsKnown = $false
         $capabilities = @{}
         $resumable = @()
         if ($null -ne $attributes) {
             if ($attributes.PSObject.Properties.Name -contains 'machine') { $machine = [string]$attributes.machine }
-            if ($attributes.PSObject.Properties.Name -contains 'sessions') { $sessions = @($attributes.sessions) }
+            if ($attributes.PSObject.Properties.Name -contains 'sessions' -and $null -ne $attributes.sessions) {
+                $sessions = @($attributes.sessions)
+                $sessionsKnown = $true
+            }
             if ($attributes.PSObject.Properties.Name -contains 'capabilities' -and $null -ne $attributes.capabilities) {
                 $capabilities = $attributes.capabilities
             }
@@ -1417,6 +1427,7 @@ function Get-BridgePeerMachine {
             Slug = $slug
             Machine = $machine
             Sessions = @($sessions)
+            SessionsKnown = $sessionsKnown
             Capabilities = $capabilities
             Resumable = @($resumable)
             Online = [bool]$online[$slug]

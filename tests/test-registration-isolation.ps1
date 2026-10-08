@@ -34,7 +34,7 @@ $script:A14PsCalls = 0
 $script:A14Guard = $null
 $script:A14ActualWindows = $script:BridgeIsWindows
 $expectedGroups = 26
-$expectedChecks = 125
+$expectedChecks = 126
 $primaryFailure = $null
 
 function Test-A14 {
@@ -1069,6 +1069,18 @@ try {
             finally { $script:A14States[$machineEntity] = $machineState; $script:DaemonStatesCache = $null }
             Test-A14 'an inventory that is simply not there yet is unreadable rather than empty' (
                 -not $missing.Readable)
+            # Same again one level in. Home Assistant restores a retained sensor's
+            # config, state and attributes separately, so the entity can be back while
+            # its sessions attribute is not - and an absent attribute reads as an empty
+            # list, exactly like a machine that genuinely runs nothing.
+            $script:A14States[$machineEntity] = [pscustomobject]@{
+                entity_id = $machineEntity; state = '0'
+                attributes = [pscustomobject]@{ machine = $script:DaemonMachineName; machine_slug = $script:DaemonMachineSlug }
+            }
+            $script:DaemonStatesCache = $null
+            try { $bare = Add-DaemonUnaccountedDescriptors -Descriptors @() -Gone @() -Headers @{} }
+            finally { $script:A14States[$machineEntity] = $machineState; $script:DaemonStatesCache = $null }
+            Test-A14 'and so is one whose session list has not been restored with it' (-not $bare.Readable)
         }
         finally {
             $script:A14States[$machineEntity].attributes.sessions = $retained
