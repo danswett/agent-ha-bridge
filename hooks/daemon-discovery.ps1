@@ -233,12 +233,30 @@ function Read-DaemonRegistrationFile {
 # session mid-registration must never be read as absent.
 $script:DaemonUnaccountedGraceMinutes = 2
 
-# When each unaccounted process was first seen, and which have already had something
-# said about them, so neither message repeats on every pass. Keyed by kind, pid and
-# start time, so a reused pid starts its own clock rather than inheriting the silence
-# of whatever held that number before.
+# When each unaccounted process was first seen, when it was last seen, and which have
+# already had something said about them, so neither message repeats on every pass.
+# Keyed by kind, pid and start time, so a reused pid starts its own clock rather than
+# inheriting the silence of whatever held that number before.
 $script:DaemonUnaccountedSince = @{}
+$script:DaemonUnaccountedLastSeen = @{}
 $script:DaemonUnaccountedReported = @{}
+
+# How long a record outlives the last pass that saw it.
+#
+# Forgetting on the first pass that missed a process looked tidy and quietly made the
+# grace above unreachable. A process only has to drop out of the candidate set for one
+# pass - an intermittently unreadable command line is enough - for its record to be
+# deleted and its clock to restart from zero on the pass after. Something flickering
+# on a ninety-second cycle therefore never reaches two minutes, and holds discovery
+# open for ever in short bursts while never being old enough to excuse.
+#
+# Observed on a Mac: 207 holds in six hours on one pid, no process ever reported as
+# unidentifiable, and exactly one excused in the whole log.
+#
+# The key already carries the start time, so re-seeing it is proof of the same process
+# rather than a new one wearing its pid. There is no correctness reason to restart the
+# clock; retention only stops the table growing without end.
+$script:DaemonUnaccountedRetentionMinutes = 30
 
 function Select-DaemonHoldingProcesses {
     <#
@@ -275,6 +293,7 @@ function Select-DaemonHoldingProcesses {
         if (-not $script:DaemonUnaccountedSince.ContainsKey($key)) {
             $script:DaemonUnaccountedSince[$key] = $now
         }
+        $script:DaemonUnaccountedLastSeen[$key] = $now
         # Without a start time there is nothing to tell one generation of a pid from
         # the next. An excused process that exits between passes, replaced by a new
         # session that happens to get the same pid and name, would inherit the elapsed
@@ -303,10 +322,17 @@ function Select-DaemonHoldingProcesses {
         }
     }
     foreach ($key in @($script:DaemonUnaccountedSince.Keys)) {
-        if ($key.StartsWith($prefix, [StringComparison]::Ordinal) -and -not $seen.ContainsKey($key)) {
-            [void]$script:DaemonUnaccountedSince.Remove($key)
-            [void]$script:DaemonUnaccountedReported.Remove($key)
-        }
+        if (-not $key.StartsWith($prefix, [StringComparison]::Ordinal)) { continue }
+        if ($seen.ContainsKey($key)) { continue }
+        # Kept for a while after it was last seen, so one missed pass does not restart
+        # the clock. Dropped once it is old enough that the process really has gone.
+        $lastSeen = if ($script:DaemonUnaccountedLastSeen.ContainsKey($key)) {
+            $script:DaemonUnaccountedLastSeen[$key]
+        } else { $script:DaemonUnaccountedSince[$key] }
+        if (($now - $lastSeen).TotalMinutes -lt $script:DaemonUnaccountedRetentionMinutes) { continue }
+        [void]$script:DaemonUnaccountedSince.Remove($key)
+        [void]$script:DaemonUnaccountedLastSeen.Remove($key)
+        [void]$script:DaemonUnaccountedReported.Remove($key)
     }
     , @($holding.ToArray())
 }
