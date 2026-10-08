@@ -29,8 +29,8 @@ $script:A14PsExit = 0
 $script:A14PsCalls = 0
 $script:A14Guard = $null
 $script:A14ActualWindows = $script:BridgeIsWindows
-$expectedGroups = 25
-$expectedChecks = 117
+$expectedGroups = 26
+$expectedChecks = 121
 $primaryFailure = $null
 
 function Test-A14 {
@@ -966,6 +966,51 @@ try {
             $snapshot.Complete -and $snapshot.Live.ContainsKey($script:A14Ids.A) -and
             $script:BridgeDashboardObservation.Verified)
     }
+    Invoke-A14Group 'a restart that lost its state keeps an unaccountable session on the dashboard' {
+        # The case publishing under uncertainty could otherwise get wrong. Descriptors
+        # are built from $State, and $State comes from a file - so a daemon that starts
+        # without a usable one knows of no sessions at all. A live process it then
+        # cannot attribute is in neither $State nor $Live, and describing this machine
+        # from those descriptors alone would say it is running nothing: the session's
+        # card would come off the shared dashboard, and its entities would sit there
+        # rendering nothing, while it was still working.
+        Reset-A14Records codex
+        [void](Invoke-A14Reconcile)
+        $nodeA = Get-CopilotMqttNodeId -SessionId $script:A14Ids.A
+        $retained = $script:A14States[$machineEntity].attributes.sessions
+        # What Home Assistant still holds from before the restart: this machine's own
+        # last accepted statement about itself, which names A.
+        $script:A14States[$machineEntity].attributes.sessions = @([pscustomobject]@{
+            name = 'session A'; machine = $script:DaemonMachineName; node = $nodeA; kind = 'codex' })
+        $script:DaemonStatesCache = $null
+        try {
+            Write-A14Json -Path (Get-A14RegistrationPath A) -Value @{}
+            Write-DaemonState -State @{}
+            $script:A14State = Read-DaemonState
+            $script:DaemonOwnerCatalogue = @{}
+            $snapshot = Invoke-A14Reconcile
+            Test-A14 'the restarted daemon can neither place the session nor call it live' (
+                -not $snapshot.Complete -and -not $snapshot.Live.ContainsKey($script:A14Ids.A) -and
+                -not $script:A14State.ContainsKey($script:A14Ids.A))
+            Test-A14 'yet this machine still names it in what it publishes about itself' (
+                $script:DaemonGlobalSignature -clike "*$nodeA*")
+            Test-A14 'and the accepted shared view still renders its card' (
+                $script:BridgeDashboardObservation.Verified -and
+                $script:BridgeDashboardObservation.ReferencedNodes -ccontains $nodeA)
+            # Carrying a node forward must not become a way for a retired one to live
+            # for ever: Complete-DaemonSessionRetirement will only remove a session's
+            # entities once the shared view has stopped rendering it.
+            Write-A14Registration A
+            $complete = Invoke-A14Reconcile
+            Test-A14 'and once it can be placed again it is adopted rather than duplicated' (
+                $complete.Complete -and $complete.Live.ContainsKey($script:A14Ids.A) -and
+                @($script:BridgeDashboardObservation.ReferencedNodes | Where-Object { $_ -ceq $nodeA }).Count -eq 1)
+        }
+        finally {
+            $script:A14States[$machineEntity].attributes.sessions = $retained
+            $script:DaemonStatesCache = $null
+        }
+    }
     Invoke-A14Group 'actual startup session cleanup defers then resumes on reconcile' {
         Reset-A14Records codex
         [void](Invoke-A14Reconcile)
@@ -1040,7 +1085,7 @@ try {
         }
         finally { $script:ClaudeStateRoot = $oldRoot }
     }
-    Test-A14 'the fixed twenty-five source groups were reached' ($script:A14Groups -eq $expectedGroups)
+    Test-A14 'the fixed twenty-six source groups were reached' ($script:A14Groups -eq $expectedGroups)
     Test-A14 'the fixed assertion inventory was reached' ($script:A14Checks -eq ($expectedChecks - 1))
 }
 catch {

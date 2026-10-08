@@ -580,6 +580,9 @@ function Sync-DaemonSessions {
     }
 
     $descriptors = @(Get-DaemonSessionDescriptors -State $State -Headers $Headers)
+    if (-not $Discovery.Complete) {
+        $descriptors = @(Add-DaemonUnaccountedDescriptors -Descriptors $descriptors -Gone $goneSessions -Headers $Headers)
+    }
     # Presence-based, so it runs whether or not the local process view is complete.
     #
     # What a session's card says, and that it exists at all, is evidence this machine
@@ -590,6 +593,14 @@ function Sync-DaemonSessions {
     # it for every machine. Sessions on other hosts stopped appearing, cards stopped
     # updating, and nothing said why. That is not a fail-safe; a card that has quietly
     # stopped telling the truth is worse than one that admits it is behind.
+    #
+    # $State is not always the whole story, though, which is why the carry-forward above
+    # exists: it is read from a file at startup, and a daemon that starts without one -
+    # lost, corrupt, first run after an upgrade that moved it - begins with nothing. A
+    # live session it then cannot attribute is in neither $State nor $live, so publishing
+    # these descriptors alone would describe this machine as not running it and take its
+    # card off the shared dashboard while it is still working. Publication under
+    # uncertainty therefore only ever adds.
     #
     # Absence-based work stays held, and is held one decision at a time rather than by
     # this flag: retirement goes through Test-DaemonRetirementObservation per session,
@@ -1001,6 +1012,94 @@ function Get-DaemonSessionDescriptors {
             Kind = 'mcp'
         }
     }
+}
+
+function Add-DaemonUnaccountedDescriptors {
+    <#
+        The descriptors for this pass, plus any session this machine's own retained
+        inventory still lists that they do not mention.
+
+        Only for a pass whose local process view is incomplete. The descriptors are
+        built from $State, and $State is read from a file at startup - so a daemon that
+        starts without a usable one knows about no sessions at all. If discovery then
+        cannot attribute some live process, that session is in neither $State nor
+        $Live, and publishing the descriptors as they stand would announce this machine
+        as not running it: its card would come off the shared dashboard, and its entities
+        would sit there rendering nothing, while it was still working. "I cannot see it"
+        is not "it is gone", and the shared view must not be made to say the second.
+
+        The previous inventory is the right place to recover it from. It is this
+        machine's own last accepted statement about itself, published by
+        Publish-DaemonGlobalStatus and retained by Home Assistant across a daemon
+        restart, and it already carries exactly the four fields a descriptor needs.
+
+        Anything proven gone this pass is excluded. Retirement still runs during an
+        incomplete pass, one session at a time through Test-DaemonRetirementObservation,
+        and Complete-DaemonSessionRetirement will only remove a session's entities once
+        the dashboard has stopped rendering its node - so carrying a retired node
+        forward here would keep it on the dashboard and stall its removal for good.
+
+        Nothing is carried forward when discovery is complete: a session absent from a
+        complete view is absent, and that is the path that lets a card ever disappear.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Descriptors,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Gone,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $carried = @($Descriptors)
+    try { $states = Get-DaemonHomeAssistantStates -Headers $Headers }
+    catch {
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        # Without the retained inventory there is nothing to compare against, so the
+        # descriptors stand as they are rather than this becoming a second reason not
+        # to publish at all.
+        Write-DaemonLog -Message "retained inventory unreadable while session ownership is incomplete: $($_.Exception.Message)"
+        return $carried
+    }
+
+    $known = [System.Collections.Generic.HashSet[string]]::new(
+        [string[]]@($carried | ForEach-Object { [string]$_.Node }), [StringComparer]::OrdinalIgnoreCase)
+    foreach ($node in @($Gone | ForEach-Object { Get-CopilotMqttNodeId -SessionId $_ })) {
+        [void]$known.Add([string]$node)
+    }
+
+    $recovered = @()
+    # Read by name rather than by property. These come back from Home Assistant as
+    # whatever was retained, including by a bridge old enough to predate a field, and a
+    # missing one is a PropertyNotFoundException under Set-StrictMode -Version Latest
+    # rather than an empty string.
+    $field = {
+        param($Source, $Name)
+        if ($null -eq $Source.PSObject.Properties[$Name]) { return '' }
+        [string]$Source.PSObject.Properties[$Name].Value
+    }
+    foreach ($machine in @(Get-BridgePeerMachine -States $states)) {
+        if (-not $machine.IsSelf) { continue }
+        foreach ($session in @($machine.Sessions)) {
+            if ($null -eq $session) { continue }
+            $node = & $field $session 'node'
+            if ([string]::IsNullOrWhiteSpace($node)) { continue }
+            if (-not $known.Add($node)) { continue }
+            $name = & $field $session 'name'
+            $owner = & $field $session 'machine'
+            $kind = & $field $session 'kind'
+            $recovered += [pscustomobject]@{
+                Node = $node
+                Name = $name
+                Machine = $(if ($owner) { $owner } else { [string]$machine.Machine })
+                Kind = $(if ($kind) { $kind } else { 'copilot' })
+            }
+        }
+    }
+
+    if ($recovered.Count -gt 0) {
+        Write-DaemonLog -Message ("retained $($recovered.Count) unaccounted session(s) in the shared view " +
+            "while session ownership is incomplete: " + (@($recovered | ForEach-Object { $_.Node }) -join ', '))
+        $carried += $recovered
+    }
+    $carried
 }
 
 function Get-DaemonLaunchCapabilities {
