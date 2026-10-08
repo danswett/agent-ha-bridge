@@ -187,10 +187,23 @@ function Sync-DaemonUpdateStatus {
     $notes = if ($status.State -in @('Unavailable', 'NotFound', 'RateLimited')) { $status.Detail } else { $status.Notes }
 
     try {
-        $signature = @($status.State, $status.Installed, $latest, $status.Url, $notes) | ConvertTo-Json -Compress
+        # Read every pass, because the stage changes while nothing else about the
+        # update does - and because the daemon restarting mid-update is one of the
+        # stages, so this may be the first pass of a daemon that has never seen the
+        # attempt start.
+        $progress = $null
+        try {
+            $progress = Read-BridgeUpdateStage -Path $script:BridgeUpdateConfig.ProgressFile `
+                -AttemptId ([string]$script:DaemonUpdatePendingAttempt)
+        }
+        catch { $progress = $null }
+        $stage = if ($progress) { [string]$progress.Stage } else { '' }
+        $proportion = if ($progress) { $progress.Proportion } else { $null }
+        $signature = @($status.State, $status.Installed, $latest, $status.Url, $notes, $stage, $proportion) | ConvertTo-Json -Compress
         if (-not $outcomeHandled -and ($signature -cne $script:DaemonUpdateSignature -or -not $script:DaemonUpdatePublished)) {
             Publish-CopilotMqttUpdate -InstalledVersion $status.Installed -LatestVersion $latest `
-                -ReleaseUrl $status.Url -ReleaseNotes $notes -InProgress:([bool]$script:DaemonUpdatePendingAttempt) -Headers $Headers
+                -ReleaseUrl $status.Url -ReleaseNotes $notes -InProgress:([bool]$script:DaemonUpdatePendingAttempt) `
+                -Stage $stage -Proportion $proportion -Headers $Headers
             [void](Set-CopilotMqttUpdateEntityIds)
             $script:DaemonUpdateSignature = $signature
             $script:DaemonUpdatePublished = $true

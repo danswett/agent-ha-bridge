@@ -30,6 +30,7 @@ $script:BridgeUpdateStages = @('checking', 'downloading', 'installing', 'restart
 
 $script:BridgeUpdateConfig = @{
     CacheFile     = Get-BridgeRuntimePath 'agent-bridge-update.json'
+    ProgressFile  = Get-BridgeRuntimePath 'agent-bridge-update-progress.json'
     # How often to check GitHub for a new release. Four times a day catches a release
     # within a few hours and still barely touches the unauthenticated GitHub rate
     # limit (60/hour/IP). Tunable with updates.checkHours in the config.

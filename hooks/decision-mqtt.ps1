@@ -597,6 +597,12 @@ function Publish-CopilotMqttUpdate {
         [string]$ReleaseUrl = '',
         [string]$ReleaseNotes = '',
         [switch]$InProgress,
+        # Where the update has actually got to, from the updater itself. A spinner says
+        # only that something is happening; on a slow or failing update that is exactly
+        # when people press again or go to a shell, and tonight both made things worse
+        # (#129). Empty when no attempt is running.
+        [string]$Stage = '',
+        [AllowNull()][object]$Proportion = $null,
         [string]$Slug,
         [Parameter(Mandatory)][hashtable]$Headers
     )
@@ -635,6 +641,12 @@ function Publish-CopilotMqttUpdate {
         # clears it the moment a later publish reports false, rather than inferring
         # the flag from an absent key.
         in_progress       = [bool]$InProgress
+        # Named rather than inferred from in_progress, so a card can say "installing"
+        # instead of "working". Empty string rather than omitted: an omitted key is
+        # retained from the previous publish, which would leave a finished update
+        # showing the stage it was at when it finished.
+        stage             = [string]$Stage
+        stage_proportion  = $(if ($null -eq $Proportion) { '' } else { [double]$Proportion })
     }
     # Stock MQTT update rejects JSON null versions and retains an omitted version.
     # Availability therefore carries "not established", without inventing a version
