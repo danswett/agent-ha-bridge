@@ -252,7 +252,7 @@ function Get-BridgeLatestRelease {
         }
     }
 
-    $lookup = [pscustomobject]@{ State = 'Unavailable'; Release = $null; Detail = 'The latest release could not be established.' }
+    $lookup = [pscustomobject]@{ State = 'Unavailable'; Release = $null; Detail = 'The latest release could not be established.'; RetryAt = $null }
     if (-not $Force -and $null -ne $cache -and $cache.PSObject.Properties['CheckedAt']) {
         $checkedAt = $null
         try { $checkedAt = ConvertTo-BridgeUpdateTime $cache.CheckedAt }
@@ -271,7 +271,26 @@ function Get-BridgeLatestRelease {
                 $lookup.Detail = 'GitHub returned 404 for the latest-release endpoint; repository existence and access are not confirmed.'
             }
             # An old null cache without Reached is unknown, not evidence of a 404.
-            $window = if ($lookup.State -eq 'Unavailable') {
+            elseif ($cache.PSObject.Properties['State'] -and $cache.State -eq 'RateLimited') {
+                # Only while the limit it describes has not yet reset: past that the
+                # detail names a time that has been and gone, and saying "wait until
+                # 09:15" at 09:40 is its own kind of wrong. Expired, it stays
+                # Unavailable, which takes the shorter retry window and checks again.
+                $retryAt = $null
+                if ($cache.PSObject.Properties['RetryAt'] -and $cache.RetryAt) {
+                    try { $retryAt = ConvertTo-BridgeUpdateTime $cache.RetryAt } catch [FormatException] { $retryAt = $null }
+                }
+                if ($null -eq $retryAt -or $retryAt -gt [DateTimeOffset]::Now) {
+                    $lookup.State = 'RateLimited'
+                    $lookup.RetryAt = $cache.RetryAt
+                    if ($cache.PSObject.Properties['Detail'] -and $cache.Detail) { $lookup.Detail = [string]$cache.Detail }
+                }
+            }
+            # Rate limiting takes the short retry window too. It is a queue to wait in,
+            # not a settled answer, and a refused request costs a negligible part of an
+            # already-spent allowance - so the machine recovers on its own within
+            # minutes of the limit clearing rather than carrying the verdict for hours.
+            $window = if ($lookup.State -in @('Unavailable', 'RateLimited')) {
                 [Math]::Min($CheckHours, $script:BridgeUpdateConfig.RetryMinutes / 60)
             } else { $CheckHours }
             $age = ([DateTimeOffset]::Now - $checkedAt).TotalHours
@@ -327,6 +346,7 @@ function Get-BridgeLatestRelease {
             # all - and the bare 403 that used to be reported read as the release being
             # broken rather than as a queue to wait in (#109, #92).
             $lookup.State = 'RateLimited'
+            $lookup.RetryAt = if ($rateLimit.RetryAt) { $rateLimit.RetryAt.ToString('o') } else { $null }
             $lookup.Detail = "GitHub is rate limiting this machine's release checks$($rateLimit.Suffix). " +
                 'The install is fine; the check will work again once the limit resets. ' +
                 'Setting updates.token raises the limit.'
@@ -337,9 +357,19 @@ function Get-BridgeLatestRelease {
     # A 404 is authoritative - GitHub answered - so it is allowed to clear what was
     # known. Anything else never reached GitHub, and Reached=false already stops the
     # cached release being served as a current finding on the next pass.
+    #
+    # The rate-limit verdict is kept with it. Reached=false alone loses why the check
+    # failed, and the daemon re-reads this cache about every fifteen seconds: the one
+    # pass that saw the 403 would report the queue to wait in, and every pass after it
+    # would say only "could not be established" - which is the reading of a refusal as
+    # a broken install that #109 and #92 were about. Its reset time comes too, so a
+    # verdict is only reinstated while it is still true.
     [pscustomobject]@{
         CheckedAt = [DateTimeOffset]::Now.ToString('o')
         Reached   = ($lookup.State -in @('Found', 'NotFound'))
+        State     = $lookup.State
+        Detail    = $lookup.Detail
+        RetryAt   = $lookup.RetryAt
         Release   = $lookup.Release
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
 

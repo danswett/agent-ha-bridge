@@ -253,6 +253,38 @@ try {
         ((Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json).Reached) -eq $false
     }
 
+    # The daemon re-reads this cache roughly every fifteen seconds, and an unreached
+    # lookup used to be rebuilt as a generic 'Unavailable'. So the single pass that saw
+    # the 403 reported the queue to wait in, and every pass after it said only that the
+    # release could not be established - which is exactly the refusal-reads-as-breakage
+    # failure this change exists to stop. Found by review on #137.
+    $cachedLimited = Get-BridgeUpdateStatus
+    Test-That 'the rate-limit verdict survives the next pass instead of decaying to a bare failure' {
+        $cachedLimited.State -eq 'RateLimited' -and $cachedLimited.Detail -match 'install is fine'
+    } "$($cachedLimited.State): $($cachedLimited.Detail)"
+
+    Test-That 'and still names the reset time it was told, rather than losing it' {
+        $cachedLimited.Detail -match $resetAt.ToString('HH:mm')
+    } $cachedLimited.Detail
+
+    # A verdict is only worth reinstating while it is still true: past the reset it
+    # names a time that has been and gone, so it must not be served as current.
+    $expired = Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json
+    $expired.RetryAt = [DateTimeOffset]::Now.AddMinutes(-5).ToString('o')
+    $expired.CheckedAt = [DateTimeOffset]::Now.ToString('o')
+    $expired | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
+    function Invoke-RestMethod { throw 'network is still down' }
+    $afterReset = Get-BridgeUpdateStatus
+    Test-That 'but a verdict whose reset has passed is not reinstated' {
+        $afterReset.State -ne 'RateLimited'
+    } "$($afterReset.State): $($afterReset.Detail)"
+
+    $resetAt = [DateTimeOffset]::Now.AddMinutes(37)
+    function Invoke-RestMethod {
+        $response = New-RateLimitedResponse -Code 403 -Remaining '0' -Reset ([string]$resetAt.ToUnixTimeSeconds())
+        throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('rate limit exceeded', $response)
+    }
+
     # 429 for a secondary limit carries Retry-After and no remaining count.
     function Invoke-RestMethod {
         $response = New-RateLimitedResponse -Code 429 -Remaining '' -RetryAfter '120'
