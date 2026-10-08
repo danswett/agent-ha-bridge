@@ -580,8 +580,15 @@ function Sync-DaemonSessions {
     }
 
     $descriptors = @(Get-DaemonSessionDescriptors -State $State -Headers $Headers)
+    $publish = $true
     if (-not $Discovery.Complete) {
-        $descriptors = @(Add-DaemonUnaccountedDescriptors -Descriptors $descriptors -Gone $goneSessions -Headers $Headers)
+        $carry = Add-DaemonUnaccountedDescriptors -Descriptors $descriptors -Gone $goneSessions -Headers $Headers
+        $descriptors = @($carry.Descriptors)
+        # The one case where publishing is worse than not. If the retained inventory
+        # could not be read, it is unknown rather than empty - and writing over it
+        # would destroy the only record of whatever this pass cannot account for,
+        # leaving the next pass nothing to recover from either.
+        $publish = [bool]$carry.Readable
     }
     # Presence-based, so it runs whether or not the local process view is complete.
     #
@@ -607,8 +614,10 @@ function Sync-DaemonSessions {
     # the orphan sweep refuses an incomplete snapshot outright, and the two below keep
     # their own gates.
     $capabilities = Get-DaemonLaunchCapabilities
-    Publish-DaemonGlobalStatus -Descriptors $descriptors -Capabilities $capabilities `
-        -Resumable @($script:DaemonResumeOffered) -Headers $Headers
+    if ($publish) {
+        Publish-DaemonGlobalStatus -Descriptors $descriptors -Capabilities $capabilities `
+            -Resumable @($script:DaemonResumeOffered) -Headers $Headers
+    }
     if ($Discovery.Complete) {
         # $live, not $State.Keys: a session whose adoption returned $null is running but
         # absent from state, and bundling one mid-sentence is exactly what this guards.
@@ -637,7 +646,7 @@ function Sync-DaemonSessions {
             Write-DaemonLog -Message "pairing check failed: $($_.Exception.Message)"
         }
     }
-    $dashboardCurrent = Sync-DaemonDashboard -Descriptors $descriptors -Capabilities $capabilities -Headers $Headers
+    $dashboardCurrent = Sync-DaemonDashboard -Descriptors $descriptors -Capabilities $capabilities -Headers $Headers -ObserveOnly:(-not $publish)
     Complete-DaemonSessionRetirement -Gone $goneSessions -DashboardCurrent $dashboardCurrent -Headers $Headers -Discovery $Discovery
     Update-DaemonOwnerCatalogue -Snapshot $Discovery -State $State
 }
@@ -1041,6 +1050,18 @@ function Add-DaemonUnaccountedDescriptors {
 
         Nothing is carried forward when discovery is complete: a session absent from a
         complete view is absent, and that is the path that lets a card ever disappear.
+
+        MCP clients are excluded. They are deliberately outside $State and outside
+        Get-LiveBridgeSessions - the MCP server owns those entities and withdraws them
+        itself - so they are rediscovered first-hand on every pass by
+        Get-LiveMcpSessions and never pass through $Gone. Their presence is therefore
+        already authoritative and has nothing to do with local process discovery:
+        carrying one forward would keep rendering a card whose entities the MCP server
+        had already withdrawn, for as long as some unrelated uncertainty lasted.
+
+        Readable says whether the retained inventory could actually be read. An
+        unreadable one is not an empty one, and the caller must not publish over the
+        very thing it would need to recover from next pass.
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Descriptors,
@@ -1052,11 +1073,13 @@ function Add-DaemonUnaccountedDescriptors {
     try { $states = Get-DaemonHomeAssistantStates -Headers $Headers }
     catch {
         if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
-        # Without the retained inventory there is nothing to compare against, so the
-        # descriptors stand as they are rather than this becoming a second reason not
-        # to publish at all.
+        # An unreadable inventory is not an empty one. Publishing over it here would
+        # destroy the only record of the sessions this pass cannot account for - and
+        # the next pass, having nothing left to read, would find nothing to recover.
+        # So the caller is told the source could not be read and holds publication,
+        # which is the old behaviour in exactly the case that needs it.
         Write-DaemonLog -Message "retained inventory unreadable while session ownership is incomplete: $($_.Exception.Message)"
-        return $carried
+        return [pscustomobject]@{ Descriptors = $carried; Readable = $false }
     }
 
     $known = [System.Collections.Generic.HashSet[string]]::new(
@@ -1085,6 +1108,7 @@ function Add-DaemonUnaccountedDescriptors {
             $name = & $field $session 'name'
             $owner = & $field $session 'machine'
             $kind = & $field $session 'kind'
+            if ($kind -ceq 'mcp') { continue }
             $recovered += [pscustomobject]@{
                 Node = $node
                 Name = $name
@@ -1099,7 +1123,7 @@ function Add-DaemonUnaccountedDescriptors {
             "while session ownership is incomplete: " + (@($recovered | ForEach-Object { $_.Node }) -join ', '))
         $carried += $recovered
     }
-    $carried
+    [pscustomobject]@{ Descriptors = $carried; Readable = $true }
 }
 
 function Get-DaemonLaunchCapabilities {

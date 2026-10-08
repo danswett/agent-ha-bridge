@@ -19,6 +19,10 @@ $script:A14Topics = @{}
 $script:A14AllowedTopics = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 $script:A14LegacyResultTopic = 'homeassistant/sensor/copilot_cli_bridge/new_session_result/config'
 $script:A14States = @{}
+# Makes the shared state read fail the way Home Assistant can, rather than replacing
+# a helper with one that throws: the point of the case it covers is that an
+# unreadable inventory must not be published over as though it were an empty one.
+$script:A14StatesFail = $false
 $script:A14FieldSlots = @{}
 $script:A14InputSelectStore = @()
 $script:A14Processes = @()
@@ -30,7 +34,7 @@ $script:A14PsCalls = 0
 $script:A14Guard = $null
 $script:A14ActualWindows = $script:BridgeIsWindows
 $expectedGroups = 26
-$expectedChecks = 121
+$expectedChecks = 124
 $primaryFailure = $null
 
 function Test-A14 {
@@ -256,6 +260,14 @@ function Invoke-CopilotHaWebSocket {
 
 function Invoke-RestMethod {
     param($Method, $Uri, $Headers, $ContentType, $Body, $TimeoutSec)
+    # Raised before the boundary wrapper below, so it reaches the caller as an ordinary
+    # transport failure rather than being recorded as a rejected boundary. Scoped to the
+    # shared state reads, which is all the case under test needs to go unreadable.
+    if ($script:A14StatesFail -and $Uri -is [string] -and $Uri -in @(
+            'http://publication.invalid:8123/api/states',
+            'http://publication.invalid:8123/api/template')) {
+        throw [IO.IOException]::new('Synthetic Home Assistant state read failure')
+    }
     $shape = [ordered]@{ Boundary = 'REST' }
     try {
         $shape = Get-A14RequestShape -Boundary REST -Method $Method -Uri $Uri -ContentType $ContentType -Body $Body
@@ -1005,6 +1017,47 @@ try {
             Test-A14 'and once it can be placed again it is adopted rather than duplicated' (
                 $complete.Complete -and $complete.Live.ContainsKey($script:A14Ids.A) -and
                 @($script:BridgeDashboardObservation.ReferencedNodes | Where-Object { $_ -ceq $nodeA }).Count -eq 1)
+            # An MCP client is discovered first-hand every pass and withdrawn by the MCP
+            # server itself, so it never passes through $Gone and local process
+            # uncertainty says nothing about it. Carried forward, a client that had
+            # disconnected would keep its card on the dashboard - pointing at entities
+            # its own server had already removed - for as long as the uncertainty lasted.
+            $script:A14States[$machineEntity].attributes.sessions = @([pscustomobject]@{
+                name = 'a client that left'; machine = $script:DaemonMachineName
+                node = 'mcpgone'; kind = 'mcp' })
+            $script:DaemonStatesCache = $null
+            Write-A14Json -Path (Get-A14RegistrationPath A) -Value @{}
+            $script:DaemonOwnerCatalogue = @{}
+            $uncertain = Invoke-A14Reconcile
+            Test-A14 'a disconnected MCP client is not carried forward by local uncertainty' (
+                -not $uncertain.Complete -and $script:DaemonGlobalSignature -cnotlike '*mcpgone*')
+            # And the inventory being unreadable is not the same as its being empty.
+            # Publishing over it here would destroy the only record of whatever this
+            # pass cannot account for, leaving the next pass nothing to recover from -
+            # so this is the one case that still holds publication. Sync-DaemonSessions
+            # is called directly because a reconcile would fail its own snapshot read
+            # first, which is a different failure from the one under test.
+            $script:A14States[$machineEntity].attributes.sessions = @([pscustomobject]@{
+                name = 'session A'; machine = $script:DaemonMachineName; node = $nodeA; kind = 'codex' })
+            $script:DaemonStatesCache = $null
+            $held = Get-LiveBridgeSessions -AsObservation -State $script:A14State
+            $script:A14StatesFail = $true
+            try {
+                $carry = Add-DaemonUnaccountedDescriptors -Descriptors @() -Gone @() -Headers @{}
+                Test-A14 'an unreadable retained inventory reports as unreadable rather than as empty' (
+                    -not $carry.Readable)
+                # Deliberately stale: any attempt to publish replaces this, so finding
+                # it afterwards is evidence the write was held rather than merely found
+                # unnecessary. Without it the check passes either way, because the
+                # descriptors have not changed since the last publish.
+                $script:DaemonGlobalSignature = 'stale-on-purpose'
+                $script:TestPublication.Commands.Clear()
+                Sync-DaemonSessions -Headers @{} -State $script:A14State -Live $held.Live -Discovery $held
+            }
+            finally { $script:A14StatesFail = $false; $script:DaemonStatesCache = $null }
+            Test-A14 'and publication is held rather than overwriting what it could not read' (
+                -not $held.Complete -and $script:DaemonGlobalSignature -ceq 'stale-on-purpose' -and
+                @(Get-TestPublicationWrites).Count -eq 0)
         }
         finally {
             $script:A14States[$machineEntity].attributes.sessions = $retained
