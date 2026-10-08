@@ -318,6 +318,23 @@ function Show-Status {
         }
     }
 
+    # The thing the bridge is for. Everything above reports whether a part is switched
+    # on, and all of it can be green on a machine where no session has registered for
+    # a day - which is exactly what happened, and what "but status says it is online"
+    # was then believed against for hours (#127).
+    if ($commandContext -and (Get-Command Get-BridgeRegistrationHealth -ErrorAction SilentlyContinue)) {
+        $registration = $null
+        try { $registration = Get-BridgeRegistrationHealth -Context $commandContext }
+        catch { Write-Host "    sessions   : could not be checked - $($_.Exception.Message)" -ForegroundColor Yellow }
+        if ($registration -and $registration.Ok) {
+            Write-Host "    sessions   : registering normally - $($registration.Detail)" -ForegroundColor Green
+        }
+        elseif ($registration) {
+            Write-Host "    sessions   : NOT registering - $($registration.Detail)" -ForegroundColor Red
+            if ($daemonLog) { Write-Host "                 see $daemonLog" -ForegroundColor Yellow }
+        }
+    }
+
     Show-BridgeMachines -HooksDir (Join-Path $bridgeHome 'hooks') -ConfigPath $configPath
 }
 
