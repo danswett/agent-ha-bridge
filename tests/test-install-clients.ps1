@@ -686,8 +686,8 @@ $allGood = Get-BridgeInstallHealth -Clients @('copilot', 'claude') -OnWindows $t
 Test-That 'every check passes when everything is in place' {
     @($allGood | Where-Object { -not $_.Ok }).Count -eq 0
 } (($allGood | Where-Object { -not $_.Ok } | ForEach-Object { $_.Name }) -join ', ')
-Test-That 'the daemon, Home Assistant, both clients and the command are all checked' {
-    @($allGood).Count -eq 5
+Test-That 'the daemon, Home Assistant, both clients, the command and registration are all checked' {
+    @($allGood).Count -eq 6
 } "$(@($allGood).Count)"
 Test-That 'the connected version is shown, not just a tick' {
     @($allGood | Where-Object { $_.Detail -eq '2026.9.4' }).Count -eq 1
@@ -701,8 +701,9 @@ Test-That 'and one on macOS' {
 Test-That 'mcp is not probed as a command, because it is not one' {
     $withMcp = Get-BridgeInstallHealth -Clients @('mcp') -OnWindows $true -DaemonProbe { $true } -CommandProbe { $true } `
         -ClientProbe { param($n) throw "mcp must not be run as a command" } `
+        -RegistrationProbe { [pscustomobject]@{ Ok = $true; Examined = 0; Detail = '' } } `
         -ConnectionProbe { [pscustomobject]@{ Ok = $true; Version = 'x'; Error = '' } }
-    @($withMcp).Count -eq 3
+    @($withMcp).Count -eq 4
 }
 
 $halfBroken = Get-BridgeInstallHealth -Clients @('claude') -OnWindows $true `
@@ -1617,6 +1618,125 @@ Test-That 'and a Codex that never carried one reports nothing to do' {
 } $absent
 
 Remove-Item -LiteralPath $codexRoot -Recurse -Force -ErrorAction SilentlyContinue
+
+# Whether status tells the truth about registration. A MacBook reported every check
+# green for a day while nothing could register, because nothing here looked at the
+# thing the bridge exists to do (#127).
+Write-Host ''
+Write-Host '--- Get-BridgeRegistrationHealth ---'
+
+function New-DaemonLogLine {
+    param([string]$Message, [int]$AgeMinutes = 5)
+    "$([DateTimeOffset]::Now.AddMinutes(-$AgeMinutes).ToString('o')) $Message"
+}
+
+Test-That 'a machine with no daemon log yet claims nothing either way' {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe { @() }
+    $health.Ok -and $health.Detail -match 'no daemon log'
+}
+
+Test-That 'an ordinary log is reported as nothing wrong' {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+        @((New-DaemonLogLine 'published machine status'), (New-DaemonLogLine 'session abc registered'))
+    }
+    $health.Ok -and $health.Detail -match 'nothing wrong'
+}
+
+# The line the user's Mac was printing every time a launch was tried, while status
+# went on saying everything was fine.
+Test-That 'a session that died before registering is reported' {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+        @(New-DaemonLogLine 'launched Codex (pid 31857) exited before registering')
+    }
+    (-not $health.Ok) -and $health.Detail -match 'died before it could register'
+}
+
+Test-That 'and says how long ago it happened' {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+        @(New-DaemonLogLine 'launched Codex (pid 31857) exited before registering' -AgeMinutes 12)
+    }
+    $health.Detail -match 'last 1[12] min ago'
+}
+
+Test-That 'launches being refused for incomplete discovery is reported' {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+        @(New-DaemonLogLine 'Session discovery is incomplete; launch is temporarily held.')
+    }
+    (-not $health.Ok) -and $health.Detail -match 'launches are being refused'
+}
+
+Test-That 'discovery held on a process it cannot account for is reported' {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+        @(New-DaemonLogLine 'holding for codex process 4412 (node): it has no readable start time')
+    }
+    (-not $health.Ok) -and $health.Detail -match 'cannot account for'
+}
+
+Test-That 'several different faults are all named, not just the first' {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+        @((New-DaemonLogLine 'launched Codex (pid 1) exited before registering'),
+          (New-DaemonLogLine 'session discovery uncertain (codex/AdapterReadFailed); absence-based work is held'))
+    }
+    $health.Detail -match 'died before it could register' -and $health.Detail -match 'uncertain'
+}
+
+Test-That 'a fault repeating is counted rather than listed twice' {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+        @((New-DaemonLogLine 'launched Codex (pid 1) exited before registering'),
+          (New-DaemonLogLine 'launched Codex (pid 2) exited before registering'),
+          (New-DaemonLogLine 'launched Codex (pid 3) exited before registering'))
+    }
+    $health.Detail -match 'x3'
+}
+
+# A fault that was fixed yesterday must not keep the verdict red today, or the check
+# becomes something to be ignored - which is where the old one ended up.
+Test-That 'a fault older than the window is not held against the machine' {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+        @(New-DaemonLogLine 'launched Codex (pid 1) exited before registering' -AgeMinutes (60 * 48))
+    }
+    $health.Ok
+}
+
+Test-That 'a line that is not the daemon''s is left alone rather than guessed at' {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+        @('something else wrote this: exited before registering')
+    }
+    $health.Ok
+}
+
+Test-That 'the verdict refuses to say All good while a session cannot register' {
+    $checks = Get-BridgeInstallHealth -Clients @() `
+        -DaemonProbe { $true } -CommandProbe { $true } -TmuxProbe { $true } `
+        -ConnectionProbe { [pscustomobject]@{ Ok = $true; Version = '2025.1'; Error = '' } } `
+        -RegistrationProbe { [pscustomobject]@{ Ok = $false; Examined = 10; Detail = 'a launched session died before it could register' } } `
+        -OnWindows $true
+    $registration = @($checks | Where-Object { $_.Name -eq 'Sessions can register' })
+    $registration.Count -eq 1 -and -not $registration[0].Ok -and
+        -not (Show-BridgeInstallVerdict -Checks $checks)
+}
+
+Test-That 'and still says All good when registration is working' {
+    $checks = Get-BridgeInstallHealth -Clients @() `
+        -DaemonProbe { $true } -CommandProbe { $true } -TmuxProbe { $true } `
+        -ConnectionProbe { [pscustomobject]@{ Ok = $true; Version = '2025.1'; Error = '' } } `
+        -RegistrationProbe { [pscustomobject]@{ Ok = $true; Examined = 10; Detail = 'nothing wrong' } } `
+        -OnWindows $true
+    Show-BridgeInstallVerdict -Checks $checks
+}
+
+# A probe nothing calls is worth nothing, and `agent-ha-bridge status` is the command
+# the report was about - it does not go anywhere near the install verdict. Asserted
+# against the source because Show-Status lives in the CLI entry point rather than a
+# library the offline runner can load.
+Test-That 'the status command itself asks whether sessions can register' {
+    $cli = Get-Content (Join-Path $PSScriptRoot '..\bin\agent-ha-bridge.ps1') -Raw
+    $start = $cli.IndexOf('function Show-Status')
+    if ($start -lt 0) { return $false }
+    $next = $cli.IndexOf("`nfunction ", $start + 10)
+    $body = if ($next -gt 0) { $cli.Substring($start, $next - $start) } else { $cli.Substring($start) }
+    $body -match 'Get-BridgeRegistrationHealth'
+}
 
 Write-Host ''
 if ($script:Failures) {

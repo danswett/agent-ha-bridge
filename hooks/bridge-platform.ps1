@@ -1355,3 +1355,99 @@ function Send-BridgeTmuxChoice {
     if (-not (Send-BridgeTmuxKeys -Pane $pane -Keys @('Enter'))) { return 'submit-failed' }
     'ok:choice'
 }
+
+function Get-BridgeRegistrationHealth {
+    <#
+        Whether sessions can actually register - the thing the bridge exists to do,
+        and the one thing the closing verdict never looked at.
+
+        On a MacBook where no session had registered for a day, every check here was
+        green: the daemon was running and publishing, Home Assistant was answering,
+        `codex` ran from the shell, the version was current. All of it was true. What
+        was broken was registration - launched sessions died before their hook could
+        record anything - so the dashboard showed nothing while status kept saying
+        "All good", and the machine was debugged for hours against that reassurance
+        (#127).
+
+        The evidence was in the daemon's own log the whole time. These four lines are
+        only ever written when something has genuinely gone wrong, which is what makes
+        them safe to report: there is no healthy machine that produces them, so this
+        cannot cry wolf. That matters more than catching every possible fault - a
+        check that fires on a working machine gets ignored, and then it is worth less
+        than nothing.
+
+        Counting live agent processes instead was the obvious alternative and is a
+        trap. Get-BridgeAgentProcesses deliberately includes node and bun, because an
+        agent CLI is often a script run under one; on any Mac doing other work that
+        reads as several unregistered sessions, every time.
+    #>
+    param(
+        [Parameter(Mandatory)]$Context,
+
+        # Long enough to cover the session that was being debugged, short enough that
+        # a fault fixed yesterday does not keep the verdict red today.
+        [int]$WithinHours = 6,
+
+        [int]$TailLines = 800,
+        [scriptblock]$LogProbe
+    )
+
+    if (-not $LogProbe) {
+        $LogProbe = {
+            $path = Join-Path (Get-BridgeRuntimeRoot -Context $Context) 'agent-bridge-daemon.log'
+            if (-not [System.IO.File]::Exists($path)) { return @() }
+            @(Get-Content -LiteralPath $path -Tail $TailLines -ErrorAction SilentlyContinue)
+        }
+    }
+
+    $symptoms = @(
+        @{ Match = 'exited before registering'; Says = 'a launched session died before it could register' }
+        @{ Match = 'Session discovery is incomplete'; Says = 'launches are being refused: session discovery is incomplete' }
+        @{ Match = 'session discovery uncertain'; Says = 'session discovery is uncertain, so retirement and cleanup are held' }
+        @{ Match = 'holding for '; Says = 'session discovery is held by a process it cannot account for' }
+    )
+
+    $lines = @()
+    try { $lines = @(& $LogProbe) } catch { $lines = @() }
+
+    $cutoff = [DateTimeOffset]::Now.AddHours(-$WithinHours)
+    $found = [ordered]@{}
+    $latest = $null
+    foreach ($line in $lines) {
+        if ([string]::IsNullOrWhiteSpace($line)) { continue }
+        # Every line is written as "<round-trip timestamp> <message>". One that does
+        # not parse is from something else writing to the file, and is left alone
+        # rather than guessed at.
+        $space = $line.IndexOf(' ')
+        if ($space -lt 1) { continue }
+        $when = [DateTimeOffset]::MinValue
+        if (-not [DateTimeOffset]::TryParse($line.Substring(0, $space), [ref]$when)) { continue }
+        if ($when -lt $cutoff) { continue }
+        foreach ($symptom in $symptoms) {
+            if ($line.IndexOf($symptom.Match, [StringComparison]::OrdinalIgnoreCase) -lt 0) { continue }
+            $says = [string]$symptom.Says
+            if (-not $found.Contains($says)) { $found[$says] = 0 }
+            $found[$says] = [int]$found[$says] + 1
+            if ($null -eq $latest -or $when -gt $latest) { $latest = $when }
+        }
+    }
+
+    $detail = ''
+    if ($found.Count -gt 0) {
+        $parts = foreach ($says in $found.Keys) {
+            $count = [int]$found[$says]
+            if ($count -gt 1) { "$says (x$count)" } else { $says }
+        }
+        $ago = [int]([DateTimeOffset]::Now - $latest).TotalMinutes
+        $detail = ($parts -join '; ') + " - last $ago min ago"
+    }
+    elseif ($lines.Count -eq 0) { $detail = 'no daemon log to read yet' }
+    else { $detail = "nothing wrong in the last $WithinHours hours of the daemon log" }
+
+    [pscustomobject]@{
+        Ok       = ($found.Count -eq 0)
+        Examined = $lines.Count
+        Detail   = $detail
+    }
+}
+

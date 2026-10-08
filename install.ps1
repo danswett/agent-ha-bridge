@@ -1137,6 +1137,7 @@ function Get-BridgeInstallHealth {
         [scriptblock]$CommandProbe,
         [scriptblock]$ConnectionProbe,
         [scriptblock]$TmuxProbe,
+        [scriptblock]$RegistrationProbe,
         [bool]$OnWindows = $script:BridgeIsWindows
     )
 
@@ -1145,6 +1146,7 @@ function Get-BridgeInstallHealth {
     if (-not $CommandProbe)    { $CommandProbe    = { [bool](Get-Command 'agent-ha-bridge' -ErrorAction SilentlyContinue) } }
     if (-not $ConnectionProbe) { $ConnectionProbe = { [pscustomobject]@{ Ok = $false; Version = ''; Error = 'not checked' } } }
     if (-not $TmuxProbe)       { $TmuxProbe       = { [bool](Get-BridgeTmuxPath) } }
+    if (-not $RegistrationProbe) { $RegistrationProbe = { Get-BridgeRegistrationHealth -Context $installContext } }
 
     $checks = [System.Collections.Generic.List[object]]::new()
 
@@ -1191,6 +1193,19 @@ function Get-BridgeInstallHealth {
         Detail = ''
         Fix    = 'open a new terminal - the PATH line only applies to new ones'
     })
+
+    # Last, because it is the only one that looks at what the bridge is for rather
+    # than at whether its parts are switched on. Everything above can pass on a
+    # machine where no session has registered for a day (#127).
+    $registration = & $RegistrationProbe
+    if ($registration) {
+        $checks.Add([pscustomobject]@{
+            Name   = 'Sessions can register'
+            Ok     = [bool]$registration.Ok
+            Detail = [string]$registration.Detail
+            Fix    = 'check the hook log, then run: agent-ha-bridge configure'
+        })
+    }
 
     @($checks)
 }
