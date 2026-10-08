@@ -1991,7 +1991,7 @@ async function checkAnswerConsumedStamp() {
   check('a question that goes without using our publish puts the words back',
     m.reply._els.textarea.value === 'and please restart it afterwards', m.reply._els.textarea.value);
   check('and says so, rather than leaving Sent standing over a loss',
-    /not sent/i.test(m.reply._els.status.textContent), m.reply._els.status.textContent);
+    /not used as the answer/i.test(m.reply._els.status.textContent), m.reply._els.status.textContent);
 
   // A different publish being consumed is not ours. Matching on "something was
   // consumed" rather than on the stamp would call every lost race a success.

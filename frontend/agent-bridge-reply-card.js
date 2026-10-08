@@ -416,9 +416,15 @@ class AgentBridgeReplyCard extends HTMLElement {
     // The question has gone and no publish of ours was named as its answer. Put the
     // words back: telling someone to send again is only honest if there is something
     // left to send.
+    //
+    // The claim is deliberately narrow. What was observed is that this publish was
+    // not used as the answer, which is certain. What became of it otherwise is not:
+    // the reply path stages a payload the question did not consume and delivers it
+    // once the question is gone, so "not sent" would be a stronger statement than
+    // this card is in a position to make.
     this._pendingAnswer = null;
     this.restoreFormText();
-    this._setStatus('Not sent - the question was answered elsewhere. Send again.', 'err');
+    this._setStatus('Not used as the answer - check the session, then send again.', 'err');
   }
 
   set hass(hass) {
