@@ -442,7 +442,12 @@ function New-DaemonDiscoverySnapshot {
 function Set-DaemonDiscoveryUncertain {
     param(
         [AllowNull()]$Snapshot = $null, [string]$Kind = '', [string]$Path = '',
-        [string]$SessionId = '', [string]$Code = 'RecordUnreadable', [int]$ProcessId = 0
+        [string]$SessionId = '', [string]$Code = 'RecordUnreadable', [int]$ProcessId = 0,
+
+        # Why, when the code alone does not say. AdapterReadFailed is the case this
+        # exists for: the reason is known at the point it is caught and was being
+        # thrown away there, so every message downstream could only repeat the code.
+        [AllowEmptyString()][string]$Reason = ''
     )
     if ($null -eq $Snapshot) {
         $current = Get-Variable -Name DaemonDiscoverySnapshot -Scope Script -ErrorAction SilentlyContinue
@@ -469,7 +474,7 @@ function Set-DaemonDiscoveryUncertain {
         [void]$Snapshot.Live.Remove($id)
     }
     if ($matches.Count -eq 0) { $Snapshot.UncertainKinds[$Kind] = $true }
-    $Snapshot.Diagnostics.Add([pscustomobject]@{ Kind = $Kind; Path = $Path; Code = $Code; KnownOwners = @($matches); ProcessId = $ProcessId })
+    $Snapshot.Diagnostics.Add([pscustomobject]@{ Kind = $Kind; Path = $Path; Code = $Code; KnownOwners = @($matches); ProcessId = $ProcessId; Reason = $Reason })
     # Named, because the only remedy an operator has is to deal with the process
     # responsible, and "session discovery uncertain (copilot/UnaccountedProcess)" does
     # not say which one. A Copilot started by hand in a terminal is the common case and
@@ -480,6 +485,11 @@ function Set-DaemonDiscoveryUncertain {
     # condition rather than an event, and one line at the moment it began would scroll
     # away long before anyone came looking for why nothing had retired.
     $what = if ($ProcessId -gt 0) { "$Kind/$Code pid $ProcessId" } else { "$Kind/$Code" }
+    # The reason belongs on this line too, not only on the one-per-daemon line where
+    # the adapter failure was first caught. That line is written once and scrolls
+    # away; this one repeats, so by the time anyone reads the log looking for why
+    # nothing retired, the code is all that is left and says nothing (#128).
+    if ($Reason) { $what += ": $Reason" }
     Write-DaemonLog -Message "session discovery uncertain ($what); absence-based work is held"
 }
 
@@ -504,9 +514,12 @@ function Get-DaemonDiscoveryHoldSummary {
         $code = [string]$diagnostic.Code
         $processId = 0
         if ($diagnostic.PSObject.Properties['ProcessId']) { $processId = [int]$diagnostic.ProcessId }
+        $reason = ''
+        if ($diagnostic.PSObject.Properties['Reason']) { $reason = [string]$diagnostic.Reason }
         $text = if ($code -eq 'UnaccountedProcess' -and $processId -gt 0) {
             "an unrecognised $kind process (pid $processId)"
         }
+        elseif ($reason) { "the $kind adapter could not be read: $reason" }
         elseif ($kind) { "$kind/$code" }
         else { $code }
         if (-not $seen.Contains($text)) { $seen.Add($text) }
@@ -639,7 +652,7 @@ function Get-DaemonSessionDiscovery {
                 $script:DaemonAdapterFailureReported[$reportKey] = $true
                 try { Write-DaemonLog -Message "adapter $kind could not be read: $reason" } catch { }
             }
-            $issues.Add([pscustomobject]@{ Kind = $kind; Path = ''; Code = 'AdapterReadFailed' })
+            $issues.Add([pscustomobject]@{ Kind = $kind; Path = ''; Code = 'AdapterReadFailed'; Reason = $reason })
         }
     }
     $snapshot = New-DaemonDiscoverySnapshot -Live $live -State $State -Complete
@@ -656,8 +669,10 @@ function Get-DaemonSessionDiscovery {
         $id = if ($issue.PSObject.Properties['SessionId']) { [string]$issue.SessionId } else { '' }
         $issuePid = 0
         if ($issue.PSObject.Properties['ProcessId']) { $issuePid = [int]$issue.ProcessId }
+        $issueReason = ''
+        if ($issue.PSObject.Properties['Reason']) { $issueReason = [string]$issue.Reason }
         Set-DaemonDiscoveryUncertain -Snapshot $snapshot -Kind $issue.Kind -Path $issue.Path -Code $issue.Code `
-            -SessionId $id -ProcessId $issuePid
+            -SessionId $id -ProcessId $issuePid -Reason $issueReason
     }
     foreach ($group in @($snapshot.OwnerCatalogue.Values | Where-Object Path | Group-Object Path -CaseSensitive:(-not $script:BridgeIsWindows))) {
         if ($group.Count -le 1) { continue }

@@ -207,6 +207,25 @@ Test-That 'the log says which adapter failed and why, not only that discovery is
     (Get-FixtureLogText) -match 'adapter copilot could not be read: Registration directory is unreadable\.'
 }
 
+# That line is written once per daemon, and the uncertainty it explains is reported
+# every pass. By the time anyone reads the log looking for why nothing has retired,
+# the explanation has scrolled away and only the code is left - which was still
+# costing an hour a year after the reason was first being captured (#128).
+Test-That 'the reason travels with the diagnostic, not only into a one-off log line' {
+    @($partial.Diagnostics | Where-Object {
+        $_.Code -eq 'AdapterReadFailed' -and $_.PSObject.Properties['Reason'] -and
+        [string]$_.Reason -eq 'Registration directory is unreadable.'
+    }).Count -eq 1
+}
+
+Test-That 'so the repeating uncertainty line carries it too' {
+    (Get-FixtureLogText) -match 'session discovery uncertain \(copilot/AdapterReadFailed: Registration directory is unreadable\.\)'
+}
+
+Test-That 'and what is holding work says it in words rather than a code' {
+    (Get-DaemonDiscoveryHoldSummary -Snapshot $partial) -match 'the copilot adapter could not be read: Registration directory is unreadable\.'
+} (Get-DaemonDiscoveryHoldSummary -Snapshot $partial)
+
 # ------------------------------------------------- the reason, reported once ----
 
 Write-Host ''
