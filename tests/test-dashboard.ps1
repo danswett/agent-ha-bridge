@@ -476,6 +476,45 @@ Test-That 'no status card is drawn for it' { $oldStatusJson -notmatch 'agent-bri
 Test-That 'so the summary is still there' { $oldStatusJson -match '## Agent sessions' }
 Test-That 'and so is the Machines card' { $oldStatusJson -match '### Machines' }
 
+# From card 1.30.0 the reply card watches the activity sensor to learn whether the
+# answer it published was the one the daemon used, so it can put the words back
+# rather than report a success it could not verify. An older card drops a config key
+# it does not know without a word, so handing it one would look like the feature had
+# shipped while nothing watched anything (#104).
+Write-Host '--- the answer-stamp sensor is only given to a card that watches it ---'
+function Find-TestCardsOfType {
+    param([Parameter(Mandatory)][string]$Type)
+    $found = [System.Collections.Generic.List[object]]::new()
+    $walk = {
+        param($node)
+        if ($node -is [System.Collections.IDictionary]) {
+            if ($node.Contains('type') -and [string]$node['type'] -eq $Type) { $found.Add($node) }
+            foreach ($value in @($node.Values)) { & $walk $value }
+        }
+        elseif ($node -is [System.Collections.IEnumerable] -and $node -isnot [string]) {
+            foreach ($item in $node) { & $walk $item }
+        }
+    }
+    & $walk $script:SavedConfig
+    @($found)
+}
+
+Set-TestPublicationCardUrl -Url '/local/agent-bridge-reply-card.js?v=1.29.0'
+Save-CopilotSessionDashboard -Sessions $sessions -Machines $twoMachines -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.29.0'
+$olderCards = @(Find-TestCardsOfType 'custom:agent-bridge-reply-card')
+Test-That 'a 1.29.0 card still gets the reply box it has always had' { $olderCards.Count -gt 0 } "$($olderCards.Count)"
+Test-That 'but is handed no sensor it has no code to watch' {
+    @($olderCards | Where-Object { $_.Contains('activity') }).Count -eq 0
+}
+
+Set-TestPublicationCardUrl -Url '/local/agent-bridge-reply-card.js?v=1.30.0'
+Save-CopilotSessionDashboard -Sessions $sessions -Machines $twoMachines -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.30.0'
+$watchingCards = @(Find-TestCardsOfType 'custom:agent-bridge-reply-card')
+Test-That 'a reply card is still generated at 1.30.0' { $watchingCards.Count -gt 0 } "$($watchingCards.Count)"
+Test-That 'and every one is given the activity sensor whose stamp it watches' {
+    @($watchingCards | Where-Object { $_.Contains('activity') -and [string]$_['activity'] -match '_activity$' }).Count -eq $watchingCards.Count
+} (($watchingCards | ForEach-Object { [string]$_['activity'] }) -join ', ')
+
 Write-Host '--- a live session produces a card ---'
 Test-That 'the control cards plus a session card are present' { @($cfg.views[0].cards).Count -ge 3 }
 
@@ -1565,6 +1604,7 @@ $script:AgentIds = @('', '   ')
 Test-That 'and a blank entry never matches a blank user' { -not (Test-BridgeAgentUserId -UserId '') }
 
 Remove-Item -LiteralPath $script:DecisionBridgeConfig.LogFile -Force -ErrorAction SilentlyContinue
+
 Write-Host ''
 if ($script:Failures) {
     Write-Host "$($script:Failures) check(s) failed" -ForegroundColor Red

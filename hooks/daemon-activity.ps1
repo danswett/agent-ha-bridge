@@ -802,6 +802,7 @@ function Update-DaemonSessionActivity {
     }
 
     Add-DaemonCardText -Entry $entry -Detail $detail -VerboseOn $verbose
+    Add-DaemonAnswerStamp -Entry $entry -Detail $detail
 
     try {
         Set-CopilotMqttActivity -SessionId $id `
@@ -981,10 +982,34 @@ function Update-DaemonCodexActivity {
         if ($fresh) { $summary = $fresh }
     }
     catch { }
+    Add-DaemonAnswerStamp -Entry $Entry -Detail $detail
     try { Set-CopilotMqttActivity -SessionId $Id `
             -Summary (Get-DaemonCardSummary -SessionId $Id -Summary $summary -Detail $detail) `
             -Detail $detail -Headers $Headers }
-    catch { Write-DaemonLog -Message "codex activity publish failed for $Id : $($_.Exception.Message)" }
+    catch { Write-DaemonLog -Message "codex activity publish failed for $Id : $($_.Exception.Message)" }}
+
+function Add-DaemonAnswerStamp {
+    <#
+        Carries the identity of the last reply-card publish consumed as an answer into
+        an activity update.
+
+        It has to go on every publish, not only the one that reports "Answer sent".
+        Set-CopilotMqttActivity replaces the attribute set, so a stamp written once is
+        gone again at the next ordinary update - and a card that happened to miss the
+        single update carrying it (a suspended tab, a reconnect) would then see a
+        question that had cleared with no stamp for its publish, conclude the words
+        had been discarded, and put back an answer that was in fact delivered. A
+        duplicate answer typed into an arrow-key prompt is its own kind of damage,
+        which makes a false restore worse than the loss it guards against (#104).
+
+        Re-derived from the session entry every time, so it is durable by construction
+        rather than by luck.
+    #>
+    param([Parameter(Mandatory)]$Entry, [Parameter(Mandatory)][hashtable]$Detail)
+
+    if ($null -eq $Entry -or -not $Entry.PSObject.Properties['LastReplyPayloadAt']) { return }
+    $stamp = [string]$Entry.LastReplyPayloadAt
+    if (-not [string]::IsNullOrWhiteSpace($stamp)) { $Detail['answer_consumed_at'] = $stamp }
 }
 
 function Add-DaemonCardText {
