@@ -30,7 +30,7 @@ $script:A14PsCalls = 0
 $script:A14Guard = $null
 $script:A14ActualWindows = $script:BridgeIsWindows
 $expectedGroups = 25
-$expectedChecks = 112
+$expectedChecks = 114
 $primaryFailure = $null
 
 function Test-A14 {
@@ -731,6 +731,26 @@ try {
         Test-A14 'empty command text stays unknown' ((Get-BridgeCommandLine -ProcessId 90003 -AsObservation).State -eq 'Unknown')
         $script:A14CommandMode = 'readable'; $script:A14CommandText = 'plain default text'
         Test-A14 'the default string API remains a string with the original value' ((Get-BridgeCommandLine -ProcessId 90003) -ceq 'plain default text')
+        # "or ''", as the function promises. CIM answers nothing for a process that has
+        # exited, and reading .CommandLine off that threw PropertyNotFound under
+        # StrictMode instead. Every caller of this path walks a process list or a parent
+        # chain, where a process going between being enumerated and being asked about is
+        # ordinary - so the throw escaped into hook and installer code with no reason to
+        # expect one, and took test-claude-install.ps1 down intermittently. The
+        # observation path beside it was already careful about the same row.
+        $script:A14CommandMode = 'absent'
+        Test-A14 'the default string API answers nothing rather than throwing once the process has gone' (
+            (Get-BridgeCommandLine -ProcessId 90003) -ceq '')
+        # But only when the query itself succeeded. A denied or provider-failed read
+        # returns no row either, and letting that collapse into the same empty string
+        # would be cached against pid and start time by Get-BridgeAgentProcessSessionIds
+        # - hiding a live session for as long as that process ran. The macOS branch
+        # already separates them; this keeps Windows honest about the difference.
+        $script:A14CommandMode = 'denied'
+        $deniedThrew = $false
+        try { [void](Get-BridgeCommandLine -ProcessId 90003) } catch { $deniedThrew = $true }
+        Test-A14 'a failed command query is raised rather than answered as a vanished process' $deniedThrew
+        $script:A14CommandMode = 'readable'
         $script:BridgeIsWindows = $false
         $script:A14PsExit = 0; $script:A14CommandMode = 'empty'
         $script:A14Processes = @([pscustomobject]@{ Id = 90003; ProcessName = 'node' }, [pscustomobject]@{ Id = 90005; ProcessName = 'claude' })
