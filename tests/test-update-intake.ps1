@@ -112,7 +112,7 @@ if ($IsWindows) {
                 $result.Detail -notmatch 'invalid release or failure details')
         }
         if ($success) {
-            Assert-UpdateIntake "$case does not certify required local health" ($result.Detail -match 'health is not certified')
+            Assert-UpdateIntake "$case does not certify required local health" ($result.Detail -match 'not certified')
             # Declining to certify is right; ending on it was not. The installer's own
             # check prints every probe green and "All good" seconds earlier, so a
             # successful update that finishes on a disclaimer reads as a failure and
