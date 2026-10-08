@@ -19,6 +19,10 @@ $script:A14Topics = @{}
 $script:A14AllowedTopics = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
 $script:A14LegacyResultTopic = 'homeassistant/sensor/copilot_cli_bridge/new_session_result/config'
 $script:A14States = @{}
+# Makes the shared state read fail the way Home Assistant can, rather than replacing
+# a helper with one that throws: the point of the case it covers is that an
+# unreadable inventory must not be published over as though it were an empty one.
+$script:A14StatesFail = $false
 $script:A14FieldSlots = @{}
 $script:A14InputSelectStore = @()
 $script:A14Processes = @()
@@ -29,8 +33,8 @@ $script:A14PsExit = 0
 $script:A14PsCalls = 0
 $script:A14Guard = $null
 $script:A14ActualWindows = $script:BridgeIsWindows
-$expectedGroups = 25
-$expectedChecks = 114
+$expectedGroups = 26
+$expectedChecks = 126
 $primaryFailure = $null
 
 function Test-A14 {
@@ -256,6 +260,14 @@ function Invoke-CopilotHaWebSocket {
 
 function Invoke-RestMethod {
     param($Method, $Uri, $Headers, $ContentType, $Body, $TimeoutSec)
+    # Raised before the boundary wrapper below, so it reaches the caller as an ordinary
+    # transport failure rather than being recorded as a rejected boundary. Scoped to the
+    # shared state reads, which is all the case under test needs to go unreadable.
+    if ($script:A14StatesFail -and $Uri -is [string] -and $Uri -in @(
+            'http://publication.invalid:8123/api/states',
+            'http://publication.invalid:8123/api/template')) {
+        throw [IO.IOException]::new('Synthetic Home Assistant state read failure')
+    }
     $shape = [ordered]@{ Boundary = 'REST' }
     try {
         $shape = Get-A14RequestShape -Boundary REST -Method $Method -Uri $Uri -ContentType $ContentType -Body $Body
@@ -930,24 +942,150 @@ try {
         Test-A14 'while an unaccounted session process still holds discovery' (-not $stranger.Complete)
     }
 
-    Invoke-A14Group 'publication resumes after completeness without a new unrelated event' {
+    Invoke-A14Group 'uncertainty holds absence-based work without freezing the shared view' {
         Reset-A14Records claude
         [void](Invoke-A14Reconcile)
-        $signature = $script:DaemonGlobalSignature; $dashboard = $script:DaemonDashboardSignature
+        $signature = $script:DaemonGlobalSignature
         Write-A14Json -Path (Get-A14RegistrationPath A) -Value @{ SessionId = $script:A14Ids.A }
         Write-A14Registration D
         $script:A14Processes += [pscustomobject]@{ Id = $script:A14Pids.D; ProcessName = 'claude'; StartTime = [datetime]::UtcNow.AddHours(-1) }
         $script:TestPublication.Commands.Clear()
+        $script:A14Requests.Clear()
         $snapshot = Invoke-A14Reconcile
         Test-A14 'a new validated positive is adopted during uncertainty' ($snapshot.Live.ContainsKey($script:A14Ids.D) -and $script:A14State.ContainsKey($script:A14Ids.D))
-        Test-A14 'held complete publication advances no success signature' (
-            $script:DaemonGlobalSignature -ceq $signature -and $script:DaemonDashboardSignature -ceq $dashboard -and @(Get-TestPublicationWrites).Count -eq 0)
+        # Publishing is presence-based and no longer waits for a complete local process
+        # view. It used to: one unidentifiable process on this machine stopped the shared
+        # dashboard being written at all, and because the writer publishes for everyone,
+        # that froze every machine's sessions on screen with nothing saying why. The
+        # session being published is one this machine can see running; the process it
+        # cannot account for has no bearing on that.
+        Test-A14 'the view is still published, because seeing a session is presence-based evidence' (
+            -not $snapshot.Complete -and $script:DaemonGlobalSignature -cne $signature -and
+            @(Get-TestPublicationWrites).Count -gt 0 -and $script:BridgeDashboardObservation.Verified)
+        # The whole point of separating the two. Making the view current is exactly what
+        # lets Update-DaemonRetireQueue act, so an uncertain owner surviving a pass that
+        # published is the property that has to hold - not an incidental consequence of
+        # never publishing at all.
+        Test-A14HeldOwner 'published under uncertainty' $snapshot
         Write-A14Registration A
         $script:TestPublication.Commands.Clear()
         $snapshot = Invoke-A14Reconcile
-        Test-A14 'completeness resumes held global/view publication without restart' (
-            $snapshot.Complete -and $script:DaemonGlobalSignature -cne $signature -and
-            @(Get-TestPublicationWrites).Count -gt 0 -and $script:BridgeDashboardObservation.Verified)
+        # No publication is expected here: the view was already written during the
+        # uncertain pass and its inputs have not changed, which is the point. What
+        # resumes is the absence-based work, and A being positive-live again is what
+        # says the hold has lifted.
+        Test-A14 'completeness resumes held absence-based work without restart' (
+            $snapshot.Complete -and $snapshot.Live.ContainsKey($script:A14Ids.A) -and
+            $script:BridgeDashboardObservation.Verified)
+    }
+    Invoke-A14Group 'a restart that lost its state keeps an unaccountable session on the dashboard' {
+        # The case publishing under uncertainty could otherwise get wrong. Descriptors
+        # are built from $State, and $State comes from a file - so a daemon that starts
+        # without a usable one knows of no sessions at all. A live process it then
+        # cannot attribute is in neither $State nor $Live, and describing this machine
+        # from those descriptors alone would say it is running nothing: the session's
+        # card would come off the shared dashboard, and its entities would sit there
+        # rendering nothing, while it was still working.
+        Reset-A14Records codex
+        [void](Invoke-A14Reconcile)
+        $nodeA = Get-CopilotMqttNodeId -SessionId $script:A14Ids.A
+        $retained = $script:A14States[$machineEntity].attributes.sessions
+        # What Home Assistant still holds from before the restart: this machine's own
+        # last accepted statement about itself, which names A.
+        $script:A14States[$machineEntity].attributes.sessions = @([pscustomobject]@{
+            name = 'session A'; machine = $script:DaemonMachineName; node = $nodeA; kind = 'codex' })
+        $script:DaemonStatesCache = $null
+        try {
+            Write-A14Json -Path (Get-A14RegistrationPath A) -Value @{}
+            Write-DaemonState -State @{}
+            $script:A14State = Read-DaemonState
+            $script:DaemonOwnerCatalogue = @{}
+            $snapshot = Invoke-A14Reconcile
+            Test-A14 'the restarted daemon can neither place the session nor call it live' (
+                -not $snapshot.Complete -and -not $snapshot.Live.ContainsKey($script:A14Ids.A) -and
+                -not $script:A14State.ContainsKey($script:A14Ids.A))
+            Test-A14 'yet this machine still names it in what it publishes about itself' (
+                $script:DaemonGlobalSignature -clike "*$nodeA*")
+            Test-A14 'and the accepted shared view still renders its card' (
+                $script:BridgeDashboardObservation.Verified -and
+                $script:BridgeDashboardObservation.ReferencedNodes -ccontains $nodeA)
+            # Carrying a node forward must not become a way for a retired one to live
+            # for ever: Complete-DaemonSessionRetirement will only remove a session's
+            # entities once the shared view has stopped rendering it.
+            Write-A14Registration A
+            $complete = Invoke-A14Reconcile
+            Test-A14 'and once it can be placed again it is adopted rather than duplicated' (
+                $complete.Complete -and $complete.Live.ContainsKey($script:A14Ids.A) -and
+                @($script:BridgeDashboardObservation.ReferencedNodes | Where-Object { $_ -ceq $nodeA }).Count -eq 1)
+            # An MCP client is discovered first-hand every pass and withdrawn by the MCP
+            # server itself, so it never passes through $Gone and local process
+            # uncertainty says nothing about it. Carried forward, a client that had
+            # disconnected would keep its card on the dashboard - pointing at entities
+            # its own server had already removed - for as long as the uncertainty lasted.
+            $script:A14States[$machineEntity].attributes.sessions = @([pscustomobject]@{
+                name = 'a client that left'; machine = $script:DaemonMachineName
+                node = 'mcpgone'; kind = 'mcp' })
+            $script:DaemonStatesCache = $null
+            Write-A14Json -Path (Get-A14RegistrationPath A) -Value @{}
+            $script:DaemonOwnerCatalogue = @{}
+            $uncertain = Invoke-A14Reconcile
+            Test-A14 'a disconnected MCP client is not carried forward by local uncertainty' (
+                -not $uncertain.Complete -and $script:DaemonGlobalSignature -cnotlike '*mcpgone*')
+            # And the inventory being unreadable is not the same as its being empty.
+            # Publishing over it here would destroy the only record of whatever this
+            # pass cannot account for, leaving the next pass nothing to recover from -
+            # so this is the one case that still holds publication. Sync-DaemonSessions
+            # is called directly because a reconcile would fail its own snapshot read
+            # first, which is a different failure from the one under test.
+            $script:A14States[$machineEntity].attributes.sessions = @([pscustomobject]@{
+                name = 'session A'; machine = $script:DaemonMachineName; node = $nodeA; kind = 'codex' })
+            $script:DaemonStatesCache = $null
+            $held = Get-LiveBridgeSessions -AsObservation -State $script:A14State
+            $script:A14StatesFail = $true
+            try {
+                $carry = Add-DaemonUnaccountedDescriptors -Descriptors @() -Gone @() -Headers @{}
+                Test-A14 'an unreadable retained inventory reports as unreadable rather than as empty' (
+                    -not $carry.Readable)
+                # Deliberately stale: any attempt to publish replaces this, so finding
+                # it afterwards is evidence the write was held rather than merely found
+                # unnecessary. Without it the check passes either way, because the
+                # descriptors have not changed since the last publish.
+                $script:DaemonGlobalSignature = 'stale-on-purpose'
+                $script:TestPublication.Commands.Clear()
+                Sync-DaemonSessions -Headers @{} -State $script:A14State -Live $held.Live -Discovery $held
+            }
+            finally { $script:A14StatesFail = $false; $script:DaemonStatesCache = $null }
+            Test-A14 'and publication is held rather than overwriting what it could not read' (
+                -not $held.Complete -and $script:DaemonGlobalSignature -ceq 'stale-on-purpose' -and
+                @(Get-TestPublicationWrites).Count -eq 0)
+            # And a state read can succeed while simply not containing this machine's
+            # own sensor at all - Home Assistant restarting, MQTT discovery not yet
+            # restored. Recovering nothing then is not evidence that there was nothing
+            # to recover.
+            $machineState = $script:A14States[$machineEntity]
+            [void]$script:A14States.Remove($machineEntity)
+            $script:DaemonStatesCache = $null
+            try { $missing = Add-DaemonUnaccountedDescriptors -Descriptors @() -Gone @() -Headers @{} }
+            finally { $script:A14States[$machineEntity] = $machineState; $script:DaemonStatesCache = $null }
+            Test-A14 'an inventory that is simply not there yet is unreadable rather than empty' (
+                -not $missing.Readable)
+            # Same again one level in. Home Assistant restores a retained sensor's
+            # config, state and attributes separately, so the entity can be back while
+            # its sessions attribute is not - and an absent attribute reads as an empty
+            # list, exactly like a machine that genuinely runs nothing.
+            $script:A14States[$machineEntity] = [pscustomobject]@{
+                entity_id = $machineEntity; state = '0'
+                attributes = [pscustomobject]@{ machine = $script:DaemonMachineName; machine_slug = $script:DaemonMachineSlug }
+            }
+            $script:DaemonStatesCache = $null
+            try { $bare = Add-DaemonUnaccountedDescriptors -Descriptors @() -Gone @() -Headers @{} }
+            finally { $script:A14States[$machineEntity] = $machineState; $script:DaemonStatesCache = $null }
+            Test-A14 'and so is one whose session list has not been restored with it' (-not $bare.Readable)
+        }
+        finally {
+            $script:A14States[$machineEntity].attributes.sessions = $retained
+            $script:DaemonStatesCache = $null
+        }
     }
     Invoke-A14Group 'actual startup session cleanup defers then resumes on reconcile' {
         Reset-A14Records codex
@@ -1023,7 +1161,7 @@ try {
         }
         finally { $script:ClaudeStateRoot = $oldRoot }
     }
-    Test-A14 'the fixed twenty-five source groups were reached' ($script:A14Groups -eq $expectedGroups)
+    Test-A14 'the fixed twenty-six source groups were reached' ($script:A14Groups -eq $expectedGroups)
     Test-A14 'the fixed assertion inventory was reached' ($script:A14Checks -eq ($expectedChecks - 1))
 }
 catch {

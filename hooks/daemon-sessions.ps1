@@ -580,16 +580,53 @@ function Sync-DaemonSessions {
     }
 
     $descriptors = @(Get-DaemonSessionDescriptors -State $State -Headers $Headers)
-    if ($Discovery.Complete) {
-        $capabilities = Get-DaemonLaunchCapabilities
+    $publish = $true
+    if (-not $Discovery.Complete) {
+        $carry = Add-DaemonUnaccountedDescriptors -Descriptors $descriptors -Gone $goneSessions -Headers $Headers
+        $descriptors = @($carry.Descriptors)
+        # The one case where publishing is worse than not. If the retained inventory
+        # could not be read, it is unknown rather than empty - and writing over it
+        # would destroy the only record of whatever this pass cannot account for,
+        # leaving the next pass nothing to recover from either.
+        $publish = [bool]$carry.Readable
+    }
+    # Presence-based, so it runs whether or not the local process view is complete.
+    #
+    # What a session's card says, and that it exists at all, is evidence this machine
+    # has: the descriptors come from $State, which an incomplete pass adds to and never
+    # removes from, so an uncertain session is still described rather than dropped.
+    # Holding these behind Complete made one unidentifiable local process stop the whole
+    # dashboard being written - and the dashboard is shared, so on the writer that froze
+    # it for every machine. Sessions on other hosts stopped appearing, cards stopped
+    # updating, and nothing said why. That is not a fail-safe; a card that has quietly
+    # stopped telling the truth is worse than one that admits it is behind.
+    #
+    # $State is not always the whole story, though, which is why the carry-forward above
+    # exists: it is read from a file at startup, and a daemon that starts without one -
+    # lost, corrupt, first run after an upgrade that moved it - begins with nothing. A
+    # live session it then cannot attribute is in neither $State nor $live, so publishing
+    # these descriptors alone would describe this machine as not running it and take its
+    # card off the shared dashboard while it is still working. Publication under
+    # uncertainty therefore only ever adds.
+    #
+    # Absence-based work stays held, and is held one decision at a time rather than by
+    # this flag: retirement goes through Test-DaemonRetirementObservation per session,
+    # the orphan sweep refuses an incomplete snapshot outright, and the two below keep
+    # their own gates.
+    $capabilities = Get-DaemonLaunchCapabilities
+    if ($publish) {
         Publish-DaemonGlobalStatus -Descriptors $descriptors -Capabilities $capabilities `
             -Resumable @($script:DaemonResumeOffered) -Headers $Headers
+    }
+    if ($Discovery.Complete) {
         # $live, not $State.Keys: a session whose adoption returned $null is running but
         # absent from state, and bundling one mid-sentence is exactly what this guards.
         # The marked test-boundary throws are re-raised rather than logged, the convention
         # #59 established: a suite that reaches the real transfer without stubbing it would
         # otherwise see a tidy refusal and pass, which is the exact failure that change
-        # exists to close. An incomplete view cannot authorize a transfer.
+        # exists to close. An incomplete view cannot authorize a transfer: a session that
+        # is uncertain is absent from $live, and the refusal that protects a live session
+        # from being bundled reads exactly that set.
         try { Invoke-DaemonTransferRequest -LiveSessionIds @($live.Keys) -Headers $Headers }
         catch {
             if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
@@ -609,11 +646,7 @@ function Sync-DaemonSessions {
             Write-DaemonLog -Message "pairing check failed: $($_.Exception.Message)"
         }
     }
-    $dashboardCurrent = if ($Discovery.Complete) {
-        Sync-DaemonDashboard -Descriptors $descriptors -Capabilities $capabilities -Headers $Headers
-    } else {
-        Sync-DaemonDashboard -Descriptors $descriptors -Capabilities @{} -Headers $Headers -ObserveOnly
-    }
+    $dashboardCurrent = Sync-DaemonDashboard -Descriptors $descriptors -Capabilities $capabilities -Headers $Headers -ObserveOnly:(-not $publish)
     Complete-DaemonSessionRetirement -Gone $goneSessions -DashboardCurrent $dashboardCurrent -Headers $Headers -Discovery $Discovery
     Update-DaemonOwnerCatalogue -Snapshot $Discovery -State $State
 }
@@ -988,6 +1021,132 @@ function Get-DaemonSessionDescriptors {
             Kind = 'mcp'
         }
     }
+}
+
+function Add-DaemonUnaccountedDescriptors {
+    <#
+        The descriptors for this pass, plus any session this machine's own retained
+        inventory still lists that they do not mention.
+
+        Only for a pass whose local process view is incomplete. The descriptors are
+        built from $State, and $State is read from a file at startup - so a daemon that
+        starts without a usable one knows about no sessions at all. If discovery then
+        cannot attribute some live process, that session is in neither $State nor
+        $Live, and publishing the descriptors as they stand would announce this machine
+        as not running it: its card would come off the shared dashboard, and its entities
+        would sit there rendering nothing, while it was still working. "I cannot see it"
+        is not "it is gone", and the shared view must not be made to say the second.
+
+        The previous inventory is the right place to recover it from. It is this
+        machine's own last accepted statement about itself, published by
+        Publish-DaemonGlobalStatus and retained by Home Assistant across a daemon
+        restart, and it already carries exactly the four fields a descriptor needs.
+
+        Anything proven gone this pass is excluded. Retirement still runs during an
+        incomplete pass, one session at a time through Test-DaemonRetirementObservation,
+        and Complete-DaemonSessionRetirement will only remove a session's entities once
+        the dashboard has stopped rendering its node - so carrying a retired node
+        forward here would keep it on the dashboard and stall its removal for good.
+
+        Nothing is carried forward when discovery is complete: a session absent from a
+        complete view is absent, and that is the path that lets a card ever disappear.
+
+        MCP clients are excluded. They are deliberately outside $State and outside
+        Get-LiveBridgeSessions - the MCP server owns those entities and withdraws them
+        itself - so they are rediscovered first-hand on every pass by
+        Get-LiveMcpSessions and never pass through $Gone. Their presence is therefore
+        already authoritative and has nothing to do with local process discovery:
+        carrying one forward would keep rendering a card whose entities the MCP server
+        had already withdrawn, for as long as some unrelated uncertainty lasted.
+
+        Readable says whether the retained inventory could actually be read. An
+        unreadable one is not an empty one, and the caller must not publish over the
+        very thing it would need to recover from next pass. A state read that simply
+        does not contain this machine's own sensor counts as unreadable for the same
+        reason: not having seen it is not having seen it empty.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Descriptors,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Gone,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $carried = @($Descriptors)
+    try { $states = Get-DaemonHomeAssistantStates -Headers $Headers }
+    catch {
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        # An unreadable inventory is not an empty one. Publishing over it here would
+        # destroy the only record of the sessions this pass cannot account for - and
+        # the next pass, having nothing left to read, would find nothing to recover.
+        # So the caller is told the source could not be read and holds publication,
+        # which is the old behaviour in exactly the case that needs it.
+        Write-DaemonLog -Message "retained inventory unreadable while session ownership is incomplete: $($_.Exception.Message)"
+        return [pscustomobject]@{ Descriptors = $carried; Readable = $false }
+    }
+
+    $known = [System.Collections.Generic.HashSet[string]]::new(
+        [string[]]@($carried | ForEach-Object { [string]$_.Node }), [StringComparer]::OrdinalIgnoreCase)
+    foreach ($node in @($Gone | ForEach-Object { Get-CopilotMqttNodeId -SessionId $_ })) {
+        [void]$known.Add([string]$node)
+    }
+
+    $recovered = @()
+    # Read by name rather than by property. These come back from Home Assistant as
+    # whatever was retained, including by a bridge old enough to predate a field, and a
+    # missing one is a PropertyNotFoundException under Set-StrictMode -Version Latest
+    # rather than an empty string.
+    $field = {
+        param($Source, $Name)
+        if ($null -eq $Source.PSObject.Properties[$Name]) { return '' }
+        [string]$Source.PSObject.Properties[$Name].Value
+    }
+    $sawSelf = $false
+    foreach ($machine in @(Get-BridgePeerMachine -States $states)) {
+        if (-not $machine.IsSelf) { continue }
+        # SessionsKnown, not merely the record existing. Home Assistant restores a
+        # retained sensor's config, state and attributes separately, so the entity can
+        # be back while its sessions attribute is not - and an attribute that has not
+        # arrived reads as an empty list, which is the same shape as a machine that
+        # genuinely runs nothing. Only an attribute actually present counts as having
+        # read the inventory.
+        if (-not $machine.SessionsKnown) { continue }
+        $sawSelf = $true
+        foreach ($session in @($machine.Sessions)) {
+            if ($null -eq $session) { continue }
+            $node = & $field $session 'node'
+            if ([string]::IsNullOrWhiteSpace($node)) { continue }
+            if (-not $known.Add($node)) { continue }
+            $name = & $field $session 'name'
+            $owner = & $field $session 'machine'
+            $kind = & $field $session 'kind'
+            if ($kind -ceq 'mcp') { continue }
+            $recovered += [pscustomobject]@{
+                Node = $node
+                Name = $name
+                Machine = $(if ($owner) { $owner } else { [string]$machine.Machine })
+                Kind = $(if ($kind) { $kind } else { 'copilot' })
+            }
+        }
+    }
+
+    # A state read can succeed and still not contain this machine's own sensor - Home
+    # Assistant restarting, MQTT discovery not yet restored, which is the case the
+    # orphan sweep above already describes as "the picture is incomplete". Recovering
+    # nothing then is not evidence that there was nothing to recover, and publishing
+    # would replace a retained inventory this pass never actually saw. The cost of
+    # being wrong the other way is one new machine's card waiting for its first
+    # complete discovery pass, which is where it waited before any of this.
+    if (-not $sawSelf) {
+        Write-DaemonLog -Message 'retained inventory for this machine is unreadable while session ownership is incomplete'
+        return [pscustomobject]@{ Descriptors = $carried; Readable = $false }
+    }
+
+    if ($recovered.Count -gt 0) {
+        Write-DaemonLog -Message ("retained $($recovered.Count) unaccounted session(s) in the shared view " +
+            "while session ownership is incomplete: " + (@($recovered | ForEach-Object { $_.Node }) -join ', '))
+        $carried += $recovered
+    }
+    [pscustomobject]@{ Descriptors = $carried; Readable = $true }
 }
 
 function Get-DaemonLaunchCapabilities {
