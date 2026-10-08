@@ -2222,6 +2222,12 @@ ha-select, mwc-select { width: 100%; }
         # Send answer, which is what lets the reply box below stay the reply card even
         # while a question is waiting (see $replyCard).
         $cardOwnsSend = Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.22.0'
+        # From 1.30.0 the reply card watches the activity sensor to learn whether the
+        # answer it published was the one the daemon used. Gated on that exact version
+        # rather than folded into $cardOwnsSend: a 1.22.0-1.29.0 card silently drops a
+        # config key it does not know, so handing it one it cannot act on would look
+        # like the feature was shipped while nothing watched anything.
+        $cardWatchesAnswers = Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.30.0'
         $answerInner = @{
             type = 'entities'
             show_header_toggle = $false
@@ -2500,18 +2506,19 @@ ha-card {
         # the textarea at the moment Send is pressed, is not capped at 255 characters,
         # and does not need the question cleared before it works.
         $replyCard = if ($cardOwnsSend) {
-            @(@{
+            $card = @{
                 type = 'custom:agent-bridge-reply-card'
                 card_mod = @{ style = $bareChild }
                 name = ''
                 topic = (Get-CopilotMqttReplyPayloadTopic -Node $node)
                 placeholder = 'Reply, or type an answer...'
-                # Watched only to learn the fate of an answer published for a form:
-                # the daemon names the payload it consumed in answer_consumed_at, and
-                # without somewhere to read that the card cannot tell a delivered
-                # answer from one discarded by a race it reported as sent (#104).
-                activity = $activityEntity
-            })
+            }
+            # Watched only to learn the fate of an answer published for a form: the
+            # daemon names the payload it consumed in answer_consumed_at, and without
+            # somewhere to read that the card cannot tell a delivered answer from one
+            # discarded by a race it reported as sent (#104).
+            if ($cardWatchesAnswers) { $card.activity = "sensor.${node}_activity" }
+            @($card)
         }
         elseif (-not [string]::IsNullOrWhiteSpace($ReplyCardUrl)) {
             @(
