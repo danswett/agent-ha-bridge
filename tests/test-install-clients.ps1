@@ -1492,6 +1492,132 @@ Test-That 'but never before this installation is confirmed to own the Codex home
     $codexOwnership -gt 0 -and $codexOwnership -lt $codexCopy
 } "ownership=$codexOwnership copy=$codexCopy"
 
+Write-Host '--- the pre-rename registration is cleaned up, not tripped over ---'
+# The installer deleted the legacy adapter directory and left it registered. Codex
+# loads every configured marketplace, so that one dead entry failed the whole plugin
+# subsystem: every `codex plugin` command exited 1, so a correct install still
+# reported "Codex registration command failed", `agent-ha-bridge update` exited
+# non-zero, and plugin hooks stopped resolving - Codex sessions simply never appeared
+# on the dashboard. It is self-perpetuating, because the entry breaks the very
+# commands that would remove it (#119).
+# Line-ending agnostic: the checkout is CRLF on one CI runner and LF on the other, so
+# matching on [Environment]::NewLine found nothing on macOS and failed a passing fix.
+$codexCleanupMatch = [regex]::Match($codexSource, '(?m)^Remove-BridgeCodexLegacyRegistration\s*$')
+$codexCleanup = if ($codexCleanupMatch.Success) { $codexCleanupMatch.Index } else { -1 }
+Test-That 'the stale registration is removed before Codex is asked anything' {
+    $codexCleanup -gt 0 -and $codexCleanup -lt $codexListing
+} "cleanup=$codexCleanup listing=$codexListing"
+
+# Uninstalling asks Codex to deregister, so on the very machines this repairs - where
+# every plugin command exits 1 - uninstall would fail too if cleanup came after it.
+$codexUninstall = [regex]::Match($codexSource, '(?m)^if \(\$Uninstall\) \{').Index
+Test-That 'and before the uninstall branch, which would otherwise fail the same way' {
+    $codexUninstall -gt 0 -and $codexCleanup -lt $codexUninstall
+} "cleanup=$codexCleanup uninstall=$codexUninstall"
+
+# Run the real readers against real config text, rather than asserting on source
+# order: the parsing is where this can quietly stop working.
+$codexAst = [System.Management.Automation.Language.Parser]::ParseInput($codexSource, [ref]$null, [ref]$null)
+$codexWanted = @('Get-BridgeCodexLegacyRegistration', 'Remove-BridgeCodexTomlSection')
+$codexDefs = $codexAst.FindAll({
+        param($node)
+        $node -is [System.Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -in $codexWanted
+    }, $true)
+$codexRoot = Join-Path ([IO.Path]::GetTempPath()) "bridge-codex-legacy-$([guid]::NewGuid().ToString('n'))"
+New-Item -ItemType Directory -Path $codexRoot -Force | Out-Null
+$legacyRootFixture = Join-Path $codexRoot '.copilot\codex-bridge'
+$configFixture = Join-Path $codexRoot 'config.toml'
+
+function Invoke-CodexLegacyProbe {
+    param([Parameter(Mandatory)][string]$Config, [Parameter(Mandatory)][string]$Script)
+    Set-Content -LiteralPath $configFixture -Value $Config -Encoding utf8
+    $body = ($codexDefs | ForEach-Object { $_.Extent.Text }) -join "`n`n"
+    $preamble = @"
+function Test-BridgeInstallPath { param([string]`$a, [string]`$b)
+    [string]::Equals((`$a -replace '[\\/]+$', ''), (`$b -replace '[\\/]+$', ''), [StringComparison]::OrdinalIgnoreCase) }
+`$legacyMarketplaceName = 'copilot-ha-bridge'
+`$legacyPluginName = 'copilot-ha-bridge'
+`$legacyBridgeRoot = '$legacyRootFixture'
+`$codexConfigFile = '$configFixture'
+"@
+    $file = Join-Path $codexRoot 'probe.ps1'
+    Set-Content -LiteralPath $file -Value "$preamble`n$body`n$Script" -Encoding utf8
+    (& pwsh -NoProfile -File $file) -join "`n"
+}
+
+# Exactly the shape found on DSWETT-HOME: the directory is gone, the registration is
+# not, and Codex records the extended-length path form on Windows.
+$brokenConfig = @"
+[hooks.state."copilot-ha-bridge@copilot-ha-bridge:hooks.json:stop:0:0"]
+trusted_hash = "sha256:abc"
+
+[marketplaces.copilot-ha-bridge]
+source_type = "local"
+source = '\\?\$legacyRootFixture'
+
+[marketplaces.agent-ha-bridge]
+source_type = "local"
+source = '\\?\C:\Users\u\.agent-ha-bridge\codex-bridge'
+
+[plugins."copilot-ha-bridge@copilot-ha-bridge"]
+enabled = true
+
+[plugins."agent-ha-bridge@agent-ha-bridge"]
+enabled = true
+"@
+
+$detected = Invoke-CodexLegacyProbe -Config $brokenConfig -Script @'
+$l = Get-BridgeCodexLegacyRegistration
+"present=$($l.Present) owned=$($l.Owned)"
+'@
+Test-That 'a registration whose directory the bridge removed is recognised as ours' {
+    $detected -match 'present=True' -and $detected -match 'owned=True'
+} $detected
+
+$cleaned = Invoke-CodexLegacyProbe -Config $brokenConfig -Script @'
+$l = Get-BridgeCodexLegacyRegistration
+$t = Remove-BridgeCodexTomlSection -Text $l.Text -Header '[marketplaces.copilot-ha-bridge]'
+$t = Remove-BridgeCodexTomlSection -Text $t -Header '[plugins."copilot-ha-bridge@copilot-ha-bridge"]'
+"legacyMarketplace=$([bool]($t -match '\[marketplaces\.copilot-ha-bridge\]'))"
+"legacyPlugin=$([bool]($t -match '\[plugins\."copilot-ha-bridge'))"
+"currentMarketplace=$([bool]($t -match '\[marketplaces\.agent-ha-bridge\]'))"
+"currentPlugin=$([bool]($t -match '\[plugins\."agent-ha-bridge'))"
+"hooks=$([bool]($t -match 'hooks\.state'))"
+'@
+Test-That 'removing it takes out both of its sections' {
+    $cleaned -match 'legacyMarketplace=False' -and $cleaned -match 'legacyPlugin=False'
+} $cleaned
+Test-That 'and leaves the working registration beside it alone' {
+    $cleaned -match 'currentMarketplace=True' -and $cleaned -match 'currentPlugin=True'
+} $cleaned
+Test-That 'and does not touch anything else in the file' {
+    $cleaned -match 'hooks=True'
+} $cleaned
+
+# A marketplace of that name pointing at a directory that is really there belongs to
+# something else. Removing it because the name matched would break whatever owns it.
+New-Item -ItemType Directory -Path (Join-Path $codexRoot 'elsewhere') -Force | Out-Null
+$foreignConfig = $brokenConfig -replace [regex]::Escape("'\\?\$legacyRootFixture'"), "'$(Join-Path $codexRoot 'elsewhere')'"
+$foreign = Invoke-CodexLegacyProbe -Config $foreignConfig -Script @'
+$l = Get-BridgeCodexLegacyRegistration
+"present=$($l.Present) owned=$($l.Owned)"
+'@
+Test-That 'a same-named marketplace that still points somewhere real is left alone' {
+    $foreign -match 'present=True' -and $foreign -match 'owned=False'
+} $foreign
+
+$absent = Invoke-CodexLegacyProbe -Config @"
+[marketplaces.agent-ha-bridge]
+source = '\\?\C:\Users\u\.agent-ha-bridge\codex-bridge'
+"@ -Script @'
+"present=$((Get-BridgeCodexLegacyRegistration).Present)"
+'@
+Test-That 'and a Codex that never carried one reports nothing to do' {
+    $absent -match 'present=False'
+} $absent
+
+Remove-Item -LiteralPath $codexRoot -Recurse -Force -ErrorAction SilentlyContinue
+
 Write-Host ''
 if ($script:Failures) {
     Write-Host "$($script:Failures) check(s) failed" -ForegroundColor Red
