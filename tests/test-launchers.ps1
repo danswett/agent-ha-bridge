@@ -249,7 +249,35 @@ finally {
     Remove-Item -LiteralPath $fakeAgent -Force -ErrorAction SilentlyContinue
 }
 
-Remove-Item -LiteralPath $script:DaemonConfig.LogFile -Force -ErrorAction SilentlyContinue
+    # The PATH a launched session is given. Finding an agent is not the same as being
+    # able to run it: a shim's interpreter normally sits beside it, and a MacPorts
+    # install put both in a directory the daemon's inherited PATH had never heard of, so
+    # the session died with "env: node: No such file or directory" and was reported only
+    # as having exited before registering (#126).
+    Test-That 'the directory the agent was found in leads the session PATH' {
+        (Get-BridgeSessionPath -Executable '/opt/local/bin/codex' -BasePath '/usr/bin:/bin') -like '/opt/local/bin:*'
+    }
+    Test-That 'the inherited PATH is kept, in its own order, after it' {
+        (Get-BridgeSessionPath -Executable '/opt/local/bin/codex' -BasePath '/usr/bin:/bin') -like '*:/usr/bin:/bin:*'
+    }
+    Test-That 'a directory already inherited is not repeated' {
+        $path = Get-BridgeSessionPath -Executable '/usr/local/bin/codex' -BasePath '/usr/local/bin:/usr/bin'
+        @($path -split ':' | Where-Object { $_ -eq '/usr/local/bin' }).Count -eq 1
+    }
+    Test-That 'the usual homes of interpreters are on it even when nothing inherited them' {
+        $path = @((Get-BridgeSessionPath -Executable '/opt/local/bin/codex' -BasePath '/usr/bin') -split ':')
+        @('/opt/homebrew/bin', '/usr/local/bin', '/opt/local/bin', '/usr/bin', '/bin') |
+            Where-Object { $path -notcontains $_ } | Measure-Object | ForEach-Object { $_.Count -eq 0 }
+    }
+    Test-That 'no entry is ever empty, which would put the working directory on PATH' {
+        $path = Get-BridgeSessionPath -Executable '/opt/local/bin/codex' -BasePath '/usr/bin::/bin:'
+        @($path -split ':' | Where-Object { [string]::IsNullOrWhiteSpace($_) }).Count -eq 0
+    }
+    Test-That 'an unknown executable still yields a usable PATH rather than nothing' {
+        (Get-BridgeSessionPath -Executable '' -BasePath '/usr/bin') -like '*/usr/bin*'
+    }
+
+    Remove-Item -LiteralPath $script:DaemonConfig.LogFile -Force -ErrorAction SilentlyContinue
 Write-Host ''
 if ($script:Failures) {
     Write-Host "$($script:Failures) check(s) failed" -ForegroundColor Red

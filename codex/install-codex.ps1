@@ -58,7 +58,15 @@ function Get-CodexExecutable {
     $command = Get-Command codex -ErrorAction SilentlyContinue
     if ($command) { return $command.Source }
     if (-not $script:BridgeIsWindows) {
-        foreach ($candidate in @('/opt/homebrew/bin/codex', '/usr/local/bin/codex', (Join-Path $HOME '.local/bin/codex'))) {
+        # The same places the launcher's Find-BridgeUnixCommand looks. They drifted:
+        # MacPorts installs to /opt/local/bin, which the launcher knew about and this
+        # did not, so on a MacPorts machine the installer reported Codex as missing
+        # and skipped registering the adapter - while the launcher went on finding
+        # the CLI and starting sessions that had no bridge adapter to report through
+        # (#125).
+        foreach ($candidate in @('/opt/homebrew/bin/codex', '/usr/local/bin/codex', '/opt/local/bin/codex',
+                (Join-Path $HOME '.local/bin/codex'), (Join-Path $HOME '.npm-global/bin/codex'),
+                (Join-Path $HOME '.bun/bin/codex'))) {
             if (Test-Path -LiteralPath $candidate) { return $candidate }
         }
         return $null
@@ -76,10 +84,23 @@ function Invoke-BridgeCodexCommand {
     if (-not $codex) { throw 'Codex CLI is unavailable; its registration could not be verified and the adapter was preserved.' }
     $previousHome = $env:CODEX_HOME
     $previousConfig = $env:AGENT_HA_BRIDGE_CONFIG
+    $previousPath = $env:PATH
     Push-Location $installContext.Home
     try {
         $env:CODEX_HOME = $installContext.CodexHome
         $env:AGENT_HA_BRIDGE_CONFIG = $installContext.ConfigPath
+        # Knowing where Codex is is not the same as being able to run it. Whenever it
+        # was found by absolute path above, it is by definition not on PATH - and
+        # /opt/local/bin/codex is a `#!/usr/bin/env node` script whose node is in that
+        # same directory, so invoking it here would fail with "env: node: No such file
+        # or directory" and leave the adapter unregistered. Prepending the directory it
+        # was found in is the same remedy Get-BridgeSessionPath applies at launch.
+        if (-not $script:BridgeIsWindows -and $codex -match '^(.*)/[^/]+$') {
+            $codexDir = $Matches[1]
+            if (@($previousPath -split ':') -notcontains $codexDir) {
+                $env:PATH = "${codexDir}:$previousPath"
+            }
+        }
         $output = & $codex @Arguments 2>&1 | Out-String
         if ($LASTEXITCODE -ne 0) { throw "Codex registration command failed (exit $LASTEXITCODE); no further adapter cleanup was performed." }
         $output
@@ -87,6 +108,7 @@ function Invoke-BridgeCodexCommand {
     finally {
         $env:CODEX_HOME = $previousHome
         $env:AGENT_HA_BRIDGE_CONFIG = $previousConfig
+        $env:PATH = $previousPath
         Pop-Location
     }
 }

@@ -1227,6 +1227,54 @@ function Find-BridgeUnixCommand {
     $null
 }
 
+function Get-BridgeSessionPath {
+    <#
+        The PATH a launched session is given.
+
+        The daemon's own PATH is the starting point, but it is a copy of what the
+        installer saw when the LaunchAgent was written - possibly months and one
+        package manager ago.
+
+        Finding the agent is not enough on its own, because an agent CLI is very often
+        a shim rather than a binary: /opt/local/bin/codex is a `#!/usr/bin/env node`
+        script. Find-BridgeUnixCommand located it perfectly well, and the session still
+        died on the spot with "env: node: No such file or directory", because node was
+        in the same MacPorts directory and that directory was not on the PATH the
+        daemon had inherited. All the launcher could report was "exited before
+        registering", which says nothing about why (#126).
+
+        So the directory the executable was actually found in goes on the PATH, along
+        with the usual homes of interpreters, and duplicates are dropped. An agent that
+        can be found can then also be run.
+    #>
+    param([string]$Executable, [string]$BasePath = $env:PATH)
+
+    $entries = [System.Collections.Generic.List[string]]::new()
+    $seen = [System.Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $add = {
+        param([string]$Dir)
+        if ([string]::IsNullOrWhiteSpace($Dir)) { return }
+        $trimmed = $Dir.TrimEnd('/')
+        if ([string]::IsNullOrWhiteSpace($trimmed)) { $trimmed = '/' }
+        if ($seen.Add($trimmed)) { [void]$entries.Add($trimmed) }
+    }
+
+    # First, so a shim's interpreter sitting beside it is found before any older copy
+    # elsewhere on the PATH. Split on '/' rather than with GetDirectoryName, which
+    # normalises to the host's separator and so returned a backslash path - unusable
+    # as a PATH entry - whenever this was reasoned about from Windows.
+    if ($Executable -match '^(.*)/[^/]+$') { & $add $Matches[1] }
+    foreach ($entry in @($BasePath -split ':')) { & $add $entry }
+    # The same places Find-BridgeUnixCommand looks, because an agent found in one of
+    # them generally needs its neighbours too.
+    foreach ($dir in @('/opt/homebrew/bin', '/usr/local/bin', '/opt/local/bin',
+            (Join-Path $HOME '.local/bin'), (Join-Path $HOME '.npm-global/bin'),
+            (Join-Path $HOME '.bun/bin'), '/usr/bin', '/bin', '/usr/sbin', '/sbin')) {
+        & $add $dir
+    }
+    $entries -join ':'
+}
+
 # Every agent the bridge can start, and what differs between them. The order is the
 # one 'auto' prefers: Agency first, because a machine that has it expects sessions to
 # carry an Agency profile. A launcher is not a session kind - Agency starts Copilot
@@ -3782,9 +3830,11 @@ function Start-BridgeTmuxSession {
     $session = "bridge-$($Name -replace '[^A-Za-z0-9_-]', '')"
 
     $new = @('new-session', '-d', '-s', $session, '-c', $WorkingDirectory, '-x', '220', '-y', '50')
-    # The agent inherits the daemon's PATH, which the LaunchAgent sets to the one the
-    # installer saw - node, Homebrew and npm's bin included.
-    if ($env:PATH) { $new += @('-e', "PATH=$($env:PATH)") }
+    # The agent inherits the daemon's PATH with the executable's own directory ahead
+    # of it: an agent CLI is often a shim, and its interpreter usually lives beside it
+    # rather than wherever the daemon's PATH was captured from (#126).
+    $sessionPath = Get-BridgeSessionPath -Executable $Executable
+    if ($sessionPath) { $new += @('-e', "PATH=$sessionPath") }
     if ($null -ne $Environment -and $Environment.Name) { $new += @('-e', "$($Environment.Name)=$($Environment.Value)") }
     $new += '--'
     $new += $Executable
