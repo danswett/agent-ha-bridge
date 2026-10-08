@@ -975,6 +975,42 @@ $script:Ask = @{ Started = $true; Pending = $false }
 Invoke-PendingDecisions -Headers $headers -State $state -Live $live
 Test-That 'an answered question has its card cleared and its marker removed' { $script:Cleared -contains $sid -and $script:Removed -contains $sid }
 
+Write-Host ''
+Write-Host '--- re-arming a card from its marker, when the card is idle ---'
+# Confirm-DaemonDecisionArmed exists to notice a card that is not armed and arm it from
+# the marker, for a question whose hook could not reach Home Assistant. It decided that
+# by reading the selector's `question` attribute - but an idle selector has no such
+# attribute, and reading a missing property throws under StrictMode. So the read threw,
+# the catch logged "marker re-arm check failed", and the one case the function exists
+# for was the one it never handled. The fixtures above all supply a question attribute,
+# which is more generous than Home Assistant is.
+$script:Rearmed = $false
+$script:RearmLog = @()
+function Set-CopilotMqttDecision { param($SessionId, $SessionName, $Machine, $Question, $Choices, $Fields, $DecisionId, $Headers) $script:Rearmed = $true; 'shown' }
+function Write-DaemonLog { param([string]$Message) $script:RearmLog += $Message }
+$rearmState = @{ $sid = [pscustomobject]@{ Name = 'Copilot: x'; Machine = 'M' } }
+$rearmMarker = [pscustomobject]@{ question = 'Which branch?'; choices = @('a', 'b'); fields = @(); decisionId = 'd9' }
+
+$script:Ha = @{ "select.${node}_decision" = [pscustomobject]@{ state = 'Idle'; attributes = [pscustomobject]@{ options = @('Idle'); friendly_name = 'Decision' } } }
+Confirm-DaemonDecisionArmed -SessionId $sid -Marker $rearmMarker -State $rearmState -Headers $headers
+Test-That 'an idle card with no question attribute is armed from the marker' { $script:Rearmed }
+Test-That 'and that is not reported as a failed check' {
+    @($script:RearmLog | Where-Object { $_ -like 'marker re-arm check failed*' }).Count -eq 0
+}
+
+$script:Rearmed = $false
+$script:Ha = @{ "select.${node}_decision" = [pscustomobject]@{ state = 'Awaiting answer...'; attributes = [pscustomobject]@{ question = 'Which branch?' } } }
+Confirm-DaemonDecisionArmed -SessionId $sid -Marker $rearmMarker -State $rearmState -Headers $headers
+Test-That 'a card already showing the question is left alone' { -not $script:Rearmed }
+
+$script:Rearmed = $false
+$script:RearmLog = @()
+$script:Ha = @{}
+Confirm-DaemonDecisionArmed -SessionId $sid -Marker $rearmMarker -State $rearmState -Headers $headers
+Test-That 'a card that truly cannot be read is still reported rather than armed blindly' {
+    -not $script:Rearmed -and @($script:RearmLog | Where-Object { $_ -like 'marker re-arm check failed*' }).Count -eq 1
+}
+
 Remove-Item -LiteralPath $script:DaemonConfig.LogFile -Force -ErrorAction SilentlyContinue
 Write-Host ''
 if ($script:Failures) {

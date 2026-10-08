@@ -176,7 +176,7 @@ function Confirm-DaemonDecisionArmed {
     $node = Get-CopilotMqttNodeId -SessionId $SessionId
     try {
         $armed = Get-HomeAssistantState -EntityId "select.${node}_decision" -Headers $Headers
-        if ([string]::IsNullOrWhiteSpace([string]$armed.attributes.question)) {
+        if ([string]::IsNullOrWhiteSpace((Get-BridgeStateAttribute -State $armed -Name 'question'))) {
             $shown = Set-CopilotMqttDecision -SessionId $SessionId `
                 -SessionName ([string]$State[$SessionId].Name) `
                 -Machine ([string]$State[$SessionId].Machine) `

@@ -2585,6 +2585,50 @@ function Get-BridgeHttpStatusCode {
     0
 }
 
+function Get-BridgeStateAttribute {
+    <#
+        One attribute of a Home Assistant state, as a string, or '' when it is not
+        there.
+
+        A state carries only the attributes it currently holds, so an idle decision
+        selector has no `question` at all - that is what "no question is armed" looks
+        like on the wire. Reading one straight off the object throws PropertyNotFound
+        under Set-StrictMode -Version Latest, and the callers wrap these reads in a
+        catch meant for a card that could not be read. So the ordinary case was
+        reported as a failure: "reply ownership card unavailable" was written for every
+        session on every reconcile - four lines every sixteen seconds, for ever - about
+        cards that were present and perfectly healthy.
+
+        Worse than noise in Confirm-DaemonDecisionArmed, which exists precisely to
+        notice an unarmed card and arm it from its marker: the read it used to decide
+        that threw, so the one case it was written for was the one it never handled.
+
+        Attributes arrive as an object from Invoke-RestMethod and as a dictionary from
+        a -AsHashtable reader, so both are accepted.
+    #>
+    param(
+        [AllowNull()]$State,
+        [Parameter(Mandatory)][string]$Name
+    )
+
+    if ($null -eq $State) { return '' }
+    $attributes = $null
+    if ($State -is [Collections.IDictionary]) {
+        if (-not $State.Contains('attributes')) { return '' }
+        $attributes = $State['attributes']
+    }
+    elseif ($State.PSObject.Properties['attributes']) { $attributes = $State.attributes }
+    else { return '' }
+
+    if ($null -eq $attributes) { return '' }
+    if ($attributes -is [Collections.IDictionary]) {
+        if (-not $attributes.Contains($Name)) { return '' }
+        return [string]$attributes[$Name]
+    }
+    if (-not $attributes.PSObject.Properties[$Name]) { return '' }
+    [string]$attributes.$Name
+}
+
 function Get-CopilotDecisionChannelObservation {
     <#
         What one answer channel holds right now, as { State; Value; Snapshot }, where

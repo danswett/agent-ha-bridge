@@ -65,6 +65,51 @@ Test-That 'a card left over from an answered question is cleared, freeing it' {
 $script:Ha = @{}
 Test-That 'an unreadable card is treated as free - a reply is the common case' { (Test-DaemonReplyBoxFree -SessionId $sid -Session $session -State $state -Headers $headers) -eq $true }
 
+Write-Host '--- an idle card, as Home Assistant actually serves one ---'
+# A state carries only the attributes it currently holds, so an idle selector has no
+# `question` at all - the fixtures above are more generous than Home Assistant is.
+# Reading a missing property throws under StrictMode, and the catch around that read
+# is meant for a card that could not be read, so the commonest healthy state in the
+# system was reported as a failure: "reply ownership card unavailable" for every
+# session on every reconcile, four lines every sixteen seconds, for ever.
+$script:Logged = @()
+function Write-DaemonLog { param([string]$Message) $script:Logged += $Message }
+$script:Marker = $null
+$script:Pending = $false
+$script:Cleared = 0
+$script:Ha = @{ "select.${node}_decision" = [pscustomobject]@{ state = 'Idle'; attributes = [pscustomobject]@{ options = @('Idle'); friendly_name = 'Decision' } } }
+Test-That 'a selector with no question attribute at all is simply not armed' {
+    (Test-DaemonReplyBoxFree -SessionId $sid -Session $session -State $state -Headers $headers) -eq $true
+}
+Test-That 'and nothing is said about it, because there is nothing wrong' {
+    @($script:Logged | Where-Object { $_ -like 'reply ownership card unavailable*' }).Count -eq 0
+}
+Test-That 'nor is a card that is merely idle mistaken for a stale one to clear' { $script:Cleared -eq 0 }
+$script:Logged = @()
+$script:Ha = @{}
+Test-That 'while a card that genuinely cannot be read still says so, and says why' {
+    [void](Test-DaemonReplyBoxFree -SessionId $sid -Session $session -State $state -Headers $headers)
+    @($script:Logged | Where-Object { $_ -like 'reply ownership card unavailable*' -and $_ -like '*404*' }).Count -eq 1
+}
+
+Write-Host '--- reading one attribute off a state ---'
+Test-That 'a missing attribute is empty, not an exception' {
+    (Get-BridgeStateAttribute -State ([pscustomobject]@{ state = 'Idle'; attributes = [pscustomobject]@{ options = @('Idle') } }) -Name 'question') -eq ''
+}
+Test-That 'an attribute that is there is returned' {
+    (Get-BridgeStateAttribute -State ([pscustomobject]@{ attributes = [pscustomobject]@{ question = 'Pick one' } }) -Name 'question') -eq 'Pick one'
+}
+Test-That 'a state with no attributes at all is empty' {
+    (Get-BridgeStateAttribute -State ([pscustomobject]@{ state = 'Idle' }) -Name 'question') -eq ''
+}
+Test-That 'and so is nothing' { (Get-BridgeStateAttribute -State $null -Name 'question') -eq '' }
+# A -AsHashtable reader hands back dictionaries, and the daemon's snapshot path uses one.
+Test-That 'a dictionary state is read the same way' {
+    (Get-BridgeStateAttribute -State @{ attributes = @{ question = 'From a hashtable' } } -Name 'question') -eq 'From a hashtable' -and
+    (Get-BridgeStateAttribute -State @{ attributes = @{} } -Name 'question') -eq ''
+}
+function Write-DaemonLog { param([string]$Message) }
+
 Write-Host '--- a Codex approval owns the card too ---'
 # It arms the same selector, but through its PermissionRequest hook rather than
 # ask_user, so Get-CopilotDecisionMarker returns nothing for it. Only that marker was

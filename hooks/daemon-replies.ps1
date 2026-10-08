@@ -434,11 +434,16 @@ function Test-DaemonReplyBoxFree {
     $armedQuestion = ''
     try {
         $decisionState = Get-DaemonEntityState -EntityId "select.${node}_decision" -Headers $Headers
-        $armedQuestion = [string]$decisionState.attributes.question
+        $armedQuestion = Get-BridgeStateAttribute -State $decisionState -Name 'question'
     }
     catch {
         if ($_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
-        Write-DaemonLog -Message "reply ownership card unavailable for $sessionId; rechecking local owners"
+        # Only a card that genuinely could not be read reaches this now, so it says why.
+        # It used to be written for every session on every reconcile, because an idle
+        # selector has no `question` attribute and reading one throws under StrictMode -
+        # so the commonest healthy state in the system was reported as a failure, four
+        # lines every sixteen seconds, and the log stopped being worth reading.
+        Write-DaemonLog -Message "reply ownership card unavailable for $sessionId : $($_.Exception.Message); rechecking local owners"
     }
     if (& $ownsInput) { return $false }
     if ([string]::IsNullOrWhiteSpace($armedQuestion)) { return $true }
