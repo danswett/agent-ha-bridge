@@ -1696,6 +1696,28 @@ Test-That 'an adapter reason survives to the status line too' {
     $health.Detail -match 'AdapterReadFailed: Registration directory is unreadable\.'
 }
 
+# The reason comes straight from an exception message, so it can contain anything -
+# a path, or a command with arguments. Ending the capture at the first ")" truncated
+# it exactly where it got interesting. Found by review on #138.
+Test-That 'a reason containing brackets is carried whole, not cut at the first one' {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+        New-SustainedLogLines 'session discovery uncertain (codex/AdapterReadFailed: cannot read /Users/d/Library/Application Support (sandboxed) registrations); absence-based work is held'
+    }
+    $health.Detail -match 'Application Support \(sandboxed\) registrations'
+}
+
+# One pass writes a line per issue, so several processes can hold at once. Naming only
+# the last left "(x4)" standing over a single process while the others went unmentioned
+# - and they have to be dealt with too. Found by review on #138.
+Test-That 'several processes holding at once are all named, not just the last' {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+        @((New-SustainedLogLines 'session discovery uncertain (copilot/UnaccountedProcess pid 11); absence-based work is held' -Count 11),
+          (New-SustainedLogLines 'session discovery uncertain (codex/UnaccountedProcess pid 22); absence-based work is held' -Count 11)) |
+            ForEach-Object { $_ }
+    }
+    $health.Detail -match 'pid 11' -and $health.Detail -match 'pid 22'
+}
+
 Test-That 'which agent died before registering is named' {
     $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
         @(New-DaemonLogLine 'launched Codex (pid 31857) exited before registering')
@@ -1703,15 +1725,15 @@ Test-That 'which agent died before registering is named' {
     $health.Detail -match 'Codex \(pid 31857\)'
 }
 
-# The cause can change while the hold persists, and the one in front of someone is
-# the one they can act on.
-Test-That 'the newest cause is the one described' {
+# The cause can change while the hold persists, and every one of them is something
+# that was holding - so they are all named rather than only whichever was last.
+Test-That 'a cause that has changed over the window keeps both, newest first' {
     $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
         @((New-SustainedLogLines 'session discovery uncertain (claude/UnaccountedProcess pid 1); absence-based work is held' -AgeMinutes 90),
           (New-SustainedLogLines 'session discovery uncertain (codex/UnaccountedProcess pid 2); absence-based work is held' -AgeMinutes 2)) |
             ForEach-Object { $_ }
     }
-    $health.Detail -match 'codex/UnaccountedProcess pid 2' -and $health.Detail -notmatch 'claude'
+    $health.Detail -match 'codex/UnaccountedProcess pid 2' -and $health.Detail -match 'claude/UnaccountedProcess pid 1'
 }
 
 Test-That 'several different faults are all named, not just the first' {

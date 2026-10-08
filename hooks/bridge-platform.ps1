@@ -1425,7 +1425,7 @@ function Get-BridgeRegistrationHealth {
         @{ Match = 'Session discovery is incomplete'; Says = 'launches are being refused: session discovery is incomplete'
            Capture = ''; Least = 1 }
         @{ Match = 'session discovery uncertain'; Says = 'session discovery is held, so retirement and cleanup wait'
-           Capture = 'session discovery uncertain \(([^)]*)\)'; Least = 20 }
+           Capture = 'session discovery uncertain \((.+)\); absence-based work is held'; Least = 20 }
         @{ Match = 'holding for '; Says = 'session discovery is held by a process it cannot account for'
            Capture = 'holding for ([^:]+?)(?::|$)'; Least = 20 }
     )
@@ -1454,10 +1454,16 @@ function Get-BridgeRegistrationHealth {
             if (-not $found.Contains($says)) { $found[$says] = 0 }
             $found[$says] = [int]$found[$says] + 1
             $least[$says] = [int]$symptom.Least
-            # The newest line wins, because a hold that has changed cause should be
-            # described by the cause it has now.
+            # Every distinct cause is kept, not just the newest. A pass writes one line
+            # per issue, so several processes can be holding at once; storing only the
+            # last one left the count saying (x4) while naming a single process, which
+            # hides holds that also have to be dealt with. Found by review on #138.
             $capture = [string]$symptom.Capture
-            if ($capture -and $line -match $capture) { $named[$says] = $Matches[1].Trim() }
+            if ($capture -and $line -match $capture) {
+                $text = $Matches[1].Trim()
+                if (-not $named.ContainsKey($says)) { $named[$says] = [Collections.Generic.List[string]]::new() }
+                if ($text -and -not $named[$says].Contains($text)) { [void]$named[$says].Add($text) }
+            }
             if (-not $seenAt.ContainsKey($says) -or $when -gt $seenAt[$says]) { $seenAt[$says] = $when }
         }
     }
@@ -1481,7 +1487,16 @@ function Get-BridgeRegistrationHealth {
     if ($found.Count -gt 0) {
         $parts = foreach ($says in $found.Keys) {
             $count = [int]$found[$says]
-            $text = if ($named.ContainsKey($says) -and $named[$says]) { "$says ($($named[$says]))" } else { $says }
+            $text = $says
+            if ($named.ContainsKey($says) -and $named[$says].Count -gt 0) {
+                # Capped, because over six hours a hold whose cause keeps changing
+                # would otherwise print a paragraph on the one screen meant to be
+                # skimmed. Three names the ones worth chasing and says there are more.
+                $causes = @($named[$says])
+                $shown = @($causes | Select-Object -First 3)
+                $suffix = if ($causes.Count -gt $shown.Count) { ", +$($causes.Count - $shown.Count) more" } else { '' }
+                $text = "$says ($($shown -join ', ')$suffix)"
+            }
             if ($count -gt 1) { "$text (x$count)" } else { $text }
         }
         $ago = [int]([DateTimeOffset]::Now - $latest).TotalMinutes
