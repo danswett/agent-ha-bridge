@@ -1508,6 +1508,13 @@ Test-That 'the stale registration is removed before Codex is asked anything' {
     $codexCleanup -gt 0 -and $codexCleanup -lt $codexListing
 } "cleanup=$codexCleanup listing=$codexListing"
 
+# Uninstalling asks Codex to deregister, so on the very machines this repairs - where
+# every plugin command exits 1 - uninstall would fail too if cleanup came after it.
+$codexUninstall = [regex]::Match($codexSource, '(?m)^if \(\$Uninstall\) \{').Index
+Test-That 'and before the uninstall branch, which would otherwise fail the same way' {
+    $codexUninstall -gt 0 -and $codexCleanup -lt $codexUninstall
+} "cleanup=$codexCleanup uninstall=$codexUninstall"
+
 # Run the real readers against real config text, rather than asserting on source
 # order: the parsing is where this can quietly stop working.
 $codexAst = [System.Management.Automation.Language.Parser]::ParseInput($codexSource, [ref]$null, [ref]$null)

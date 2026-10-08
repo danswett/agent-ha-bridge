@@ -257,6 +257,13 @@ function Remove-BridgeCodexAdapter {
 if ($env:BRIDGE_INSTALL_NORUN) { return }
 if ($RepairOnly -and -not $Uninstall) { Assert-BridgeAdapterSelection -Context $installContext -Client codex }
 
+# Before anything asks Codex a question, and before the uninstall branch below: a
+# stale pre-rename registration makes every plugin command fail, so uninstalling on
+# the very machines this repairs would fail too - Remove-BridgeCodexAdapter asks Codex
+# to deregister. Cleanup runs without the CLI if it has to, by rewriting config.toml,
+# so it belongs ahead of the Codex-not-found guard as well.
+Remove-BridgeCodexLegacyRegistration
+
 # ------------------------------------------------------------------ uninstall
 if ($Uninstall) {
     Write-Step 'Removing the Codex adapter'
@@ -304,9 +311,6 @@ Write-Host '    bridge-platform.ps1'
 if (-not $codex) {
     throw 'Codex CLI was not found. Install it with: npm install -g @openai/codex'
 }
-# Before anything asks Codex a question: a stale pre-rename registration makes every
-# plugin command fail, including the read below.
-Remove-BridgeCodexLegacyRegistration
 $existingMarketplace = Get-BridgeCodexMarketplace
 
 $versionFile = Join-Path (Split-Path $PSScriptRoot -Parent) 'VERSION'
