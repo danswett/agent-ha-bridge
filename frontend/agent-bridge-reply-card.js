@@ -23,7 +23,23 @@
  * uploaded image these sit in the sensor's attributes.
  */
 
-const CARD_VERSION = '1.27.0';
+/*
+ * 1.28.0 and not 1.27.1: 1.27.0 was published to a live Home Assistant from a
+ * work-in-progress build of #96, and the branch moved on before it merged. The
+ * released 1.27.0 is therefore different bytes under the same number, which the
+ * publication fence correctly refuses to overwrite ("Equal card versions have
+ * conflicting content"), so that Home Assistant went on serving the unfinished
+ * card indefinitely.
+ *
+ * The dashboard generator gates on the served version alone, so it offered that
+ * card 1.27.0 features it did not have: the answer form drew a second Send, and
+ * Send answer never published the reply box, so every answer came back "Answer
+ * unconfirmed - check the terminal".
+ *
+ * Skipping the number is the fence's own first remedy, and what was done when
+ * #98 contaminated 1.26.0 the same way. The card itself is unchanged.
+ */
+const CARD_VERSION = '1.28.0';
 
 /*
  * How large a non-image attachment may be.
