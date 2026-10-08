@@ -1085,14 +1085,20 @@ function Publish-DaemonGlobalStatus {
         "#$($Capabilities.newSession)$($Capabilities.profile)$($Capabilities.resume)$($Capabilities.agent)$($Capabilities.tuning)$($Capabilities.detailed)$($Capabilities.dev)" +
         "#fleet=$(if ($Capabilities.ContainsKey('fleet')) { $Capabilities.fleet } else { '' })" +
         "#$resumeSignature"
+    $discoveryHeld = ''
+    try { $discoveryHeld = Get-DaemonDiscoveryHoldSummary -Snapshot $script:DaemonDiscoverySnapshot } catch { $discoveryHeld = '' }
     $globalStale = ([DateTimeOffset]::Now - $script:DaemonGlobalLastPublish).TotalSeconds -ge $script:DaemonConfig.GlobalReassertSeconds
+    # The hold is part of the signature, or a machine that became held - or stopped
+    # being held - would keep publishing the state it had when something else last
+    # changed, which is exactly when somebody is looking to see why it is stuck.
+    $globalSignature = "$globalSignature#held=$discoveryHeld"
     if ($globalSignature -ne $script:DaemonGlobalSignature -or $globalStale) {
         try {
             Publish-CopilotMqttGlobalStatus -Headers $Headers -Capabilities $Capabilities -Sessions @(
                 $Descriptors | ForEach-Object {
                     @{ name = $_.Name; machine = $_.Machine; node = $_.Node; kind = [string]$_.Kind }
                 }
-            ) -Resumable $export
+            ) -Resumable $export -DiscoveryHeld $discoveryHeld
             $script:DaemonGlobalSignature = $globalSignature
             $script:DaemonGlobalLastPublish = [DateTimeOffset]::Now
         }

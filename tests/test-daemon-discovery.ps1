@@ -123,6 +123,11 @@ function Reset-FixtureState {
     $script:DaemonOwnerCatalogue = @{}
     $script:DaemonPendingRetire = @()
     $script:DaemonDiscoverySnapshot = $null
+    # Ageing state carries across passes on purpose - that is how a process earns its
+    # way out of holding discovery - so a group that does not clear it inherits the
+    # previous group's clock and stops testing what it says it does.
+    $script:DaemonUnaccountedSince = @{}
+    $script:DaemonUnaccountedReported = @{}
     $script:ClaudeAdapterLoaded = $false
     $script:CodexAdapterLoaded = $false
     if (Test-Path -LiteralPath $script:DaemonConfig.LogFile) {
@@ -408,6 +413,117 @@ Test-That 'restoring the adapter restores discovery without a daemon restart' {
     $recovered = Get-DaemonSessionDiscovery
     $recovered.Complete -and $recovered.Live.ContainsKey('copilot-1')
 }
+
+# --------------------------------------------- healing a wedged discovery ----
+
+Write-Host ''
+Write-Host 'A process that never accounts for itself'
+
+# Twice in one day a program that is not a session and never registers - Codex's
+# app-server, Scout's embedded copilot --headless - held retirement, the orphan sweep
+# and every launch on a machine until that specific case was identified in code. Each
+# fix was another entry on a list, and the next such program would have wedged it the
+# same way. A session registers within seconds, so one still unaccounted for minutes
+# later is positive evidence that it is not a session that is still starting up.
+
+Reset-FixtureState -Kinds @('copilot')
+$script:ProcessesByAgent = @{ copilot = @([pscustomobject]@{ Id = 31001; ProcessName = 'copilot'; StartedUtcTicks = 111 }) }
+$fresh = Get-DaemonSessionDiscovery
+
+Test-That 'a process that has only just appeared still holds absence-based work' {
+    -not $fresh.Complete -and (Get-FixtureDiagnosticCodes -Snapshot $fresh) -contains 'UnaccountedProcess'
+} "complete=$($fresh.Complete) codes: $((Get-FixtureDiagnosticCodes -Snapshot $fresh) -join ', ')"
+
+# Back-dating the clock rather than waiting: the grace is minutes, and the behaviour
+# under test is what happens once it has passed.
+foreach ($key in @($script:DaemonUnaccountedSince.Keys)) {
+    $script:DaemonUnaccountedSince[$key] = [DateTimeOffset]::Now.AddMinutes(-10)
+}
+$aged = Get-DaemonSessionDiscovery
+
+Test-That 'but once it has been silent for long enough the bridge carries on without it' {
+    $aged.Complete -and (Get-FixtureDiagnosticCodes -Snapshot $aged) -notcontains 'UnaccountedProcess'
+} "complete=$($aged.Complete) codes: $((Get-FixtureDiagnosticCodes -Snapshot $aged) -join ', ')"
+
+Test-That 'and says so, naming the process it decided to leave out' {
+    (Get-FixtureLogText) -match 'carrying on without copilot process 31001'
+} (Get-FixtureLogText)
+
+$again = Get-DaemonSessionDiscovery
+
+Test-That 'saying it once, not on every pass for as long as the process runs' {
+    ([regex]::Matches((Get-FixtureLogText), 'carrying on without copilot process 31001')).Count -eq 1 -and $again.Complete
+} "occurrences: $(([regex]::Matches((Get-FixtureLogText), 'carrying on without copilot process 31001')).Count)"
+
+# A pid is reused, and the number alone cannot tell a process that has been silent for
+# minutes from a new one that has just inherited it. Excusing the newcomer on the old
+# one's record would let absence-based work run against a session still registering.
+Reset-FixtureState -Kinds @('copilot')
+$script:ProcessesByAgent = @{ copilot = @([pscustomobject]@{ Id = 31002; ProcessName = 'copilot'; StartedUtcTicks = 111 }) }
+[void](Get-DaemonSessionDiscovery)
+foreach ($key in @($script:DaemonUnaccountedSince.Keys)) {
+    $script:DaemonUnaccountedSince[$key] = [DateTimeOffset]::Now.AddMinutes(-10)
+}
+$script:ProcessesByAgent = @{ copilot = @([pscustomobject]@{ Id = 31002; ProcessName = 'copilot'; StartedUtcTicks = 222 }) }
+$reused = Get-DaemonSessionDiscovery
+
+Test-That 'a reused pid starts its own clock rather than inheriting the silence' {
+    -not $reused.Complete -and (Get-FixtureDiagnosticCodes -Snapshot $reused) -contains 'UnaccountedProcess'
+} "complete=$($reused.Complete) codes: $((Get-FixtureDiagnosticCodes -Snapshot $reused) -join ', ')"
+
+# A process that registers late must not keep a record that would excuse it instantly
+# if it ever went unaccounted again.
+Reset-FixtureState -Kinds @('copilot')
+$script:ProcessesByAgent = @{ copilot = @([pscustomobject]@{ Id = 31003; ProcessName = 'copilot'; StartedUtcTicks = 333 }) }
+[void](Get-DaemonSessionDiscovery)
+$script:SessionsByKind = @{
+    copilot = @{ 'copilot-late' = New-FixtureSession -SessionId 'copilot-late' -ProcessId 31003 -Kind 'copilot' }
+}
+[void](Get-DaemonSessionDiscovery)
+$script:SessionsByKind = @{}
+$relapsed = Get-DaemonSessionDiscovery
+
+Test-That 'a process that registered and then stopped being accounted for starts over' {
+    -not $relapsed.Complete -and (Get-FixtureDiagnosticCodes -Snapshot $relapsed) -contains 'UnaccountedProcess'
+} "complete=$($relapsed.Complete) codes: $((Get-FixtureDiagnosticCodes -Snapshot $relapsed) -join ', ')"
+
+# Being held is only discoverable by reading this log on the machine itself, which is
+# why a day went into finding the process behind a refused launch.
+Reset-FixtureState -Kinds @('copilot')
+$script:ProcessesByAgent = @{ copilot = @([pscustomobject]@{ Id = 31004; ProcessName = 'copilot'; StartedUtcTicks = 444 }) }
+$heldSnapshot = Get-DaemonSessionDiscovery
+
+Test-That 'what is holding discovery can be said in words, naming the process' {
+    (Get-DaemonDiscoveryHoldSummary -Snapshot $heldSnapshot) -match 'unrecognised copilot process \(pid 31004\)'
+} (Get-DaemonDiscoveryHoldSummary -Snapshot $heldSnapshot)
+
+Test-That 'and a discovery that is holding nothing says nothing' {
+    foreach ($key in @($script:DaemonUnaccountedSince.Keys)) {
+        $script:DaemonUnaccountedSince[$key] = [DateTimeOffset]::Now.AddMinutes(-10)
+    }
+    (Get-DaemonDiscoveryHoldSummary -Snapshot (Get-DaemonSessionDiscovery)) -eq ''
+}
+
+# A process whose start time cannot be read - an older adapter's copy of the platform
+# layer reports none, and a denied read carries 0 - has no generation to tell it apart
+# from a new session that reuses its pid and name between passes. That newcomer would
+# inherit the elapsed clock and be excused on sight, and discovery would go Complete
+# while it was still registering. Excusing takes positive identification here too.
+Reset-FixtureState -Kinds @('copilot')
+$script:ProcessesByAgent = @{ copilot = @([pscustomobject]@{ Id = 31005; ProcessName = 'copilot' }) }
+[void](Get-DaemonSessionDiscovery)
+foreach ($key in @($script:DaemonUnaccountedSince.Keys)) {
+    $script:DaemonUnaccountedSince[$key] = [DateTimeOffset]::Now.AddMinutes(-10)
+}
+$noGeneration = Get-DaemonSessionDiscovery
+
+Test-That 'a process with no readable start time is never aged out, however long it waits' {
+    -not $noGeneration.Complete -and (Get-FixtureDiagnosticCodes -Snapshot $noGeneration) -contains 'UnaccountedProcess'
+} "complete=$($noGeneration.Complete) codes: $((Get-FixtureDiagnosticCodes -Snapshot $noGeneration) -join ', ')"
+
+Test-That 'and says why, so a machine held for that reason can be diagnosed' {
+    (Get-FixtureLogText) -match 'holding for copilot process 31005 .*no readable start time'
+} (Get-FixtureLogText)
 
 # ------------------------------------------------------------- the test guard ----
 

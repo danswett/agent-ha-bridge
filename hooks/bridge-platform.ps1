@@ -837,7 +837,20 @@ function Get-BridgeAgentProcesses {
                 }
                 # Return identity facts, not a borrowed/mutated process object or the
                 # command line used locally by the existing identification predicate.
-                $positive[$processId] = [pscustomobject]@{ Id = $processId; ProcessName = $processName }
+                # The start time is one of those facts: discovery ages an unaccounted
+                # process out of holding everything up, and a pid alone cannot tell a
+                # process that has been silent for minutes from a new one that has
+                # just inherited its number.
+                $startedUtcTicks = [long]0
+                try {
+                    if ($candidate.PSObject.Properties['StartTime']) {
+                        $startedUtcTicks = [long]([datetime]$candidate.StartTime).ToUniversalTime().Ticks
+                    }
+                }
+                catch { $startedUtcTicks = [long]0 }
+                $positive[$processId] = [pscustomobject]@{
+                    Id = $processId; ProcessName = $processName; StartedUtcTicks = $startedUtcTicks
+                }
             }
         }
         catch {
