@@ -1672,12 +1672,46 @@ Test-That 'discovery held on a process it cannot account for is reported' {
     (-not $health.Ok) -and $health.Detail -match 'cannot account for'
 }
 
+# #120 put the kind and pid on these lines, and #128 the adapter's reason, precisely
+# because a bare code sent people hunting. Collapsing it back to a fixed sentence here
+# would throw that away again on the screen most likely to be read.
+Test-That 'the held kind and pid are carried through, not collapsed into a fixed phrase' {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+        @(New-DaemonLogLine 'session discovery uncertain (codex/UnaccountedProcess pid 4412); absence-based work is held')
+    }
+    $health.Detail -match 'codex/UnaccountedProcess pid 4412'
+}
+
+Test-That 'an adapter reason survives to the status line too' {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+        @(New-DaemonLogLine 'session discovery uncertain (copilot/AdapterReadFailed: Registration directory is unreadable.); absence-based work is held')
+    }
+    $health.Detail -match 'AdapterReadFailed: Registration directory is unreadable\.'
+}
+
+Test-That 'which agent died before registering is named' {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+        @(New-DaemonLogLine 'launched Codex (pid 31857) exited before registering')
+    }
+    $health.Detail -match 'Codex \(pid 31857\)'
+}
+
+# The cause can change while the hold persists, and the one in front of someone is
+# the one they can act on.
+Test-That 'the newest cause is the one described' {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+        @((New-DaemonLogLine 'session discovery uncertain (claude/UnaccountedProcess pid 1); absence-based work is held' -AgeMinutes 90),
+          (New-DaemonLogLine 'session discovery uncertain (codex/UnaccountedProcess pid 2); absence-based work is held' -AgeMinutes 2))
+    }
+    $health.Detail -match 'codex/UnaccountedProcess pid 2' -and $health.Detail -notmatch 'claude'
+}
+
 Test-That 'several different faults are all named, not just the first' {
     $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
         @((New-DaemonLogLine 'launched Codex (pid 1) exited before registering'),
           (New-DaemonLogLine 'session discovery uncertain (codex/AdapterReadFailed); absence-based work is held'))
     }
-    $health.Detail -match 'died before it could register' -and $health.Detail -match 'uncertain'
+    $health.Detail -match 'died before it could register' -and $health.Detail -match 'discovery is held'
 }
 
 Test-That 'a fault repeating is counted rather than listed twice' {

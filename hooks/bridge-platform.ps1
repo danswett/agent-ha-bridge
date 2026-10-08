@@ -1400,11 +1400,20 @@ function Get-BridgeRegistrationHealth {
         }
     }
 
+    # Capture names the part of the line that says which thing is responsible. #120
+    # put the kind and pid on the uncertainty line, and #128 the adapter's reason,
+    # precisely because the bare code sent people hunting; collapsing it back to a
+    # fixed sentence here would throw that away again on the one screen most likely
+    # to be read.
     $symptoms = @(
-        @{ Match = 'exited before registering'; Says = 'a launched session died before it could register' }
-        @{ Match = 'Session discovery is incomplete'; Says = 'launches are being refused: session discovery is incomplete' }
-        @{ Match = 'session discovery uncertain'; Says = 'session discovery is uncertain, so retirement and cleanup are held' }
-        @{ Match = 'holding for '; Says = 'session discovery is held by a process it cannot account for' }
+        @{ Match = 'exited before registering'; Says = 'a launched session died before it could register'
+           Capture = 'launched\s+(.+?)\s+exited before registering' }
+        @{ Match = 'Session discovery is incomplete'; Says = 'launches are being refused: session discovery is incomplete'
+           Capture = '' }
+        @{ Match = 'session discovery uncertain'; Says = 'session discovery is held, so retirement and cleanup wait'
+           Capture = 'session discovery uncertain \(([^)]*)\)' }
+        @{ Match = 'holding for '; Says = 'session discovery is held by a process it cannot account for'
+           Capture = 'holding for ([^:]+?)(?::|$)' }
     )
 
     $lines = @()
@@ -1412,6 +1421,7 @@ function Get-BridgeRegistrationHealth {
 
     $cutoff = [DateTimeOffset]::Now.AddHours(-$WithinHours)
     $found = [ordered]@{}
+    $named = @{}
     $latest = $null
     foreach ($line in $lines) {
         if ([string]::IsNullOrWhiteSpace($line)) { continue }
@@ -1428,6 +1438,10 @@ function Get-BridgeRegistrationHealth {
             $says = [string]$symptom.Says
             if (-not $found.Contains($says)) { $found[$says] = 0 }
             $found[$says] = [int]$found[$says] + 1
+            # The newest line wins, because a hold that has changed cause should be
+            # described by the cause it has now.
+            $capture = [string]$symptom.Capture
+            if ($capture -and $line -match $capture) { $named[$says] = $Matches[1].Trim() }
             if ($null -eq $latest -or $when -gt $latest) { $latest = $when }
         }
     }
@@ -1436,7 +1450,8 @@ function Get-BridgeRegistrationHealth {
     if ($found.Count -gt 0) {
         $parts = foreach ($says in $found.Keys) {
             $count = [int]$found[$says]
-            if ($count -gt 1) { "$says (x$count)" } else { $says }
+            $text = if ($named.ContainsKey($says) -and $named[$says]) { "$says ($($named[$says]))" } else { $says }
+            if ($count -gt 1) { "$text (x$count)" } else { $text }
         }
         $ago = [int]([DateTimeOffset]::Now - $latest).TotalMinutes
         $detail = ($parts -join '; ') + " - last $ago min ago"
