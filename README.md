@@ -1274,7 +1274,9 @@ On the dashboard that press is on the machine's own row in **Agent sessions**, w
 it takes the place of that row's **Detail** switch, and it is only there when there is
 something to say. It names the version it would install — *Update to 1.33.9* — and
 while the update runs it reports the stage the updater has actually reached:
-*Checking*, *Downloading* with a proportion, *Installing*, *Restarting*, *Verifying*.
+*Checking*, *Downloading*, *Installing*, *Restarting*, *Verifying*. A stage that
+reports how far it has got is drawn as a bar as well; no stage reports one yet, so
+today each is named without a percentage.
 A machine that is part-way through shows that rather than the **✕**, because its
 liveness sensor expires while its own daemon restarts — which is one of the stages.
 
