@@ -600,8 +600,10 @@ function Publish-CopilotMqttUpdate {
         # Where the update has actually got to, from the updater itself. A spinner says
         # only that something is happening; on a slow or failing update that is exactly
         # when people press again or go to a shell, and tonight both made things worse
-        # (#129). Empty when no attempt is running.
+        # (#129). Empty when no attempt is running. Published as an entity attribute,
+        # because the state payload accepts only the fields in MQTT_JSON_UPDATE_SCHEMA.
         [string]$Stage = '',
+        # 0 to 1. Published as update_percentage, which is the schema's own field.
         [AllowNull()][object]$Proportion = $null,
         # Why that stage, in words, for the stages where "failed" alone is useless.
         # Same always-published rule as the stage itself.
@@ -614,12 +616,21 @@ function Publish-CopilotMqttUpdate {
     $node = Get-CopilotMqttMachineNode -Slug $Slug
     $device = Get-CopilotMqttMachineDevice -Slug $Slug
     $stateTopic = "$(Get-CopilotMqttMachineTopicRoot -Slug $Slug)/update/state"
+    # Stage and its explanation travel here, not on the state topic. Home Assistant
+    # validates the state payload against MQTT_JSON_UPDATE_SCHEMA, a plain vol.Schema
+    # with no ALLOW_EXTRA: one unknown key raises MultipleInvalid, and the handler
+    # logs a warning and *returns*, so the whole payload is discarded. Putting a
+    # custom key there would have stopped installed_version and latest_version ever
+    # being applied again - the machine reading as dead on the dashboard, which is
+    # #109. Found by review on #129.
+    $attributesTopic = "$(Get-CopilotMqttMachineTopicRoot -Slug $Slug)/update/attributes"
 
     $config = @{
         name        = 'Update'
         unique_id   = "agent_bridge_${Slug}_update"
         object_id   = "agent_bridge_${Slug}_update"
         state_topic = $stateTopic
+        json_attributes_topic = $attributesTopic
         availability_topic = $stateTopic
         availability_template = "{{ 'online' if value_json.get('latest_version') else 'offline' }}"
         device_class = 'firmware'
@@ -644,18 +655,13 @@ function Publish-CopilotMqttUpdate {
         # clears it the moment a later publish reports false, rather than inferring
         # the flag from an absent key.
         in_progress       = [bool]$InProgress
-        # Named rather than inferred from in_progress, so a card can say "installing"
-        # instead of "working". Empty string rather than omitted: an omitted key is
-        # retained from the previous publish, which would leave a finished update
-        # showing the stage it was at when it finished.
+        # The proportion has a native home: update_percentage is 0-100 or null, and
+        # anything else - including the empty string - violates the schema and makes
+        # Home Assistant discard the entire payload. Explicitly null rather than
+        # omitted, because an omitted key keeps the last percentage shown.
         #
-        # The progress stages come from the updater itself; `completed`, `failed` and
-        # `current` are the three terminal verdicts the daemon reports, and they are
-        # kept apart deliberately - a release that was already installed is not a
-        # failure, which is the conflation #92 is about.
-        stage             = [string]$Stage
-        stage_proportion  = $(if ($null -eq $Proportion) { '' } else { [double]$Proportion })
-        stage_detail      = [string]$StageDetail
+        # Reported only while in_progress is true: UpdateEntity blanks it otherwise.
+        update_percentage = $(if ($null -eq $Proportion) { $null } else { [math]::Round([double]$Proportion * 100, 0) })
     }
     # Stock MQTT update rejects JSON null versions and retains an omitted version.
     # Availability therefore carries "not established", without inventing a version
@@ -665,6 +671,20 @@ function Publish-CopilotMqttUpdate {
 
     Publish-CopilotMqttMessage -Topic $stateTopic `
         -Payload ($state | ConvertTo-Json -Depth 6 -Compress) -Headers $Headers -Retain
+
+    # Named rather than inferred from in_progress, so a card can say "installing"
+    # instead of "working". Empty strings rather than omitted keys: an omitted key is
+    # retained from the previous publish, which would leave a finished update showing
+    # the stage it was at when it finished.
+    #
+    # The progress stages come from the updater itself; `completed`, `failed` and
+    # `current` are the three terminal verdicts the daemon reports, and they are kept
+    # apart deliberately - a release that was already installed is not a failure,
+    # which is the conflation #92 is about.
+    Publish-CopilotMqttMessage -Topic $attributesTopic -Payload (@{
+        stage        = [string]$Stage
+        stage_detail = [string]$StageDetail
+    } | ConvertTo-Json -Depth 4 -Compress) -Headers $Headers -Retain
 
     $button = @{
         name          = 'Install Bridge Update'

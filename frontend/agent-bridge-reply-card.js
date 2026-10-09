@@ -2829,16 +2829,18 @@ class AgentBridgeStatusCard extends HTMLElement {
     return !!(entityId && this._hass && this._hass.states[entityId]);
   }
 
-  // The published proportion, or null unless it is a number between 0 and 1. It is
-  // empty for every stage that is not a transfer, and a bar drawn at an arbitrary
-  // place is worse than no bar. Read from the state rather than through _attr,
-  // which reports a genuine 0 as no value at all.
+  // The proportion Home Assistant reports, as 0 to 1, or null when there is none.
+  //
+  // `update_percentage` is the update entity's own field rather than anything this
+  // bridge invented: the MQTT state payload is validated against a schema that
+  // accepts no extra keys, and one unknown key makes Home Assistant discard the
+  // whole payload. It is 0-100, and blanked entirely unless in_progress is true.
   _proportion(entityId) {
     const s = entityId && this._hass ? this._hass.states[entityId] : undefined;
-    const raw = s && s.attributes ? s.attributes.stage_proportion : undefined;
+    const raw = s && s.attributes ? s.attributes.update_percentage : undefined;
     if (raw === undefined || raw === null || raw === '') { return null; }
     const value = Number(raw);
-    return Number.isFinite(value) && value >= 0 && value <= 1 ? value : null;
+    return Number.isFinite(value) && value >= 0 && value <= 100 ? value / 100 : null;
   }
 
   _drawUpdate(entry, verdict) {

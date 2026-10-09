@@ -73,6 +73,10 @@ function Invoke-CopilotHaWebSocket {
 function Get-StatePayload {
     ($script:MqttMsgs | Where-Object { $_.Topic -match '/update/state$' } | Select-Object -Last 1).Payload
 }
+function Get-UpdateAttributesPayload {
+    <# The entity attributes, which is where anything outside HA's schema has to go. #>
+    ($script:MqttMsgs | Where-Object { $_.Topic -match '/update/attributes$' } | Select-Object -Last 1).Payload
+}
 function Reset-UpdateCapture {
     $script:MqttMsgs = @()
     $script:Notified = @()
@@ -104,6 +108,27 @@ function Receive-UpdatePayload {
         throw 'The discovery payload does not match the supported availability contract.'
     }
     $wire = $StatePayload | ConvertFrom-Json -AsHashtable
+    # MQTT_JSON_UPDATE_SCHEMA is a plain vol.Schema with no ALLOW_EXTRA, so an
+    # unrecognised key raises MultipleInvalid and _handle_state_message_received
+    # logs a warning and returns - the entire payload is discarded and the entity
+    # keeps whatever it had, including its versions. Modelled here because the
+    # fixture previously tracked only the keys it knew and so accepted a payload
+    # Home Assistant would have thrown away whole, which is how three invented
+    # keys reached a published entity (#129 review).
+    $allowed = @('installed_version', 'latest_version', 'title', 'release_summary',
+        'release_url', 'entity_picture', 'in_progress', 'update_percentage')
+    $unknown = @($wire.Keys | Where-Object { $_ -cnotin $allowed })
+    if ($unknown.Count -gt 0) {
+        throw "Home Assistant would discard this payload whole: $($unknown -join ', ') are not in MQTT_JSON_UPDATE_SCHEMA."
+    }
+    # vol.Any(vol.Range(min=0, max=100), None): an empty string is a violation, and
+    # a violation costs the whole payload rather than just this field.
+    if ($wire.Contains('update_percentage') -and $null -ne $wire['update_percentage']) {
+        $percentage = $wire['update_percentage'] -as [double]
+        if ($null -eq $percentage -or $percentage -lt 0 -or $percentage -gt 100) {
+            throw "Home Assistant would discard this payload whole: update_percentage '$($wire['update_percentage'])' is neither null nor 0-100."
+        }
+    }
     foreach ($key in @('installed_version', 'latest_version')) {
         if ($wire.Contains($key)) {
             if ($wire[$key] -isnot [string] -or $wire[$key] -notmatch '^\d+\.\d+\.\d+$') {
@@ -127,6 +152,31 @@ Publish-CopilotMqttUpdate -InstalledVersion '1.1.0' -LatestVersion '1.2.0' -Rele
 Receive-UpdatePayload $consumer
 Assert-UpdateOutcome 'a real available publish carries the spinner and newer version' ($consumer.state -eq 'on' -and $consumer.in_progress)
 Assert-UpdateOutcome 'the real publisher preserves nonempty release notes' ($consumer.release_summary -ceq 'Fixture release notes')
+
+# Everything Home Assistant is told has to survive its own schema, because a single
+# key outside it costs the whole payload - versions included.
+Reset-UpdateCapture
+Publish-CopilotMqttUpdate -InstalledVersion '1.1.0' -LatestVersion '1.2.0' -InProgress `
+    -Stage 'downloading' -Proportion 0.42 -StageDetail 'fetching the release' -Headers $headers
+$accepted = $true
+$rejection = ''
+try { Receive-UpdatePayload $consumer }
+catch { $accepted = $false; $rejection = $_.Exception.Message }
+Assert-UpdateOutcome 'a payload carrying progress is one Home Assistant would accept' $accepted "[$rejection]"
+Assert-UpdateOutcome 'and the proportion travels as the schema own update_percentage' (
+    (Get-StatePayload | ConvertFrom-Json -AsHashtable)['update_percentage'] -eq 42)
+Assert-UpdateOutcome 'with no proportion published as null rather than an empty string' (
+    $(
+        Publish-CopilotMqttUpdate -InstalledVersion '1.1.0' -LatestVersion '1.2.0' -Headers $headers
+        $idle = Get-StatePayload | ConvertFrom-Json -AsHashtable
+        $idle.Contains('update_percentage') -and $null -eq $idle['update_percentage']
+    ))
+$attributes = Get-UpdateAttributesPayload | ConvertFrom-Json -AsHashtable
+Assert-UpdateOutcome 'while the stage rides on the attributes topic, where custom keys are allowed' (
+    $null -ne $attributes -and $attributes.Contains('stage') -and $attributes.Contains('stage_detail'))
+Reset-UpdateCapture
+Publish-CopilotMqttUpdate -InstalledVersion '1.1.0' -LatestVersion '1.2.0' -ReleaseNotes 'Fixture release notes' -InProgress -Headers $headers
+Receive-UpdatePayload $consumer
 # Replay only the historical omission against the same discovery and retained
 # consumer. All production-path assertions below use unmodified captured JSON.
 $omittedSummary = Get-StatePayload | ConvertFrom-Json -AsHashtable
@@ -160,7 +210,7 @@ Assert-UpdateOutcome 'the notification is scoped to this machine' ($script:Notif
 # The notification is a one-shot; the entity is what the dashboard reads on every
 # pass. Without the verdict there, an update that finished looked exactly like one
 # that was never pressed - which is the silence #129 is about.
-$terminal = Get-StatePayload | ConvertFrom-Json -AsHashtable
+$terminal = Get-UpdateAttributesPayload | ConvertFrom-Json -AsHashtable
 Assert-UpdateOutcome 'the entity carries how the attempt ended, not only that it stopped' (
     $terminal['stage'] -ceq 'completed' -and $terminal['stage_detail'] -match '1\.2\.0')
 Assert-UpdateOutcome 'the claimed marker is consumed' (-not (Test-Path -LiteralPath $outcomeFile))
@@ -173,7 +223,7 @@ Write-Marker @{ schemaVersion = 1; attemptId = ('a' * 32); success = $false; exi
 Receive-UpdatePayload $consumer
 Assert-UpdateOutcome 'retry availability is established by both actual JSON versions and the consumer' ($consumer.state -eq 'on' -and $consumer.installed_version -eq '1.1.0' -and $consumer.latest_version -eq '1.2.0' -and -not $consumer.in_progress)
 Assert-UpdateOutcome 'failure reports the error without claiming rollback' ($script:Notified.Count -eq 1 -and $script:Notified[0].message -match 'disk full.*no rollback is claimed')
-$terminal = Get-StatePayload | ConvertFrom-Json -AsHashtable
+$terminal = Get-UpdateAttributesPayload | ConvertFrom-Json -AsHashtable
 Assert-UpdateOutcome 'and the entity says it failed, and why' (
     $terminal['stage'] -ceq 'failed' -and $terminal['stage_detail'] -ceq 'disk full')
 
@@ -325,7 +375,7 @@ function Invoke-BridgeSelfUpdate {
 }
 try { Sync-DaemonUpdateStatus -Headers $headers }
 finally { Set-Item Function:\Invoke-BridgeSelfUpdate -Value $realSelfUpdate }
-$currentWire = Get-StatePayload | ConvertFrom-Json -AsHashtable
+$currentWire = Get-UpdateAttributesPayload | ConvertFrom-Json -AsHashtable
 Assert-UpdateOutcome 'it is reported as already current, not as a failed update' (
     $currentWire['stage'] -ceq 'current' -and $currentWire['stage_detail'] -match 'no newer release')
 

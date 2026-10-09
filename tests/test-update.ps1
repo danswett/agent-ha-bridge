@@ -846,7 +846,8 @@ Test-That 'and ends on a terminal stage that distinguishes success from failure'
     $generated -match "Write-UpdateStage -Stage \`$\(if \(\`$outcome\.success\) \{ 'completed' \} else \{ 'failed' \}\)"
 }
 
-$genValid = Invoke-BridgeSelfUpdate -ScriptOnly -TargetHome $env:TEMPTest-That 'a valid TargetHome is passed through to the installer' {
+$genValid = Invoke-BridgeSelfUpdate -ScriptOnly -TargetHome $env:TEMP
+Test-That 'a valid TargetHome is passed through to the installer' {
     $genValid -match "-TargetHome '"
 }
 $quoteDir = Join-Path $env:TEMP ("bridge'quote-" + [guid]::NewGuid().ToString('N').Substring(0, 6))

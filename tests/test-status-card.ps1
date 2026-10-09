@@ -378,7 +378,7 @@ function New-UpdateStates {
     foreach ($key in $haStates.Keys) { $copy[$key] = $haStates[$key] }
     $base = @{
         installed_version = '1.19.0'; latest_version = '1.20.0'
-        in_progress = $false; stage = ''; stage_proportion = ''; stage_detail = ''
+        in_progress = $false; update_percentage = $null; stage = ''; stage_detail = ''
     }
     foreach ($key in $Attributes.Keys) { $base[$key] = $Attributes[$key] }
     $copy[$EntityId] = @{ state = $State; attributes = $base }
@@ -438,7 +438,7 @@ Test-That 'and it stops offering an update it has already asked for' {
 Write-Host ''
 Write-Host '--- while it runs it says which stage, not that something is happening ---'
 $downloading = Invoke-StatusCard -States (New-UpdateStates -EntityId $liveUpdate -State 'on' -Attributes @{
-    in_progress = $true; stage = 'downloading'; stage_proportion = 0.42 })
+    in_progress = $true; stage = 'downloading'; update_percentage = 42 })
 Test-That 'the stage the updater reported is the stage shown' {
     (Get-UpdateRow -Rendered $downloading -Machine $live.Machine).update.note.text -eq 'Downloading 42%'
 } "[$((Get-UpdateRow -Rendered $downloading -Machine $live.Machine).update.note.text)]"
