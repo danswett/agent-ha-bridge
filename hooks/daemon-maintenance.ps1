@@ -36,9 +36,15 @@ function Set-DaemonUpdateVerdict {
     param(
         [Parameter(Mandatory)][ValidateSet('completed', 'failed', 'current')][string]$Stage,
         [string]$Detail = '',
+        # The attempt this verdict is about, where there is one. A verdict that names
+        # no attempt is one for a press that never started an updater, and it must not
+        # inherit an unrelated record's longer life.
+        [string]$AttemptId = '',
         [DateTimeOffset]$At = [DateTimeOffset]::Now
     )
-    $script:DaemonUpdateVerdict = [pscustomobject]@{ Stage = $Stage; Detail = $Detail; At = $At }
+    $script:DaemonUpdateVerdict = [pscustomobject]@{
+        Stage = $Stage; Detail = $Detail; AttemptId = $AttemptId; At = $At
+    }
     # The verdict is part of what is published, so the last signature no longer
     # describes what the entity should say.
     $script:DaemonUpdateSignature = ''
@@ -74,6 +80,17 @@ function Get-DaemonUpdateProgress {
         if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
         $progress = $null
     }
+
+    # A verdict lives as long as the record it describes, and only then. Once the
+    # daemon has restarted there is no attempt id left to bind the reader with, so an
+    # hour-old record from a previous attempt is accepted for any attempt - and
+    # without this an "Already current" from a press made seconds ago would borrow
+    # that record's hour instead of its own ten minutes. Review on #129.
+    $paired = $verdict -and $progress -and $verdict.AttemptId -and
+        $verdict.AttemptId -ceq [string]$progress.AttemptId
+    $live = [bool]($verdict -and ($paired -or ($Now - $verdict.At).TotalMinutes -le $script:DaemonUpdateVerdictMinutes))
+    if ($verdict -and -not $live) { $script:DaemonUpdateVerdict = $null }
+
     if ($progress) {
         # A verdict for the same ending is the better of the two. The child's terminal
         # stage carries whatever it had to hand, which on success is nothing - its
@@ -82,13 +99,9 @@ function Get-DaemonUpdateProgress {
         # child's record first turned "Updated to 1.33.9" back into a bare "Updated"
         # on the very next pass, for the rest of the hour. Review on #129.
         #
-        # It is kept for as long as the record it describes, rather than the shorter
-        # window below: expiring first simply postponed that same regression to the
-        # ten-minute mark and then showed the bare stage for the remaining fifty.
-        #
         # A stage that is still running always wins: nothing has ended yet, so there
         # is no verdict that could describe it.
-        if ($verdict -and $progress.Done) {
+        if ($live -and $progress.Done) {
             return [pscustomobject]@{ Stage = [string]$verdict.Stage; Detail = [string]$verdict.Detail; Proportion = $null }
         }
         return [pscustomobject]@{
@@ -102,11 +115,7 @@ function Get-DaemonUpdateProgress {
     # the only thing that will ever say so. Short-lived on purpose: long enough to be
     # read by someone who pressed and looked away, short enough that it is plainly
     # about the press they just made rather than one from an hour ago.
-    if (-not $verdict) { return $blank }
-    if (($Now - $verdict.At).TotalMinutes -gt $script:DaemonUpdateVerdictMinutes) {
-        $script:DaemonUpdateVerdict = $null
-        return $blank
-    }
+    if (-not $live) { return $blank }
     [pscustomobject]@{ Stage = [string]$verdict.Stage; Detail = [string]$verdict.Detail; Proportion = $null }
 }
 
@@ -176,7 +185,7 @@ function Invoke-DaemonUpdateOutcome {
             if ($outcome.Version) { "Updated to $($outcome.Version)" } else { 'Updated' }
         }
         else { [string]$outcome.Error }
-        Set-DaemonUpdateVerdict -Stage $verdictStage -Detail $verdictDetail
+        Set-DaemonUpdateVerdict -Stage $verdictStage -Detail $verdictDetail -AttemptId ([string]$outcome.AttemptId)
         Publish-CopilotMqttUpdate -InstalledVersion $installed -LatestVersion $outcome.Version `
             -ReleaseUrl $outcome.ReleaseUrl -InProgress:([bool]$script:DaemonUpdatePendingAttempt) `
             -Stage $verdictStage -StageDetail $verdictDetail -Headers $Headers
@@ -378,6 +387,11 @@ function Sync-DaemonUpdateStatus {
             try {
                 $current = $result.PSObject.Properties['State'] -and $result.State -eq 'Current'
                 $knownTarget = if ($result.PSObject.Properties['AttemptedVersion']) { $result.AttemptedVersion } else { $null }
+                # Nothing started, so nothing will write a progress record - and the
+                # one the last attempt left would go on being published as though it
+                # described this press. Removing it is what makes the verdict below
+                # the only thing speaking for the press just made. Review on #129.
+                Remove-BridgeUpdateProgress
                 # A release that is already installed is not a failure. Conflating the
                 # two is what #92 was: a press that found nothing to do looked exactly
                 # like a press that broke.

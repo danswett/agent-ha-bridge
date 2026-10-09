@@ -360,6 +360,12 @@ $script:Lookup = 'current'
 Write-Host '--- a press with nothing to install says so, and is not a failure ---'
 Reset-UpdateCapture
 $script:DaemonUpdateVerdict = $null
+# The previous attempt's terminal record, still inside its publishable hour. The
+# press that follows supersedes it: nothing will write a new one, so leaving it would
+# let an hour-old "completed" outrank the verdict for the press just made.
+@{ schemaVersion = 1; attemptId = ('c' * 32); stage = 'completed'; detail = 'Updated to 1.2.0'
+   at = [DateTimeOffset]::Now.ToString('o') } | ConvertTo-Json -Compress |
+    Set-Content -LiteralPath $script:BridgeUpdateConfig.ProgressFile -Encoding UTF8
 $script:ButtonState = [DateTimeOffset]::Now.AddMinutes(2).ToString('o')
 $script:DaemonUpdateLastPress = ''
 $script:DaemonUpdateSignature = ''
@@ -378,6 +384,8 @@ finally { Set-Item Function:\Invoke-BridgeSelfUpdate -Value $realSelfUpdate }
 $currentWire = Get-UpdateAttributesPayload | ConvertFrom-Json -AsHashtable
 Assert-UpdateOutcome 'it is reported as already current, not as a failed update' (
     $currentWire['stage'] -ceq 'current' -and $currentWire['stage_detail'] -match 'no newer release')
+Assert-UpdateOutcome 'and the superseded record is gone, so it cannot outrank this press' (
+    -not (Test-Path -LiteralPath $script:BridgeUpdateConfig.ProgressFile))
 
 # The verdict has to outlive the pass that made it, because nothing else records it:
 # the updater never started, so there is no progress file to read it back from.
@@ -412,7 +420,7 @@ Assert-UpdateOutcome 'and the progress file wins over any verdict, being the new
 @{ schemaVersion = 1; attemptId = ('b' * 32); stage = 'completed'; detail = ''
    at = [DateTimeOffset]::Now.ToString('o') } | ConvertTo-Json -Compress |
     Set-Content -LiteralPath $progressFile -Encoding UTF8
-Set-DaemonUpdateVerdict -Stage 'completed' -Detail 'Updated to 1.3.0'
+Set-DaemonUpdateVerdict -Stage 'completed' -Detail 'Updated to 1.3.0' -AttemptId ('b' * 32)
 $ended = Get-DaemonUpdateProgress
 Assert-UpdateOutcome 'an ended attempt keeps the verdict that names the version, not the bare stage' (
     $ended.Stage -ceq 'completed' -and $ended.Detail -ceq 'Updated to 1.3.0') "[$($ended.Stage)/$($ended.Detail)]"
@@ -422,6 +430,16 @@ Assert-UpdateOutcome 'an ended attempt keeps the verdict that names the version,
 $later = Get-DaemonUpdateProgress -Now ([DateTimeOffset]::Now.AddMinutes(30))
 Assert-UpdateOutcome 'and keeps it for as long as that record is still being published' (
     $later.Detail -ceq 'Updated to 1.3.0') "[$($later.Stage)/$($later.Detail)]"
+# But only the verdict for *that* attempt. Once the daemon has restarted there is no
+# attempt id left to bind the reader with, so an hour-old record is accepted for any
+# attempt - and a verdict for a press made seconds ago must not borrow its hour.
+Set-DaemonUpdateVerdict -Stage 'current' -Detail 'no newer release found; nothing installed'
+$borrowed = Get-DaemonUpdateProgress -Now ([DateTimeOffset]::Now.AddMinutes(30))
+Assert-UpdateOutcome 'a verdict for another attempt does not inherit that record''s hour' (
+    $borrowed.Detail -cne 'no newer release found; nothing installed') "[$($borrowed.Stage)/$($borrowed.Detail)]"
+Set-DaemonUpdateVerdict -Stage 'current' -Detail 'no newer release found; nothing installed'
+Assert-UpdateOutcome 'though it still speaks for the press that was just made' (
+    (Get-DaemonUpdateProgress).Stage -ceq 'current')
 @{ schemaVersion = 1; attemptId = ('b' * 32); stage = 'installing'
    at = [DateTimeOffset]::Now.ToString('o') } | ConvertTo-Json -Compress |
     Set-Content -LiteralPath $progressFile -Encoding UTF8

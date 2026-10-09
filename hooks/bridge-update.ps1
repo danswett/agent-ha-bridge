@@ -449,11 +449,30 @@ function Read-BridgeUpdateStage {
     }
     [pscustomobject]@{
         Stage      = $stage
+        AttemptId  = [string]$record['attemptId']
         Version    = [string]$record['version']
         Detail     = [string]$record['detail']
         Proportion = $proportion
         At         = $at
         Done       = $stage -cin @('completed', 'failed')
+    }
+}
+
+function Remove-BridgeUpdateProgress {
+    <#
+        Discards the progress record, for a press that supersedes it.
+
+        A press that never starts an updater writes nothing, so an hour-old record
+        from the previous attempt would go on being published as though it described
+        the press just made - and would lend its own hour-long life to the verdict
+        for it. Best effort: failing to remove a display file must not fail anything.
+    #>
+    param([string]$Path = $script:BridgeUpdateConfig.ProgressFile)
+
+    if (Test-BridgeTestExecution) { Assert-BridgeTestPath -Path $Path }
+    try { Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
     }
 }
 
