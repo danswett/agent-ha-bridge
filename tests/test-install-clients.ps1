@@ -1075,16 +1075,58 @@ function Get-BridgeUpdateStatus {
     $script:BridgeIsWindows = $false
     $script:LaunchdFixtureMode = 'failed'
     $script:LaunchdStopCalls = 0
+    # How many `print` calls after a bootout still report the job as loaded, which is
+    # the whole of #123: launchd tears a job down after accepting the request, so a
+    # print issued in that window finds it and says the shutdown did not happen.
+    $script:LaunchdLingeringPrints = 0
+    $script:LaunchdPrintCalls = 0
+    $script:LaunchdBootstrapCalls = 0
+    # What `print` answers once the lingering window has passed. 'absent' is the
+    # normal teardown; 'ambiguous' is launchctl answering with neither 0 nor 113,
+    # which is the case that used to leave the machine unloaded with no route back.
+    $script:LaunchdSettledMode = 'absent'
+    # Whether a bootstrap put back what the bootout took away, and whether the older
+    # `load -w` does when bootstrap refuses - which install.ps1 treats as common.
+    $script:LaunchdBootstrapRestores = $true
+    $script:LaunchdLoadRestores = $true
+    $script:LaunchdLoadCalls = 0
     function id { param($Option) $global:LASTEXITCODE = 0; '1000' }
     function launchctl {
-        param($Action, $Service)
+        param($Action, $Service, $PlistPath)
         if ($Action -eq 'bootout') {
             $script:LaunchdStopCalls++
             $global:LASTEXITCODE = if ($script:LaunchdFixtureMode -eq 'failed') { 5 } else { 0 }
-            if ($global:LASTEXITCODE -eq 0) { $script:LaunchdFixtureMode = 'absent' }
+            if ($global:LASTEXITCODE -eq 0) { $script:LaunchdFixtureMode = 'booted-out' }
+            return
         }
-        else { $global:LASTEXITCODE = if ($script:LaunchdFixtureMode -eq 'absent') { 113 } else { 0 } }
+        if ($Action -eq 'bootstrap') {
+            $script:LaunchdBootstrapCalls++
+            if ($script:LaunchdBootstrapRestores) { $script:LaunchdFixtureMode = 'running' }
+            $global:LASTEXITCODE = 0
+            return
+        }
+        if ($Action -eq 'load') {
+            $script:LaunchdLoadCalls++
+            if ($script:LaunchdLoadRestores) { $script:LaunchdFixtureMode = 'running' }
+            $global:LASTEXITCODE = 0
+            return
+        }
+        $script:LaunchdPrintCalls++
+        if ($script:LaunchdFixtureMode -eq 'booted-out') {
+            if ($script:LaunchdLingeringPrints -gt 0) {
+                $script:LaunchdLingeringPrints--
+                $global:LASTEXITCODE = 0
+                return
+            }
+            $global:LASTEXITCODE = if ($script:LaunchdSettledMode -eq 'ambiguous') { 37 } else { 113 }
+            return
+        }
+        $global:LASTEXITCODE = if ($script:LaunchdFixtureMode -eq 'absent') { 113 } else { 0 }
     }
+    $savedWaitAttempts = $script:BridgeLaunchAgentWaitAttempts
+    $savedUnloadAttempts = $script:BridgeLaunchAgentUnloadAttempts
+    $savedWaitDelay = $script:BridgeLaunchAgentWaitMilliseconds
+    $script:BridgeLaunchAgentWaitMilliseconds = 0
     try {
         Test-That 'a failed service shutdown preserves its registration and blocks cleanup' {
             $rejected = $false
@@ -1104,10 +1146,118 @@ function Get-BridgeUpdateStatus {
         Test-That 'a positively absent service needs no stop before its owned registration is removed' {
             $script:LaunchdStopCalls -eq 0 -and -not (Test-Path -LiteralPath $plistPath)
         }
+
+        # The failure #123 reports: the same update failed twice and succeeded on the
+        # third run with nothing else changed, because the confirmation was asked for
+        # once, immediately, and launchd had not finished yet.
+        [IO.File]::WriteAllText($plistPath, $ownedPlist)
+        $script:LaunchdFixtureMode = 'running'
+        $script:LaunchdSettledMode = 'absent'
+        $script:LaunchdLingeringPrints = 3
+        $script:LaunchdStopCalls = 0
+        $lingered = $null
+        try { Stop-BridgeOwnedService -Context $contextA -Remove }
+        catch { $lingered = $_.Exception.Message }
+        Test-That 'a teardown launchd has accepted but not finished is waited for, not failed' {
+            $null -eq $lingered -and $script:LaunchdStopCalls -eq 1 -and -not (Test-Path -LiteralPath $plistPath)
+        } "[$lingered]"
+
+        # Failing after the unload is the one outcome to avoid: the machine is left
+        # with no daemon, and restart cannot make one because nothing is loaded to
+        # restart. "its files were preserved" read as a safe no-op and was not.
+        [IO.File]::WriteAllText($plistPath, $ownedPlist)
+        $script:LaunchdFixtureMode = 'running'
+        $script:LaunchdSettledMode = 'ambiguous'
+        $script:LaunchdLingeringPrints = 0
+        $script:LaunchdBootstrapCalls = 0
+        $unconfirmed = $null
+        try { Stop-BridgeOwnedService -Context $contextA -Remove }
+        catch { $unconfirmed = $_.Exception.Message }
+        Test-That 'an unconfirmed shutdown puts the LaunchAgent back rather than leaving none' {
+            $script:LaunchdBootstrapCalls -eq 1 -and $unconfirmed -match 'reloaded and is running'
+        } "[$unconfirmed]"
+        Test-That 'and says so instead of claiming only that its files survived' {
+            $unconfirmed -notmatch 'files were preserved'
+        } "[$unconfirmed]"
+        Test-That 'while the registration it could not stop is kept' { Test-Path -LiteralPath $plistPath }
+
+        # And when it cannot be put back, the one command that rebuilds it is in the
+        # failure itself - it was only ever discoverable from a later `restart`.
+        [IO.File]::WriteAllText($plistPath, $ownedPlist)
+        $script:LaunchdFixtureMode = 'running'
+        $script:LaunchdSettledMode = 'ambiguous'
+        $script:LaunchdBootstrapRestores = $false
+        $script:LaunchdLoadRestores = $false
+        $script:LaunchdBootstrapCalls = 0
+        $script:LaunchdLoadCalls = 0
+        $stranded = $null
+        try { Stop-BridgeOwnedService -Context $contextA -Remove }
+        catch { $stranded = $_.Exception.Message }
+        Test-That 'a LaunchAgent that cannot be reloaded names the command that rebuilds it' {
+            $script:LaunchdBootstrapCalls -eq 1 -and $stranded -match 'agent-ha-bridge configure'
+        } "[$stranded]"
+        Test-That 'and does not claim it was reloaded' { $stranded -notmatch 'running as before' } "[$stranded]"
+
+        # bootstrap refusing a job the older API still takes is common enough that
+        # install.ps1 falls back to `load -w`. Recovery that stops at the refusal
+        # leaves exactly the unloaded daemon this is all for.
+        [IO.File]::WriteAllText($plistPath, $ownedPlist)
+        $script:LaunchdFixtureMode = 'running'
+        $script:LaunchdSettledMode = 'ambiguous'
+        $script:LaunchdBootstrapRestores = $false
+        $script:LaunchdLoadRestores = $true
+        $script:LaunchdBootstrapCalls = 0
+        $script:LaunchdLoadCalls = 0
+        $legacyLoaded = $null
+        try { Stop-BridgeOwnedService -Context $contextA -Remove }
+        catch { $legacyLoaded = $_.Exception.Message }
+        Test-That 'a bootstrap that is refused falls back to the load that still works' {
+            $script:LaunchdLoadCalls -eq 1 -and $legacyLoaded -match 'reloaded and is running'
+        } "bootstrap=$($script:LaunchdBootstrapCalls) load=$($script:LaunchdLoadCalls) [$legacyLoaded]"
+
+        # launchd keeps a booted-out job registered until it has finished exiting, so
+        # a teardown that outlasts the wait still answers `print` with 0. Bootstrapping
+        # over it fails, and the old job answering 0 looked exactly like a restored
+        # one - a success message issued moments before the daemon went away for good.
+        [IO.File]::WriteAllText($plistPath, $ownedPlist)
+        $script:LaunchdFixtureMode = 'running'
+        $script:LaunchdSettledMode = 'absent'
+        $script:LaunchdLingeringPrints = 100000
+        $script:LaunchdBootstrapRestores = $true
+        $script:LaunchdBootstrapCalls = 0
+        $script:LaunchdLoadCalls = 0
+        $slow = $null
+        try { Stop-BridgeOwnedService -Context $contextA -Remove }
+        catch { $slow = $_.Exception.Message }
+        Test-That 'a teardown that outlasts the wait is not mistaken for a reloaded service' {
+            $slow -match 'still loaded' -and $slow -notmatch 'reloaded and is running'
+        } "[$slow]"
+        Test-That 'and nothing is bootstrapped over a job launchd still has registered' {
+            $script:LaunchdBootstrapCalls -eq 0 -and $script:LaunchdLoadCalls -eq 0
+        } "bootstrap=$($script:LaunchdBootstrapCalls) load=$($script:LaunchdLoadCalls)"
+        Test-That 'while the registration is kept, because nothing was taken away' { Test-Path -LiteralPath $plistPath }
+        $script:LaunchdLingeringPrints = 0
+
+        # A bootout launchd refused changed nothing, so there is nothing to put back
+        # and the old wording is the accurate one.
+        [IO.File]::WriteAllText($plistPath, $ownedPlist)
+        $script:LaunchdFixtureMode = 'failed'
+        $script:LaunchdBootstrapRestores = $true
+        $script:LaunchdBootstrapCalls = 0
+        $script:LaunchdLoadCalls = 0
+        $refused = $null
+        try { Stop-BridgeOwnedService -Context $contextA -Remove }
+        catch { $refused = $_.Exception.Message }
+        Test-That 'a refused bootout is not followed by a reload of something still loaded' {
+            $script:LaunchdBootstrapCalls -eq 0 -and $refused -match 'files were preserved'
+        } "[$refused]"
     }
     finally {
         $contextA.Isolated = $true
         $script:BridgeIsWindows = $savedWindows
+        $script:BridgeLaunchAgentWaitAttempts = $savedWaitAttempts
+        $script:BridgeLaunchAgentUnloadAttempts = $savedUnloadAttempts
+        $script:BridgeLaunchAgentWaitMilliseconds = $savedWaitDelay
         Remove-Item Function:\id, Function:\launchctl
     }
     $started = [datetime]'2026-01-01T00:00:00Z'
@@ -1200,6 +1350,74 @@ function Get-BridgeUpdateStatus {
             $script:OwnedProcessFixture[910002] = $savedDaemon
             $script:OwnedProcessFixture[910005] = $savedKeepAwake
             $script:ShutdownOrder = @()
+        }
+
+        # A failed update can leave the LaunchAgent unloaded. restart refused that
+        # outright and named `configure` - a full reinstall - to load a file that was
+        # already correct and already proven to be ours (#123).
+        $launchAgentLabel = $contextA.LaunchAgentLabel
+        $restartPlist = Join-Path $contextA.Home "Library\LaunchAgents\$launchAgentLabel.plist"
+        [void][IO.Directory]::CreateDirectory((Split-Path $restartPlist -Parent))
+        [IO.File]::WriteAllText($restartPlist, $ownedPlist)
+        $script:BridgeIsWindows = $false
+        $script:RestartKickstarts = 0
+        $script:RestartLoaded = $false
+        $script:RestartBootstrapWorks = $true
+        $script:RestartLoadWorks = $true
+        $script:RestartLoadCalls = 0
+        function id { param($Option) $global:LASTEXITCODE = 0; '1000' }
+        function launchctl {
+            param($Action, $Service, $PlistPath)
+            if ($Action -eq 'kickstart') {
+                $script:RestartKickstarts++
+                $global:LASTEXITCODE = if ($script:RestartLoaded) { 0 } else { 3 }
+                return
+            }
+            if ($Action -eq 'bootstrap') {
+                if ($script:RestartBootstrapWorks) { $script:RestartLoaded = $true }
+                $global:LASTEXITCODE = 0
+                return
+            }
+            if ($Action -eq 'load') {
+                $script:RestartLoadCalls++
+                if ($script:RestartLoadWorks) { $script:RestartLoaded = $true }
+                $global:LASTEXITCODE = 0
+                return
+            }
+            $global:LASTEXITCODE = if ($script:RestartLoaded) { 0 } else { 113 }
+        }
+        $savedRestartWait = $script:BridgeLaunchAgentWaitMilliseconds
+        $script:BridgeLaunchAgentWaitMilliseconds = 0
+        try {
+            $recovered = $null
+            try { Invoke-Restart } catch { $recovered = $_.Exception.Message }
+            Test-That 'restart loads a LaunchAgent a failed update left unloaded' {
+                $null -eq $recovered -and $script:RestartLoaded
+            } "[$recovered]"
+
+            $script:RestartLoaded = $false
+            $script:RestartBootstrapWorks = $false
+            $script:RestartLoadWorks = $false
+            $stuck = $null
+            try { Invoke-Restart } catch { $stuck = $_.Exception.Message }
+            Test-That 'and still names configure when loading it really does not work' {
+                $stuck -match 'could not be loaded' -and $stuck -match 'agent-ha-bridge configure'
+            } "[$stuck]"
+
+            $script:RestartLoaded = $false
+            $script:RestartBootstrapWorks = $false
+            $script:RestartLoadWorks = $true
+            $script:RestartLoadCalls = 0
+            $legacy = $null
+            try { Invoke-Restart } catch { $legacy = $_.Exception.Message }
+            Test-That 'a refused bootstrap still loads through the older API, as the installer does' {
+                $null -eq $legacy -and $script:RestartLoadCalls -eq 1 -and $script:RestartLoaded
+            } "load=$($script:RestartLoadCalls) [$legacy]"
+        }
+        finally {
+            $script:BridgeIsWindows = $savedWindows
+            $script:BridgeLaunchAgentWaitMilliseconds = $savedRestartWait
+            Remove-Item Function:\id, Function:\launchctl
         }
         $script:BridgeInstallContext = $contextA
         $ownedAttachments = Get-BridgeAttachmentRoot
