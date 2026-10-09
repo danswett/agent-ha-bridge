@@ -258,58 +258,67 @@ function Get-BridgeReleaseArchiveUri {
 
 function Get-BridgeLatestReleaseWithoutApi {
     <#
-        The newest release tag from the repository's Atom feed, for when the API has
-        refused the check.
+        The current release, found without spending the API allowance that refused the
+        check.
 
-        github.com/<r>/releases.atom is not part of the API allowance - measured while
-        the unauthenticated pool sat at 41/60, which it still did afterwards - so this
-        can answer when the request that matters cannot. It carries no usable release
-        notes, the entries being HTML, so this is deliberately only enough to know
-        which release is current and where to get it. A correct version with no notes
-        beats a stale one presented as current.
+        github.com/<r>/releases/latest answers with a 302 to the release's own page,
+        and is not part of that allowance - verified while the unauthenticated pool sat
+        at 41/60, which it still did afterwards.
+
+        It is used rather than releases.atom because it is the same selection the API
+        makes: newest *published, non-prerelease* release. The feed is ordered by date
+        and includes prereleases, so on a repository that ships them its newest entry
+        is the wrong answer - PowerShell/PowerShell's feed leads with v7.7.0-preview.5
+        while the API and this redirect both say v7.6.6. Taking the feed's first entry
+        would have had a rate-limited machine install a preview, and this project
+        pushes a release tag while its release is still a draft, so the feed can lead
+        with a version whose assets are not attached yet.
+
+        It carries no release notes, so this is deliberately only enough to know which
+        release is current and where to get it. A correct version with no notes beats a
+        stale one presented as current.
     #>
     param([Parameter(Mandatory)][string]$Repository)
 
     if ($Repository -notmatch '^[\w.-]+/[\w.-]+$') { return $null }
-    $uri = "https://github.com/$Repository/releases.atom"
-    Assert-BridgeHttpAllowed -Uri $uri -Transport Rest
-    $feed = Invoke-RestMethod -Uri $uri -Headers @{ 'User-Agent' = $script:BridgeUpdateConfig.UserAgent } `
-        -TimeoutSec $script:BridgeUpdateConfig.RequestTimeout
+    $uri = "https://github.com/$Repository/releases/latest"
+    Assert-BridgeHttpAllowed -Uri $uri -Transport WebRequest
 
-    # Entries come newest first. Taken by position rather than by parsing dates: the
-    # feed is already ordered, and a malformed date must not promote an older release.
-    $entry = @($feed) | Select-Object -First 1
-    if ($null -eq $entry) { return $null }
+    $response = $null
+    try {
+        $response = Invoke-WebRequest -Uri $uri -Headers @{ 'User-Agent' = $script:BridgeUpdateConfig.UserAgent } `
+            -MaximumRedirection 0 -TimeoutSec $script:BridgeUpdateConfig.RequestTimeout -ErrorAction Stop
+    }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        # The redirect *is* the answer, and PowerShell raises it rather than returning
+        # it when told not to follow one. Anything with no response attached is a real
+        # failure and is left to the caller.
+        if ($null -eq $_.Exception.PSObject.Properties['Response'] -or $null -eq $_.Exception.Response) { throw }
+        $response = $_.Exception.Response
+    }
 
-    # Only the two structured fields are read. <title> is the release *name*, and on
-    # this repository that is "v1.33.8 - A dashboard that publishes, and a Mac you can
-    # use": the tag is at the front, and any number a human puts at the end of a
-    # release name would be taken for a version. That is the one failure worth
-    # designing against here, because the answer is fed straight to the downloader -
-    # a wrong version installs the wrong release, where no version merely leaves the
-    # rate-limit verdict standing.
-    $tag = ''
-    # Read through PSObject.Properties, not $entry.link directly: under StrictMode an
-    # absent property throws rather than yielding $null, and a feed entry missing a
-    # field is precisely the case this fallback exists to survive. Six separate live
-    # crashes in this repository have had exactly that shape.
-    $readField = {
-        param($Name)
-        if ($null -eq $entry.PSObject.Properties[$Name]) { return $null }
-        $entry.$Name
+    # Both header shapes are read. PowerShell 7 hands back an HttpResponseMessage whose
+    # Headers has a Location property; 5.1 and the basic-parsing object index by name
+    # instead. Under StrictMode the wrong one of those throws rather than yielding
+    # null, which is the most common live crash in this repository.
+    $location = ''
+    $headers = $null
+    if ($null -ne $response -and $null -ne $response.PSObject.Properties['Headers']) { $headers = $response.Headers }
+    if ($null -ne $headers) {
+        $raw = $null
+        try { $raw = $headers.Location } catch { $raw = $null }
+        if (-not $raw) { try { $raw = $headers['Location'] } catch { $raw = $null } }
+        $location = [string](@($raw) | Where-Object { $_ } | Select-Object -First 1)
     }
-    $href = @(& $readField 'link') | Where-Object { $null -ne $_ } |
-        ForEach-Object { if ($null -ne $_.PSObject.Properties['href']) { [string]$_.href } } |
-        Where-Object { $_ -match '/releases/tag/' } | Select-Object -First 1
-    foreach ($candidate in @($href, [string](& $readField 'id'))) {
-        if ($tag) { break }
-        if ([string]::IsNullOrWhiteSpace($candidate)) { continue }
-        # tag:github.com,2008:Repository/<id>/<tag> and .../releases/tag/<tag> both end
-        # in the tag, so the last segment is it - no searching inside free text.
-        $last = ($candidate -split '/')[-1]
-        if ($last -match '^[vV]?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?$') { $tag = $last }
-    }
-    if (-not $tag) { return $null }
+    if ([string]::IsNullOrWhiteSpace($location)) { return $null }
+
+    # A repository with no release at all redirects to the releases index, so the tag
+    # is taken from the structured path rather than searched for anywhere in the URL.
+    $match = [regex]::Match($location, '/releases/tag/(?<tag>[^/?#]+)$')
+    if (-not $match.Success) { return $null }
+    $tag = [Uri]::UnescapeDataString($match.Groups['tag'].Value)
+    if ($tag -notmatch '^[vV]?\d+\.\d+\.\d+(?:[-+][0-9A-Za-z.+-]+)?$') { return $null }
 
     [pscustomobject]@{
         Tag       = $tag
@@ -320,7 +329,6 @@ function Get-BridgeLatestReleaseWithoutApi {
         Published = ''
     }
 }
-
 function Get-BridgeLatestRelease {
     <#
         The newest published release, cached so a restart loop cannot hammer GitHub.

@@ -1308,12 +1308,15 @@ Three things keep that from becoming a failed update:
   API allowance. The `zipball_url` the API offers is itself an API request, so pressing
   **Install update** used to spend the same allowance the check competes for - and be
   refused once it was gone, for a reason that had nothing to do with this machine.
-- When the check itself is refused, the repository's `releases.atom` feed is asked
-  instead; it is outside the allowance too. The release notes are not available that
-  way, but which release is current is, and a correct version with no notes beats a
-  stale one presented as current. Only the feed's structured fields are read - a
-  version merely mentioned in a release *name* is never taken as the release.
-- If the feed cannot answer either, the refusal is reported as rate limiting with the
+- When the check itself is refused, `github.com/<r>/releases/latest` is asked instead;
+  that redirect is outside the allowance too. It is used rather than the `releases.atom`
+  feed because it makes the same selection the API does - the newest **published,
+  non-prerelease** release. The feed is ordered by date and includes prereleases, so on
+  a repository that ships them its newest entry is the wrong answer, and this project
+  pushes a release tag while the release is still a draft. Release notes are not
+  available this way, but which release is current is, and a correct version with no
+  notes beats a stale one presented as current.
+- If that endpoint cannot answer either, the refusal is reported as rate limiting with the
   time the limit resets - not as a failed update - and the machine keeps publishing its
   installed version rather than going blank, because the fault is neither in the
   install nor in the release.

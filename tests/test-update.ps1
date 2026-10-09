@@ -39,6 +39,11 @@ function Test-That {
 # failure-handling logic under test needs no real response, and this keeps the suite
 # offline and stable.
 function Invoke-RestMethod { throw 'network disabled in test' }
+# A refused check now falls back to a second endpoint over Invoke-WebRequest. A REST
+# stub does not stand in for that transport - the boundary guard says so - and an
+# unstubbed call would surface as a test-boundary violation rather than as the outage
+# these tests simulate.
+function Invoke-WebRequest { throw 'network disabled in test' }
 
 Write-Host '--- version comparison ---'
 $cases = @(
@@ -355,91 +360,122 @@ try {
     # 41/60, which it still did afterwards. Without this the machine kept republishing
     # whatever version it last managed to read, with the update entity at "off": one
     # days behind looked exactly like one that was current.
-    function New-AtomEntry {
-        param([string]$Tag)
-        [pscustomobject]@{
-            id    = "tag:github.com,2008:Repository/1380937967/$Tag"
-            link  = [pscustomobject]@{ href = "https://github.com/danswett/agent-ha-bridge/releases/tag/$Tag" }
-            title = "$Tag - a release whose name is not a version"
-        }
+    # Built as a real HttpResponseMessage, because that is what PowerShell 7 attaches
+    # to the error it raises for a 3xx when told not to follow one. The redirect is
+    # the answer here, so the "failure" path is the normal one.
+    function New-RedirectError {
+        param([string]$Location)
+        $response = [System.Net.Http.HttpResponseMessage]::new([System.Net.HttpStatusCode]::Found)
+        if ($Location) { $response.Headers.Location = [Uri]$Location }
+        [Microsoft.PowerShell.Commands.HttpResponseException]::new('redirect', $response)
     }
     $resetAt = [DateTimeOffset]::Now.AddMinutes(37)
+    $script:AskedFor = @()
     function Invoke-RestMethod {
         param($Uri, $Headers, $TimeoutSec)
-        if ($Uri -like 'https://github.com/*/releases.atom') {
-            return @((New-AtomEntry -Tag 'v9.9.9'), (New-AtomEntry -Tag 'v9.9.8'))
-        }
+        $script:AskedFor += [string]$Uri
         $response = New-RateLimitedResponse -Code 403 -Remaining '0' -Reset ([string]$resetAt.ToUnixTimeSeconds())
         throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('rate limit exceeded', $response)
     }
+    function Invoke-WebRequest {
+        param($Uri, $Headers, $TimeoutSec, $MaximumRedirection)
+        $script:AskedFor += [string]$Uri
+        throw (New-RedirectError -Location 'https://github.com/danswett/agent-ha-bridge/releases/tag/v9.9.9')
+    }
     Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
     $rescued = Get-BridgeUpdateStatus -Force
-    Test-That 'a refused check that the feed can answer reports the release, not the refusal' {
+    Test-That 'a refused check that can be answered elsewhere reports the release, not the refusal' {
         $rescued.State -eq 'Available' -or $rescued.Available
     } "$($rescued.State): $($rescued.Detail)"
-    Test-That 'and names the version the feed gave, rather than the last one it managed to read' {
+    Test-That 'and names the version it was told, rather than the last one it managed to read' {
         $rescued.Latest -eq '9.9.9'
     } $rescued.Latest
     Test-That 'and offers an archive that can actually be downloaded while refused' {
         $rescued.Zip -ceq 'https://codeload.github.com/danswett/agent-ha-bridge/zip/refs/tags/v9.9.9'
     } $rescued.Zip
-    Test-That 'a release found through the feed is recorded as having reached GitHub' {
+    Test-That 'a release found that way is recorded as having reached GitHub' {
         ((Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json).Reached) -eq $true
     }
 
-    # <title> is the release *name*. On this repository it reads "v1.33.8 - A dashboard
-    # that publishes, and a Mac you can use", so the tag is at the front, and any
-    # version a human mentions at the end would be read as the release. This answer is
-    # handed straight to the downloader, so taking it from the name installs a real but
-    # wrong release - a silent downgrade. Only the structured id and link are trusted,
-    # and when neither carries a tag the refusal stands instead.
-    function Invoke-RestMethod {
-        param($Uri, $Headers, $TimeoutSec)
-        if ($Uri -like 'https://github.com/*/releases.atom') {
-            return @([pscustomobject]@{
-                id    = 'tag:github.com,2008:Repository/1380937967'
-                link  = [pscustomobject]@{ href = 'https://github.com/danswett/agent-ha-bridge/releases' }
-                title = 'A dashboard that publishes - rolls up every fix since 1.2.3'
-            })
-        }
-        $response = New-RateLimitedResponse -Code 403 -Remaining '0' -Reset ([string]$resetAt.ToUnixTimeSeconds())
-        throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('rate limit exceeded', $response)
+    # Which endpoint is asked *is* the prerelease guarantee, so it is pinned here.
+    # releases.atom is ordered by date and includes prereleases, so its newest entry is
+    # the wrong answer on any repository that ships them - checked live against
+    # PowerShell/PowerShell, whose feed leads with v7.7.0-preview.5 while both the API
+    # and this redirect say v7.6.6. Taking the feed's first entry would have had a
+    # rate-limited machine install a preview; this project also pushes a release tag
+    # while the release is still a draft, so the feed can lead with a version whose
+    # assets are not attached yet. GitHub does the selecting, which is the point.
+    Test-That 'the release is asked for at the endpoint that excludes prereleases and drafts' {
+        ($script:AskedFor -contains 'https://github.com/danswett/agent-ha-bridge/releases/latest') -and
+            -not (@($script:AskedFor) -match 'releases\.atom')
+    } ($script:AskedFor -join ' | ')
+
+    # PowerShell 5.1 hands back a WebHeaderCollection, which has no Location *property*
+    # - reading one throws PropertyNotFoundException under StrictMode, checked rather
+    # than assumed - and must be indexed by name instead. A hashtable would resolve
+    # either way and prove nothing, so the real type is used.
+    function Invoke-WebRequest {
+        param($Uri, $Headers, $TimeoutSec, $MaximumRedirection)
+        $collection = [System.Net.WebHeaderCollection]::new()
+        $collection.Add('Location', 'https://github.com/danswett/agent-ha-bridge/releases/tag/v9.9.7')
+        [pscustomobject]@{ StatusCode = 302; Headers = $collection }
     }
     Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
-    $fromName = Get-BridgeUpdateStatus -Force
-    Test-That 'a version merely mentioned in a release name is never taken as the release' {
-        $fromName.Latest -ne '1.2.3' -and $fromName.State -eq 'RateLimited'
-    } "$($fromName.State): latest=$($fromName.Latest)"
+    $indexed = Get-BridgeUpdateStatus -Force
+    Test-That 'a response that indexes its headers by name is read too, not thrown on' {
+        $indexed.Latest -eq '9.9.7'
+    } "$($indexed.State): latest=$($indexed.Latest)"
 
-    # A feed entry missing the fields is the case this fallback exists to survive, and
-    # under StrictMode reading an absent property throws rather than yielding null -
-    # the single most common live crash in this repository.
-    function Invoke-RestMethod {
-        param($Uri, $Headers, $TimeoutSec)
-        if ($Uri -like 'https://github.com/*/releases.atom') {
-            return @([pscustomobject]@{ title = 'a release with no id and no link' })
+    # A repository with no release at all redirects to the releases index, and
+    # /releases/expanded_assets/<tag> is a real GitHub URL that ends in a version
+    # without being a release. The tag is taken from the structured path for that
+    # reason - anything found loosely in a URL goes straight to the downloader.
+    foreach ($elsewhere in @(
+        'https://github.com/danswett/agent-ha-bridge/releases',
+        'https://github.com/danswett/agent-ha-bridge/releases/expanded_assets/v9.9.9')) {
+        function Invoke-WebRequest {
+            param($Uri, $Headers, $TimeoutSec, $MaximumRedirection)
+            throw (New-RedirectError -Location $elsewhere)
         }
-        $response = New-RateLimitedResponse -Code 403 -Remaining '0' -Reset ([string]$resetAt.ToUnixTimeSeconds())
-        throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('rate limit exceeded', $response)
+        Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+        $noRelease = Get-BridgeUpdateStatus -Force
+        Test-That "a redirect to $(($elsewhere -split '/')[-2..-1] -join '/') is not read as a release" {
+            $noRelease.State -eq 'RateLimited' -and $null -eq $noRelease.Latest
+        } "$($noRelease.State): latest=$($noRelease.Latest)"
+    }
+
+    # A tag that is not a version must not be handed to the downloader either.
+    function Invoke-WebRequest {
+        param($Uri, $Headers, $TimeoutSec, $MaximumRedirection)
+        throw (New-RedirectError -Location 'https://github.com/danswett/agent-ha-bridge/releases/tag/nightly')
     }
     Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
     $unusable = Get-BridgeUpdateStatus -Force
-    Test-That 'a feed entry with no usable tag leaves the rate-limit verdict standing' {
-        $unusable.State -eq 'RateLimited' -and $unusable.Detail -match 'install is fine'
-    } "$($unusable.State): $($unusable.Detail)"
+    Test-That 'a redirect to a tag that is not a version is declined rather than installed' {
+        $unusable.State -eq 'RateLimited' -and $null -eq $unusable.Latest
+    } "$($unusable.State): latest=$($unusable.Latest)"
 
-    # And when the feed is unreachable too, the verdict and its reset time survive
+    # A response with no Location at all is a failure, not a release.
+    function Invoke-WebRequest {
+        param($Uri, $Headers, $TimeoutSec, $MaximumRedirection)
+        throw (New-RedirectError -Location '')
+    }
+    Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+    $headerless = Get-BridgeUpdateStatus -Force
+    Test-That 'a redirect with no Location header is declined rather than guessed at' {
+        $headerless.State -eq 'RateLimited'
+    } "$($headerless.State): latest=$($headerless.Latest)"
+
+    # And when that endpoint is unreachable too, the verdict and its reset time survive
     # exactly as before. The fallback is a second chance, never a second failure to
     # report (#109, #92).
-    function Invoke-RestMethod {
-        param($Uri, $Headers, $TimeoutSec)
-        if ($Uri -like 'https://github.com/*/releases.atom') { throw 'the feed is unreachable too' }
-        $response = New-RateLimitedResponse -Code 403 -Remaining '0' -Reset ([string]$resetAt.ToUnixTimeSeconds())
-        throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('rate limit exceeded', $response)
+    function Invoke-WebRequest {
+        param($Uri, $Headers, $TimeoutSec, $MaximumRedirection)
+        throw 'the redirect endpoint is unreachable too'
     }
     Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
     $stillLimited = Get-BridgeUpdateStatus -Force
-    Test-That 'a refused check the feed cannot answer either is still reported as rate limiting' {
+    Test-That 'a refused check that cannot be answered elsewhere is still reported as rate limiting' {
         $stillLimited.State -eq 'RateLimited' -and $stillLimited.Detail -match $resetAt.ToString('HH:mm')
     } "$($stillLimited.State): $($stillLimited.Detail)"
 
@@ -475,6 +511,7 @@ try {
     }
 
     function Invoke-RestMethod { throw 'network disabled in test' }
+    function Invoke-WebRequest { throw 'network disabled in test' }
 
     Write-Host '--- failure is survivable ---'
     Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
