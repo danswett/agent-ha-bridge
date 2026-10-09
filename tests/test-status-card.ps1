@@ -447,6 +447,12 @@ Test-That 'and it stops offering an update it has already asked for' {
     $row = Get-UpdateRow -Rendered $pressed -Machine $live.Machine
     $row.update.button.hidden -and $row.update.note.text -eq 'Starting'
 } "[$((Get-UpdateRow -Rendered $pressed -Machine $live.Machine).update.note.text)]"
+Test-That 'and arms a re-check, so the claim cannot outlive its grace in silence' {
+    # A press that reached Home Assistant whose machine then went quiet publishes
+    # nothing, and nothing else would redraw the row - so "Starting" would stay put
+    # with no way back to the button.
+    @($pressed.timers | Where-Object { $_ -ge 120000 }).Count -ge 1
+} "timers=[$(@($pressed.timers) -join ',')]"
 
 # A call that has not come back yet is the window a second click lands in, and a
 # second press is a second installer. The claim has to be drawn before the call is

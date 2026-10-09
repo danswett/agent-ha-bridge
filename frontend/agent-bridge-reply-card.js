@@ -2694,6 +2694,7 @@ class AgentBridgeStatusCard extends HTMLElement {
         entry.updateNote = note;
         entry.pressedAt = 0;
         entry.pressedFrom = '';
+        entry.pressTimer = null;
       }
       host.appendChild(row);
       return entry;
@@ -3000,6 +3001,13 @@ class AgentBridgeStatusCard extends HTMLElement {
         if (entry.forget.hidden) { this._resetForget(entry); }
       }
       this._drawUpdate(entry, showUpdate ? verdict : { kind: 'none' });
+      // Re-check once the optimistic claim would expire, even if nothing arrives to
+      // redraw the card. A press that reached Home Assistant whose machine then went
+      // quiet would otherwise sit on "Starting" until some unrelated state changed,
+      // with no way back to the button. Same shape as the launch card's press note.
+      if (entry.pressedAt && !entry.pressTimer) {
+        entry.pressTimer = setTimeout(() => { entry.pressTimer = null; this._render(); }, STATUS_UPDATE_GRACE + 500);
+      }
       if (entry.detail) { entry.detail.hidden = showUpdate || (!online && !!entry.forget); }
     }
 

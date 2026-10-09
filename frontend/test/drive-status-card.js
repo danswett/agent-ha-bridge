@@ -28,7 +28,7 @@ process.stdin.setEncoding('utf8');
 process.stdin.on('data', (chunk) => { raw += chunk; });
 process.stdin.on('end', async () => {
   const job = JSON.parse(raw);
-  const { AgentBridgeStatusCard } = loadCards();
+  const { AgentBridgeStatusCard, sandbox } = loadCards();
 
   const calls = [];
   const hass = {
@@ -143,5 +143,8 @@ process.stdin.on('end', async () => {
     calls,
     missing,
     duringPress,
+    // Every timer the card armed, so a claim that could never expire on its own is
+    // visible rather than something you only meet on a quiet instance.
+    timers: sandbox.timers.filter(Boolean).map((t) => t.ms),
   }));
 });

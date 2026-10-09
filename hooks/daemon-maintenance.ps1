@@ -99,9 +99,16 @@ function Get-DaemonUpdateProgress {
         # child's record first turned "Updated to 1.33.9" back into a bare "Updated"
         # on the very next pass, for the rest of the hour. Review on #129.
         #
-        # A stage that is still running always wins: nothing has ended yet, so there
-        # is no verdict that could describe it.
-        if ($live -and $progress.Done) {
+        # A verdict paired to this very attempt supersedes any stage of it, terminal
+        # or not: the outcome record it was built from is proof the attempt ended,
+        # and Write-UpdateStage is best effort by construction - a terminal stage it
+        # failed to write would otherwise leave the dashboard reporting "Installing"
+        # for an hour after the update had finished. Review on #129.
+        #
+        # An unpaired verdict only outranks a stage that has itself ended, because
+        # nothing then ties the two together: a stage still running is the better
+        # evidence of what is happening now.
+        if ($live -and ($paired -or $progress.Done)) {
             return [pscustomobject]@{ Stage = [string]$verdict.Stage; Detail = [string]$verdict.Detail; Proportion = $null }
         }
         return [pscustomobject]@{

@@ -445,6 +445,14 @@ Assert-UpdateOutcome 'though it still speaks for the press that was just made' (
     Set-Content -LiteralPath $progressFile -Encoding UTF8
 Assert-UpdateOutcome 'while a stage still running outranks any verdict, nothing having ended yet' (
     (Get-DaemonUpdateProgress).Stage -ceq 'installing')
+# Unless the verdict is for that very attempt. Write-UpdateStage is best effort, so
+# a terminal stage it failed to write would leave the record at "installing" while
+# the outcome record - which the verdict is built from - proves the attempt ended.
+Set-DaemonUpdateVerdict -Stage 'completed' -Detail 'Updated to 1.3.0' -AttemptId ('b' * 32)
+$stalled = Get-DaemonUpdateProgress
+Assert-UpdateOutcome 'a verdict for this attempt ends it even if its last stage never landed' (
+    $stalled.Stage -ceq 'completed' -and $stalled.Detail -ceq 'Updated to 1.3.0') "[$($stalled.Stage)/$($stalled.Detail)]"
+$script:DaemonUpdateVerdict = $null
 @{ schemaVersion = 1; attemptId = ('b' * 32); stage = 'completed'
    at = [DateTimeOffset]::Now.AddHours(-26).ToString('o') } | ConvertTo-Json -Compress |
     Set-Content -LiteralPath $progressFile -Encoding UTF8
