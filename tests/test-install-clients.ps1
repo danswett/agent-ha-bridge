@@ -1124,6 +1124,7 @@ function Get-BridgeUpdateStatus {
         $global:LASTEXITCODE = if ($script:LaunchdFixtureMode -eq 'absent') { 113 } else { 0 }
     }
     $savedWaitAttempts = $script:BridgeLaunchAgentWaitAttempts
+    $savedUnloadAttempts = $script:BridgeLaunchAgentUnloadAttempts
     $savedWaitDelay = $script:BridgeLaunchAgentWaitMilliseconds
     $script:BridgeLaunchAgentWaitMilliseconds = 0
     try {
@@ -1214,6 +1215,29 @@ function Get-BridgeUpdateStatus {
             $script:LaunchdLoadCalls -eq 1 -and $legacyLoaded -match 'reloaded and is running'
         } "bootstrap=$($script:LaunchdBootstrapCalls) load=$($script:LaunchdLoadCalls) [$legacyLoaded]"
 
+        # launchd keeps a booted-out job registered until it has finished exiting, so
+        # a teardown that outlasts the wait still answers `print` with 0. Bootstrapping
+        # over it fails, and the old job answering 0 looked exactly like a restored
+        # one - a success message issued moments before the daemon went away for good.
+        [IO.File]::WriteAllText($plistPath, $ownedPlist)
+        $script:LaunchdFixtureMode = 'running'
+        $script:LaunchdSettledMode = 'absent'
+        $script:LaunchdLingeringPrints = 100000
+        $script:LaunchdBootstrapRestores = $true
+        $script:LaunchdBootstrapCalls = 0
+        $script:LaunchdLoadCalls = 0
+        $slow = $null
+        try { Stop-BridgeOwnedService -Context $contextA -Remove }
+        catch { $slow = $_.Exception.Message }
+        Test-That 'a teardown that outlasts the wait is not mistaken for a reloaded service' {
+            $slow -match 'still loaded' -and $slow -notmatch 'reloaded and is running'
+        } "[$slow]"
+        Test-That 'and nothing is bootstrapped over a job launchd still has registered' {
+            $script:LaunchdBootstrapCalls -eq 0 -and $script:LaunchdLoadCalls -eq 0
+        } "bootstrap=$($script:LaunchdBootstrapCalls) load=$($script:LaunchdLoadCalls)"
+        Test-That 'while the registration is kept, because nothing was taken away' { Test-Path -LiteralPath $plistPath }
+        $script:LaunchdLingeringPrints = 0
+
         # A bootout launchd refused changed nothing, so there is nothing to put back
         # and the old wording is the accurate one.
         [IO.File]::WriteAllText($plistPath, $ownedPlist)
@@ -1232,6 +1256,7 @@ function Get-BridgeUpdateStatus {
         $contextA.Isolated = $true
         $script:BridgeIsWindows = $savedWindows
         $script:BridgeLaunchAgentWaitAttempts = $savedWaitAttempts
+        $script:BridgeLaunchAgentUnloadAttempts = $savedUnloadAttempts
         $script:BridgeLaunchAgentWaitMilliseconds = $savedWaitDelay
         Remove-Item Function:\id, Function:\launchctl
     }

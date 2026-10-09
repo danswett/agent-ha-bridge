@@ -34,6 +34,12 @@ $script:BridgeAgentSessionIdCache = @{}
 $script:BridgeLaunchAgentWaitAttempts = 20
 $script:BridgeLaunchAgentWaitMilliseconds = 100
 
+# Unloading gets a far longer budget than loading, because launchd gives a job it is
+# tearing down until ExitTimeOut - 20 seconds by default - before it kills it, and
+# keeps it registered until then. Two seconds was enough to miss a perfectly ordinary
+# shutdown and then mistake the old, still-registered job for a restored one.
+$script:BridgeLaunchAgentUnloadAttempts = 250
+
 function Initialize-BridgePlatform {
     <#
         On macOS, sets $env:TEMP - the name every script uses for the temporary folder
@@ -636,6 +642,15 @@ function Restore-BridgeOwnedLaunchAgent {
     param([Parameter(Mandatory)][string]$Service, [Parameter(Mandatory)][string]$PlistPath)
 
     if (-not [IO.File]::Exists($PlistPath)) { return $false }
+    # A job that is still registered has not been restored by anything. launchd keeps
+    # a booted-out job in the domain until it has finished exiting - up to ExitTimeOut,
+    # 20 seconds by default - and bootstrapping over a registered label fails with EIO
+    # while `print` still answers 0. Reading that 0 as success would report "reloaded
+    # and running as before" moments before the pending teardown took the daemon away
+    # for good, which is the wedge this exists to prevent wearing a success message.
+    # Review on #123.
+    & launchctl print $Service 2>$null | Out-Null
+    if ($LASTEXITCODE -eq 0) { return $false }
     # "gui/<uid>" from "gui/<uid>/<label>" - bootstrap takes the domain and the file,
     # where bootout takes the service.
     $domain = ($Service -split '/', 3)[0..1] -join '/'
@@ -698,9 +713,19 @@ function Stop-BridgeOwnedService {
                     throw "LaunchAgent shutdown failed (bootout exit $bootoutCode); its files were preserved."
                 }
                 $booted = $true
-                $readCode = Wait-BridgeLaunchAgentState -Service $service -Until 'unloaded'
+                $readCode = Wait-BridgeLaunchAgentState -Service $service -Until 'unloaded' `
+                    -AttemptLimit $script:BridgeLaunchAgentUnloadAttempts
             }
             if ($readCode -ne 113) {
+                if ($readCode -eq 0) {
+                    # Still registered after the full wait, so launchd has not acted
+                    # on the bootout and the daemon is - for now - still there.
+                    # Nothing has been dismantled that could be put back, and a
+                    # bootstrap over a registered label fails anyway, so reporting a
+                    # reload here would be a success message for a machine that is
+                    # about to lose its daemon. Review on #123.
+                    throw "LaunchAgent shutdown did not take effect; it is still loaded. Its files were preserved."
+                }
                 # launchd accepted the bootout, so the daemon may well be gone even
                 # though this could not confirm it. Throwing and leaving it that way
                 # is the worst available outcome: the machine has no daemon, and
