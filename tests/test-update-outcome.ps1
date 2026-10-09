@@ -416,6 +416,12 @@ Set-DaemonUpdateVerdict -Stage 'completed' -Detail 'Updated to 1.3.0'
 $ended = Get-DaemonUpdateProgress
 Assert-UpdateOutcome 'an ended attempt keeps the verdict that names the version, not the bare stage' (
     $ended.Stage -ceq 'completed' -and $ended.Detail -ceq 'Updated to 1.3.0') "[$($ended.Stage)/$($ended.Detail)]"
+# The child's terminal record stays publishable for an hour. A verdict that expired
+# at ten minutes simply postponed the regression: the bare "Updated" came back for
+# the remaining fifty. It now lasts as long as the record it describes.
+$later = Get-DaemonUpdateProgress -Now ([DateTimeOffset]::Now.AddMinutes(30))
+Assert-UpdateOutcome 'and keeps it for as long as that record is still being published' (
+    $later.Detail -ceq 'Updated to 1.3.0') "[$($later.Stage)/$($later.Detail)]"
 @{ schemaVersion = 1; attemptId = ('b' * 32); stage = 'installing'
    at = [DateTimeOffset]::Now.ToString('o') } | ConvertTo-Json -Compress |
     Set-Content -LiteralPath $progressFile -Encoding UTF8

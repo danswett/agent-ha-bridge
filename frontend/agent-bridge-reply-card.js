@@ -2758,19 +2758,18 @@ class AgentBridgeStatusCard extends HTMLElement {
     if (!entityId || !this._hass || !entry.update) { return undefined; }
     entry.pressedAt = Date.now();
     entry.pressedFrom = this._progressSignature(entry);
-    // A refused call means no press reached the daemon, so holding the optimistic
-    // claim would show "Starting" for the whole grace while nothing was happening -
-    // and the button people would reach for is hidden behind it. Give the claim up
-    // and let the row offer the update again, which is the one useful thing then.
-    //
+    // Drawn before the call is awaited, not after it. A slow call would otherwise
+    // leave the button visible and enabled for the whole request, and a second click
+    // is a second installer - exactly what the claim exists to prevent. Review, #129.
+    this._render();
     // Returned so a caller that needs the call finished - the tests - can wait for
     // it. A click handler simply ignores it, as it does for the X.
     return Promise.resolve(this._hass.callService('button', 'press', { entity_id: entityId }))
       .catch(() => {
         entry.pressedAt = 0;
         if (entry.updateNote) { entry.updateNote.setAttribute('title', 'The press was refused; try again.'); }
-      })
-      .then(() => this._render());
+        this._render();
+      });
   }
 
   // What the machine currently reports about an update, as one string: the press

@@ -57,7 +57,9 @@ function Get-DaemonUpdateProgress {
 
     $blank = [pscustomobject]@{ Stage = ''; Detail = ''; Proportion = $null }
     $verdict = $script:DaemonUpdateVerdict
-    if ($verdict -and ($Now - $verdict.At).TotalMinutes -gt $script:DaemonUpdateVerdictMinutes) {
+    if ($verdict -and ($Now - $verdict.At).TotalHours -gt $script:DaemonUpdateProgressHours) {
+        # Past the point where even a progress record would still be published, so
+        # there is nothing left on the entity for it to describe.
         $script:DaemonUpdateVerdict = $null
         $verdict = $null
     }
@@ -80,6 +82,10 @@ function Get-DaemonUpdateProgress {
         # child's record first turned "Updated to 1.33.9" back into a bare "Updated"
         # on the very next pass, for the rest of the hour. Review on #129.
         #
+        # It is kept for as long as the record it describes, rather than the shorter
+        # window below: expiring first simply postponed that same regression to the
+        # ten-minute mark and then showed the bare stage for the remaining fifty.
+        #
         # A stage that is still running always wins: nothing has ended yet, so there
         # is no verdict that could describe it.
         if ($verdict -and $progress.Done) {
@@ -92,7 +98,15 @@ function Get-DaemonUpdateProgress {
         }
     }
 
+    # No record at all, so this is an attempt that never started and the verdict is
+    # the only thing that will ever say so. Short-lived on purpose: long enough to be
+    # read by someone who pressed and looked away, short enough that it is plainly
+    # about the press they just made rather than one from an hour ago.
     if (-not $verdict) { return $blank }
+    if (($Now - $verdict.At).TotalMinutes -gt $script:DaemonUpdateVerdictMinutes) {
+        $script:DaemonUpdateVerdict = $null
+        return $blank
+    }
     [pscustomobject]@{ Stage = [string]$verdict.Stage; Detail = [string]$verdict.Detail; Proportion = $null }
 }
 

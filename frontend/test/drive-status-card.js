@@ -53,6 +53,7 @@ process.stdin.on('end', async () => {
   card.hass = hass;
 
   const missing = [];
+  let duringPress = null;
   for (const name of (job.flips || [])) {
     const entry = card._rows.find((r) => r.machine.machine === name);
     if (!entry || !entry.toggle) { missing.push(name); continue; }
@@ -73,6 +74,37 @@ process.stdin.on('end', async () => {
     const entry = card._rows.find((r) => r.machine.machine === name);
     if (!entry || !entry.update || entry.update.hidden || entry.updateButton.hidden) { missing.push(name); continue; }
     await card._install(entry);
+  }
+
+  // A press whose call has not come back yet. The button has to be gone by the time
+  // the click handler returns, or a second click before the first settles sends a
+  // second press - and a second press is a second installer.
+  if (job.slowInstall) {
+    const entry = card._rows.find((r) => r.machine.machine === job.slowInstall);
+    if (!entry || !entry.update || entry.updateButton.hidden) { missing.push(job.slowInstall); }
+    else {
+      let settle;
+      const firstCall = new Promise((resolve) => { settle = resolve; });
+      let callIndex = 0;
+      hass.callService = (domain, service, data) => {
+        calls.push({ domain, service, data });
+        callIndex += 1;
+        return callIndex === 1 ? firstCall : Promise.resolve();
+      };
+      const inFlight = card._install(entry);
+      // What the card looks like while the call is still outstanding, which is the
+      // window a second click would land in.
+      duringPress = {
+        button: { hidden: !!entry.updateButton.hidden, disabled: !!entry.updateButton.disabled },
+        note: { hidden: !!entry.updateNote.hidden, text: entry.updateNote.textContent },
+      };
+      // And a second click in exactly that window - but only if there is still
+      // something to click, because a browser cannot click a hidden button and the
+      // stand-in DOM here would happily fire the listener anyway.
+      if (!entry.updateButton.hidden) { entry.updateButton.click(); }
+      settle();
+      await inFlight;
+    }
   }
 
   const rows = card._rows.map((entry) => ({
@@ -110,5 +142,6 @@ process.stdin.on('end', async () => {
     rows,
     calls,
     missing,
+    duringPress,
   }));
 });

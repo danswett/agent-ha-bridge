@@ -233,18 +233,20 @@ function Invoke-StatusCard {
         [string[]]$Flips = @(),
         [string[]]$Forgets = @(),
         [string[]]$Installs = @(),
+        [string]$SlowInstall = '',
         [bool]$Open = $true,
         [hashtable]$States = $null,
         [switch]$Refuse
     )
     $job = @{
-        config   = $cardConfig
-        states   = $(if ($States) { $States } else { $haStates })
-        open     = $Open
-        flips    = @($Flips)
-        forgets  = @($Forgets)
-        installs = @($Installs)
-        refuse   = [bool]$Refuse
+        config      = $cardConfig
+        states      = $(if ($States) { $States } else { $haStates })
+        open        = $Open
+        flips       = @($Flips)
+        forgets     = @($Forgets)
+        installs    = @($Installs)
+        slowInstall = $SlowInstall
+        refuse      = [bool]$Refuse
     } | ConvertTo-Json -Depth 20 -Compress
     $out = $job | & $nodeExe.Source $driver
     if ($LASTEXITCODE -ne 0) { throw "the card driver exited with $LASTEXITCODE" }
@@ -445,6 +447,17 @@ Test-That 'and it stops offering an update it has already asked for' {
     $row = Get-UpdateRow -Rendered $pressed -Machine $live.Machine
     $row.update.button.hidden -and $row.update.note.text -eq 'Starting'
 } "[$((Get-UpdateRow -Rendered $pressed -Machine $live.Machine).update.note.text)]"
+
+# A call that has not come back yet is the window a second click lands in, and a
+# second press is a second installer. The claim has to be drawn before the call is
+# waited on, not after it.
+$slow = Invoke-StatusCard -States (New-UpdateStates -EntityId $liveUpdate -State 'on') -SlowInstall $live.Machine
+Test-That 'the button is gone the moment it is pressed, not when the call comes back' {
+    $slow.duringPress.button.hidden -and $slow.duringPress.note.text -eq 'Starting'
+} "[$($slow.duringPress.button.hidden)/$($slow.duringPress.note.text)]"
+Test-That 'so a second click while the first is in flight sends no second press' {
+    @($slow.calls).Count -eq 1
+} "calls=$(@($slow.calls).Count)"
 
 # A call Home Assistant refuses is a press that never reached the daemon. Holding
 # the optimistic claim would hide the button behind "Starting" for two minutes while
