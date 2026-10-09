@@ -3602,6 +3602,7 @@ function Test-CopilotAnswerMatchesSelections {
         }
         if ($expected.Count -eq 0) { return (& $finish 'Unconfirmed') }
         $identities = [Collections.Generic.Dictionary[string, int]]::new([StringComparer]::Ordinal)
+        $commaSpellings = [Collections.Generic.List[string]]::new()
         for ($index = 0; $index -lt $options.Count; $index++) {
             try { $value = Get-DecisionFieldOptionValue -Field $field -Option $options[$index] }
             catch { return (& $finish 'Unconfirmed') }
@@ -3610,11 +3611,28 @@ function Test-CopilotAnswerMatchesSelections {
             $encodings = @($valueKey)
             if ($textMode) {
                 $spelling = if ($value -is [string]) { $value } else { $valueKey }
-                $encodings = @([string]$options[$index], $spelling)
                 # Delimiters, quoting and trimmed whitespace can encode two different
-                # answers identically. Only structured results can resolve these.
-                if (@($encodings | Where-Object { $_ -match '[,="]' -or $_ -cne $_.Trim() }).Count -gt 0) {
+                # answers identically, and the flattened text result is lossy about all
+                # three. In the *value* that ambiguity is unresolvable, because the
+                # value is what the result writes down: with an option valued
+                # "Confirm=No", the text "Confirm=No" is either this field answered No
+                # or that option, and nothing here can tell. The whole field stays
+                # unconfirmed, as it always has.
+                if ($spelling -match '[,="]' -or $spelling -cne $spelling.Trim()) {
                     return (& $finish 'Unconfirmed')
+                }
+                $encodings = @($spelling)
+                # A label is the other way an option can be written down, but once it
+                # differs from the value it usually is not written down at all.
+                # Refusing the field for a delimiter in one left 87% of real answers
+                # unconfirmed - against a check that had never once caught a mismatch
+                # (#147). Only that spelling is dropped now: the option stays
+                # identifiable by its value, and a result that really did record such a
+                # label resolves to nothing, which is still never a false confirmation.
+                $label = [string]$options[$index]
+                if ($label -notmatch '[,="]' -and $label -ceq $label.Trim()) { $encodings += $label }
+                elseif ($label.Contains(',')) {
+                    $commaSpellings.Add((@($label.Split(',') | ForEach-Object { $_.Trim() }) -join ','))
                 }
             }
             foreach ($encoding in $encodings) {
@@ -3626,7 +3644,22 @@ function Test-CopilotAnswerMatchesSelections {
         }
         $actualValue = $answers[$key]
         $parts = [object[]]::new(1)
-        if ($multi -and $textMode) { $parts = @(([string]$actualValue).Split(',') | ForEach-Object { $_.Trim() }) }
+        if ($multi -and $textMode) {
+            $parts = @(([string]$actualValue).Split(',') | ForEach-Object { $_.Trim() })
+            # A dropped label that spelled a comma is ambiguous only where the recorded
+            # text could actually be it: with "a,b" among the options, a recorded "a,b"
+            # is either that one answer or the two called "a" and "b", and the halves
+            # would otherwise resolve and report a confident mismatch. An unrelated
+            # "C,D" elsewhere in the same field says nothing about "a,b", and refusing
+            # on it would put back the noise this is here to remove.
+            $joined = $parts -join ','
+            foreach ($spelling in $commaSpellings) {
+                if ($joined -ceq $spelling -or $joined.StartsWith("$spelling,", [StringComparison]::Ordinal) -or
+                    $joined.EndsWith(",$spelling", [StringComparison]::Ordinal) -or $joined.Contains(",$spelling,")) {
+                    return (& $finish 'Unconfirmed')
+                }
+            }
+        }
         elseif ($multi -and $actualValue -is [array]) { $parts = @($actualValue) }
         elseif (-not $multi) { $parts[0] = $actualValue }
         else { return (& $finish 'Unconfirmed') }
