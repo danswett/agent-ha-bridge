@@ -510,6 +510,78 @@ try {
         -not $noTokenHeaders.ContainsKey('Authorization')
     }
 
+    # A token that merely happens to be in the environment is not necessarily a good
+    # one: GITHUB_TOKEN expires when its workflow job ends, and a revoked or
+    # SSO-blocked token answers 401. Sending one of those turned a check that would
+    # have succeeded unauthenticated - these are public releases - into a failure that
+    # repeated on every retry, because the same token was selected again. Raised by
+    # Codex on #157.
+    $priorToken = [Environment]::GetEnvironmentVariable('GH_TOKEN')
+    try {
+        Set-Item -LiteralPath Env:GH_TOKEN -Value 'an-expired-token'
+        $script:AuthAttempts = @()
+        function Invoke-RestMethod {
+            param($Uri, $Headers, $TimeoutSec)
+            $script:AuthAttempts += [bool]$Headers.ContainsKey('Authorization')
+            if ($Headers.ContainsKey('Authorization')) {
+                $response = [System.Net.Http.HttpResponseMessage]::new([System.Net.HttpStatusCode]::Unauthorized)
+                throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('Bad credentials', $response)
+            }
+            [pscustomobject]@{
+                tag_name = 'v9.9.6'; name = 'synthetic'; body = ''; published_at = ''
+                html_url = 'https://github.com/danswett/agent-ha-bridge/releases/tag/v9.9.6'
+                zipball_url = 'https://api.github.com/repos/danswett/agent-ha-bridge/zipball/v9.9.6'
+            }
+        }
+        Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+        $expired = Get-BridgeUpdateStatus -Force
+        Test-That 'an expired ambient token is not allowed to fail a check that works without one' {
+            $expired.Latest -eq '9.9.6'
+        } "$($expired.State): latest=$($expired.Latest)"
+        Test-That 'and the retry is actually anonymous, having tried the token exactly once' {
+            $script:AuthAttempts.Count -eq 2 -and $script:AuthAttempts[0] -and -not $script:AuthAttempts[1]
+        } ($script:AuthAttempts -join ', ')
+
+        # The allowance, not the credential, is what a rate-limited 403 refused.
+        # Retrying it anonymously would spend a second request to be told the same
+        # thing; the non-API fallback is what answers that case.
+        $script:AuthAttempts = @()
+        function Invoke-RestMethod {
+            param($Uri, $Headers, $TimeoutSec)
+            $script:AuthAttempts += [bool]$Headers.ContainsKey('Authorization')
+            $response = New-RateLimitedResponse -Code 403 -Remaining '0' -Reset ([string]$resetAt.ToUnixTimeSeconds())
+            throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('rate limit exceeded', $response)
+        }
+        function Invoke-WebRequest {
+            param($Uri, $Headers, $TimeoutSec, $MaximumRedirection)
+            throw 'the redirect endpoint is unreachable too'
+        }
+        Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+        $limitedWithToken = Get-BridgeUpdateStatus -Force
+        Test-That 'a rate-limited refusal is not retried anonymously, being about the allowance' {
+            $script:AuthAttempts.Count -eq 1 -and $limitedWithToken.State -eq 'RateLimited'
+        } "$($limitedWithToken.State), attempts=$($script:AuthAttempts.Count)"
+    }
+    finally {
+        if ($null -eq $priorToken) { Remove-Item -LiteralPath Env:GH_TOKEN -ErrorAction SilentlyContinue }
+        else { Set-Item -LiteralPath Env:GH_TOKEN -Value $priorToken }
+    }
+
+    # Without a token there is nothing to retry without, so a 401 must not quietly
+    # double every refused check.
+    $script:AuthAttempts = @()
+    function Invoke-RestMethod {
+        param($Uri, $Headers, $TimeoutSec)
+        $script:AuthAttempts += [bool]$Headers.ContainsKey('Authorization')
+        $response = [System.Net.Http.HttpResponseMessage]::new([System.Net.HttpStatusCode]::Unauthorized)
+        throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('Bad credentials', $response)
+    }
+    Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+    $noToken401 = Get-BridgeUpdateStatus -Force
+    Test-That 'a 401 with no token to blame is asked once, not twice' {
+        $script:AuthAttempts.Count -eq 1 -and $noToken401.State -eq 'Unavailable'
+    } "$($noToken401.State), attempts=$($script:AuthAttempts.Count)"
+
     function Invoke-RestMethod { throw 'network disabled in test' }
     function Invoke-WebRequest { throw 'network disabled in test' }
 

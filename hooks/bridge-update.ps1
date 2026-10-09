@@ -211,11 +211,19 @@ function Get-BridgeReleaseRequestHeaders {
 
         The token is read from configuration or the environment and is never logged;
         only whether one was used is ever reported.
+
+        -Anonymous omits it deliberately. A token the machine merely happened to have
+        can be expired or revoked - GITHUB_TOKEN expires when its workflow job ends -
+        and sending one of those turns a release check that would have succeeded
+        unauthenticated into a 401. The caller retries without it on exactly that.
     #>
+    param([switch]$Anonymous)
+
     $headers = @{
         'User-Agent' = $script:BridgeUpdateConfig.UserAgent
         Accept       = 'application/vnd.github+json'
     }
+    if ($Anonymous) { return $headers }
     $token = ''
     try { $token = [string](Get-BridgeSetting 'updates.token' '') } catch { $token = '' }
     foreach ($name in @('AGENT_HA_BRIDGE_UPDATE_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')) {
@@ -410,9 +418,34 @@ function Get-BridgeLatestRelease {
         if ($repository -notmatch '^[\w.-]+/[\w.-]+$') { throw 'The update repository must be owner/name.' }
         $uri = "https://api.github.com/repos/$repository/releases/latest"
         Assert-BridgeHttpAllowed -Uri $uri -Transport Rest
-        $response = Invoke-RestMethod -Uri $uri `
-            -Headers (Get-BridgeReleaseRequestHeaders) `
-            -TimeoutSec $script:BridgeUpdateConfig.RequestTimeout
+        $headers = Get-BridgeReleaseRequestHeaders
+        $sentToken = $headers.ContainsKey('Authorization')
+        try {
+            $response = Invoke-RestMethod -Uri $uri -Headers $headers `
+                -TimeoutSec $script:BridgeUpdateConfig.RequestTimeout
+        }
+        catch {
+            if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+            # A token picked up from the environment is not necessarily a good one.
+            # GITHUB_TOKEN expires when its workflow job ends, and a revoked or
+            # SSO-blocked token answers 401 - so sending one turns a check that would
+            # have worked unauthenticated into a failure, on every retry, for a public
+            # release anyone can read. Asking again without it costs one request and
+            # only happens when credentials were actually the problem.
+            #
+            # A rate-limited 403 is deliberately not retried here: the allowance, not
+            # the credential, is what was refused, and the non-API fallback below is
+            # what answers that.
+            $failureStatus = 0
+            if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
+                $failureStatus = [int]$_.Exception.Response.StatusCode
+            }
+            $badCredential = $failureStatus -eq 401 -or
+                ($failureStatus -eq 403 -and -not (Get-BridgeRateLimitWait -Response $_.Exception.Response -Status $failureStatus).Limited)
+            if (-not $sentToken -or -not $badCredential) { throw }
+            $response = Invoke-RestMethod -Uri $uri -Headers (Get-BridgeReleaseRequestHeaders -Anonymous) `
+                -TimeoutSec $script:BridgeUpdateConfig.RequestTimeout
+        }
 
         $release = [pscustomobject]@{
             Tag       = [string]$response.tag_name
