@@ -217,6 +217,8 @@ What differs on a Mac:
   control Terminal, which is how the window is opened. Allow it.
 * **The daemon is a LaunchAgent** (`com.agent-ha-bridge.daemon`) rather than a
   scheduled task: it starts at login and launchd restarts it if it exits.
+  `agent-ha-bridge restart` loads it if something has left it unloaded, rather than
+  sending you back to `configure`.
 * **`agent-ha-bridge` goes on your PATH through `~/.zprofile`**; open a new terminal
   to use it.
 

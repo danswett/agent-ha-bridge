@@ -462,7 +462,19 @@ function Invoke-Restart {
         }
         $target = "gui/$(& id -u)/$launchAgentLabel"
         & launchctl kickstart -k $target 2>&1 | Out-Null
-        if ($LASTEXITCODE -ne 0) { throw "The '$launchAgentLabel' LaunchAgent is not loaded. Run: agent-ha-bridge configure" }
+        if ($LASTEXITCODE -ne 0) {
+            # Nothing loaded to kick. The plist is right here and has already been
+            # proven to be ours, so load it rather than refusing: a failed update can
+            # leave the LaunchAgent unloaded, and restart is the command people reach
+            # for. Being told to run `configure` - a full reinstall - to reload a file
+            # that is already correct is the long way round (#123).
+            Write-Host '    the LaunchAgent was not loaded; loading it' -ForegroundColor Yellow
+            if (-not (Restore-BridgeOwnedLaunchAgent -Service $target -PlistPath $plist)) {
+                throw "The '$launchAgentLabel' LaunchAgent is not loaded and could not be loaded. Run: agent-ha-bridge configure"
+            }
+            Write-Host '    loaded' -ForegroundColor Green
+            return
+        }
         Write-Host '    restarted' -ForegroundColor Green
         return
     }

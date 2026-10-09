@@ -27,6 +27,13 @@ $script:BridgeIsWindows = [bool]($IsWindows -or $PSVersionTable.PSEdition -eq 'D
 # seconds; Get-BridgeAgentProcessSessionIds prunes it as processes go.
 $script:BridgeAgentSessionIdCache = @{}
 
+# How long to wait for launchd to finish what it has accepted. Both bootout and
+# bootstrap return before the job has gone or arrived, so the state has to be waited
+# for; 20 x 100 ms is what install.ps1 already found sufficient on the bootstrap side.
+# Script-scoped so tests can collapse the wait rather than sleeping through it.
+$script:BridgeLaunchAgentWaitAttempts = 20
+$script:BridgeLaunchAgentWaitMilliseconds = 100
+
 function Initialize-BridgePlatform {
     <#
         On macOS, sets $env:TEMP - the name every script uses for the temporary folder
@@ -576,6 +583,69 @@ function Test-BridgeLaunchAgentOwnership {
     finally { $reader.Dispose() }
 }
 
+function Wait-BridgeLaunchAgentState {
+    <#
+        Waits for a LaunchAgent to actually reach the state asked for, rather than
+        asking once and believing the answer.
+
+        `launchctl bootout` and `launchctl bootstrap` both return as soon as launchd
+        accepts the request; the job is torn down or brought up afterwards. A `print`
+        issued inside that window still finds the old state, so a shutdown that was
+        working perfectly reads as one that failed - which is why the same
+        `agent-ha-bridge update` failed twice and succeeded on the third run with
+        nothing else changed (#123).
+
+        install.ps1 learned this on the bootstrap side and waits there. This is the
+        same wait on the other side of it.
+
+        Returns the last exit code from `launchctl print`: 0 means loaded, 113 means
+        launchd has no such service.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Service,
+        [Parameter(Mandatory)][ValidateSet('loaded', 'unloaded')][string]$Until,
+        [int]$AttemptLimit = $script:BridgeLaunchAgentWaitAttempts,
+        [int]$DelayMilliseconds = $script:BridgeLaunchAgentWaitMilliseconds
+    )
+
+    $wanted = if ($Until -eq 'unloaded') { 113 } else { 0 }
+    $code = -1
+    for ($attempt = 0; $attempt -lt $AttemptLimit; $attempt++) {
+        if ($attempt -gt 0) { Start-Sleep -Milliseconds $DelayMilliseconds }
+        & launchctl print $Service 2>$null | Out-Null
+        $code = $LASTEXITCODE
+        if ($code -eq $wanted) { break }
+    }
+    $code
+}
+
+function Restore-BridgeOwnedLaunchAgent {
+    <#
+        Puts back a LaunchAgent whose shutdown could not be confirmed.
+
+        Failing *after* dismantling the service is the one outcome to avoid. It leaves
+        the machine with no daemon at all, and `agent-ha-bridge restart` cannot
+        recover it - there is nothing loaded to restart, so it refuses with "is not
+        loaded. Run: agent-ha-bridge configure". The message said "its files were
+        preserved", which reads as a safe no-op and is not one (#123).
+
+        Returns whether the service is loaded afterwards. Best effort by construction:
+        this runs while something has already gone wrong, and its own failure must not
+        replace the original fault with a less useful one.
+    #>
+    param([Parameter(Mandatory)][string]$Service, [Parameter(Mandatory)][string]$PlistPath)
+
+    if (-not [IO.File]::Exists($PlistPath)) { return $false }
+    # "gui/<uid>" from "gui/<uid>/<label>" - bootstrap takes the domain and the file,
+    # where bootout takes the service.
+    $domain = ($Service -split '/', 3)[0..1] -join '/'
+    try {
+        & launchctl bootstrap $domain $PlistPath 2>$null | Out-Null
+        (Wait-BridgeLaunchAgentState -Service $Service -Until 'loaded') -eq 0
+    }
+    catch { $false }
+}
+
 function Stop-BridgeOwnedService {
     param([Parameter(Mandatory)]$Context, [switch]$Remove,
         [ValidateSet('daemon', 'devbox-keepawake')][string[]]$Roles = @('daemon', 'devbox-keepawake'))
@@ -612,13 +682,32 @@ function Stop-BridgeOwnedService {
             $service = "gui/$userId/$label"
             & launchctl print $service 2>$null | Out-Null
             $readCode = $LASTEXITCODE
+            $booted = $false
             if ($readCode -eq 0) {
                 & launchctl bootout $service 2>$null | Out-Null
-                if ($LASTEXITCODE -ne 0) { throw "LaunchAgent shutdown failed (bootout exit $LASTEXITCODE); its files were preserved." }
-                & launchctl print $service 2>$null | Out-Null
-                $readCode = $LASTEXITCODE
+                $bootoutCode = $LASTEXITCODE
+                # 113 is "no such service": it went between the print and the bootout,
+                # which is the same race as below and is exactly the outcome wanted.
+                if ($bootoutCode -ne 0 -and $bootoutCode -ne 113) {
+                    throw "LaunchAgent shutdown failed (bootout exit $bootoutCode); its files were preserved."
+                }
+                $booted = $true
+                $readCode = Wait-BridgeLaunchAgentState -Service $service -Until 'unloaded'
             }
-            if ($readCode -ne 113) { throw "LaunchAgent shutdown could not be confirmed (print exit $readCode); its files were preserved." }
+            if ($readCode -ne 113) {
+                # launchd accepted the bootout, so the daemon may well be gone even
+                # though this could not confirm it. Throwing and leaving it that way
+                # is the worst available outcome: the machine has no daemon, and
+                # restart cannot make one because there is nothing loaded to restart.
+                # Put it back before reporting, and say which state it is in (#123).
+                if ($booted -and (Restore-BridgeOwnedLaunchAgent -Service $service -PlistPath $plist)) {
+                    throw "LaunchAgent shutdown could not be confirmed (print exit $readCode); it was reloaded and is running as before."
+                }
+                if ($booted) {
+                    throw "LaunchAgent shutdown could not be confirmed (print exit $readCode) and it could not be reloaded, so this machine may have no daemon. Run: agent-ha-bridge configure"
+                }
+                throw "LaunchAgent shutdown could not be confirmed (print exit $readCode); its files were preserved."
+            }
             $global:LASTEXITCODE = 0
             if ($Remove -or $label -ne $Context.LaunchAgentLabel) { Remove-Item -LiteralPath $plist -Force }
         }
