@@ -267,6 +267,39 @@ Test-That 'an unknown trailing Claude sentence is not silently discarded' {
         -Fields @($claudeField) -Selections @('No') -Detailed).Status -ceq 'Unconfirmed'
 }
 
+$commaLabelField = [pscustomobject]@{
+    Name    = 'How to capture these'
+    Options = @('File all four as GitHub issues, with the evidence', 'Fix them now')
+    Values  = @('file', 'fix')
+    IsText  = $false
+}
+Test-That 'a comma in a label does not stop the value the result recorded from being confirmed' {
+    (Test-CopilotAnswerMatchesSelections -ResultContent 'User responded: file' `
+        -Fields @($commaLabelField) -Selections @('File all four as GitHub issues, with the evidence') -Detailed).Status -ceq 'Matched'
+}
+Test-That 'and the wrong answer behind that same comma-bearing label is still caught' {
+    (Test-CopilotAnswerMatchesSelections -ResultContent 'User responded: fix' `
+        -Fields @($commaLabelField) -Selections @('File all four as GitHub issues, with the evidence') -Detailed).Status -ceq 'Mismatch'
+}
+
+$commaValueField = [pscustomobject]@{ Name = 'Pick'; Options = @('First', 'Second'); Values = @('a,b', 'c'); IsText = $false }
+Test-That 'a comma inside the value the result recorded is still not confirmed' {
+    (Test-CopilotAnswerMatchesSelections -ResultContent 'User responded: a,b' `
+        -Fields @($commaValueField) -Selections @('First') -Detailed).Status -ceq 'Unconfirmed'
+}
+
+# The halves of this option's *label* are the values of the other two, so a matcher
+# that merely dropped the unusable label would resolve them and report a confident
+# mismatch against the answer the user actually gave.
+$commaSplitField = [pscustomobject]@{
+    Name = 'Which'; Options = @('a,b', 'First', 'Second'); Values = @('v0', 'a', 'b')
+    MultiSelect = $true; IsText = $false
+}
+Test-That 'a multi-select answer is never split into options that merely spell its halves' {
+    (Test-CopilotAnswerMatchesSelections -ResultContent 'User responded: a,b' `
+        -Fields @($commaSplitField) -Selections @('a,b') -Detailed).Status -ceq 'Unconfirmed'
+}
+
 if ($script:Failures -gt 0) {
     Write-Host "`n$($script:Failures) failed" -ForegroundColor Red
     exit 1

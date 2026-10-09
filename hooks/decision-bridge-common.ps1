@@ -3602,6 +3602,7 @@ function Test-CopilotAnswerMatchesSelections {
         }
         if ($expected.Count -eq 0) { return (& $finish 'Unconfirmed') }
         $identities = [Collections.Generic.Dictionary[string, int]]::new([StringComparer]::Ordinal)
+        $splitRisk = $false
         for ($index = 0; $index -lt $options.Count; $index++) {
             try { $value = Get-DecisionFieldOptionValue -Field $field -Option $options[$index] }
             catch { return (& $finish 'Unconfirmed') }
@@ -3610,12 +3611,27 @@ function Test-CopilotAnswerMatchesSelections {
             $encodings = @($valueKey)
             if ($textMode) {
                 $spelling = if ($value -is [string]) { $value } else { $valueKey }
-                $encodings = @([string]$options[$index], $spelling)
                 # Delimiters, quoting and trimmed whitespace can encode two different
-                # answers identically. Only structured results can resolve these.
-                if (@($encodings | Where-Object { $_ -match '[,="]' -or $_ -cne $_.Trim() }).Count -gt 0) {
+                # answers identically, and the flattened text result is lossy about all
+                # three. In the *value* that ambiguity is unresolvable, because the
+                # value is what the result writes down: with an option valued
+                # "Confirm=No", the text "Confirm=No" is either this field answered No
+                # or that option, and nothing here can tell. The whole field stays
+                # unconfirmed, as it always has.
+                if ($spelling -match '[,="]' -or $spelling -cne $spelling.Trim()) {
                     return (& $finish 'Unconfirmed')
                 }
+                $encodings = @($spelling)
+                # A label is the other way an option can be written down, but once it
+                # differs from the value it usually is not written down at all.
+                # Refusing the field for a delimiter in one left 87% of real answers
+                # unconfirmed - against a check that had never once caught a mismatch
+                # (#147). Only that spelling is dropped now: the option stays
+                # identifiable by its value, and a result that really did record such a
+                # label resolves to nothing, which is still never a false confirmation.
+                $label = [string]$options[$index]
+                if ($label -notmatch '[,="]' -and $label -ceq $label.Trim()) { $encodings += $label }
+                elseif ($label.Contains(',')) { $splitRisk = $true }
             }
             foreach ($encoding in $encodings) {
                 if ($identities.ContainsKey($encoding) -and $identities[$encoding] -ne $index) {
@@ -3626,7 +3642,15 @@ function Test-CopilotAnswerMatchesSelections {
         }
         $actualValue = $answers[$key]
         $parts = [object[]]::new(1)
-        if ($multi -and $textMode) { $parts = @(([string]$actualValue).Split(',') | ForEach-Object { $_.Trim() }) }
+        if ($multi -and $textMode) {
+            # Splitting on the comma only identifies anything while no option spells
+            # one itself: with "a,b" among the options, a recorded "a,b" is either
+            # that single answer or the two called "a" and "b". Dropping the unusable
+            # encoding above is not enough here - the remaining ones would match the
+            # halves and report a confident mismatch against the answer actually given.
+            if ($splitRisk -and ([string]$actualValue).Contains(',')) { return (& $finish 'Unconfirmed') }
+            $parts = @(([string]$actualValue).Split(',') | ForEach-Object { $_.Trim() })
+        }
         elseif ($multi -and $actualValue -is [array]) { $parts = @($actualValue) }
         elseif (-not $multi) { $parts[0] = $actualValue }
         else { return (& $finish 'Unconfirmed') }
