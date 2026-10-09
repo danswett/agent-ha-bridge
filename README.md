@@ -402,7 +402,7 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `updates.repository` | Repository to check for releases (default `danswett/agent-ha-bridge`) |
 | `updates.checkForUpdates` | Set to `false` to disable the update check |
 | `updates.checkHours` | How often to check GitHub for a release (default `6`, i.e. 4×/day) |
-| `updates.token` | Optional GitHub token for release checks only, sent to `api.github.com` and never logged. Unauthenticated callers share **60 requests an hour per IP**, so a Dev Box or anything else behind shared egress can be refused without the bridge having made a request of its own. `AGENT_HA_BRIDGE_UPDATE_TOKEN` works too, and wins if the setting is empty. A read-only token with no scopes is enough for public releases |
+| `updates.token` | Optional GitHub token for release checks only, sent to `api.github.com` and never logged. Unauthenticated callers share **60 requests an hour per IP**, so a Dev Box or anything else behind shared egress can be refused without the bridge having made a request of its own. `AGENT_HA_BRIDGE_UPDATE_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN` in the environment are used too, in that order, when the setting is empty - a machine that already has one needs no configuration. If a token is rejected as bad credentials, the check is retried without one rather than failing - an ambient `GITHUB_TOKEN` expires when its workflow job ends, and these are public releases. A read-only token with no scopes is enough for them |
 | `usage.publish` | Set to `false` to stop collecting and publishing each agent's remaining allowance (default `true`). This stops the vendor calls, not just the card |
 | `usage.intervalSeconds` | How often to re-read the allowances (default `120`). Copilot's figure moves continuously while a session runs, so this is a poll rather than a cache read |
 | `usage.keychain` | Set to `true` to let the Copilot allowance read its token from the macOS login keychain (default `false`). Off because the read raises an authorization panel that **Always Allow** cannot silence — the CLI replaces the item on every token refresh, so each grant outlives its item by minutes. `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN` get the same figure without prompting. No effect on Windows, which reads the credential store silently |
@@ -1301,11 +1301,32 @@ action, because this software types into terminals and registers scheduled tasks
 
 **If the check is refused.** GitHub allows unauthenticated callers 60 requests an hour
 per IP, so a machine behind shared egress can be rate limited without having made a
-request of its own. That is reported as rate limiting, with the time the limit resets -
-not as a failed update - and the machine keeps publishing its installed version rather
-than going blank, because the fault is neither in the install nor in the release.
-Pressing the install button again does not help and spends more of the same allowance;
-set `updates.token` to raise the limit.
+request of its own - measured here going from 39 remaining to none in ninety seconds.
+Three things keep that from becoming a failed update:
+
+- The release archive is fetched from `codeload.github.com`, which is not part of the
+  API allowance. The `zipball_url` the API offers is itself an API request, so pressing
+  **Install update** used to spend the same allowance the check competes for - and be
+  refused once it was gone, for a reason that had nothing to do with this machine.
+- When the check itself is refused, `github.com/<r>/releases/latest` is asked instead;
+  that redirect is outside the allowance too. It is used rather than the `releases.atom`
+  feed because it makes the same selection the API does - the newest **published,
+  non-prerelease** release. The feed is ordered by date and includes prereleases, so on
+  a repository that ships them its newest entry is the wrong answer, and this project
+  pushes a release tag while the release is still a draft. Release notes are not
+  available this way, but which release is current is, and a correct version with no
+  notes beats a stale one presented as current.
+- A secondary limit names no reset time of its own, so the wait doubles each time it
+  keeps answering - 1, 2, 4, 8 minutes and so on to an hour - rather than asking again
+  at a fixed interval, which GitHub warns can earn a ban.
+- If that endpoint cannot answer either, the refusal is reported as rate limiting with the
+  time the limit resets - not as a failed update - and the machine keeps publishing its
+  installed version rather than going blank, because the fault is neither in the
+  install nor in the release.
+
+A token raises the limit to 5,000 requests an hour. One already in the environment as
+`GH_TOKEN` or `GITHUB_TOKEN` is used automatically; `updates.token` sets one
+explicitly.
 
 ---
 
