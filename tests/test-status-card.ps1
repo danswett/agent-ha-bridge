@@ -234,19 +234,21 @@ function Invoke-StatusCard {
         [string[]]$Forgets = @(),
         [string[]]$Installs = @(),
         [string]$SlowInstall = '',
+        [string]$RetryAfterRefusal = '',
         [bool]$Open = $true,
         [hashtable]$States = $null,
         [switch]$Refuse
     )
     $job = @{
-        config      = $cardConfig
-        states      = $(if ($States) { $States } else { $haStates })
-        open        = $Open
-        flips       = @($Flips)
-        forgets     = @($Forgets)
-        installs    = @($Installs)
-        slowInstall = $SlowInstall
-        refuse      = [bool]$Refuse
+        config            = $cardConfig
+        states            = $(if ($States) { $States } else { $haStates })
+        open              = $Open
+        flips             = @($Flips)
+        forgets           = @($Forgets)
+        installs          = @($Installs)
+        slowInstall       = $SlowInstall
+        retryAfterRefusal = $RetryAfterRefusal
+        refuse            = [bool]$Refuse
     } | ConvertTo-Json -Depth 20 -Compress
     $out = $job | & $nodeExe.Source $driver
     if ($LASTEXITCODE -ne 0) { throw "the card driver exited with $LASTEXITCODE" }
@@ -473,6 +475,17 @@ Test-That 'a refused press goes back to offering the update rather than claiming
     $row = Get-UpdateRow -Rendered $refused -Machine $live.Machine
     -not $row.update.button.hidden -and $row.update.button.text -eq 'Update to 1.20.0'
 } "[$((Get-UpdateRow -Rendered $refused -Machine $live.Machine).update.button.text)/$((Get-UpdateRow -Rendered $refused -Machine $live.Machine).update.note.text)]"
+
+# A re-check belongs to the press that asked for it. One left over from a press that
+# has already settled would stop the retry arming its own, fire early, and schedule a
+# fresh full grace from that moment - holding "Starting" for nearly twice as long.
+$retried = Invoke-StatusCard -States (New-UpdateStates -EntityId $liveUpdate -State 'on') -RetryAfterRefusal $live.Machine
+Test-That 'a retry after a refusal arms its own re-check rather than inheriting one' {
+    @($retried.calls).Count -eq 2 -and $retried.timersArmed -ge 2
+} "calls=$(@($retried.calls).Count) armed=$($retried.timersArmed)"
+Test-That 'and leaves exactly one of them live, for the claim that is actually held' {
+    @($retried.timers).Count -eq 1
+} "timers=[$(@($retried.timers) -join ',')]"
 
 Write-Host ''
 Write-Host '--- while it runs it says which stage, not that something is happening ---'

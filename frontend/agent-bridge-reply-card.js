@@ -2757,6 +2757,11 @@ class AgentBridgeStatusCard extends HTMLElement {
   _install(entry) {
     const entityId = entry.machine.install;
     if (!entityId || !this._hass || !entry.update) { return undefined; }
+    // Each press gets its own claim and its own re-check. A timer left over from a
+    // press that has already settled - a refusal, say - would stop this one arming,
+    // then fire early and schedule a fresh full grace from that moment, holding
+    // "Starting" for up to twice as long as the claim it belongs to. Review, #129.
+    this._clearPressClaim(entry);
     entry.pressedAt = Date.now();
     entry.pressedFrom = this._progressSignature(entry);
     // Drawn before the call is awaited, not after it. A slow call would otherwise
@@ -2767,10 +2772,19 @@ class AgentBridgeStatusCard extends HTMLElement {
     // it. A click handler simply ignores it, as it does for the X.
     return Promise.resolve(this._hass.callService('button', 'press', { entity_id: entityId }))
       .catch(() => {
-        entry.pressedAt = 0;
+        this._clearPressClaim(entry);
         if (entry.updateNote) { entry.updateNote.setAttribute('title', 'The press was refused; try again.'); }
         this._render();
       });
+  }
+
+  // Gives up an optimistic claim and the re-check that belongs to it. The two are
+  // always dropped together: a timer outliving its claim is one that fires against
+  // whatever claim happens to be current when it does.
+  _clearPressClaim(entry) {
+    entry.pressedAt = 0;
+    entry.pressedFrom = '';
+    if (entry.pressTimer) { clearTimeout(entry.pressTimer); entry.pressTimer = null; }
   }
 
   // What the machine currently reports about an update, as one string: the press
@@ -2806,7 +2820,7 @@ class AgentBridgeStatusCard extends HTMLElement {
     const claimed = entry.pressedAt &&
       Date.now() - entry.pressedAt < STATUS_UPDATE_GRACE &&
       this._progressSignature(entry) === entry.pressedFrom;
-    if (!claimed) { entry.pressedAt = 0; }
+    if (!claimed) { this._clearPressClaim(entry); }
 
     if (running) {
       let text = running;
@@ -3005,8 +3019,12 @@ class AgentBridgeStatusCard extends HTMLElement {
       // redraw the card. A press that reached Home Assistant whose machine then went
       // quiet would otherwise sit on "Starting" until some unrelated state changed,
       // with no way back to the button. Same shape as the launch card's press note.
+      //
+      // The delay is what is left of *this* claim's grace rather than a fresh one,
+      // so a re-check can never outlive the claim that asked for it.
       if (entry.pressedAt && !entry.pressTimer) {
-        entry.pressTimer = setTimeout(() => { entry.pressTimer = null; this._render(); }, STATUS_UPDATE_GRACE + 500);
+        const remaining = Math.max(250, STATUS_UPDATE_GRACE - (Date.now() - entry.pressedAt) + 250);
+        entry.pressTimer = setTimeout(() => { entry.pressTimer = null; this._render(); }, remaining);
       }
       if (entry.detail) { entry.detail.hidden = showUpdate || (!online && !!entry.forget); }
     }

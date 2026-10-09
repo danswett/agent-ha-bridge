@@ -4,7 +4,8 @@
  *
  * Reads a job on stdin:
  *   { config, states, open, flips: [<machine name>, ...], forgets: [<machine name>, ...],
- *     installs: [<machine name>, ...], refuse: <bool> }
+ *     installs: [<machine name>, ...], slowInstall: <machine name>,
+ *     retryAfterRefusal: <machine name>, refuse: <bool> }
  * where `config` is the card config Save-CopilotSessionDashboard generated and
  * `states` are the entity states the bridge's own publishers produce. Each flip is
  * the name of the machine whose Detail switch to move, in order; each forget is a
@@ -107,6 +108,26 @@ process.stdin.on('end', async () => {
     }
   }
 
+  // A press that is refused, then retried. Each press has to arm its own re-check:
+  // a timer left over from the first would stop the retry arming one, fire early,
+  // and then schedule a fresh full grace from that moment.
+  if (job.retryAfterRefusal) {
+    const entry = card._rows.find((r) => r.machine.machine === job.retryAfterRefusal);
+    if (!entry || !entry.update || entry.updateButton.hidden) { missing.push(job.retryAfterRefusal); }
+    else {
+      hass.callService = (domain, service, data) => {
+        calls.push({ domain, service, data });
+        return Promise.reject(new Error('refused'));
+      };
+      await card._install(entry);
+      hass.callService = (domain, service, data) => {
+        calls.push({ domain, service, data });
+        return Promise.resolve();
+      };
+      await card._install(entry);
+    }
+  }
+
   const rows = card._rows.map((entry) => ({
     machine: entry.machine.machine,
     meta: entry.meta.textContent,
@@ -144,7 +165,10 @@ process.stdin.on('end', async () => {
     missing,
     duringPress,
     // Every timer the card armed, so a claim that could never expire on its own is
-    // visible rather than something you only meet on a quiet instance.
+    // visible rather than something you only meet on a quiet instance. `timers` is
+    // the ones still live; `timersArmed` counts every one created, which is what
+    // shows whether a press armed its own or inherited an earlier press's.
     timers: sandbox.timers.filter(Boolean).map((t) => t.ms),
+    timersArmed: sandbox.timers.length,
   }));
 });
