@@ -607,6 +607,50 @@ try {
         Test-That 'and names a time to try again, which a secondary limit never sends' {
             $secondary.Detail -match '\d\d:\d\d'
         } $secondary.Detail
+
+        # A secondary limit that persists must not be asked again at the same interval
+        # for as long as it lasts: GitHub requires exponentially increasing waits and
+        # warns that continuing can earn a ban. The expired-reset cache bypass makes
+        # that the difference between one request a minute and a backing-off one, so
+        # the wait is carried across checks rather than recomputed fresh each time.
+        # Raised by Codex on #157.
+        $waits = @()
+        foreach ($round in 1..4) {
+            Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+            if ($waits.Count) {
+                # Only the strike count survives; the entry is otherwise expired so the
+                # next call really does re-check rather than being served from cache.
+                [pscustomobject]@{
+                    CheckedAt = [DateTimeOffset]::Now.AddHours(-9).ToString('o')
+                    Reached = $false; State = 'RateLimited'; Detail = 'x'
+                    RetryAt = [DateTimeOffset]::Now.AddMinutes(-5).ToString('o')
+                    RateLimitStrikes = $waits.Count
+                    Release = $null
+                } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
+            }
+            $null = Get-BridgeUpdateStatus -Force
+            $written = Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json
+            $waits += [int][Math]::Round(([DateTimeOffset]$written.RetryAt - [DateTimeOffset]::Now).TotalMinutes)
+        }
+        Test-That 'a secondary limit that keeps answering is backed off, not polled at a fixed minute' {
+            ($waits -join ',') -eq '1,2,4,8'
+        } ($waits -join ',')
+        Test-That 'and the strike count is carried in the cache so the wait survives a restart' {
+            ([int](Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json).RateLimitStrikes) -eq 4
+        }
+
+        # A limit that named its own reset ends on its own, so it must not accumulate
+        # backoff - GitHub already said when.
+        Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+        function Invoke-RestMethod {
+            param($Uri, $Headers, $TimeoutSec)
+            $response = New-RateLimitedResponse -Code 403 -Remaining '0' -Reset ([string]$resetAt.ToUnixTimeSeconds())
+            throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('rate limit exceeded', $response)
+        }
+        $null = Get-BridgeUpdateStatus -Force
+        Test-That 'a limit that named its own reset accrues no backoff' {
+            ([int](Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json).RateLimitStrikes) -eq 0
+        } ([string](Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json).RateLimitStrikes)
     }
     finally {
         if ($null -eq $priorToken) { Remove-Item -LiteralPath Env:GH_TOKEN -ErrorAction SilentlyContinue }

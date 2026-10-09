@@ -172,9 +172,9 @@ function Get-BridgeRateLimitWait {
         refused check reads as the machine being broken, so the operator presses the
         button again, which spends more of the allowance that was already exhausted.
     #>
-    param([AllowNull()]$Response, [int]$Status = 0, [string]$Detail = '')
+    param([AllowNull()]$Response, [int]$Status = 0, [string]$Detail = '', [int]$Attempt = 1)
 
-    $none = [pscustomobject]@{ Limited = $false; RetryAt = $null; Suffix = '' }
+    $none = [pscustomobject]@{ Limited = $false; RetryAt = $null; Suffix = ''; Explicit = $false }
     if ($Status -ne 403 -and $Status -ne 429) { return $none }
 
     $header = {
@@ -219,22 +219,32 @@ function Get-BridgeRateLimitWait {
     if (-not $limited) { return $none }
 
     $retryAt = $null
+    $explicit = $false
     $seconds = 0
     if ($retryAfter -and [int]::TryParse($retryAfter, [ref]$seconds) -and $seconds -gt 0) {
         $retryAt = [DateTimeOffset]::Now.AddSeconds($seconds)
+        $explicit = $true
     }
     else {
         $epoch = 0L
         if ($reset -and [long]::TryParse($reset, [ref]$epoch) -and $epoch -gt 0) {
             $retryAt = [DateTimeOffset]::FromUnixTimeSeconds($epoch).ToLocalTime()
+            $explicit = $true
         }
-        # A secondary limit names no time at all, and GitHub asks for at least a
-        # minute. Saying so beats reporting a refusal with no end to it.
-        elseif ($secondary) { $retryAt = [DateTimeOffset]::Now.AddMinutes(1) }
+        # A secondary limit names no time at all. GitHub asks for at least a minute,
+        # and for exponentially increasing waits while it keeps answering this way -
+        # continuing to ask at a fixed interval is what it warns can earn a ban. So
+        # the wait doubles per consecutive refusal it had to invent a time for,
+        # capped at an hour: 1, 2, 4, 8, 16, 32, 60 minutes.
+        elseif ($secondary) {
+            $steps = [Math]::Max(0, [Math]::Min($Attempt - 1, 6))
+            $minutes = [Math]::Min(60, [Math]::Pow(2, $steps))
+            $retryAt = [DateTimeOffset]::Now.AddMinutes($minutes)
+        }
     }
 
     $suffix = if ($null -ne $retryAt) { " until $($retryAt.ToString('HH:mm'))" } else { '' }
-    [pscustomobject]@{ Limited = $true; RetryAt = $retryAt; Suffix = $suffix }
+    [pscustomobject]@{ Limited = $true; RetryAt = $retryAt; Suffix = $suffix; Explicit = $explicit }
 }
 
 function Get-BridgeReleaseRequestHeaders {
@@ -399,6 +409,13 @@ function Get-BridgeLatestRelease {
     }
 
     $lookup = [pscustomobject]@{ State = 'Unavailable'; Release = $null; Detail = 'The latest release could not be established.'; RetryAt = $null }
+    # Carried across checks so a limit that names no time of its own backs off instead
+    # of being asked again at the same fixed interval for as long as it lasts.
+    $strikes = 0
+    if ($null -ne $cache -and $cache.PSObject.Properties['RateLimitStrikes']) {
+        $parsed = 0
+        if ([int]::TryParse([string]$cache.RateLimitStrikes, [ref]$parsed) -and $parsed -gt 0) { $strikes = $parsed }
+    }
     if (-not $Force -and $null -ne $cache -and $cache.PSObject.Properties['CheckedAt']) {
         $checkedAt = $null
         try { $checkedAt = ConvertTo-BridgeUpdateTime $cache.CheckedAt }
@@ -511,6 +528,7 @@ function Get-BridgeLatestRelease {
         $lookup.State = 'Found'
         $lookup.Release = $release
         $lookup.Detail = ''
+        $strikes = 0
     }
     catch {
         if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
@@ -521,7 +539,10 @@ function Get-BridgeLatestRelease {
             $httpStatus = [int]$failureResponse.StatusCode
         }
         $rateLimit = Get-BridgeRateLimitWait -Response $failureResponse -Status $httpStatus `
-            -Detail (Get-BridgeHttpErrorDetail -ErrorRecord $_)
+            -Detail (Get-BridgeHttpErrorDetail -ErrorRecord $_) -Attempt ($strikes + 1)
+        # A refusal GitHub gave no time for is the one that has to back off; when it
+        # named a reset, that time is the answer and waiting for it ends the loop.
+        $strikes = if ($rateLimit.Limited -and -not $rateLimit.Explicit) { $strikes + 1 } else { 0 }
         if ($httpStatus -eq 404) {
             $lookup.State = 'NotFound'
             $lookup.Detail = 'GitHub returned 404 for the latest-release endpoint; repository existence and access are not confirmed.'
@@ -550,6 +571,7 @@ function Get-BridgeLatestRelease {
                     $lookup.Release = $fallback
                     $lookup.RetryAt = $null
                     $lookup.Detail = ''
+                    $strikes = 0
                 }
             }
             catch {
@@ -577,6 +599,7 @@ function Get-BridgeLatestRelease {
         State     = $lookup.State
         Detail    = $lookup.Detail
         RetryAt   = $lookup.RetryAt
+        RateLimitStrikes = $strikes
         Release   = $lookup.Release
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
 

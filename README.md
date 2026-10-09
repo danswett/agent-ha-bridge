@@ -1316,6 +1316,9 @@ Three things keep that from becoming a failed update:
   pushes a release tag while the release is still a draft. Release notes are not
   available this way, but which release is current is, and a correct version with no
   notes beats a stale one presented as current.
+- A secondary limit names no reset time of its own, so the wait doubles each time it
+  keeps answering - 1, 2, 4, 8 minutes and so on to an hour - rather than asking again
+  at a fixed interval, which GitHub warns can earn a ban.
 - If that endpoint cannot answer either, the refusal is reported as rate limiting with the
   time the limit resets - not as a failed update - and the machine keeps publishing its
   installed version rather than going blank, because the fault is neither in the
