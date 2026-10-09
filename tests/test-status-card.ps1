@@ -234,7 +234,8 @@ function Invoke-StatusCard {
         [string[]]$Forgets = @(),
         [string[]]$Installs = @(),
         [bool]$Open = $true,
-        [hashtable]$States = $null
+        [hashtable]$States = $null,
+        [switch]$Refuse
     )
     $job = @{
         config   = $cardConfig
@@ -243,6 +244,7 @@ function Invoke-StatusCard {
         flips    = @($Flips)
         forgets  = @($Forgets)
         installs = @($Installs)
+        refuse   = [bool]$Refuse
     } | ConvertTo-Json -Depth 20 -Compress
     $out = $job | & $nodeExe.Source $driver
     if ($LASTEXITCODE -ne 0) { throw "the card driver exited with $LASTEXITCODE" }
@@ -309,6 +311,15 @@ Test-That 'they cover every discovery config the bridge published for it' {
         ForEach-Object { $_.Topic } | Sort-Object -Unique)
     $published.Count -gt 0 -and @($published | Where-Object { $darkForget -notcontains $_ }).Count -eq 0
 } "missing=[$(@($script:Published | Where-Object { $_.Topic -match "^homeassistant/[a-z_]+/(agent_bridge_$($dark.Slug)|$($darkNodes -join '|'))/[^/]+/config$" } | ForEach-Object { $_.Topic } | Sort-Object -Unique | Where-Object { $darkForget -notcontains $_ }) -join ',')]"
+Test-That 'and every retained topic it published, not only its discovery configs' {
+    # Clearing the configs withdraws the entities, but a retained payload left on the
+    # broker comes back the moment a machine of the same name does - which is how an
+    # old update stage would reappear on a fresh install (#129 review).
+    $root = Get-CopilotMqttMachineTopicRoot -Slug $dark.Slug
+    $retained = @($script:Published | Where-Object { $_.Topic -like "$root/*" } |
+        ForEach-Object { $_.Topic } | Sort-Object -Unique)
+    $retained.Count -gt 0 -and @($retained | Where-Object { $darkForget -notcontains $_ }).Count -eq 0
+} "missing=[$(@($script:Published | Where-Object { $_.Topic -like "$(Get-CopilotMqttMachineTopicRoot -Slug $dark.Slug)/*" } | ForEach-Object { $_.Topic } | Sort-Object -Unique | Where-Object { $darkForget -notcontains $_ }) -join ',')]"
 Test-That 'and nothing belonging to the machine that is still running' {
     @($darkForget | Where-Object { $_ -match "$($live.Slug)|$(@($sessions | ForEach-Object { $_.Node }) -join '|')" }).Count -eq 0
 }
@@ -434,6 +445,15 @@ Test-That 'and it stops offering an update it has already asked for' {
     $row = Get-UpdateRow -Rendered $pressed -Machine $live.Machine
     $row.update.button.hidden -and $row.update.note.text -eq 'Starting'
 } "[$((Get-UpdateRow -Rendered $pressed -Machine $live.Machine).update.note.text)]"
+
+# A call Home Assistant refuses is a press that never reached the daemon. Holding
+# the optimistic claim would hide the button behind "Starting" for two minutes while
+# nothing at all was happening.
+$refused = Invoke-StatusCard -States (New-UpdateStates -EntityId $liveUpdate -State 'on') -Installs @($live.Machine) -Refuse
+Test-That 'a refused press goes back to offering the update rather than claiming it started' {
+    $row = Get-UpdateRow -Rendered $refused -Machine $live.Machine
+    -not $row.update.button.hidden -and $row.update.button.text -eq 'Update to 1.20.0'
+} "[$((Get-UpdateRow -Rendered $refused -Machine $live.Machine).update.button.text)/$((Get-UpdateRow -Rendered $refused -Machine $live.Machine).update.note.text)]"
 
 Write-Host ''
 Write-Host '--- while it runs it says which stage, not that something is happening ---'

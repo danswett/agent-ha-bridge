@@ -1518,6 +1518,10 @@ function Get-CopilotMqttMachineTopic {
         "$prefix/sensor/$node/sessions/config"
         "$prefix/binary_sensor/$node/online/config"
         "$root/update/state"
+        # Added with the stage attributes (#129). Retained like the rest, so a machine
+        # recreated under the same slug would otherwise come back briefly wearing the
+        # stage its predecessor finished on.
+        "$root/update/attributes"
         "$root/newsession/result"
         "$root/newsession/promptpayload"
         "$root/transfer/request"

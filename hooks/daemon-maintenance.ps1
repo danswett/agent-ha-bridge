@@ -56,6 +56,12 @@ function Get-DaemonUpdateProgress {
     param([DateTimeOffset]$Now = [DateTimeOffset]::Now)
 
     $blank = [pscustomobject]@{ Stage = ''; Detail = ''; Proportion = $null }
+    $verdict = $script:DaemonUpdateVerdict
+    if ($verdict -and ($Now - $verdict.At).TotalMinutes -gt $script:DaemonUpdateVerdictMinutes) {
+        $script:DaemonUpdateVerdict = $null
+        $verdict = $null
+    }
+
     $progress = $null
     try {
         $progress = Read-BridgeUpdateStage -Path $script:BridgeUpdateConfig.ProgressFile `
@@ -67,6 +73,18 @@ function Get-DaemonUpdateProgress {
         $progress = $null
     }
     if ($progress) {
+        # A verdict for the same ending is the better of the two. The child's terminal
+        # stage carries whatever it had to hand, which on success is nothing - its
+        # detail is the error string - while the verdict is built from the outcome
+        # record and names the version reached or the reason it failed. Taking the
+        # child's record first turned "Updated to 1.33.9" back into a bare "Updated"
+        # on the very next pass, for the rest of the hour. Review on #129.
+        #
+        # A stage that is still running always wins: nothing has ended yet, so there
+        # is no verdict that could describe it.
+        if ($verdict -and $progress.Done) {
+            return [pscustomobject]@{ Stage = [string]$verdict.Stage; Detail = [string]$verdict.Detail; Proportion = $null }
+        }
         return [pscustomobject]@{
             Stage      = [string]$progress.Stage
             Detail     = [string]$progress.Detail
@@ -74,12 +92,7 @@ function Get-DaemonUpdateProgress {
         }
     }
 
-    $verdict = $script:DaemonUpdateVerdict
     if (-not $verdict) { return $blank }
-    if (($Now - $verdict.At).TotalMinutes -gt $script:DaemonUpdateVerdictMinutes) {
-        $script:DaemonUpdateVerdict = $null
-        return $blank
-    }
     [pscustomobject]@{ Stage = [string]$verdict.Stage; Detail = [string]$verdict.Detail; Proportion = $null }
 }
 

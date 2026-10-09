@@ -4,12 +4,13 @@
  *
  * Reads a job on stdin:
  *   { config, states, open, flips: [<machine name>, ...], forgets: [<machine name>, ...],
- *     installs: [<machine name>, ...] }
+ *     installs: [<machine name>, ...], refuse: <bool> }
  * where `config` is the card config Save-CopilotSessionDashboard generated and
  * `states` are the entity states the bridge's own publishers produce. Each flip is
  * the name of the machine whose Detail switch to move, in order; each forget is a
  * machine whose X to press twice - once to arm it, once to remove it; each install
- * is a machine whose Update button to press.
+ * is a machine whose Update button to press. `refuse` makes Home Assistant reject
+ * every service call, which is a press that never reached the daemon.
  *
  * Writes on stdout:
  *   { summary, waiting, hidden, size, rows: [...], calls: [...], missing: [...] }
@@ -39,6 +40,10 @@ process.stdin.on('end', async () => {
       const entity = job.states[data.entity_id];
       if (entity && service === 'toggle') { entity.state = entity.state === 'on' ? 'off' : 'on'; }
       card.hass = hass;
+      // A call Home Assistant refuses - no connection, no permission - is a press
+      // that never reached the daemon, and the card has to stop claiming it did.
+      if (job.refuse) { return Promise.reject(new Error('refused')); }
+      return Promise.resolve();
     },
   };
 
@@ -67,7 +72,7 @@ process.stdin.on('end', async () => {
   for (const name of (job.installs || [])) {
     const entry = card._rows.find((r) => r.machine.machine === name);
     if (!entry || !entry.update || entry.update.hidden || entry.updateButton.hidden) { missing.push(name); continue; }
-    entry.updateButton.click();
+    await card._install(entry);
   }
 
   const rows = card._rows.map((entry) => ({

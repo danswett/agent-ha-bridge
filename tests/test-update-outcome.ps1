@@ -404,6 +404,23 @@ Assert-UpdateOutcome 'and the progress file wins over any verdict, being the new
         Set-DaemonUpdateVerdict -Stage 'failed' -Detail 'stale'
         (Get-DaemonUpdateProgress).Stage -ceq 'downloading'
     ))
+# The child's own terminal stage carries whatever it had to hand, which on success is
+# nothing at all - its detail is the error string. The verdict is built from the
+# outcome record and names the version reached, so it is the better of the two for an
+# attempt that has ended. Taking the child's first turned "Updated to 1.3.0" back
+# into a bare "Updated" on the very next pass (#129 review).
+@{ schemaVersion = 1; attemptId = ('b' * 32); stage = 'completed'; detail = ''
+   at = [DateTimeOffset]::Now.ToString('o') } | ConvertTo-Json -Compress |
+    Set-Content -LiteralPath $progressFile -Encoding UTF8
+Set-DaemonUpdateVerdict -Stage 'completed' -Detail 'Updated to 1.3.0'
+$ended = Get-DaemonUpdateProgress
+Assert-UpdateOutcome 'an ended attempt keeps the verdict that names the version, not the bare stage' (
+    $ended.Stage -ceq 'completed' -and $ended.Detail -ceq 'Updated to 1.3.0') "[$($ended.Stage)/$($ended.Detail)]"
+@{ schemaVersion = 1; attemptId = ('b' * 32); stage = 'installing'
+   at = [DateTimeOffset]::Now.ToString('o') } | ConvertTo-Json -Compress |
+    Set-Content -LiteralPath $progressFile -Encoding UTF8
+Assert-UpdateOutcome 'while a stage still running outranks any verdict, nothing having ended yet' (
+    (Get-DaemonUpdateProgress).Stage -ceq 'installing')
 @{ schemaVersion = 1; attemptId = ('b' * 32); stage = 'completed'
    at = [DateTimeOffset]::Now.AddHours(-26).ToString('o') } | ConvertTo-Json -Compress |
     Set-Content -LiteralPath $progressFile -Encoding UTF8
