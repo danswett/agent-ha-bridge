@@ -46,21 +46,38 @@ function Get-LiveCopilotSessions {
 
     $named = Get-BridgeAgentProcessSessionIds -Processes $processes
 
+    # When each process started, so that a directory it cannot have written since is
+    # not mistaken below for a session it moved to. Not every process will say - a
+    # protected one throws - and one that will not simply keeps its command line.
+    $startedAtUtc = @{}
+    foreach ($process in $processes) {
+        try { $startedAtUtc[[int]$process.Id] = $process.StartTime.ToUniversalTime() } catch { }
+    }
+
     $candidates = @()
     foreach ($dir in [IO.Directory]::EnumerateDirectories($root)) {
-        $processId = $null
         foreach ($lock in [IO.Directory]::EnumerateFiles($dir, 'inuse.*.lock')) {
             $name = [IO.Path]::GetFileName($lock)
             if ($name -notmatch '^inuse\.(\d+)\.lock$') { continue }
             $candidatePid = [int]$Matches[1]
-            if ($livePids.ContainsKey($candidatePid)) { $processId = $candidatePid; break }
-        }
-        if ($null -eq $processId) { continue }
+            if (-not $livePids.ContainsKey($candidatePid)) { continue }
 
-        # Null only if the directory went between enumerating it and reading it;
-        # appending that would put a $null in the list for the tie-break to trip over.
-        $candidate = New-DaemonCopilotSession -Directory $dir -ProcessId $processId
-        if ($null -ne $candidate) { $candidates += $candidate }
+            # The lock's own timestamp, kept because the directory's transcript cannot
+            # say which process wrote it. A lock left behind by a dead CLI whose pid
+            # has since been recycled was written before the process now holding that
+            # pid started, and is not evidence about that process at all.
+            $lockWrite = [datetime]::MinValue
+            try { $lockWrite = [IO.File]::GetLastWriteTimeUtc($lock) } catch { }
+
+            # One candidate per live lock rather than the first one found. A directory
+            # two live CLIs both hold a lock in used to yield a candidate for only one
+            # of them, leaving the other with no candidate at all.
+            #
+            # Null only if the directory went between enumerating it and reading it;
+            # appending that would put a $null in the list for the tie-break to trip over.
+            $candidate = New-DaemonCopilotSession -Directory $dir -ProcessId $candidatePid -LockWriteUtc $lockWrite
+            if ($null -ne $candidate) { $candidates += $candidate }
+        }
     }
 
     # One CLI process owns exactly one live session. A process that resumed a
@@ -69,8 +86,10 @@ function Get-LiveCopilotSessions {
     # phantom sessions in Home Assistant and, worse, deliver a reply meant for one
     # session into whichever session shares the pid.
     #
-    # A command line settles that outright, so it is taken first and the lock-based
-    # tie-break is left to the processes it could not answer for.
+    # A command line names one session outright, so it is taken first and the
+    # lock-based tie-break is left to the processes it could not answer for. It is
+    # not quite the last word: Resolve-DaemonResumedCopilotSession covers the one
+    # resume a command line cannot describe.
     $live = @{}
     $settled = @{}
     foreach ($entry in $named.GetEnumerator()) {
@@ -84,7 +103,8 @@ function Get-LiveCopilotSessions {
             else { New-DaemonCopilotSession -Directory ([IO.Path]::Combine($root, $sessionId)) -ProcessId $processId }
         if ($null -eq $resolved) { continue }
 
-        $live[$sessionId] = $resolved
+        $resolved = Resolve-DaemonResumedCopilotSession -Named $resolved -Candidates $candidates -StartedAtUtc $startedAtUtc
+        $live[$resolved.SessionId] = $resolved
         $settled[$processId] = $true
     }
 
@@ -98,6 +118,67 @@ function Get-LiveCopilotSessions {
     $live
 }
 
+function Resolve-DaemonResumedCopilotSession {
+    <#
+        The session a process is really in, when its command line still names one it
+        has since left.
+
+        `--session-id` is fixed when the CLI is launched. A resume made from *inside*
+        it - /resume, or the session picker - switches the live session without
+        rewriting that, so the command line goes on naming the throwaway session the
+        CLI started in. That one stops at its first two events while the resumed
+        transcript grows under a second `inuse.<pid>.lock` the same process holds.
+
+        On 2026-10-09 that put two dead sessions on the dashboard, each frozen at 793
+        bytes with no model and a placeholder name, while the two real sessions they
+        stood for had no card at all. Worse than cosmetic: a reply typed on the phone
+        was injected into the process and answered in its terminal, but the card it
+        came from was watching the abandoned transcript, so it never saw the turn and
+        read as ignored.
+
+        The command line is still believed by default - it is the only thing that
+        knows about a resume onto an id with no lock of its own, which is why it is
+        consulted first. A lock directory displaces it only when this process can be
+        shown to have written that directory since, which takes all three of:
+
+          - the lock there belongs to this run of this pid, not to a dead CLI whose
+            pid was recycled. A stale lock names a live `copilot` process and passes
+            every other test, while another CLI entirely may be resuming that session
+            and writing its transcript right now - so the transcript's age says
+            nothing about the process holding the pid today.
+          - its transcript is newer than the named session's, so the process really
+            did move on rather than still writing where it started.
+          - its transcript is newer than the process start. Without this a session
+            launched moments ago, which has no transcript for its first seconds,
+            would lose to any stale directory that happened to be written recently.
+    #>
+    param(
+        [Parameter(Mandatory)]$Named,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Candidates,
+        [Parameter(Mandatory)][hashtable]$StartedAtUtc
+    )
+
+    $processId = [int]$Named.ProcessId
+    if (-not $StartedAtUtc.ContainsKey($processId)) { return $Named }
+    $startedAt = $StartedAtUtc[$processId]
+
+    $moved = @($Candidates |
+        Where-Object {
+            $_.ProcessId -eq $processId -and
+            $_.SessionId -ne $Named.SessionId -and
+            $_.HasTranscript -and
+            $_.LockWrite -ge $startedAt -and
+            $_.LastWrite -gt $Named.LastWrite -and
+            $_.LastWrite -gt $startedAt
+        } |
+        Sort-Object LastWrite -Descending)
+
+    # Bare `$moved[0]` on an empty array yields $null under StrictMode rather than
+    # failing, which would drop the session from the map entirely.
+    if ($moved.Count -eq 0) { return $Named }
+    $moved[0]
+}
+
 function New-DaemonCopilotSession {
     <#
         One live Copilot session, as Get-LiveCopilotSessions describes them. Shared so
@@ -109,7 +190,11 @@ function New-DaemonCopilotSession {
     #>
     param(
         [Parameter(Mandatory)][string]$Directory,
-        [Parameter(Mandatory)][int]$ProcessId
+        [Parameter(Mandatory)][int]$ProcessId,
+        # When this pid's lock in $Directory was written, for the resume test in
+        # Resolve-DaemonResumedCopilotSession. MinValue for a session found by its
+        # command line, which has no lock here to date.
+        [datetime]$LockWriteUtc = [datetime]::MinValue
     )
 
     if (-not [IO.Directory]::Exists($Directory)) { return $null }
@@ -131,6 +216,7 @@ function New-DaemonCopilotSession {
         # A missing file reports a 1601 sentinel, which naturally loses the
         # per-pid tie-break to any session that has actually written one.
         LastWrite = if ($hasTranscript) { [IO.File]::GetLastWriteTimeUtc($transcript) } else { [DateTime]::MinValue }
+        LockWrite = $LockWriteUtc
         Kind = 'copilot'
     }
 }
