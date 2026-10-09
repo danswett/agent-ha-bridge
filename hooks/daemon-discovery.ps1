@@ -56,19 +56,28 @@ function Get-LiveCopilotSessions {
 
     $candidates = @()
     foreach ($dir in [IO.Directory]::EnumerateDirectories($root)) {
-        $processId = $null
         foreach ($lock in [IO.Directory]::EnumerateFiles($dir, 'inuse.*.lock')) {
             $name = [IO.Path]::GetFileName($lock)
             if ($name -notmatch '^inuse\.(\d+)\.lock$') { continue }
             $candidatePid = [int]$Matches[1]
-            if ($livePids.ContainsKey($candidatePid)) { $processId = $candidatePid; break }
-        }
-        if ($null -eq $processId) { continue }
+            if (-not $livePids.ContainsKey($candidatePid)) { continue }
 
-        # Null only if the directory went between enumerating it and reading it;
-        # appending that would put a $null in the list for the tie-break to trip over.
-        $candidate = New-DaemonCopilotSession -Directory $dir -ProcessId $processId
-        if ($null -ne $candidate) { $candidates += $candidate }
+            # The lock's own timestamp, kept because the directory's transcript cannot
+            # say which process wrote it. A lock left behind by a dead CLI whose pid
+            # has since been recycled was written before the process now holding that
+            # pid started, and is not evidence about that process at all.
+            $lockWrite = [datetime]::MinValue
+            try { $lockWrite = [IO.File]::GetLastWriteTimeUtc($lock) } catch { }
+
+            # One candidate per live lock rather than the first one found. A directory
+            # two live CLIs both hold a lock in used to yield a candidate for only one
+            # of them, leaving the other with no candidate at all.
+            #
+            # Null only if the directory went between enumerating it and reading it;
+            # appending that would put a $null in the list for the tie-break to trip over.
+            $candidate = New-DaemonCopilotSession -Directory $dir -ProcessId $candidatePid -LockWriteUtc $lockWrite
+            if ($null -ne $candidate) { $candidates += $candidate }
+        }
     }
 
     # One CLI process owns exactly one live session. A process that resumed a
@@ -130,10 +139,18 @@ function Resolve-DaemonResumedCopilotSession {
         The command line is still believed by default - it is the only thing that
         knows about a resume onto an id with no lock of its own, which is why it is
         consulted first. A lock directory displaces it only when this process can be
-        shown to have written that directory since: its transcript is newer than the
-        named session's *and* newer than the process start. Without the second test a
-        session launched moments ago, which has no transcript for its first seconds,
-        would lose to any stale directory a recycled pid still holds a lock in.
+        shown to have written that directory since, which takes all three of:
+
+          - the lock there belongs to this run of this pid, not to a dead CLI whose
+            pid was recycled. A stale lock names a live `copilot` process and passes
+            every other test, while another CLI entirely may be resuming that session
+            and writing its transcript right now - so the transcript's age says
+            nothing about the process holding the pid today.
+          - its transcript is newer than the named session's, so the process really
+            did move on rather than still writing where it started.
+          - its transcript is newer than the process start. Without this a session
+            launched moments ago, which has no transcript for its first seconds,
+            would lose to any stale directory that happened to be written recently.
     #>
     param(
         [Parameter(Mandatory)]$Named,
@@ -150,6 +167,7 @@ function Resolve-DaemonResumedCopilotSession {
             $_.ProcessId -eq $processId -and
             $_.SessionId -ne $Named.SessionId -and
             $_.HasTranscript -and
+            $_.LockWrite -ge $startedAt -and
             $_.LastWrite -gt $Named.LastWrite -and
             $_.LastWrite -gt $startedAt
         } |
@@ -172,7 +190,11 @@ function New-DaemonCopilotSession {
     #>
     param(
         [Parameter(Mandatory)][string]$Directory,
-        [Parameter(Mandatory)][int]$ProcessId
+        [Parameter(Mandatory)][int]$ProcessId,
+        # When this pid's lock in $Directory was written, for the resume test in
+        # Resolve-DaemonResumedCopilotSession. MinValue for a session found by its
+        # command line, which has no lock here to date.
+        [datetime]$LockWriteUtc = [datetime]::MinValue
     )
 
     if (-not [IO.Directory]::Exists($Directory)) { return $null }
@@ -194,6 +216,7 @@ function New-DaemonCopilotSession {
         # A missing file reports a 1601 sentinel, which naturally loses the
         # per-pid tie-break to any session that has actually written one.
         LastWrite = if ($hasTranscript) { [IO.File]::GetLastWriteTimeUtc($transcript) } else { [DateTime]::MinValue }
+        LockWrite = $LockWriteUtc
         Kind = 'copilot'
     }
 }

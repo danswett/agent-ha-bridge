@@ -54,12 +54,19 @@ function New-FixtureSession {
         [Parameter(Mandatory)][string]$Id,
         [int[]]$LockPids = @(),
         [switch]$WithTranscript,
-        [int]$TranscriptAgeMinutes = 0
+        [int]$TranscriptAgeMinutes = 0,
+        # Minutes before now for the lock files, so a lock left behind by a dead CLI
+        # whose pid was recycled can be told from one this process wrote itself.
+        [int]$LockAgeMinutes = 0
     )
     $dir = Join-Path $root $Id
     [void][IO.Directory]::CreateDirectory($dir)
     foreach ($lockPid in $LockPids) {
-        Set-Content -LiteralPath (Join-Path $dir "inuse.$lockPid.lock") -Value 'x' -Encoding UTF8
+        $lockPath = Join-Path $dir "inuse.$lockPid.lock"
+        Set-Content -LiteralPath $lockPath -Value 'x' -Encoding UTF8
+        if ($LockAgeMinutes -ne 0) {
+            [IO.File]::SetLastWriteTimeUtc($lockPath, [datetime]::UtcNow.AddMinutes(-$LockAgeMinutes))
+        }
     }
     if ($WithTranscript) {
         $transcript = Join-Path $dir 'events.jsonl'
@@ -279,6 +286,38 @@ try {
     Test-That 'and the session it left behind captures no reply' {
         $null -eq (Get-CopilotSessionProcessId -SessionId $freshId)
     } "got: $(Get-CopilotSessionProcessId -SessionId $freshId)"
+
+    # A recycled pid, which the transcript's age alone cannot see. The dead CLI left
+    # its lock in a session that a different live CLI has since resumed and is writing
+    # now, so that transcript is newer than this process's start and newer than the
+    # session its command line names - every test but the lock's own age. Displacing
+    # on that would take the new process's card away and send its replies elsewhere.
+    Get-ChildItem -LiteralPath $root -Directory | Remove-Item -Recurse -Force
+    $null = New-FixtureSession -Id $freshId -LockPids 211 -WithTranscript -TranscriptAgeMinutes 2
+    $null = New-FixtureSession -Id $otherId -LockPids 211 -WithTranscript -TranscriptAgeMinutes 0 -LockAgeMinutes 120
+    Set-FixtureProcesses @((New-FixtureProcess -Id 211 -CommandLine (New-CopilotCommandLine -SessionId $freshId) -StartedMinutesAgo 10))
+    $live = Get-LiveCopilotSessions
+    Test-That 'a lock left by a dead CLI whose pid was recycled does not displace the new one' {
+        $live.Count -eq 1 -and $live.ContainsKey($freshId)
+    } "keys: $(@($live.Keys) -join ',')"
+    Test-That 'and the recycled pid keeps the card its command line names' {
+        (Get-CopilotSessionProcessId -SessionId $freshId) -eq 211
+    } "got: $(Get-CopilotSessionProcessId -SessionId $freshId)"
+
+    # Candidates are kept per lock, not one per directory: keeping only the first live
+    # lock found left the second CLI holding a lock there with no candidate at all.
+    Get-ChildItem -LiteralPath $root -Directory | Remove-Item -Recurse -Force
+    $null = New-FixtureSession -Id $freshId -LockPids 212, 213 -WithTranscript
+    Set-FixtureProcesses @(
+        (New-FixtureProcess -Id 212 -NoCommandLineProperty),
+        (New-FixtureProcess -Id 213 -NoCommandLineProperty)
+    )
+    $script:CommandLines[212] = ''
+    $script:CommandLines[213] = ''
+    $live = Get-LiveCopilotSessions
+    Test-That 'a directory two live CLIs both hold a lock in is still the one session they share' {
+        $live.Count -eq 1 -and $live.ContainsKey($freshId)
+    } "keys: $(@($live.Keys) -join ',')"
 
     Get-ChildItem -LiteralPath $root -Directory | Remove-Item -Recurse -Force
     $null = New-FixtureSession -Id $otherId -LockPids 204 -WithTranscript -TranscriptAgeMinutes 0
