@@ -639,6 +639,26 @@ try {
             ([int](Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json).RateLimitStrikes) -eq 4
         }
 
+        # And a secondary limit still carries the *primary* bucket's reset header,
+        # which can be most of an hour away and has nothing to do with what was
+        # refused. Taking it as GitHub's answer also cancelled the backoff, so the
+        # secondary limit was both misreported and polled at a fixed interval.
+        # Raised by Codex on #157.
+        Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+        $primaryReset = [DateTimeOffset]::Now.AddMinutes(43)
+        function Invoke-RestMethod {
+            param($Uri, $Headers, $TimeoutSec)
+            $response = New-RateLimitedResponse -Code 403 -Remaining '57' -Reset ([string]$primaryReset.ToUnixTimeSeconds())
+            throw [Microsoft.PowerShell.Commands.HttpResponseException]::new(
+                'You have exceeded a secondary rate limit. Please wait a few minutes before you try again.', $response)
+        }
+        $withPrimaryReset = Get-BridgeUpdateStatus -Force
+        Test-That 'a secondary limit does not take the primary bucket reset as its own answer' {
+            $written = Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json
+            [Math]::Round(([DateTimeOffset]$written.RetryAt - [DateTimeOffset]::Now).TotalMinutes) -eq 1 -and
+                [int]$written.RateLimitStrikes -eq 1
+        } "$($withPrimaryReset.Detail)"
+
         # A limit that named its own reset ends on its own, so it must not accumulate
         # backoff - GitHub already said when.
         Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue

@@ -226,8 +226,15 @@ function Get-BridgeRateLimitWait {
         $explicit = $true
     }
     else {
+        # X-RateLimit-Reset belongs to the primary bucket and is sent on every reply,
+        # including a secondary-limit refusal that still has allowance left. Taking it
+        # then names a time that has nothing to do with what was refused - and, being
+        # treated as an answer from GitHub, cancels the backoff the secondary limit
+        # needs. So it counts only when the primary allowance is actually gone, which
+        # is the order GitHub documents: Retry-After, then reset if remaining is zero,
+        # otherwise wait a minute and back off. Raised by Codex on #157.
         $epoch = 0L
-        if ($reset -and [long]::TryParse($reset, [ref]$epoch) -and $epoch -gt 0) {
+        if ($remaining -eq '0' -and $reset -and [long]::TryParse($reset, [ref]$epoch) -and $epoch -gt 0) {
             $retryAt = [DateTimeOffset]::FromUnixTimeSeconds($epoch).ToLocalTime()
             $explicit = $true
         }
