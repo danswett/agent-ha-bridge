@@ -561,6 +561,30 @@ try {
         Test-That 'a rate-limited refusal is not retried anonymously, being about the allowance' {
             $script:AuthAttempts.Count -eq 1 -and $limitedWithToken.State -eq 'RateLimited'
         } "$($limitedWithToken.State), attempts=$($script:AuthAttempts.Count)"
+
+        # A secondary limit answers 403 with a nonzero remaining count and no
+        # Retry-After, saying which it was only in the body. Reading that as a bad
+        # credential and immediately asking again is the one response GitHub warns can
+        # get a caller banned. Raised by Codex on #157.
+        $script:AuthAttempts = @()
+        function Invoke-RestMethod {
+            param($Uri, $Headers, $TimeoutSec)
+            $script:AuthAttempts += [bool]$Headers.ContainsKey('Authorization')
+            $response = New-RateLimitedResponse -Code 403 -Remaining '57'
+            throw [Microsoft.PowerShell.Commands.HttpResponseException]::new(
+                'You have exceeded a secondary rate limit. Please wait a few minutes before you try again.', $response)
+        }
+        Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+        $secondary = Get-BridgeUpdateStatus -Force
+        Test-That 'a secondary limit is not retried anonymously, which GitHub warns can earn a ban' {
+            $script:AuthAttempts.Count -eq 1
+        } "attempts=$($script:AuthAttempts.Count)"
+        Test-That 'and is reported as rate limiting rather than as an unexplained failure' {
+            $secondary.State -eq 'RateLimited' -and $secondary.Detail -match 'install is fine'
+        } "$($secondary.State): $($secondary.Detail)"
+        Test-That 'and names a time to try again, which a secondary limit never sends' {
+            $secondary.Detail -match '\d\d:\d\d'
+        } $secondary.Detail
     }
     finally {
         if ($null -eq $priorToken) { Remove-Item -LiteralPath Env:GH_TOKEN -ErrorAction SilentlyContinue }

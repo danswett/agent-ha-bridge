@@ -130,6 +130,34 @@ function ConvertTo-BridgeUpdateTime {
     throw [FormatException]::new('The update timestamp is invalid.')
 }
 
+function Get-BridgeHttpErrorDetail {
+    <#
+        The response body of a failed web call, or '' when there is none.
+
+        GitHub says some things only in the body. A secondary rate limit answers 403
+        with no X-RateLimit-Remaining: 0 and no Retry-After, and only the message says
+        which it was - and that distinction decides whether the next thing this does is
+        wait or make another request GitHub has asked it not to make.
+    #>
+    param([AllowNull()]$ErrorRecord)
+
+    if ($null -eq $ErrorRecord) { return '' }
+    $parts = @()
+    try {
+        if ($null -ne $ErrorRecord.PSObject.Properties['ErrorDetails'] -and $ErrorRecord.ErrorDetails) {
+            $parts += [string]$ErrorRecord.ErrorDetails.Message
+        }
+    }
+    catch { $parts = $parts }
+    try {
+        if ($null -ne $ErrorRecord.PSObject.Properties['Exception'] -and $ErrorRecord.Exception) {
+            $parts += [string]$ErrorRecord.Exception.Message
+        }
+    }
+    catch { $parts = $parts }
+    ($parts | Where-Object { $_ }) -join ' '
+}
+
 function Get-BridgeRateLimitWait {
     <#
         Whether a failed GitHub call was refused for rate limiting, and when it can be
@@ -144,7 +172,7 @@ function Get-BridgeRateLimitWait {
         refused check reads as the machine being broken, so the operator presses the
         button again, which spends more of the allowance that was already exhausted.
     #>
-    param([AllowNull()]$Response, [int]$Status = 0)
+    param([AllowNull()]$Response, [int]$Status = 0, [string]$Detail = '')
 
     $none = [pscustomobject]@{ Limited = $false; RetryAt = $null; Suffix = '' }
     if ($Status -ne 403 -and $Status -ne 429) { return $none }
@@ -181,7 +209,13 @@ function Get-BridgeRateLimitWait {
 
     # A secondary limit answers 429 with Retry-After and no remaining count, so either
     # signal on its own is enough.
-    $limited = ($remaining -eq '0') -or ($Status -eq 429) -or ($retryAfter -ne '')
+    #
+    # It can also answer 403 with neither: a nonzero remaining count, no Retry-After,
+    # and only the body saying which it was. Reading that as a credential problem and
+    # immediately asking again is the one response GitHub explicitly warns can get the
+    # caller banned, so the message is believed here too.
+    $secondary = $Status -eq 403 -and $Detail -match 'secondary rate limit'
+    $limited = ($remaining -eq '0') -or ($Status -eq 429) -or ($retryAfter -ne '') -or $secondary
     if (-not $limited) { return $none }
 
     $retryAt = $null
@@ -194,6 +228,9 @@ function Get-BridgeRateLimitWait {
         if ($reset -and [long]::TryParse($reset, [ref]$epoch) -and $epoch -gt 0) {
             $retryAt = [DateTimeOffset]::FromUnixTimeSeconds($epoch).ToLocalTime()
         }
+        # A secondary limit names no time at all, and GitHub asks for at least a
+        # minute. Saying so beats reporting a refusal with no end to it.
+        elseif ($secondary) { $retryAt = [DateTimeOffset]::Now.AddMinutes(1) }
     }
 
     $suffix = if ($null -ne $retryAt) { " until $($retryAt.ToString('HH:mm'))" } else { '' }
@@ -440,8 +477,10 @@ function Get-BridgeLatestRelease {
             if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
                 $failureStatus = [int]$_.Exception.Response.StatusCode
             }
+            $failureDetail = Get-BridgeHttpErrorDetail -ErrorRecord $_
             $badCredential = $failureStatus -eq 401 -or
-                ($failureStatus -eq 403 -and -not (Get-BridgeRateLimitWait -Response $_.Exception.Response -Status $failureStatus).Limited)
+                ($failureStatus -eq 403 -and -not (Get-BridgeRateLimitWait -Response $_.Exception.Response `
+                    -Status $failureStatus -Detail $failureDetail).Limited)
             if (-not $sentToken -or -not $badCredential) { throw }
             $response = Invoke-RestMethod -Uri $uri -Headers (Get-BridgeReleaseRequestHeaders -Anonymous) `
                 -TimeoutSec $script:BridgeUpdateConfig.RequestTimeout
@@ -472,7 +511,8 @@ function Get-BridgeLatestRelease {
             $failureResponse = $_.Exception.Response
             $httpStatus = [int]$failureResponse.StatusCode
         }
-        $rateLimit = Get-BridgeRateLimitWait -Response $failureResponse -Status $httpStatus
+        $rateLimit = Get-BridgeRateLimitWait -Response $failureResponse -Status $httpStatus `
+            -Detail (Get-BridgeHttpErrorDetail -ErrorRecord $_)
         if ($httpStatus -eq 404) {
             $lookup.State = 'NotFound'
             $lookup.Detail = 'GitHub returned 404 for the latest-release endpoint; repository existence and access are not confirmed.'
