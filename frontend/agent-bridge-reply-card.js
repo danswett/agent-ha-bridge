@@ -53,7 +53,7 @@
  * naming the publish it used, and the card holds the words until it sees that name
  * or sees the question go without it - see _checkAnswerConsumed (#104).
  */
-const CARD_VERSION = '1.31.0';
+const CARD_VERSION = '1.32.0';
 
 /*
  * How large a non-image attachment may be.
@@ -1077,9 +1077,13 @@ class AgentBridgeActivityCard extends HTMLElement {
     // running is not idle, and closing it throws that work away - so it reads in
     // words, with a count and a colour of its own rather than the idle grey.
     const agents = statusText === 'agents' ? Number(attr(status, 'background_agents') || 0) : 0;
+    // The same for a background command it started and has not collected - a build, a
+    // test run, a CI watch. Shown in the session's own words rather than as the bare
+    // status, and not in idle grey, because the whole point is that it is not idle.
+    const shells = statusText === 'shell' ? Number(attr(status, 'background_shells') || 0) : 0;
     const dot = question ? '🟡'
       : (statusText === 'working' ? '🟢'
-        : (statusText === 'agents' ? '🔵'
+        : (['agents', 'shell'].includes(statusText) ? '🔵'
           : (['ending', 'ended'].includes(statusText) ? '⏹️' : '⚪')));
 
     const title = `${dot} ${this._config.name}`;
@@ -1088,7 +1092,9 @@ class AgentBridgeActivityCard extends HTMLElement {
     const shownStatus = question ? 'waiting for you'
       : (statusText === 'agents'
         ? `waiting for ${agents > 0 ? `${agents} ` : ''}background agent${agents === 1 ? '' : 's'}`
-        : statusText);
+        : (statusText === 'shell'
+          ? `waiting for ${shells > 0 ? `${shells} ` : ''}background command${shells === 1 ? '' : 's'}`
+          : statusText));
     let activityText = activity ? String(activity.state || '') : '';
     // The summary is usually the first line of the newest message, which the body
     // right below already starts with. Repeating it read as the card saying
@@ -2001,9 +2007,10 @@ class AgentBridgeSessionCard extends HTMLElement {
            changes; the breathing halo on top of it is .glow, below. */
         .frame.working { border-color: var(--primary-color); box-shadow: 0 0 6px 0 var(--primary-color); }
         .frame.waiting { border-color: var(--warning-color); box-shadow: 0 0 6px 0 var(--warning-color); }
-        /* Waiting on background agents it started: live work, but not the session's
-           own, so it keeps the working colour as a steady edge and none of the
-           breathing. The point of it is only that this is not a card to close. */
+        /* Waiting on background agents it started, or on a background command it has
+           not collected: live work, but not the session's own, so it keeps the working
+           colour as a steady edge and none of the breathing. The point of it is only
+           that this is not a card to close. */
         .frame.delegating { border-color: var(--primary-color); }
         /* Driven through Home Assistant by an agent rather than by you. The pulse is
            the same shape so "something is happening" still reads at a glance; only
@@ -2126,7 +2133,7 @@ class AgentBridgeSessionCard extends HTMLElement {
     const waiting = !!(decision && decision.attributes && decision.attributes.question);
     const state = waiting ? 'waiting'
       : (status && status.state === 'working' ? 'working'
-        : (status && status.state === 'agents' ? 'delegating' : ''));
+        : (status && ['agents', 'shell'].includes(status.state) ? 'delegating' : ''));
     // Who last drove this session. Absent on a card served by an older daemon, which
     // reads as yours - the safe way round, since a wrong glow is worse than none.
     const driver = (activity && activity.attributes && activity.attributes.driver) || 'human';

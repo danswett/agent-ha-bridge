@@ -480,6 +480,126 @@ finally {
 }
 
 Write-Host ''
+Write-Host '--- waiting for a background command is not idle either ---'
+<#
+    A backgrounded shell leaves no subagent pair to count. The async call returns a
+    shell id and completes at once, assistant.turn_end follows, and the command runs
+    on outside anything the turn bookkeeping records - so a session sat idle on the
+    dashboard for half an hour with a CI watch under it (#151).
+
+    The markers are the tool's own, taken from a real transcript: a sync command that
+    outruns its wait is backgrounded too and says so only in its result, which is how
+    130 of this session's shells arrived against 46 started explicitly async.
+#>
+function New-ShellResult {
+    param([string]$Content)
+    ([ordered]@{ type = 'tool.execution_complete'
+        data = [ordered]@{ toolCallId = 'toolu_s'; toolName = 'powershell'; result = [ordered]@{ content = $Content } } } |
+        ConvertTo-Json -Depth 6 -Compress)
+}
+function New-ShellStarted { param([string]$Id) New-ShellResult "<command started in background with shellId: $Id>" }
+function New-ShellStillRunning { param([string]$Id) New-ShellResult "<command with shellId: $Id is still running after 240 seconds. The command is still running.>" }
+function New-ShellCollected { param([string]$Id) New-ShellResult "output here`n<shellId: $Id completed with exit code 0>" }
+# Ordered deliberately. The reducer reads the event type from the first "type" in the
+# line, exactly as Copilot writes it; an unordered hashtable put the nested
+# shell_completed first and the event was read as that instead.
+function New-ShellNotified {
+    param([string]$Id)
+    ([ordered]@{ type = 'system.notification'
+        data = [ordered]@{ content = "Shell command (shellId: $Id) has completed successfully."
+                  kind = [ordered]@{ type = 'shell_completed'; shellId = $Id; exitCode = 0 } } } |
+        ConvertTo-Json -Depth 6 -Compress)
+}
+
+$activity = Get-ActivityFromEvents -Lines @((New-ShellStarted 'ci164')) -VerboseMode $false
+Test-That 'a command put into the background is reported by its shell id' {
+    (@($activity.ShellsStarted) -join ',') -eq 'ci164'
+} (@($activity.ShellsStarted) -join ',')
+# The case that matters most in practice, and the one a check on the requested mode
+# would miss: the command asked to run synchronously and outran its wait.
+$activity = Get-ActivityFromEvents -Lines @((New-ShellStillRunning 'fullsuite')) -VerboseMode $false
+Test-That 'a sync command that outran its wait is backgrounded too' {
+    (@($activity.ShellsStarted) -join ',') -eq 'fullsuite'
+} (@($activity.ShellsStarted) -join ',')
+$activity = Get-ActivityFromEvents -Lines @((New-ShellCollected 'ci164')) -VerboseMode $false
+Test-That 'collecting one names the same shell as finished' {
+    (@($activity.ShellsFinished) -join ',') -eq 'ci164'
+} (@($activity.ShellsFinished) -join ',')
+$activity = Get-ActivityFromEvents -Lines @((New-ShellNotified 'ci164')) -VerboseMode $false
+Test-That 'and so does the notification that it ended' {
+    (@($activity.ShellsFinished) -join ',') -eq 'ci164'
+} (@($activity.ShellsFinished) -join ',')
+
+$shellLog = Join-Path ([IO.Path]::GetTempPath()) "copilot-shells-$([guid]::NewGuid().ToString('N')).jsonl"
+$shellSessionId = 'cccccccc-1111-2222-3333-444444444444'
+$shellEntry = [pscustomobject]@{ Offset = 0; Name = 'Copilot: build'; Machine = 'DESK'; Status = 'working'; Kind = 'copilot' }
+$shellSession = [pscustomobject]@{ SessionId = $shellSessionId; Transcript = $shellLog; ProcessId = 1 }
+function StepShells {
+    param([string[]]$Lines)
+    Add-Content -LiteralPath $shellLog -Value $Lines -Encoding utf8
+    Update-DaemonSessionActivity -Id $shellSessionId -Entry $shellEntry -Session $shellSession -Headers @{} -VerboseOn $false
+}
+try {
+    $script:StatusPublishes = @()
+    StepShells -Lines @((New-ShellStarted 'ci164'), '{"type":"assistant.turn_end"}')
+    Test-That 'a turn ending with a command still running does not read as idle' {
+        $shellEntry.Status -eq 'shell'
+    } "$($shellEntry.Status)"
+    Test-That 'and that is what reaches the card' { $script:StatusPublishes[-1].Status -eq 'shell' }
+    Test-That 'with how many, so the card need not say "some"' {
+        $script:StatusPublishes[-1].Attributes['background_shells'] -eq 1
+    }
+
+    StepShells -Lines @((New-ShellStillRunning 'fullsuite'))
+    Test-That 'a second command joins the first rather than replacing it' {
+        @($shellEntry.BackgroundShells).Count -eq 2
+    } (@($shellEntry.BackgroundShells) -join ',')
+    # Reading one back while it is still going is not news; it must not be counted
+    # twice, or a watched command would inflate the number on the card every poll.
+    StepShells -Lines @((New-ShellStillRunning 'fullsuite'))
+    Test-That 'and reading it again does not count it twice' {
+        @($shellEntry.BackgroundShells).Count -eq 2
+    } (@($shellEntry.BackgroundShells) -join ',')
+
+    StepShells -Lines @((New-ShellNotified 'ci164'))
+    Test-That 'one finishing leaves the session waiting on the other' { $shellEntry.Status -eq 'shell' }
+
+    $script:StatusPublishes = @()
+    StepShells -Lines @((New-ShellCollected 'fullsuite'))
+    Test-That 'the last one finishing hands the session back to idle' {
+        $shellEntry.Status -eq 'idle'
+    } "$($shellEntry.Status)"
+    Test-That 'and says so, rather than leaving the card waiting on nothing' {
+        $script:StatusPublishes[-1].Status -eq 'idle'
+    }
+
+    StepShells -Lines @((New-ShellStarted 'rel137'), '{"type":"assistant.turn_end"}')
+    Test-That 'and a restart finds it waiting, not idle' {
+        (Get-DaemonStartupStatus -Session $shellSession -Entry $shellEntry) -eq 'shell'
+    } (Get-DaemonStartupStatus -Session $shellSession -Entry $shellEntry)
+
+    # A shell belongs to the process that started it. After this machine rebooted
+    # mid-session, seven shells were still listed as running against a process that no
+    # longer existed - and nothing in the transcript would ever have settled them, so
+    # the session would have read as busy for the rest of its life.
+    $script:StatusPublishes = @()
+    StepShells -Lines @('{"type":"session.resume"}')
+    Test-That 'a resumed session owns none of the dead process''s commands' {
+        $shellEntry.Status -eq 'idle' -and @($shellEntry.BackgroundShells).Count -eq 0
+    } "$($shellEntry.Status), outstanding=$(@($shellEntry.BackgroundShells).Count)"
+
+    Test-That 'a session carrying no commands at all is waiting on none' {
+        (Get-DaemonBackgroundShellCount -Entry ([pscustomobject]@{ BackgroundShells = $null })) -eq 0
+    }
+    Test-That 'and neither is one from before the bridge tracked them' {
+        (Get-DaemonBackgroundShellCount -Entry ([pscustomobject]@{ Status = 'idle' })) -eq 0
+    }
+}
+finally {
+    Remove-Item -LiteralPath $shellLog -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host ''
 Write-Host '--- a session whose transcript is not there yet ---'
 # On 2026-10-07 a session between starting and writing its first event logged a read
 # failure about eight times a second. The fast lane runs on every 100 ms tick of the
