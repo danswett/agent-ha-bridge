@@ -46,6 +46,14 @@ function Get-LiveCopilotSessions {
 
     $named = Get-BridgeAgentProcessSessionIds -Processes $processes
 
+    # When each process started, so that a directory it cannot have written since is
+    # not mistaken below for a session it moved to. Not every process will say - a
+    # protected one throws - and one that will not simply keeps its command line.
+    $startedAtUtc = @{}
+    foreach ($process in $processes) {
+        try { $startedAtUtc[[int]$process.Id] = $process.StartTime.ToUniversalTime() } catch { }
+    }
+
     $candidates = @()
     foreach ($dir in [IO.Directory]::EnumerateDirectories($root)) {
         $processId = $null
@@ -69,8 +77,10 @@ function Get-LiveCopilotSessions {
     # phantom sessions in Home Assistant and, worse, deliver a reply meant for one
     # session into whichever session shares the pid.
     #
-    # A command line settles that outright, so it is taken first and the lock-based
-    # tie-break is left to the processes it could not answer for.
+    # A command line names one session outright, so it is taken first and the
+    # lock-based tie-break is left to the processes it could not answer for. It is
+    # not quite the last word: Resolve-DaemonResumedCopilotSession covers the one
+    # resume a command line cannot describe.
     $live = @{}
     $settled = @{}
     foreach ($entry in $named.GetEnumerator()) {
@@ -84,7 +94,8 @@ function Get-LiveCopilotSessions {
             else { New-DaemonCopilotSession -Directory ([IO.Path]::Combine($root, $sessionId)) -ProcessId $processId }
         if ($null -eq $resolved) { continue }
 
-        $live[$sessionId] = $resolved
+        $resolved = Resolve-DaemonResumedCopilotSession -Named $resolved -Candidates $candidates -StartedAtUtc $startedAtUtc
+        $live[$resolved.SessionId] = $resolved
         $settled[$processId] = $true
     }
 
@@ -96,6 +107,58 @@ function Get-LiveCopilotSessions {
     }
 
     $live
+}
+
+function Resolve-DaemonResumedCopilotSession {
+    <#
+        The session a process is really in, when its command line still names one it
+        has since left.
+
+        `--session-id` is fixed when the CLI is launched. A resume made from *inside*
+        it - /resume, or the session picker - switches the live session without
+        rewriting that, so the command line goes on naming the throwaway session the
+        CLI started in. That one stops at its first two events while the resumed
+        transcript grows under a second `inuse.<pid>.lock` the same process holds.
+
+        On 2026-10-09 that put two dead sessions on the dashboard, each frozen at 793
+        bytes with no model and a placeholder name, while the two real sessions they
+        stood for had no card at all. Worse than cosmetic: a reply typed on the phone
+        was injected into the process and answered in its terminal, but the card it
+        came from was watching the abandoned transcript, so it never saw the turn and
+        read as ignored.
+
+        The command line is still believed by default - it is the only thing that
+        knows about a resume onto an id with no lock of its own, which is why it is
+        consulted first. A lock directory displaces it only when this process can be
+        shown to have written that directory since: its transcript is newer than the
+        named session's *and* newer than the process start. Without the second test a
+        session launched moments ago, which has no transcript for its first seconds,
+        would lose to any stale directory a recycled pid still holds a lock in.
+    #>
+    param(
+        [Parameter(Mandatory)]$Named,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Candidates,
+        [Parameter(Mandatory)][hashtable]$StartedAtUtc
+    )
+
+    $processId = [int]$Named.ProcessId
+    if (-not $StartedAtUtc.ContainsKey($processId)) { return $Named }
+    $startedAt = $StartedAtUtc[$processId]
+
+    $moved = @($Candidates |
+        Where-Object {
+            $_.ProcessId -eq $processId -and
+            $_.SessionId -ne $Named.SessionId -and
+            $_.HasTranscript -and
+            $_.LastWrite -gt $Named.LastWrite -and
+            $_.LastWrite -gt $startedAt
+        } |
+        Sort-Object LastWrite -Descending)
+
+    # Bare `$moved[0]` on an empty array yields $null under StrictMode rather than
+    # failing, which would drop the session from the map entirely.
+    if ($moved.Count -eq 0) { return $Named }
+    $moved[0]
 }
 
 function New-DaemonCopilotSession {

@@ -12,8 +12,11 @@
 
     These cover the command line as the second source: that it finds the session the
     locks miss, that it settles which session a pid owns when the locks are
-    ambiguous, that the lock-based path still behaves as it did, and that a command
-    line - the expensive part - is read once per process rather than every pass.
+    ambiguous, that a resume made from inside the CLI - which the command line cannot
+    describe, because it is fixed at launch - is followed to the session the process
+    actually moved to, that the lock-based path still behaves as it did, and that a
+    command line - the expensive part - is read once per process rather than every
+    pass.
 
     Fixtures are real directories under a temporary root. No process is started, and
     nothing talks to Home Assistant.
@@ -71,10 +74,15 @@ function New-FixtureProcess {
         [Parameter(Mandatory)][int]$Id,
         [string]$CommandLine = '',
         [int]$StartedTicksOffset = 0,
+        # Minutes before now, for the cases that weigh a process start against a
+        # transcript's age. The fixed 2026 date the other cases use sits before every
+        # transcript written here, which would make that comparison vacuous.
+        [int]$StartedMinutesAgo = -1,
         [switch]$NoCommandLineProperty
     )
     $script:CommandLines[$Id] = $CommandLine
-    $started = ([datetime]'2026-01-01T00:00:00Z').AddTicks($StartedTicksOffset)
+    $started = if ($StartedMinutesAgo -ge 0) { [datetime]::UtcNow.AddMinutes(-$StartedMinutesAgo) }
+        else { ([datetime]'2026-01-01T00:00:00Z').AddTicks($StartedTicksOffset) }
     $process = [pscustomobject]@{ Id = $Id; StartTime = $started }
     if (-not $NoCommandLineProperty) {
         # A ScriptProperty so each read is counted: the real one costs about 77 ms,
@@ -215,15 +223,62 @@ try {
     } "keys: $(@($live.Keys) -join ',')"
 
     # The stale lock the CLI leaves behind: the same pid appears under two session
-    # directories, and only the command line says which one it is really in.
+    # directories, and the command line says which one it is really in. The sibling
+    # here was last written before this process started, so it is a leftover rather
+    # than somewhere the process has moved to.
     Get-ChildItem -LiteralPath $root -Directory | Remove-Item -Recurse -Force
-    $null = New-FixtureSession -Id $otherId -LockPids 203 -WithTranscript -TranscriptAgeMinutes 0
+    $null = New-FixtureSession -Id $otherId -LockPids 203 -WithTranscript -TranscriptAgeMinutes 90
     $null = New-FixtureSession -Id $resumedId -LockPids 203 -WithTranscript -TranscriptAgeMinutes 30
-    Set-FixtureProcesses @((New-FixtureProcess -Id 203 -CommandLine (New-CopilotCommandLine -SessionId $resumedId)))
+    Set-FixtureProcesses @((New-FixtureProcess -Id 203 -CommandLine (New-CopilotCommandLine -SessionId $resumedId) -StartedMinutesAgo 60))
     $live = Get-LiveCopilotSessions
-    Test-That 'the command line, not the newest transcript, decides which session a pid is in' {
+    Test-That 'the command line decides which session a pid is in' {
         $live.Count -eq 1 -and $live.ContainsKey($resumedId)
     } "keys: $(@($live.Keys) -join ',')"
+
+    # A resume made from inside the CLI - /resume, or the session picker. The command
+    # line still names the throwaway session it started in, which stopped at its first
+    # events, while the session it moved to goes on being written under a second lock
+    # the same pid holds. On 2026-10-09 this showed two sessions frozen at 793 bytes
+    # with placeholder names while the two real ones had no card at all.
+    Get-ChildItem -LiteralPath $root -Directory | Remove-Item -Recurse -Force
+    $null = New-FixtureSession -Id $freshId -LockPids 208 -WithTranscript -TranscriptAgeMinutes 20
+    $null = New-FixtureSession -Id $resumedId -LockPids 208 -WithTranscript -TranscriptAgeMinutes 1
+    Set-FixtureProcesses @((New-FixtureProcess -Id 208 -CommandLine (New-CopilotCommandLine -SessionId $freshId) -StartedMinutesAgo 25))
+    $live = Get-LiveCopilotSessions
+    Test-That 'a session resumed from inside the CLI displaces the one its command line still names' {
+        $live.Count -eq 1 -and $live.ContainsKey($resumedId)
+    } "keys: $(@($live.Keys) -join ',')"
+    Test-That 'and is reported against the process that moved to it' {
+        $live.ContainsKey($resumedId) -and $live[$resumedId].ProcessId -eq 208
+    }
+    Test-That 'so the session it abandoned gets no card of its own' { -not $live.ContainsKey($freshId) }
+
+    # The guard that stops that displacing a launch. A session seconds old has no
+    # transcript at all, and would otherwise lose to any stale directory a recycled
+    # pid still holds a lock in.
+    Get-ChildItem -LiteralPath $root -Directory | Remove-Item -Recurse -Force
+    $null = New-FixtureSession -Id $freshId -LockPids 209
+    $null = New-FixtureSession -Id $otherId -LockPids 209 -WithTranscript -TranscriptAgeMinutes 120
+    Set-FixtureProcesses @((New-FixtureProcess -Id 209 -CommandLine (New-CopilotCommandLine -SessionId $freshId) -StartedMinutesAgo 1))
+    $live = Get-LiveCopilotSessions
+    Test-That 'a just-launched session with no transcript is not displaced by a stale directory' {
+        $live.Count -eq 1 -and $live.ContainsKey($freshId)
+    } "keys: $(@($live.Keys) -join ',')"
+
+    # The reply has to follow the card. Get-CopilotSessionProcessId reads the same
+    # resolution, so the session shown is the session typed into - which is what
+    # failed on 2026-10-09: the reply was answered in the terminal while the card it
+    # came from watched the abandoned transcript and never saw the turn.
+    Get-ChildItem -LiteralPath $root -Directory | Remove-Item -Recurse -Force
+    $null = New-FixtureSession -Id $freshId -LockPids 210 -WithTranscript -TranscriptAgeMinutes 20
+    $null = New-FixtureSession -Id $resumedId -LockPids 210 -WithTranscript -TranscriptAgeMinutes 1
+    Set-FixtureProcesses @((New-FixtureProcess -Id 210 -CommandLine (New-CopilotCommandLine -SessionId $freshId) -StartedMinutesAgo 25))
+    Test-That 'a reply to the resumed session resolves to the CLI that is in it' {
+        (Get-CopilotSessionProcessId -SessionId $resumedId) -eq 210
+    } "got: $(Get-CopilotSessionProcessId -SessionId $resumedId)"
+    Test-That 'and the session it left behind captures no reply' {
+        $null -eq (Get-CopilotSessionProcessId -SessionId $freshId)
+    } "got: $(Get-CopilotSessionProcessId -SessionId $freshId)"
 
     Get-ChildItem -LiteralPath $root -Directory | Remove-Item -Recurse -Force
     $null = New-FixtureSession -Id $otherId -LockPids 204 -WithTranscript -TranscriptAgeMinutes 0

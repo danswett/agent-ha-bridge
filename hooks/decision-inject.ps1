@@ -412,10 +412,12 @@ function Get-CopilotSessionProcessId {
     <#
         Resolves the CLI process that owns a session.
 
-        Two sources, in the same order and for the same reason as
-        Get-LiveCopilotSessions: the `--session-id` on a process's command line first,
-        then the `inuse.<pid>.lock` files for the processes it could not answer for. A
-        lock whose process is gone is stale and ignored, which keeps a reply from being
+        Daemon discovery is asked first where it is loaded, because it is the one
+        place this is settled and the two answers must agree. Failing that, two
+        sources in the same order and for the same reason as Get-LiveCopilotSessions:
+        the `--session-id` on a process's command line first, then the
+        `inuse.<pid>.lock` files for the processes it could not answer for. A lock
+        whose process is gone is stale and ignored, which keeps a reply from being
         delivered to a dead pid.
 
         The locks alone used to be the whole answer, and a resumed session could not
@@ -436,6 +438,28 @@ function Get-CopilotSessionProcessId {
     $dir = Join-Path $script:DecisionBridgeConfig.SessionStateRoot (Get-CopilotSafeSessionKey -SessionId $SessionId)
     if (-not (Test-Path -LiteralPath $dir)) {
         return $null
+    }
+
+    # Discovery settles this ambiguity already, and its answer and this one must
+    # agree or a reply lands where the card did not. Asking it outright is what makes
+    # that true by construction, rather than by two copies of one rule staying in
+    # step - which they did not. A resume made from inside the CLI leaves the command
+    # line naming the session it started in; discovery now looks past that and this
+    # did not, so on 2026-10-09 the session holding the card resolved no process at
+    # all while the one it had abandoned resolved the live pid.
+    #
+    # Not always loaded: decision-inject.ps1 is dot-sourced on its own by hooks and
+    # by tests, and without the daemon's discovery the two sources below still stand.
+    if (Get-Command -Name 'Get-LiveCopilotSessions' -CommandType Function -ErrorAction SilentlyContinue) {
+        $liveSessions = Get-LiveCopilotSessions
+        if ($null -ne $liveSessions) {
+            # A live session discovery does not list is not being worked in - typically
+            # the one a CLI started in and then resumed away from, whose lock is still
+            # there and whose pid is still alive. Typing into that is exactly the
+            # delivery that used to land silently in the wrong session.
+            if (-not $liveSessions.ContainsKey($SessionId)) { return $null }
+            return [int]$liveSessions[$SessionId].ProcessId
+        }
     }
 
     # The command line is asked first, because it names exactly one session where a
