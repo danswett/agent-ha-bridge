@@ -121,12 +121,32 @@ function Invoke-RestMethod {
     }
     throw "Unexpected REST fixture endpoint: $Uri"
 }
+
+# A refused lookup now tries github.com/<r>/releases/latest before accepting the
+# refusal, and that is Invoke-WebRequest rather than Invoke-RestMethod - the boundary
+# guard refuses an unstubbed call rather than letting it reach the network, which is
+# how this gap was found. These cases are about what a refusal is reported as, so the
+# second chance is made unavailable here and the rate-limit verdict stands; the
+# fallback succeeding is covered in test-update.ps1.
+function Invoke-WebRequest {
+    param($Uri, $OutFile, $Headers, $TimeoutSec, $MaximumRedirection, [switch]$UseBasicParsing)
+    if ($Uri -eq 'https://github.com/fixture-owner/fixture-bridge/releases/latest') {
+        throw [IO.IOException]::new('synthetic release-redirect outage')
+    }
+    throw "Unexpected WebRequest fixture endpoint: $Uri"
+}
 if ($FixtureMode -eq 'Updater') {
     if (-not $IsWindows) { throw 'This generated-child fixture has no non-Windows process boundary.' }
     Assert-BridgeTestPath -Path $UpdaterEntry
     function Invoke-WebRequest {
-        param($Uri, $OutFile, $Headers, [switch]$UseBasicParsing)
+        param($Uri, $OutFile, $Headers, $TimeoutSec, $MaximumRedirection, [switch]$UseBasicParsing)
         $fixtureState = Get-UpdateFixtureState
+        # This mode replaces the stub above, so it has to keep refusing the fallback
+        # endpoint too - an unstubbed call there reaches the boundary guard, not the
+        # assertion below.
+        if ($Uri -eq 'https://github.com/fixture-owner/fixture-bridge/releases/latest') {
+            throw [IO.IOException]::new('synthetic release-redirect outage')
+        }
         Assert-BridgeTestPath -Path @($OutFile, $fixtureState.Fixture.Archive)
         # The archive now comes from codeload rather than the API's zipball_url, so
         # that pressing Update neither spends nor is refused by the 60-an-hour API
