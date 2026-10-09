@@ -300,6 +300,17 @@ Test-That 'a multi-select answer is never split into options that merely spell i
         -Fields @($commaSplitField) -Selections @('a,b') -Detailed).Status -ceq 'Unconfirmed'
 }
 
+# ...but a comma somewhere else in the same field says nothing about this answer, and
+# refusing on it would put back exactly the noise this change exists to remove.
+$unrelatedCommaField = [pscustomobject]@{
+    Name = 'Which'; Options = @('A', 'B', 'C,D'); Values = @('a', 'b', 'cd')
+    MultiSelect = $true; IsText = $false
+}
+Test-That 'a comma in an option the answer is not does not refuse the answer it is' {
+    (Test-CopilotAnswerMatchesSelections -ResultContent 'User responded: a,b' `
+        -Fields @($unrelatedCommaField) -Selections @('#1,2') -Detailed).Status -ceq 'Matched'
+}
+
 if ($script:Failures -gt 0) {
     Write-Host "`n$($script:Failures) failed" -ForegroundColor Red
     exit 1

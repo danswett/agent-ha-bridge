@@ -3602,7 +3602,7 @@ function Test-CopilotAnswerMatchesSelections {
         }
         if ($expected.Count -eq 0) { return (& $finish 'Unconfirmed') }
         $identities = [Collections.Generic.Dictionary[string, int]]::new([StringComparer]::Ordinal)
-        $splitRisk = $false
+        $commaSpellings = [Collections.Generic.List[string]]::new()
         for ($index = 0; $index -lt $options.Count; $index++) {
             try { $value = Get-DecisionFieldOptionValue -Field $field -Option $options[$index] }
             catch { return (& $finish 'Unconfirmed') }
@@ -3631,7 +3631,9 @@ function Test-CopilotAnswerMatchesSelections {
                 # label resolves to nothing, which is still never a false confirmation.
                 $label = [string]$options[$index]
                 if ($label -notmatch '[,="]' -and $label -ceq $label.Trim()) { $encodings += $label }
-                elseif ($label.Contains(',')) { $splitRisk = $true }
+                elseif ($label.Contains(',')) {
+                    $commaSpellings.Add((@($label.Split(',') | ForEach-Object { $_.Trim() }) -join ','))
+                }
             }
             foreach ($encoding in $encodings) {
                 if ($identities.ContainsKey($encoding) -and $identities[$encoding] -ne $index) {
@@ -3643,13 +3645,20 @@ function Test-CopilotAnswerMatchesSelections {
         $actualValue = $answers[$key]
         $parts = [object[]]::new(1)
         if ($multi -and $textMode) {
-            # Splitting on the comma only identifies anything while no option spells
-            # one itself: with "a,b" among the options, a recorded "a,b" is either
-            # that single answer or the two called "a" and "b". Dropping the unusable
-            # encoding above is not enough here - the remaining ones would match the
-            # halves and report a confident mismatch against the answer actually given.
-            if ($splitRisk -and ([string]$actualValue).Contains(',')) { return (& $finish 'Unconfirmed') }
             $parts = @(([string]$actualValue).Split(',') | ForEach-Object { $_.Trim() })
+            # A dropped label that spelled a comma is ambiguous only where the recorded
+            # text could actually be it: with "a,b" among the options, a recorded "a,b"
+            # is either that one answer or the two called "a" and "b", and the halves
+            # would otherwise resolve and report a confident mismatch. An unrelated
+            # "C,D" elsewhere in the same field says nothing about "a,b", and refusing
+            # on it would put back the noise this is here to remove.
+            $joined = $parts -join ','
+            foreach ($spelling in $commaSpellings) {
+                if ($joined -ceq $spelling -or $joined.StartsWith("$spelling,", [StringComparison]::Ordinal) -or
+                    $joined.EndsWith(",$spelling", [StringComparison]::Ordinal) -or $joined.Contains(",$spelling,")) {
+                    return (& $finish 'Unconfirmed')
+                }
+            }
         }
         elseif ($multi -and $actualValue -is [array]) { $parts = @($actualValue) }
         elseif (-not $multi) { $parts[0] = $actualValue }
