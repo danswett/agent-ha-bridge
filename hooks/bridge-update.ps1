@@ -23,8 +23,14 @@
 
 Set-StrictMode -Version Latest
 
+# The stages an update passes through, in order, and the only values a progress record
+# may carry. An unrecognised one is treated as no progress at all rather than drawn as
+# a stage nobody can interpret.
+$script:BridgeUpdateStages = @('checking', 'downloading', 'installing', 'restarting', 'verifying', 'completed', 'failed')
+
 $script:BridgeUpdateConfig = @{
     CacheFile     = Get-BridgeRuntimePath 'agent-bridge-update.json'
+    ProgressFile  = Get-BridgeRuntimePath 'agent-bridge-update-progress.json'
     # How often to check GitHub for a new release. Four times a day catches a release
     # within a few hours and still barely touches the unauthenticated GitHub rate
     # limit (60/hour/IP). Tunable with updates.checkHours in the config.
@@ -392,6 +398,84 @@ function Get-BridgeLatestReleaseWithoutApi {
         Published = ''
     }
 }
+
+function Read-BridgeUpdateStage {
+    <#
+        Where an update has got to, or $null when nothing current says.
+
+        Deliberately forgiving where Read-BridgeUpdateOutcome is strict. That one
+        guards a terminal claim - whether an update succeeded - so an unreadable or
+        unexpected record must throw rather than be guessed at. This is a progress
+        display: an unreadable one means "nothing to show", never a failed update, and
+        must not be able to turn a healthy update into a reported fault.
+
+        It is still bound to the attempt. A stage file left by a previous attempt is
+        exactly what would show a finished update as still downloading, so a record
+        naming another attempt, or predating the one asked about, is no record at all.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [string]$AttemptId = '',
+        [DateTimeOffset]$NotBefore = [DateTimeOffset]::MinValue
+    )
+
+    if (Test-BridgeTestExecution) { Assert-BridgeTestPath -Path $Path }
+    if (-not [System.IO.File]::Exists($Path)) { return $null }
+    $record = $null
+    try {
+        Assert-BridgeInstallPayload -Root $Path -CheckAncestors
+        $record = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json -AsHashtable
+    }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        return $null
+    }
+    if ($record -isnot [Collections.IDictionary]) { return $null }
+    if ($record['schemaVersion'] -ne 1) { return $null }
+    $stage = [string]$record['stage']
+    if ($stage -cnotin $script:BridgeUpdateStages) { return $null }
+    if ($AttemptId -and [string]$record['attemptId'] -cne $AttemptId) { return $null }
+    $at = [DateTimeOffset]::MinValue
+    try { $at = ConvertTo-BridgeUpdateTime $record['at'] } catch { return $null }
+    if ($at -lt $NotBefore) { return $null }
+
+    # A proportion only means anything while something is being transferred, and only
+    # between 0 and 1. Anything else is reported as no proportion rather than drawn as
+    # a bar at some arbitrary place.
+    $proportion = $null
+    if ($record.Contains('proportion')) {
+        $value = $record['proportion'] -as [double]
+        if ($null -ne $value -and $value -ge 0 -and $value -le 1) { $proportion = [double]$value }
+    }
+    [pscustomobject]@{
+        Stage      = $stage
+        AttemptId  = [string]$record['attemptId']
+        Version    = [string]$record['version']
+        Detail     = [string]$record['detail']
+        Proportion = $proportion
+        At         = $at
+        Done       = $stage -cin @('completed', 'failed')
+    }
+}
+
+function Remove-BridgeUpdateProgress {
+    <#
+        Discards the progress record, for a press that supersedes it.
+
+        A press that never starts an updater writes nothing, so an hour-old record
+        from the previous attempt would go on being published as though it described
+        the press just made - and would lend its own hour-long life to the verdict
+        for it. Best effort: failing to remove a display file must not fail anything.
+    #>
+    param([string]$Path = $script:BridgeUpdateConfig.ProgressFile)
+
+    if (Test-BridgeTestExecution) { Assert-BridgeTestPath -Path $Path }
+    try { Remove-Item -LiteralPath $Path -Force -ErrorAction SilentlyContinue }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+    }
+}
+
 function Get-BridgeLatestRelease {
     <#
         The newest published release, cached so a restart loop cannot hammer GitHub.
@@ -809,11 +893,21 @@ function Invoke-BridgeSelfUpdate {
     $rootArgument = " -InstallRoot '$($updateContext.BridgeHome.Replace("'", "''"))'"
     $logPath = Get-BridgeRuntimePath -Name 'agent-bridge-update.log' -Context $updateContext
     $outcomePath = Get-BridgeRuntimePath -Name 'agent-bridge-update-outcome.json' -Context $updateContext
+    # Separate from the outcome on purpose. Read-BridgeUpdateOutcome is a strict
+    # allowlist that throws on an unknown key and pins schemaVersion to 1, and a stage
+    # is meaningless once the attempt has ended - so a progress field there would mean
+    # migrating the terminal contract to carry something that only exists before it.
+    #
+    # A file rather than memory because the daemon restart *is* one of the stages: the
+    # child outlives the daemon, so a daemon that comes back mid-update reads where the
+    # update actually is instead of losing it (#129).
+    $progressPath = Get-BridgeRuntimePath -Name 'agent-bridge-update-progress.json' -Context $updateContext
     $scriptText = @"
 `$ErrorActionPreference = 'Stop'
 `$staging = '$($staging.Replace("'", "''"))'
 `$log = '$($logPath.Replace("'", "''"))'
 `$outcomeFile = '$($outcomePath.Replace("'", "''"))'
+`$progressFile = '$($progressPath.Replace("'", "''"))'
 `$resultFile = '$($resultPath.Replace("'", "''"))'
 `$env:AGENT_HA_BRIDGE_CONFIG = '$($updateContext.ConfigPath.Replace("'", "''"))'
 `$pathsVerified = `$false
@@ -849,6 +943,21 @@ function Write-UpdateOutcome {
     version = '$($status.Latest)'; releaseUrl = '$($status.Url.Replace("'", "''"))'
     error = ''; at = ''
 }
+function Write-UpdateStage {
+    param([string]`$Stage, [string]`$Detail = '', [double]`$Proportion = -1)
+    # Best effort by construction: a progress report that throws would fail an update
+    # that is otherwise fine, which is the opposite of what it is for.
+    try {
+        Write-UpdateOutcome -Path `$progressFile -Outcome @{
+            schemaVersion = 1; attemptId = '$($result.AttemptId)'; stage = `$Stage
+            version = '$($status.Latest)'; detail = `$Detail
+            proportion = `$Proportion; at = [DateTimeOffset]::Now.ToString('o')
+        }
+    }
+    catch {
+        if (`$_.Exception.Data['BridgeTestWriteBlocked'] -or `$_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+    }
+}
 
 try {
     `$contextLibrary = '$((Join-Path $updateContext.HooksDir 'bridge-install-context.ps1').Replace("'", "''"))'
@@ -869,6 +978,7 @@ try {
     . '$((Join-Path $updateContext.HooksDir 'bridge-platform.ps1').Replace("'", "''"))'
     . '$((Join-Path $updateContext.HooksDir 'bridge-test-guard.ps1').Replace("'", "''"))'
     `$pathsVerified = `$true
+    Write-UpdateStage -Stage 'downloading'
     Write-UpdateLog 'downloading $($status.Latest)'
     `$zip = Join-Path `$staging 'release.zip'
     Assert-BridgeHttpAllowed -Uri '$($status.Zip.Replace("'", "''"))' -Transport WebRequest
@@ -891,6 +1001,7 @@ try {
         throw "archive version `$archiveVersion does not match the expected release $($status.Latest)"
     }
 
+    Write-UpdateStage -Stage 'installing'
     Write-UpdateLog "installing from `$(`$root.FullName)"
     # The existing config is preserved and backed up by the installer, so no
     # settings are passed here.
@@ -908,7 +1019,11 @@ try {
     Assert-BridgeInstallPayload -Root `$ownedContext.HooksDir -RelativePaths @('bridge-platform.ps1')
     . '$((Join-Path $updateContext.HooksDir 'bridge-platform.ps1').Replace("'", "''"))'
     `$ownedContext = Resolve-BridgeInstallContext -BridgeHome '$($updateContext.BridgeHome.Replace("'", "''"))'$contextArgument
+    # Written before the daemon is stopped, because stopping it is what makes a reader
+    # disappear: a stage published after this point would have nobody to publish it.
+    Write-UpdateStage -Stage 'restarting'
     Stop-BridgeOwnedRuntime -Context `$ownedContext -Roles daemon
+    Write-UpdateStage -Stage 'verifying'
     Write-UpdateLog 'installer complete; the daemon was asked to restart, so nothing has checked the install since'
     `$outcome.success = `$true
     `$outcome.exitCode = 0
@@ -937,6 +1052,7 @@ if (-not `$resultFile) {
     }
 }
 `$outcome.at = [DateTimeOffset]::Now.ToString('o')
+Write-UpdateStage -Stage `$(if (`$outcome.success) { 'completed' } else { 'failed' }) -Detail `$outcome.error
 if (`$resultFile) { Write-UpdateOutcome -Path `$resultFile -Outcome `$outcome }
 Write-UpdateOutcome -Path `$outcomeFile -Outcome `$outcome
 exit `$outcome.exitCode

@@ -6,6 +6,11 @@
 #>
 
 . (Join-Path $PSScriptRoot 'bridge-secrets.ps1')
+# 1.6.0, not 1.5.0: the machine rows in the Agent sessions dropdown now carry each
+# machine's own install button, and the standalone update card is drawn only for a
+# browser served a card older than 1.31.0 (#129). Both change what
+# Save-CopilotSessionDashboard renders, so the fence needs a version to move to.
+#
 # 1.5.0, not 1.4.0: the same trap as below, walked into a second time by #131, which
 # gave the choices card an activity sensor to watch so a form's typed answer is held
 # until the daemon confirms it was used (#104). That changed what
@@ -22,7 +27,7 @@
 # definition of a conflict there - so on any installation already fenced at the old
 # renderer, publication is refused and the fix can never reach the dashboard without
 # an operator pin nobody should have to take.
-$script:BridgeDashboardRenderVersion = '1.5.0'
+$script:BridgeDashboardRenderVersion = '1.6.0'
 $script:BridgeDashboardObservation = $null
 
 function Invoke-CopilotHaWebSocket {
@@ -1757,6 +1762,11 @@ function Save-CopilotSessionDashboard {
         # ones an uninstall walks, and a rule restated in JavaScript is a rule that
         # drifts.
         $canForget = Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.20.0'
+        # From card 1.31.0 the machine's row carries its own update button, in place of
+        # the Detail switch and only while there is an update to install or one running
+        # (#129). Updating a machine meant finding its own card lower down the view and
+        # then watching a spinner that said only that something was happening.
+        $canUpdate = Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.31.0'
         $statusCard = [ordered]@{
             type      = 'custom:agent-bridge-status-card'
             title     = 'Agent sessions'
@@ -1773,6 +1783,14 @@ function Save-CopilotSessionDashboard {
                 }
                 if ($_.PSObject.Properties['IncludeDetailed'] -and $_.IncludeDetailed) {
                     $entry.detailed = Get-BridgeMachineEntityId -Domain 'input_boolean' -Key 'detailed_activity' -Slug $_.Slug
+                }
+                # The version entity above already carries the stage and the versions;
+                # only the press has nowhere else to come from. Given for every machine,
+                # live or not, because the card decides from the entity whether there is
+                # anything to press - and a machine whose row says offline because its
+                # own daemon is mid-restart is one that may well have an update running.
+                if ($canUpdate) {
+                    $entry.install = Get-BridgeMachineEntityId -Domain 'button' -Key 'install_update' -Slug $_.Slug
                 }
                 if ($_.PSObject.Properties['IsDev'] -and $_.IsDev) { $entry.dev = $true }
                 if ($canForget) {
@@ -1835,23 +1853,31 @@ function Save-CopilotSessionDashboard {
     # One per machine: each runs its own copy at its own version, so a single shared
     # row showed whichever machine published last and its install button ran on every
     # machine at once.
-    $updateCards = @($onlineList | ForEach-Object {
-        $updateEntity = Get-BridgeMachineEntityId -Domain 'update' -Key 'update' -Slug $_.Slug
-        $installEntity = Get-BridgeMachineEntityId -Domain 'button' -Key 'install_update' -Slug $_.Slug
-        $title = if ($multiMachine) { "Bridge update available on $($_.Machine)" } else { 'Bridge update available' }
-        @{
-            type = 'conditional'
-            conditions = @(@{ entity = $updateEntity; state = 'on' })
-            card = @{
-                type = 'entities'
-                title = $title
-                entities = @(
-                    @{ entity = $updateEntity; name = 'Version' }
-                    @{ entity = $installEntity; name = 'Install now' }
-                )
+    #
+    # From card 1.31.0 this moves into the machine's own row in the Agent sessions
+    # dropdown, where the machine already is, so it is drawn here only for a browser
+    # served an older card. Both at once would offer the same press in two places and
+    # the lower one would still be a spinner.
+    $updateCards = @()
+    if (-not ($statusCard -and $canUpdate)) {
+        $updateCards = @($onlineList | ForEach-Object {
+            $updateEntity = Get-BridgeMachineEntityId -Domain 'update' -Key 'update' -Slug $_.Slug
+            $installEntity = Get-BridgeMachineEntityId -Domain 'button' -Key 'install_update' -Slug $_.Slug
+            $title = if ($multiMachine) { "Bridge update available on $($_.Machine)" } else { 'Bridge update available' }
+            @{
+                type = 'conditional'
+                conditions = @(@{ entity = $updateEntity; state = 'on' })
+                card = @{
+                    type = 'entities'
+                    title = $title
+                    entities = @(
+                        @{ entity = $updateEntity; name = 'Version' }
+                        @{ entity = $installEntity; name = 'Install now' }
+                    )
+                }
             }
-        }
-    })
+        })
+    }
 
     # Starting a new session. Placed with the controls rather than among the session
     # cards because it belongs to the bridge, not to any one session, and it stays

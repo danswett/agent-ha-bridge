@@ -969,6 +969,8 @@ There is still **one dashboard**, and it shows everything:
 - an **Agent sessions** card at the top: live sessions and pending decisions on the line
   you always see, folding open to a row per machine — whether it is online right now,
   how many sessions it is running, what version it is on, and its own **Detail** switch,
+  replaced by an update button whenever that machine has one to install or is part-way
+  through installing it,
 - one **Start a new session** card with a **Machine** dropdown at the top — pick where,
   then the workspace, profile and resume rows for *that* machine appear beneath it,
 - one card per session wherever it is running, labelled with its machine — and because
@@ -1266,10 +1268,30 @@ until an explicit policy operation authorizes it.
 The daemon asks GitHub for the newest release a few times a day (every 6 hours by
 default, tunable via `updates.checkHours`) and publishes the result as
 a Home Assistant **update entity**, so a new version shows up on the dashboard and in
-Home Assistant's own Updates list — with the release notes and a one-press **Install
-now** button. Pressing it shows a spinner while the install runs and leaves a
-notification when it finishes — *Bridge updated to X*, or the error if it failed —
-then restarts the daemon so the new version is actually running.
+Home Assistant's own Updates list — with the release notes and a one-press install.
+
+On the dashboard that press is on the machine's own row in **Agent sessions**, where
+it takes the place of that row's **Detail** switch, and it is only there when there is
+something to say. It names the version it would install — *Update to 1.33.9* — and
+while the update runs it reports the stage the updater has actually reached:
+*Checking*, *Downloading*, *Installing*, *Restarting*, *Verifying*. A stage that
+reports how far it has got is drawn as a bar as well; no stage reports one yet, so
+today each is named without a percentage.
+A machine that is part-way through shows that rather than the **✕**, because its
+liveness sensor expires while its own daemon restarts — which is one of the stages.
+
+It ends on what happened rather than on silence: *Updated to 1.33.9*, *Already
+current*, or *Update failed* with the reason, which can be pressed again to retry. A
+release that was already installed is **not** reported as a failure. A machine whose
+release check failed says that too, instead of looking like one with nothing to
+install.
+
+A notification is left as well — *Bridge updated to X*, or the error if it failed. The
+updater then asks the supervisor to restart the daemon so the new version is actually
+running.
+
+A browser served a card older than 1.31.0 gets the previous separate **Bridge update
+available** card instead; the two are never drawn at once.
 
 From a terminal:
 
@@ -1302,7 +1324,7 @@ action, because this software types into terminals and registers scheduled tasks
 **If the check is refused.** GitHub allows unauthenticated callers 60 requests an hour
 per IP, so a machine behind shared egress can be rate limited without having made a
 request of its own - measured here going from 39 remaining to none in ninety seconds.
-Three things keep that from becoming a failed update:
+Four things keep that from becoming a failed update:
 
 - The release archive is fetched from `codeload.github.com`, which is not part of the
   API allowance. The `zipball_url` the API offers is itself an API request, so pressing
@@ -1322,7 +1344,8 @@ Three things keep that from becoming a failed update:
 - If that endpoint cannot answer either, the refusal is reported as rate limiting with the
   time the limit resets - not as a failed update - and the machine keeps publishing its
   installed version rather than going blank, because the fault is neither in the
-  install nor in the release.
+  install nor in the release. The machine's row says **Update check failed**
+  rather than going quiet, so a refused check does not read as nothing to install.
 
 A token raises the limit to 5,000 requests an hour. One already in the environment as
 `GH_TOKEN` or `GITHUB_TOKEN` is used automatically; `updates.token` sets one

@@ -204,6 +204,7 @@ Test-That 'every entity it reads is one the bridge actually publishes' {
     $wanted = @($cardConfig.machines | ForEach-Object {
         [string]$_.online; [string]$_.sessions; [string]$_.version
         if ($_.PSObject.Properties['detailed']) { [string]$_.detailed }
+        if ($_.PSObject.Properties['install']) { [string]$_.install }
     })
     @($wanted | Where-Object { -not $haStates.ContainsKey($_) }).Count -eq 0
 } "unpublished=[$(@(@($cardConfig.machines | ForEach-Object { [string]$_.online; [string]$_.sessions; [string]$_.version }) | Where-Object { -not $haStates.ContainsKey($_) }) -join ',')]"
@@ -228,13 +229,26 @@ if (-not $nodeExe) {
 
 function Invoke-StatusCard {
     <# What the real card draws, and the service calls the given actions produce. #>
-    param([string[]]$Flips = @(), [string[]]$Forgets = @(), [bool]$Open = $true)
+    param(
+        [string[]]$Flips = @(),
+        [string[]]$Forgets = @(),
+        [string[]]$Installs = @(),
+        [string]$SlowInstall = '',
+        [string]$RetryAfterRefusal = '',
+        [bool]$Open = $true,
+        [hashtable]$States = $null,
+        [switch]$Refuse
+    )
     $job = @{
-        config  = $cardConfig
-        states  = $haStates
-        open    = $Open
-        flips   = @($Flips)
-        forgets = @($Forgets)
+        config            = $cardConfig
+        states            = $(if ($States) { $States } else { $haStates })
+        open              = $Open
+        flips             = @($Flips)
+        forgets           = @($Forgets)
+        installs          = @($Installs)
+        slowInstall       = $SlowInstall
+        retryAfterRefusal = $RetryAfterRefusal
+        refuse            = [bool]$Refuse
     } | ConvertTo-Json -Depth 20 -Compress
     $out = $job | & $nodeExe.Source $driver
     if ($LASTEXITCODE -ne 0) { throw "the card driver exited with $LASTEXITCODE" }
@@ -301,6 +315,15 @@ Test-That 'they cover every discovery config the bridge published for it' {
         ForEach-Object { $_.Topic } | Sort-Object -Unique)
     $published.Count -gt 0 -and @($published | Where-Object { $darkForget -notcontains $_ }).Count -eq 0
 } "missing=[$(@($script:Published | Where-Object { $_.Topic -match "^homeassistant/[a-z_]+/(agent_bridge_$($dark.Slug)|$($darkNodes -join '|'))/[^/]+/config$" } | ForEach-Object { $_.Topic } | Sort-Object -Unique | Where-Object { $darkForget -notcontains $_ }) -join ',')]"
+Test-That 'and every retained topic it published, not only its discovery configs' {
+    # Clearing the configs withdraws the entities, but a retained payload left on the
+    # broker comes back the moment a machine of the same name does - which is how an
+    # old update stage would reappear on a fresh install (#129 review).
+    $root = Get-CopilotMqttMachineTopicRoot -Slug $dark.Slug
+    $retained = @($script:Published | Where-Object { $_.Topic -like "$root/*" } |
+        ForEach-Object { $_.Topic } | Sort-Object -Unique)
+    $retained.Count -gt 0 -and @($retained | Where-Object { $darkForget -notcontains $_ }).Count -eq 0
+} "missing=[$(@($script:Published | Where-Object { $_.Topic -like "$(Get-CopilotMqttMachineTopicRoot -Slug $dark.Slug)/*" } | ForEach-Object { $_.Topic } | Sort-Object -Unique | Where-Object { $darkForget -notcontains $_ }) -join ',')]"
 Test-That 'and nothing belonging to the machine that is still running' {
     @($darkForget | Where-Object { $_ -match "$($live.Slug)|$(@($sessions | ForEach-Object { $_.Node }) -join '|')" }).Count -eq 0
 }
@@ -342,6 +365,192 @@ Test-That 'and the machine that is still running is untouched' {
     $afterStates.ContainsKey("binary_sensor.agent_bridge_$($live.Slug)_online") -and
     $afterStates["binary_sensor.agent_bridge_$($live.Slug)_online"].state -eq 'on'
 }
+
+# --- 4. the update button, on the row the machine already has ----------------------
+#
+# Updating a machine meant finding its own card further down the view and then
+# watching a spinner that said only that something was happening. On a slow or
+# failing update the natural move is to press again or go to a shell, and both made
+# things worse (#129). The control sits on the machine's row, appears only when there
+# is something to say, and says which stage the updater has actually reached.
+
+$liveUpdate = Get-BridgeMachineEntityId -Domain 'update' -Key 'update' -Slug $live.Slug
+$liveInstall = Get-BridgeMachineEntityId -Domain 'button' -Key 'install_update' -Slug $live.Slug
+$darkUpdate = Get-BridgeMachineEntityId -Domain 'update' -Key 'update' -Slug $dark.Slug
+
+function New-UpdateStates {
+    <#
+        The published states with one machine's update entity replaced, so each
+        scenario starts from what the bridge really publishes rather than from a
+        hand-built world.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$EntityId,
+        [Parameter(Mandatory)][string]$State,
+        [hashtable]$Attributes = @{}
+    )
+    $copy = @{}
+    foreach ($key in $haStates.Keys) { $copy[$key] = $haStates[$key] }
+    $base = @{
+        installed_version = '1.19.0'; latest_version = '1.20.0'
+        in_progress = $false; update_percentage = $null; stage = ''; stage_detail = ''
+    }
+    foreach ($key in $Attributes.Keys) { $base[$key] = $Attributes[$key] }
+    $copy[$EntityId] = @{ state = $State; attributes = $base }
+    $copy
+}
+
+function Get-UpdateRow {
+    param([Parameter(Mandatory)][object]$Rendered, [Parameter(Mandatory)][string]$Machine)
+    @($Rendered.rows | Where-Object { $_.machine -eq $Machine })[0]
+}
+
+Write-Host ''
+Write-Host '--- the update button is on the machine row, and only when it has to be ---'
+Test-That 'the dashboard hands every row its own install button' {
+    @($cardConfig.machines | Where-Object { $_.PSObject.Properties['install'] }).Count -eq @($cardConfig.machines).Count
+}
+Test-That 'each naming the button that machine publishes, and no other' {
+    @($cardConfig.machines | Where-Object {
+        $slug = if ($_.machine -eq $live.Machine) { $live.Slug } else { $dark.Slug }
+        [string]$_.install -ne (Get-BridgeMachineEntityId -Domain 'button' -Key 'install_update' -Slug $slug)
+    }).Count -eq 0
+}
+Test-That 'with nothing to install the row keeps its Detail switch and shows no button' {
+    $row = Get-UpdateRow -Rendered $rendered -Machine $live.Machine
+    $row.update.hidden -and -not $row.detail.hidden
+}
+
+$offered = Invoke-StatusCard -States (New-UpdateStates -EntityId $liveUpdate -State 'on')
+Test-That 'an available update names the version it would install' {
+    (Get-UpdateRow -Rendered $offered -Machine $live.Machine).update.button.text -eq 'Update to 1.20.0'
+} "[$((Get-UpdateRow -Rendered $offered -Machine $live.Machine).update.button.text)]"
+Test-That 'and takes the place of the Detail switch rather than crowding the row' {
+    $row = Get-UpdateRow -Rendered $offered -Machine $live.Machine
+    -not $row.update.hidden -and -not $row.update.button.hidden -and $row.detail.hidden
+}
+Test-That 'the other machine, with nothing to install, is unaffected' {
+    (Get-UpdateRow -Rendered $offered -Machine $dark.Machine).update.hidden
+}
+
+$pressed = Invoke-StatusCard -States (New-UpdateStates -EntityId $liveUpdate -State 'on') -Installs @($live.Machine)
+Write-Host ''
+Write-Host '--- and pressing it starts that machine''s update, and only that one ---'
+Test-That 'the button was there to press' { @($pressed.missing).Count -eq 0 } "missing=[$(@($pressed.missing) -join ',')]"
+Test-That 'exactly one service call is made' { @($pressed.calls).Count -eq 1 } "calls=$(@($pressed.calls).Count)"
+Test-That 'pressing the button this machine publishes, through its own domain' {
+    @($pressed.calls)[0].domain -eq 'button' -and @($pressed.calls)[0].service -eq 'press' -and
+    @($pressed.calls)[0].data.entity_id -eq $liveInstall
+} "[$(@($pressed.calls)[0].domain)/$(@($pressed.calls)[0].service) $(@($pressed.calls)[0].data.entity_id)]"
+Test-That 'and it stops offering an update it has already asked for' {
+    # The daemon only sees the press on its next maintenance pass, so the entity
+    # still says an update is available. Offering again here is what got pressed
+    # twice, and a second press is a second installer.
+    $row = Get-UpdateRow -Rendered $pressed -Machine $live.Machine
+    $row.update.button.hidden -and $row.update.note.text -eq 'Starting'
+} "[$((Get-UpdateRow -Rendered $pressed -Machine $live.Machine).update.note.text)]"
+Test-That 'and arms a re-check, so the claim cannot outlive its grace in silence' {
+    # A press that reached Home Assistant whose machine then went quiet publishes
+    # nothing, and nothing else would redraw the row - so "Starting" would stay put
+    # with no way back to the button.
+    @($pressed.timers | Where-Object { $_ -ge 120000 }).Count -ge 1
+} "timers=[$(@($pressed.timers) -join ',')]"
+
+# A call that has not come back yet is the window a second click lands in, and a
+# second press is a second installer. The claim has to be drawn before the call is
+# waited on, not after it.
+$slow = Invoke-StatusCard -States (New-UpdateStates -EntityId $liveUpdate -State 'on') -SlowInstall $live.Machine
+Test-That 'the button is gone the moment it is pressed, not when the call comes back' {
+    $slow.duringPress.button.hidden -and $slow.duringPress.note.text -eq 'Starting'
+} "[$($slow.duringPress.button.hidden)/$($slow.duringPress.note.text)]"
+Test-That 'so a second click while the first is in flight sends no second press' {
+    @($slow.calls).Count -eq 1
+} "calls=$(@($slow.calls).Count)"
+
+# A call Home Assistant refuses is a press that never reached the daemon. Holding
+# the optimistic claim would hide the button behind "Starting" for two minutes while
+# nothing at all was happening.
+$refused = Invoke-StatusCard -States (New-UpdateStates -EntityId $liveUpdate -State 'on') -Installs @($live.Machine) -Refuse
+Test-That 'a refused press goes back to offering the update rather than claiming it started' {
+    $row = Get-UpdateRow -Rendered $refused -Machine $live.Machine
+    -not $row.update.button.hidden -and $row.update.button.text -eq 'Update to 1.20.0'
+} "[$((Get-UpdateRow -Rendered $refused -Machine $live.Machine).update.button.text)/$((Get-UpdateRow -Rendered $refused -Machine $live.Machine).update.note.text)]"
+
+# A re-check belongs to the press that asked for it. One left over from a press that
+# has already settled would stop the retry arming its own, fire early, and schedule a
+# fresh full grace from that moment - holding "Starting" for nearly twice as long.
+$retried = Invoke-StatusCard -States (New-UpdateStates -EntityId $liveUpdate -State 'on') -RetryAfterRefusal $live.Machine
+Test-That 'a retry after a refusal arms its own re-check rather than inheriting one' {
+    @($retried.calls).Count -eq 2 -and $retried.timersArmed -ge 2
+} "calls=$(@($retried.calls).Count) armed=$($retried.timersArmed)"
+Test-That 'and leaves exactly one of them live, for the claim that is actually held' {
+    @($retried.timers).Count -eq 1
+} "timers=[$(@($retried.timers) -join ',')]"
+
+Write-Host ''
+Write-Host '--- while it runs it says which stage, not that something is happening ---'
+$downloading = Invoke-StatusCard -States (New-UpdateStates -EntityId $liveUpdate -State 'on' -Attributes @{
+    in_progress = $true; stage = 'downloading'; update_percentage = 42 })
+Test-That 'the stage the updater reported is the stage shown' {
+    (Get-UpdateRow -Rendered $downloading -Machine $live.Machine).update.note.text -eq 'Downloading 42%'
+} "[$((Get-UpdateRow -Rendered $downloading -Machine $live.Machine).update.note.text)]"
+Test-That 'with a bar drawn at the proportion it reported' {
+    $row = Get-UpdateRow -Rendered $downloading -Machine $live.Machine
+    -not $row.update.bar.hidden -and $row.update.bar.width -eq '42%'
+} "[$((Get-UpdateRow -Rendered $downloading -Machine $live.Machine).update.bar.width)]"
+Test-That 'and nothing to press while it is running' {
+    (Get-UpdateRow -Rendered $downloading -Machine $live.Machine).update.button.hidden
+}
+
+$installing = Invoke-StatusCard -States (New-UpdateStates -EntityId $liveUpdate -State 'on' -Attributes @{
+    in_progress = $true; stage = 'installing' })
+Test-That 'a stage with no proportion draws no bar rather than an invented one' {
+    $row = Get-UpdateRow -Rendered $installing -Machine $live.Machine
+    $row.update.note.text -eq 'Installing' -and $row.update.bar.hidden
+} "[$((Get-UpdateRow -Rendered $installing -Machine $live.Machine).update.note.text)]"
+
+# Restarting the daemon is one of the stages, so the machine's liveness sensor
+# expires part-way through its own update. An X offering to forget a machine that is
+# mid-update is exactly the wrong control at exactly the wrong moment.
+$restarting = Invoke-StatusCard -States (New-UpdateStates -EntityId $darkUpdate -State 'on' -Attributes @{
+    installed_version = '1.17.1'; in_progress = $true; stage = 'restarting' })
+Test-That 'a machine restarting into its update says so instead of offering an X' {
+    $row = Get-UpdateRow -Rendered $restarting -Machine $dark.Machine
+    -not $row.update.hidden -and $row.update.note.text -eq 'Restarting' -and $row.forget.hidden
+} "[$((Get-UpdateRow -Rendered $restarting -Machine $dark.Machine).update.note.text)]"
+
+Write-Host ''
+Write-Host '--- and it ends on what happened, not on silence ---'
+$done = Invoke-StatusCard -States (New-UpdateStates -EntityId $liveUpdate -State 'off' -Attributes @{
+    installed_version = '1.20.0'; stage = 'completed'; stage_detail = 'Updated to 1.20.0' })
+Test-That 'a finished update names the version it reached' {
+    $row = Get-UpdateRow -Rendered $done -Machine $live.Machine
+    $row.update.note.text -eq 'Updated to 1.20.0' -and $row.update.note.tone -eq 'good'
+} "[$((Get-UpdateRow -Rendered $done -Machine $live.Machine).update.note.text)]"
+
+$current = Invoke-StatusCard -States (New-UpdateStates -EntityId $liveUpdate -State 'off' -Attributes @{
+    latest_version = '1.19.0'; stage = 'current'; stage_detail = 'No newer release found; nothing installed.' })
+Test-That 'a release already installed is reported as that, not as a failure' {
+    # Conflating the two is #92: a press that found nothing to do looked exactly
+    # like a press that broke, and the answer was always to go and read a log.
+    $row = Get-UpdateRow -Rendered $current -Machine $live.Machine
+    -not $row.update.hidden -and $row.update.note.tone -ne 'bad'
+} "tone=[$((Get-UpdateRow -Rendered $current -Machine $live.Machine).update.note.tone)]"
+
+$failed = Invoke-StatusCard -States (New-UpdateStates -EntityId $liveUpdate -State 'on' -Attributes @{
+    stage = 'failed'; stage_detail = 'the download was rejected: 403' })
+Test-That 'a failure says so, carries why, and can be pressed again' {
+    $row = Get-UpdateRow -Rendered $failed -Machine $live.Machine
+    -not $row.update.button.hidden -and -not $row.update.button.disabled -and
+    $row.update.button.text -eq 'Update failed' -and
+    $row.update.button.title -eq 'the download was rejected: 403'
+} "[$((Get-UpdateRow -Rendered $failed -Machine $live.Machine).update.button.text)/$((Get-UpdateRow -Rendered $failed -Machine $live.Machine).update.button.title)]"
+
+$unknown = Invoke-StatusCard -States (New-UpdateStates -EntityId $liveUpdate -State 'unavailable' -Attributes @{ latest_version = '' })
+Test-That 'a check that failed is not reported as nothing to install' {
+    $row = Get-UpdateRow -Rendered $unknown -Machine $live.Machine
+    -not $row.update.hidden -and $row.update.note.text -eq 'Update check failed' -and $row.update.button.hidden
+} "[$((Get-UpdateRow -Rendered $unknown -Machine $live.Machine).update.note.text)]"
 
 Write-Host ''
 if ($script:Failures) {

@@ -818,6 +818,34 @@ Test-That 'the updater still runs the installer non-interactively' {
 Test-That 'no -TargetHome argument is emitted when none is supplied' {
     $generated -notmatch '-TargetHome'
 }
+
+# The whole point of #129 is that the stages come from the updater rather than being
+# guessed by a card, so the generated child has to actually emit them - and it is
+# generated text, which no amount of testing the parent would catch a syntax error in.
+Test-That 'the generated updater parses as PowerShell' {
+    $errors = $null
+    [void][System.Management.Automation.Language.Parser]::ParseInput($generated, [ref]$null, [ref]$errors)
+    @($errors).Count -eq 0
+} "parse errors: $(@(([System.Management.Automation.Language.Parser]::ParseInput($generated, [ref]$null, [ref]([System.Management.Automation.Language.ParseError[]]$null)))) | Out-String)"
+
+Test-That 'it reports each stage it passes through' {
+    foreach ($stage in @('downloading', 'installing', 'restarting', 'verifying')) {
+        if ($generated -notmatch "Write-UpdateStage -Stage '$stage'") { return $false }
+    }
+    $true
+}
+
+# Stopping the daemon is what removes the reader, so a stage written after it has
+# nobody to publish it.
+Test-That 'it says it is restarting before it stops the daemon, not after' {
+    $generated.IndexOf("Write-UpdateStage -Stage 'restarting'") -lt
+        $generated.IndexOf('Stop-BridgeOwnedRuntime')
+}
+
+Test-That 'and ends on a terminal stage that distinguishes success from failure' {
+    $generated -match "Write-UpdateStage -Stage \`$\(if \(\`$outcome\.success\) \{ 'completed' \} else \{ 'failed' \}\)"
+}
+
 $genValid = Invoke-BridgeSelfUpdate -ScriptOnly -TargetHome $env:TEMP
 Test-That 'a valid TargetHome is passed through to the installer' {
     $genValid -match "-TargetHome '"
@@ -898,6 +926,70 @@ $stagingAfter = @(Get-ChildItem -LiteralPath $fixtureRuntime -Directory -Filter 
 Test-That 'and no half-written staging folder is left behind' {
     ($stagingAfter -join "`n") -ceq ($stagingBefore -join "`n")
 } "before=$(@($stagingBefore).Count) after=$(@($stagingAfter).Count)"
+
+# --- reading progress back ---------------------------------------------------------
+# A display, not a verdict. Read-BridgeUpdateOutcome throws on anything unexpected
+# because it guards the claim that an update succeeded; this must never turn a healthy
+# update into a reported fault, so everything it cannot trust reads as "nothing yet".
+$stageDir = Join-Path $env:TEMP ("bridge-stage-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $stageDir -Force | Out-Null
+$stagePath = Join-Path $stageDir 'progress.json'
+function Set-StageFile {
+    param([hashtable]$Record)
+    ($Record | ConvertTo-Json -Compress) | Set-Content -LiteralPath $stagePath -Encoding UTF8
+}
+try {
+    Test-That 'no progress file at all is simply nothing to show' {
+        $null -eq (Read-BridgeUpdateStage -Path (Join-Path $stageDir 'absent.json'))
+    }
+
+    Set-StageFile @{ schemaVersion = 1; attemptId = 'a1'; stage = 'downloading'; version = '9.9.9'; detail = ''; proportion = 0.5; at = [DateTimeOffset]::Now.ToString('o') }
+    $live = Read-BridgeUpdateStage -Path $stagePath -AttemptId 'a1'
+    Test-That 'a current record reports the stage, the version and the proportion' {
+        $live.Stage -eq 'downloading' -and $live.Version -eq '9.9.9' -and $live.Proportion -eq 0.5 -and -not $live.Done
+    } "$($live | Out-String)"
+
+    Test-That 'a record from another attempt is not this attempt''s progress' {
+        $null -eq (Read-BridgeUpdateStage -Path $stagePath -AttemptId 'a2')
+    }
+
+    Test-That 'nor is one that predates the attempt asking' {
+        $null -eq (Read-BridgeUpdateStage -Path $stagePath -AttemptId 'a1' -NotBefore ([DateTimeOffset]::Now.AddMinutes(5)))
+    }
+
+    foreach ($bad in @(0.5, 'half', -1, 2)) {
+        Set-StageFile @{ schemaVersion = 1; attemptId = 'a1'; stage = 'downloading'; version = '9.9.9'; detail = ''; proportion = $bad; at = [DateTimeOffset]::Now.ToString('o') }
+        $read = Read-BridgeUpdateStage -Path $stagePath -AttemptId 'a1'
+        if ($bad -eq 0.5) { continue }
+        Test-That "a proportion of '$bad' is shown as no proportion rather than drawn somewhere arbitrary" {
+            $read.Stage -eq 'downloading' -and $null -eq $read.Proportion
+        } "proportion=$($read.Proportion)"
+    }
+
+    Set-StageFile @{ schemaVersion = 1; attemptId = 'a1'; stage = 'sideways'; version = '9.9.9'; detail = ''; proportion = -1; at = [DateTimeOffset]::Now.ToString('o') }
+    Test-That 'a stage nobody can interpret is no progress at all' {
+        $null -eq (Read-BridgeUpdateStage -Path $stagePath -AttemptId 'a1')
+    }
+
+    Set-StageFile @{ schemaVersion = 2; attemptId = 'a1'; stage = 'downloading'; version = '9.9.9'; detail = ''; proportion = -1; at = [DateTimeOffset]::Now.ToString('o') }
+    Test-That 'so is a schema this does not know' {
+        $null -eq (Read-BridgeUpdateStage -Path $stagePath -AttemptId 'a1')
+    }
+
+    Set-Content -LiteralPath $stagePath -Value 'this is not json' -Encoding UTF8
+    Test-That 'an unreadable record reads as nothing to show, never as a failed update' {
+        $null -eq (Read-BridgeUpdateStage -Path $stagePath -AttemptId 'a1')
+    }
+
+    foreach ($terminal in @('completed', 'failed')) {
+        Set-StageFile @{ schemaVersion = 1; attemptId = 'a1'; stage = $terminal; version = '9.9.9'; detail = 'why'; proportion = -1; at = [DateTimeOffset]::Now.ToString('o') }
+        $end = Read-BridgeUpdateStage -Path $stagePath -AttemptId 'a1'
+        Test-That "'$terminal' is reported as finished, carrying its detail" {
+            $end.Done -and $end.Stage -eq $terminal -and $end.Detail -eq 'why'
+        }
+    }
+}
+finally { Remove-Item -LiteralPath $stageDir -Recurse -Force -ErrorAction SilentlyContinue }
 
 Write-Host ''
 if ($script:Failures) {

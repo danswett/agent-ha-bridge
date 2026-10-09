@@ -192,11 +192,13 @@ function loadCards(sourceFile) {
     btoa: (s) => Buffer.from(s, 'binary').toString('base64'),
     Uint8Array,
     fetch: async () => { throw new Error('fetch was not stubbed'); },
-    // The launch card arms a timer while a press is in flight. Recorded rather than
-    // run: a real timer would keep the test process alive for its full delay, and
-    // nothing here needs it to fire.
+    // The launch card arms a timer while a press is in flight, and the status card
+    // does the same for its update claim. Recorded rather than run: a real timer
+    // would keep the test process alive for its full delay, and a test that cares
+    // reads `timers` to see that one was armed at all.
     setTimeout: (fn, ms) => { sandboxTimers.push({ fn, ms }); return sandboxTimers.length; },
     clearTimeout: (id) => { if (id) { sandboxTimers[id - 1] = null; } },
+    timers: sandboxTimers,
     // Recorded, not run, for the same reason as setTimeout. `intervals` is what a test
     // counts to see whether a timer is actually running. Closures rather than `this`,
     // because the card calls these as bare globals.

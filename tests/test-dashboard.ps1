@@ -515,6 +515,38 @@ Test-That 'and every one is given the activity sensor whose stamp it watches' {
     @($watchingCards | Where-Object { $_.Contains('activity') -and [string]$_['activity'] -match '_activity$' }).Count -eq $watchingCards.Count
 } (($watchingCards | ForEach-Object { [string]$_['activity'] }) -join ', ')
 
+# The press used to be on a card of its own further down the view, and the only
+# feedback after it was a spinner. It now sits on the machine's row in the Agent
+# sessions card, so the two must never both be drawn - the lower one would offer the
+# same press again and still say nothing useful (#129).
+Write-Host '--- from card 1.31.0 the update press is on the machine row ---'
+Set-TestPublicationCardUrl -Url '/local/agent-bridge-reply-card.js?v=1.31.0'
+Save-CopilotSessionDashboard -Sessions $sessions -Machines $twoMachines -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.31.0'
+$updateStatus = @($script:SavedConfig.views[0].cards | Where-Object { $_['type'] -eq 'custom:agent-bridge-status-card' })[0]
+$updateJson = $script:SavedConfig | ConvertTo-Json -Depth 40 -Compress
+Test-That 'every machine row is given the button that installs on that machine' {
+    @($updateStatus['machines'] | Where-Object { [string]$_['install'] -match '^button\.agent_bridge_.+_install_update$' }).Count -eq
+        @($updateStatus['machines']).Count
+}
+Test-That 'each row its own, never one shared button' {
+    @(@($updateStatus['machines'] | ForEach-Object { [string]$_['install'] }) | Sort-Object -Unique).Count -eq
+        @($updateStatus['machines']).Count
+}
+Test-That 'and the separate update card is not drawn as well' {
+    $updateJson -notmatch 'Bridge update available'
+}
+
+Write-Host '--- and an older served card keeps the separate update card ---'
+Set-TestPublicationCardUrl -Url '/local/agent-bridge-reply-card.js?v=1.30.0'
+Save-CopilotSessionDashboard -Sessions $sessions -Machines $twoMachines -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.30.0'
+$fallbackStatus = @($script:SavedConfig.views[0].cards | Where-Object { $_['type'] -eq 'custom:agent-bridge-status-card' })[0]
+Test-That 'a 1.30.0 card is handed no button it has no code to press' {
+    @($fallbackStatus['machines'] | Where-Object { $_.Contains('install') }).Count -eq 0
+}
+Test-That 'so the press it does know is still there' {
+    ($script:SavedConfig | ConvertTo-Json -Depth 40 -Compress) -match 'Bridge update available'
+}
+
 Write-Host '--- a live session produces a card ---'
 Test-That 'the control cards plus a session card are present' { @($cfg.views[0].cards).Count -ge 3 }
 
@@ -1614,8 +1646,8 @@ Test-That 'and a blank entry never matches a blank user' { -not (Test-BridgeAgen
 # fingerprints and this fails, saying to bump the version and update both constants
 # together. It is deliberately a hash of source text: that is precisely what the fence
 # compares, so anything that would conflict there fails here first.
-$script:ExpectedRenderVersion = '1.5.0'
-$script:ExpectedRenderHash = '61a847f420a3e04275ed1695136264172d5e50177c1a1d736db05a23a63618d4'
+$script:ExpectedRenderVersion = '1.6.0'
+$script:ExpectedRenderHash = '67907ac70da340db50f08e91413f99b200acd2b4a44554a67e37f2259a390ebf'
 $artifact = Get-BridgeRenderArtifact
 
 Test-That 'the renderer is still the one this version was pinned to' {
