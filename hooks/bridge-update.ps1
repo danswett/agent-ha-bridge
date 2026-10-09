@@ -231,12 +231,13 @@ function Get-BridgeRateLimitWait {
             $retryAt = [DateTimeOffset]::FromUnixTimeSeconds($epoch).ToLocalTime()
             $explicit = $true
         }
-        # A secondary limit names no time at all. GitHub asks for at least a minute,
-        # and for exponentially increasing waits while it keeps answering this way -
-        # continuing to ask at a fixed interval is what it warns can earn a ban. So
-        # the wait doubles per consecutive refusal it had to invent a time for,
-        # capped at an hour: 1, 2, 4, 8, 16, 32, 60 minutes.
-        elseif ($secondary) {
+        # A secondary limit names no time at all, and neither does a 403 or 429 that
+        # arrives without the headers. GitHub asks for an initial wait and then
+        # exponentially increasing ones while it keeps answering that way - asking
+        # again at a fixed interval is what it warns can earn a ban. So any refusal it
+        # gave no time for waits a doubling amount per consecutive refusal, capped at
+        # an hour: 1, 2, 4, 8, 16, 32, 60 minutes.
+        else {
             $steps = [Math]::Max(0, [Math]::Min($Attempt - 1, 6))
             $minutes = [Math]::Min(60, [Math]::Pow(2, $steps))
             $retryAt = [DateTimeOffset]::Now.AddMinutes($minutes)
@@ -422,6 +423,7 @@ function Get-BridgeLatestRelease {
         catch [FormatException] { Write-Warning 'The update cache has an invalid check time; checking again.' }
         if ($null -ne $checkedAt) {
             $rateLimitExpired = $false
+            $cachedRetryAt = $null
             $cachedRelease = if ($cache.PSObject.Properties['Release']) { $cache.Release } else { $null }
             $reached = $cache.PSObject.Properties['Reached']
             if ((-not $reached -or ($cache.Reached -is [bool] -and $cache.Reached)) -and
@@ -443,6 +445,7 @@ function Get-BridgeLatestRelease {
                 if ($cache.PSObject.Properties['RetryAt'] -and $cache.RetryAt) {
                     try { $retryAt = ConvertTo-BridgeUpdateTime $cache.RetryAt } catch [FormatException] { $retryAt = $null }
                 }
+                $cachedRetryAt = $retryAt
                 if ($null -eq $retryAt -or $retryAt -gt [DateTimeOffset]::Now) {
                     $lookup.State = 'RateLimited'
                     $lookup.RetryAt = $cache.RetryAt
@@ -465,6 +468,15 @@ function Get-BridgeLatestRelease {
             $window = if ($lookup.State -in @('Unavailable', 'RateLimited')) {
                 [Math]::Min($CheckHours, $script:BridgeUpdateConfig.RetryMinutes / 60)
             } else { $CheckHours }
+            # Except that a verdict naming a time further out than that window is held
+            # until the time it named. Otherwise the backoff above stops growing at
+            # fifteen minutes, and the 16-, 32- and 60-minute waits all become asking
+            # again sooner than GitHub allowed. Raised by Codex on #157.
+            if ($lookup.State -eq 'RateLimited' -and $null -ne $cachedRetryAt -and
+                $cachedRetryAt -gt [DateTimeOffset]::Now) {
+                $untilRetry = ($cachedRetryAt - $checkedAt).TotalHours
+                $window = [Math]::Min($CheckHours, [Math]::Max($window, $untilRetry))
+            }
             $age = ([DateTimeOffset]::Now - $checkedAt).TotalHours
             if ($age -ge 0 -and $age -lt $window -and -not $rateLimitExpired) {
                 if ($IncludeStatus) { return $lookup }

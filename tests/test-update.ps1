@@ -651,6 +651,45 @@ try {
         Test-That 'a limit that named its own reset accrues no backoff' {
             ([int](Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json).RateLimitStrikes) -eq 0
         } ([string](Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json).RateLimitStrikes)
+
+        # A secondary limit can arrive as 429 just as well as 403, and without the
+        # headers either way. Keying the inferred wait on 403 left a headerless 429
+        # with no time at all, so the strike count it was accruing did nothing.
+        # Raised by Codex on #157.
+        Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+        function Invoke-RestMethod {
+            param($Uri, $Headers, $TimeoutSec)
+            $response = New-RateLimitedResponse -Code 429 -Remaining '' -RetryAfter ''
+            throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('too many requests', $response)
+        }
+        $headerless429 = Get-BridgeUpdateStatus -Force
+        Test-That 'a 429 carrying no headers is given a wait as well, not left with none' {
+            $written = Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json
+            $headerless429.State -eq 'RateLimited' -and $written.RetryAt -and
+                [Math]::Round(([DateTimeOffset]$written.RetryAt - [DateTimeOffset]::Now).TotalMinutes) -eq 1
+        } "$($headerless429.State): $($headerless429.Detail)"
+
+        # And a wait longer than the fifteen-minute retry window has to outlast it,
+        # or the backoff stops growing there and every later step asks again early.
+        Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+        [pscustomobject]@{
+            CheckedAt = [DateTimeOffset]::Now.AddMinutes(-16).ToString('o')
+            Reached = $false; State = 'RateLimited'
+            Detail = "GitHub is rate limiting this machine's release checks until 23:59. The install is fine."
+            RetryAt = [DateTimeOffset]::Now.AddMinutes(16).ToString('o')
+            RateLimitStrikes = 5
+            Release = $null
+        } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
+        $script:AuthAttempts = @()
+        function Invoke-RestMethod {
+            param($Uri, $Headers, $TimeoutSec)
+            $script:AuthAttempts += $true
+            throw [IO.IOException]::new('this request should never have been made')
+        }
+        $held = Get-BridgeUpdateStatus
+        Test-That 'a wait past the retry window is honoured rather than cut short at fifteen minutes' {
+            $script:AuthAttempts.Count -eq 0 -and $held.State -eq 'RateLimited'
+        } "$($held.State), requests=$($script:AuthAttempts.Count)"
     }
     finally {
         if ($null -eq $priorToken) { Remove-Item -LiteralPath Env:GH_TOKEN -ErrorAction SilentlyContinue }
