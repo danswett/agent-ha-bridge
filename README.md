@@ -405,7 +405,7 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `updates.token` | Optional GitHub token for release checks only, sent to `api.github.com` and never logged. Unauthenticated callers share **60 requests an hour per IP**, so a Dev Box or anything else behind shared egress can be refused without the bridge having made a request of its own. `AGENT_HA_BRIDGE_UPDATE_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN` in the environment are used too, in that order, when the setting is empty - a machine that already has one needs no configuration. If a token is rejected as bad credentials, the check is retried without one rather than failing - an ambient `GITHUB_TOKEN` expires when its workflow job ends, and these are public releases. A read-only token with no scopes is enough for them |
 | `usage.publish` | Set to `false` to stop collecting and publishing each agent's remaining allowance (default `true`). This stops the vendor calls, not just the card |
 | `usage.intervalSeconds` | How often to re-read the allowances (default `120`). Copilot's figure moves continuously while a session runs, so this is a poll rather than a cache read |
-| `usage.keychain` | Set to `true` to let the Copilot allowance read its token from the macOS login keychain (default `false`). Off because the read raises an authorization panel that **Always Allow** cannot silence — the CLI replaces the item on every token refresh, so each grant outlives its item by minutes. `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN` get the same figure without prompting. No effect on Windows, which reads the credential store silently |
+| `usage.keychain` | Set to `true` to let the Copilot allowance read its token from the macOS login keychain (default `false`). Off because the read raises an authorization panel that **Always Allow** cannot silence — the CLI replaces the item on every token refresh, so each grant outlives its item by minutes. `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN` get the same figure without prompting, and so does a machine signed in to the GitHub CLI (`gh auth login`) as the same account — see [Agent usage](#agent-usage). No effect on Windows, which reads the credential store silently |
 
 Prefer keeping tokens out of a file? Leave `token` / `agentToken` empty and set the
 variables named by `tokenEnvVar` / `agentTokenEnvVar` in the environment of each process
@@ -887,7 +887,7 @@ whichever read it most recently rather than drawn twice.
 
 | | |
 |---|---|
-| **Copilot** | The monthly AI-credit allowance, read live from GitHub using the credential Copilot CLI itself stored. Falls back to the CLI's own cache when there is no credential to hand — and then says so, because a cached figure was measured thirteen minutes stale, and already wrong, during an active session |
+| **Copilot** | The monthly AI-credit allowance, read live from GitHub using the credential Copilot CLI itself would use — an environment token, the item it stored in the keychain, or the token the GitHub CLI holds for the same account, in the CLI's own order. Falls back to the CLI's own cache when there is no credential to hand — and then says so, because a cached figure was measured thirteen minutes stale, and already wrong, during an active session. With nothing cached either, the card says which credential is missing rather than only that one is |
 | **Claude** | The session (5-hour) and weekly windows, read with the OAuth token Claude Code keeps beside its settings. Both are drawn whenever Anthropic lists them, including a session window sitting at 0% because none is open — leaving those out made Claude look as though it had only a weekly cap. That token expires about hourly and only Claude Code can refresh it: Anthropic retires a refresh token as it is used, so refreshing from here would either sign Claude Code out or race its own write. An expired token is therefore not spent, and the retained sensor keeps its last reading and ages |
 | **Codex** | The 5-hour and weekly rate-limit windows. Codex has no endpoint to ask — it learns its limits from the replies it gets — so this is the newest figure in its own transcripts, and the card marks it stale once it is over an hour old |
 
@@ -903,18 +903,35 @@ Tokens are read, spent on the one request, and dropped — never logged, never
 published, never written anywhere. Turn the whole thing off with `usage.publish:
 false`, which stops the collection rather than merely hiding the result.
 
-On macOS the Copilot figure needs a token the CLI keeps in the login keychain, and
-reading it is **off by default** (`usage.keychain`). Nothing the bridge can do makes
-that read quiet: the keychain item does not trust `/usr/bin/security`, so every read
-raises an authorization panel, and pressing **Always Allow** does not settle it,
-because the CLI replaces the item whenever it refreshes its token and the replacement
-carries a new ACL that the earlier grant does not belong to. With a two-minute poll
-behind it, that was enough panels to make a Mac unusable.
+On macOS, reading the token the CLI keeps in the login keychain is **off by default**
+(`usage.keychain`). Nothing the bridge can do makes that read quiet: the keychain item
+does not trust `/usr/bin/security`, so every read raises an authorization panel, and
+pressing **Always Allow** does not settle it, because the CLI replaces the item whenever
+it refreshes its token and the replacement carries a new ACL that the earlier grant does
+not belong to. With a two-minute poll behind it, that was enough panels to make a Mac
+unusable.
 
-Set `usage.keychain: true` to allow the read anyway. A machine that wants the live
-Copilot figure without any of that can export `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or
-`GITHUB_TOKEN` instead — those are read first and prompt for nothing. Otherwise the
-allowance falls back to its cached reading, and the other agents are unaffected.
+None of that touches a machine signed in to the GitHub CLI as the same account, and for
+that machine nothing needs turning on. The last rung of Copilot CLI's own credential
+order is `gh auth token`, and the daemon takes it too, asking for the login Copilot is
+signed in as: `gh auth token --hostname github.com --user <login>`. `gh` reads and writes
+its keychain entries through `/usr/bin/security`, which therefore already trusts them, so
+no panel is raised and `gh auth login` as that account is the whole setup. It is asked
+afresh on each poll, so signing in heals the card within two minutes; a `gh` that never
+answers is not asked again until the daemon restarts, so a keyring waiting to be unlocked
+cannot become the same storm. The same rung covers a Windows or Linux machine whose
+Copilot access comes from `gh`, with no item of the CLI's own to read. The daemon looks
+for `gh` in Homebrew's and the installers' folders as well as on `PATH`, since a
+LaunchAgent's `PATH` does not include them.
+
+Set `usage.keychain: true` to allow the CLI's own item to be read as well. A machine that
+wants the live Copilot figure without any of that can export `COPILOT_GITHUB_TOKEN`,
+`GH_TOKEN` or `GITHUB_TOKEN` instead — those are read first and prompt for nothing.
+Otherwise the allowance falls back to its cached reading, and the other agents are
+unaffected. When nothing is cached either, the card says why instead of only that there
+is no credential — for a Mac whose `gh` is not signed in as the account Copilot is:
+*No Copilot credential was available and nothing was cached (gh has no token for
+octocat - run gh auth login).*
 
 ### How current it is
 
