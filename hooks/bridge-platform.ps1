@@ -641,6 +641,12 @@ function Restore-BridgeOwnedLaunchAgent {
     $domain = ($Service -split '/', 3)[0..1] -join '/'
     try {
         & launchctl bootstrap $domain $PlistPath 2>$null | Out-Null
+        if ((Wait-BridgeLaunchAgentState -Service $Service -Until 'loaded') -eq 0) { return $true }
+        # bootstrap refusing a job that the older API still takes is common and
+        # recoverable; Register-BridgeLaunchAgent falls back the same way and says
+        # so. Giving up after the first refusal would leave the machine with the
+        # unloaded daemon this function exists to prevent. Review on #123.
+        & launchctl load -w $PlistPath 2>$null | Out-Null
         (Wait-BridgeLaunchAgentState -Service $Service -Until 'loaded') -eq 0
     }
     catch { $false }

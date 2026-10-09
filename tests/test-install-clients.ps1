@@ -1085,8 +1085,11 @@ function Get-BridgeUpdateStatus {
     # normal teardown; 'ambiguous' is launchctl answering with neither 0 nor 113,
     # which is the case that used to leave the machine unloaded with no route back.
     $script:LaunchdSettledMode = 'absent'
-    # Whether a bootstrap put back what the bootout took away.
-    $script:LaunchdRestoreWorks = $true
+    # Whether a bootstrap put back what the bootout took away, and whether the older
+    # `load -w` does when bootstrap refuses - which install.ps1 treats as common.
+    $script:LaunchdBootstrapRestores = $true
+    $script:LaunchdLoadRestores = $true
+    $script:LaunchdLoadCalls = 0
     function id { param($Option) $global:LASTEXITCODE = 0; '1000' }
     function launchctl {
         param($Action, $Service, $PlistPath)
@@ -1098,7 +1101,13 @@ function Get-BridgeUpdateStatus {
         }
         if ($Action -eq 'bootstrap') {
             $script:LaunchdBootstrapCalls++
-            $script:LaunchdFixtureMode = if ($script:LaunchdRestoreWorks) { 'running' } else { 'absent' }
+            if ($script:LaunchdBootstrapRestores) { $script:LaunchdFixtureMode = 'running' }
+            $global:LASTEXITCODE = 0
+            return
+        }
+        if ($Action -eq 'load') {
+            $script:LaunchdLoadCalls++
+            if ($script:LaunchdLoadRestores) { $script:LaunchdFixtureMode = 'running' }
             $global:LASTEXITCODE = 0
             return
         }
@@ -1176,8 +1185,10 @@ function Get-BridgeUpdateStatus {
         [IO.File]::WriteAllText($plistPath, $ownedPlist)
         $script:LaunchdFixtureMode = 'running'
         $script:LaunchdSettledMode = 'ambiguous'
-        $script:LaunchdRestoreWorks = $false
+        $script:LaunchdBootstrapRestores = $false
+        $script:LaunchdLoadRestores = $false
         $script:LaunchdBootstrapCalls = 0
+        $script:LaunchdLoadCalls = 0
         $stranded = $null
         try { Stop-BridgeOwnedService -Context $contextA -Remove }
         catch { $stranded = $_.Exception.Message }
@@ -1186,12 +1197,30 @@ function Get-BridgeUpdateStatus {
         } "[$stranded]"
         Test-That 'and does not claim it was reloaded' { $stranded -notmatch 'running as before' } "[$stranded]"
 
+        # bootstrap refusing a job the older API still takes is common enough that
+        # install.ps1 falls back to `load -w`. Recovery that stops at the refusal
+        # leaves exactly the unloaded daemon this is all for.
+        [IO.File]::WriteAllText($plistPath, $ownedPlist)
+        $script:LaunchdFixtureMode = 'running'
+        $script:LaunchdSettledMode = 'ambiguous'
+        $script:LaunchdBootstrapRestores = $false
+        $script:LaunchdLoadRestores = $true
+        $script:LaunchdBootstrapCalls = 0
+        $script:LaunchdLoadCalls = 0
+        $legacyLoaded = $null
+        try { Stop-BridgeOwnedService -Context $contextA -Remove }
+        catch { $legacyLoaded = $_.Exception.Message }
+        Test-That 'a bootstrap that is refused falls back to the load that still works' {
+            $script:LaunchdLoadCalls -eq 1 -and $legacyLoaded -match 'reloaded and is running'
+        } "bootstrap=$($script:LaunchdBootstrapCalls) load=$($script:LaunchdLoadCalls) [$legacyLoaded]"
+
         # A bootout launchd refused changed nothing, so there is nothing to put back
         # and the old wording is the accurate one.
         [IO.File]::WriteAllText($plistPath, $ownedPlist)
         $script:LaunchdFixtureMode = 'failed'
-        $script:LaunchdRestoreWorks = $true
+        $script:LaunchdBootstrapRestores = $true
         $script:LaunchdBootstrapCalls = 0
+        $script:LaunchdLoadCalls = 0
         $refused = $null
         try { Stop-BridgeOwnedService -Context $contextA -Remove }
         catch { $refused = $_.Exception.Message }
@@ -1309,6 +1338,8 @@ function Get-BridgeUpdateStatus {
         $script:RestartKickstarts = 0
         $script:RestartLoaded = $false
         $script:RestartBootstrapWorks = $true
+        $script:RestartLoadWorks = $true
+        $script:RestartLoadCalls = 0
         function id { param($Option) $global:LASTEXITCODE = 0; '1000' }
         function launchctl {
             param($Action, $Service, $PlistPath)
@@ -1318,7 +1349,13 @@ function Get-BridgeUpdateStatus {
                 return
             }
             if ($Action -eq 'bootstrap') {
-                $script:RestartLoaded = $script:RestartBootstrapWorks
+                if ($script:RestartBootstrapWorks) { $script:RestartLoaded = $true }
+                $global:LASTEXITCODE = 0
+                return
+            }
+            if ($Action -eq 'load') {
+                $script:RestartLoadCalls++
+                if ($script:RestartLoadWorks) { $script:RestartLoaded = $true }
                 $global:LASTEXITCODE = 0
                 return
             }
@@ -1335,11 +1372,22 @@ function Get-BridgeUpdateStatus {
 
             $script:RestartLoaded = $false
             $script:RestartBootstrapWorks = $false
+            $script:RestartLoadWorks = $false
             $stuck = $null
             try { Invoke-Restart } catch { $stuck = $_.Exception.Message }
             Test-That 'and still names configure when loading it really does not work' {
                 $stuck -match 'could not be loaded' -and $stuck -match 'agent-ha-bridge configure'
             } "[$stuck]"
+
+            $script:RestartLoaded = $false
+            $script:RestartBootstrapWorks = $false
+            $script:RestartLoadWorks = $true
+            $script:RestartLoadCalls = 0
+            $legacy = $null
+            try { Invoke-Restart } catch { $legacy = $_.Exception.Message }
+            Test-That 'a refused bootstrap still loads through the older API, as the installer does' {
+                $null -eq $legacy -and $script:RestartLoadCalls -eq 1 -and $script:RestartLoaded
+            } "load=$($script:RestartLoadCalls) [$legacy]"
         }
         finally {
             $script:BridgeIsWindows = $savedWindows
