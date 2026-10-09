@@ -479,10 +479,18 @@ function Get-BridgeLatestRelease {
             # until the time it named. Otherwise the backoff above stops growing at
             # fifteen minutes, and the 16-, 32- and 60-minute waits all become asking
             # again sooner than GitHub allowed. Raised by Codex on #157.
+            #
+            # Deliberately not bounded by CheckHours: that is how often to look when
+            # things are fine, and a configured cadence shorter than the wait would
+            # otherwise override an instruction not to ask yet. It is bounded at an
+            # hour instead, which is every legitimate case - the primary allowance
+            # resets hourly, a secondary limit asks for minutes, and the inferred
+            # backoff caps at sixty - so a corrupt or skewed timestamp past that falls
+            # back to the ordinary window rather than silencing the check for a day.
             if ($lookup.State -eq 'RateLimited' -and $null -ne $cachedRetryAt -and
                 $cachedRetryAt -gt [DateTimeOffset]::Now) {
                 $untilRetry = ($cachedRetryAt - $checkedAt).TotalHours
-                $window = [Math]::Min($CheckHours, [Math]::Max($window, $untilRetry))
+                $window = [Math]::Max($window, [Math]::Min($untilRetry, 1))
             }
             $age = ([DateTimeOffset]::Now - $checkedAt).TotalHours
             if ($age -ge 0 -and $age -lt $window -and -not $rateLimitExpired) {

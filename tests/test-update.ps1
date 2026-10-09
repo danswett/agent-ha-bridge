@@ -710,6 +710,42 @@ try {
         Test-That 'a wait past the retry window is honoured rather than cut short at fifteen minutes' {
             $script:AuthAttempts.Count -eq 0 -and $held.State -eq 'RateLimited'
         } "$($held.State), requests=$($script:AuthAttempts.Count)"
+
+        # A short configured check interval says how often to look when things are
+        # fine. It must not override an instruction not to ask yet, or every backoff
+        # past it collapses to the polling cadence. Raised by Codex on #157.
+        Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+        [pscustomobject]@{
+            CheckedAt = [DateTimeOffset]::Now.AddMinutes(-20).ToString('o')
+            Reached = $false; State = 'RateLimited'
+            Detail = "GitHub is rate limiting this machine's release checks until 23:59. The install is fine."
+            RetryAt = [DateTimeOffset]::Now.AddMinutes(32).ToString('o')
+            RateLimitStrikes = 6
+            Release = $null
+        } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
+        $script:AuthAttempts = @()
+        $heldShortInterval = Get-BridgeLatestRelease -CheckHours 0.0833 -IncludeStatus
+        Test-That 'a five-minute check interval does not cut a thirty-two minute backoff short' {
+            $script:AuthAttempts.Count -eq 0 -and $heldShortInterval.State -eq 'RateLimited'
+        } "$($heldShortInterval.State), requests=$($script:AuthAttempts.Count)"
+
+        # Bounded all the same: a timestamp further out than any real limit is honoured
+        # for at most an hour, so a corrupt or skewed one cannot silence the check for
+        # days. Checked seventy minutes on, which is past that cap.
+        Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+        [pscustomobject]@{
+            CheckedAt = [DateTimeOffset]::Now.AddMinutes(-70).ToString('o')
+            Reached = $false; State = 'RateLimited'
+            Detail = "GitHub is rate limiting this machine's release checks until 23:59. The install is fine."
+            RetryAt = [DateTimeOffset]::Now.AddDays(3).ToString('o')
+            RateLimitStrikes = 6
+            Release = $null
+        } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
+        $script:AuthAttempts = @()
+        $null = Get-BridgeLatestRelease -CheckHours 0.0833 -IncludeStatus
+        Test-That 'but a wait three days out is held for an hour at most, not for three days' {
+            $script:AuthAttempts.Count -eq 1
+        } "requests=$($script:AuthAttempts.Count)"
     }
     finally {
         if ($null -eq $priorToken) { Remove-Item -LiteralPath Env:GH_TOKEN -ErrorAction SilentlyContinue }
