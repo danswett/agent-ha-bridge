@@ -284,6 +284,28 @@ try {
         $afterReset.State -ne 'RateLimited'
     } "$($afterReset.State): $($afterReset.Detail)"
 
+    # And it is looked at again straight away, rather than sat on for the rest of the
+    # retry window. A secondary limit names a minute and Retry-After often names two,
+    # both well inside the fifteen minutes an unreached lookup is otherwise kept for -
+    # so honouring that window would report a bare failure for the remaining fourteen,
+    # having been told exactly when the check would work again. Raised by Codex on #157.
+    $expired.RetryAt = [DateTimeOffset]::Now.AddMinutes(-5).ToString('o')
+    $expired.CheckedAt = [DateTimeOffset]::Now.ToString('o')
+    $expired | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
+    function Invoke-RestMethod {
+        param($Uri, $Headers, $TimeoutSec)
+        [pscustomobject]@{
+            tag_name = 'v9.9.5'; name = 'synthetic'; body = ''; published_at = ''
+            html_url = 'https://github.com/danswett/agent-ha-bridge/releases/tag/v9.9.5'
+            zipball_url = 'https://api.github.com/repos/danswett/agent-ha-bridge/zipball/v9.9.5'
+        }
+    }
+    $reChecked = Get-BridgeUpdateStatus
+    Test-That 'and the check is made again at the time it was told, not when the window ends' {
+        $reChecked.Latest -eq '9.9.5'
+    } "$($reChecked.State): latest=$($reChecked.Latest)"
+    function Invoke-RestMethod { throw 'network is still down' }
+
     $resetAt = [DateTimeOffset]::Now.AddMinutes(37)
     function Invoke-RestMethod {
         $response = New-RateLimitedResponse -Code 403 -Remaining '0' -Reset ([string]$resetAt.ToUnixTimeSeconds())

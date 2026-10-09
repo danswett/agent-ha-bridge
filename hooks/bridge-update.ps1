@@ -404,6 +404,7 @@ function Get-BridgeLatestRelease {
         try { $checkedAt = ConvertTo-BridgeUpdateTime $cache.CheckedAt }
         catch [FormatException] { Write-Warning 'The update cache has an invalid check time; checking again.' }
         if ($null -ne $checkedAt) {
+            $rateLimitExpired = $false
             $cachedRelease = if ($cache.PSObject.Properties['Release']) { $cache.Release } else { $null }
             $reached = $cache.PSObject.Properties['Reached']
             if ((-not $reached -or ($cache.Reached -is [bool] -and $cache.Reached)) -and
@@ -420,8 +421,7 @@ function Get-BridgeLatestRelease {
             elseif ($cache.PSObject.Properties['State'] -and $cache.State -eq 'RateLimited') {
                 # Only while the limit it describes has not yet reset: past that the
                 # detail names a time that has been and gone, and saying "wait until
-                # 09:15" at 09:40 is its own kind of wrong. Expired, it stays
-                # Unavailable, which takes the shorter retry window and checks again.
+                # 09:15" at 09:40 is its own kind of wrong.
                 $retryAt = $null
                 if ($cache.PSObject.Properties['RetryAt'] -and $cache.RetryAt) {
                     try { $retryAt = ConvertTo-BridgeUpdateTime $cache.RetryAt } catch [FormatException] { $retryAt = $null }
@@ -430,6 +430,15 @@ function Get-BridgeLatestRelease {
                     $lookup.State = 'RateLimited'
                     $lookup.RetryAt = $cache.RetryAt
                     if ($cache.PSObject.Properties['Detail'] -and $cache.Detail) { $lookup.Detail = [string]$cache.Detail }
+                }
+                else {
+                    # Past the reset, this cache entry has nothing left to say, and the
+                    # retry window is what decides when to look again. A secondary limit
+                    # names a minute and Retry-After often names two, both well inside
+                    # the fifteen-minute window - so honouring that window would report
+                    # a bare failure for the rest of it, having been told exactly when
+                    # the check would work again. Raised by Codex on #157.
+                    $rateLimitExpired = $true
                 }
             }
             # Rate limiting takes the short retry window too. It is a queue to wait in,
@@ -440,7 +449,7 @@ function Get-BridgeLatestRelease {
                 [Math]::Min($CheckHours, $script:BridgeUpdateConfig.RetryMinutes / 60)
             } else { $CheckHours }
             $age = ([DateTimeOffset]::Now - $checkedAt).TotalHours
-            if ($age -ge 0 -and $age -lt $window) {
+            if ($age -ge 0 -and $age -lt $window -and -not $rateLimitExpired) {
                 if ($IncludeStatus) { return $lookup }
                 return $lookup.Release
             }
