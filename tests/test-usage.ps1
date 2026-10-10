@@ -865,8 +865,7 @@ function Set-CopilotMqttUsageEntityIds {
     $false
 }
 
-$script:DaemonUsageCheckedAt = [DateTimeOffset]::MinValue
-$script:DaemonUsageSignature = ''
+$script:DaemonUsageClients = @{}
 $script:DaemonUsageEntityIds = ''
 $clock = [DateTimeOffset]::Parse('2026-10-07T12:00:00Z')
 
@@ -916,6 +915,330 @@ Test-That 'and turning it off stops the collecting, not just the showing' {
     $before = $script:Collected
     (Sync-DaemonUsage -Headers $headers -Now $clock.AddHours(1)) -eq $false -and $script:Collected -eq $before
 }
+
+# --- 6b. each client at the pace its sessions set ---------------------------------
+
+Write-Host ''
+Write-Host '--- asking quickly only while a session is open ---'
+
+# The allowance belongs to the account, not the machine, so every machine signed in to
+# it asking every two minutes was the same question from each of them, for an answer
+# only the one doing the work could be changing. What these drive is Sync-DaemonUsage
+# with a clock and a set of open sessions, reading back which clients it asked about
+# and what it published: nothing is slept and nothing is fetched.
+$settingsBefore = $script:Settings
+$script:Settings = @{}
+$script:Selected = @('copilot', 'claude', 'codex', 'mcp')
+function Get-BridgeSelectedClients { if ($null -eq $script:Selected) { return $null }; , @($script:Selected) }
+$script:Readings = @{}
+$script:AskLog = [System.Collections.Generic.List[string]]::new()
+$script:Published = [System.Collections.Generic.List[string]]::new()
+$script:ForcedWith = [System.Collections.Generic.List[string]]::new()
+$script:Logged = [System.Collections.Generic.List[string]]::new()
+$script:CollectorThrows = $false
+$script:PublishThrows = $false
+$script:ForcingThrows = $false
+function Write-DaemonLog { param([string]$Message) $script:Logged.Add($Message) }
+function Get-BridgeAgentAllowance {
+    param([AllowEmptyCollection()][string[]]$Clients = @())
+    $script:AskLog.Add($Clients -join ',')
+    if ($script:CollectorThrows) { throw 'the collector blew up' }
+    foreach ($client in $Clients) { if ($script:Readings.ContainsKey($client)) { $script:Readings[$client] } }
+}
+function Publish-CopilotMqttUsage {
+    param([object[]]$Records, [string]$Slug, [string]$MachineName, [hashtable]$Headers)
+    if ($script:PublishThrows) { throw 'mqtt unreachable' }
+    foreach ($record in $Records) { $script:Published.Add([string]$record.client) }
+}
+function Set-CopilotMqttUsageEntityIds {
+    param([string]$Slug, [AllowEmptyCollection()][string[]]$Clients = @())
+    $script:ForcedWith.Add($Clients -join ',')
+    if ($script:ForcingThrows) { throw 'the entity registry could not be reached' }
+    $false
+}
+
+function New-UsageReading {
+    param([string]$Client, [double]$Used)
+    New-BridgeUsageRecord -Client $Client -Source 'api' -Windows @(Get-BridgeUsageWindow -Key 'main' -Label 'Main' -PercentUsed $Used)
+}
+function Reset-UsagePacing {
+    $script:DaemonUsageClients = @{}
+    $script:DaemonUsageEntityIds = ''
+    $script:Settings = @{}
+    $script:Selected = @('copilot', 'claude', 'codex', 'mcp')
+    $script:CollectorThrows = $false
+    $script:PublishThrows = $false
+    $script:ForcingThrows = $false
+    $script:Logged.Clear()
+    $script:Readings = @{
+        copilot = New-UsageReading 'copilot' 10
+        claude  = New-UsageReading 'claude' 20
+        codex   = New-UsageReading 'codex' 30
+    }
+}
+# Open sessions as discovery reports them: an entry per session, an object with a Kind
+# - except the word 'unkinded', a session recorded before kinds existed, which has none.
+function New-LiveSessions {
+    param([string[]]$Kinds = @())
+    $live = @{}
+    foreach ($kind in $Kinds) {
+        $id = "session-$($live.Count)"
+        $live[$id] = if ($kind -eq 'unkinded') { [pscustomobject]@{ SessionId = $id } } else { [pscustomobject]@{ SessionId = $id; Kind = $kind } }
+    }
+    $live
+}
+$paceStart = [DateTimeOffset]::Parse('2026-10-07T12:00:00Z')
+function Invoke-UsageAt {
+    param([double]$Seconds, $Live)
+    $script:AskLog.Clear()
+    $script:Published.Clear()
+    $script:ForcedWith.Clear()
+    [void](Sync-DaemonUsage -Headers $headers -Live $Live -Now $paceStart.AddSeconds($Seconds))
+    $script:AskLog -join ';'
+}
+$none = New-LiveSessions
+$claudeOpen = New-LiveSessions 'claude'
+
+Reset-UsagePacing
+Test-That 'the first pass asks about every client, there being nothing yet to be quiet about' {
+    $asked = Invoke-UsageAt 0 $none
+    $asked -ceq 'copilot,claude,codex' -and (@($script:Published) -join ',') -ceq 'copilot,claude,codex'
+}
+Test-That 'with no session open anywhere, nothing is asked again for a quarter of an hour' {
+    $asks = @(foreach ($second in 30, 120, 300, 600, 899) { Invoke-UsageAt $second $none })
+    @($asks | Where-Object { $_ }).Count -eq 0
+}
+Test-That 'and then every client is' {
+    (Invoke-UsageAt 900 $none) -ceq 'copilot,claude,codex'
+}
+
+Reset-UsagePacing
+[void](Invoke-UsageAt 0 $none)
+Test-That 'a session opening is asked about at once, and only for its own client' {
+    (Invoke-UsageAt 100 $claudeOpen) -ceq 'claude'
+}
+Test-That 'then at the quick pace for as long as it stays open' {
+    $early = Invoke-UsageAt 219 $claudeOpen
+    $due = Invoke-UsageAt 220 $claudeOpen
+    $early -ceq '' -and $due -ceq 'claude'
+}
+Test-That 'while the other clients wait for their own turn' {
+    $asks = @(foreach ($second in 340, 460, 580, 700, 820) { Invoke-UsageAt $second $claudeOpen })
+    ($asks -join ',') -ceq 'claude,claude,claude,claude,claude'
+}
+Test-That 'and an ask that finds nothing new publishes nothing' {
+    $asked = Invoke-UsageAt 940 $claudeOpen
+    $asked -match 'claude' -and @($script:Published).Count -eq 0
+}
+Test-That 'the session closing is asked about once more at once, for what it spent at the end' {
+    (Invoke-UsageAt 1000 $none) -ceq 'claude'
+}
+Test-That 'after which that client goes back to the idle pace' {
+    # Copilot and Codex were last asked at 940, so they are due a quarter of an hour on.
+    $early = (Invoke-UsageAt 1899 $none) -split ','
+    $due = (Invoke-UsageAt 1900 $none) -split ','
+    $early -notcontains 'claude' -and $early -contains 'copilot' -and $due -contains 'claude'
+}
+
+Reset-UsagePacing
+[void](Invoke-UsageAt 0 $none)
+Test-That 'a session that opens inside the gap since the last ask is not asked about yet' {
+    (Invoke-UsageAt 10 $claudeOpen) -ceq ''
+}
+Test-That 'one that closes again before the gap is up costs nothing at all' {
+    $closed = Invoke-UsageAt 20 $none
+    $after = Invoke-UsageAt 31 $none
+    $closed -ceq '' -and $after -ceq ''
+}
+Test-That 'while one that is still open when the gap is up is asked about' {
+    (Invoke-UsageAt 40 $claudeOpen) -ceq 'claude'
+}
+
+Reset-UsagePacing
+Test-That 'discovery that could not say counts as a session open for every client' {
+    $first = Invoke-UsageAt 0 $null
+    $early = Invoke-UsageAt 119 $null
+    $due = Invoke-UsageAt 120 $null
+    $first -ceq 'copilot,claude,codex' -and $early -ceq '' -and $due -ceq 'copilot,claude,codex'
+}
+
+# One torn read of a session's registration is enough for discovery to say it cannot
+# account for everything, and a pass like that comes exactly when a session registers.
+# It sets the pace - every client counts as open - but it is not a session opening, and
+# the pass after it is not one closing: counted as both, each such pass cost every
+# client with no session two asks that had nothing to do with it.
+Reset-UsagePacing
+[void](Invoke-UsageAt 0 $none)
+Test-That 'a pass where discovery could not say is not a session opening for clients with none' {
+    $early = Invoke-UsageAt 105 $null
+    $due = Invoke-UsageAt 120 $null
+    $early -ceq '' -and $due -ceq 'copilot,claude,codex'
+}
+Test-That 'nor is the pass after it a session closing' {
+    (Invoke-UsageAt 150 $none) -ceq ''
+}
+Test-That 'while a session that is open when discovery can say again is found as usual' {
+    (Invoke-UsageAt 180 $claudeOpen) -ceq 'claude'
+}
+
+Reset-UsagePacing
+[void](Invoke-UsageAt 0 $none)
+Test-That 'a session recorded with no kind is Copilot''s' {
+    (Invoke-UsageAt 100 (New-LiveSessions 'unkinded')) -ceq 'copilot'
+}
+Reset-UsagePacing
+[void](Invoke-UsageAt 0 $none)
+Test-That 'and one MCP client is not a session of anything that meters an allowance' {
+    (Invoke-UsageAt 100 (New-LiveSessions 'mcp')) -ceq ''
+}
+Reset-UsagePacing
+[void](Invoke-UsageAt 0 $none)
+Test-That 'each client is told apart by its own sessions' {
+    $asked = Invoke-UsageAt 100 (New-LiveSessions 'codex', 'copilot')
+    $asked -ceq 'copilot,codex'
+}
+
+Reset-UsagePacing
+$script:Settings['usage.idleIntervalSeconds'] = 1800
+[void](Invoke-UsageAt 0 $none)
+Test-That 'the idle pace is the one configured' {
+    $early = Invoke-UsageAt 900 $none
+    $due = Invoke-UsageAt 1800 $none
+    $early -ceq '' -and $due -ceq 'copilot,claude,codex'
+}
+Reset-UsagePacing
+$script:Settings['usage.intervalSeconds'] = 300
+$script:Settings['usage.idleIntervalSeconds'] = 60
+[void](Invoke-UsageAt 0 $none)
+Test-That 'but an idle machine is never asked more often than a busy one' {
+    $early = Invoke-UsageAt 299 $none
+    $due = Invoke-UsageAt 300 $none
+    $early -ceq '' -and $due -ceq 'copilot,claude,codex'
+}
+Reset-UsagePacing
+$script:Settings['usage.idleIntervalSeconds'] = 120
+Test-That 'an idle interval set to the quick one asks everywhere as often as before' {
+    [void](Invoke-UsageAt 0 $none)
+    $early = Invoke-UsageAt 119 $none
+    $due = Invoke-UsageAt 120 $none
+    $early -ceq '' -and $due -ceq 'copilot,claude,codex'
+}
+Reset-UsagePacing
+$script:Settings['usage.intervalSeconds'] = 'often'
+Test-That 'an interval that is not a number is the default, not a failure of the reconcile' {
+    [void](Invoke-UsageAt 0 $claudeOpen)
+    $early = Invoke-UsageAt 119 $claudeOpen
+    $due = Invoke-UsageAt 120 $claudeOpen
+    $early -ceq '' -and $due -ceq 'claude'
+}
+# NaN and infinity both parse as numbers and both would silently stop an idle client
+# being asked at all, since nothing is ever greater than or equal to them.
+foreach ($unusable in 'never', 'NaN', 'Infinity') {
+    Reset-UsagePacing
+    $script:Settings['usage.idleIntervalSeconds'] = $unusable
+    Test-That "and so is an idle interval of '$unusable'" {
+        [void](Invoke-UsageAt 0 $none)
+        $early = Invoke-UsageAt 899 $none
+        $due = Invoke-UsageAt 900 $none
+        $early -ceq '' -and $due -ceq 'copilot,claude,codex'
+    }
+}
+
+Reset-UsagePacing
+[void](Invoke-UsageAt 0 $none)
+$script:Readings['codex'] = New-UsageReading 'codex' 31
+Test-That 'only the client whose reading moved is republished, though all were asked' {
+    $asked = Invoke-UsageAt 900 $none
+    $asked -ceq 'copilot,claude,codex' -and (@($script:Published) -join ',') -ceq 'codex'
+}
+
+Reset-UsagePacing
+$script:Readings.Remove('codex')
+Test-That 'the entity ids are forced when a client is first published, with every client published so far' {
+    [void](Invoke-UsageAt 0 $none)
+    $first = @($script:ForcedWith) -join '|'
+    $script:Readings['codex'] = New-UsageReading 'codex' 30
+    [void](Invoke-UsageAt 900 $none)
+    $second = @($script:ForcedWith) -join '|'
+    $script:Readings['codex'] = New-UsageReading 'codex' 31
+    [void](Invoke-UsageAt 1800 $none)
+    $third = @($script:ForcedWith) -join '|'
+    $first -ceq 'claude,copilot' -and $second -ceq 'claude,codex,copilot' -and $third -ceq ''
+}
+
+Reset-UsagePacing
+Test-That 'a clock that has gone backwards asks rather than waiting to be caught up with' {
+    [void](Invoke-UsageAt 1000 $none)
+    (Invoke-UsageAt 500 $none) -ceq 'copilot,claude,codex'
+}
+
+Reset-UsagePacing
+$script:CollectorThrows = $true
+Test-That 'a collection that fails waits for its turn rather than being repeated on every pass' {
+    $first = Invoke-UsageAt 0 $null
+    $retry = Invoke-UsageAt 60 $null
+    $later = Invoke-UsageAt 120 $null
+    $first -ceq 'copilot,claude,codex' -and $retry -ceq '' -and $later -ceq 'copilot,claude,codex' -and
+        @($script:Logged | Where-Object { $_ -match 'usage collection failed' }).Count -eq 2
+}
+
+Reset-UsagePacing
+$script:PublishThrows = $true
+Test-That 'a reading that could not be published is asked for again at the busy pace, not the idle one' {
+    [void](Invoke-UsageAt 0 $none)
+    $early = Invoke-UsageAt 119 $none
+    $script:PublishThrows = $false
+    $retry = Invoke-UsageAt 120 $none
+    $published = @($script:Published) -join ','
+    $early -ceq '' -and $retry -ceq 'copilot,claude,codex' -and $published -ceq 'copilot,claude,codex'
+}
+Test-That 'and once it has published it is back on the idle pace' {
+    $early = Invoke-UsageAt 1019 $none
+    $due = Invoke-UsageAt 1020 $none
+    $early -ceq '' -and $due -ceq 'copilot,claude,codex'
+}
+
+# The correction of the entity ids is a separate step from the publish, and failing it
+# loses nothing that reading again would bring back: the readings are on the bus.
+Reset-UsagePacing
+$script:ForcingThrows = $true
+Test-That 'entity ids that could not be corrected are logged, and the readings were published all the same' {
+    $asked = Invoke-UsageAt 0 $none
+    $asked -ceq 'copilot,claude,codex' -and (@($script:Published) -join ',') -ceq 'copilot,claude,codex' -and
+        @($script:Logged | Where-Object { $_ -match 'entity ids could not be corrected' }).Count -eq 1 -and
+        @($script:Logged | Where-Object { $_ -match 'could not be published' }).Count -eq 0
+}
+Test-That 'and that is no reason to read the vendors again at the busy pace' {
+    (Invoke-UsageAt 120 $none) -ceq ''
+}
+Test-That 'but it is tried again at the next ask, though no reading has moved since' {
+    $script:ForcingThrows = $false
+    $asked = Invoke-UsageAt 900 $none
+    $asked -ceq 'copilot,claude,codex' -and @($script:Published).Count -eq 0 -and
+        (@($script:ForcedWith) -join '|') -ceq 'claude,codex,copilot' -and $script:DaemonUsageEntityIds -ceq 'claude,codex,copilot'
+}
+Test-That 'after which it is left alone' {
+    [void](Invoke-UsageAt 1800 $none)
+    @($script:ForcedWith).Count -eq 0
+}
+
+Reset-UsagePacing
+$script:Selected = @('Copilot', 'CLAUDE', 'mcp')
+Test-That 'a client selected under another capitalisation is the same client' {
+    [void](Invoke-UsageAt 0 $none)
+    $asked = Invoke-UsageAt 100 (New-LiveSessions 'claude')
+    $keys = (@($script:DaemonUsageClients.Keys) | Sort-Object) -join ','
+    $asked -ceq 'claude' -and $keys -ceq 'claude,copilot'
+}
+Reset-UsagePacing
+$script:Selected = $null
+Test-That 'an install that never chose its clients is asked about all three' {
+    (Invoke-UsageAt 0 $none) -ceq 'copilot,claude,codex'
+}
+
+$script:Settings = $settingsBefore
+function Get-BridgeSelectedClients { , @('copilot', 'mcp') }
+function Write-DaemonLog { param([string]$Message) }
 
 # --- 7. the keychain the Copilot token comes from ---------------------------------
 

@@ -40,10 +40,12 @@ foreach ($name in 'Invoke-PendingReplies', 'Invoke-PendingStops', 'Sync-DaemonNe
     'Write-DaemonState', 'Set-BridgeHomeAssistantReachable', 'Set-BridgeDaemonAlive') {
     Set-Item -Path "function:script:$name" -Value ([scriptblock]::Create("`$script:Calls.Add('$name')"))
 }
+$script:DiscoveryLive = @{}
+$script:DiscoveryComplete = $true
 function Get-LiveBridgeSessions {
     param([switch]$AsObservation, [hashtable]$State)
     $script:Calls.Add('Get-LiveBridgeSessions')
-    if ($AsObservation) { return New-DaemonDiscoverySnapshot -Live @{} -State $State -Complete }
+    if ($AsObservation) { return New-DaemonDiscoverySnapshot -Live $script:DiscoveryLive -State $State -Complete:$script:DiscoveryComplete }
     @{}
 }
 $script:DaemonDiscoverySnapshot = New-DaemonDiscoverySnapshot -Live $script:DaemonLive -State $state -Complete
@@ -133,6 +135,34 @@ Invoke-DaemonReconcile -Headers $headers -State $state
 Test-That 'sessions are synced before anything is delivered to them' { $script:Calls.IndexOf('Sync-DaemonSessions') -lt $script:Calls.IndexOf('Invoke-PendingReplies') }
 Test-That 'activity streams between the slow steps' { @($script:Calls | Where-Object { $_ -eq 'Invoke-DaemonFastActivity' }).Count -eq 4 }
 Test-That 'the daemon marks itself alive last' { $script:Calls[$script:Calls.Count - 1] -eq 'Set-BridgeDaemonAlive' }
+
+# What the usage step is told about the sessions. Whether an allowance is asked for at
+# the quick pace or the idle one rests on this alone, and getting it wrong fails
+# quietly in both directions: an empty set passed as nothing leaves every machine at
+# the quick pace for ever, and a partial one passed as complete lets a figure go stale
+# behind a session that was simply missed.
+$script:UsageCall = $null
+function Sync-DaemonUsage { param($Headers, $Live) $script:UsageCall = [pscustomobject]@{ Live = $Live } }
+$script:DiscoveryLive = @{ 'claude-1' = [pscustomobject]@{ SessionId = 'claude-1'; Kind = 'claude' } }
+Invoke-DaemonReconcile -Headers $headers -State $state
+Test-That 'the usage step is handed the sessions discovery found' {
+    $script:UsageCall.Live -is [hashtable] -and $script:UsageCall.Live.ContainsKey('claude-1')
+}
+$script:DiscoveryLive = @{}
+$script:UsageCall = $null
+Invoke-DaemonReconcile -Headers $headers -State $state
+Test-That 'none found is passed as an empty set, which is not the same as not knowing' {
+    $null -ne $script:UsageCall -and $script:UsageCall.Live -is [hashtable] -and $script:UsageCall.Live.Count -eq 0
+}
+$script:DiscoveryLive = @{ 'claude-1' = [pscustomobject]@{ SessionId = 'claude-1'; Kind = 'claude' } }
+$script:DiscoveryComplete = $false
+$script:UsageCall = $null
+Invoke-DaemonReconcile -Headers $headers -State $state
+Test-That 'discovery that could not account for everything passes nothing, not what it did find' {
+    $null -ne $script:UsageCall -and $null -eq $script:UsageCall.Live
+}
+$script:DiscoveryComplete = $true
+$script:DiscoveryLive = @{}
 function Sync-DaemonSessions { throw 'ha down' }
 $script:Calls.Clear()
 Invoke-DaemonReconcile -Headers $headers -State $state

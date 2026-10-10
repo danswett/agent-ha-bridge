@@ -961,7 +961,10 @@ function Invoke-DaemonReconcile {
         Sync-DaemonUpdateStatus -Headers $headers
         if ($discovery.Complete) { Sync-DaemonNewSession -Headers $headers -Live $live }
         Sync-DaemonClients -Headers $headers
-        [void](Sync-DaemonUsage -Headers $headers)
+        # Discovery that could not account for everything passes nothing rather than a
+        # partial set, and the usage pacing then treats every client as busy: a session
+        # that was missed must not be what lets a figure go stale.
+        [void](Sync-DaemonUsage -Headers $headers -Live $(if ($discovery.Complete) { $live } else { $null }))
         Clear-DaemonStaleNote -Headers $headers
         Invoke-DaemonFastActivity -Headers $headers -State $state
         Write-DaemonState -State $state
