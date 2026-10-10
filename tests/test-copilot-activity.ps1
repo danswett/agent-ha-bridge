@@ -557,7 +557,14 @@ Test-That 'and one quoting a finish does not settle a command still running' {
 $shellLog = Join-Path ([IO.Path]::GetTempPath()) "copilot-shells-$([guid]::NewGuid().ToString('N')).jsonl"
 $shellSessionId = 'cccccccc-1111-2222-3333-444444444444'
 $shellEntry = [pscustomobject]@{ Offset = 0; Name = 'Copilot: build'; Machine = 'DESK'; Status = 'working'; Kind = 'copilot' }
-$shellSession = [pscustomobject]@{ SessionId = $shellSessionId; Transcript = $shellLog; ProcessId = 1 }
+$shellSession = [pscustomobject]@{ SessionId = $shellSessionId; Transcript = $shellLog; ProcessId = $PID }
+# A process id nothing can be reading. Found rather than assumed, so the checks below
+# are not quietly passing because some unrelated process happened to hold the number.
+$deadPid = 0
+foreach ($candidate in 999999, 999997, 999995, 999993) {
+    if (-not (Get-Process -Id $candidate -ErrorAction SilentlyContinue)) { $deadPid = $candidate; break }
+}
+Test-That 'the fixtures below have a process id that really is gone' { $deadPid -gt 0 } "$deadPid"
 function StepShells {
     param([string[]]$Lines)
     Add-Content -LiteralPath $shellLog -Value $Lines -Encoding utf8
@@ -622,19 +629,70 @@ try {
     # mid-session, seven shells were still listed against a process that no longer
     # existed - and nothing in the transcript would ever have settled them, so the
     # session would have read as busy for the rest of its life.
-    $restarted = [pscustomobject]@{ SessionId = $shellSessionId; Transcript = $shellLog; ProcessId = 4242 }
+    #
+    # A dead process is the honest shape of that: the id no longer reads.
+    $restarted = [pscustomobject]@{ SessionId = $shellSessionId; Transcript = $shellLog; ProcessId = $deadPid }
     Add-Content -LiteralPath $shellLog -Value @('{"type":"assistant.turn_end"}') -Encoding utf8
     Update-DaemonSessionActivity -Id $shellSessionId -Entry $shellEntry -Session $restarted -Headers @{} -VerboseOn $false
     Test-That 'but a new process owns none of the dead one''s commands' {
         $shellEntry.Status -eq 'idle' -and @($shellEntry.BackgroundShells).Count -eq 0
     } "$($shellEntry.Status), outstanding=$(@($shellEntry.BackgroundShells).Count)"
 
+    # The id on its own is not an identity. An OS reuses process ids, most freely
+    # across exactly the reboot this is here to survive, so a replacement CLI can
+    # present the same number - and a set pinned to the number alone would be carried
+    # straight into a process that never started any of it. The pin below is the one a
+    # pid-only implementation would have written.
+    StepShells -Lines @((New-ShellStarted 'recycled'), '{"type":"assistant.turn_end"}')
+    Test-That 'a command is outstanding again, pinned to more than this id' {
+        $shellEntry.Status -eq 'shell' -and
+        $shellEntry.BackgroundShellsOwner -like "$PID|*" -and
+        $shellEntry.BackgroundShellsOwner -ne "$PID"
+    } "$($shellEntry.Status), owner=$($shellEntry.BackgroundShellsOwner)"
+    $shellEntry.BackgroundShellsOwner = "$PID"
+    StepShells -Lines @('{"type":"assistant.turn_end"}')
+    Test-That 'so the same id on a process that started later clears them' {
+        $shellEntry.Status -eq 'idle' -and @($shellEntry.BackgroundShells).Count -eq 0
+    } "$($shellEntry.Status), outstanding=$(@($shellEntry.BackgroundShells).Count)"
+
+    # The path that would otherwise never be reached. A session whose CLI has been
+    # replaced and which writes nothing at all takes the empty-append return, so a
+    # check that runs only after new transcript lines never runs for it - and the card
+    # waits for ever on commands that died with the process that started them.
+    $shellEntry.Status = 'shell'
+    Set-DaemonSessionProperty -Entry $shellEntry -Name 'BackgroundShells' -Value @('orphan')
+    Set-DaemonSessionProperty -Entry $shellEntry -Name 'BackgroundShellsOwner' -Value "$deadPid|1"
+    $script:StatusPublishes = @()
+    Update-DaemonSessionActivity -Id $shellSessionId -Entry $shellEntry -Session $restarted -Headers @{} -VerboseOn $false
+    Test-That 'a silent session whose process is gone is let go, not left waiting' {
+        $shellEntry.Status -eq 'idle' -and @($shellEntry.BackgroundShells).Count -eq 0
+    } "$($shellEntry.Status), outstanding=$(@($shellEntry.BackgroundShells).Count)"
+    Test-That 'and the card is told, since nothing else will write' {
+        $script:StatusPublishes.Count -ge 1 -and $script:StatusPublishes[-1].Status -eq 'idle'
+    } "publishes=$($script:StatusPublishes.Count)"
+
+    # The same session seen fresh by a restarted daemon, which reads the saved set
+    # before any transcript has been read at all.
+    $startupEntry = [pscustomobject]@{ Offset = 0; Name = 'Copilot: build'; Machine = 'DESK'; Status = 'idle'; Kind = 'copilot' }
+    Set-DaemonSessionProperty -Entry $startupEntry -Name 'BackgroundShells' -Value @('orphan')
+    Set-DaemonSessionProperty -Entry $startupEntry -Name 'BackgroundShellsOwner' -Value "$deadPid|1"
+    Test-That 'and a restart does not restore it to waiting either' {
+        (Get-DaemonStartupStatus -Session $restarted -Entry $startupEntry) -eq 'idle'
+    } (Get-DaemonStartupStatus -Session $restarted -Entry $startupEntry)
+
     Test-That 'a session carrying no commands at all is waiting on none' {
         (Get-DaemonBackgroundShellCount -Entry ([pscustomobject]@{ BackgroundShells = $null })) -eq 0
-    }
-    Test-That 'and neither is one from before the bridge tracked them' {
+    }    Test-That 'and neither is one from before the bridge tracked them' {
         (Get-DaemonBackgroundShellCount -Entry ([pscustomobject]@{ Status = 'idle' })) -eq 0
     }
+
+    # The moment this status exists for. End session asks for a second press and names
+    # what the first one would interrupt; without a line of its own that read "this
+    # session is shell", which tells the one person about to kill a running build
+    # nothing at all.
+    Test-That 'End session names the commands it would interrupt' {
+        (Get-DaemonStopConfirmHint -Status 'shell') -match 'waiting for background commands it started'
+    } (Get-DaemonStopConfirmHint -Status 'shell')
 }
 finally {
     Remove-Item -LiteralPath $shellLog -Force -ErrorAction SilentlyContinue

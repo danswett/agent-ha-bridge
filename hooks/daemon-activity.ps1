@@ -175,6 +175,11 @@ function Get-DaemonStartupStatus {
     # Same reasoning for a background shell, which the turn bookkeeping cannot see at
     # all: the async call returns at once and the turn ends, so a session waiting on a
     # build, a test run or a CI watch read as idle - an invitation to press End on it.
+    #
+    # Checked against the process first. This runs for a session the daemon is only now
+    # picking up, which is exactly when the set it saved may belong to a CLI that has
+    # since been replaced, and nothing that process started will ever report back.
+    [void](Clear-DaemonStaleBackgroundShells -Entry $Entry -ProcessId $Session.ProcessId)
     if ((Get-DaemonBackgroundShellCount -Entry $Entry) -gt 0) { return 'shell' }
     'idle'
 }
@@ -596,6 +601,55 @@ function Get-DaemonBackgroundShellCount {
     @(@($value) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }).Count
 }
 
+function Get-DaemonBackgroundShellOwner {
+    <#
+        What identifies the CLI process a session's background commands belong to.
+
+        A process id alone is not an identity - the OS reuses them, most freely across
+        exactly the reboot this is here to survive - so it is paired with the process
+        start time, the way Get-DaemonProcessIdentity already does for End session.
+
+        Empty when there is nothing to pin: no id, or a process this daemon cannot
+        read, which for a session that was running means it is gone.
+    #>
+    param([AllowNull()]$ProcessId = $null)
+
+    $value = 0
+    if ($null -ne $ProcessId) { $value = [int]$ProcessId }
+    if ($value -le 0) { return '' }
+    $identity = Get-DaemonProcessIdentity -ProcessId $value
+    if ($null -eq $identity) { return '' }
+    "$value|$identity"
+}
+
+function Clear-DaemonStaleBackgroundShells {
+    <#
+        Drops the commands an entry carries when the process that started them is gone,
+        and reports whether it did.
+
+        A dead process will never settle anything it backgrounded, so a set outliving
+        it is not stale data that corrects itself - it is a card parked on 'shell' for
+        as long as the session exists. That is the one failure worse than the idle
+        reading this status replaces, because waiting does not fix it.
+
+        Kept apart from the fold below, and called before the transcript is read, since
+        the session that most needs it is the one writing nothing at all.
+    #>
+    param([Parameter(Mandatory)]$Entry, [AllowNull()]$ProcessId = $null)
+
+    if ((Get-DaemonBackgroundShellCount -Entry $Entry) -le 0) { return $false }
+    if (-not $Entry.PSObject.Properties['BackgroundShellsOwner']) { return $false }
+    $known = [string]$Entry.BackgroundShellsOwner
+    # Nothing was pinned, so there is nothing to contradict. The transcript still
+    # settles these; only the shortcut is unavailable.
+    if ([string]::IsNullOrEmpty($known)) { return $false }
+    if ((Get-DaemonBackgroundShellOwner -ProcessId $ProcessId) -ceq $known) { return $false }
+
+    Set-DaemonSessionProperty -Entry $Entry -Name 'BackgroundShells' -Value @()
+    Set-DaemonSessionProperty -Entry $Entry -Name 'BackgroundShellsOwner' -Value ''
+    $true
+}
+
 function Update-DaemonBackgroundShells {
     <#
         Folds a batch's background-shell starts and finishes into the set a session is
@@ -605,12 +659,11 @@ function Update-DaemonBackgroundShells {
         outlives the turn that started it, and a daemon restart is the one moment a
         waiting session has nothing else to say for itself.
 
-        A shell belongs to the CLI process that started it, so the set is dropped when
-        that process is gone and not before. Dropping it on session.resume instead was
-        wrong both ways: Copilot's /resume and its session picker switch sessions
-        inside the same process, which still owns what it backgrounded, while a reboot
-        leaves seven shells listed against a process that no longer exists and nothing
-        in the transcript would ever settle them.
+        A shell belongs to the CLI process that started it, and Clear-DaemonStale-
+        BackgroundShells above has already dropped the set if that process is gone, so
+        what is carried here is known to still be owned. Dropping it on session.resume
+        instead was wrong: Copilot's /resume and its session picker switch sessions
+        inside the same process, which still owns what it backgrounded.
     #>
     param(
         [Parameter(Mandatory)]$Entry,
@@ -620,15 +673,6 @@ function Update-DaemonBackgroundShells {
 
     $running = New-Object System.Collections.Generic.List[string]
 
-    # Only a process id we can actually compare says anything. A missing or unreadable
-    # one keeps what is there rather than throwing the set away, because a wrongly
-    # cleared set reads as idle - the bug this exists to fix.
-    $owner = ''
-    if ($null -ne $ProcessId) { $owner = [string]$ProcessId }
-    $knownOwner = ''
-    if ($Entry.PSObject.Properties['BackgroundShellsOwner']) { $knownOwner = [string]$Entry.BackgroundShellsOwner }
-    $sameOwner = ($owner -eq '' -or $knownOwner -eq '' -or $owner -ceq $knownOwner)
-
     $add = {
         param($Values)
         foreach ($value in @($Values)) {
@@ -637,7 +681,7 @@ function Update-DaemonBackgroundShells {
         }
     }
 
-    if ($sameOwner -and $Entry.PSObject.Properties['BackgroundShells']) { & $add $Entry.BackgroundShells }
+    if ($Entry.PSObject.Properties['BackgroundShells']) { & $add $Entry.BackgroundShells }
     if ($Activity.PSObject.Properties['ShellsStarted']) { & $add $Activity.ShellsStarted }
     if ($Activity.PSObject.Properties['ShellsFinished']) {
         foreach ($value in @($Activity.ShellsFinished)) { [void]$running.Remove([string]$value) }
@@ -646,8 +690,12 @@ function Update-DaemonBackgroundShells {
     if ($running.Count -gt 0 -or $Entry.PSObject.Properties['BackgroundShells']) {
         Set-DaemonSessionProperty -Entry $Entry -Name 'BackgroundShells' -Value @($running)
     }
-    if ($owner -ne '' -and $owner -cne $knownOwner) {
-        Set-DaemonSessionProperty -Entry $Entry -Name 'BackgroundShellsOwner' -Value $owner
+    # Pinned while there is something to pin it to. Recorded even when the set is
+    # empty would be noise; recorded only with shells outstanding is what the staleness
+    # check above actually reads.
+    if ($running.Count -gt 0) {
+        $owner = Get-DaemonBackgroundShellOwner -ProcessId $ProcessId
+        if ($owner -ne '') { Set-DaemonSessionProperty -Entry $Entry -Name 'BackgroundShellsOwner' -Value $owner }
     }
     $running.Count
 }
@@ -727,9 +775,32 @@ function Update-DaemonSessionActivity {
         $hookStatusAt = Sync-DaemonHookStatus -Entry $entry -Session $session -SessionId $id -Headers $Headers
     }
 
+    # Before the transcript, because the session this matters most for writes nothing:
+    # a resumed card whose CLI has been replaced takes the empty-append return below
+    # and would otherwise sit on 'shell' for ever, waiting on commands that died with
+    # the process that started them.
+    $shellsDropped = Clear-DaemonStaleBackgroundShells -Entry $entry -ProcessId $session.ProcessId
+
     $append = Read-BridgeTranscriptAppend -Path $session.Transcript -Offset ([long]$entry.Offset) -Kind $entryKind
     $entry.Offset = $append.Offset
-    if ($append.Lines.Count -eq 0) { return }
+    if ($append.Lines.Count -eq 0) {
+        if ($shellsDropped -and [string]$entry.Status -eq 'shell') {
+            $entry.Status = 'idle'
+            try {
+                Set-CopilotMqttStatus -SessionId $id -Status 'idle' -Headers $Headers -Attributes (
+                    Add-DaemonTuningAttributes -Attributes @{
+                        session = $entry.Name
+                        machine = $entry.Machine
+                        process_id = $session.ProcessId
+                        updated = [DateTimeOffset]::Now.ToString('o')
+                    } -Tuning $entry)
+            }
+            catch {
+                Write-DaemonLog -Message "status publish failed for $id : $($_.Exception.Message)"
+            }
+        }
+        return
+    }
 
     $activity = Get-BridgeActivity -Lines $append.Lines -VerboseMode $verbose -Kind $entryKind
 

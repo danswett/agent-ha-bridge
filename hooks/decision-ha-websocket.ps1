@@ -6,6 +6,14 @@
 #>
 
 . (Join-Path $PSScriptRoot 'bridge-secrets.ps1')
+# 1.7.0, not 1.6.0: a session waiting on a background command it started publishes
+# 'shell', and both things the generator draws for a session - the stack's own edge
+# and the markdown header - now recognise it (#151). A status value is not a config
+# key, so an older card is handed it either way; what the generator draws is the only
+# part of that reading an old card still takes, which is how #86 covered 'agents'.
+# Changing it changes what Save-CopilotSessionDashboard renders, so the fence needs a
+# version to move to.
+#
 # 1.6.0, not 1.5.0: the machine rows in the Agent sessions dropdown now carry each
 # machine's own install button, and the standalone update card is drawn only for a
 # browser served a card older than 1.31.0 (#129). Both change what
@@ -27,7 +35,7 @@
 # definition of a conflict there - so on any installation already fenced at the old
 # renderer, publication is refused and the fix can never reach the dashboard without
 # an operator pin nobody should have to take.
-$script:BridgeDashboardRenderVersion = '1.6.0'
+$script:BridgeDashboardRenderVersion = '1.7.0'
 $script:BridgeDashboardObservation = $null
 
 function Invoke-CopilotHaWebSocket {
@@ -2115,9 +2123,10 @@ function Save-CopilotSessionDashboard {
   {% elif is_state('$statusEntity','working') %}
   border: 1px solid var(--primary-color);
   animation: cpwork 1.6s ease-in-out infinite;
-  {% elif is_state('$statusEntity','agents') %}
-  /* Waiting on background agents: live, but not the session's own work, so the
-     edge is steady rather than breathing. */
+  {% elif is_state('$statusEntity','agents') or is_state('$statusEntity','shell') %}
+  /* Waiting on background agents, or on a command it started and has not collected:
+     live, but not the session's own work, so the edge is steady rather than
+     breathing. */
   border: 1px solid var(--primary-color);
   box-shadow: none;
   animation: none;
@@ -2193,8 +2202,8 @@ ha-select, mwc-select { width: 100%; }
             type = 'markdown'
             card_mod = @{ style = $bareChild }
             content = @"
-### {% if state_attr('$decisionEntity','question') %}🟡{% elif is_state('$statusEntity','working') %}🟢{% elif is_state('$statusEntity','agents') %}🔵{% else %}⚪{% endif %} $($session.Name)
-*$($session.Machine)* &bull; status: **{% if state_attr('$decisionEntity','question') %}waiting for you{% else %}{% set st = states('$statusEntity') %}{% if st in ['unknown', 'unavailable'] %}ended{% elif st == 'agents' %}waiting for background agents{% else %}{{ st }}{% endif %}{% endif %}**{% set act = states('$activityEntity') %}{% set body = state_attr('$activityEntity','response') or '' %}{% if not (body and body.startswith(act.rstrip('.'))) %} &bull; {{ act }}{% endif %}
+### {% if state_attr('$decisionEntity','question') %}🟡{% elif is_state('$statusEntity','working') %}🟢{% elif is_state('$statusEntity','agents') or is_state('$statusEntity','shell') %}🔵{% else %}⚪{% endif %} $($session.Name)
+*$($session.Machine)* &bull; status: **{% if state_attr('$decisionEntity','question') %}waiting for you{% else %}{% set st = states('$statusEntity') %}{% if st in ['unknown', 'unavailable'] %}ended{% elif st == 'agents' %}waiting for background agents{% elif st == 'shell' %}waiting for background commands{% else %}{{ st }}{% endif %}{% endif %}**{% set act = states('$activityEntity') %}{% set body = state_attr('$activityEntity','response') or '' %}{% if not (body and body.startswith(act.rstrip('.'))) %} &bull; {{ act }}{% endif %}
 {% set q = state_attr('$decisionEntity','question') %}{% set resp = state_attr('$activityEntity','response') %}{% if q %}
 
 ---

@@ -573,6 +573,20 @@ Test-That 'the header no longer draws its own border' {
 Test-That 'the header no longer owns the glow' {
     $sessionHeader.card_mod.style -notmatch 'cpwait'
 }
+# A status value is not a config key, so an older card is still handed it - and the
+# cards served between 1.10 and 1.31 have no code for 'shell', leaving it as a bare
+# word under an idle-grey edge. What they do still take is what the generator draws:
+# the stack's own border and the markdown header. Both are told about it here, which
+# is how #86 covered the identical case for 'agents' rather than by a version gate.
+Test-That 'a session waiting on a background command gets the live edge, not the idle one' {
+    $sessionCard.card_mod.style -match "is_state\('[^']+','shell'\)"
+} ($sessionCard.card_mod.style -match 'shell')
+Test-That 'and the markdown fallback says so in words, not as the bare status' {
+    $sessionHeader.content -match 'waiting for background commands'
+}
+Test-That 'with a dot that is not the idle one' {
+    $sessionHeader.content -match "is_state\('[^']+','shell'\)[^%]*%\}🔵"
+}
 Test-That 'every inner card is transparent so one surface shows through' {
     $inner = @($sessionCard.cards | Where-Object { $_.type -in @('markdown', 'conditional') })
     $opaque = foreach ($c in $inner) {
@@ -1646,8 +1660,8 @@ Test-That 'and a blank entry never matches a blank user' { -not (Test-BridgeAgen
 # fingerprints and this fails, saying to bump the version and update both constants
 # together. It is deliberately a hash of source text: that is precisely what the fence
 # compares, so anything that would conflict there fails here first.
-$script:ExpectedRenderVersion = '1.6.0'
-$script:ExpectedRenderHash = '67907ac70da340db50f08e91413f99b200acd2b4a44554a67e37f2259a390ebf'
+$script:ExpectedRenderVersion = '1.7.0'
+$script:ExpectedRenderHash = '3898a6015c180ffce5df73d84fdb44ab829e0a39fe160c0d34d62e18d9f0b157'
 $artifact = Get-BridgeRenderArtifact
 
 Test-That 'the renderer is still the one this version was pinned to' {
