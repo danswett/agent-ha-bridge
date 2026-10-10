@@ -404,7 +404,12 @@ exit 0
 function Invoke-BridgeTestProcess {
     param(
         [Parameter(Mandatory)][Diagnostics.ProcessStartInfo]$StartInfo,
-        [ValidateRange(1, 3600)][int]$TimeoutSeconds = 180
+        # A nested child finishes in seconds; the longest measured is the whole of
+        # test-runner.ps1 at ~35s. The previous three-minute budget was 25-35x that, so
+        # a stuck child was never caught early and read as a hard failure rather than a
+        # hang, burning a fifth of the 900s per-suite budget doing nothing (#160). Pass
+        # an explicit value at any call site that genuinely needs longer.
+        [ValidateRange(1, 3600)][int]$TimeoutSeconds = 60
     )
 
     $process = [Diagnostics.Process]::new()
@@ -424,11 +429,26 @@ function Invoke-BridgeTestProcess {
             $process.WaitForExit()
         }
         if (-not $stdout.Wait(5000) -or -not $stderr.Wait(5000)) { throw 'Test output did not close; a suite left a child process running.' }
+        $seconds = [Math]::Round($watch.Elapsed.TotalSeconds, 2)
+        $output = $stdout.GetAwaiter().GetResult() + $stderr.GetAwaiter().GetResult()
+        if ($timedOut) {
+            # Callers assert on ExitCode and pass Output as the failure detail, so a
+            # timeout used to report as an assertion that failed for no stated reason -
+            # with a blank detail, because PowerShell block-buffers to a pipe and the
+            # kill drops whatever the child had not flushed. That made a flaky macOS
+            # hang undiagnosable from CI logs, and the surviving last line looked like
+            # the failure point when it was not (#159). Saying both here means every
+            # existing caller that prints Output says it too, with no call-site change.
+            if ($output -and -not $output.EndsWith("`n")) { $output += [Environment]::NewLine }
+            $output += "*** TIMED OUT after ${seconds}s (limit ${TimeoutSeconds}s): the child process tree was killed. " +
+                'Output it had not flushed is lost, so the last line above is not necessarily the last thing it did. ***' +
+                [Environment]::NewLine
+        }
         [pscustomobject]@{
             ExitCode = $process.ExitCode
             TimedOut = $timedOut
-            Seconds = [Math]::Round($watch.Elapsed.TotalSeconds, 2)
-            Output = $stdout.GetAwaiter().GetResult() + $stderr.GetAwaiter().GetResult()
+            Seconds = $seconds
+            Output = $output
         }
     }
     finally {

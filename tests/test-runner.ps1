@@ -826,7 +826,8 @@ Write-Output 'isolated registry names verified without registry writes'
         Kind = 'baseline'; Case = 'native-exit-23'; Result = $failure
     })
     Test-That 'the original nonzero exit code and output are preserved' {
-        $failure.ExitCode -eq 23 -and $failure.Output -match 'failure-output' -and -not $failure.TimedOut
+        $failure.ExitCode -eq 23 -and $failure.Output -match 'failure-output' -and -not $failure.TimedOut -and
+            $failure.Output -notmatch 'TIMED OUT'
     } $failure.Output
     Set-Content -LiteralPath $failureProbe -Value "throw 'intentional runner regression failure'"
     $failure = Invoke-BridgeTestProcess -StartInfo (New-BridgeTestProcessStartInfo -ScriptPath $failureProbe -Sandbox $secondBox)
@@ -849,6 +850,10 @@ Start-Sleep -Seconds 60
         Kind = 'baseline'; Case = 'owned-timeout'; Result = $timeout
     })
     Test-That 'a timeout is reported within the bounded wait' { $timeout.TimedOut -and $timeout.Seconds -lt 15 }
+    Test-That 'a timed-out child says it timed out, and warns that its tail may be missing' {
+        $timeout.Output -match 'TIMED OUT after [\d.]+s \(limit 5s\)' -and
+            $timeout.Output -match 'not flushed is lost'
+    } $timeout.Output
     $childInfo = Get-Content -LiteralPath (Join-Path $secondBox 'child.json') -Raw | ConvertFrom-Json
     Test-That 'timing out kills the owned descendant as well as the suite' {
         $childProcess = Get-Process -Id $childInfo.Id -ErrorAction SilentlyContinue
