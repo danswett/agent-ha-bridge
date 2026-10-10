@@ -193,6 +193,7 @@ function Get-DaemonStopConfirmHint {
     $doing = if ([string]::IsNullOrWhiteSpace($Status) -or $Status -eq 'working') { 'this session is still working' }
         elseif ($Status -eq 'waiting') { 'this session is waiting on you' }
         elseif ($Status -eq 'agents') { 'this session is waiting for background agents it started' }
+        elseif ($Status -eq 'shell') { 'this session is waiting for background commands it started' }
         else { "this session is $Status" }
     "$doing - the confirmation lapses in $($script:DaemonConfig.StopConfirmSeconds)s"
 }

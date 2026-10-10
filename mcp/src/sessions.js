@@ -147,7 +147,8 @@ export async function listSessions(ha) {
  *
  * A session waiting on background agents it started reports `agents` rather than
  * `idle`, so it is correctly not done: its own turn has ended, but it will take
- * another one with what those agents found.
+ * another one with what those agents found. A session waiting on a background
+ * command it started and has not collected reports `shell`, for the same reason.
  */
 export async function readSession(ha, sessionId, { since = '' } = {}) {
   const ids = sessionEntities(sessionId);

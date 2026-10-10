@@ -6,6 +6,13 @@
 #>
 
 . (Join-Path $PSScriptRoot 'bridge-secrets.ps1')
+# 1.7.0, not 1.6.0: a session waiting on a background command it started publishes
+# 'shell', and the custom activity and session cards are now drawn only for a browser
+# served card 1.34.0 or newer, because every older one renders it as the bare word
+# under an idle-grey frame (#151). Below that the generated markdown header and stack
+# are the fallback, and both were taught the status. All of it changes what
+# Save-CopilotSessionDashboard renders, so the fence needs a version to move to.
+#
 # 1.6.0, not 1.5.0: the machine rows in the Agent sessions dropdown now carry each
 # machine's own install button, and the standalone update card is drawn only for a
 # browser served a card older than 1.31.0 (#129). Both change what
@@ -27,7 +34,7 @@
 # definition of a conflict there - so on any installation already fenced at the old
 # renderer, publication is refused and the fix can never reach the dashboard without
 # an operator pin nobody should have to take.
-$script:BridgeDashboardRenderVersion = '1.6.0'
+$script:BridgeDashboardRenderVersion = '1.7.0'
 $script:BridgeDashboardObservation = $null
 
 function Invoke-CopilotHaWebSocket {
@@ -2115,9 +2122,10 @@ function Save-CopilotSessionDashboard {
   {% elif is_state('$statusEntity','working') %}
   border: 1px solid var(--primary-color);
   animation: cpwork 1.6s ease-in-out infinite;
-  {% elif is_state('$statusEntity','agents') %}
-  /* Waiting on background agents: live, but not the session's own work, so the
-     edge is steady rather than breathing. */
+  {% elif is_state('$statusEntity','agents') or is_state('$statusEntity','shell') %}
+  /* Waiting on background agents, or on a command it started and has not collected:
+     live, but not the session's own work, so the edge is steady rather than
+     breathing. */
   border: 1px solid var(--primary-color);
   box-shadow: none;
   animation: none;
@@ -2193,8 +2201,8 @@ ha-select, mwc-select { width: 100%; }
             type = 'markdown'
             card_mod = @{ style = $bareChild }
             content = @"
-### {% if state_attr('$decisionEntity','question') %}🟡{% elif is_state('$statusEntity','working') %}🟢{% elif is_state('$statusEntity','agents') %}🔵{% else %}⚪{% endif %} $($session.Name)
-*$($session.Machine)* &bull; status: **{% if state_attr('$decisionEntity','question') %}waiting for you{% else %}{% set st = states('$statusEntity') %}{% if st in ['unknown', 'unavailable'] %}ended{% elif st == 'agents' %}waiting for background agents{% else %}{{ st }}{% endif %}{% endif %}**{% set act = states('$activityEntity') %}{% set body = state_attr('$activityEntity','response') or '' %}{% if not (body and body.startswith(act.rstrip('.'))) %} &bull; {{ act }}{% endif %}
+### {% if state_attr('$decisionEntity','question') %}🟡{% elif is_state('$statusEntity','working') %}🟢{% elif is_state('$statusEntity','agents') or is_state('$statusEntity','shell') %}🔵{% else %}⚪{% endif %} $($session.Name)
+*$($session.Machine)* &bull; status: **{% if state_attr('$decisionEntity','question') %}waiting for you{% else %}{% set st = states('$statusEntity') %}{% if st in ['unknown', 'unavailable'] %}ended{% elif st == 'agents' %}waiting for background agents{% elif st == 'shell' %}waiting for background commands{% else %}{{ st }}{% endif %}{% endif %}**{% set act = states('$activityEntity') %}{% set body = state_attr('$activityEntity','response') or '' %}{% if not (body and body.startswith(act.rstrip('.'))) %} &bull; {{ act }}{% endif %}
 {% set q = state_attr('$decisionEntity','question') %}{% set resp = state_attr('$activityEntity','response') %}{% if q %}
 
 ---
@@ -2219,7 +2227,14 @@ ha-select, mwc-select { width: 100%; }
         # The activity card updates in place instead. It ships in the reply card's file,
         # so it is used only when Home Assistant serves a copy new enough to have it -
         # a view naming a custom element that does not exist renders an error box.
-        if (Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl) {
+        #
+        # 1.34.0, not 1.10.0: from here the header has to be able to say a session is
+        # waiting on a background command (#151). A card served between 1.10 and 1.31
+        # has no branch for it and falls through to printing the bare status, so the
+        # one session that must not look idle reads 'shell' under an idle-grey dot.
+        # The markdown below does know it, so for that window it is the better header -
+        # which is the whole point of keeping it as the fallback.
+        if (Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.34.0') {
             $header = @{
                 type     = 'custom:agent-bridge-activity-card'
                 card_mod = @{ style = $bareChild }
@@ -2729,7 +2744,12 @@ ha-card {
         $footerCards = if ($formCard) { @($sendStatusCard, $settingsCard, $stopCard) }
             else { @($sendStatusCard, $cancelCard, $settingsCard, $stopCard) }
         $sessionCards = @($header) + @($fieldCards) + @($answerCard) + @($replyCard) + $footerCards
-        if (Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.12.0') {
+        # 1.34.0, not 1.12.0: the frame is drawn by the card's own code from the status
+        # it reads, and a card served between 1.12 and 1.31 has no 'shell' in it - so a
+        # session waiting on a background command gets the idle divider, the one
+        # reading this status exists to prevent (#151). The stack below takes its edge
+        # from the generated card_mod instead, which does know it.
+        if (Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.34.0') {
             @{
                 type     = 'custom:agent-bridge-session-card'
                 status   = $statusEntity

@@ -172,6 +172,15 @@ function Get-DaemonStartupStatus {
     # one. Without this every restart - including every update - said idle, which is
     # exactly the reading this status exists to correct.
     if ((Get-DaemonBackgroundAgentCount -Entry $Entry) -gt 0) { return 'agents' }
+    # Same reasoning for a background shell, which the turn bookkeeping cannot see at
+    # all: the async call returns at once and the turn ends, so a session waiting on a
+    # build, a test run or a CI watch read as idle - an invitation to press End on it.
+    #
+    # Checked against the process first. This runs for a session the daemon is only now
+    # picking up, which is exactly when the set it saved may belong to a CLI that has
+    # since been replaced, and nothing that process started will ever report back.
+    [void](Clear-DaemonStaleBackgroundShells -Entry $Entry -ProcessId $Session.ProcessId)
+    if ((Get-DaemonBackgroundShellCount -Entry $Entry) -gt 0) { return 'shell' }
     'idle'
 }
 
@@ -293,10 +302,52 @@ function Get-ActivityFromEvents {
     $history = New-Object System.Collections.Generic.List[string]
     $agentsStarted = New-Object System.Collections.Generic.List[string]
     $agentsFinished = New-Object System.Collections.Generic.List[string]
+    $shellsStarted = New-Object System.Collections.Generic.List[string]
+    $shellsFinished = New-Object System.Collections.Generic.List[string]
+    # The same starts again, but only those written after a CLI last attached to this
+    # session. Collected only once an attach has been seen, because before that there
+    # is nothing to say the tail is not the previous process's. Used solely by a caller
+    # that already knows the attaching process is a different one.
+    $shellsSinceAttach = New-Object System.Collections.Generic.List[string]
+    $attached = $false
 
     foreach ($line in $Lines) {
         if ($line -notmatch '"type":"([^"]+)"') { continue }
         $type = $Matches[1]
+
+        # A resumed session is not on its own proof of anything: Copilot's /resume and
+        # its session picker switch sessions inside the *same* CLI process, which still
+        # owns whatever it backgrounded. What invalidates a shell is the process that
+        # started it going away, so that is tested against the live process id below
+        # rather than inferred from this event.
+        #
+        # It is still the line that separates one process's work from the next one's
+        # within a single batch, which is what ShellsSinceAttach is for.
+        if ($type -eq 'session.resume' -or $type -eq 'session.start') {
+            $attached = $true
+            $shellsSinceAttach.Clear()
+            continue
+        }
+
+        if ($type -eq 'system.notification') {
+            # The only notification that settles a shell names it. Parsed rather than
+            # counted, for the same reason the agents above are: ids survive a restart
+            # and a repeat, a count does not.
+            if ($line -match '"shell_completed"') {
+                try {
+                    $parsed = $line | ConvertFrom-Json
+                    $kind = if ($parsed.data.PSObject.Properties['kind']) { $parsed.data.kind } else { $null }
+                    # Not $shellId: that is a PowerShell automatic variable and is
+                    # read-only, so assigning to it threw straight into the catch below
+                    # and every completion was dropped without a word - the shells then
+                    # never cleared, which is the opposite of the bug being fixed.
+                    $endedShell = Get-BridgeEventField -Data $kind -Name 'shellId'
+                    if ($endedShell) { [void]$shellsFinished.Add($endedShell) }
+                }
+                catch { }
+            }
+            continue
+        }
 
         if ($type -eq 'subagent.started' -or $type -eq 'subagent.completed') {
             try {
@@ -356,6 +407,51 @@ function Get-ActivityFromEvents {
                 if (-not [string]::IsNullOrWhiteSpace($tool)) {
                     $summary = "Running: $tool"
                     $history.Add($summary)
+                }
+            }
+            catch { }
+            continue
+        }
+
+        # How a background shell is seen at all. The async call that starts one returns
+        # immediately and assistant.turn_end follows, so nothing in the turn bookkeeping
+        # says the session is still waiting - which is exactly how a session sat idle on
+        # the dashboard for half an hour with a CI watch running under it (#151).
+        #
+        # Read from the tool's own result rather than the request: a sync command that
+        # outruns its wait is backgrounded too, and says so only here. In this session
+        # 130 shells arrived that way against 46 started explicitly async, so matching
+        # on `mode: async` alone would have missed most of them.
+        #
+        # Anchored to the start of a line. Copilot writes each wrapper on its own line,
+        # while text that merely mentions one - this file, an issue body, a command that
+        # prints its own output back - has it inside a sentence or a table cell. Left
+        # unanchored, quoting a start marker invented a shell that no completion could
+        # ever settle, and quoting a completion cleared a real one.
+        if ($type -eq 'tool.execution_complete') {
+            if ($line -notmatch 'shellId') { continue }
+            try {
+                $parsed = $line | ConvertFrom-Json
+                $result = if ($parsed.data.PSObject.Properties['result']) { $parsed.data.result } else { $null }
+                $content = Get-BridgeEventField -Data $result -Name 'content'
+                if ([string]::IsNullOrWhiteSpace($content)) { continue }
+                # Finishes first: one read can collect an ended shell and report another
+                # as still running, and the ending is the older news of the two.
+                foreach ($match in [regex]::Matches($content, '(?m)^<shellId: (\S+?) completed with exit code')) {
+                    [void]$shellsFinished.Add($match.Groups[1].Value)
+                }
+                $match = [regex]::Match($content, '(?m)^<command started in background with shellId: ([^>\r\n]+)>')
+                if ($match.Success) {
+                    $id = $match.Groups[1].Value.Trim()
+                    [void]$shellsStarted.Add($id)
+                    if ($attached) { [void]$shellsSinceAttach.Add($id) }
+                    continue
+                }
+                $match = [regex]::Match($content, '(?m)^<command with shellId: (\S+) is still running')
+                if ($match.Success) {
+                    $id = $match.Groups[1].Value
+                    [void]$shellsStarted.Add($id)
+                    if ($attached) { [void]$shellsSinceAttach.Add($id) }
                 }
             }
             catch { }
@@ -441,6 +537,17 @@ function Get-ActivityFromEvents {
         # agent routinely outlives the turn - and many reads - that started it.
         AgentsStarted = @($agentsStarted)
         AgentsFinished = @($agentsFinished)
+        # Background shells this batch started and settled, by shell id. Kept apart from
+        # the agents above because they arrive by a different route entirely - a tool
+        # result rather than a subagent event - and because a resume invalidates the
+        # whole set, which no agent event ever does.
+        ShellsStarted = @($shellsStarted)
+        ShellsFinished = @($shellsFinished)
+        # Only the starts a replacement process can possibly own: everything after the
+        # last point a CLI attached. Empty when no attach appears in the batch, which
+        # for a process known to be new means the whole tail is the dead one's.
+        ShellsSinceAttach = @($shellsSinceAttach)
+        ShellAttachSeen = $attached
     }
 }
 
@@ -503,6 +610,133 @@ function Get-DaemonBackgroundAgentCount {
     $value = $Entry.BackgroundAgents
     if ($null -eq $value) { return 0 }
     @(@($value) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }).Count
+}
+
+function Get-DaemonBackgroundShellCount {
+    <#
+        How many background shells a session is still waiting on.
+
+        Separate from the agent count, and read the same careful way: a property that
+        is present but null wraps to a one-element array holding $null, which would
+        park a session that had never run one on a status nothing could clear.
+    #>
+    param([Parameter(Mandatory)]$Entry)
+
+    if (-not $Entry.PSObject.Properties['BackgroundShells']) { return 0 }
+    $value = $Entry.BackgroundShells
+    if ($null -eq $value) { return 0 }
+    @(@($value) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }).Count
+}
+
+function Get-DaemonBackgroundShellOwner {
+    <#
+        What identifies the CLI process a session's background commands belong to.
+
+        A process id alone is not an identity - the OS reuses them, most freely across
+        exactly the reboot this is here to survive - so it is paired with the process
+        start time, the way Get-DaemonProcessIdentity already does for End session.
+
+        Empty when there is nothing to pin: no id, or a process this daemon cannot
+        read, which for a session that was running means it is gone.
+    #>
+    param([AllowNull()]$ProcessId = $null)
+
+    $value = 0
+    if ($null -ne $ProcessId) { $value = [int]$ProcessId }
+    if ($value -le 0) { return '' }
+    $identity = Get-DaemonProcessIdentity -ProcessId $value
+    if ($null -eq $identity) { return '' }
+    "$value|$identity"
+}
+
+function Clear-DaemonStaleBackgroundShells {
+    <#
+        Reports whether the CLI process behind a session has been replaced, dropping
+        anything the previous one had outstanding.
+
+        A dead process will never settle what it backgrounded, so a set outliving it is
+        not stale data that corrects itself - it is a card parked on 'shell' for as long
+        as the session exists. That is the one failure worse than the idle reading this
+        status replaces, because waiting does not fix it.
+
+        Called before the transcript is read, since the session that most needs it is
+        the one writing nothing at all. The answer is returned rather than acted on
+        alone because the batch about to be read needs it too: a replacement process
+        inherits the previous one's unread tail, and a start marker in there belongs to
+        a command that died with the process that wrote it.
+    #>
+    param([Parameter(Mandatory)]$Entry, [AllowNull()]$ProcessId = $null)
+
+    if (-not $Entry.PSObject.Properties['BackgroundShellsOwner']) { return $false }
+    $known = [string]$Entry.BackgroundShellsOwner
+    # Nothing was pinned, so there is nothing to contradict. The transcript still
+    # settles these; only the shortcut is unavailable.
+    if ([string]::IsNullOrEmpty($known)) { return $false }
+    $owner = Get-DaemonBackgroundShellOwner -ProcessId $ProcessId
+    # An id that no longer reads is a process that is gone, which is the whole reboot
+    # case: nothing it started can ever report back. Treating that as merely
+    # unverifiable and keeping the set is the permanent wedge this exists to prevent,
+    # where clearing it wrongly costs at worst an idle reading that the next thing the
+    # session writes corrects.
+    if ($owner -ceq $known) { return $false }
+
+    Set-DaemonSessionProperty -Entry $Entry -Name 'BackgroundShells' -Value @()
+    $true
+}
+
+function Update-DaemonBackgroundShells {
+    <#
+        Folds a batch's background-shell starts and finishes into the set a session is
+        still waiting on, and returns how many are left.
+
+        Kept on the entry for the same reason the agents are: a shell routinely
+        outlives the turn that started it, and a daemon restart is the one moment a
+        waiting session has nothing else to say for itself.
+
+        A shell belongs to the CLI process that started it. When the owner has changed,
+        the batch being folded is the dead process's unread tail as much as the live
+        one's work, so only what was started after a CLI attached is taken - and
+        nothing at all if no attach is in the batch, since then none of it can be the
+        new process's. Without that the replacement inherits a command that died with
+        its predecessor, pins it to itself, and the card waits on it for ever.
+
+        Dropping the set on session.resume instead was wrong: Copilot's /resume and its
+        session picker switch sessions inside the same process, which still owns what
+        it backgrounded.
+    #>
+    param(
+        [Parameter(Mandatory)]$Entry,
+        [Parameter(Mandatory)]$Activity,
+        [AllowNull()]$ProcessId = $null,
+        [switch]$OwnerChanged
+    )
+
+    $running = New-Object System.Collections.Generic.List[string]
+
+    $add = {
+        param($Values)
+        foreach ($value in @($Values)) {
+            $text = [string]$value
+            if ($text -and -not $running.Contains($text)) { [void]$running.Add($text) }
+        }
+    }
+
+    if (-not $OwnerChanged -and $Entry.PSObject.Properties['BackgroundShells']) { & $add $Entry.BackgroundShells }
+    $startedField = if ($OwnerChanged) { 'ShellsSinceAttach' } else { 'ShellsStarted' }
+    if ($Activity.PSObject.Properties[$startedField]) { & $add $Activity.$startedField }
+    if ($Activity.PSObject.Properties['ShellsFinished']) {
+        foreach ($value in @($Activity.ShellsFinished)) { [void]$running.Remove([string]$value) }
+    }
+
+    if ($running.Count -gt 0 -or $Entry.PSObject.Properties['BackgroundShells']) {
+        Set-DaemonSessionProperty -Entry $Entry -Name 'BackgroundShells' -Value @($running)
+    }
+    # Pinned on every pass, not only while something is outstanding: a session carrying
+    # nothing still has to be able to tell a replacement process from its predecessor,
+    # or the first command it inherits is one it never started.
+    $owner = Get-DaemonBackgroundShellOwner -ProcessId $ProcessId
+    if ($owner -ne '') { Set-DaemonSessionProperty -Entry $Entry -Name 'BackgroundShellsOwner' -Value $owner }
+    $running.Count
 }
 
 function Update-DaemonBackgroundAgents {
@@ -580,9 +814,39 @@ function Update-DaemonSessionActivity {
         $hookStatusAt = Sync-DaemonHookStatus -Entry $entry -Session $session -SessionId $id -Headers $Headers
     }
 
+    # Before the transcript, because the session this matters most for writes nothing:
+    # a resumed card whose CLI has been replaced takes the empty-append return below
+    # and would otherwise sit on 'shell' for ever, waiting on commands that died with
+    # the process that started them.
+    $shellsDropped = Clear-DaemonStaleBackgroundShells -Entry $entry -ProcessId $session.ProcessId
+
     $append = Read-BridgeTranscriptAppend -Path $session.Transcript -Offset ([long]$entry.Offset) -Kind $entryKind
     $entry.Offset = $append.Offset
-    if ($append.Lines.Count -eq 0) { return }
+    if ($append.Lines.Count -eq 0) {
+        if ($shellsDropped -and [string]$entry.Status -eq 'shell') {
+            $entry.Status = 'idle'
+            try {
+                Set-CopilotMqttStatus -SessionId $id -Status 'idle' -Headers $Headers -Attributes (
+                    Add-DaemonTuningAttributes -Attributes @{
+                        session = $entry.Name
+                        machine = $entry.Machine
+                        process_id = $session.ProcessId
+                        updated = [DateTimeOffset]::Now.ToString('o')
+                    } -Tuning $entry)
+            }
+            catch {
+                Write-DaemonLog -Message "status publish failed for $id : $($_.Exception.Message)"
+            }
+        }
+        # Pinned here too, because this return skips the fold that normally does it.
+        # Left unpinned the session would read as freshly replaced on every pass, and
+        # go on discarding the live process's own commands as its predecessor's.
+        if ($shellsDropped) {
+            $owner = Get-DaemonBackgroundShellOwner -ProcessId $session.ProcessId
+            if ($owner -ne '') { Set-DaemonSessionProperty -Entry $entry -Name 'BackgroundShellsOwner' -Value $owner }
+        }
+        return
+    }
 
     $activity = Get-BridgeActivity -Lines $append.Lines -VerboseMode $verbose -Kind $entryKind
 
@@ -627,6 +891,26 @@ function Update-DaemonSessionActivity {
         $newStatus = 'idle'
     }
 
+    # A background shell does the same thing by a route the turn bookkeeping cannot
+    # see, so it is folded the same way. Ordered after the agents: a session waiting on
+    # both is better described as delegating than as running a command.
+    $shellsBefore = Get-DaemonBackgroundShellCount -Entry $entry
+    $runningShells = Update-DaemonBackgroundShells -Entry $entry -Activity $activity `
+        -ProcessId $session.ProcessId -OwnerChanged:$shellsDropped
+    if ($runningShells -gt 0) {
+        if ($newStatus -eq 'idle' -or
+            ([string]::IsNullOrWhiteSpace($newStatus) -and [string]$entry.Status -eq 'idle')) {
+            $newStatus = 'shell'
+        }
+    }
+    elseif ([string]::IsNullOrWhiteSpace($newStatus) -and [string]$entry.Status -eq 'shell') {
+        $newStatus = 'idle'
+    }
+    # How many is published as an attribute, and a second command starting does not
+    # change the status string - so without this the card went on saying one while two
+    # were running, until the session next moved for some other reason.
+    $shellCountChanged = ($runningShells -ne $shellsBefore)
+
     # The model the transcript just named. Recorded before the status publish below,
     # so a batch that changes both spends one publish on the pair.
     $modelChanged = $false
@@ -655,16 +939,18 @@ function Update-DaemonSessionActivity {
             Write-DaemonLog -Message "status publish failed for $id : $($_.Exception.Message)"
         }
     }
-    elseif ($modelChanged) {
+    elseif ($modelChanged -or $shellCountChanged) {
         # A model can change without the status doing so - a session already working
         # when the daemon first sees it, or a /model typed mid-turn - and the status
         # attributes are republished wholesale, so the card would otherwise carry the
-        # old model until the next time the session happened to go idle.
+        # old model until the next time the session happened to go idle. The number of
+        # background commands moves the same way: a second one starting leaves the
+        # status on 'shell' while the count the card draws goes stale.
         #
         # Only from a status Set-CopilotMqttStatus accepts: an entry parked on
         # something else ('ending') is mid-retirement and its card is about to go.
         $current = [string]$entry.Status
-        if ($current -in @('working', 'idle', 'waiting', 'agents', 'offline')) {
+        if ($current -in @('working', 'idle', 'waiting', 'agents', 'shell', 'offline')) {
             try {
                 Set-CopilotMqttStatus -SessionId $id -Status $current -Headers $Headers -Attributes (
                     Add-DaemonTuningAttributes -Attributes @{

@@ -294,7 +294,7 @@ Save-CopilotSessionDashboard `
     -Sessions @([pscustomobject]@{ Node = $node; Name = 'Copilot: a task'; Machine = 'BOX'; Kind = 'copilot' }) `
     -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.21.1'
 $oldDash = $script:SavedConfig | ConvertTo-Json -Depth 40 | ConvertFrom-Json -Depth 40
-$oldCard = @($oldDash.views[0].cards | Where-Object { $_.type -eq 'custom:agent-bridge-session-card' })[0]
+$oldCard = Get-TestSessionContainer -Config $oldDash
 $oldChoices = @($oldCard.cards | Where-Object {
     $_.type -eq 'conditional' -and "$($_.card.type)" -eq 'custom:agent-bridge-choices-card'
 })[0].card
@@ -315,7 +315,7 @@ Save-CopilotSessionDashboard `
     -Sessions @([pscustomobject]@{ Node = $node; Name = 'Copilot: a task'; Machine = 'BOX'; Kind = 'copilot' }) `
     -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.26.0'
 $preTopicDash = $script:SavedConfig | ConvertTo-Json -Depth 40 | ConvertFrom-Json -Depth 40
-$preTopicCard = @($preTopicDash.views[0].cards | Where-Object { $_.type -eq 'custom:agent-bridge-session-card' })[0]
+$preTopicCard = Get-TestSessionContainer -Config $preTopicDash
 $preTopicChoices = @($preTopicCard.cards | Where-Object {
     $_.type -eq 'conditional' -and "$($_.card.type)" -eq 'custom:agent-bridge-choices-card'
 })[0].card

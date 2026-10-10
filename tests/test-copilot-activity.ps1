@@ -226,6 +226,15 @@ Set-CopilotMqttStatus -SessionId 'eeeeeeee-1111-2222-3333-444444444444' -Status 
 Test-That 'a session waiting on background agents is a status it accepts' {
     $script:MqttPayloads -contains 'agents'
 } ($script:MqttPayloads -join '|')
+# The same check for this change's own status, and the one that would have caught it
+# being missing: every test below stubs the publisher, so a status it refuses looks
+# perfectly healthy there while in production the card never moves off idle.
+$script:MqttPayloads = @()
+Set-CopilotMqttStatus -SessionId 'eeeeeeee-1111-2222-3333-444444444444' -Status 'shell' `
+    -Headers @{} -Attributes @{ background_shells = 2 }
+Test-That 'and so is one waiting on background commands' {
+    $script:MqttPayloads -contains 'shell'
+} ($script:MqttPayloads -join '|')
 
 Write-Host '--- what reaches the card ---'
 # Everything that would reach Home Assistant is stood in for.
@@ -477,6 +486,262 @@ try {
 }
 finally {
     Remove-Item -LiteralPath $agentLog -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host ''
+Write-Host '--- waiting for a background command is not idle either ---'
+<#
+    A backgrounded shell leaves no subagent pair to count. The async call returns a
+    shell id and completes at once, assistant.turn_end follows, and the command runs
+    on outside anything the turn bookkeeping records - so a session sat idle on the
+    dashboard for half an hour with a CI watch under it (#151).
+
+    The markers are the tool's own, taken from a real transcript: a sync command that
+    outruns its wait is backgrounded too and says so only in its result, which is how
+    130 of this session's shells arrived against 46 started explicitly async.
+#>
+function New-ShellResult {
+    param([string]$Content)
+    ([ordered]@{ type = 'tool.execution_complete'
+        data = [ordered]@{ toolCallId = 'toolu_s'; toolName = 'powershell'; result = [ordered]@{ content = $Content } } } |
+        ConvertTo-Json -Depth 6 -Compress)
+}
+function New-ShellStarted { param([string]$Id) New-ShellResult "<command started in background with shellId: $Id>" }
+function New-ShellStillRunning { param([string]$Id) New-ShellResult "<command with shellId: $Id is still running after 240 seconds. The command is still running.>" }
+function New-ShellCollected { param([string]$Id) New-ShellResult "output here`n<shellId: $Id completed with exit code 0>" }
+# Ordered deliberately. The reducer reads the event type from the first "type" in the
+# line, exactly as Copilot writes it; an unordered hashtable put the nested
+# shell_completed first and the event was read as that instead.
+function New-ShellNotified {
+    param([string]$Id)
+    ([ordered]@{ type = 'system.notification'
+        data = [ordered]@{ content = "Shell command (shellId: $Id) has completed successfully."
+                  kind = [ordered]@{ type = 'shell_completed'; shellId = $Id; exitCode = 0 } } } |
+        ConvertTo-Json -Depth 6 -Compress)
+}
+
+$activity = Get-ActivityFromEvents -Lines @((New-ShellStarted 'ci164')) -VerboseMode $false
+Test-That 'a command put into the background is reported by its shell id' {
+    (@($activity.ShellsStarted) -join ',') -eq 'ci164'
+} (@($activity.ShellsStarted) -join ',')
+# The case that matters most in practice, and the one a check on the requested mode
+# would miss: the command asked to run synchronously and outran its wait.
+$activity = Get-ActivityFromEvents -Lines @((New-ShellStillRunning 'fullsuite')) -VerboseMode $false
+Test-That 'a sync command that outran its wait is backgrounded too' {
+    (@($activity.ShellsStarted) -join ',') -eq 'fullsuite'
+} (@($activity.ShellsStarted) -join ',')
+$activity = Get-ActivityFromEvents -Lines @((New-ShellCollected 'ci164')) -VerboseMode $false
+Test-That 'collecting one names the same shell as finished' {
+    (@($activity.ShellsFinished) -join ',') -eq 'ci164'
+} (@($activity.ShellsFinished) -join ',')
+$activity = Get-ActivityFromEvents -Lines @((New-ShellNotified 'ci164')) -VerboseMode $false
+Test-That 'and so does the notification that it ended' {
+    (@($activity.ShellsFinished) -join ',') -eq 'ci164'
+} (@($activity.ShellsFinished) -join ',')
+
+# Text that merely mentions a marker is not a command. This file, the issue that asked
+# for the feature and any command that prints its own output back all quote one, and
+# unanchored matching turned every mention into a shell: a quoted start invented one
+# that no completion could ever settle, and a quoted finish cleared a real one.
+$activity = Get-ActivityFromEvents -Lines @(
+    (New-ShellResult 'grep found: "<command started in background with shellId: phantom>" in the docs')) -VerboseMode $false
+Test-That 'a command that merely prints a start marker starts nothing' {
+    @($activity.ShellsStarted).Count -eq 0
+} (@($activity.ShellsStarted) -join ',')
+$activity = Get-ActivityFromEvents -Lines @(
+    (New-ShellResult '| 3 | <shellId: ci164 completed with exit code 0> | sample |')) -VerboseMode $false
+Test-That 'and one quoting a finish does not settle a command still running' {
+    @($activity.ShellsFinished).Count -eq 0
+} (@($activity.ShellsFinished) -join ',')
+
+$shellLog = Join-Path ([IO.Path]::GetTempPath()) "copilot-shells-$([guid]::NewGuid().ToString('N')).jsonl"
+$shellSessionId = 'cccccccc-1111-2222-3333-444444444444'
+$shellEntry = [pscustomobject]@{ Offset = 0; Name = 'Copilot: build'; Machine = 'DESK'; Status = 'working'; Kind = 'copilot' }
+$shellSession = [pscustomobject]@{ SessionId = $shellSessionId; Transcript = $shellLog; ProcessId = $PID }
+# A process id nothing can be reading. Found rather than assumed, so the checks below
+# are not quietly passing because some unrelated process happened to hold the number.
+$deadPid = 0
+foreach ($candidate in 999999, 999997, 999995, 999993) {
+    if (-not (Get-Process -Id $candidate -ErrorAction SilentlyContinue)) { $deadPid = $candidate; break }
+}
+Test-That 'the fixtures below have a process id that really is gone' { $deadPid -gt 0 } "$deadPid"
+function StepShells {
+    param([string[]]$Lines)
+    Add-Content -LiteralPath $shellLog -Value $Lines -Encoding utf8
+    Update-DaemonSessionActivity -Id $shellSessionId -Entry $shellEntry -Session $shellSession -Headers @{} -VerboseOn $false
+}
+try {
+    $script:StatusPublishes = @()
+    StepShells -Lines @((New-ShellStarted 'ci164'), '{"type":"assistant.turn_end"}')
+    Test-That 'a turn ending with a command still running does not read as idle' {
+        $shellEntry.Status -eq 'shell'
+    } "$($shellEntry.Status)"
+    Test-That 'and that is what reaches the card' { $script:StatusPublishes[-1].Status -eq 'shell' }
+    Test-That 'with how many, so the card need not say "some"' {
+        $script:StatusPublishes[-1].Attributes['background_shells'] -eq 1
+    }
+
+    $script:StatusPublishes = @()
+    StepShells -Lines @((New-ShellStillRunning 'fullsuite'))
+    Test-That 'a second command joins the first rather than replacing it' {
+        @($shellEntry.BackgroundShells).Count -eq 2
+    } (@($shellEntry.BackgroundShells) -join ',')
+    # The status string does not move from 'shell' when a second one starts, and the
+    # publisher only runs when something moves - so the card went on saying one command
+    # while two were running, until the session next changed for an unrelated reason.
+    Test-That 'and the card is told, though the status itself did not change' {
+        $script:StatusPublishes.Count -ge 1 -and
+        $script:StatusPublishes[-1].Attributes['background_shells'] -eq 2
+    } "publishes=$($script:StatusPublishes.Count)"
+    # Reading one back while it is still going is not news; it must not be counted
+    # twice, or a watched command would inflate the number on the card every poll.
+    StepShells -Lines @((New-ShellStillRunning 'fullsuite'))
+    Test-That 'and reading it again does not count it twice' {
+        @($shellEntry.BackgroundShells).Count -eq 2
+    } (@($shellEntry.BackgroundShells) -join ',')
+
+    StepShells -Lines @((New-ShellNotified 'ci164'))
+    Test-That 'one finishing leaves the session waiting on the other' { $shellEntry.Status -eq 'shell' }
+
+    $script:StatusPublishes = @()
+    StepShells -Lines @((New-ShellCollected 'fullsuite'))
+    Test-That 'the last one finishing hands the session back to idle' {
+        $shellEntry.Status -eq 'idle'
+    } "$($shellEntry.Status)"
+    Test-That 'and says so, rather than leaving the card waiting on nothing' {
+        $script:StatusPublishes[-1].Status -eq 'idle'
+    }
+
+    StepShells -Lines @((New-ShellStarted 'rel137'), '{"type":"assistant.turn_end"}')
+    Test-That 'and a restart finds it waiting, not idle' {
+        (Get-DaemonStartupStatus -Session $shellSession -Entry $shellEntry) -eq 'shell'
+    } (Get-DaemonStartupStatus -Session $shellSession -Entry $shellEntry)
+
+    # Copilot's /resume and its session picker switch sessions inside the same CLI
+    # process, which still owns whatever it backgrounded. Treating every resume as a
+    # new process threw away live work and put the session back to reading idle.
+    StepShells -Lines @('{"type":"session.resume"}')
+    Test-That 'a resume inside the same process keeps the commands it still owns' {
+        $shellEntry.Status -eq 'shell' -and @($shellEntry.BackgroundShells).Count -eq 1
+    } "$($shellEntry.Status), outstanding=$(@($shellEntry.BackgroundShells).Count)"
+
+    # A shell belongs to the process that started it. After this machine rebooted
+    # mid-session, seven shells were still listed against a process that no longer
+    # existed - and nothing in the transcript would ever have settled them, so the
+    # session would have read as busy for the rest of its life.
+    #
+    # A dead process is the honest shape of that: the id no longer reads.
+    $restarted = [pscustomobject]@{ SessionId = $shellSessionId; Transcript = $shellLog; ProcessId = $deadPid }
+    Add-Content -LiteralPath $shellLog -Value @('{"type":"assistant.turn_end"}') -Encoding utf8
+    Update-DaemonSessionActivity -Id $shellSessionId -Entry $shellEntry -Session $restarted -Headers @{} -VerboseOn $false
+    Test-That 'but a new process owns none of the dead one''s commands' {
+        $shellEntry.Status -eq 'idle' -and @($shellEntry.BackgroundShells).Count -eq 0
+    } "$($shellEntry.Status), outstanding=$(@($shellEntry.BackgroundShells).Count)"
+
+    # The id on its own is not an identity. An OS reuses process ids, most freely
+    # across exactly the reboot this is here to survive, so a replacement CLI can
+    # present the same number - and a set pinned to the number alone would be carried
+    # straight into a process that never started any of it. The pin below is the one a
+    # pid-only implementation would have written.
+    StepShells -Lines @((New-ShellStarted 'recycled'), '{"type":"assistant.turn_end"}')
+    Test-That 'a command is outstanding again, pinned to more than this id' {
+        $shellEntry.Status -eq 'shell' -and
+        $shellEntry.BackgroundShellsOwner -like "$PID|*" -and
+        $shellEntry.BackgroundShellsOwner -ne "$PID"
+    } "$($shellEntry.Status), owner=$($shellEntry.BackgroundShellsOwner)"
+    $shellEntry.BackgroundShellsOwner = "$PID"
+    StepShells -Lines @('{"type":"assistant.turn_end"}')
+    Test-That 'so the same id on a process that started later clears them' {
+        $shellEntry.Status -eq 'idle' -and @($shellEntry.BackgroundShells).Count -eq 0
+    } "$($shellEntry.Status), outstanding=$(@($shellEntry.BackgroundShells).Count)"
+
+    # The path that would otherwise never be reached. A session whose CLI has been
+    # replaced and which writes nothing at all takes the empty-append return, so a
+    # check that runs only after new transcript lines never runs for it - and the card
+    # waits for ever on commands that died with the process that started them.
+    $shellEntry.Status = 'shell'
+    Set-DaemonSessionProperty -Entry $shellEntry -Name 'BackgroundShells' -Value @('orphan')
+    Set-DaemonSessionProperty -Entry $shellEntry -Name 'BackgroundShellsOwner' -Value "$deadPid|1"
+    $script:StatusPublishes = @()
+    Update-DaemonSessionActivity -Id $shellSessionId -Entry $shellEntry -Session $restarted -Headers @{} -VerboseOn $false
+    Test-That 'a silent session whose process is gone is let go, not left waiting' {
+        $shellEntry.Status -eq 'idle' -and @($shellEntry.BackgroundShells).Count -eq 0
+    } "$($shellEntry.Status), outstanding=$(@($shellEntry.BackgroundShells).Count)"
+    Test-That 'and the card is told, since nothing else will write' {
+        $script:StatusPublishes.Count -ge 1 -and $script:StatusPublishes[-1].Status -eq 'idle'
+    } "publishes=$($script:StatusPublishes.Count)"
+
+    # The same session seen fresh by a restarted daemon, which reads the saved set
+    # before any transcript has been read at all.
+    $startupEntry = [pscustomobject]@{ Offset = 0; Name = 'Copilot: build'; Machine = 'DESK'; Status = 'idle'; Kind = 'copilot' }
+    Set-DaemonSessionProperty -Entry $startupEntry -Name 'BackgroundShells' -Value @('orphan')
+    Set-DaemonSessionProperty -Entry $startupEntry -Name 'BackgroundShellsOwner' -Value "$deadPid|1"
+    Test-That 'and a restart does not restore it to waiting either' {
+        (Get-DaemonStartupStatus -Session $restarted -Entry $startupEntry) -eq 'idle'
+    } (Get-DaemonStartupStatus -Session $restarted -Entry $startupEntry)
+
+    Test-That 'a session carrying no commands at all is waiting on none' {
+        (Get-DaemonBackgroundShellCount -Entry ([pscustomobject]@{ BackgroundShells = $null })) -eq 0
+    }    Test-That 'and neither is one from before the bridge tracked them' {
+        (Get-DaemonBackgroundShellCount -Entry ([pscustomobject]@{ Status = 'idle' })) -eq 0
+    }
+
+    # A replacement process inherits whatever its predecessor wrote and the daemon had
+    # not read yet. Clearing the saved set is not enough on its own: the unread tail
+    # still carries the dead process's start marker, and adopting it pins a command
+    # that can never report back to the process now running - which parks the card on
+    # 'shell' for the life of the session, the one failure waiting does not fix.
+    $tailLog = Join-Path ([IO.Path]::GetTempPath()) "copilot-tail-$([guid]::NewGuid().ToString('N')).jsonl"
+    try {
+        $tailEntry = [pscustomobject]@{ Offset = 0; Name = 'Copilot: build'; Machine = 'DESK'; Status = 'idle'; Kind = 'copilot' }
+        Set-DaemonSessionProperty -Entry $tailEntry -Name 'BackgroundShells' -Value @('dead')
+        Set-DaemonSessionProperty -Entry $tailEntry -Name 'BackgroundShellsOwner' -Value "$PID|1"
+        $tailSession = [pscustomobject]@{ SessionId = $shellSessionId; Transcript = $tailLog; ProcessId = $PID }
+        Set-Content -LiteralPath $tailLog -Value @((New-ShellStarted 'orphaned'), '{"type":"assistant.turn_end"}') -Encoding utf8
+        Update-DaemonSessionActivity -Id $shellSessionId -Entry $tailEntry -Session $tailSession -Headers @{} -VerboseOn $false
+        Test-That 'a command left in the unread tail is not adopted by the process that replaced it' {
+            $tailEntry.Status -eq 'idle' -and @($tailEntry.BackgroundShells).Count -eq 0
+        } "$($tailEntry.Status), outstanding=$(@($tailEntry.BackgroundShells) -join ',')"
+        # And the replacement is now pinned, or every later pass would read as another
+        # replacement and go on throwing away the live process's own commands.
+        Test-That 'and the replacement is pinned, so its own work is not thrown away next' {
+            $tailEntry.BackgroundShellsOwner -like "$PID|*" -and $tailEntry.BackgroundShellsOwner -ne "$PID|1"
+        } "owner=$($tailEntry.BackgroundShellsOwner)"
+        Add-Content -LiteralPath $tailLog -Value @((New-ShellStarted 'mine'), '{"type":"assistant.turn_end"}') -Encoding utf8
+        Update-DaemonSessionActivity -Id $shellSessionId -Entry $tailEntry -Session $tailSession -Headers @{} -VerboseOn $false
+        Test-That 'what it starts itself is still tracked' {
+            $tailEntry.Status -eq 'shell' -and (@($tailEntry.BackgroundShells) -join ',') -eq 'mine'
+        } "$($tailEntry.Status), outstanding=$(@($tailEntry.BackgroundShells) -join ',')"
+
+        # The same tail, but with the attach written before the command. That one the
+        # new process really did start, so dropping it would under-report live work.
+        $afterEntry = [pscustomobject]@{ Offset = 0; Name = 'Copilot: build'; Machine = 'DESK'; Status = 'idle'; Kind = 'copilot' }
+        Set-DaemonSessionProperty -Entry $afterEntry -Name 'BackgroundShells' -Value @('dead')
+        Set-DaemonSessionProperty -Entry $afterEntry -Name 'BackgroundShellsOwner' -Value "$PID|1"
+        $afterLog = Join-Path ([IO.Path]::GetTempPath()) "copilot-after-$([guid]::NewGuid().ToString('N')).jsonl"
+        Set-Content -LiteralPath $afterLog -Value @(
+            (New-ShellStarted 'theirs'), '{"type":"session.resume"}', (New-ShellStarted 'ours'),
+            '{"type":"assistant.turn_end"}') -Encoding utf8
+        Update-DaemonSessionActivity -Id $shellSessionId -Entry $afterEntry `
+            -Session ([pscustomobject]@{ SessionId = $shellSessionId; Transcript = $afterLog; ProcessId = $PID }) `
+            -Headers @{} -VerboseOn $false
+        Test-That 'a command started after the attach is kept, and the one before it is not' {
+            (@($afterEntry.BackgroundShells) -join ',') -eq 'ours'
+        } "outstanding=$(@($afterEntry.BackgroundShells) -join ',')"
+        Remove-Item -LiteralPath $afterLog -Force -ErrorAction SilentlyContinue
+    }
+    finally { Remove-Item -LiteralPath $tailLog -Force -ErrorAction SilentlyContinue }
+
+    # The moment this status exists for. End session asks for a second press and names
+    # what the first one would interrupt; without a line of its own that read "this
+    # session is shell", which tells the one person about to kill a running build
+    # nothing at all.
+    Test-That 'End session names the commands it would interrupt' {
+        (Get-DaemonStopConfirmHint -Status 'shell') -match 'waiting for background commands it started'
+    } (Get-DaemonStopConfirmHint -Status 'shell')
+}
+finally {
+    Remove-Item -LiteralPath $shellLog -Force -ErrorAction SilentlyContinue
 }
 
 Write-Host ''

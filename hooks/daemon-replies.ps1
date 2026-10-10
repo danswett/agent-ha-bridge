@@ -1090,7 +1090,7 @@ function Resolve-DaemonPrimedCard {
     #>
     param(
         [Parameter(Mandatory)]$Entry,
-        [Parameter(Mandatory)][ValidateSet('working', 'waiting', 'idle', 'agents', 'error')][string]$Status,
+        [Parameter(Mandatory)][ValidateSet('working', 'waiting', 'idle', 'agents', 'shell', 'error')][string]$Status,
         [bool]$VerboseOn
     )
 
@@ -1099,7 +1099,8 @@ function Resolve-DaemonPrimedCard {
         [string]$Entry.LastSummary
     }
     elseif ($Status -eq 'working') { 'Working' }
-    elseif ($Status -eq 'agents') { 'Waiting for background agents' } else { 'Idle' }
+    elseif ($Status -eq 'agents') { 'Waiting for background agents' }
+    elseif ($Status -eq 'shell') { 'Waiting for background commands' } else { 'Idle' }
 
     $detail = @{
         session = $Entry.Name
