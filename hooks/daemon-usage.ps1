@@ -13,9 +13,14 @@
     and a weekly one. The card draws whatever windows it is handed rather than knowing
     anything about any of them.
 
+    How often it asks is per client and follows the sessions. A figure only moves while
+    somebody is spending, and the allowance belongs to the account rather than the
+    machine, so a machine with a session of a client open asks about it every couple of
+    minutes and one with none asks rarely; see Sync-DaemonUsage.
+
     Part of agent-bridge-daemon.ps1, which dot-sources it into its own scope after
     declaring the shared $script: state; see docs/daemon-split.md.
-    Shared state it changes: DaemonUsageCheckedAt, DaemonUsageSignature.
+    Shared state it changes: DaemonUsageClients, DaemonUsageEntityIds.
 #>
 
 # Asked once per daemon, then left alone - see the macOS branch of
@@ -56,8 +61,20 @@ $script:BridgeUsageConfig = @{
     # The figures move continuously while a session runs - Copilot's remaining credits
     # were measured changing inside three minutes - so this is a poll, not a cache
     # read. Two minutes is the compromise between showing "what is left right now" and
-    # asking three vendors for it from every machine that runs a bridge.
+    # asking three vendors for it. It is the pace for a client with a session open on
+    # this machine; see IdleIntervalSeconds for the rest.
     IntervalSeconds = 120
+    # The pace for a client with no session open here. The allowance belongs to the
+    # account, not the machine, so every machine signed in to it was asking the same
+    # question every two minutes whether or not it was the one spending - three
+    # machines, three times the requests to a vendor, for an answer that only one of
+    # them could be changing. A quarter of an hour still keeps a machine that is merely
+    # switched on honest about a pool that is metered by the month or the week.
+    IdleIntervalSeconds = 900
+    # How soon after the last ask a session starting or ending may bring the next one
+    # forward. Without it a session that keeps crashing and restarting would ask on
+    # every reconcile, which is more often than the pace it is meant to relieve.
+    MinimumGapSeconds = 30
     RequestTimeout  = 15
     # One attempt is not a reading, it is a coin toss on any path that is less than
     # perfect. Measured on DSWETT-HOME on 2026-10-07: api.github.com completed 6 of 14
@@ -72,8 +89,11 @@ $script:BridgeUsageConfig = @{
     MaxStateBytes   = 8MB
 }
 
-$script:DaemonUsageCheckedAt = [DateTimeOffset]::MinValue
-$script:DaemonUsageSignature = ''
+# Per client, because a client with a session open and one without are on different
+# clocks: when it was last asked, whether a session of it was open then, the signature
+# of what was last published for it, and whether that last reading failed to publish.
+# See Get-BridgeUsageClientState.
+$script:DaemonUsageClients = @{}
 $script:DaemonUsageEntityIds = ''
 
 function Get-BridgeUsageLabel {
@@ -1049,33 +1069,169 @@ function Get-BridgeAgentAllowance {
     $records
 }
 
+function Get-BridgeUsageSetting {
+    <#
+        A number of seconds from the config, or $Default when what is there is not one.
+
+        Read inline as a [double] cast before, where a hand-edited "often" threw out of
+        the reconcile on every pass - past the step that marks the daemon alive - so a
+        typo in a polling interval looked exactly like a daemon that had stopped.
+    #>
+    param([Parameter(Mandatory)][string]$Name, [Parameter(Mandatory)][double]$Default)
+
+    $parsed = 0.0
+    $text = [string](Get-BridgeSetting $Name $Default)
+    if ([double]::TryParse($text, [Globalization.NumberStyles]::Float, [Globalization.CultureInfo]::InvariantCulture, [ref]$parsed) -and
+        -not [double]::IsNaN($parsed) -and -not [double]::IsInfinity($parsed)) {
+        return $parsed
+    }
+    $Default
+}
+
+function Get-BridgeUsageClientState {
+    <#
+        One client's pacing, created the first time anything asks for it.
+
+        A client nobody has asked about starts at the beginning of time, so it is
+        simply overdue and the first pass after the daemon starts asks for all of them.
+    #>
+    param([Parameter(Mandatory)][string]$Client)
+
+    if (-not $script:DaemonUsageClients.ContainsKey($Client)) {
+        $script:DaemonUsageClients[$Client] = @{
+            CheckedAt = [DateTimeOffset]::MinValue
+            Busy      = $false
+            Signature = ''
+            Retry     = $false
+        }
+    }
+    $script:DaemonUsageClients[$Client]
+}
+
+function Test-BridgeUsageBusy {
+    <#
+        Whether a session of this client is open on this machine.
+
+        "Open", not "working": a session at its prompt is spending nothing, but it is
+        the one whose person is about to, and it is when somebody is at a terminal that
+        the card is being looked at. Telling the two apart would also need the status of
+        every session, where this needs only that one exists.
+
+        $null means discovery could not say - it was incomplete, or the caller had none
+        - and then every client counts as busy. A wrong "idle" leaves a figure stale; a
+        wrong "busy" only asks at the pace it always did.
+    #>
+    param([Parameter(Mandatory)][string]$Client, [AllowNull()]$Live)
+
+    if ($null -eq $Live) { return $true }
+    foreach ($session in @($Live.Values)) {
+        # An entry with no kind is Copilot's, as Get-DaemonEntryKind has it. Not called
+        # from here because this file is loaded without daemon-agents.ps1 in its tests.
+        $kind = if ($null -ne $session -and $session.PSObject.Properties['Kind'] -and $session.Kind) { [string]$session.Kind } else { 'copilot' }
+        if ($kind -eq $Client) { return $true }
+    }
+    $false
+}
+
+function Test-BridgeUsageDue {
+    <#
+        Whether a client is owed another ask.
+
+        Four things make it so. The pace for what the client is doing has elapsed. A
+        session of it has opened or closed since the last ask, which is the figure
+        someone starting work wants and the final tally of one that just finished -
+        but never within $Gap of that last ask, and only when $Known: a pass where
+        discovery could not say sets the pace and nothing more. Counted as a session
+        opening, it made the next ordinary pass look like one closing, so a single
+        torn read of a registration cost every idle client two asks that had nothing
+        to do with it. The last reading could not be published, in which case the busy
+        pace applies however idle it is, so a failure costs two minutes and not a
+        quarter of an hour. Or the clock has gone backwards: the elapsed time would be
+        negative and hold every ask off until the clock caught up with itself.
+    #>
+    param(
+        [Parameter(Mandatory)]$State,
+        [Parameter(Mandatory)][bool]$Busy,
+        [Parameter(Mandatory)][bool]$Known,
+        [Parameter(Mandatory)][DateTimeOffset]$Now,
+        [Parameter(Mandatory)][double]$Interval,
+        [Parameter(Mandatory)][double]$IdleInterval,
+        [Parameter(Mandatory)][double]$Gap
+    )
+
+    $elapsed = ($Now - $State.CheckedAt).TotalSeconds
+    if ($elapsed -lt 0) { return $true }
+    if ($elapsed -ge $(if ($Busy -or $State.Retry) { $Interval } else { $IdleInterval })) { return $true }
+    $Known -and ($Busy -ne [bool]$State.Busy) -and $elapsed -ge $Gap
+}
+
+function Get-BridgeUsageSignature {
+    <#
+        Everything about a reading except when it was taken, so a poll that found no
+        change does not republish a retained message for the sake of a new timestamp.
+        The account counts as part of the reading: the same windows under another
+        account are another reading, and the card groups on it.
+    #>
+    param([Parameter(Mandatory)]$Record)
+
+    @($Record.client, $Record.account, $Record.account_id, $Record.source, $Record.error,
+        ($Record.windows | ForEach-Object { "$($_.key)=$($_.percent)" })) -join '|'
+}
+
 function Sync-DaemonUsage {
     <#
-        Publishes this machine's usage, at most every configured interval.
+        Publishes this machine's usage, each client at the pace its sessions set.
+
+        A client is asked about every usage.intervalSeconds while a session of it is
+        open on this machine and every usage.idleIntervalSeconds while none is; see
+        Test-BridgeUsageDue for what brings an ask forward. -Live is the session set
+        discovery just took, or $null when it could not say, which counts as every
+        client having one open. Each client keeps its own clock, so a Claude session
+        does not make Copilot's figure be asked for.
 
         Off by default for nobody: the figures are already on the dashboard's own
         machine, and `usage.publish: false` turns it off for anyone who would rather
         not have an allowance on a screen. The signature check keeps an unchanged
         reading off the MQTT bus between polls, which matters because every publish is
-        retained.
+        retained; it is kept per client, so one that moved does not republish the rest.
     #>
     param(
         [Parameter(Mandatory)][hashtable]$Headers,
+        [AllowNull()]$Live = $null,
         [DateTimeOffset]$Now = [DateTimeOffset]::Now
     )
 
     if (-not [bool](Get-BridgeSetting 'usage.publish' $true)) { return $false }
-    $interval = [double](Get-BridgeSetting 'usage.intervalSeconds' $script:BridgeUsageConfig.IntervalSeconds)
-    if (($Now - $script:DaemonUsageCheckedAt).TotalSeconds -lt $interval) { return $false }
-    $script:DaemonUsageCheckedAt = $Now
+    $interval = Get-BridgeUsageSetting 'usage.intervalSeconds' $script:BridgeUsageConfig.IntervalSeconds
+    # Never quicker than the busy pace: a machine doing nothing asking more often than
+    # one doing something would be backwards.
+    $idleInterval = [Math]::Max($interval, (Get-BridgeUsageSetting 'usage.idleIntervalSeconds' $script:BridgeUsageConfig.IdleIntervalSeconds))
+    $gap = [Math]::Min($interval, $script:BridgeUsageConfig.MinimumGapSeconds)
 
     $clients = Get-BridgeSelectedClients
     if ($null -eq $clients) { $clients = @('copilot', 'claude', 'codex') }
-    $clients = @($clients | Where-Object { $_ -ne 'mcp' })
+    $clients = @($clients | Where-Object { $_ -ne 'mcp' } | ForEach-Object { ([string]$_).ToLowerInvariant() } | Select-Object -Unique)
     if ($clients.Count -eq 0) { return $false }
 
+    $known = $null -ne $Live
+    $due = @()
+    foreach ($client in $clients) {
+        $state = Get-BridgeUsageClientState -Client $client
+        $busy = Test-BridgeUsageBusy -Client $client -Live $Live
+        if (-not (Test-BridgeUsageDue -State $state -Busy $busy -Known $known -Now $Now -Interval $interval -IdleInterval $idleInterval -Gap $gap)) { continue }
+        # Stamped before asking, so an ask that fails still waits its turn rather than
+        # being repeated on every pass until one works.
+        $state.CheckedAt = $Now
+        # What discovery could not see is not remembered as the state of the sessions,
+        # or the pass after it would be compared against a state that never existed.
+        if ($known) { $state.Busy = $busy }
+        $state.Retry = $false
+        $due += $client
+    }
+    if ($due.Count -eq 0) { return $false }
+
     try {
-        $records = @(Get-BridgeAgentAllowance -Clients $clients)
+        $records = @(Get-BridgeAgentAllowance -Clients $due)
     }
     catch {
         if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
@@ -1084,34 +1240,57 @@ function Sync-DaemonUsage {
     }
     if ($records.Count -eq 0) { return $false }
 
-    # Everything except when it was taken, so a poll that found no change does not
-    # republish a retained message every two minutes for the sake of a new timestamp.
-    # The account counts as part of the reading: the same windows under another
-    # account are another reading, and the card groups on it.
-    $signature = ($records | ForEach-Object {
-        @($_.client, $_.account, $_.account_id, $_.source, $_.error, ($_.windows | ForEach-Object { "$($_.key)=$($_.percent)" })) -join '|'
-    }) -join ';'
-    if ($signature -ceq $script:DaemonUsageSignature) { return $false }
+    $changed = @()
+    $signatures = @{}
+    foreach ($record in $records) {
+        $client = [string]$record.client
+        $signature = Get-BridgeUsageSignature -Record $record
+        if ($signature -ceq (Get-BridgeUsageClientState -Client $client).Signature) { continue }
+        $changed += $record
+        $signatures[$client] = $signature
+    }
 
-    try {
-        Publish-CopilotMqttUsage -Records $records -Headers $Headers
-        $script:DaemonUsageSignature = $signature
-
-        # Home Assistant ignores object_id on an MQTT entity and names it after the
-        # device, so the ids the dashboard was built around have to be forced. Done
-        # when the set of clients changes rather than on every publish: the correction
-        # needs the whole entity registry, which is thousands of rows, while the
-        # reading itself changes every few minutes on a busy machine.
-        $published = (@($records | ForEach-Object { [string]$_.client } | Sort-Object -Unique)) -join ','
-        if ($published -cne $script:DaemonUsageEntityIds) {
-            [void](Set-CopilotMqttUsageEntityIds -Clients @($records | ForEach-Object { [string]$_.client }))
-            $script:DaemonUsageEntityIds = $published
+    $published = $false
+    if ($changed.Count -gt 0) {
+        try {
+            Publish-CopilotMqttUsage -Records $changed -Headers $Headers
+            foreach ($client in $signatures.Keys) { (Get-BridgeUsageClientState -Client $client).Signature = $signatures[$client] }
+            $published = $true
         }
-        return $true
+        catch {
+            if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+            # What was read was fine and went nowhere, so it is worth asking again soon
+            # rather than after however long the idle pace is.
+            foreach ($client in $signatures.Keys) { (Get-BridgeUsageClientState -Client $client).Retry = $true }
+            Write-DaemonLog -Message "usage could not be published: $($_.Exception.Message)"
+            return $false
+        }
     }
-    catch {
-        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
-        Write-DaemonLog -Message "usage could not be published: $($_.Exception.Message)"
-        return $false
+
+    # Home Assistant ignores object_id on an MQTT entity and names it after the
+    # device, so the ids the dashboard was built around have to be forced. Done when
+    # the set of clients with a sensor changes rather than on every publish: the
+    # correction needs the whole entity registry, which is thousands of rows, while the
+    # reading itself changes every few minutes on a busy machine. The whole set is
+    # passed each time, not just what is new, so an earlier client the registry had
+    # not caught up with yet is corrected on the way.
+    #
+    # Checked on every ask that read anything, not only one that published, and apart
+    # from the publish above: a correction that failed was otherwise never tried
+    # again, because the readings were by then unchanged and the ask ended before it
+    # got here. And a failure of it is no reason to read the vendors again - the
+    # reading was fine and is already on the bus.
+    $sensors = @($script:DaemonUsageClients.Keys | Where-Object { $script:DaemonUsageClients[$_].Signature } | Sort-Object)
+    $sensorKey = $sensors -join ','
+    if ($sensorKey -cne $script:DaemonUsageEntityIds) {
+        try {
+            [void](Set-CopilotMqttUsageEntityIds -Clients $sensors)
+            $script:DaemonUsageEntityIds = $sensorKey
+        }
+        catch {
+            if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+            Write-DaemonLog -Message "usage entity ids could not be corrected: $($_.Exception.Message)"
+        }
     }
+    $published
 }

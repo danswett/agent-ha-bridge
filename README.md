@@ -404,7 +404,8 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `updates.checkHours` | How often to check GitHub for a release (default `6`, i.e. 4×/day) |
 | `updates.token` | Optional GitHub token for release checks only, sent to `api.github.com` and never logged. Unauthenticated callers share **60 requests an hour per IP**, so a Dev Box or anything else behind shared egress can be refused without the bridge having made a request of its own. `AGENT_HA_BRIDGE_UPDATE_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN` in the environment are used too, in that order, when the setting is empty - a machine that already has one needs no configuration. If a token is rejected as bad credentials, the check is retried without one rather than failing - an ambient `GITHUB_TOKEN` expires when its workflow job ends, and these are public releases. A read-only token with no scopes is enough for them |
 | `usage.publish` | Set to `false` to stop collecting and publishing each agent's remaining allowance (default `true`). This stops the vendor calls, not just the card |
-| `usage.intervalSeconds` | How often to re-read the allowances (default `120`). Copilot's figure moves continuously while a session runs, so this is a poll rather than a cache read |
+| `usage.intervalSeconds` | How often to re-read an agent's allowance while a session of that agent is open on this machine (default `120`). Copilot's figure moves continuously while a session runs, so this is a poll rather than a cache read |
+| `usage.idleIntervalSeconds` | How often to re-read it while none is (default `900`, and never less than `usage.intervalSeconds`). An allowance belongs to the account, not the machine, so a machine with nothing open is not what is spending it. A session opening or closing asks at once — see [How current it is](#how-current-it-is) |
 | `usage.keychain` | Set to `true` to let the Copilot allowance read its token from the macOS login keychain (default `false`). Off because the read raises an authorization panel that **Always Allow** cannot silence — the CLI replaces the item on every token refresh, so each grant outlives its item by minutes. `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN` get the same figure without prompting, and so does a machine signed in to the GitHub CLI (`gh auth login`) as the same account — see [Agent usage](#agent-usage). No effect on Windows, which reads the credential store silently |
 
 Prefer keeping tokens out of a file? Leave `token` / `agentToken` empty and set the
@@ -935,9 +936,11 @@ order is `gh auth token`, and the daemon takes it too, asking for the login Copi
 signed in as: `gh auth token --hostname github.com --user <login>`. `gh` reads and writes
 its keychain entries through `/usr/bin/security`, which therefore already trusts them, so
 no panel is raised and `gh auth login` as that account is the whole setup. It is asked
-afresh on each poll, so signing in heals the card within two minutes; a `gh` that never
-answers is not asked again until the daemon restarts, so a keyring waiting to be unlocked
-cannot become the same storm. The same rung covers a Windows or Linux machine whose
+afresh on each poll, so signing in heals the card on the next one — within two minutes
+with a session open, a quarter of an hour without (see
+[How current it is](#how-current-it-is)); a `gh` that never answers is not asked again
+until the daemon restarts, so a keyring waiting to be unlocked cannot become the same
+storm. The same rung covers a Windows or Linux machine whose
 Copilot access comes from `gh`, with no item of the CLI's own to read. The daemon looks
 for `gh` in Homebrew's and the installers' folders as well as on `PATH`, since a
 LaunchAgent's `PATH` does not include them.
@@ -953,12 +956,35 @@ octocat - run gh auth login).*
 
 ### How current it is
 
-The daemon re-reads the allowances every `usage.intervalSeconds` (120 by default) and
-publishes only when a figure has actually moved, since every publish is retained. Home
-Assistant then pushes that change straight to any open dashboard, so **a card you are
-looking at redraws within a second of the daemon publishing** — there is nothing to
-refresh. In practice that means Copilot is never more than two minutes behind, which is
-the point: its figure was measured moving continuously during an active session.
+An allowance belongs to the account, not the machine, so every machine signed in to it
+asking every two minutes was the same question from each of them, for an answer that
+only the machine doing the work could be changing. Each machine therefore asks about
+each agent at a pace set by that agent's sessions *on that machine*: every
+`usage.intervalSeconds` (120 by default) while one is open, and every
+`usage.idleIntervalSeconds` (900) while none is. A session opening or closing asks at
+once — the figure you sit down to is current, and the last one for a session that just
+finished includes what it spent — but never within 30 seconds of the previous ask, so a
+session that keeps restarting cannot turn the idle pace back into a storm. Each agent
+keeps its own clock: a Claude session does not make Copilot's figure be asked for.
+
+"Open" means the bridge can see the session, not that it is busy: one sitting at its
+prompt is the one whose person is about to spend. When discovery cannot account for
+every session — an adapter could not be read — every agent counts as having one open and
+the quick pace applies, since a missed session must not be what lets a figure go stale.
+That is only a pace: such a pass is not counted as a session opening, nor the pass after
+it as one closing, so a momentary failure to read a registration does not bring every
+agent's next ask forward.
+
+The daemon publishes only when a figure has actually moved, since every publish is
+retained. Home Assistant then pushes that change straight to any open dashboard, so **a
+card you are looking at redraws within a second of the daemon publishing** — there is
+nothing to refresh. In practice that means Copilot is never more than two minutes behind
+on a machine you are working in, which is the point: its figure was measured moving
+continuously during an active session. A machine with nothing open can be up to a
+quarter of an hour behind, but the card shows whichever machine read the account most
+recently, so the machine where the work is happening is the one you are looking at. A
+reading that could not be published is asked for again at the quick pace, not the idle
+one.
 
 The card also runs a half-minute timer of its own, purely so the relative text —
 `37m ago`, `resets in 3h` — keeps up when nothing is being pushed. Codex's figures can
