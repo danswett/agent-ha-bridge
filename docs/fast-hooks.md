@@ -508,12 +508,14 @@ program. So:
   direction has to be a prompt, not unearned blanket approval, which is also why the
   comparison is case-sensitive.
 
-  **Allow all** now also answers Claude's folder-trust dialog instead of waiting for a
-  second Launch press. That dialog is the one prompt `--dangerously-skip-permissions`
-  cannot waive - Claude skips it only in non-interactive mode (`-p`, or a non-TTY) and
-  a bridge window is deliberately interactive - so an unattended launch stopped there,
-  which is exactly the deadlock the setting exists to avoid. Ordinary launches still
-  ask for their second press.
+  **Allow all** now also answers Claude's startup questions instead of waiting for a
+  second Launch press. There are two, and neither is waived by
+  `--dangerously-skip-permissions`: the folder-trust dialog, which Claude skips only in
+  non-interactive mode (`-p`, or a non-TTY) and a bridge window is deliberately
+  interactive, and the Bypass Permissions warning, which is that flag asking to confirm
+  itself. An unattended launch stopped at whichever came next, which is exactly the
+  deadlock the setting exists to avoid. Ordinary launches still ask for their second
+  press, now naming which question is waiting.
 
   The lesson is the same one 1.14.2 recorded, in a new place. Both features had tests
   at each end - a user id mapped, a flag translated per agent - and nothing following a

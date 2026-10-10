@@ -155,7 +155,8 @@ Write-Host '--- a slow launch is still watched, so a late trust prompt is caught
 # work with. The first launch gave up after 90 s; the next one found the prompt in two.
 $script:Notes = @()
 $script:TrustPrompt = ''
-function Read-BridgeTrustPrompt { param([int]$ProcessId) $script:TrustPrompt }
+$script:TrustKind = 'trust'
+function Read-BridgeStartupPrompt { param([int]$ProcessId) New-BridgeStartupPrompt -Kind $(if ($script:TrustPrompt) { $script:TrustKind } else { '' }) -Selection $script:TrustPrompt }
 function Send-BridgeTrustAnswer { param([int]$ProcessId, [string]$Selection) 'ok' }
 $script:DaemonPendingLaunch = [pscustomobject]@{
     SessionId = ''; Launcher = 'claude'; ProcessId = $otherPid; Label = 'danswett'; Verb = 'Started'

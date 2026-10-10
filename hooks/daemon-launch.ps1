@@ -1504,9 +1504,10 @@ function Test-DaemonNewSessionPressed {
 
 function Confirm-DaemonPendingTrust {
     <#
-        Takes a press while a launched Claude session is asking whether to trust its
-        folder as the user's confirmation, not a request for another session: trusting
-        lets Claude read, edit and run files there, so the bridge only ever answers it
+        Takes a press while a launched Claude session is asking one of its startup
+        questions as the user's confirmation, not a request for another session:
+        trusting lets Claude read, edit and run files there, and accepting Bypass
+        Permissions mode waives its approval prompts, so the bridge only ever answers
         on this deliberate second press. The answer is sent on the next pass, from the
         screen as it is then. Returns whether the press was that.
     #>
@@ -1519,8 +1520,14 @@ function Confirm-DaemonPendingTrust {
     $pending.TrustConfirmed = $true
     $pending.LastCheck = [DateTimeOffset]::MinValue
     $agent = Get-BridgeLauncherLabel -Launcher ([string]$pending.Launcher)
-    Write-DaemonLog -Message "Launch pressed again: trusting the folder for the $agent session in $($pending.Label)"
-    Set-CopilotMqttNewSessionResult -Headers $Headers -Text "Trusting $($pending.Label) for $agent..." | Out-Null
+    # What was actually asked, recorded when the question was put on the card, so the
+    # confirmation names the Bypass Permissions warning rather than claiming a folder
+    # was trusted.
+    $asking = if ($pending.PSObject.Properties['TrustAsking'] -and $pending.TrustAsking) {
+        [string]$pending.TrustAsking
+    } else { "trust $($pending.Label)" }
+    Write-DaemonLog -Message "Launch pressed again: accepting '$asking' for the $agent session in $($pending.Label)"
+    Set-CopilotMqttNewSessionResult -Headers $Headers -Text "Accepting $asking for $agent..." | Out-Null
     Update-DaemonPendingLaunch -Headers $Headers | Out-Null
     $true
 }
@@ -2016,16 +2023,21 @@ function Start-DaemonLaunch {
             Since          = $launchedAt
             LastCheck      = [DateTimeOffset]::MinValue
             TrustAskedAt   = $null
-            # Allow all means "launch without permission prompts", and Claude's folder
-            # trust dialog is one - the one flag that cannot waive it, because Claude only
-            # skips that dialog in non-interactive mode and a bridge window is deliberately
-            # interactive. Left needing a second press, an unattended launch simply stops
-            # there with nobody at the keyboard, which is the deadlock the setting exists
-            # to avoid. The folder is one of the configured workspaces and the choice was
-            # made on the press, so the confirmation this stands in for has already
-            # happened; an ordinary launch still asks for its second press.
+            # Allow all means "launch without permission prompts", and Claude's two
+            # startup questions are both prompts the flag cannot waive: it only skips
+            # the folder-trust dialog in non-interactive mode, and a bridge window is
+            # deliberately interactive, while the Bypass Permissions warning is
+            # --dangerously-skip-permissions asking to confirm itself. Left needing a
+            # second press, an unattended launch simply stops there with nobody at the
+            # keyboard, which is the deadlock the setting exists to avoid. The folder
+            # is one of the configured workspaces and the choice was made on the press,
+            # so the confirmation this stands in for has already happened; an ordinary
+            # launch still asks for its second press.
             TrustConfirmed = $allowAllTools
+            # One budget per question: see Update-DaemonPendingLaunch.
             TrustAnswers   = 0
+            BypassAnswers  = 0
+            TrustAsking    = ''
             # Who pressed Launch, carried from the press to whichever session it produces:
             # a session an agent started should show as agent-driven from the moment it
             # appears, not only once the agent first replies to it.
@@ -2096,11 +2108,13 @@ function Test-DaemonLaunchProgressNote {
     param([AllowEmptyString()][AllowNull()][string]$Text)
     $t = ([string]$Text).Trim()
     if (-not $t) { return $false }
-    # "<Agent> is open in ...", "<Agent> is asking whether to trust ..." and "<Agent> in
+    # "<Agent> is open in ...", "<Agent> is asking whether to trust ...", "<Agent> is
+    # asking whether to accept ..." (the Bypass Permissions warning) and "<Agent> in
     # <folder> is asking you to trust ...", for any agent (see Update-DaemonPendingLaunch);
     # "is still asking" is an outcome, and not matched.
     $t.EndsWith('...') -or $t -like '* is open in *. It appears here after*' -or
-        $t -like '* is asking whether to trust *' -or $t -like '* is asking you to trust *'
+        $t -like '* is asking whether to trust *' -or $t -like '* is asking whether to accept *' -or
+        $t -like '* is asking you to trust *'
 }
 
 function Clear-DaemonStaleNote {
@@ -2232,24 +2246,40 @@ function Update-DaemonPendingLaunch {
     }
 
     if ((Get-BridgeLauncher -Launcher $p.Launcher).AnswersTrustPrompt -and $p.ProcessId -gt 0) {
-        $selection = Read-BridgeTrustPrompt -ProcessId $p.ProcessId
-        if ($selection) {
+        $prompt = Read-BridgeStartupPrompt -ProcessId $p.ProcessId
+        if ($prompt.Kind) {
+            # Claude asks two of these in a row for an Allow all launch - folder trust,
+            # then the Bypass Permissions warning --dangerously-skip-permissions brings
+            # with it - so each gets its own budget. Sharing one counter let a screen
+            # that had not repainted yet spend the allowance on the question already
+            # answered, leaving the next one unanswered and the launch parked where
+            # nobody at the dashboard could see it (#172).
+            $budget = if ($prompt.Kind -eq 'bypass') { 'BypassAnswers' } else { 'TrustAnswers' }
+            # Phrased so Test-DaemonLaunchProgressNote still reads the note as live:
+            # "is asking whether to ..." is a launch in progress, "is still asking" an
+            # outcome.
+            $asking = if ($prompt.Kind -eq 'bypass') {
+                "accept Bypass Permissions mode in $($p.Label)"
+            } else { "trust $($p.Label)" }
             if ($p.TrustConfirmed) {
-                if ($p.TrustAnswers -lt 3) {
-                    $p.TrustAnswers++
-                    $sent = Send-BridgeTrustAnswer -ProcessId $p.ProcessId -Selection $selection
-                    Write-DaemonLog -Message "answered $agent's trust question for $($p.Label) (highlight was '$selection'): $sent"
+                if (-not $p.PSObject.Properties[$budget]) { Set-DaemonSessionProperty -Entry $p -Name $budget -Value 0 }
+                if ($p.$budget -lt 3) {
+                    $p.$budget++
+                    $sent = Send-BridgeTrustAnswer -ProcessId $p.ProcessId -Selection $prompt.Selection
+                    Write-DaemonLog -Message ("answered $agent's $($prompt.Kind) question for $($p.Label) " +
+                        "(highlight was '$($prompt.Selection)'): $sent")
                 }
             }
             elseif ($null -eq $p.TrustAskedAt) {
                 $p.TrustAskedAt = $now
-                Write-DaemonLog -Message "$agent in $($p.Label) is asking whether to trust the folder; waiting for a second press"
+                Write-DaemonLog -Message "$agent in $($p.Label) is asking whether to $asking; waiting for a second press"
+                Set-DaemonSessionProperty -Entry $p -Name 'TrustAsking' -Value $asking
                 Set-CopilotMqttNewSessionResult -Headers $Headers `
-                    -Text "$agent is asking whether to trust $($p.Label). Press Launch again within 2 minutes to trust it and start."
+                    -Text "$agent is asking whether to $asking. Press Launch again within 2 minutes to accept it and start."
             }
             elseif (($now - $p.TrustAskedAt).TotalSeconds -gt 120) {
-                & $finish "$agent is still asking whether to trust $($p.Label) - answer it in its window." `
-                    "trust confirmation for $($p.Label) expired; left for the window"
+                & $finish "$agent is still asking whether to $asking - answer it in its window." `
+                    "startup confirmation for $($p.Label) expired; left for the window"
             }
             return
         }

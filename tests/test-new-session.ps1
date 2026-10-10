@@ -353,6 +353,55 @@ Test-That 'no question on screen reads as nothing' { (Get-BridgeTrustPromptSelec
 Test-That 'an unreadable screen reads as nothing' { (Get-BridgeTrustPromptSelection -Screen $null) -eq '' }
 
 Write-Host ''
+Write-Host '--- reading the Bypass Permissions warning off the screen ---'
+
+# Captured from a launch that stalled on DASDESK: Allow all answered the folder-trust
+# question, Claude then put this up - the warning --dangerously-skip-permissions brings
+# with it - and the bridge, which only knew the trust wording, read an empty screen and
+# waited out its ten minutes without it ever reaching the dashboard (#172).
+$bypassScreen = @'
+  WARNING: Claude Code running in Bypass Permissions mode
+
+  In Bypass Permissions mode, Claude Code will not ask for your approval before running potentially dangerous
+  commands.
+
+  By proceeding, you accept all responsibility for actions taken while running in Bypass Permissions mode.
+
+  https://code.claude.com/docs/en/security
+
+  > No, exit
+    Yes, I accept
+
+  Enter to confirm · Esc to cancel
+'@
+$bypassYes = "  WARNING: Claude Code running in Bypass Permissions mode`n`n    No, exit`n  > Yes, I accept`n"
+Test-That 'the warning is recognised, highlight and all' { (Get-BridgeBypassPromptSelection -Screen $bypassScreen) -eq 'no' }
+Test-That 'and a moved highlight reads Yes' { (Get-BridgeBypassPromptSelection -Screen $bypassYes) -eq 'yes' }
+# Both halves are required, so a session that merely mentions accepting something is
+# never answered blind with keystrokes.
+Test-That 'an accept option without the warning is not it' {
+    (Get-BridgeBypassPromptSelection -Screen "Terms`n > Yes, I accept`n   No, exit") -eq ''
+}
+Test-That 'and the warning alone, with no options, is not either' {
+    (Get-BridgeBypassPromptSelection -Screen 'Bypass Permissions mode is on') -eq ''
+}
+Test-That 'the trust reader does not claim the warning' { (Get-BridgeTrustPromptSelection -Screen $bypassScreen) -eq '' }
+Test-That 'nor the bypass reader the trust question' { (Get-BridgeBypassPromptSelection -Screen $noScreen) -eq '' }
+
+# One capture, one answer: which question is showing decides what the launch says and
+# which answer budget it spends.
+$startup = Get-BridgeStartupPromptSelection -Screen $bypassScreen
+Test-That 'a screen read names the question it found' { $startup.Kind -eq 'bypass' -and $startup.Selection -eq 'no' }
+Test-That 'the trust question is named too' {
+    $t = Get-BridgeStartupPromptSelection -Screen $noScreen
+    $t.Kind -eq 'trust' -and $t.Selection -eq 'no'
+}
+Test-That 'and a screen showing neither names nothing' {
+    $n = Get-BridgeStartupPromptSelection -Screen 'Welcome to Claude Code'
+    $n.Kind -eq '' -and $n.Selection -eq ''
+}
+
+Write-Host ''
 Write-Host '--- the profiles this machine actually has ---'
 
 # Agency's own listing, as `agency config profiles` prints it.
@@ -1201,9 +1250,10 @@ function Start-BridgeCopilotSession {
 # What the launched session is doing: registered yet, and what its screen shows.
 $script:FakeRegistered = $false
 $script:FakeTrustScreen = ''
+$script:FakeTrustKind = 'trust'
 $script:TrustAnswers = @()
 function Test-BridgeSessionRegistered { param([string]$SessionId, [string]$Launcher, [DateTimeOffset]$Since) $script:FakeRegistered }
-function Read-BridgeTrustPrompt { param([int]$ProcessId) $script:FakeTrustScreen }
+function Read-BridgeStartupPrompt { param([int]$ProcessId) New-BridgeStartupPrompt -Kind $(if ($script:FakeTrustScreen) { $script:FakeTrustKind } else { '' }) -Selection $script:FakeTrustScreen }
 function Send-BridgeTrustAnswer { param([int]$ProcessId, [string]$Selection) $script:TrustAnswers += $Selection; 'ok:2' }
 function Invoke-HomeAssistantService {
     param([string]$Domain, [string]$Service, [hashtable]$Data, [hashtable]$Headers)
@@ -1516,6 +1566,45 @@ Reset-NewSessionTest -Press '2026-06-01T12:40:20+00:00' -AgentState 'Claude'
 Sync-DaemonNewSession -Headers $headers -Live $noLive
 Test-That 'a second press confirms instead of starting another session' { $script:Launches.Count -eq 0 -and $script:DaemonPendingLaunch.TrustConfirmed }
 Test-That 'and answers from the highlighted option' { ($script:TrustAnswers -join ',') -eq 'no' }
+
+# The bug this section grew for: Claude asks a second question after the folder-trust
+# one when the launch asked for Allow all, and the bridge used to see an unreadable
+# screen and wait out its ten minutes - launched, unregistered, invisible, and holding
+# every other launch while discovery could not account for the process (#172).
+$script:FakeTrustKind = 'bypass'
+$script:FakeTrustScreen = 'no'
+$script:TrustAnswers = @()
+$script:Results = @()
+Invoke-FollowUp
+Test-That 'the Bypass Permissions warning that follows is answered too' {
+    ($script:TrustAnswers -join ',') -eq 'no'
+} ($script:TrustAnswers -join ',')
+Test-That 'and it is spent from its own budget, not the trust one' {
+    $script:DaemonPendingLaunch.BypassAnswers -eq 1 -and $script:DaemonPendingLaunch.TrustAnswers -eq 1
+} "bypass=$($script:DaemonPendingLaunch.BypassAnswers) trust=$($script:DaemonPendingLaunch.TrustAnswers)"
+Test-That 'the launch is still followed while it answers' { $null -ne $script:DaemonPendingLaunch }
+
+# Unconfirmed, the warning waits for a second press like the trust question - and the
+# note has to read as a launch in progress, or Clear-DaemonStaleNote wipes it while it
+# is still the live instruction.
+$script:DaemonPendingLaunch.TrustConfirmed = $false
+$script:DaemonPendingLaunch.TrustAskedAt = $null
+$script:TrustAnswers = @()
+$script:Results = @()
+Invoke-FollowUp
+Test-That 'an unconfirmed warning asks for a second press instead' {
+    ($script:Results -join ' ') -match 'asking whether to accept Bypass Permissions mode .* Press Launch again'
+} ($script:Results -join ' ')
+Test-That 'without sending any keys' { $script:TrustAnswers.Count -eq 0 }
+Test-That 'and that note counts as a launch in progress' {
+    Test-DaemonLaunchProgressNote -Text $script:Results[-1]
+} ($script:Results[-1])
+Test-That 'while giving up on it does not' {
+    -not (Test-DaemonLaunchProgressNote -Text 'Claude is still asking whether to accept Bypass Permissions mode in repo - answer it in its window.')
+}
+
+$script:FakeTrustKind = 'trust'
+$script:DaemonPendingLaunch.TrustConfirmed = $true
 
 $script:FakeTrustScreen = ''
 $script:FakeRegistered = $true

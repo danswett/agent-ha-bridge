@@ -3610,6 +3610,22 @@ namespace CopilotCli {
 '@
 }
 
+function New-BridgeStartupPrompt {
+    <#
+        One reading of a Claude startup question: which question it is ('trust',
+        'bypass' or '' for none) and which option is highlighted ('yes', 'no' or '').
+
+        Shared by the readers and by the tests that stand in for them, so a stub
+        cannot quietly omit a property that Set-StrictMode would then throw on.
+    #>
+    param(
+        [ValidateSet('', 'trust', 'bypass')][string]$Kind = '',
+        [ValidateSet('', 'yes', 'no')][string]$Selection = ''
+    )
+
+    [pscustomobject]@{ Kind = $Kind; Selection = $Selection }
+}
+
 function Get-BridgeTrustPromptSelection {
     <#
         Reads Claude's "Do you trust this folder?" question off a console screen.
@@ -3626,26 +3642,73 @@ function Get-BridgeTrustPromptSelection {
     ''
 }
 
-function Read-BridgeTrustPrompt {
+function Get-BridgeBypassPromptSelection {
     <#
-        Looks at a Claude session's screen for its "Do you trust this folder?" question.
-        Returns 'yes' or 'no' for the highlighted option, or '' when the question is not
-        showing. Whether Claude will ask cannot be predicted reliably from its config -
-        it has honoured entries its own code path would not suggest - so the bridge
-        reads what is actually on screen.
+        Reads Claude's "running in Bypass Permissions mode" acceptance off a console
+        screen, the same way. Returns 'yes', 'no' or ''.
+
+        This is the *second* question --dangerously-skip-permissions cannot waive, and
+        it is the flag's own: passing it makes Claude demand this acknowledgement
+        before the session starts. Both the warning wording and the accept option have
+        to be there, so an ordinary "Yes, I accept" somewhere in a transcript is not
+        mistaken for the dialog and answered blind.
+    #>
+    param([AllowEmptyString()][AllowNull()][string]$Screen)
+
+    if ([string]::IsNullOrWhiteSpace($Screen) -or
+        $Screen -notmatch 'Yes, I accept' -or $Screen -notmatch 'Bypass Permissions') { return '' }
+    foreach ($line in ($Screen -split "`n")) {
+        if ($line -match '^\s*[>❯›]\s*Yes, I accept') { return 'yes' }
+        if ($line -match '^\s*[>❯›]\s*No, exit') { return 'no' }
+    }
+    ''
+}
+
+function Get-BridgeStartupPromptSelection {
+    <#
+        Whichever of Claude's startup questions a screen is showing, from one capture.
+
+        It asks them in order - folder trust, then the Bypass Permissions warning when
+        the launch asked for Allow all - so the trust question is looked for first and
+        the screen can only ever be one of them. Pure, so it can be tested against
+        captured screens.
+    #>
+    param([AllowEmptyString()][AllowNull()][string]$Screen)
+
+    $trust = Get-BridgeTrustPromptSelection -Screen $Screen
+    if ($trust) { return (New-BridgeStartupPrompt -Kind 'trust' -Selection $trust) }
+    $bypass = Get-BridgeBypassPromptSelection -Screen $Screen
+    if ($bypass) { return (New-BridgeStartupPrompt -Kind 'bypass' -Selection $bypass) }
+    New-BridgeStartupPrompt
+}
+
+function Read-BridgeStartupPrompt {
+    <#
+        Looks at a Claude session's screen for whichever startup question is holding it
+        back, in a single capture. Returns a Kind/Selection pair; an empty Kind means
+        neither is showing.
+
+        Whether Claude will ask cannot be predicted reliably from its config - it has
+        honoured entries its own code path would not suggest, and the Bypass
+        Permissions warning is not recorded in its config at all - so the bridge reads
+        what is actually on screen. One read, not one per question: reading attaches to
+        that console and detaches after.
     #>
     param([Parameter(Mandatory)][int]$ProcessId)
 
     try {
-        Get-BridgeTrustPromptSelection -Screen (Read-BridgeConsoleScreen -ProcessId $ProcessId)
+        Get-BridgeStartupPromptSelection -Screen (Read-BridgeConsoleScreen -ProcessId $ProcessId)
     }
-    catch { '' }
+    catch { New-BridgeStartupPrompt }
 }
 
 function Send-BridgeTrustAnswer {
     <#
-        Answers Claude's trust question with "Yes, I trust this folder", given which
-        option is highlighted now. Only called after the user explicitly confirmed.
+        Accepts whichever of Claude's startup questions is showing - "Yes, I trust this
+        folder" or "Yes, I accept" for Bypass Permissions mode - given which option is
+        highlighted now. Only called after the user explicitly confirmed.
+
+        One set of keys serves both: each is a two-option list with "No, exit" first.
 
         Never blind: the option list wraps, so one Down too many lands back on
         "No, exit" and closes the session (verified). From "No" it is Down then Enter;
