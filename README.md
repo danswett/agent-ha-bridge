@@ -883,7 +883,9 @@ Each client gets its own sensor per machine —
 Home Assistant records the history and you can graph or alert on it like anything
 else. The **Agent usage** card groups them by account, not by machine: an allowance
 belongs to a login, so two machines signed in to the same account are reconciled to
-whichever read it most recently rather than drawn twice.
+whichever read it most recently rather than drawn twice. A machine that tried and
+failed has not read it, so it never displaces a reading another machine took, however
+much newer its attempt is (see [When a read fails](#when-a-read-fails)).
 
 | | |
 |---|---|
@@ -965,6 +967,15 @@ outer message for a failed HTTPS call is *"The SSL connection could not be estab
 see inner exception"* — which names no cause and points at something a card cannot
 show. The cause (*"An existing connection was forcibly closed by the remote host"*) is
 always a level or two further down.
+
+The same rule holds across machines. A machine that cannot read an account's allowance
+at all still publishes a record, with no figure and the time of the *attempt* as its
+timestamp, so judged on the clock alone it would always look newer than a reading
+another machine took earlier and would replace it with a bare error. The card ranks a
+reading above a failed attempt first and uses the clock only to choose among readings,
+or among failures when nothing was read. When the reading it keeps is over an hour old,
+the newer failure's reason is shown beneath it, so the figure and the explanation for
+why it has not moved are on screen together.
 
 ---
 

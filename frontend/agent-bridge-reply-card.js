@@ -53,7 +53,7 @@
  * naming the publish it used, and the card holds the words until it sees that name
  * or sees the question go without it - see _checkAnswerConsumed (#104).
  */
-const CARD_VERSION = '1.31.0';
+const CARD_VERSION = '1.33.0';
 
 /*
  * How large a non-image attachment may be.
@@ -3188,21 +3188,25 @@ class AgentBridgeUsageCard extends HTMLElement {
   }
 
   // One entry per client+account, carrying the freshest reading any machine has.
+  //
+  // A reading outranks a failure however new the failure is, and only then does the
+  // clock decide. A read that fails with nothing to fall back on still returns a
+  // record, and New-BridgeUsageRecord stamps it with the time of the *attempt*, so
+  // judged on the clock alone a machine that cannot read an account's allowance
+  // outvotes one that can: the card showed an error and no figure although the figure
+  // was on the dashboard one entity over.
   _collect() {
-    const best = new Map();
+    const slots = new Map();
     for (const entityId of this._config.entities) {
       const entity = this._hass ? this._hass.states[entityId] : undefined;
       if (!entity || !entity.attributes) { continue }
       const a = entity.attributes;
       if (!a.client) { continue }
       const key = `${a.client}\u0000${a.account || ''}`;
-      const at = Date.parse(a.measured_at || a.updated || '') || 0;
-      const prior = best.get(key);
-      if (prior && prior.at >= at) { continue }
       const percent = Number.parseFloat(entity.state);
-      best.set(key, {
+      const entry = {
         key,
-        at,
+        at: Date.parse(a.measured_at || a.updated || '') || 0,
         percent: Number.isFinite(percent) ? percent : null,
         label: a.label || a.client,
         account: a.account || '',
@@ -3210,10 +3214,34 @@ class AgentBridgeUsageCard extends HTMLElement {
         machine: a.machine || '',
         error: a.error || '',
         windows: Array.isArray(a.windows) ? a.windows : [],
-      });
+      };
+      const kind = AgentBridgeUsageCard._hasReading(entry) ? 'reading' : 'failure';
+      const slot = slots.get(key) || {};
+      if (!slot[kind] || slot[kind].at < entry.at) { slot[kind] = entry }
+      slots.set(key, slot);
+    }
+
+    const entries = [];
+    for (const { reading, failure } of slots.values()) {
+      if (!reading) { entries.push(failure); continue }
+      // The reading is what is drawn, but a failure newer than it is still the latest
+      // word on why nothing fresher exists. _renderGroup shows an error only once the
+      // reading has gone stale, so while the reading is fresh this changes nothing; it
+      // is what keeps the reason on screen when the reading is hours old.
+      entries.push(failure && failure.error && failure.at > reading.at
+        ? Object.assign({}, reading, { error: failure.error })
+        : reading);
     }
     // Closest to running out first: that is the one worth seeing without scrolling.
-    return Array.from(best.values()).sort((x, y) => (y.percent || 0) - (x.percent || 0));
+    return entries.sort((x, y) => (y.percent || 0) - (x.percent || 0));
+  }
+
+  // Whether a record carries a figure at all, as opposed to only the reason there
+  // is not one. One definition, so choosing a record and deciding whether to report
+  // its error can never disagree about which kind it is.
+  static _hasReading(entry) {
+    return Number.isFinite(entry.percent) ||
+      (Array.isArray(entry.windows) && entry.windows.length > 0);
   }
 
   // An hour old is not a reading, it is a memory - and Codex's only source is its
@@ -3312,8 +3340,7 @@ class AgentBridgeUsageCard extends HTMLElement {
     // it with the time of the *attempt* - so an error-only record is always "fresh",
     // and keying off the age alone hid the one diagnostic there was for an hour, at
     // exactly the moment there were no bars to justify hiding it.
-    const hasReading = Number.isFinite(entry.percent) ||
-      (Array.isArray(entry.windows) && entry.windows.length > 0);
+    const hasReading = AgentBridgeUsageCard._hasReading(entry);
     const fresh = entry.at > 0 && !AgentBridgeUsageCard._isStale(entry.at);
     if (entry.error && !(hasReading && fresh)) {
       const error = document.createElement('div');
