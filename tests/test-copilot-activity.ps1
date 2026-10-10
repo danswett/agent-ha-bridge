@@ -686,6 +686,52 @@ try {
         (Get-DaemonBackgroundShellCount -Entry ([pscustomobject]@{ Status = 'idle' })) -eq 0
     }
 
+    # A replacement process inherits whatever its predecessor wrote and the daemon had
+    # not read yet. Clearing the saved set is not enough on its own: the unread tail
+    # still carries the dead process's start marker, and adopting it pins a command
+    # that can never report back to the process now running - which parks the card on
+    # 'shell' for the life of the session, the one failure waiting does not fix.
+    $tailLog = Join-Path ([IO.Path]::GetTempPath()) "copilot-tail-$([guid]::NewGuid().ToString('N')).jsonl"
+    try {
+        $tailEntry = [pscustomobject]@{ Offset = 0; Name = 'Copilot: build'; Machine = 'DESK'; Status = 'idle'; Kind = 'copilot' }
+        Set-DaemonSessionProperty -Entry $tailEntry -Name 'BackgroundShells' -Value @('dead')
+        Set-DaemonSessionProperty -Entry $tailEntry -Name 'BackgroundShellsOwner' -Value "$PID|1"
+        $tailSession = [pscustomobject]@{ SessionId = $shellSessionId; Transcript = $tailLog; ProcessId = $PID }
+        Set-Content -LiteralPath $tailLog -Value @((New-ShellStarted 'orphaned'), '{"type":"assistant.turn_end"}') -Encoding utf8
+        Update-DaemonSessionActivity -Id $shellSessionId -Entry $tailEntry -Session $tailSession -Headers @{} -VerboseOn $false
+        Test-That 'a command left in the unread tail is not adopted by the process that replaced it' {
+            $tailEntry.Status -eq 'idle' -and @($tailEntry.BackgroundShells).Count -eq 0
+        } "$($tailEntry.Status), outstanding=$(@($tailEntry.BackgroundShells) -join ',')"
+        # And the replacement is now pinned, or every later pass would read as another
+        # replacement and go on throwing away the live process's own commands.
+        Test-That 'and the replacement is pinned, so its own work is not thrown away next' {
+            $tailEntry.BackgroundShellsOwner -like "$PID|*" -and $tailEntry.BackgroundShellsOwner -ne "$PID|1"
+        } "owner=$($tailEntry.BackgroundShellsOwner)"
+        Add-Content -LiteralPath $tailLog -Value @((New-ShellStarted 'mine'), '{"type":"assistant.turn_end"}') -Encoding utf8
+        Update-DaemonSessionActivity -Id $shellSessionId -Entry $tailEntry -Session $tailSession -Headers @{} -VerboseOn $false
+        Test-That 'what it starts itself is still tracked' {
+            $tailEntry.Status -eq 'shell' -and (@($tailEntry.BackgroundShells) -join ',') -eq 'mine'
+        } "$($tailEntry.Status), outstanding=$(@($tailEntry.BackgroundShells) -join ',')"
+
+        # The same tail, but with the attach written before the command. That one the
+        # new process really did start, so dropping it would under-report live work.
+        $afterEntry = [pscustomobject]@{ Offset = 0; Name = 'Copilot: build'; Machine = 'DESK'; Status = 'idle'; Kind = 'copilot' }
+        Set-DaemonSessionProperty -Entry $afterEntry -Name 'BackgroundShells' -Value @('dead')
+        Set-DaemonSessionProperty -Entry $afterEntry -Name 'BackgroundShellsOwner' -Value "$PID|1"
+        $afterLog = Join-Path ([IO.Path]::GetTempPath()) "copilot-after-$([guid]::NewGuid().ToString('N')).jsonl"
+        Set-Content -LiteralPath $afterLog -Value @(
+            (New-ShellStarted 'theirs'), '{"type":"session.resume"}', (New-ShellStarted 'ours'),
+            '{"type":"assistant.turn_end"}') -Encoding utf8
+        Update-DaemonSessionActivity -Id $shellSessionId -Entry $afterEntry `
+            -Session ([pscustomobject]@{ SessionId = $shellSessionId; Transcript = $afterLog; ProcessId = $PID }) `
+            -Headers @{} -VerboseOn $false
+        Test-That 'a command started after the attach is kept, and the one before it is not' {
+            (@($afterEntry.BackgroundShells) -join ',') -eq 'ours'
+        } "outstanding=$(@($afterEntry.BackgroundShells) -join ',')"
+        Remove-Item -LiteralPath $afterLog -Force -ErrorAction SilentlyContinue
+    }
+    finally { Remove-Item -LiteralPath $tailLog -Force -ErrorAction SilentlyContinue }
+
     # The moment this status exists for. End session asks for a second press and names
     # what the first one would interrupt; without a line of its own that read "this
     # session is shell", which tells the one person about to kill a running build
