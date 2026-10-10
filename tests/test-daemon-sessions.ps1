@@ -41,6 +41,15 @@ $script:DaemonHttpStates = @(
 )
 $script:DaemonHttpRequests = [Collections.Generic.List[object]]::new()
 $script:DaemonHttpTemplateRefused = $false
+# Derived from the ceiling rather than written out, so raising it does not quietly
+# leave the fixture modelling a session with fewer slots than the daemon provisions.
+# The provisioning probe asks for the *last* slot: a session published under a lower
+# ceiling has the first one and is missing everything added since.
+$script:DaemonFieldEntities = @(
+    1..$script:CopilotMqttMaxFields |
+        ForEach-Object { "select.agent_bridge_1111111100004000_f$_" }
+)
+$script:DaemonProbeFieldEntity = $script:DaemonFieldEntities[-1]
 function Invoke-RestMethod {
     param([string]$Method, [string]$Uri, [hashtable]$Headers, [object]$Body, [string]$ContentType, [int]$TimeoutSec)
 
@@ -72,7 +81,7 @@ function Invoke-RestMethod {
     }
     elseif ($args.Count -eq 0 -and $Method -eq 'Get' -and $Uri -cin @(
         'http://publication.invalid:8123/api/states/select.agent_bridge_1111111100004000_decision'
-        'http://publication.invalid:8123/api/states/select.agent_bridge_1111111100004000_f1'
+        "http://publication.invalid:8123/api/states/$($script:DaemonProbeFieldEntity)"
         'http://publication.invalid:8123/api/states/button.agent_bridge_1111111100004000_submit'
     ) -and -not $PSBoundParameters.ContainsKey('Body') -and -not $PSBoundParameters.ContainsKey('ContentType')) {
         $request.Unexpected = $false
@@ -107,12 +116,7 @@ function Invoke-RestMethod {
             $valid = $false
             if ($Uri -ceq 'http://publication.invalid:8123/api/services/select/select_option') {
                 $valid = $payload.Contains('option') -and $payload.option -is [string] -and $payload.option -ceq 'Idle' -and
-                    $payload.entity_id -cin @(
-                        'select.agent_bridge_1111111100004000_f1'
-                        'select.agent_bridge_1111111100004000_f2'
-                        'select.agent_bridge_1111111100004000_f3'
-                        'select.agent_bridge_1111111100004000_f4'
-                    )
+                    $payload.entity_id -cin $script:DaemonFieldEntities
             }
             else {
                 $valid = $payload.Contains('value') -and $payload.value -is [string] -and
@@ -660,9 +664,10 @@ Test-That 'unexpected HTTP routes remain observable even when a best-effort call
 } (($script:DaemonHttpRequests | Where-Object Unexpected | ForEach-Object { "$($_.Method) $($_.Uri)" }) -join ' | ')
 Test-That 'the reporting node uses exactly its three synthetic missing-entity routes' {
     $reportingNode = Get-CopilotMqttNodeId -SessionId $script:Ids.s1
+    $lastSlot = Get-CopilotMqttFieldEntityId -Node $reportingNode -Index $script:CopilotMqttMaxFields
     $expected = @(
         "http://publication.invalid:8123/api/states/select.${reportingNode}_decision"
-        "http://publication.invalid:8123/api/states/select.${reportingNode}_f1"
+        "http://publication.invalid:8123/api/states/$lastSlot"
         "http://publication.invalid:8123/api/states/button.${reportingNode}_submit"
     )
     $seen = @($script:DaemonHttpRequests | Where-Object {
@@ -677,19 +682,20 @@ Test-That 'the real detail check reads only the derived fixture toggle and obser
     })
     $toggleReads.Count -eq 1 -and $script:DaemonVerbose -eq $false
 }
-Test-That 'the actual field initializer sends exactly four byte-JSON Idle service actions' {
+Test-That 'the actual field initializer parks every published slot with a byte-JSON Idle service action' {
     $actions = @($script:DaemonHttpRequests | Where-Object {
         $_.Method -eq 'Post' -and $_.Uri -ceq 'http://publication.invalid:8123/api/services/select/select_option'
     })
     $reportingNode = Get-CopilotMqttNodeId -SessionId $script:Ids.s1
-    $expected = @(1..4 | ForEach-Object { Get-CopilotMqttFieldEntityId -Node $reportingNode -Index $_ })
+    $slots = $script:CopilotMqttMaxFields
+    $expected = @(1..$slots | ForEach-Object { Get-CopilotMqttFieldEntityId -Node $reportingNode -Index $_ })
     $targets = @($actions | ForEach-Object { $_.Data.entity_id })
-    $actions.Count -eq 4 -and (($targets | Sort-Object) -join ',') -ceq (($expected | Sort-Object) -join ',') -and
+    $actions.Count -eq $slots -and (($targets | Sort-Object) -join ',') -ceq (($expected | Sort-Object) -join ',') -and
         @($actions | Where-Object {
             -not $_.Unexpected -and $_.BodyIsBytes -and $_.ContentType -ceq 'application/json; charset=utf-8' -and
                 $_.Data.Count -eq 2 -and $_.Data.Contains('entity_id') -and $_.Data.Contains('option') -and
                 $_.Data.option -is [string] -and $_.Data.option -ceq 'Idle'
-        }).Count -eq 4
+        }).Count -eq $slots
 }
 Test-That 'the actual reply initializer sends one exact blank byte-JSON service action' {
     $actions = @($script:DaemonHttpRequests | Where-Object {

@@ -802,13 +802,13 @@ $script:FieldStarts = @{}
 $script:FieldOptions = @{}
 function Publish-CopilotMqttMessage {
     param([string]$Topic, [string]$Payload, [hashtable]$Headers, [switch]$Retain)
-    if ($Topic -match '/select/[^/]+/(f\d)/config$') {
+    if ($Topic -match '/select/[^/]+/(f\d+)/config$') {
         $script:FieldOptions[$Matches[1]] = ($Payload | ConvertFrom-Json).options
     }
 }
 function Invoke-HomeAssistantService {
     param([string]$Domain, [string]$Service, [hashtable]$Headers, [hashtable]$Data)
-    if ("$($Data.entity_id)" -match '_(f\d)$') { $script:FieldStarts[$Matches[1]] = [string]$Data.option }
+    if ("$($Data.entity_id)" -match '_(f\d+)$') { $script:FieldStarts[$Matches[1]] = [string]$Data.option }
 }
 function Set-CopilotMqttEntityIds { param([string]$SessionId) }
 
@@ -1172,16 +1172,16 @@ Test-That 'the choices card is handed the field entities' {
 # Read-DaemonFormAnswer reads them, so a rename on either side is a form that takes
 # every tap and delivers nothing. Both sides are asked the same helper.
 Test-That 'and they are exactly the slots the daemon reads, in slot order' {
-    $expected = @(1..4 | ForEach-Object { Get-CopilotMqttFieldEntityId -Node $node -Index $_ })
+    $expected = @(1..$script:CopilotMqttMaxFields | ForEach-Object { Get-CopilotMqttFieldEntityId -Node $node -Index $_ })
     (@($formAnswer.card.fields) -join ',') -eq ($expected -join ',')
 } "fields=[$(@($formAnswer.card.fields) -join ',')]"
 Test-That 'the answer card no longer hides itself when a field is in play' {
-    @($formAnswer.conditions | Where-Object { "$($_.entity)" -match '_f\d$' }).Count -eq 0
+    @($formAnswer.conditions | Where-Object { "$($_.entity)" -match '_f\d+$' }).Count -eq 0
 }
 Test-That 'the per-field dropdowns it replaces are gone' {
     @($formSession.cards | Where-Object {
         $_.type -eq 'conditional' -and "$($_.card.type)" -eq 'entities' -and
-        "$($_.card.entities[0].entity)" -match '_f\d$'
+        "$($_.card.entities[0].entity)" -match '_f\d+$'
     }).Count -eq 0
 }
 Test-That 'and so is the separate cancel button, which the card draws as a row' {
@@ -1205,8 +1205,8 @@ $oldSession = Get-TestSessionContainer -Config $oldDash
 Test-That 'a card served before 1.15.0 keeps its dropdowns rather than an empty form' {
     @($oldSession.cards | Where-Object {
         $_.type -eq 'conditional' -and "$($_.card.type)" -eq 'entities' -and
-        "$($_.card.entities[0].entity)" -match '_f\d$'
-    }).Count -eq 4
+        "$($_.card.entities[0].entity)" -match '_f\d+$'
+    }).Count -eq $script:CopilotMqttMaxFields
 }
 Test-That 'and is handed no fields it would not know what to do with' {
     $old = @($oldSession.cards | Where-Object {

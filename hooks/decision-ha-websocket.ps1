@@ -427,7 +427,7 @@ function Resolve-CopilotMqttEntityIds {
         "${node}_status" = 'Status'
         "${node}_activity" = 'Activity'
     }
-    for ($i = 1; $i -le 4; $i++) { $wanted["${node}_f$i"] = "Field$i" }
+    for ($i = 1; $i -le $script:CopilotMqttMaxFields; $i++) { $wanted["${node}_f$i"] = "Field$i" }
     $wanted["${node}_submit"] = 'Submit'
     $wanted["${node}_stop"] = 'Stop'
 
@@ -2858,7 +2858,7 @@ function Set-CopilotMqttEntityIds {
         Activity = "sensor.${node}_activity"
     }
     # Per-field dropdowns for multi-field questions share the same treatment.
-    for ($i = 1; $i -le 4; $i++) { $targets["Field$i"] = "select.${node}_f$i" }
+    for ($i = 1; $i -le $script:CopilotMqttMaxFields; $i++) { $targets["Field$i"] = "select.${node}_f$i" }
     $targets['Submit'] = "button.${node}_submit"
     $targets['Stop'] = "button.${node}_stop"
 

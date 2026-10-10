@@ -1184,6 +1184,20 @@ function Test-DecisionFieldIsText {
 # full list is what the Home Assistant select must enumerate to hold the answer at
 # all, and what an older card still renders a row each for.
 $script:DecisionMultiSelectMaxChoices = 63
+
+# How many fields of a form the dashboard can answer, which is how many per-field
+# dropdown slots a session publishes (Get-CopilotMqttFieldEntityId). A form with more
+# falls back to the numbered outline and has to be answered in the terminal.
+#
+# This was 4, chosen to keep the card short, and a five-field question was refused for
+# the sake of one slot - the card said "more fields than the dashboard can drive" for
+# a form that was otherwise entirely ordinary. Nothing was ever structurally limited
+# to four: the choices card iterates whatever slots it is handed and the keystroke
+# injection walks the fields one at a time, so the only real cost is the entities each
+# session carries. The slot sweep no longer scales with this number either - it is
+# bounded by what is actually armed (Publish-CopilotMqttDecisionFields) - so the
+# ceiling buys headroom rather than traffic.
+$script:DecisionMaxFormFields = 12
 $script:DecisionMultiSelectSeparator = ' + '
 
 # The same answer, written as positions instead of words: '#1,3' is the first and
@@ -1515,7 +1529,7 @@ function Test-DecisionFieldsAnswerable {
     #>
     param(
         [AllowNull()][AllowEmptyCollection()][object[]]$Fields,
-        [int]$MaxFields = 4
+        [int]$MaxFields = $script:DecisionMaxFormFields
     )
 
     $list = @($Fields)

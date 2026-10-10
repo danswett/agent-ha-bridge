@@ -177,9 +177,11 @@ function Get-CopilotMqttTopics {
 }
 
 # A multi-field question gets one dropdown per field, mirroring the native prompt's
-# tabbed form. Capped so the card stays readable; a form with more fields falls back
-# to the free-text outline.
-$script:CopilotMqttMaxFields = 4
+# tabbed form. A form with more fields than this falls back to the free-text outline.
+# The cap itself lives with the rest of the decision parsing, because that is where a
+# form is judged answerable; this is the same number seen as "how many slots does a
+# session publish".
+$script:CopilotMqttMaxFields = $script:DecisionMaxFormFields
 
 function Get-CopilotMqttFieldEntityId {
     param(
@@ -1664,6 +1666,43 @@ function Set-CopilotMqttActivity {
     }
 }
 
+function Get-CopilotMqttArmedFieldCount {
+    <#
+        How many field slots this session currently has armed, or -1 when that cannot
+        be established.
+
+        The count rides on the decision entity's `field_count` attribute, published
+        with every question. It is read rather than assumed because the slots are
+        armed by whichever process handled the question - a hook or the daemon - so
+        neither can keep the figure in memory and be right about the other's work.
+
+        Callers use it to touch only the slots that are actually dirty. -1 means
+        "unknown", and the only safe reading of that is "all of them".
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    try {
+        $node = Get-CopilotMqttNodeId -SessionId $SessionId
+        $state = Get-HomeAssistantState -EntityId "select.${node}_decision" -Headers $Headers
+        if ($null -eq $state -or $null -eq $state.PSObject.Properties['attributes']) { return -1 }
+        $attributes = $state.attributes
+        if ($null -eq $attributes -or $null -eq $attributes.PSObject.Properties['field_count']) { return -1 }
+        $count = $attributes.field_count
+        if ($count -isnot [int] -and $count -isnot [long] -and $count -isnot [double]) { return -1 }
+        $count = [int]$count
+        if ($count -lt 0 -or $count -gt $script:CopilotMqttMaxFields) { return -1 }
+        return $count
+    }
+    catch {
+        # An unreadable attribute is not worth failing a question over; the caller
+        # falls back to sweeping every slot, which is what it always used to do.
+        return -1
+    }
+}
+
 function Publish-CopilotMqttDecisionFields {
     <#
         Publishes one dropdown per field of a question answered through its slots,
@@ -1687,7 +1726,11 @@ function Publish-CopilotMqttDecisionFields {
         [Parameter(Mandatory)][string]$SessionName,
         [Parameter(Mandatory)][string]$Machine,
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Fields,
-        [Parameter(Mandatory)][hashtable]$Headers
+        [Parameter(Mandatory)][hashtable]$Headers,
+
+        # How many slots are armed right now, when the caller already knows - or is
+        # about to destroy the attribute that says so. -1 means "find out".
+        [int]$ArmedSlots = -1
     )
 
     foreach ($field in $Fields) {
@@ -1701,7 +1744,23 @@ function Publish-CopilotMqttDecisionFields {
     $device = New-CopilotMqttDeviceBlock -Node $node -SessionName $SessionName -Machine $Machine
     $availability = @(@{ topic = $topics.Availability; payload_available = 'online'; payload_not_available = 'offline' })
 
-    for ($i = 1; $i -le $script:CopilotMqttMaxFields; $i++) {
+    # Only the slots this question arms, plus any the last one left armed, are worth
+    # writing: the rest are already parked on Idle and republishing them costs two
+    # Home Assistant calls each for no change at all. That used to be eight calls a
+    # question and did not much matter; at a ceiling of twelve it is twenty-four, on
+    # every question including the single-choice ones that arm one slot and the clear
+    # that follows every answer. Bounding it this way is what keeps the ceiling a
+    # matter of how many entities a session carries rather than how slow it is.
+    #
+    # An unknown previous count means sweeping everything, which is the old behaviour
+    # and the only safe reading: a slot left armed above the count would otherwise
+    # keep offering a dead question's options on the card.
+    $previous = if ($ArmedSlots -ge 0) { [Math]::Min($ArmedSlots, $script:CopilotMqttMaxFields) }
+                else { Get-CopilotMqttArmedFieldCount -SessionId $SessionId -Headers $Headers }
+    $slotCount = if ($previous -lt 0) { $script:CopilotMqttMaxFields }
+                 else { [Math]::Max($Fields.Count, $previous) }
+
+    for ($i = 1; $i -le $slotCount; $i++) {
         $field = if ($i -le $Fields.Count) { $Fields[$i - 1] } else { $null }
 
         # Unused field slots collapse to a single Idle option so the dashboard's
@@ -1740,10 +1799,18 @@ function Publish-CopilotMqttDecisionFields {
     # the dashboard points at. Force them onto the deterministic ids before driving
     # their values, otherwise the dashboard's per-field cards reference entities that
     # do not exist and simply render nothing.
-    Start-Sleep -Milliseconds 900
-    if (Get-Command Set-CopilotMqttEntityIds -ErrorAction SilentlyContinue) {
-        try { [void](Set-CopilotMqttEntityIds -SessionId $SessionId) }
-        catch { }
+    #
+    # Skipped outright when nothing was published - a freeform question whose previous
+    # question had no slots either - because there is then no new entity to rename and
+    # the wait and the registry read are pure cost. The session publish does the same
+    # fix for the slots it creates, so a session's ids are correct before any question
+    # arrives.
+    if ($slotCount -gt 0) {
+        Start-Sleep -Milliseconds 900
+        if (Get-Command Set-CopilotMqttEntityIds -ErrorAction SilentlyContinue) {
+            try { [void](Set-CopilotMqttEntityIds -SessionId $SessionId) }
+            catch { }
+        }
     }
 
     # Now set each dropdown's starting value. These are optimistic selects, so their
@@ -1752,7 +1819,7 @@ function Publish-CopilotMqttDecisionFields {
     # one. Starting it on 'Choose...' left it holding a value that was not even in its
     # own option list, so the dashboard's "hide while Idle" condition failed to hide
     # it and a blank dropdown appeared between the real ones.
-    for ($i = 1; $i -le $script:CopilotMqttMaxFields; $i++) {
+    for ($i = 1; $i -le $slotCount; $i++) {
         $slotField = if ($i -le $Fields.Count) { $Fields[$i - 1] } else { $null }
         $isChoiceSlot = ($null -ne $slotField) -and -not (Test-DecisionFieldIsText -Field $slotField)
         $start = if ($isChoiceSlot) { 'Choose...' } else { 'Idle' }
@@ -1901,11 +1968,15 @@ function Clear-CopilotMqttDecisionFields {
         [Parameter(Mandatory)][string]$SessionId,
         [Parameter(Mandatory)][string]$SessionName,
         [Parameter(Mandatory)][string]$Machine,
-        [Parameter(Mandatory)][hashtable]$Headers
+        [Parameter(Mandatory)][hashtable]$Headers,
+
+        # Passed on, for a caller clearing up after a question whose `field_count` it
+        # has already read or already overwritten. -1 means "find out".
+        [int]$ArmedSlots = -1
     )
 
     Publish-CopilotMqttDecisionFields -SessionId $SessionId -SessionName $SessionName `
-        -Machine $Machine -Fields @() -Headers $Headers
+        -Machine $Machine -Fields @() -Headers $Headers -ArmedSlots $ArmedSlots
 }
 
 function Set-CopilotMqttSelectOption {
@@ -2068,6 +2139,13 @@ function Set-CopilotMqttDecision {
     $device = New-CopilotMqttDeviceBlock -Node $node -SessionName $SessionName -Machine $Machine
     $availability = @(@{ topic = $topics.Availability; payload_available = 'online'; payload_not_available = 'offline' })
 
+    # What the last question left armed, read before this one's discovery config goes
+    # out. Republishing the config is what makes the decision entity's attributes
+    # briefly unreadable, and `field_count` is among them - so reading afterwards gets
+    # "unknown" and sweeps all twelve slots for no reason. Unknown is still safe; this
+    # just means the common path does not pay for it.
+    $armedSlots = Get-CopilotMqttArmedFieldCount -SessionId $SessionId -Headers $Headers
+
     $fieldList = @($Fields)
     # Every question with fields is answered through its field slots, and committed
     # with Send. A single choice used to ride on the main selector and commit on the
@@ -2115,11 +2193,11 @@ function Set-CopilotMqttDecision {
     # collapse them otherwise so a previous question's fields never linger.
     if ($usesFieldSlots) {
         Publish-CopilotMqttDecisionFields -SessionId $SessionId -SessionName $SessionName `
-            -Machine $Machine -Fields $fieldList -Headers $Headers
+            -Machine $Machine -Fields $fieldList -Headers $Headers -ArmedSlots $armedSlots
     }
     else {
         Clear-CopilotMqttDecisionFields -SessionId $SessionId -SessionName $SessionName `
-            -Machine $Machine -Headers $Headers
+            -Machine $Machine -Headers $Headers -ArmedSlots $armedSlots
     }
 
     # The card shows the question in full, so it is published whole rather than split
@@ -2207,6 +2285,12 @@ function Clear-CopilotMqttDecision {
     $device = New-CopilotMqttDeviceBlock -Node $node -SessionName $SessionName -Machine $Machine
     $availability = @(@{ topic = $topics.Availability; payload_available = 'online'; payload_not_available = 'offline' })
 
+    # Read before the attributes are wiped below, because `field_count` is where the
+    # number of armed slots lives and the wipe is what destroys it. Reading after left
+    # the clear with no idea what was armed, so it swept every slot - the one place
+    # where that costs the most, since it runs after every single question.
+    $armedSlots = Get-CopilotMqttArmedFieldCount -SessionId $SessionId -Headers $Headers
+
     $decision = @{
         name = 'Decision'
         unique_id = "${node}_decision"
@@ -2232,7 +2316,7 @@ function Clear-CopilotMqttDecision {
     # Collapse any per-field dropdowns from a multi-field question.
     try {
         Clear-CopilotMqttDecisionFields -SessionId $SessionId -SessionName $SessionName `
-            -Machine $Machine -Headers $Headers
+            -Machine $Machine -Headers $Headers -ArmedSlots $armedSlots
     }
     catch {
         # Non-fatal.

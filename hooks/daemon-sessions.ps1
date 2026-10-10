@@ -236,7 +236,10 @@ function Restore-DaemonSessionEntities {
         # The set the first publish does not cover. Each is published unconditionally
         # rather than probed: the card referencing any one of them renders an "Entity
         # not found" box, and we already know this session's entities were missing.
-        Clear-CopilotMqttDecisionFields -SessionId $id -SessionName $name -Machine $machine -Headers $Headers | Out-Null
+        # Every slot, not just the armed ones: this is provisioning, so what is armed
+        # says nothing about what exists.
+        Clear-CopilotMqttDecisionFields -SessionId $id -SessionName $name -Machine $machine `
+            -Headers $Headers -ArmedSlots $script:CopilotMqttMaxFields | Out-Null
         Publish-CopilotMqttSubmitButton -SessionId $id -SessionName $name -Machine $machine -Headers $Headers | Out-Null
         Publish-CopilotMqttReplyPayloadSensor -SessionId $id -SessionName $name -Machine $machine -Headers $Headers | Out-Null
         [void](Set-CopilotMqttEntityIds -SessionId $id)
@@ -714,13 +717,18 @@ function Add-DaemonSession {
     # missing entity renders an "Entity not found" box on the session card.
     try {
         $probeField = $null
-        try { $probeField = Get-HomeAssistantState -EntityId "select.${node}_f1" -Headers $Headers }
+        # The *last* slot, not the first. A session published when the ceiling was
+        # lower has f1 and is missing the slots added since, so probing f1 found it,
+        # declared the set complete and left a form that needs the new slots with
+        # nowhere to put them.
+        $lastSlot = Get-CopilotMqttFieldEntityId -Node $node -Index $script:CopilotMqttMaxFields
+        try { $probeField = Get-HomeAssistantState -EntityId $lastSlot -Headers $Headers }
         catch { $probeField = $null }
         # Every call below discards its output: this function returns the state entry,
         # and anything a call emits would be returned with it.
         if ($null -eq $probeField) {
             Clear-CopilotMqttDecisionFields -SessionId $id -SessionName $display.Name `
-                -Machine $display.Machine -Headers $Headers | Out-Null
+                -Machine $display.Machine -Headers $Headers -ArmedSlots $script:CopilotMqttMaxFields | Out-Null
             Write-DaemonLog -Message "provisioned field slots for $($id.Substring(0,8))"
         }
 

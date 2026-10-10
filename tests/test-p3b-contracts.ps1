@@ -968,7 +968,7 @@ function Invoke-WebRequest {
             if ($script:A23Fault -eq 'publish') { throw 'Synthetic MQTT publication failure.' }
             $script:A23Messages[$Topic] = $Payload
             $data = $Payload | ConvertFrom-Json
-            if ($Topic -match '/select/[^/]+/(decision|f\d)/config$') {
+            if ($Topic -match '/select/[^/]+/(decision|f\d+)/config$') {
                 $script:A23Ha["select.$($data.unique_id)"] = [pscustomobject]@{
                     state = 'unknown'
                     attributes = [pscustomobject]@{ options = @($data.options); question = '' }

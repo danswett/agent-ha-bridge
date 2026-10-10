@@ -17,6 +17,10 @@
 #>
 
 $ErrorActionPreference = 'Stop'
+# Both, in the order every entry point loads them. decision-mqtt.ps1 reads constants
+# the common layer owns - the form-field ceiling among them - so sourcing it alone
+# left those $null and tested a file in a state production never runs it in.
+. (Join-Path (Split-Path $PSScriptRoot -Parent) 'hooks\decision-bridge-common.ps1')
 . (Join-Path (Split-Path $PSScriptRoot -Parent) 'hooks\decision-mqtt.ps1')
 
 $script:Failures = 0

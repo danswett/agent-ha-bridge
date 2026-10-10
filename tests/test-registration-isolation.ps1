@@ -91,7 +91,7 @@ function Get-A14ValueShape {
             if ($Value -cmatch "^(?:sensor|text|select|button)\.$nodePattern`_(?:status|activity|reply_payload|reply|decision|submit|stop)$") {
                 $shape['SyntheticIdentity'] = $Value
             }
-            elseif ($Value -cmatch "^select\.$nodePattern`_f[1-4]$" -and $script:A14FieldSlots.ContainsKey($Value)) {
+            elseif ($Value -cmatch "^select\.$nodePattern`_f\d+$" -and $script:A14FieldSlots.ContainsKey($Value)) {
                 $shape['SyntheticIdentity'] = $Value
             }
         }
@@ -555,7 +555,7 @@ foreach ($id in $script:A14Ids.Values) {
         $entity = "$($pair[0]).${node}_$($pair[1])"
         $script:A14States[$entity] = [pscustomobject]@{ entity_id = $entity; state = 'unknown'; attributes = [pscustomobject]@{} }
     }
-    for ($fieldIndex = 1; $fieldIndex -le 4; $fieldIndex++) {
+    for ($fieldIndex = 1; $fieldIndex -le $script:CopilotMqttMaxFields; $fieldIndex++) {
         $fieldEntity = Get-CopilotMqttFieldEntityId -Node $node -Index $fieldIndex
         $script:A14FieldSlots[$fieldEntity] = [pscustomobject]@{ EntityId = $fieldEntity; Slot = $fieldIndex }
         $script:A14States[$fieldEntity] = [pscustomobject]@{
