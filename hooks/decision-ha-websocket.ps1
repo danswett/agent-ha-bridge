@@ -8,7 +8,7 @@
 . (Join-Path $PSScriptRoot 'bridge-secrets.ps1')
 # 1.7.0, not 1.6.0: a session waiting on a background command it started publishes
 # 'shell', and the custom activity and session cards are now drawn only for a browser
-# served card 1.32.0 or newer, because every older one renders it as the bare word
+# served card 1.34.0 or newer, because every older one renders it as the bare word
 # under an idle-grey frame (#151). Below that the generated markdown header and stack
 # are the fallback, and both were taught the status. All of it changes what
 # Save-CopilotSessionDashboard renders, so the fence needs a version to move to.
@@ -2228,13 +2228,13 @@ ha-select, mwc-select { width: 100%; }
         # so it is used only when Home Assistant serves a copy new enough to have it -
         # a view naming a custom element that does not exist renders an error box.
         #
-        # 1.32.0, not 1.10.0: from here the header has to be able to say a session is
+        # 1.34.0, not 1.10.0: from here the header has to be able to say a session is
         # waiting on a background command (#151). A card served between 1.10 and 1.31
         # has no branch for it and falls through to printing the bare status, so the
         # one session that must not look idle reads 'shell' under an idle-grey dot.
         # The markdown below does know it, so for that window it is the better header -
         # which is the whole point of keeping it as the fallback.
-        if (Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.32.0') {
+        if (Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.34.0') {
             $header = @{
                 type     = 'custom:agent-bridge-activity-card'
                 card_mod = @{ style = $bareChild }
@@ -2744,12 +2744,12 @@ ha-card {
         $footerCards = if ($formCard) { @($sendStatusCard, $settingsCard, $stopCard) }
             else { @($sendStatusCard, $cancelCard, $settingsCard, $stopCard) }
         $sessionCards = @($header) + @($fieldCards) + @($answerCard) + @($replyCard) + $footerCards
-        # 1.32.0, not 1.12.0: the frame is drawn by the card's own code from the status
+        # 1.34.0, not 1.12.0: the frame is drawn by the card's own code from the status
         # it reads, and a card served between 1.12 and 1.31 has no 'shell' in it - so a
         # session waiting on a background command gets the idle divider, the one
         # reading this status exists to prevent (#151). The stack below takes its edge
         # from the generated card_mod instead, which does know it.
-        if (Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.32.0') {
+        if (Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.34.0') {
             @{
                 type     = 'custom:agent-bridge-session-card'
                 status   = $statusEntity

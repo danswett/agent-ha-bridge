@@ -298,7 +298,7 @@ function Invoke-TestPreFencePublication {
 }
 
 # Which container holds a session's sections depends on the served card version: the
-# bridge's own session card from 1.32.0, the card-mod stack below it (#151). Checks on
+# bridge's own session card from 1.34.0, the card-mod stack below it (#151). Checks on
 # what is *inside* a session take whichever one is there, so that they keep testing
 # their own subject rather than the gate that chose the wrapper. Defined above the
 # fixtures boundary because the suites that dot-source this one need it too.
@@ -564,16 +564,18 @@ Test-That 'so the press it does know is still there' {
 }
 
 # The custom activity and session cards draw the status from their own code, so a card
-# served before 1.32.0 has no branch for 'shell' and renders the bare word under an
+# served before 1.34.0 has no branch for 'shell' and renders the bare word under an
 # idle-grey frame - exactly the reading this status exists to replace. Handing those
 # versions the generated markdown and stack instead is worse for every other status,
 # and better for this one, which is why it is a fallback and not the default (#151).
-Write-Host '--- below card 1.32.0 the session falls back to output that knows shell ---'
-Set-TestPublicationCardUrl -Url '/local/agent-bridge-reply-card.js?v=1.31.0'
-Save-CopilotSessionDashboard -Sessions $sessions -Machines $twoMachines -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.31.0'
+Write-Host '--- below card 1.34.0 the session falls back to output that knows shell ---'
+Set-TestPublicationCardUrl -Url '/local/agent-bridge-reply-card.js?v=1.33.0'
+Save-CopilotSessionDashboard -Sessions $sessions -Machines $twoMachines -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.33.0'
 $oldSession = @(Find-TestCardsOfType 'custom:agent-bridge-session-card')
 $oldActivity = @(Find-TestCardsOfType 'custom:agent-bridge-activity-card')
-Test-That 'a 1.31.0 card is handed neither custom card it cannot render this on' {
+# The last version before the branch exists, so the boundary is tested where it is
+# rather than somewhere safely below it.
+Test-That 'a 1.33.0 card is handed neither custom card it cannot render this on' {
     $oldSession.Count -eq 0 -and $oldActivity.Count -eq 0
 } "session=$($oldSession.Count), activity=$($oldActivity.Count)"
 $oldJson = $script:SavedConfig | ConvertTo-Json -Depth 40 -Compress
@@ -581,9 +583,9 @@ Test-That 'and gets the stack and header that do know it' {
     $oldJson -match 'waiting for background commands' -and $oldJson -match "shell"
 }
 
-Write-Host '--- at 1.32.0 the custom cards come back, because now they know it ---'
-Set-TestPublicationCardUrl -Url '/local/agent-bridge-reply-card.js?v=1.32.0'
-Save-CopilotSessionDashboard -Sessions $sessions -Machines $twoMachines -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.32.0'
+Write-Host '--- at 1.34.0 the custom cards come back, because now they know it ---'
+Set-TestPublicationCardUrl -Url '/local/agent-bridge-reply-card.js?v=1.34.0'
+Save-CopilotSessionDashboard -Sessions $sessions -Machines $twoMachines -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.34.0'
 Test-That 'the session card is used again' { @(Find-TestCardsOfType 'custom:agent-bridge-session-card').Count -gt 0 }
 Test-That 'and so is the activity header that updates in place' {
     @(Find-TestCardsOfType 'custom:agent-bridge-activity-card').Count -gt 0
@@ -619,7 +621,7 @@ Test-That 'the header no longer owns the glow' {
 # generator does - and a card served between 1.12 and 1.31 has no branch for it, so it
 # draws the bare word under an idle-grey frame: the one reading this status exists to
 # prevent. What such a browser can still be given is the generated output, so from
-# 1.32.0 the custom cards are gated and the stack and markdown below are the fallback.
+# 1.34.0 the custom cards are gated and the stack and markdown below are the fallback.
 # They are what these assertions are on, since $cfg is built without a served card.
 Test-That 'a session waiting on a background command gets the live edge, not the idle one' {
     $sessionCard.card_mod.style -match "is_state\('[^']+','shell'\)"
@@ -1009,15 +1011,15 @@ Write-Host '--- the session header updates in place when the card supports it --
 # reasoning expander while it streams. The activity card ships in the reply card's
 # file from 1.10.0, and naming it against an older served copy would render an error.
 #
-# The gate is 1.32.0 rather than 1.10.0 from #151: every card before that renders a
+# The gate is 1.34.0 rather than 1.10.0 from #151: every card before that renders a
 # session waiting on a background command as the bare word 'shell' under an idle-grey
 # dot, which is the one reading the status exists to prevent. For that window the
 # markdown header - which does know the status - is the better of the two.
 function Get-SavedJson { $script:SavedConfig | ConvertTo-Json -Depth 40 -Compress }
 
-Set-TestPublicationCardUrl -Url '/local/agent-bridge-reply-card.js?v=1.32.0'
-Save-CopilotSessionDashboard -Sessions $sessions -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.32.0'
-Test-That 'a served 1.32.0 card gets the in-place activity header' { (Get-SavedJson) -match 'custom:agent-bridge-activity-card' }
+Set-TestPublicationCardUrl -Url '/local/agent-bridge-reply-card.js?v=1.34.0'
+Save-CopilotSessionDashboard -Sessions $sessions -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.34.0'
+Test-That 'a served 1.34.0 card gets the in-place activity header' { (Get-SavedJson) -match 'custom:agent-bridge-activity-card' }
 Test-That 'the header is pointed at the session entities' {
     (Get-SavedJson) -match [regex]::Escape("sensor.$($sessions[0].Node)_activity")
 }
@@ -1026,8 +1028,8 @@ Set-TestPublicationCardUrl -Url '/local/agent-bridge-reply-card.js?v=1.9.2'
 Save-CopilotSessionDashboard -Sessions $sessions -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.9.2'
 Test-That 'an older served card keeps the markdown header' { (Get-SavedJson) -notmatch 'custom:agent-bridge-activity-card' }
 
-Set-TestPublicationCardUrl -Url '/local/agent-bridge-reply-card.js?v=1.31.0'
-Save-CopilotSessionDashboard -Sessions $sessions -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.31.0'
+Set-TestPublicationCardUrl -Url '/local/agent-bridge-reply-card.js?v=1.33.0'
+Save-CopilotSessionDashboard -Sessions $sessions -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.33.0'
 Test-That 'and so does the last one before the status it cannot draw' {
     (Get-SavedJson) -notmatch 'custom:agent-bridge-activity-card'
 }
@@ -1049,15 +1051,15 @@ Write-Host '--- the session frame does not depend on card-mod loading first ---'
 # refresh whenever it was built before card-mod loaded. From 1.12.0 the bridge's own
 # card draws them.
 #
-# Gated at 1.32.0 since #151: the frame colour is chosen by the card's own code from
+# Gated at 1.34.0 since #151: the frame colour is chosen by the card's own code from
 # the status it reads, and no card before that has a branch for a session waiting on a
 # background command, so it would draw the idle divider. The stack's generated
 # card_mod does know it, which makes it the better frame for that window.
-Set-TestPublicationCardUrl -Url '/local/agent-bridge-reply-card.js?v=1.32.0'
-Save-CopilotSessionDashboard -Sessions $sessions -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.32.0'
+Set-TestPublicationCardUrl -Url '/local/agent-bridge-reply-card.js?v=1.34.0'
+Save-CopilotSessionDashboard -Sessions $sessions -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.34.0'
 $framed = $script:SavedConfig | ConvertTo-Json -Depth 40 | ConvertFrom-Json -Depth 40
 $sessionCard = @($framed.views[0].cards | Where-Object { $_.type -eq 'custom:agent-bridge-session-card' }) | Select-Object -First 1
-Test-That 'a served 1.32.0 card frames each session with the session card' { $null -ne $sessionCard }
+Test-That 'a served 1.34.0 card frames each session with the session card' { $null -ne $sessionCard }
 Test-That 'which watches the session status and decision for its glow' {
     $sessionCard.status -eq "sensor.$($sessions[0].Node)_status" -and $sessionCard.decision -eq "select.$($sessions[0].Node)_decision"
 }
@@ -1731,7 +1733,7 @@ Test-That 'and a blank entry never matches a blank user' { -not (Test-BridgeAgen
 # together. It is deliberately a hash of source text: that is precisely what the fence
 # compares, so anything that would conflict there fails here first.
 $script:ExpectedRenderVersion = '1.7.0'
-$script:ExpectedRenderHash = 'a4292376ae16c3f9d9918ea23aa19495019b183b3d6d2ac24d8cb07b764cf984'
+$script:ExpectedRenderHash = 'bad032668e378cc3c7b4b90f5386372b1df980b5fc57667a333bca142837601c'
 $artifact = Get-BridgeRenderArtifact
 
 Test-That 'the renderer is still the one this version was pinned to' {

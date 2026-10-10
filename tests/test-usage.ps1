@@ -753,6 +753,10 @@ function Invoke-BridgeCommandProbe {
     $script:ProbeResult
 }
 
+# The rung after the keychain has its own section below. Here gh is absent, so that
+# what these count is the keychain and nothing else.
+function Get-BridgeGitHubCliPath { $null }
+
 foreach ($name in @('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')) {
     Set-Item -LiteralPath "env:$name" -Value '' -ErrorAction SilentlyContinue
 }
@@ -835,6 +839,201 @@ Test-That 'and a refusal for one account does not silence the next' {
     (Get-BridgeCopilotToken -Login 'hubot') -eq 'gho_for_https://github.com:hubot'
 }
 
+# --- 8. the token gh holds --------------------------------------------------------
+
+Write-Host ''
+Write-Host '--- reading the Copilot token from the GitHub CLI ---'
+
+# Copilot CLI's own order ends at `gh auth token`, and the bridge stopped one rung
+# short of it. Measured on 2026-10-09: a Mac signed in to Copilot as danswett, with the
+# keychain read off by default, said "No Copilot credential was available" while gh
+# held a token for that login that the quota endpoint accepted. gh reads and writes its
+# keychain entries through /usr/bin/security, which therefore trusts them, so asking it
+# raises none of the panels that reading the CLI's own item does.
+$script:GhPath = '/opt/homebrew/bin/gh'
+function Get-BridgeGitHubCliPath { $script:GhPath }
+
+function New-ProbeAnswer {
+    param([bool]$Ran = $true, [bool]$TimedOut = $false, [int]$ExitCode = 0, [string]$Stdout = '')
+    [pscustomobject]@{ Ran = $Ran; TimedOut = $TimedOut; ExitCode = $ExitCode; Output = $Stdout; StandardOutput = $Stdout }
+}
+
+# Anything that is not the `security` command is gh, so a test can tell which of the
+# two was run without caring about either's real arguments.
+function Invoke-BridgeCommandProbe {
+    param([string]$Executable, [string[]]$Arguments, [int]$TimeoutMs)
+    if ($Executable -ceq 'security') { $script:KeychainRuns++; return $script:KeychainAnswer }
+    $script:GhRuns += [pscustomobject]@{ Executable = $Executable; Arguments = @($Arguments) }
+    $script:GhAnswer
+}
+function Write-DaemonLog { param([string]$Message) $script:GhLog += $Message }
+
+function Reset-GhRung {
+    $script:GhRuns = @()
+    $script:KeychainRuns = 0
+    $script:GhLog = @()
+    $script:GhPath = '/opt/homebrew/bin/gh'
+    $script:GhAnswer = New-ProbeAnswer -Stdout "gho_fromgh`n"
+    $script:KeychainAnswer = New-ProbeAnswer -ExitCode 44
+    $script:Settings = @{}
+    $script:BridgeKeychainToken = ''
+    $script:BridgeKeychainAccount = ''
+    $script:BridgeKeychainUnavailable = $false
+    $script:BridgeGhAccount = ''
+    $script:BridgeGhReason = ''
+    $script:BridgeGhUnavailable = $false
+    foreach ($name in @('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')) {
+        Set-Item -LiteralPath "env:$name" -Value '' -ErrorAction SilentlyContinue
+    }
+}
+
+Reset-GhRung
+Test-That 'a Mac that leaves its keychain alone still gets the token gh holds' {
+    (Get-BridgeCopilotToken -Login 'octocat') -ceq 'gho_fromgh' -and $script:KeychainRuns -eq 0
+} "keychain asked $($script:KeychainRuns) time(s)"
+Test-That 'asked for the login Copilot is signed in as, on github.com, not whichever account is active' {
+    @($script:GhRuns).Count -eq 1 -and
+        $script:GhRuns[0].Executable -ceq $script:GhPath -and
+        ($script:GhRuns[0].Arguments -join ' ') -ceq 'auth token --hostname github.com --user octocat'
+} "ran: $(@($script:GhRuns | ForEach-Object { $_.Arguments -join ' ' }) -join ' | ')"
+
+Reset-GhRung
+$env:GH_TOKEN = 'gho_fromenvironment'
+Test-That 'an environment token still comes first, and gh is not run' {
+    (Get-BridgeCopilotToken -Login 'octocat') -ceq 'gho_fromenvironment' -and @($script:GhRuns).Count -eq 0
+}
+$env:GH_TOKEN = ''
+
+Reset-GhRung
+$script:Settings['usage.keychain'] = $true
+$script:KeychainAnswer = New-ProbeAnswer -Stdout "gho_fromkeychain`n"
+Test-That 'a keychain that was turned on is read before gh' {
+    (Get-BridgeCopilotToken -Login 'octocat') -ceq 'gho_fromkeychain' -and @($script:GhRuns).Count -eq 0
+}
+Reset-GhRung
+$script:Settings['usage.keychain'] = $true
+Test-That 'and when it refuses, gh is the next rung rather than the end of the line' {
+    (Get-BridgeCopilotToken -Login 'octocat') -ceq 'gho_fromgh' -and $script:KeychainRuns -eq 1
+} "keychain asked $($script:KeychainRuns) time(s)"
+
+Reset-GhRung
+$script:GhPath = $null
+Test-That 'a machine without gh gets no token from it, and runs nothing' {
+    (Get-BridgeCopilotToken -Login 'octocat') -ceq '' -and @($script:GhRuns).Count -eq 0
+}
+Test-That 'and the refusal says so' {
+    (Get-BridgeGitHubCliRefusal -Login 'octocat') -ceq 'gh is not installed'
+}
+
+Reset-GhRung
+$script:GhAnswer = New-ProbeAnswer -ExitCode 1
+Test-That 'gh holding no token for that account gets none' {
+    (Get-BridgeCopilotToken -Login 'octocat') -ceq ''
+}
+Test-That 'and is asked again on the next poll, so signing in to gh heals the card without a restart' {
+    $before = @($script:GhRuns).Count
+    $null = Get-BridgeCopilotToken -Login 'octocat'
+    @($script:GhRuns).Count -eq $before + 1
+}
+Test-That 'the refusal names the account and what mends it' {
+    (Get-BridgeGitHubCliRefusal -Login 'octocat') -ceq 'gh has no token for octocat - run gh auth login'
+}
+Test-That 'and is logged once, not on every poll' {
+    @($script:GhLog).Count -eq 1
+} "log: $(@($script:GhLog) -join ' | ')"
+Test-That 'a refusal belongs to the account it was given for' {
+    (Get-BridgeGitHubCliRefusal -Login 'hubot') -ceq '' -and
+        (Get-BridgeGitHubCliRefusal -Login 'octocat' -HostUrl 'https://octo.ghe.com') -ceq ''
+}
+
+Reset-GhRung
+$script:GhAnswer = New-ProbeAnswer -Ran $false
+Test-That 'a gh that cannot be run gets none, and says that rather than that it has no token' {
+    (Get-BridgeCopilotToken -Login 'octocat') -ceq '' -and (Get-BridgeGitHubCliRefusal -Login 'octocat') -ceq 'gh could not be run'
+}
+
+# A keyring waiting to be unlocked holds gh at a prompt, and asking again in two
+# minutes raises that prompt again - the storm the keychain read is kept off for.
+Reset-GhRung
+$script:GhAnswer = New-ProbeAnswer -TimedOut $true -ExitCode -1
+Test-That 'a gh that never answers is asked once, not on every poll' {
+    $first = Get-BridgeCopilotToken -Login 'octocat'
+    $second = Get-BridgeCopilotToken -Login 'octocat'
+    $first -ceq '' -and $second -ceq '' -and @($script:GhRuns).Count -eq 1
+} "runs: $(@($script:GhRuns).Count)"
+Test-That 'and says that it did not answer' {
+    (Get-BridgeGitHubCliRefusal -Login 'octocat') -ceq 'gh did not answer in time'
+}
+Test-That 'but another account is asked afresh' {
+    $script:GhAnswer = New-ProbeAnswer -Stdout "gho_forhubot`n"
+    (Get-BridgeCopilotToken -Login 'hubot') -ceq 'gho_forhubot'
+}
+
+# What goes into an Authorization header, and what lands in a log, are not for gh to
+# decide: a success prints the token itself.
+Reset-GhRung
+$script:GhAnswer = New-ProbeAnswer -Stdout "gho_one`ngho_two`n"
+Test-That 'more than one line of output is not a token, and is not copied into the log' {
+    (Get-BridgeCopilotToken -Login 'octocat') -ceq '' -and -not (@($script:GhLog) -join ' ').Contains('gho_')
+} "log: $(@($script:GhLog) -join ' | ')"
+Reset-GhRung
+$script:GhAnswer = New-ProbeAnswer -Stdout "gho with a space`n"
+Test-That 'nor is a line with whitespace in it' {
+    (Get-BridgeCopilotToken -Login 'octocat') -ceq ''
+}
+Reset-GhRung
+$script:GhAnswer = New-ProbeAnswer -Stdout "`r`n"
+Test-That 'nor is nothing' {
+    (Get-BridgeCopilotToken -Login 'octocat') -ceq ''
+}
+Reset-GhRung
+$script:GhAnswer = New-ProbeAnswer -Stdout "  gho_fromgh`r`n"
+Test-That 'but the line ending and padding around a real one are not part of it' {
+    (Get-BridgeCopilotToken -Login 'octocat') -ceq 'gho_fromgh'
+}
+
+Reset-GhRung
+Test-That 'a host other than github.com is not sent to gh, since the quota is read from api.github.com' {
+    (Get-BridgeCopilotToken -Login 'octocat' -HostUrl 'https://octo.ghe.com') -ceq '' -and @($script:GhRuns).Count -eq 0
+}
+
+# The whole chain, through the allowance rather than the token alone.
+$ghConfig = Join-Path $root 'gh-config.json'
+Set-Content -LiteralPath $ghConfig -Encoding UTF8 -Value @'
+{
+  "lastLoggedInUser": { "host": "https://github.com", "login": "octocat" },
+  "loggedInUsers": [ { "host": "https://github.com", "login": "octocat" } ]
+}
+'@
+
+Reset-GhRung
+$script:SpentToken = ''
+$viaGh = Get-BridgeCopilotAllowance -ConfigPath $ghConfig -CachePath '' -Fetch {
+    param($Token)
+    $script:SpentToken = $Token
+    New-CopilotBody -Login 'octocat'
+}
+Test-That 'the allowance is read live with the token gh holds' {
+    $viaGh.source -ceq 'api' -and $script:SpentToken -ceq 'gho_fromgh' -and -not $viaGh.error
+} "source=$($viaGh.source) error=$($viaGh.error)"
+Test-That 'and attributed to the account that was asked for' {
+    $viaGh.account -ceq 'octocat'
+}
+
+Reset-GhRung
+$script:GhAnswer = New-ProbeAnswer -ExitCode 1
+$unsigned = Get-BridgeCopilotAllowance -ConfigPath $ghConfig -CachePath '' -Fetch { throw 'never reached without a token' }
+Test-That 'with no credential anywhere, the card is told which one to mend' {
+    $unsigned.source -ceq 'none' -and
+        $unsigned.error -ceq 'No Copilot credential was available and nothing was cached (gh has no token for octocat - run gh auth login).'
+} "error=$($unsigned.error)"
+
+$plain = Get-BridgeCopilotAllowance -ConfigPath $copilotConfig -CachePath '' -ResolveToken { '' } -Fetch { throw 'no token' }
+Test-That 'while an account gh was never asked about keeps the plain message' {
+    $plain.error -ceq 'No Copilot credential was available and nothing was cached.'
+} "error=$($plain.error)"
+
+Reset-GhRung
 Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
 
 Write-Host ''

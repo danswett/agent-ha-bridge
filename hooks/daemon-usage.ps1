@@ -26,6 +26,14 @@ $script:BridgeKeychainToken = ''
 $script:BridgeKeychainAccount = ''
 $script:BridgeKeychainUnavailable = $false
 
+# What `gh` last said for the account being read, also per account. The reason is kept
+# so a failure is logged when it changes rather than every poll, and so the card can
+# say why there was no credential; the flag stops a `gh` that hung from being run
+# again - see Get-BridgeGitHubCliToken.
+$script:BridgeGhAccount = ''
+$script:BridgeGhReason = ''
+$script:BridgeGhUnavailable = $false
+
 function Get-BridgeKeychainRefusal {
     <#
         Why the keychain read did not produce a token, in words that say whether the
@@ -364,6 +372,124 @@ function Get-BridgeCopilotAccount {
     $logins[0]
 }
 
+function Get-BridgeGitHubCliPath {
+    <#
+        gh, found where its installers put it as well as on PATH: a LaunchAgent or a
+        scheduled task starts the daemon with a PATH that can predate the install and
+        need not include /opt/homebrew/bin.
+    #>
+    $command = Get-Command gh -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+    if ($command) { return $command.Source }
+
+    $candidates = if ($script:BridgeIsWindows) {
+        @($env:ProgramFiles, ${env:ProgramFiles(x86)}, $(if ($env:LOCALAPPDATA) { Join-Path $env:LOCALAPPDATA 'Programs' })) |
+            Where-Object { $_ } |
+            ForEach-Object { Join-Path $_ 'GitHub CLI\gh.exe' }
+    }
+    else {
+        @('/opt/homebrew/bin/gh', '/usr/local/bin/gh', '/opt/local/bin/gh', '/usr/bin/gh',
+            '/home/linuxbrew/.linuxbrew/bin/gh', (Join-Path $HOME '.local/bin/gh'))
+    }
+    foreach ($candidate in $candidates) {
+        if ([IO.File]::Exists($candidate)) { return $candidate }
+    }
+    $null
+}
+
+function Get-BridgeGitHubCliToken {
+    <#
+        The token `gh` holds for one login: the last rung of the ladder Copilot CLI
+        itself climbs - COPILOT_GITHUB_TOKEN, GH_TOKEN, GITHUB_TOKEN, the keychain item
+        it stores its own login in, and only then `gh auth token`.
+
+        The bridge stopped one rung short of the CLI, so an account whose credential
+        `gh` holds was reported as having none. Measured on 2026-10-09: a Mac signed in
+        to Copilot as danswett, with the keychain read off by default (see
+        Get-BridgeCopilotToken), showed "No Copilot credential was available" while
+        `gh auth token --user danswett` returned a token the quota endpoint accepted,
+        and a Windows machine with no copilot-cli credential item at all showed a
+        three-day-old cache.
+
+        It costs the person at the machine nothing, which is the difference from the
+        CLI's own item on a Mac: `gh` writes and reads its keychain entries through
+        /usr/bin/security, so that tool already trusts them and no authorization panel
+        is raised. It is asked for the login Copilot is signed in as, not for whichever
+        account `gh` has active, so the quota read is the same account's.
+
+        Only for github.com. The quota is read from api.github.com, and a token for any
+        other host is not one to send there.
+
+        Not remembered between polls, unlike the keychain's: `gh` answers in
+        milliseconds, so signing in to it heals the card on the next poll instead of
+        at the next restart. A `gh` that never answers is a different matter. A keyring
+        waiting to be unlocked holds it at a prompt, and asking again in two minutes
+        raises that prompt again - so a timeout is final for the run, as the keychain's
+        refusal is.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][string]$Login, [string]$HostUrl = 'https://github.com')
+
+    $hostName = ''
+    try { $hostName = ([Uri]$HostUrl).Host } catch { $hostName = '' }
+    if ($hostName -ne 'github.com' -or [string]::IsNullOrWhiteSpace($Login)) { return '' }
+
+    # Same reasoning as the keychain's: whatever was learned belongs to the account it
+    # was learned for, and Copilot's lastLoggedInUser can change under a running daemon.
+    $account = "${HostUrl}:$Login"
+    if ($script:BridgeGhAccount -ne $account) {
+        $script:BridgeGhAccount = $account
+        $script:BridgeGhReason = ''
+        $script:BridgeGhUnavailable = $false
+    }
+    if ($script:BridgeGhUnavailable) { return '' }
+
+    $reason = ''
+    $gh = Get-BridgeGitHubCliPath
+    if (-not $gh) { $reason = 'gh is not installed' }
+    else {
+        $probe = Invoke-BridgeCommandProbe -Executable $gh -TimeoutMs 5000 `
+            -Arguments @('auth', 'token', '--hostname', $hostName, '--user', $Login)
+        if ($probe.TimedOut) {
+            $script:BridgeGhUnavailable = $true
+            $reason = 'gh did not answer in time'
+        }
+        elseif (-not $probe.Ran) { $reason = 'gh could not be run' }
+        elseif ($probe.ExitCode -ne 0) { $reason = "gh has no token for $Login - run gh auth login" }
+        else {
+            # Standard output alone, and exactly one line of printable characters: this
+            # goes into an Authorization header, and anything else that gh printed
+            # beside the token is not part of it.
+            $lines = @(([string]$probe.StandardOutput) -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+            if ($lines.Count -eq 1 -and $lines[0] -match '^[\x21-\x7E]+$') {
+                $script:BridgeGhReason = ''
+                return $lines[0]
+            }
+            $reason = 'gh answered with something that is not a token'
+        }
+    }
+
+    # Said when it changes, not every poll. The reason is deliberately all there is: what
+    # gh printed is not logged, because on a success that is the token.
+    $changed = $script:BridgeGhReason -cne $reason
+    $script:BridgeGhReason = $reason
+    if ($changed) { Write-DaemonLog -Message "the Copilot allowance could not be read through gh: $reason" }
+    ''
+}
+
+function Get-BridgeGitHubCliRefusal {
+    <#
+        Why gh produced no token for this login, in words for the card. A machine with
+        no gh to ask and one that is signed in as somebody else are mended differently,
+        and "nothing was cached" says neither.
+
+        Empty when gh was not asked for this account - another host, a token that came
+        from somewhere else - rather than the last reason it gave for a different one.
+    #>
+    param([AllowEmptyString()][string]$Login, [string]$HostUrl = 'https://github.com')
+
+    if ($script:BridgeGhAccount -ne "${HostUrl}:$Login") { return '' }
+    [string]$script:BridgeGhReason
+}
+
 function Get-BridgeCopilotToken {
     <#
         The token Copilot CLI itself would use, so the quota read is the same account's.
@@ -374,7 +500,9 @@ function Get-BridgeCopilotToken {
 
         The environment variables come first because the CLI honours them first, so a
         machine driven that way would otherwise be read as a different account than the
-        one actually spending.
+        one actually spending. After them comes the keychain item the CLI stores its own
+        login in, and last the token `gh` holds for the same login - the order the CLI
+        documents for itself, so the figure is the account's whichever of them it spends.
     #>
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Login, [string]$HostUrl = 'https://github.com')
 
@@ -464,28 +592,40 @@ public static class BridgeCredentialStore
             # asked, over and over, for a number that decorates a gauge (#122). An
             # allowance is not worth an interruption that the person cannot switch off
             # by answering it, so the default is to leave the keychain alone and let
-            # the allowance fall back to its cache. COPILOT_GITHUB_TOKEN, GH_TOKEN and
-            # GITHUB_TOKEN above are read first and prompt for nothing, so a machine
-            # that wants the live figure has a way to it that costs no interruption.
-            if (-not [bool](Get-BridgeSetting 'usage.keychain' $false)) { return '' }
-            if ($script:BridgeKeychainUnavailable) { return '' }
-            $found = Invoke-BridgeCommandProbe -Executable 'security' `
-                -Arguments @('find-generic-password', '-s', 'copilot-cli', '-a', $account, '-w') -TimeoutMs 5000
-            if ($found.Ran -and -not $found.TimedOut -and $found.ExitCode -eq 0) {
-                $value = ([string]$found.Output).Trim()
-                if (-not [string]::IsNullOrWhiteSpace($value)) {
-                    # Held for the daemon's life rather than re-read: asking twice is
-                    # the whole complaint, and the token outlives the poll by hours.
-                    $script:BridgeKeychainToken = $value
-                    return $value
+            # the allowance come from `gh`, which prompts for nothing, or else fall back
+            # to its cache. COPILOT_GITHUB_TOKEN, GH_TOKEN and GITHUB_TOKEN above are
+            # read first and prompt for nothing either, so a machine that wants the live
+            # figure has two ways to it that cost no interruption.
+            if ([bool](Get-BridgeSetting 'usage.keychain' $false) -and -not $script:BridgeKeychainUnavailable) {
+                $found = Invoke-BridgeCommandProbe -Executable 'security' `
+                    -Arguments @('find-generic-password', '-s', 'copilot-cli', '-a', $account, '-w') -TimeoutMs 5000
+                if ($found.Ran -and -not $found.TimedOut -and $found.ExitCode -eq 0) {
+                    $value = ([string]$found.Output).Trim()
+                    if (-not [string]::IsNullOrWhiteSpace($value)) {
+                        # Held for the daemon's life rather than re-read: asking twice is
+                        # the whole complaint, and the token outlives the poll by hours.
+                        $script:BridgeKeychainToken = $value
+                        return $value
+                    }
                 }
+                # Once is enough even when it was allowed to ask. A refusal repeated every
+                # two minutes is the same storm by another route.
+                $script:BridgeKeychainUnavailable = $true
+                Write-DaemonLog -Message ("the Copilot allowance will not be read from the keychain again this run: " +
+                    "$(Get-BridgeKeychainRefusal -Probe $found)")
             }
-            # Once is enough even when it was allowed to ask. A refusal repeated every
-            # two minutes is the same storm by another route.
-            $script:BridgeKeychainUnavailable = $true
-            Write-DaemonLog -Message ("the Copilot allowance will not be read from the keychain again this run: " +
-                "$(Get-BridgeKeychainRefusal -Probe $found)")
         }
+    }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+    }
+
+    # Its own attempt rather than part of the one above, so a credential store that
+    # cannot be read - a type that will not compile, a keychain that refuses - does not
+    # also take away the one source that needs neither.
+    try {
+        $fromGh = Get-BridgeGitHubCliToken -Login $Login -HostUrl $HostUrl
+        if ($fromGh) { return $fromGh }
     }
     catch {
         if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
@@ -623,7 +763,14 @@ function Get-BridgeCopilotAllowance {
         }
     }
 
-    if (-not $failure) { $failure = 'No Copilot credential was available and nothing was cached.' }
+    if (-not $failure) {
+        $failure = 'No Copilot credential was available and nothing was cached.'
+        # Said because "nothing was cached" alone does not tell the person which of the
+        # three ways to a credential to mend: install gh, sign in to it, or hand the
+        # daemon a token.
+        $why = Get-BridgeGitHubCliRefusal -Login $account.Login -HostUrl $account.Host
+        if ($why) { $failure = "No Copilot credential was available and nothing was cached ($why)." }
+    }
     New-BridgeUsageRecord -Client 'copilot' -Account $account.Login -Source 'none' -Problem $failure
 }
 
