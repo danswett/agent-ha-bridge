@@ -297,6 +297,22 @@ function Invoke-TestPreFencePublication {
     Save-CopilotSessionDashboard -Sessions $Sessions -ReplyCardUrl $legacyCard.Url
 }
 
+# Which container holds a session's sections depends on the served card version: the
+# bridge's own session card from 1.32.0, the card-mod stack below it (#151). Checks on
+# what is *inside* a session take whichever one is there, so that they keep testing
+# their own subject rather than the gate that chose the wrapper. Defined above the
+# fixtures boundary because the suites that dot-source this one need it too.
+function Get-TestSessionContainer {
+    param($Config)
+    $cards = @($Config.views[0].cards)
+    $card = @($cards | Where-Object { $_.type -eq 'custom:agent-bridge-session-card' }) | Select-Object -First 1
+    if ($card) { return $card }
+    @($cards | Where-Object {
+        $_.type -eq 'vertical-stack' -and
+        @($_.cards | Where-Object { $_.type -eq 'conditional' }).Count -gt 0
+    }) | Select-Object -First 1
+}
+
 if ($PublicationFixturesOnly) { return }
 
 . (Join-Path $PSScriptRoot '..\hooks\decision-bridge-common.ps1')
@@ -998,21 +1014,6 @@ Write-Host '--- the session header updates in place when the card supports it --
 # dot, which is the one reading the status exists to prevent. For that window the
 # markdown header - which does know the status - is the better of the two.
 function Get-SavedJson { $script:SavedConfig | ConvertTo-Json -Depth 40 -Compress }
-
-# Which container holds a session's sections depends on the served card version: the
-# bridge's own session card from 1.32.0, the card-mod stack below it (#151). Checks on
-# what is *inside* a session take whichever one is there, so that they keep testing
-# their own subject rather than the gate.
-function Get-TestSessionContainer {
-    param($Config)
-    $cards = @($Config.views[0].cards)
-    $card = @($cards | Where-Object { $_.type -eq 'custom:agent-bridge-session-card' }) | Select-Object -First 1
-    if ($card) { return $card }
-    @($cards | Where-Object {
-        $_.type -eq 'vertical-stack' -and
-        @($_.cards | Where-Object { $_.type -eq 'conditional' }).Count -gt 0
-    }) | Select-Object -First 1
-}
 
 Set-TestPublicationCardUrl -Url '/local/agent-bridge-reply-card.js?v=1.32.0'
 Save-CopilotSessionDashboard -Sessions $sessions -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.32.0'
