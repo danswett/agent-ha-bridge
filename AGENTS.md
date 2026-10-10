@@ -77,6 +77,27 @@ is fine here - the worktree is disposable - but detaching is enough.
 on an isolation failure, the launch is refused with a diagnostic on the launch card
 and in the daemon log. There is no fallback to the primary checkout.
 
+### Tidy up only after yourself
+
+"The bridge tidies them up later" means the bridge, not you. `~/repos/wt` is shared
+across repositories and sessions, so most of what is in it belongs to someone else and
+its uncommitted work is invisible from here. Remove a worktree you created, by name.
+Never sweep the root, and never write an ad-hoc reclaimer - a cluttered root is not
+evidence that anything in it is finished.
+
+On 2026-10-08 a session that had just finished a release on an *unrelated project*
+emptied every worktree under the root, twice in fifteen minutes, destroying uncommitted
+and untracked work across projects it had no connection to. Branch `fix/keychain-prompt-storm`
+was checked out in one of them. #143 records the same anti-pattern hours earlier, where
+"an ad-hoc remover written during the original incident omitted it and used `--force`".
+
+`Remove-BridgeFinishedWorktree` is the one supported reclaimer, and the checks above
+are why it is trustworthy: a checked-out branch, uncommitted or untracked files, a
+missing marker or an age under `newSession.worktreeIdleHours` are deliberate
+protections for other people's work, not obstacles to route around with `--force`.
+It also only ever enumerates the repository it is given, so it cannot reach another
+project's trees - an ad-hoc sweep of the shared root can, and did.
+
 The general rules - never touch a branch you did not create, never `git stash`, stage
 only files you changed, never `git add -A` - are in
 `~/.copilot/reference/git-workflow.md`.

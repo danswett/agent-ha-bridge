@@ -783,6 +783,17 @@ try {
     Test-That 'and says the bridge owns the file, so nobody hand-edits it' {
         $script:InstrText -match 'uninstall' -and $script:InstrText -match 'overwritten'
     }
+    # The session that emptied every worktree under the shared root was working on an
+    # unrelated project, so it never read this repository's AGENTS.md. The rule only
+    # reaches it here (#148).
+    Test-That 'and tells an agent to remove only the worktrees it made itself' {
+        $script:InstrText -match 'Remove only the worktrees you made' -and
+            $script:InstrText -match 'other sessions and other' -and
+            $script:InstrText -match '[Nn]ever sweep the root'
+    }
+    Test-That 'and says the reclaimer refusals protect work rather than obstruct it' {
+        $script:InstrText -match '--force' -and $script:InstrText -match 'not yours'
+    }
 }
 finally {
     Remove-Item -LiteralPath $script:InstrRoot -Recurse -Force -ErrorAction SilentlyContinue
