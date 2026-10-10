@@ -290,6 +290,16 @@ Set-Content -LiteralPath $claudeStatePath -Encoding UTF8 -Value @"
 { "claudeAiOauth": { "accessToken": "stub-token", "subscriptionType": "pro", "expiresAt": $claudeExpiry } }
 "@
 
+# Where Claude Code records the account it is signed in as. The same object holds an
+# email address and an organisation and the file a great deal besides; every collector
+# below is given this path rather than left to find the real one under $HOME.
+$claudeUuid = '0f6a5c1e-7d2b-4c8e-9a31-5b7e2d4f8a10'
+$claudeOrganisation = '3b9d4e72-a1c6-4f58-b0e3-6c2d7a8f9e14'
+$claudeAccountPath = Join-Path $root 'claude-account.json'
+Set-Content -LiteralPath $claudeAccountPath -Encoding UTF8 -Value @"
+{ "numStartups": 12, "oauthAccount": { "accountUuid": "$claudeUuid", "organizationUuid": "$claudeOrganisation", "emailAddress": "someone@example.test", "organizationName": "Example Org", "ccOnboardingFlags": { "seen": true } }, "projects": {} }
+"@
+
 # The body Anthropic really returns when no five-hour window is open: the session
 # limit is listed, but inactive and at zero. The weekly window is anchored relative to
 # now for the same reason the Copilot snapshot is - a fixed date makes "how far
@@ -306,7 +316,7 @@ $claudeBody = @"
 }
 "@ | ConvertFrom-Json
 
-$claude = Get-BridgeClaudeAllowance -StatePath $claudeStatePath -Fetch { $claudeBody }
+$claude = Get-BridgeClaudeAllowance -StatePath $claudeStatePath -AccountPath $claudeAccountPath -Fetch { $claudeBody }
 
 Test-That 'the plan comes from the credential, not from the usage body' { $claude.plan -ceq 'pro' }
 # The bug this guards: filtering out inactive zero windows hid the session limit from
@@ -345,18 +355,128 @@ Test-That 'an expired token is not spent at all' {
     $past = [DateTimeOffset]::UtcNow.AddMinutes(-5).ToUnixTimeMilliseconds()
     Set-Content -LiteralPath $expired -Encoding UTF8 -Value "{ `"claudeAiOauth`": { `"accessToken`": `"stub`", `"expiresAt`": $past } }"
     $called = $false
-    $result = Get-BridgeClaudeAllowance -StatePath $expired -Fetch { $script:ClaudeFetchCalled = $true; $claudeBody }
+    $result = Get-BridgeClaudeAllowance -StatePath $expired -AccountPath $claudeAccountPath -Fetch { $script:ClaudeFetchCalled = $true; $claudeBody }
     $null -eq $result -and -not $called
 }
 Test-That 'and a token refused as it expires is not reported as a fault' {
-    $null -eq (Get-BridgeClaudeAllowance -StatePath $claudeStatePath -Fetch { throw 'Response status code does not indicate success: 401 (Unauthorized).' })
+    $null -eq (Get-BridgeClaudeAllowance -StatePath $claudeStatePath -AccountPath $claudeAccountPath -Fetch { throw 'Response status code does not indicate success: 401 (Unauthorized).' })
 }
 Test-That 'while a real failure still is' {
-    $broken = Get-BridgeClaudeAllowance -StatePath $claudeStatePath -Fetch { throw 'the name resolution failed' }
+    $broken = Get-BridgeClaudeAllowance -StatePath $claudeStatePath -AccountPath $claudeAccountPath -Fetch { throw 'the name resolution failed' }
     $null -eq $broken.percent -and $broken.error -match 'name resolution'
 }
 Test-That 'and a machine with no Claude credential reports nothing' {
-    $null -eq (Get-BridgeClaudeAllowance -StatePath (Join-Path $root 'absent.json'))
+    $null -eq (Get-BridgeClaudeAllowance -StatePath (Join-Path $root 'absent.json') -AccountPath $claudeAccountPath)
+}
+
+Write-Host ''
+Write-Host '--- Claude, and whose allowance it is ---'
+
+# Neither the credential nor the usage body names an account, so a Claude record used
+# to be the same account as every other Claude record. The card keeps one row per
+# account, which drew two machines signed in to two different Claude accounts as one
+# row - whichever had read last - and left the other account's figure nowhere at all.
+$claudeId = Get-BridgeClaudeAccountId -Path $claudeAccountPath
+Test-That 'the account is told by a short opaque id, and the record carries it' {
+    $claudeId -cmatch '^[0-9a-f]{12}$' -and $claude.account_id -ceq $claudeId
+} "id=$claudeId; record=$($claude.account_id)"
+Test-That 'a failed read says whose it was too, so it is not a second row beside the reading it failed to refresh' {
+    $broken = Get-BridgeClaudeAllowance -StatePath $claudeStatePath -AccountPath $claudeAccountPath -Fetch { throw 'the name resolution failed' }
+    $broken.account_id -ceq $claudeId
+}
+# Anything thrown outside the fetch's own handling lands in the collector loop's catch,
+# a credentials file half written while Claude Code refreshes its token, say. That
+# record must name the account as well, or it is a second row beside the reading.
+Test-That 'and so does a collector that threw outright' {
+    function Get-BridgeClaudeAllowance { throw 'the credentials file was half written' }
+    function Get-BridgeClaudeAccountId { 'a1b2c3d4e5f6' }
+    $thrown = @(Get-BridgeAgentAllowance -Clients @('claude'))
+    $thrown.Count -eq 1 -and $thrown[0].account_id -ceq 'a1b2c3d4e5f6' -and $thrown[0].error -match 'half written'
+}
+Test-That 'while another client that threw is not given an id it has no use for' {
+    function Get-BridgeCopilotAllowance { throw 'the config could not be read' }
+    function Get-BridgeClaudeAccountId { throw 'must not be asked about for Copilot' }
+    $thrown = @(Get-BridgeAgentAllowance -Clients @('copilot'))
+    $thrown.Count -eq 1 -and $thrown[0].account_id -ceq '' -and $thrown[0].error -match 'config could not be read'
+}
+Test-That 'the id is not the identifier it stands for' {
+    $claudeId -notmatch '0f6a5c1e|7d2b|4c8e|9a31|3b9d4e72|a1c6|4f58|b0e3'
+}
+Test-That 'and nothing else from that file reaches the record: not the email, not the organisation' {
+    $text = $claude | ConvertTo-Json -Depth 8 -Compress
+    $text -notmatch 'someone@example\.test' -and $text -notmatch 'Example Org' -and
+        $text -notmatch [regex]::Escape($claudeUuid) -and $text -notmatch [regex]::Escape($claudeOrganisation)
+}
+Test-That 'one allowance reads as one id however the file spells it, and wherever the file is' {
+    $respelled = Join-Path $root 'claude-account-respelled.json'
+    Set-Content -LiteralPath $respelled -Encoding UTF8 -Value "{ `"oauthAccount`": { `"organizationUuid`": `" $($claudeOrganisation.ToUpperInvariant())`", `"accountUuid`": `"  $($claudeUuid.ToUpperInvariant()) `" } }"
+    (Get-BridgeClaudeAccountId -Path $respelled) -ceq $claudeId
+}
+Test-That 'and another account is another id' {
+    $elsewhere = Join-Path $root 'claude-account-other.json'
+    Set-Content -LiteralPath $elsewhere -Encoding UTF8 -Value "{ `"oauthAccount`": { `"accountUuid`": `"9f8e7d6c-5b4a-4c3d-8e2f-1a0b9c8d7e6f`", `"organizationUuid`": `"$claudeOrganisation`" } }"
+    $otherId = Get-BridgeClaudeAccountId -Path $elsewhere
+    $otherId -cmatch '^[0-9a-f]{12}$' -and $otherId -cne $claudeId
+}
+
+# One person can sit in more than one organisation - a personal plan on one machine, a
+# team seat on another - and each has an allowance of its own under the same account
+# UUID. Keyed on the account alone they would still be drawn as one row.
+$claudeBare = Join-Path $root 'claude-account-bare.json'
+Set-Content -LiteralPath $claudeBare -Encoding UTF8 -Value "{ `"oauthAccount`": { `"accountUuid`": `"$claudeUuid`" } }"
+$claudeInTeam = Join-Path $root 'claude-account-team.json'
+Set-Content -LiteralPath $claudeInTeam -Encoding UTF8 -Value "{ `"oauthAccount`": { `"accountUuid`": `"$claudeUuid`", `"organizationUuid`": `"5d1e8a3c-72b4-4096-8cf1-e03a9b6d2714`" } }"
+$claudeOddOrganisation = Join-Path $root 'claude-account-odd-organisation.json'
+Set-Content -LiteralPath $claudeOddOrganisation -Encoding UTF8 -Value "{ `"oauthAccount`": { `"accountUuid`": `"$claudeUuid`", `"organizationUuid`": 7 } }"
+Test-That 'the same account in another organisation is another allowance, so another id' {
+    $teamId = Get-BridgeClaudeAccountId -Path $claudeInTeam
+    $teamId -cmatch '^[0-9a-f]{12}$' -and $teamId -cne $claudeId
+}
+Test-That 'an organisation that is missing still leaves an id, from the account alone' {
+    $bareId = Get-BridgeClaudeAccountId -Path $claudeBare
+    $bareId -cmatch '^[0-9a-f]{12}$' -and $bareId -cne $claudeId
+}
+Test-That 'and one that is not text is ignored rather than voiding the account' {
+    (Get-BridgeClaudeAccountId -Path $claudeOddOrganisation) -ceq (Get-BridgeClaudeAccountId -Path $claudeBare)
+}
+
+# Whatever cannot be read is no id, not a guess: a wrong id would put two accounts in
+# one row, which is the very thing this exists to prevent.
+$noAccount = [ordered]@{
+    'a file signed out of Claude'         = '{ "oauthAccount": null }'
+    'a file with no account in it'        = '{ "numStartups": 3 }'
+    'a blank identifier'                  = '{ "oauthAccount": { "accountUuid": "  " } }'
+    'a number where the identifier goes'  = '{ "oauthAccount": { "accountUuid": 12 } }'
+    'a string where the account goes'     = '{ "oauthAccount": "x" }'
+    'a file that is not JSON'             = 'this is not json'
+    'a list where the object should be'   = '[1, 2]'
+}
+foreach ($case in $noAccount.Keys) {
+    $unreadable = Join-Path $root "claude-account-$([guid]::NewGuid().ToString('N').Substring(0, 6)).json"
+    Set-Content -LiteralPath $unreadable -Encoding UTF8 -Value $noAccount[$case]
+    Test-That "$case yields no id, so the record goes ungrouped as it always did" {
+        (Get-BridgeClaudeAccountId -Path $unreadable) -ceq ''
+    }
+}
+Test-That 'a machine with no such file at all yields none either' {
+    (Get-BridgeClaudeAccountId -Path (Join-Path $root 'nowhere.json')) -ceq '' -and
+        (Get-BridgeClaudeAccountId -Path '') -ceq ''
+}
+Test-That 'and a file too large to be the small state document it should be is not read for one' {
+    $limit = $script:BridgeUsageConfig.MaxStateBytes
+    try {
+        $script:BridgeUsageConfig.MaxStateBytes = 20
+        (Get-BridgeClaudeAccountId -Path $claudeAccountPath) -ceq ''
+    }
+    finally { $script:BridgeUsageConfig.MaxStateBytes = $limit }
+}
+Test-That 'a machine whose account cannot be told still reports its allowance, only ungrouped' {
+    $ungrouped = Get-BridgeClaudeAllowance -StatePath $claudeStatePath -AccountPath (Join-Path $root 'nowhere.json') -Fetch { $claudeBody }
+    $ungrouped.windows.Count -eq 2 -and $ungrouped.Contains('account_id') -and $ungrouped.account_id -ceq ''
+}
+Test-That 'every record has an account_id, blank where the client names its own account' {
+    (New-BridgeUsageRecord -Client 'copilot' -Account 'work_account').Contains('account_id') -and
+        (New-BridgeUsageRecord -Client 'copilot' -Account 'work_account').account_id -ceq ''
 }
 
 # --- 3. Codex -------------------------------------------------------------------
@@ -456,6 +576,17 @@ Test-That 'and it is declared as a percentage measurement' {
     $config = (@($script:Published | Where-Object { $_.Topic -ceq $topic })[-1].Payload) | ConvertFrom-Json
     $config.unit_of_measurement -ceq '%' -and $config.state_class -ceq 'measurement' -and
         $config.object_id -ceq "agent_bridge_$($desk.Slug)_usage_copilot"
+}
+Test-That 'the account id rides in the attributes beside the account, for the card to group on' {
+    $topic = "copilot/cli/machine/$($desk.Slug)/usage/claude/attr"
+    $attributes = (@($script:Published | Where-Object { $_.Topic -ceq $topic })[-1].Payload) | ConvertFrom-Json
+    $attributes.account_id -ceq $claudeId
+} "id=$claudeId"
+Test-That 'and is blank rather than missing for a client that names its own account' {
+    $topic = "copilot/cli/machine/$($desk.Slug)/usage/copilot/attr"
+    $attributes = (@($script:Published | Where-Object { $_.Topic -ceq $topic })[-1].Payload) | ConvertFrom-Json
+    $null -ne $attributes.PSObject.Properties['account_id'] -and $attributes.account_id -ceq '' -and
+        $attributes.account -ceq 'work_account'
 }
 
 $unknown = Get-BridgeCopilotAllowance -ConfigPath $copilotConfig -CachePath '' -ResolveToken { '' } -Fetch { throw 'no token' }
@@ -637,6 +768,37 @@ Test-That 'Codex draws both of its windows' {
     @((@($drawn.groups | Where-Object { $_.name -eq 'Codex' })[0]).windows).Count -eq 2
 }
 
+# Claude names no account, so what tells its accounts apart is the id the daemon chose
+# to publish. Two machines are published through the real publisher and drawn by the
+# real card; nothing between them knows what an account is except that one attribute.
+$secondAccountPath = Join-Path $root 'claude-account-second.json'
+Set-Content -LiteralPath $secondAccountPath -Encoding UTF8 -Value '{ "oauthAccount": { "accountUuid": "9f8e7d6c-5b4a-4c3d-8e2f-1a0b9c8d7e6f" } }'
+function Get-ClaudeRowsDrawn {
+    param([string]$SecondMachineAccountPath)
+    $second = Get-BridgeClaudeAllowance -StatePath $claudeStatePath -AccountPath $SecondMachineAccountPath -Fetch { $claudeBody }
+    $script:Published.Clear()
+    Publish-CopilotMqttUsage -Records @($claude) -Slug $desk.Slug -MachineName $desk.Machine -Headers $headers
+    Publish-CopilotMqttUsage -Records @($second) -Slug $book.Slug -MachineName $book.Machine -Headers $headers
+    $claudeOnly = @{
+        type = 'custom:agent-bridge-usage-card'; title = 'Agent usage'
+        entities = @("sensor.agent_bridge_$($desk.Slug)_usage_claude", "sensor.agent_bridge_$($book.Slug)_usage_claude")
+    }
+    $request = @{ config = $claudeOnly; states = (Get-PublishedHaStates); open = $true } | ConvertTo-Json -Depth 40
+    ($request | & $nodeExe.Source $driver) | ConvertFrom-Json -Depth 40
+}
+$oneClaude = Get-ClaudeRowsDrawn -SecondMachineAccountPath $claudeAccountPath
+$twoClaudes = Get-ClaudeRowsDrawn -SecondMachineAccountPath $secondAccountPath
+Test-That 'one Claude account on two machines is drawn once' {
+    @($oneClaude.groups | Where-Object { $_.name -eq 'Claude Code' }).Count -eq 1
+} "rows=$(@($oneClaude.groups).Count)"
+Test-That 'while two Claude accounts on two machines are drawn as two rows, which used to be one' {
+    @($twoClaudes.groups | Where-Object { $_.name -eq 'Claude Code' }).Count -eq 2
+} "rows=$(@($twoClaudes.groups).Count)"
+Test-That 'and told apart on the card by a few characters of the id each machine published' {
+    $shown = @($twoClaudes.groups | ForEach-Object { $_.account })
+    @($shown | Where-Object { $_ -match '^#[0-9a-f]{4} .{1,3} pro$' }).Count -eq 2 -and @($shown | Select-Object -Unique).Count -eq 2
+} "shown=$(@($twoClaudes.groups | ForEach-Object { $_.account }) -join ' | ')"
+
 # A quota nearly gone has to look different, because the number alone is what nobody
 # reads in time.
 $hot = $haStates.Clone()
@@ -727,6 +889,21 @@ Test-That 'while a reading that moved is' {
 Test-That 'the entity ids are forced once, not on every reading that moves' {
     $script:IdForcings -eq 1
 } "forcings=$($script:IdForcings)"
+# The same windows under another account are another reading, and the card groups on
+# the account: a machine signed in to a different Claude account must republish even
+# though not one percentage moved.
+Test-That 'a change of account alone is a reading that moved, and is published' {
+    $windows = @(Get-BridgeUsageWindow -Key 'weekly_all' -Label 'Weekly' -PercentUsed 14)
+    $script:Pending = New-BridgeUsageRecord -Client 'claude' -AccountId 'a1b2c3d4e5f6' -Plan 'max' -Source 'api' -Windows $windows
+    function Get-BridgeAgentAllowance { param([AllowEmptyCollection()][string[]]$Clients = @()) @($script:Pending) }
+    $before = $script:UsagePublishes
+    [void](Sync-DaemonUsage -Headers $headers -Now $clock.AddSeconds(600))
+    [void](Sync-DaemonUsage -Headers $headers -Now $clock.AddSeconds(800))
+    $afterFirst = $script:UsagePublishes
+    $script:Pending = New-BridgeUsageRecord -Client 'claude' -AccountId '9f8e7d6c5b4a' -Plan 'max' -Source 'api' -Windows $windows
+    [void](Sync-DaemonUsage -Headers $headers -Now $clock.AddSeconds(1000))
+    $afterFirst -eq $before + 1 -and $script:UsagePublishes -eq $afterFirst + 1
+} "publishes=$($script:UsagePublishes)"
 Test-That 'and turning it off stops the collecting, not just the showing' {
     $script:Settings['usage.publish'] = $false
     $before = $script:Collected

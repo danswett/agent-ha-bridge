@@ -53,7 +53,7 @@
  * naming the publish it used, and the card holds the words until it sees that name
  * or sees the question go without it - see _checkAnswerConsumed (#104).
  */
-const CARD_VERSION = '1.33.0';
+const CARD_VERSION = '1.34.0';
 
 /*
  * How large a non-image attachment may be.
@@ -3202,14 +3202,18 @@ class AgentBridgeUsageCard extends HTMLElement {
       if (!entity || !entity.attributes) { continue }
       const a = entity.attributes;
       if (!a.client) { continue }
-      const key = `${a.client}\u0000${a.account || ''}`;
+      // account_id is what a vendor that names no account publishes in its place (an
+      // opaque id, for Claude); where there is none the account is the identity.
+      const key = `${a.client}\u0000${a.account_id || a.account || ''}`;
       const percent = Number.parseFloat(entity.state);
       const entry = {
         key,
+        client: a.client,
         at: Date.parse(a.measured_at || a.updated || '') || 0,
         percent: Number.isFinite(percent) ? percent : null,
         label: a.label || a.client,
         account: a.account || '',
+        accountId: a.account_id || '',
         plan: a.plan || '',
         machine: a.machine || '',
         error: a.error || '',
@@ -3231,6 +3235,18 @@ class AgentBridgeUsageCard extends HTMLElement {
       entries.push(failure && failure.error && failure.at > reading.at
         ? Object.assign({}, reading, { error: failure.error })
         : reading);
+    }
+
+    // Two rows of one client with no account to name either - Claude names none, so
+    // what separates its accounts is an opaque id - would look identical on the
+    // dashboard. A few characters of that id keep them apart, and only when there is
+    // something to keep apart: a lone row has no use for a name it was never given.
+    const rows = new Map();
+    for (const entry of entries) { rows.set(entry.client, (rows.get(entry.client) || 0) + 1) }
+    for (const entry of entries) {
+      if (!entry.account && entry.accountId && rows.get(entry.client) > 1) {
+        entry.account = `#${entry.accountId.slice(0, 4)}`;
+      }
     }
     // Closest to running out first: that is the one worth seeing without scrolling.
     return entries.sort((x, y) => (y.percent || 0) - (x.percent || 0));

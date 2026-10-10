@@ -180,6 +180,9 @@ function New-BridgeUsageRecord {
     param(
         [Parameter(Mandatory)][string]$Client,
         [AllowEmptyString()][string]$Account = '',
+        # What the card groups on when it is not blank: for a vendor that names no
+        # account, an opaque stand-in for it. See Get-BridgeClaudeAccountId.
+        [AllowEmptyString()][string]$AccountId = '',
         [AllowEmptyString()][string]$Plan = '',
         [AllowEmptyString()][string]$Source = '',
         [AllowEmptyCollection()][object[]]$Windows = @(),
@@ -201,6 +204,7 @@ function New-BridgeUsageRecord {
         client      = $Client
         label       = Get-BridgeUsageLabel -Client $Client
         account     = $Account
+        account_id  = $AccountId
         plan        = $Plan
         source      = $Source
         windows     = @($Windows)
@@ -774,6 +778,65 @@ function Get-BridgeCopilotAllowance {
     New-BridgeUsageRecord -Client 'copilot' -Account $account.Login -Source 'none' -Problem $failure
 }
 
+function Get-BridgeClaudeAccountId {
+    <#
+        An opaque id for the Claude account this machine is signed in to, or '' when it
+        cannot be told.
+
+        Claude's usage record named no account at all: neither the credential nor the
+        usage body says whose allowance it is. The card keeps one row per account, so
+        every Claude record was the same account to it, and two machines signed in to
+        two different Claude accounts were drawn as one row - whichever had read last -
+        with the other account's figure nowhere on the dashboard. Claude Code records
+        the account it is signed in as under `oauthAccount` in ~/.claude.json, which is
+        what this reads.
+
+        What comes back is a short digest of that account's UUID and its organisation's,
+        not either of them and not anything else in the object (the email address is in
+        there too). The organisation is part of it because one person can sit in more
+        than one - a personal plan on one machine, a team seat on another - and each has
+        an allowance of its own under the same account UUID; keyed on the account alone
+        they would still be drawn as one row. The card needs to know whether two records
+        are the same allowance and nothing more, so nothing more is published. It is a
+        grouping key rather than a secret: stable for the allowance, and sitting in a
+        retained attribute like the rest.
+
+        Read with the JSON reader that does not build the whole document, because the
+        file is everything Claude Code remembers - megabytes of per-project state for a
+        heavy user - and this runs on every poll. Anything unreadable is '' and the
+        record goes ungrouped, exactly as every Claude record did before. An
+        organisation that is missing is not unreadable: the account alone still tells
+        two machines apart, so it is used on its own.
+    #>
+    param([AllowEmptyString()][string]$Path = (Join-Path $HOME '.claude.json'))
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not [IO.File]::Exists($Path)) { return '' }
+    try {
+        if ((Get-Item -LiteralPath $Path -Force -ErrorAction Stop).Length -gt $script:BridgeUsageConfig.MaxStateBytes) {
+            return ''
+        }
+        $account = ''
+        $organisation = ''
+        $document = [Text.Json.JsonDocument]::Parse([IO.File]::ReadAllText($Path))
+        try {
+            foreach ($property in $document.RootElement.GetProperty('oauthAccount').EnumerateObject()) {
+                # Only text counts: a number where an id belongs is not an id, and
+                # skipping it here leaves the account blank rather than guessing.
+                if ($property.Value.ValueKind -ne [Text.Json.JsonValueKind]::String) { continue }
+                if ($property.Name -ceq 'accountUuid') { $account = $property.Value.GetString() }
+                elseif ($property.Name -ceq 'organizationUuid') { $organisation = $property.Value.GetString() }
+            }
+        }
+        finally { $document.Dispose() }
+        if ([string]::IsNullOrWhiteSpace($account)) { return '' }
+        $identity = "claude:$($account.Trim().ToLowerInvariant())"
+        if (-not [string]::IsNullOrWhiteSpace($organisation)) { $identity += ":$($organisation.Trim().ToLowerInvariant())" }
+        $digest = [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($identity))
+        [Convert]::ToHexString($digest).Substring(0, 12).ToLowerInvariant()
+    }
+    catch { '' }
+}
+
 function Get-BridgeClaudeAllowance {
     <#
         Claude's session and weekly windows.
@@ -793,6 +856,7 @@ function Get-BridgeClaudeAllowance {
     #>
     param(
         [AllowEmptyString()][string]$StatePath = (Join-Path $HOME '.claude/.credentials.json'),
+        [AllowEmptyString()][string]$AccountPath = (Join-Path $HOME '.claude.json'),
         [DateTimeOffset]$Now = [DateTimeOffset]::UtcNow,
         [scriptblock]$Fetch = {
             param($Token)
@@ -821,6 +885,10 @@ function Get-BridgeClaudeAllowance {
         if ($expiresAt -le $Now) { return $null }
     }
 
+    # Carried by a failed read as well as a good one: a failure that could not say whose
+    # it was would be a second Claude row beside the reading it failed to refresh.
+    $accountId = Get-BridgeClaudeAccountId -Path $AccountPath
+
     try {
         $response = Invoke-BridgeUsageAttempt -Operation { & $Fetch ([string]$oauth.accessToken) }
     }
@@ -829,7 +897,7 @@ function Get-BridgeClaudeAllowance {
         # A refused token is the expiry above arriving a moment early, not a fault to
         # report: the retained reading carries on and ages.
         if ("$($_.Exception.Message)" -match '\b401\b|Unauthorized') { return $null }
-        return New-BridgeUsageRecord -Client 'claude' -Plan $plan -Source 'none' `
+        return New-BridgeUsageRecord -Client 'claude' -AccountId $accountId -Plan $plan -Source 'none' `
             -Problem "The Claude usage could not be read: $(Get-BridgeUsageFailureText -ErrorRecord $_)"
     }
 
@@ -864,7 +932,7 @@ function Get-BridgeClaudeAllowance {
     }
     if ($windows.Count -eq 0) { return $null }
 
-    New-BridgeUsageRecord -Client 'claude' -Plan $plan -Source 'api' -Windows $windows
+    New-BridgeUsageRecord -Client 'claude' -AccountId $accountId -Plan $plan -Source 'api' -Windows $windows
 }
 
 function Get-BridgeCodexAllowance {
@@ -960,7 +1028,13 @@ function Get-BridgeAgentAllowance {
         }
         catch {
             if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
-            $records += New-BridgeUsageRecord -Client $client -Source 'none' `
+            # What a collector that threw could not say is whose allowance it was reading.
+            # The card keeps one row per account, so for Claude - told apart by that id -
+            # a failure without it is a second row beside the reading it failed to
+            # refresh. The id reader catches everything itself, so asking for it here
+            # cannot turn one failure into another.
+            $accountId = if ($client -ceq 'claude') { Get-BridgeClaudeAccountId } else { '' }
+            $records += New-BridgeUsageRecord -Client $client -AccountId $accountId -Source 'none' `
                 -Problem "Usage for $client could not be collected: $($_.Exception.Message)"
         }
     }
@@ -1006,8 +1080,10 @@ function Sync-DaemonUsage {
 
     # Everything except when it was taken, so a poll that found no change does not
     # republish a retained message every two minutes for the sake of a new timestamp.
+    # The account counts as part of the reading: the same windows under another
+    # account are another reading, and the card groups on it.
     $signature = ($records | ForEach-Object {
-        @($_.client, $_.account, $_.source, $_.error, ($_.windows | ForEach-Object { "$($_.key)=$($_.percent)" })) -join '|'
+        @($_.client, $_.account, $_.account_id, $_.source, $_.error, ($_.windows | ForEach-Object { "$($_.key)=$($_.percent)" })) -join '|'
     }) -join ';'
     if ($signature -ceq $script:DaemonUsageSignature) { return $false }
 
