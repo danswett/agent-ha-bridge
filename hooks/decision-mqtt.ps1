@@ -1277,6 +1277,7 @@ function Publish-CopilotMqttUsage {
             client       = $client
             label        = [string]$record.label
             account      = [string]$record.account
+            account_id   = [string]$record.account_id
             plan         = [string]$record.plan
             source       = [string]$record.source
             windows      = @($record.windows)

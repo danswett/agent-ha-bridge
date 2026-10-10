@@ -1222,6 +1222,83 @@ check('one definition of a reading, shared by choosing a record and reporting it
   !AgentBridgeUsageCard._hasReading({ percent: null, windows: [] }));
 
 console.log('');
+console.log('--- the usage card tells one account from another when the vendor names none ---');
+/*
+ * Copilot publishes the login it read, so two machines on one login are one row. Claude
+ * names no account at all, so every Claude record used to be the same account to the
+ * card: two machines signed in to two Claude accounts were drawn as one row, whichever
+ * had read last, and the other account's figure was nowhere on the dashboard. The
+ * daemon now publishes an opaque account_id for it and the card groups on that, falling
+ * back to the account where there is none.
+ */
+function claudeRecord({ id, account = '', ageMs = 2 * MINUTE, percent = 14, plan = 'max', error = '', machine = 'desk' }) {
+  const bars = percent === null ? [] : [{ key: 'weekly_all', label: 'Weekly', percent }];
+  const attributes = {
+    client: 'claude', label: 'Claude Code', account, plan, source: bars.length ? 'api' : 'none',
+    windows: bars, error, machine, measured_at: agoIso(ageMs),
+  };
+  if (id !== undefined) { attributes.account_id = id; }
+  return { state: percent === null ? 'unknown' : String(percent), attributes };
+}
+const idOf = (group) => group.children[0].children[1].textContent;
+
+const sameAccount = collectUsage({
+  'sensor.desk': claudeRecord({ id: 'a1b2c3d4e5f6', ageMs: 30 * MINUTE, percent: 14 }),
+  'sensor.vm': claudeRecord({ id: 'a1b2c3d4e5f6', ageMs: 1 * MINUTE, percent: 15, machine: 'vm' }),
+});
+check('one Claude account on two machines is one row, and the newer reading is the one kept',
+  sameAccount.length === 1 && sameAccount[0].percent === 15 && sameAccount[0].machine === 'vm',
+  JSON.stringify(sameAccount.map((e) => [e.percent, e.machine])));
+check('which has no use for a name, because there is nothing to tell it from',
+  sameAccount[0].account === '', JSON.stringify(sameAccount[0].account));
+
+const twoClaudes = collectUsage({
+  'sensor.desk': claudeRecord({ id: 'a1b2c3d4e5f6', percent: 14 }),
+  'sensor.vm': claudeRecord({ id: '9f8e7d6c5b4a', percent: 61, machine: 'vm' }),
+});
+check('two Claude accounts are two rows, not whichever read last',
+  twoClaudes.length === 2 && twoClaudes.map((e) => e.percent).sort((x, y) => x - y).join(',') === '14,61',
+  JSON.stringify(twoClaudes.map((e) => [e.percent, e.machine])));
+check('and each is named by a few characters of its own id, so the two can be told apart',
+  twoClaudes.map((e) => e.account).sort().join(',') === '#9f8e,#a1b2', JSON.stringify(twoClaudes.map((e) => e.account)));
+check('on the row itself, where it is read',
+  idOf(usageCard()._renderGroup(twoClaudes[0])) === `${twoClaudes[0].account} \u00b7 max`,
+  idOf(usageCard()._renderGroup(twoClaudes[0])));
+check('the full id is not what is shown', twoClaudes.every((e) => !e.account.includes('a1b2c3d4')));
+
+const loneWithId = collectUsage({ 'sensor.desk': claudeRecord({ id: 'a1b2c3d4e5f6' }) });
+check('a lone Claude row is not given a name it has no use for', loneWithId[0].account === '', loneWithId[0].account);
+
+// A machine on an older bridge publishes no account_id and a blank account. It is the
+// same Claude account as far as the person at the dashboard knows, but the card cannot
+// know that, so it stays a row of its own until that machine is updated.
+const mixed = collectUsage({
+  'sensor.desk': claudeRecord({ id: 'a1b2c3d4e5f6', percent: 14 }),
+  'sensor.old': claudeRecord({ percent: 40, machine: 'old' }),
+});
+check('a machine that publishes no id is grouped as before, apart from those that do',
+  mixed.length === 2, JSON.stringify(mixed.map((e) => [e.percent, e.account])));
+check('and the one that does not is not made up a name',
+  mixed.find((e) => e.machine === 'old').account === '', JSON.stringify(mixed.map((e) => [e.machine, e.account])));
+
+const failedClaude = collectUsage({
+  'sensor.desk': claudeRecord({ id: 'a1b2c3d4e5f6', ageMs: 20 * MINUTE, percent: 14 }),
+  'sensor.vm': claudeRecord({ id: 'a1b2c3d4e5f6', ageMs: 1 * MINUTE, percent: null, error: 'The Claude usage could not be read', machine: 'vm' }),
+});
+check('a failed Claude read carrying the same id does not open a row of its own, or displace the reading',
+  failedClaude.length === 1 && failedClaude[0].percent === 14, JSON.stringify(failedClaude.map((e) => [e.percent, e.error])));
+
+const logins = collectUsage({
+  'sensor.desk': usageRecord({ account: 'work_account', ageMs: 30 * MINUTE, percent: 40 }),
+  'sensor.vm': usageRecord({ account: 'work_account', ageMs: 1 * MINUTE, percent: 42 }),
+  'sensor.mac': usageRecord({ account: 'personal_account', ageMs: 1 * MINUTE, percent: 3 }),
+});
+check('Copilot, which names its account, is grouped on that exactly as before',
+  logins.length === 2 && logins.map((e) => e.account).sort().join(',') === 'personal_account,work_account',
+  JSON.stringify(logins.map((e) => [e.account, e.percent])));
+check('and is never given an id-shaped name', logins.every((e) => !e.account.startsWith('#')));
+
+console.log('');
 console.log('--- the launch card carries model, effort and context ---');
 /*
  * The three tuning selectors are the launch card's only controls whose options change

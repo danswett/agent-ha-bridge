@@ -893,6 +893,22 @@ much newer its attempt is (see [When a read fails](#when-a-read-fails)).
 | **Claude** | The session (5-hour) and weekly windows, read with the OAuth token Claude Code keeps beside its settings. Both are drawn whenever Anthropic lists them, including a session window sitting at 0% because none is open — leaving those out made Claude look as though it had only a weekly cap. That token expires about hourly and only Claude Code can refresh it: Anthropic retires a refresh token as it is used, so refreshing from here would either sign Claude Code out or race its own write. An expired token is therefore not spent, and the retained sensor keeps its last reading and ages |
 | **Codex** | The 5-hour and weekly rate-limit windows. Codex has no endpoint to ask — it learns its limits from the replies it gets — so this is the newest figure in its own transcripts, and the card marks it stale once it is over an hour old |
 
+Copilot's record names the login it read, so that login is the account. Claude's names
+none — neither its credential nor its usage reply says whose allowance it is — so the
+daemon reads which account and organisation Claude Code is signed in to (`oauthAccount`
+in `~/.claude.json`) and publishes an `account_id` for them: a short digest of the two
+UUIDs, not either of them, and nothing else from that file, the email address included.
+The organisation is part of it because one person can have a personal plan on one machine
+and a team seat on another, and those are separate allowances under one account. The card
+groups on the id, so one Claude allowance on two machines is one row and two allowances
+are two rows, told apart by the first few characters of the id (`#a1b2`) when nothing
+else tells them apart. It is a grouping key, not a secret — stable for the allowance, in a
+retained attribute like the rest. A machine that is not yet on a bridge that publishes it,
+or whose `~/.claude.json` cannot be read, publishes none and is grouped as before — with
+every other Claude record that names no account — until it is updated. Codex's
+transcripts name no account either and nothing reads one for it yet, so the card still
+draws a single Codex row, from whichever machine ran it last.
+
 Each bar carries a thin **pace mark** where an even spend would have reached by now,
 with the line underneath naming it: `│ even pace 20% · 48% ahead of pace`. Two thirds
 of a monthly allowance gone means nothing on its own — on the 25th it is thrift, on the
