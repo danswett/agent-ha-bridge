@@ -402,6 +402,13 @@ Test-That 'while another client that threw is not given an id it has no use for'
 Test-That 'the id is not the identifier it stands for' {
     $claudeId -notmatch '0f6a5c1e|7d2b|4c8e|9a31|3b9d4e72|a1c6|4f58|b0e3'
 }
+# Pinned, because the card compares ids from different machines: two bridge versions
+# that derived it differently would split one allowance into two rows. The values were
+# taken from SHA256.HashData over "claude:<account>:<organisation>", so they also prove
+# the runtime-compatible hashing used now produces exactly what the first version did.
+Test-That 'the id is a fixed function of the account and organisation, the same on every machine' {
+    $claudeId -ceq '95adb0b680fe' -and (Get-BridgeClaudeAccountId -Path $claudeAccountPath) -ceq '95adb0b680fe'
+} "id=$claudeId"
 Test-That 'and nothing else from that file reaches the record: not the email, not the organisation' {
     $text = $claude | ConvertTo-Json -Depth 8 -Compress
     $text -notmatch 'someone@example\.test' -and $text -notmatch 'Example Org' -and
@@ -434,8 +441,8 @@ Test-That 'the same account in another organisation is another allowance, so ano
 }
 Test-That 'an organisation that is missing still leaves an id, from the account alone' {
     $bareId = Get-BridgeClaudeAccountId -Path $claudeBare
-    $bareId -cmatch '^[0-9a-f]{12}$' -and $bareId -cne $claudeId
-}
+    $bareId -cmatch '^[0-9a-f]{12}$' -and $bareId -cne $claudeId -and $bareId -ceq '070ee00faa64'
+} "id=$(Get-BridgeClaudeAccountId -Path $claudeBare)"
 Test-That 'and one that is not text is ignored rather than voiding the account' {
     (Get-BridgeClaudeAccountId -Path $claudeOddOrganisation) -ceq (Get-BridgeClaudeAccountId -Path $claudeBare)
 }

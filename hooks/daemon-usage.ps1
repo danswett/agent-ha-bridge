@@ -831,8 +831,14 @@ function Get-BridgeClaudeAccountId {
         if ([string]::IsNullOrWhiteSpace($account)) { return '' }
         $identity = "claude:$($account.Trim().ToLowerInvariant())"
         if (-not [string]::IsNullOrWhiteSpace($organisation)) { $identity += ":$($organisation.Trim().ToLowerInvariant())" }
-        $digest = [Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($identity))
-        [Convert]::ToHexString($digest).Substring(0, 12).ToLowerInvariant()
+        # Create() and BitConverter rather than SHA256.HashData and Convert.ToHexString:
+        # those two need .NET 5, and this function's catch turns a missing method into
+        # "no id" - which would quietly leave every Claude record ungrouped on a runtime
+        # that lacks them, with nothing to say why.
+        $hasher = [Security.Cryptography.SHA256]::Create()
+        try { $digest = $hasher.ComputeHash([Text.Encoding]::UTF8.GetBytes($identity)) }
+        finally { $hasher.Dispose() }
+        [BitConverter]::ToString($digest).Replace('-', '').ToLowerInvariant().Substring(0, 12)
     }
     catch { '' }
 }
