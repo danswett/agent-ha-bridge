@@ -1116,6 +1116,14 @@ Test-That 'but an idle machine is never asked more often than a busy one' {
     $early -ceq '' -and $due -ceq 'copilot,claude,codex'
 }
 Reset-UsagePacing
+$script:Settings['usage.idleIntervalSeconds'] = 120
+Test-That 'an idle interval set to the quick one asks everywhere as often as before' {
+    [void](Invoke-UsageAt 0 $none)
+    $early = Invoke-UsageAt 119 $none
+    $due = Invoke-UsageAt 120 $none
+    $early -ceq '' -and $due -ceq 'copilot,claude,codex'
+}
+Reset-UsagePacing
 $script:Settings['usage.intervalSeconds'] = 'often'
 Test-That 'an interval that is not a number is the default, not a failure of the reconcile' {
     [void](Invoke-UsageAt 0 $claudeOpen)

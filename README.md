@@ -982,8 +982,14 @@ nothing to refresh. In practice that means Copilot is never more than two minute
 on a machine you are working in, which is the point: its figure was measured moving
 continuously during an active session. A machine with nothing open can be up to a
 quarter of an hour behind, but the card shows whichever machine read the account most
-recently, so the machine where the work is happening is the one you are looking at. A
-reading that could not be published is asked for again at the quick pace, not the idle
+recently, so the machine where the work is happening is the one you are looking at.
+
+That holds for work the bridge can see. Spending it cannot — Copilot in an editor, say,
+with no CLI session open on any machine — is picked up at the idle pace, so the figure
+can lag it by up to `usage.idleIntervalSeconds`. Set that to the same as
+`usage.intervalSeconds` to ask everywhere as often as before.
+
+A reading that could not be published is asked for again at the quick pace, not the idle
 one.
 
 The card also runs a half-minute timer of its own, purely so the relative text —
