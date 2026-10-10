@@ -1790,6 +1790,12 @@ function Get-BridgeAgentInstructions {
         cost: nothing errors, nothing is logged, and the symptom shows up somewhere the
         agent is not looking. Both were learned the hard way on 2026-09-29.
 
+        The worktree rule is different: it does not fail silently, it destroys
+        uncommitted work belonging to other sessions. It lives here rather than only in
+        the repository's own AGENTS.md for the reason below - the session that swept the
+        root twice on 2026-10-08 was finishing a release on an unrelated project, and
+        never read that file (#148).
+
         This lives here rather than only in the repository's AGENTS.md because an agent
         driving the bridge is almost never working *in* the bridge's repository - it is
         in some unrelated project on a machine that happens to have the bridge
@@ -1837,7 +1843,9 @@ local edits are overwritten on the next install.
 
 This machine runs a bridge that puts agent sessions on a Home Assistant dashboard. You
 can drive a session - yours, or one on another machine - through its entities. Two
-things about that fail silently, so they are worth knowing before you try.
+things about that fail silently, so they are worth knowing before you try. The last
+section is about the worktrees the bridge creates, and is here because getting it
+wrong has already destroyed other sessions' work.
 
 ## Authenticate writes as the agent
 
@@ -1860,6 +1868,24 @@ Do not ask a session to answer with a persistent notification. Home Assistant do
 expose those through `GET /api/states`, so polling for a `persistent_notification.*`
 entity finds nothing however long you wait, and that silence looks exactly like the
 session having died.
+
+## Remove only the worktrees you made yourself
+
+The bridge gives an isolated session a git worktree under a shared root - `~/repos/wt`
+by default. That root holds trees belonging to **other sessions and other
+repositories**, whose uncommitted work is invisible from yours. Remove one you created,
+by name. Never sweep the root, never empty it wholesale, and never write your own
+reclaimer.
+
+Tidying it is not housekeeping you can do on the bridge's behalf. On 2026-10-08 a
+session that had just finished a release on an unrelated project emptied every worktree
+under the root, twice in fifteen minutes, destroying uncommitted work in projects it had
+never touched. All it reported was "no open PRs or issues, worktrees released".
+
+The bridge already reclaims what is safe to reclaim. Its refusals - a checked-out
+branch, uncommitted or untracked files, a missing bridge marker, an age under the
+configured idle hours - are protections for work that is not yours, not obstacles to
+get past with `--force`. A tree that looks stale is one you leave alone.
 '@
 
     $body.Replace('__TOKENRULE__', $tokenRule.Trim()).Replace('__ENVVAR__', $EnvVarName)

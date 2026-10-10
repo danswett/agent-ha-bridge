@@ -302,11 +302,45 @@ try {
     Write-Host '--- requested isolation never falls back to the repository ---'
     $notRepo = Join-Path $sandbox 'plain'
     [void][System.IO.Directory]::CreateDirectory($notRepo)
-    $plain = New-BridgeSessionWorktree -RepositoryPath $notRepo
+    # This fixture is only "not a repository" when nothing above it is one, and that is
+    # not something the suite controls: $sandbox sits under the per-suite TEMP, which
+    # -ResultsDirectory can put inside a checkout. Git's discovery then walks up, finds
+    # that enclosing repository and the call reaches a later refusal about a missing
+    # subdirectory instead. #169 was reported as a Windows bug for exactly that reason -
+    # the message was right for the situation git had actually found, and CI never saw
+    # it because its results directory is outside any checkout. A ceiling stops the walk
+    # at the sandbox, so the non-repository branch is proven wherever the suite runs.
+    $savedCeiling = $env:GIT_CEILING_DIRECTORIES
+    try {
+        $env:GIT_CEILING_DIRECTORIES = $sandbox
+        $plain = New-BridgeSessionWorktree -RepositoryPath $notRepo
+    }
+    finally { $env:GIT_CEILING_DIRECTORIES = $savedCeiling }
     Test-That 'a non-repository cannot provide requested isolation or an executable fallback' {
         -not $plain.Isolated -and [string]::IsNullOrWhiteSpace($plain.Path)
     }
     Test-That 'and says why' { $plain.Detail -match 'not a git repository' } "[$($plain.Detail)]"
+
+    # The other side of the same coin, pinned here so the distinction is not mistaken
+    # for a bug again: a directory that is not itself a repository but sits inside one
+    # is isolated against the enclosing repository, and is then refused because an
+    # untracked subdirectory is absent from a fresh worktree of it. The cap is disabled
+    # rather than inherited so this proves the subdirectory branch, not the limit.
+    $nestedPlain = Join-Path $repo 'scratch'
+    [void][System.IO.Directory]::CreateDirectory($nestedPlain)
+    $beforeNested = @(Get-BridgeManagedWorktree -RepositoryPath $repo)
+    $nested = New-BridgeSessionWorktree -RepositoryPath $nestedPlain -Limit 0
+    Test-That 'a plain directory inside a repository is refused for the subdirectory, not for being a non-repository' {
+        -not $nested.Isolated -and [string]::IsNullOrWhiteSpace($nested.Path) -and
+            $nested.Detail -match 'approved subdirectory is absent' -and
+            $nested.Detail -notmatch 'not a git repository'
+    } "[$($nested.Detail)]"
+    # That refusal deliberately retains the worktree it made, so take it back out before
+    # the assertions below count or cap anything.
+    foreach ($made in @(Get-BridgeManagedWorktree -RepositoryPath $repo)) {
+        if ($beforeNested -notcontains $made) { Invoke-Git $repo @('worktree', 'remove', '--force', $made) }
+    }
+    Remove-Item -LiteralPath $nestedPlain -Recurse -Force -ErrorAction SilentlyContinue
 
     $capped = New-BridgeSessionWorktree -RepositoryPath $repo -Limit 1
     Test-That 'hitting the worktree limit refuses an executable fallback' {
