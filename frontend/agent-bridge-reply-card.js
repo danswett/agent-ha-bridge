@@ -53,7 +53,7 @@
  * naming the publish it used, and the card holds the words until it sees that name
  * or sees the question go without it - see _checkAnswerConsumed (#104).
  */
-const CARD_VERSION = '1.34.0';
+const CARD_VERSION = '1.35.0';
 
 /*
  * How large a non-image attachment may be.
