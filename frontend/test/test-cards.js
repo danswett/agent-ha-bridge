@@ -1123,6 +1123,105 @@ check('one definition of stale, so the age and the error can never disagree',
   AgentBridgeUsageCard._isStale(Date.now() - 3600001) && !AgentBridgeUsageCard._isStale(Date.now() - 60000));
 
 console.log('');
+console.log('--- a reading outranks a machine that merely failed to take one ---');
+/*
+ * An allowance belongs to an account, so two machines signed in to the same one both
+ * publish it and the card keeps whichever is newest. A read that fails with nothing
+ * to fall back on still returns a record, stamped with the time of the attempt, so on
+ * the clock alone the machine that could not read the allowance beat the one that
+ * could: the card showed an error and no figure with the figure one entity over.
+ */
+const agoIso = (ms) => new Date(Date.now() - ms).toISOString();
+const MINUTE = 60 * 1000;
+const HOUR = 60 * MINUTE;
+
+function usageRecord({ account = 'danswett', ageMs, percent, error = '', windows }) {
+  const bars = windows !== undefined ? windows
+    : (percent === undefined ? [] : [{ key: 'plan', label: 'Plan', percent }]);
+  return {
+    state: percent === undefined ? 'unknown' : String(percent),
+    attributes: {
+      client: 'copilot', label: 'GitHub Copilot', account, plan: 'enterprise',
+      source: bars.length ? 'api' : 'none', windows: bars, error, measured_at: agoIso(ageMs),
+    },
+  };
+}
+function collectUsage(records) {
+  const card = usageCard();
+  card._config = { title: 'Agent usage', entities: Object.keys(records) };
+  card._hass = { states: records };
+  return card._collect();
+}
+const attempt = 'No Copilot credential was available and nothing was cached';
+
+const reading = usageRecord({ ageMs: 20 * MINUTE, percent: 68 });
+const failed = usageRecord({ ageMs: 1 * MINUTE, error: attempt });
+for (const order of [['sensor.desk', 'sensor.laptop'], ['sensor.laptop', 'sensor.desk']]) {
+  const entries = collectUsage(Object.fromEntries(order.map((id) =>
+    [id, id === 'sensor.desk' ? reading : failed])));
+  check(`a newer failed attempt does not displace the reading (${order[0]} first)`,
+    entries.length === 1 && entries[0].percent === 68 && entries[0].windows.length === 1,
+    JSON.stringify(entries.map((e) => [e.percent, e.windows.length])));
+}
+
+const freshEntry = collectUsage({ 'sensor.desk': reading, 'sensor.laptop': failed })[0];
+check('and while that reading is fresh the failure stays unreported',
+  errText(usageCard()._renderGroup(freshEntry)) === '', errText(usageCard()._renderGroup(freshEntry)));
+
+const hoursOld = usageRecord({ ageMs: 5 * HOUR, percent: 68 });
+const agedEntry = collectUsage({ 'sensor.desk': hoursOld, 'sensor.laptop': failed })[0];
+check('once the reading is hours old the card draws it, aged',
+  agedEntry.percent === 68 && AgentBridgeUsageCard._isStale(agedEntry.at), String(agedEntry.at));
+check('and carries the newer failure, so the reason is not lost with the bars',
+  errText(usageCard()._renderGroup(agedEntry)).includes(attempt), errText(usageCard()._renderGroup(agedEntry)));
+
+const cached = usageRecord({ ageMs: 5 * HOUR, percent: 68, error: 'The Copilot quota could not be read' });
+const olderFailure = usageRecord({ ageMs: 6 * HOUR, error: attempt });
+const keptOwn = collectUsage({ 'sensor.desk': cached, 'sensor.laptop': olderFailure })[0];
+check('a failure older than the reading says nothing the reading did not',
+  keptOwn.error === 'The Copilot quota could not be read', keptOwn.error);
+
+const newerReading = usageRecord({ ageMs: 2 * MINUTE, percent: 71 });
+const betweenReadings = collectUsage({ 'sensor.a': reading, 'sensor.b': newerReading, 'sensor.c': failed });
+check('between two readings the newer still wins',
+  betweenReadings.length === 1 && betweenReadings[0].percent === 71, JSON.stringify(betweenReadings.map((e) => e.percent)));
+
+const firstFailure = usageRecord({ ageMs: 30 * MINUTE, error: 'first reason' });
+const lastFailure = usageRecord({ ageMs: 1 * MINUTE, error: 'latest reason' });
+const onlyFailures = collectUsage({ 'sensor.a': firstFailure, 'sensor.b': lastFailure });
+check('and between two failures with nothing to draw the latest reason wins',
+  onlyFailures.length === 1 && onlyFailures[0].error === 'latest reason', JSON.stringify(onlyFailures.map((e) => e.error)));
+check('which is reported however new the attempt is',
+  errText(usageCard()._renderGroup(onlyFailures[0])) === 'latest reason', errText(usageCard()._renderGroup(onlyFailures[0])));
+
+const twoAccounts = collectUsage({
+  'sensor.desk': usageRecord({ account: 'dswett_microsoft', ageMs: 3 * MINUTE, percent: 7 }),
+  'sensor.laptop': usageRecord({ account: 'danswett', ageMs: 1 * MINUTE, error: attempt }),
+});
+check('an account that nobody could read keeps its own row, and its reason',
+  twoAccounts.length === 2 && twoAccounts.some((e) => e.account === 'danswett' && e.error === attempt),
+  JSON.stringify(twoAccounts.map((e) => [e.account, e.percent, e.error])));
+check('while another account is not offered the failure that belongs to it',
+  twoAccounts.find((e) => e.account === 'dswett_microsoft').error === '',
+  JSON.stringify(twoAccounts.map((e) => [e.account, e.error])));
+check('and the row closest to running out is still the first',
+  twoAccounts[0].account === 'dswett_microsoft', twoAccounts.map((e) => e.account).join(','));
+
+// An entity restored by Home Assistant can read as unavailable while its attributes
+// still describe a good reading - what is drawn is the windows, not the state string.
+const restored = usageRecord({ ageMs: 4 * MINUTE, percent: 68 });
+restored.state = 'unavailable';
+const restoredEntries = collectUsage({ 'sensor.desk': restored, 'sensor.laptop': failed });
+check('a reading whose state string is not a number still counts as one while it has windows',
+  restoredEntries.length === 1 && restoredEntries[0].windows.length === 1 && restoredEntries[0].percent === null,
+  JSON.stringify(restoredEntries.map((e) => [e.percent, e.windows.length])));
+
+check('one definition of a reading, shared by choosing a record and reporting its error',
+  AgentBridgeUsageCard._hasReading({ percent: 12, windows: [] }) &&
+  AgentBridgeUsageCard._hasReading({ percent: null, windows: [{ percent: 3 }] }) &&
+  !AgentBridgeUsageCard._hasReading({ percent: null, windows: [] }));
+
+console.log('');
 console.log('--- the launch card carries model, effort and context ---');
 /*
  * The three tuning selectors are the launch card's only controls whose options change
