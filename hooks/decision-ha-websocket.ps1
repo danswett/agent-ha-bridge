@@ -45,7 +45,16 @@
 # definition of a conflict there - so on any installation already fenced at the old
 # renderer, publication is refused and the fix can never reach the dashboard without
 # an operator pin nobody should have to take.
-$script:BridgeDashboardRenderVersion = '1.8.0'
+# 1.9.0, not 1.8.0: the form-field ceiling went from four to twelve, so the renderer
+# now hands the choices card twelve slot entity ids instead of four. That is a change
+# in what Save-CopilotSessionDashboard writes, but it came from a constant rather than
+# from the function's own text, so every fingerprint stayed identical and the fence had
+# nothing to move to. Left at 1.8.0 an upgraded machine would verify its existing
+# receipt, skip the rebuild entirely, and go on serving a card with four slots while
+# the bridge armed up to twelve - a five-field question whose fifth field has no
+# control, waiting for an answer that cannot be given. Get-BridgeRenderArtifact now
+# fingerprints the ceiling too, so the next change to it cannot repeat this quietly.
+$script:BridgeDashboardRenderVersion = '1.9.0'
 $script:BridgeDashboardObservation = $null
 
 function Invoke-CopilotHaWebSocket {
@@ -966,6 +975,14 @@ function Get-BridgeRenderArtifact {
         foreach ($name in @('Save-CopilotSessionDashboard', 'Test-BridgeActivityCardServed', 'Get-BridgeDashboardInputSignature', 'ConvertTo-BridgePublicationJson')) {
             (Get-Command $name).ScriptBlock.ToString().Replace("`r`n", "`n")
         }
+        # The renderer writes one field-slot entity id per slot, so this ceiling
+        # decides what it emits while appearing nowhere in the source above. Raising
+        # it from four to twelve left every fingerprint byte-identical: the fence saw
+        # no change, nothing rebuilt the dashboard, and a newly accepted five-field
+        # question reached a card still configured to draw four of its fields - with
+        # the fifth unanswerable and the daemon waiting on a slot nobody could set.
+        # A value the output depends on belongs in the fingerprint with the source.
+        "fieldSlots=$script:CopilotMqttMaxFields"
     ) -join "`n"
     @{
         version = $script:BridgeDashboardRenderVersion

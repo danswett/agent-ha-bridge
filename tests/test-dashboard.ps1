@@ -1747,8 +1747,15 @@ Test-That 'and a blank entry never matches a blank user' { -not (Test-BridgeAgen
 # fingerprints and this fails, saying to bump the version and update both constants
 # together. It is deliberately a hash of source text: that is precisely what the fence
 # compares, so anything that would conflict there fails here first.
-$script:ExpectedRenderVersion = '1.8.0'
-$script:ExpectedRenderHash = 'a736c9465b7c3456eedd76de483955d0ba415db3fa255dbfa417c53212f16570'
+#
+# The fingerprint now covers the form-field ceiling as well, because a third way of
+# changing the rendered output slipped past both the fence and this test: the renderer
+# writes one slot entity id per field slot, so raising the ceiling changed what it
+# emitted while every byte of source stayed the same. An upgraded machine verified its
+# old receipt and skipped the rebuild, leaving a card that could draw four fields for
+# questions the bridge had started arming twelve slots for.
+$script:ExpectedRenderVersion = '1.9.0'
+$script:ExpectedRenderHash = 'b3b4bdfe199e29a82738e4c5fb9ad7efe315823a5982108315e7c23c98591d7f'
 $artifact = Get-BridgeRenderArtifact
 
 Test-That 'the renderer is still the one this version was pinned to' {
@@ -1758,11 +1765,26 @@ renderer fingerprint moved without a version bump.
   pinned : $($script:ExpectedRenderVersion) / $($script:ExpectedRenderHash)
   actual : $($artifact.version) / $($artifact.hash)
 If you changed Save-CopilotSessionDashboard, Test-BridgeActivityCardServed,
-Get-BridgeDashboardInputSignature or ConvertTo-BridgePublicationJson, bump
-`$script:BridgeDashboardRenderVersion in hooks/decision-ha-websocket.ps1 and update
-both constants above. Shipping the change without the bump freezes publication on
-every already-fenced machine.
+Get-BridgeDashboardInputSignature, ConvertTo-BridgePublicationJson or the form-field
+ceiling, bump `$script:BridgeDashboardRenderVersion in hooks/decision-ha-websocket.ps1
+and update both constants above. Shipping the change without the bump freezes
+publication on every already-fenced machine, or leaves it serving the old dashboard.
 "@
+
+# The pin above only catches a ceiling change because the fingerprint now includes it.
+# This is the check that keeps that true: without the ceiling in the hash, raising it
+# left the artifact identical, the fence had nothing to move to, and the upgrade
+# silently kept serving a dashboard built for four slots.
+Test-That 'the renderer fingerprint moves when the form-field ceiling does' {
+    $pinned = (Get-BridgeRenderArtifact).hash
+    $saved = $script:CopilotMqttMaxFields
+    try {
+        $script:CopilotMqttMaxFields = $saved + 1
+        $raised = (Get-BridgeRenderArtifact).hash
+    }
+    finally { $script:CopilotMqttMaxFields = $saved }
+    $raised -ne $pinned -and (Get-BridgeRenderArtifact).hash -eq $pinned
+}
 
 Remove-Item -LiteralPath $script:DecisionBridgeConfig.LogFile -Force -ErrorAction SilentlyContinue
 
