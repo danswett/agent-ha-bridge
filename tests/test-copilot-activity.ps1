@@ -226,6 +226,15 @@ Set-CopilotMqttStatus -SessionId 'eeeeeeee-1111-2222-3333-444444444444' -Status 
 Test-That 'a session waiting on background agents is a status it accepts' {
     $script:MqttPayloads -contains 'agents'
 } ($script:MqttPayloads -join '|')
+# The same check for this change's own status, and the one that would have caught it
+# being missing: every test below stubs the publisher, so a status it refuses looks
+# perfectly healthy there while in production the card never moves off idle.
+$script:MqttPayloads = @()
+Set-CopilotMqttStatus -SessionId 'eeeeeeee-1111-2222-3333-444444444444' -Status 'shell' `
+    -Headers @{} -Attributes @{ background_shells = 2 }
+Test-That 'and so is one waiting on background commands' {
+    $script:MqttPayloads -contains 'shell'
+} ($script:MqttPayloads -join '|')
 
 Write-Host '--- what reaches the card ---'
 # Everything that would reach Home Assistant is stood in for.
@@ -530,6 +539,21 @@ Test-That 'and so does the notification that it ended' {
     (@($activity.ShellsFinished) -join ',') -eq 'ci164'
 } (@($activity.ShellsFinished) -join ',')
 
+# Text that merely mentions a marker is not a command. This file, the issue that asked
+# for the feature and any command that prints its own output back all quote one, and
+# unanchored matching turned every mention into a shell: a quoted start invented one
+# that no completion could ever settle, and a quoted finish cleared a real one.
+$activity = Get-ActivityFromEvents -Lines @(
+    (New-ShellResult 'grep found: "<command started in background with shellId: phantom>" in the docs')) -VerboseMode $false
+Test-That 'a command that merely prints a start marker starts nothing' {
+    @($activity.ShellsStarted).Count -eq 0
+} (@($activity.ShellsStarted) -join ',')
+$activity = Get-ActivityFromEvents -Lines @(
+    (New-ShellResult '| 3 | <shellId: ci164 completed with exit code 0> | sample |')) -VerboseMode $false
+Test-That 'and one quoting a finish does not settle a command still running' {
+    @($activity.ShellsFinished).Count -eq 0
+} (@($activity.ShellsFinished) -join ',')
+
 $shellLog = Join-Path ([IO.Path]::GetTempPath()) "copilot-shells-$([guid]::NewGuid().ToString('N')).jsonl"
 $shellSessionId = 'cccccccc-1111-2222-3333-444444444444'
 $shellEntry = [pscustomobject]@{ Offset = 0; Name = 'Copilot: build'; Machine = 'DESK'; Status = 'working'; Kind = 'copilot' }
@@ -550,10 +574,18 @@ try {
         $script:StatusPublishes[-1].Attributes['background_shells'] -eq 1
     }
 
+    $script:StatusPublishes = @()
     StepShells -Lines @((New-ShellStillRunning 'fullsuite'))
     Test-That 'a second command joins the first rather than replacing it' {
         @($shellEntry.BackgroundShells).Count -eq 2
     } (@($shellEntry.BackgroundShells) -join ',')
+    # The status string does not move from 'shell' when a second one starts, and the
+    # publisher only runs when something moves - so the card went on saying one command
+    # while two were running, until the session next changed for an unrelated reason.
+    Test-That 'and the card is told, though the status itself did not change' {
+        $script:StatusPublishes.Count -ge 1 -and
+        $script:StatusPublishes[-1].Attributes['background_shells'] -eq 2
+    } "publishes=$($script:StatusPublishes.Count)"
     # Reading one back while it is still going is not news; it must not be counted
     # twice, or a watched command would inflate the number on the card every poll.
     StepShells -Lines @((New-ShellStillRunning 'fullsuite'))
@@ -578,13 +610,22 @@ try {
         (Get-DaemonStartupStatus -Session $shellSession -Entry $shellEntry) -eq 'shell'
     } (Get-DaemonStartupStatus -Session $shellSession -Entry $shellEntry)
 
-    # A shell belongs to the process that started it. After this machine rebooted
-    # mid-session, seven shells were still listed as running against a process that no
-    # longer existed - and nothing in the transcript would ever have settled them, so
-    # the session would have read as busy for the rest of its life.
-    $script:StatusPublishes = @()
+    # Copilot's /resume and its session picker switch sessions inside the same CLI
+    # process, which still owns whatever it backgrounded. Treating every resume as a
+    # new process threw away live work and put the session back to reading idle.
     StepShells -Lines @('{"type":"session.resume"}')
-    Test-That 'a resumed session owns none of the dead process''s commands' {
+    Test-That 'a resume inside the same process keeps the commands it still owns' {
+        $shellEntry.Status -eq 'shell' -and @($shellEntry.BackgroundShells).Count -eq 1
+    } "$($shellEntry.Status), outstanding=$(@($shellEntry.BackgroundShells).Count)"
+
+    # A shell belongs to the process that started it. After this machine rebooted
+    # mid-session, seven shells were still listed against a process that no longer
+    # existed - and nothing in the transcript would ever have settled them, so the
+    # session would have read as busy for the rest of its life.
+    $restarted = [pscustomobject]@{ SessionId = $shellSessionId; Transcript = $shellLog; ProcessId = 4242 }
+    Add-Content -LiteralPath $shellLog -Value @('{"type":"assistant.turn_end"}') -Encoding utf8
+    Update-DaemonSessionActivity -Id $shellSessionId -Entry $shellEntry -Session $restarted -Headers @{} -VerboseOn $false
+    Test-That 'but a new process owns none of the dead one''s commands' {
         $shellEntry.Status -eq 'idle' -and @($shellEntry.BackgroundShells).Count -eq 0
     } "$($shellEntry.Status), outstanding=$(@($shellEntry.BackgroundShells).Count)"
 

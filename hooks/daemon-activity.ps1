@@ -299,22 +299,17 @@ function Get-ActivityFromEvents {
     $agentsFinished = New-Object System.Collections.Generic.List[string]
     $shellsStarted = New-Object System.Collections.Generic.List[string]
     $shellsFinished = New-Object System.Collections.Generic.List[string]
-    $shellsReset = $false
 
     foreach ($line in $Lines) {
         if ($line -notmatch '"type":"([^"]+)"') { continue }
         $type = $Matches[1]
 
-        # A resumed session is a new process, and a shell belongs to the process that
-        # started it. Nothing outstanding survives, so the set is dropped rather than
-        # left to age out: after a reboot this session carried seven dead shells, and
-        # every one of them would have read as work still running.
-        if ($type -eq 'session.resume' -or $type -eq 'session.start') {
-            $shellsReset = $true
-            $shellsStarted.Clear()
-            $shellsFinished.Clear()
-            continue
-        }
+        # A resumed session is not on its own proof of anything: Copilot's /resume and
+        # its session picker switch sessions inside the *same* CLI process, which still
+        # owns whatever it backgrounded. What invalidates a shell is the process that
+        # started it going away, so that is tested against the live process id below
+        # rather than inferred from this event.
+        if ($type -eq 'session.resume' -or $type -eq 'session.start') { continue }
 
         if ($type -eq 'system.notification') {
             # The only notification that settles a shell names it. Parsed rather than
@@ -409,6 +404,12 @@ function Get-ActivityFromEvents {
         # outruns its wait is backgrounded too, and says so only here. In this session
         # 130 shells arrived that way against 46 started explicitly async, so matching
         # on `mode: async` alone would have missed most of them.
+        #
+        # Anchored to the start of a line. Copilot writes each wrapper on its own line,
+        # while text that merely mentions one - this file, an issue body, a command that
+        # prints its own output back - has it inside a sentence or a table cell. Left
+        # unanchored, quoting a start marker invented a shell that no completion could
+        # ever settle, and quoting a completion cleared a real one.
         if ($type -eq 'tool.execution_complete') {
             if ($line -notmatch 'shellId') { continue }
             try {
@@ -418,12 +419,12 @@ function Get-ActivityFromEvents {
                 if ([string]::IsNullOrWhiteSpace($content)) { continue }
                 # Finishes first: one read can collect an ended shell and report another
                 # as still running, and the ending is the older news of the two.
-                foreach ($match in [regex]::Matches($content, '<shellId: (\S+?) completed with exit code')) {
+                foreach ($match in [regex]::Matches($content, '(?m)^<shellId: (\S+?) completed with exit code')) {
                     [void]$shellsFinished.Add($match.Groups[1].Value)
                 }
-                $match = [regex]::Match($content, '<command started in background with shellId: ([^>]+)>')
+                $match = [regex]::Match($content, '(?m)^<command started in background with shellId: ([^>\r\n]+)>')
                 if ($match.Success) { [void]$shellsStarted.Add($match.Groups[1].Value.Trim()); continue }
-                $match = [regex]::Match($content, '<command with shellId: (\S+) is still running')
+                $match = [regex]::Match($content, '(?m)^<command with shellId: (\S+) is still running')
                 if ($match.Success) { [void]$shellsStarted.Add($match.Groups[1].Value) }
             }
             catch { }
@@ -515,7 +516,6 @@ function Get-ActivityFromEvents {
         # whole set, which no agent event ever does.
         ShellsStarted = @($shellsStarted)
         ShellsFinished = @($shellsFinished)
-        ShellsReset = $shellsReset
     }
 }
 
@@ -605,19 +605,29 @@ function Update-DaemonBackgroundShells {
         outlives the turn that started it, and a daemon restart is the one moment a
         waiting session has nothing else to say for itself.
 
-        A reset empties the set before the batch is applied. A resumed session is a new
-        process and owns none of the old process's shells, so anything still listed is
-        dead - without this, seven shells killed by a reboot would have read as live
-        work for as long as the session lasted.
+        A shell belongs to the CLI process that started it, so the set is dropped when
+        that process is gone and not before. Dropping it on session.resume instead was
+        wrong both ways: Copilot's /resume and its session picker switch sessions
+        inside the same process, which still owns what it backgrounded, while a reboot
+        leaves seven shells listed against a process that no longer exists and nothing
+        in the transcript would ever settle them.
     #>
     param(
         [Parameter(Mandatory)]$Entry,
-        [Parameter(Mandatory)]$Activity
+        [Parameter(Mandatory)]$Activity,
+        [AllowNull()]$ProcessId = $null
     )
 
     $running = New-Object System.Collections.Generic.List[string]
-    $reset = $false
-    if ($Activity.PSObject.Properties['ShellsReset']) { $reset = [bool]$Activity.ShellsReset }
+
+    # Only a process id we can actually compare says anything. A missing or unreadable
+    # one keeps what is there rather than throwing the set away, because a wrongly
+    # cleared set reads as idle - the bug this exists to fix.
+    $owner = ''
+    if ($null -ne $ProcessId) { $owner = [string]$ProcessId }
+    $knownOwner = ''
+    if ($Entry.PSObject.Properties['BackgroundShellsOwner']) { $knownOwner = [string]$Entry.BackgroundShellsOwner }
+    $sameOwner = ($owner -eq '' -or $knownOwner -eq '' -or $owner -ceq $knownOwner)
 
     $add = {
         param($Values)
@@ -627,7 +637,7 @@ function Update-DaemonBackgroundShells {
         }
     }
 
-    if (-not $reset -and $Entry.PSObject.Properties['BackgroundShells']) { & $add $Entry.BackgroundShells }
+    if ($sameOwner -and $Entry.PSObject.Properties['BackgroundShells']) { & $add $Entry.BackgroundShells }
     if ($Activity.PSObject.Properties['ShellsStarted']) { & $add $Activity.ShellsStarted }
     if ($Activity.PSObject.Properties['ShellsFinished']) {
         foreach ($value in @($Activity.ShellsFinished)) { [void]$running.Remove([string]$value) }
@@ -635,6 +645,9 @@ function Update-DaemonBackgroundShells {
 
     if ($running.Count -gt 0 -or $Entry.PSObject.Properties['BackgroundShells']) {
         Set-DaemonSessionProperty -Entry $Entry -Name 'BackgroundShells' -Value @($running)
+    }
+    if ($owner -ne '' -and $owner -cne $knownOwner) {
+        Set-DaemonSessionProperty -Entry $Entry -Name 'BackgroundShellsOwner' -Value $owner
     }
     $running.Count
 }
@@ -764,7 +777,8 @@ function Update-DaemonSessionActivity {
     # A background shell does the same thing by a route the turn bookkeeping cannot
     # see, so it is folded the same way. Ordered after the agents: a session waiting on
     # both is better described as delegating than as running a command.
-    $runningShells = Update-DaemonBackgroundShells -Entry $entry -Activity $activity
+    $shellsBefore = Get-DaemonBackgroundShellCount -Entry $entry
+    $runningShells = Update-DaemonBackgroundShells -Entry $entry -Activity $activity -ProcessId $session.ProcessId
     if ($runningShells -gt 0) {
         if ($newStatus -eq 'idle' -or
             ([string]::IsNullOrWhiteSpace($newStatus) -and [string]$entry.Status -eq 'idle')) {
@@ -774,6 +788,10 @@ function Update-DaemonSessionActivity {
     elseif ([string]::IsNullOrWhiteSpace($newStatus) -and [string]$entry.Status -eq 'shell') {
         $newStatus = 'idle'
     }
+    # How many is published as an attribute, and a second command starting does not
+    # change the status string - so without this the card went on saying one while two
+    # were running, until the session next moved for some other reason.
+    $shellCountChanged = ($runningShells -ne $shellsBefore)
 
     # The model the transcript just named. Recorded before the status publish below,
     # so a batch that changes both spends one publish on the pair.
@@ -803,16 +821,18 @@ function Update-DaemonSessionActivity {
             Write-DaemonLog -Message "status publish failed for $id : $($_.Exception.Message)"
         }
     }
-    elseif ($modelChanged) {
+    elseif ($modelChanged -or $shellCountChanged) {
         # A model can change without the status doing so - a session already working
         # when the daemon first sees it, or a /model typed mid-turn - and the status
         # attributes are republished wholesale, so the card would otherwise carry the
-        # old model until the next time the session happened to go idle.
+        # old model until the next time the session happened to go idle. The number of
+        # background commands moves the same way: a second one starting leaves the
+        # status on 'shell' while the count the card draws goes stale.
         #
         # Only from a status Set-CopilotMqttStatus accepts: an entry parked on
         # something else ('ending') is mid-retirement and its card is about to go.
         $current = [string]$entry.Status
-        if ($current -in @('working', 'idle', 'waiting', 'agents', 'offline')) {
+        if ($current -in @('working', 'idle', 'waiting', 'agents', 'shell', 'offline')) {
             try {
                 Set-CopilotMqttStatus -SessionId $id -Status $current -Headers $Headers -Attributes (
                     Add-DaemonTuningAttributes -Attributes @{

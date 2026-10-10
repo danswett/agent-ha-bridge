@@ -255,7 +255,7 @@ function Restore-DaemonSessionEntities {
     # same reason a restart does: the summary, reasoning, last response and history the
     # operator was looking at are all still in the entry.
     $status = [string]$entry.Status
-    if ($status -notin @('working', 'waiting', 'idle', 'agents', 'error')) { $status = 'idle' }
+    if ($status -notin @('working', 'waiting', 'idle', 'agents', 'shell', 'error')) { $status = 'idle' }
     try {
         $card = Resolve-DaemonPrimedCard -Entry $entry -Status $status -VerboseOn (Test-VerboseStreaming -Headers $Headers)
         Set-CopilotMqttStatus -SessionId $id -Status $status -Headers $Headers -Attributes @{
