@@ -258,11 +258,30 @@ Test-Case 'two free-text fields are refused, not silently accepted' {
     -not (Test-DecisionFieldsAnswerable -Fields @($twoTextParsed.Fields)) -and $twoTextParsed.TerminalOnly
 }
 
-# More fields than the card publishes dropdowns for.
+# A five-field form is ordinary, and was refused for the sake of one slot when the
+# ceiling was four: the card said "more fields than the dashboard can drive" for a
+# question whose fields were all plain single-select enums.
 $fiveField = '{"message":"Q","requestedSchema":{"properties":{"a":{"type":"string","enum":["1","2"]},"b":{"type":"string","enum":["1","2"]},"c":{"type":"string","enum":["1","2"]},"d":{"type":"string","enum":["1","2"]},"e":{"type":"string","enum":["1","2"]}}}}' | ConvertFrom-Json
 $fiveParsed = Repair-DecisionToolArguments -ToolArgs $fiveField
-Test-Case 'a five-field form is refused rather than half-answered' { $fiveParsed.TerminalOnly }
-Test-Case 'and it still spells the fields out in the question' { $fiveParsed.Question -match 'Answer these' }
+Test-Case 'a five-field form is answered on the dashboard, not sent to the terminal' {
+    -not $fiveParsed.TerminalOnly -and @($fiveParsed.Fields).Count -eq 5
+}
+Test-Case 'every one of its fields gets a slot of its own' {
+    (Test-DecisionFieldsAnswerable -Fields @($fiveParsed.Fields)) -and
+    @($fiveParsed.Fields | Where-Object { @($_.Options).Count -eq 2 }).Count -eq 5
+}
+
+# Past the ceiling there is still nowhere to put the extra fields, so the outline and
+# the terminal-only flag remain the honest answer.
+$overCapProps = @{}
+foreach ($i in 1..($script:DecisionMaxFormFields + 1)) {
+    $overCapProps["f$i"] = @{ type = 'string'; enum = @('1', '2') }
+}
+$overCap = @{ message = 'Q'; requestedSchema = @{ properties = $overCapProps } } |
+    ConvertTo-Json -Depth 8 | ConvertFrom-Json
+$overCapParsed = Repair-DecisionToolArguments -ToolArgs $overCap
+Test-Case 'a form past the ceiling is refused rather than half-answered' { $overCapParsed.TerminalOnly }
+Test-Case 'and it still spells the fields out in the question' { $overCapParsed.Question -match 'Answer these' }
 
 Test-Case 'a single free-text field stays plain freeform' {
     $one = '{"message":"Q","requestedSchema":{"properties":{"a":{"type":"string","title":"A"}}}}' | ConvertFrom-Json

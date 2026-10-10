@@ -100,7 +100,7 @@ function Get-HomeAssistantState {
 }
 function Publish-CopilotMqttMessage {
     param([string]$Topic, [string]$Payload, [hashtable]$Headers, [switch]$Retain)
-    if ($Topic -match '/select/[^/]+/(decision|f\d)/config$') {
+    if ($Topic -match '/select/[^/]+/(decision|f\d+)/config$') {
         $slot = $Matches[1]
         $config = $Payload | ConvertFrom-Json
         $entityId = if ($slot -eq 'decision') { "select.${node}_decision" } else { "select.${node}_$slot" }
@@ -1052,6 +1052,82 @@ $script:HaStates["sensor.${node}_reply_payload"].attributes.images = @([pscustom
 Test-That 'a reply carrying an image is left alone rather than half-delivered' {
     [string]::IsNullOrWhiteSpace((Read-DaemonDecisionAnswer -SessionId $sessionId -Marker $textMarker -State $textState -Headers $headers).Answer)
 }
+
+Write-Host ''
+Write-Host '--- only the slots that are dirty are written ---'
+# The ceiling is twelve slots, and every question used to rewrite all of them twice -
+# once to publish the config, once to park the value - including the single-choice
+# ones that arm one slot and the clear that follows every answer. At four slots that
+# was eight calls nobody noticed; at twelve it is twenty-four, on every question. The
+# slots above what is armed are already parked on Idle, so writing them changes
+# nothing and the work is pure latency between the question being asked and the card
+# showing it.
+$script:SweepSession = 'bbbb1111-2222-4000-8000-0000000000dd'
+$script:SweepNode = Get-CopilotMqttNodeId -SessionId $script:SweepSession
+$script:SweptSlots = [Collections.Generic.List[string]]::new()
+function Measure-SweptSlots {
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Fields,
+        [int]$ArmedSlots = -1
+    )
+    $script:SweptSlots = [Collections.Generic.List[string]]::new()
+    function Publish-CopilotMqttMessage {
+        param([string]$Topic, [string]$Payload, [hashtable]$Headers, [switch]$Retain)
+        if ($Topic -match '/select/[^/]+/(f\d+)/config$') { $script:SweptSlots.Add($Matches[1]) }
+    }
+    Publish-CopilotMqttDecisionFields -SessionId $script:SweepSession -SessionName 'Copilot: sweep' `
+        -Machine 'BOX' -Fields $Fields -Headers $headers -ArmedSlots $ArmedSlots
+    @($script:SweptSlots)
+}
+
+$twoFields = @(
+    [pscustomobject]@{ Label = 'One'; Options = @('a', 'b'); IsText = $false }
+    [pscustomobject]@{ Label = 'Two'; Options = @('c', 'd'); IsText = $false }
+)
+
+Test-That 'arming a two-field form over a clean session writes only its two slots' {
+    $swept = @(Measure-SweptSlots -Fields $twoFields -ArmedSlots 0)
+    ($swept -join ',') -eq 'f1,f2'
+} "swept=[$(@($script:SweptSlots) -join ',')]"
+
+Test-That 'clearing up after it writes those two and no more' {
+    $swept = @(Measure-SweptSlots -Fields @() -ArmedSlots 2)
+    ($swept -join ',') -eq 'f1,f2'
+} "swept=[$(@($script:SweptSlots) -join ',')]"
+
+Test-That 'a shorter form still clears the slots the longer one left behind' {
+    $swept = @(Measure-SweptSlots -Fields $twoFields -ArmedSlots 5)
+    ($swept -join ',') -eq 'f1,f2,f3,f4,f5'
+} "swept=[$(@($script:SweptSlots) -join ',')]"
+
+Test-That 'a freeform question over a clean session writes nothing at all' {
+    @(Measure-SweptSlots -Fields @() -ArmedSlots 0).Count -eq 0
+} "swept=[$(@($script:SweptSlots) -join ',')]"
+
+# The count is unknown on a session the bridge has not armed before, and on one whose
+# attributes cannot be read. Sweeping everything is the only safe reading: a slot left
+# armed above the count would go on offering a dead question's options.
+Test-That 'an unknown armed count sweeps every slot, as it always did' {
+    $swept = @(Measure-SweptSlots -Fields $twoFields -ArmedSlots -1)
+    $swept.Count -eq $script:CopilotMqttMaxFields -and $swept[-1] -eq "f$($script:CopilotMqttMaxFields)"
+} "swept=$(@($script:SweptSlots).Count)"
+
+# The attribute is the shared source of truth precisely because the slots may have
+# been armed by the other process - a hook, or the daemon - so neither can keep the
+# figure in memory and be right about the other's work.
+Test-That 'the armed count is read from the decision attributes when not supplied' {
+    $script:HaStates["select.$($script:SweepNode)_decision"] = [ordered]@{
+        state = 'Awaiting answer...'
+        attributes = [ordered]@{ options = @('Awaiting answer...'); field_count = 3 }
+    }
+    $swept = @(Measure-SweptSlots -Fields @())
+    ($swept -join ',') -eq 'f1,f2,f3'
+} "swept=[$(@($script:SweptSlots) -join ',')]"
+
+Test-That 'and a nonsense count is treated as unknown rather than trusted' {
+    $script:HaStates["select.$($script:SweepNode)_decision"].attributes['field_count'] = 99
+    @(Measure-SweptSlots -Fields @()).Count -eq $script:CopilotMqttMaxFields
+} "swept=$(@($script:SweptSlots).Count)"
 
 Write-Host ''
 if ($script:Failures) {

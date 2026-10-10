@@ -802,13 +802,13 @@ $script:FieldStarts = @{}
 $script:FieldOptions = @{}
 function Publish-CopilotMqttMessage {
     param([string]$Topic, [string]$Payload, [hashtable]$Headers, [switch]$Retain)
-    if ($Topic -match '/select/[^/]+/(f\d)/config$') {
+    if ($Topic -match '/select/[^/]+/(f\d+)/config$') {
         $script:FieldOptions[$Matches[1]] = ($Payload | ConvertFrom-Json).options
     }
 }
 function Invoke-HomeAssistantService {
     param([string]$Domain, [string]$Service, [hashtable]$Headers, [hashtable]$Data)
-    if ("$($Data.entity_id)" -match '_(f\d)$') { $script:FieldStarts[$Matches[1]] = [string]$Data.option }
+    if ("$($Data.entity_id)" -match '_(f\d+)$') { $script:FieldStarts[$Matches[1]] = [string]$Data.option }
 }
 function Set-CopilotMqttEntityIds { param([string]$SessionId) }
 
@@ -1172,16 +1172,16 @@ Test-That 'the choices card is handed the field entities' {
 # Read-DaemonFormAnswer reads them, so a rename on either side is a form that takes
 # every tap and delivers nothing. Both sides are asked the same helper.
 Test-That 'and they are exactly the slots the daemon reads, in slot order' {
-    $expected = @(1..4 | ForEach-Object { Get-CopilotMqttFieldEntityId -Node $node -Index $_ })
+    $expected = @(1..$script:CopilotMqttMaxFields | ForEach-Object { Get-CopilotMqttFieldEntityId -Node $node -Index $_ })
     (@($formAnswer.card.fields) -join ',') -eq ($expected -join ',')
 } "fields=[$(@($formAnswer.card.fields) -join ',')]"
 Test-That 'the answer card no longer hides itself when a field is in play' {
-    @($formAnswer.conditions | Where-Object { "$($_.entity)" -match '_f\d$' }).Count -eq 0
+    @($formAnswer.conditions | Where-Object { "$($_.entity)" -match '_f\d+$' }).Count -eq 0
 }
 Test-That 'the per-field dropdowns it replaces are gone' {
     @($formSession.cards | Where-Object {
         $_.type -eq 'conditional' -and "$($_.card.type)" -eq 'entities' -and
-        "$($_.card.entities[0].entity)" -match '_f\d$'
+        "$($_.card.entities[0].entity)" -match '_f\d+$'
     }).Count -eq 0
 }
 Test-That 'and so is the separate cancel button, which the card draws as a row' {
@@ -1205,8 +1205,8 @@ $oldSession = Get-TestSessionContainer -Config $oldDash
 Test-That 'a card served before 1.15.0 keeps its dropdowns rather than an empty form' {
     @($oldSession.cards | Where-Object {
         $_.type -eq 'conditional' -and "$($_.card.type)" -eq 'entities' -and
-        "$($_.card.entities[0].entity)" -match '_f\d$'
-    }).Count -eq 4
+        "$($_.card.entities[0].entity)" -match '_f\d+$'
+    }).Count -eq $script:CopilotMqttMaxFields
 }
 Test-That 'and is handed no fields it would not know what to do with' {
     $old = @($oldSession.cards | Where-Object {
@@ -1747,8 +1747,15 @@ Test-That 'and a blank entry never matches a blank user' { -not (Test-BridgeAgen
 # fingerprints and this fails, saying to bump the version and update both constants
 # together. It is deliberately a hash of source text: that is precisely what the fence
 # compares, so anything that would conflict there fails here first.
-$script:ExpectedRenderVersion = '1.8.0'
-$script:ExpectedRenderHash = 'a736c9465b7c3456eedd76de483955d0ba415db3fa255dbfa417c53212f16570'
+#
+# The fingerprint now covers the form-field ceiling as well, because a third way of
+# changing the rendered output slipped past both the fence and this test: the renderer
+# writes one slot entity id per field slot, so raising the ceiling changed what it
+# emitted while every byte of source stayed the same. An upgraded machine verified its
+# old receipt and skipped the rebuild, leaving a card that could draw four fields for
+# questions the bridge had started arming twelve slots for.
+$script:ExpectedRenderVersion = '1.9.0'
+$script:ExpectedRenderHash = 'b3b4bdfe199e29a82738e4c5fb9ad7efe315823a5982108315e7c23c98591d7f'
 $artifact = Get-BridgeRenderArtifact
 
 Test-That 'the renderer is still the one this version was pinned to' {
@@ -1758,11 +1765,26 @@ renderer fingerprint moved without a version bump.
   pinned : $($script:ExpectedRenderVersion) / $($script:ExpectedRenderHash)
   actual : $($artifact.version) / $($artifact.hash)
 If you changed Save-CopilotSessionDashboard, Test-BridgeActivityCardServed,
-Get-BridgeDashboardInputSignature or ConvertTo-BridgePublicationJson, bump
-`$script:BridgeDashboardRenderVersion in hooks/decision-ha-websocket.ps1 and update
-both constants above. Shipping the change without the bump freezes publication on
-every already-fenced machine.
+Get-BridgeDashboardInputSignature, ConvertTo-BridgePublicationJson or the form-field
+ceiling, bump `$script:BridgeDashboardRenderVersion in hooks/decision-ha-websocket.ps1
+and update both constants above. Shipping the change without the bump freezes
+publication on every already-fenced machine, or leaves it serving the old dashboard.
 "@
+
+# The pin above only catches a ceiling change because the fingerprint now includes it.
+# This is the check that keeps that true: without the ceiling in the hash, raising it
+# left the artifact identical, the fence had nothing to move to, and the upgrade
+# silently kept serving a dashboard built for four slots.
+Test-That 'the renderer fingerprint moves when the form-field ceiling does' {
+    $pinned = (Get-BridgeRenderArtifact).hash
+    $saved = $script:CopilotMqttMaxFields
+    try {
+        $script:CopilotMqttMaxFields = $saved + 1
+        $raised = (Get-BridgeRenderArtifact).hash
+    }
+    finally { $script:CopilotMqttMaxFields = $saved }
+    $raised -ne $pinned -and (Get-BridgeRenderArtifact).hash -eq $pinned
+}
 
 Remove-Item -LiteralPath $script:DecisionBridgeConfig.LogFile -Force -ErrorAction SilentlyContinue
 

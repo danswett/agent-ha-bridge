@@ -1637,8 +1637,16 @@ function Invoke-AdapterEntityCleanupFixture {
             . ([scriptblock]::Create($cleanup.Extent.Text))
             $node = Get-CopilotMqttNodeId -SessionId $session
             $without = @($script:CleanupPublications | Where-Object { $_.topic -like "*/$node/*" })
-            Test-That "$fixtureClient-only uninstall publishes the complete 21-message cleanup with no Copilot directory" {
-                $without.Count -eq 21 -and
+            # 17 topics that have nothing to do with the form, plus one discovery topic
+            # per field slot. Split that way rather than spelled out as a single number
+            # because raising the slot ceiling legitimately moves the total, and a bare
+            # literal would then have to be edited on every change - which is exactly
+            # how a tripwire stops being read. The 17 is still the tripwire: it caught
+            # the permissions selector being added to the dashboard and not to the
+            # cleanup, which left a dead entity behind in Home Assistant.
+            $expectedSessionCleanup = 17 + $script:CopilotMqttMaxFields
+            Test-That "$fixtureClient-only uninstall publishes the complete $expectedSessionCleanup-message cleanup with no Copilot directory" {
+                $without.Count -eq $expectedSessionCleanup -and
                     $without[0].topic -eq (Get-CopilotMqttTopics -SessionId $session).Availability -and
                     $without[0].payload -ceq 'offline' -and
                     @($without | Where-Object { -not $_.retain }).Count -eq 0 -and
@@ -1658,7 +1666,7 @@ function Invoke-AdapterEntityCleanupFixture {
             . ([scriptblock]::Create($cleanup.Extent.Text))
             $with = @($script:CleanupPublications | Where-Object { $_.topic -like "*/$node/*" }).Count
             Test-That "adding an empty Copilot directory does not change $fixtureClient cleanup" {
-                $with -eq 21 -and $without.Count -eq $with -and $script:CleanupPublications.Count - $with -eq 25
+                $with -eq $expectedSessionCleanup -and $without.Count -eq $with -and $script:CleanupPublications.Count - $with -eq 25
             }
         }
         finally {
