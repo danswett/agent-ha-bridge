@@ -3237,26 +3237,34 @@ if (-not ($selectedClients -contains 'copilot') -and (Test-Path -LiteralPath $ag
 # guidance goes in as a marked block rather than a file the bridge owns. Without this
 # a machine configured for Claude alone got no bridge guidance at all - including the
 # rule about not sweeping the shared worktree root (#181).
-foreach ($instructionClient in @(
-    @{ Client = 'claude'; Path = (Join-Path $installContext.ClaudeHome 'CLAUDE.md') },
-    @{ Client = 'codex'; Path = (Join-Path $installContext.CodexHome 'AGENTS.md') }
-)) {
-    $instructionPath = $instructionClient.Path
+foreach ($instructionClient in @('claude', 'codex')) {
+    $choice = Get-BridgeClientInstructionPath -Client $instructionClient -Context $installContext
     try {
-        if ($selectedClients -contains $instructionClient.Client) {
-            if (Set-BridgeManagedInstructionBlock -Path $instructionPath -InstallationId $installContext.Id `
+        if ($selectedClients -contains $instructionClient) {
+            if (Set-BridgeManagedInstructionBlock -Path $choice.Active -InstallationId $installContext.Id `
                     -Content (Get-BridgeAgentInstructions `
                         -EnvVarName ([string]$config.homeAssistant.agentTokenEnvVar) -HasAgentToken:$hasAgentToken)) {
-                Write-Host "    $instructionPath"
+                Write-Host "    $($choice.Active)"
+            }
+            # An override that appeared or went away moves which file Codex reads, so a
+            # block left in the other one is guidance nothing will ever load.
+            foreach ($stale in @($choice.All | Where-Object { $_ -ne $choice.Active })) {
+                if (Remove-BridgeManagedInstructionBlock -Path $stale -InstallationId $installContext.Id) {
+                    Write-Host "    $stale"
+                }
             }
         }
-        elseif (Remove-BridgeManagedInstructionBlock -Path $instructionPath -InstallationId $installContext.Id) {
-            Write-Host "    $instructionPath"
+        else {
+            foreach ($path in $choice.All) {
+                if (Remove-BridgeManagedInstructionBlock -Path $path -InstallationId $installContext.Id) {
+                    Write-Host "    $path"
+                }
+            }
         }
     }
     catch {
         # Never fail an install over someone else's instruction file.
-        Write-Warning "The $($instructionClient.Client) guidance was left unchanged: $($_.Exception.Message)"
+        Write-Warning "The $instructionClient guidance was left unchanged: $($_.Exception.Message)"
     }
 }
 

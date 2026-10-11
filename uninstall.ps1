@@ -446,9 +446,11 @@ function Invoke-BridgeUninstall {
         }
     }
     # The Claude and Codex guidance is a block inside the user's own file, so this takes
-    # the block out and leaves everything they wrote (#181).
+    # the block out and leaves everything they wrote (#181). Both Codex candidates are
+    # cleared, because which one it reads depends on whether an override exists.
     foreach ($blockPath in @(
         (Join-Path $installContext.ClaudeHome 'CLAUDE.md'),
+        (Join-Path $installContext.CodexHome 'AGENTS.override.md'),
         (Join-Path $installContext.CodexHome 'AGENTS.md')
     )) {
         try {

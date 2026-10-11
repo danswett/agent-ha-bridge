@@ -880,6 +880,93 @@ try {
         $text = [IO.File]::ReadAllText($script:BlockFile)
         $text -match 'one' -and $text -notmatch "`r`n"
     }
+
+    # Everything below was found by review on #182: the guarantee was "byte for byte"
+    # and three of these quietly broke it. The first test only ever used a file ending
+    # in exactly one newline, which is the one case that happened to survive.
+    Test-That 'a file ending without a newline comes back without one' {
+        $original = "# Notes`nno trailing newline"
+        [IO.File]::WriteAllText($script:BlockFile, $original)
+        [void](Set-BridgeManagedInstructionBlock -Path $script:BlockFile -Content 'G' -InstallationId $script:OwnerId)
+        [void](Remove-BridgeManagedInstructionBlock -Path $script:BlockFile -InstallationId $script:OwnerId)
+        [IO.File]::ReadAllText($script:BlockFile) -ceq $original
+    }
+    Test-That 'and one ending in several keeps every one of them' {
+        $original = "# Notes`n`n`n`n"
+        [IO.File]::WriteAllText($script:BlockFile, $original)
+        [void](Set-BridgeManagedInstructionBlock -Path $script:BlockFile -Content 'G' -InstallationId $script:OwnerId)
+        [void](Remove-BridgeManagedInstructionBlock -Path $script:BlockFile -InstallationId $script:OwnerId)
+        [IO.File]::ReadAllText($script:BlockFile) -ceq $original
+    }
+    Test-That 'a UTF-8 file with a byte order mark still has one afterwards' {
+        [IO.File]::WriteAllText($script:BlockFile, "# Notes`nkeep bom`n", [Text.UTF8Encoding]::new($true))
+        [void](Set-BridgeManagedInstructionBlock -Path $script:BlockFile -Content 'G' -InstallationId $script:OwnerId)
+        $bytes = [IO.File]::ReadAllBytes($script:BlockFile)
+        $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF -and
+            ([IO.File]::ReadAllText($script:BlockFile) -match 'keep bom')
+    }
+    Test-That 'and a UTF-16 one is not silently rewritten as UTF-8' {
+        [IO.File]::WriteAllText($script:BlockFile, "# Notes`nwide`n", [Text.UnicodeEncoding]::new($false, $true))
+        [void](Set-BridgeManagedInstructionBlock -Path $script:BlockFile -Content 'G' -InstallationId $script:OwnerId)
+        $bytes = [IO.File]::ReadAllBytes($script:BlockFile)
+        $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE -and
+            ([IO.File]::ReadAllText($script:BlockFile, [Text.UnicodeEncoding]::new($false, $true)) -match 'wide')
+    }
+
+    # Codex reads AGENTS.override.md in its home first and ignores AGENTS.md entirely
+    # when the override has anything in it, so writing to the wrong one puts the
+    # guidance where Codex never looks - silently, which is the failure this whole
+    # change exists to prevent.
+    $script:CodexCtx = [pscustomobject]@{
+        ClaudeHome = (Join-Path $script:InstrRoot 'c-home')
+        CodexHome  = (Join-Path $script:InstrRoot 'x-home')
+    }
+    [void][IO.Directory]::CreateDirectory($script:CodexCtx.CodexHome)
+    $script:Override = Join-Path $script:CodexCtx.CodexHome 'AGENTS.override.md'
+    $script:Standard = Join-Path $script:CodexCtx.CodexHome 'AGENTS.md'
+
+    Test-That 'with no override, Codex guidance goes to AGENTS.md' {
+        Remove-Item -LiteralPath $script:Override -Force -ErrorAction SilentlyContinue
+        (Get-BridgeClientInstructionPath -Client 'codex' -Context $script:CodexCtx).Active -eq $script:Standard
+    }
+    Test-That 'an empty override is skipped, exactly as Codex skips it' {
+        [IO.File]::WriteAllText($script:Override, "   `n")
+        (Get-BridgeClientInstructionPath -Client 'codex' -Context $script:CodexCtx).Active -eq $script:Standard
+    }
+    Test-That 'but a non-empty override is where the guidance has to go' {
+        [IO.File]::WriteAllText($script:Override, "# my override`n")
+        (Get-BridgeClientInstructionPath -Client 'codex' -Context $script:CodexCtx).Active -eq $script:Override
+    }
+    Test-That 'and Claude has no override to consider' {
+        $claude = Get-BridgeClientInstructionPath -Client 'claude' -Context $script:CodexCtx
+        $claude.Active -eq (Join-Path $script:CodexCtx.ClaudeHome 'CLAUDE.md') -and $claude.All.Count -eq 1
+    }
+    Test-That 'both Codex candidates are offered, so a block in the inactive one can be cleared' {
+        $all = (Get-BridgeClientInstructionPath -Client 'codex' -Context $script:CodexCtx).All
+        $all -contains $script:Override -and $all -contains $script:Standard
+    }
+
+    if ($IsWindows -or $IsLinux -or $IsMacOS) {
+        $script:LinkTarget = Join-Path $script:InstrRoot 'link-target.md'
+        $script:LinkPath = Join-Path $script:InstrRoot 'linked-CLAUDE.md'
+        [IO.File]::WriteAllText($script:LinkTarget, '')
+        $script:MadeLink = $false
+        try {
+            New-Item -ItemType SymbolicLink -Path $script:LinkPath -Target $script:LinkTarget -ErrorAction Stop | Out-Null
+            $script:MadeLink = $true
+        }
+        catch { $script:MadeLink = $false }
+        if ($script:MadeLink) {
+            Test-That 'a symlinked instruction file is emptied rather than unlinked' {
+                [void](Set-BridgeManagedInstructionBlock -Path $script:LinkPath -Content 'G' -InstallationId $script:OwnerId)
+                [void](Remove-BridgeManagedInstructionBlock -Path $script:LinkPath -InstallationId $script:OwnerId)
+                (Test-Path -LiteralPath $script:LinkPath) -and
+                    (Get-Item -LiteralPath $script:LinkPath -Force).LinkType -and
+                    -not ([IO.File]::ReadAllText($script:LinkTarget)).Trim()
+            }
+        }
+        else { Write-Host '  SKIP  symbolic links are not available to this account' }
+    }
 }
 finally {
     Remove-Item -LiteralPath $script:InstrRoot -Recurse -Force -ErrorAction SilentlyContinue
