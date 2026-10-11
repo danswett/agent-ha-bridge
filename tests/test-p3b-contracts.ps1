@@ -149,6 +149,67 @@ try {
         $payloads.Count -eq 1 -and $payloads[0].Payload -ceq ''
     }
 
+    # minItems decides whether a multi-select field may be answered with nothing at
+    # all. It was not captured, so every array field looked like one that required a
+    # choice and none of them could be answered empty from the dashboard (#81).
+    $minItemsCases = @(
+        @{ Json = '{"properties":{"f":{"title":"F","type":"array","items":{"enum":["A","B"]}}}}'; Allows = $true; Why = 'absent minItems is zero, which is what the ask_user form leaves it at' }
+        @{ Json = '{"properties":{"f":{"title":"F","type":"array","minItems":0,"items":{"enum":["A","B"]}}}}'; Allows = $true; Why = 'and a minItems of zero says so outright' }
+        @{ Json = '{"properties":{"f":{"title":"F","type":"array","default":[],"items":{"enum":["A","B"]}}}}'; Allows = $true; Why = 'a default of nothing is a form that opens on an answer it accepts' }
+        @{ Json = '{"properties":{"f":{"title":"F","type":"array","minItems":1,"items":{"enum":["A","B"]}}}}'; Allows = $false; Why = 'while minItems of one requires a choice' }
+        @{ Json = '{"properties":{"f":{"title":"F","type":"array","minItems":"1","items":{"enum":["A","B"]}}}}'; Allows = $false; Why = 'and a minItems that is not a whole number is not read as permission' }
+    )
+    foreach ($case in $minItemsCases) {
+        $minField = @(Get-DecisionSchemaFields -Schema (ConvertFrom-DecisionJson -Json $case.Json))[0]
+        Test-That $case.Why {
+            (Test-DecisionMultiSelectAllowsEmpty -Field $minField) -eq $case.Allows
+        } "allowsEmpty=$($minField.AllowsEmpty)"
+    }
+    # A scalar field is never an empty answer, however its schema is written: there is
+    # no 'none' row in an arrow-key list, only options.
+    $scalarArrayless = @(Get-DecisionSchemaFields -Schema (ConvertFrom-DecisionJson `
+        -Json '{"properties":{"f":{"title":"F","enum":["A","B"]}}}'))[0]
+    Test-That 'and a single-choice field is never one of them' {
+        -not (Test-DecisionMultiSelectAllowsEmpty -Field $scalarArrayless)
+    }
+    # The carriers only exist alongside the ones its subsets already use, so a field
+    # that could not be offered at all does not become offerable by way of 'none'.
+    $unofferable = [pscustomobject]@{
+        Label = 'One'; Options = @('Only'); IsText = $false
+        MultiSelect = $true; MultiSelectStyle = 'space-toggle'; DefaultIndexes = @(); AllowsEmpty = $true
+    }
+    Test-That 'an unofferable field is not made answerable by the empty set alone' {
+        @(Get-DecisionMultiSelectChoices -Field $unofferable).Count -eq 0 -and
+        -not (Test-DecisionFieldsAnswerable -Fields @($unofferable))
+    }
+    # An option spelled exactly like a carrier would make the dropdown offer the same
+    # entry for two different answers, so that carrier is withheld rather than guessed.
+    $collidingWords = [pscustomobject]@{
+        Label = 'Rows'; Options = @('(none)', 'B'); IsText = $false
+        MultiSelect = $true; MultiSelectStyle = 'space-toggle'; DefaultIndexes = @(); AllowsEmpty = $true
+    }
+    Test-That 'an option written like the empty set leaves only the position carrier' {
+        $carriers = @(Get-DecisionMultiSelectEmptyChoices -Field $collidingWords)
+        ($carriers -join '|') -ceq '#0' -and (Get-DecisionMultiSelectEmptyChoice -Field $collidingWords) -ceq '#0'
+    } "carriers=[$(@(Get-DecisionMultiSelectEmptyChoices -Field $collidingWords) -join '|')]"
+    $collidingCode = [pscustomobject]@{
+        Label = 'Rows'; Options = @('#0', 'B'); IsText = $false
+        MultiSelect = $true; MultiSelectStyle = 'space-toggle'; DefaultIndexes = @(); AllowsEmpty = $true
+    }
+    Test-That 'and one written like its position form leaves only the words' {
+        $carriers = @(Get-DecisionMultiSelectEmptyChoices -Field $collidingCode)
+        ($carriers -join '|') -ceq '(none)' -and (Get-DecisionMultiSelectEmptyChoice -Field $collidingCode) -ceq '(none)'
+    } "carriers=[$(@(Get-DecisionMultiSelectEmptyChoices -Field $collidingCode) -join '|')]"
+    Test-That 'a field that must have a choice never resolves either carrier as one' {
+        $required = [pscustomobject]@{
+            Label = 'Rows'; Options = @('A', 'B'); IsText = $false
+            MultiSelect = $true; MultiSelectStyle = 'space-toggle'; DefaultIndexes = @()
+        }
+        -not (Test-DecisionMultiSelectEmptyChoice -Field $required -Choice '#0') -and
+        -not (Test-DecisionMultiSelectEmptyChoice -Field $required -Choice '(none)') -and
+        @(Get-DecisionMultiSelectEmptyChoices -Field $required).Count -eq 0
+    }
+
     Write-Host '--- lossless scalar containers, defaults and supported result shapes ---'
     $typedSchema = ConvertFrom-DecisionJson -Json @'
 {"properties":{"value":{"title":"Value","default":null,"oneOf":[

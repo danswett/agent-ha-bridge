@@ -308,6 +308,9 @@ function controlledEnv(armed, decisionId) {
       // Absent for a bridge old enough to publish only the options written out, which
       // is what the card has to keep writing back to it.
       if (field.codes) { attributes[`field_${i}_codes`] = true; }
+      // What to write when every row is unticked. Absent unless the field's own
+      // schema accepts an empty answer, and absent from any bridge older than it.
+      if (field.empty) { attributes[`field_${i}_empty`] = field.empty; }
     }
     states[F(i)] = {
       state: field.state || 'Choose...',
@@ -451,6 +454,56 @@ async function checkDeferredChoices() {
   card.hass = env.hass;
   check('where the field does use positions, the same text is read as one',
     pickedRows(card) === 'Auth', pickedRows(card));
+
+  console.log('--- a field that may be answered with nothing ticked ---');
+
+  // Unticking the last row used to write the field slot's 'Choose...' placeholder,
+  // which is the one value the daemon reads as "not answered yet" - so a schema that
+  // accepted an empty answer could not be given one here, while the terminal prompt
+  // took it by pressing Enter on an untouched list (#81). The value to write is the
+  // bridge's to name, because it is the bridge that published the slot's options.
+  card = newCard(FIELDS, SUBMIT);
+  env = controlledEnv({ 1: { label: 'Features', multi: true, codes: true, empty: '#0',
+    options: ['Auth', 'Billing'], state: '#0',
+    slotOptions: ['Auth', 'Billing', 'Auth + Billing', '#1', '#2', '#1,2', '(none)', '#0'] } });
+  env.card = card;
+  card.hass = env.hass;
+  check('a slot sitting on the empty set ticks no row', pickedRows(card) === '', pickedRows(card));
+  check('and offers none of its carriers as a row to tap',
+    !buttons(card).some((b) => b.textContent === '#0' || b.textContent === '(none)'),
+    buttons(card).map((b) => b.textContent).join('|'));
+  check('while the form reads as answered, because the field is',
+    card._complete === true);
+  buttons(card).find((b) => b.textContent === 'Billing').click();
+  check('ticking a row moves it off the empty set',
+    env.calls[env.calls.length - 1].data.option === '#2',
+    env.calls.map((c) => c.data.option).join(' / '));
+  env.calls[env.calls.length - 1].settle.resolve();
+  await flush();
+  env.arrive(F(1), '#2');
+  await flush();
+  buttons(card).find((b) => b.textContent === 'Billing').click();
+  check('and unticking the last one returns it there, not to the placeholder',
+    env.calls[env.calls.length - 1].data.option === '#0',
+    env.calls.map((c) => c.data.option).join(' / '));
+
+  // The other side of the same gate. A field whose schema requires a choice - and any
+  // field at all against a bridge too old to publish the attribute - is unchanged.
+  card = newCard(FIELDS, SUBMIT);
+  env = controlledEnv({ 1: { label: 'Features', multi: true, codes: true,
+    options: ['Auth', 'Billing'], state: '#2' } });
+  env.card = card;
+  card.hass = env.hass;
+  buttons(card).find((b) => b.textContent === 'Billing').click();
+  check('a field with no empty carrier still unticks to the placeholder',
+    env.calls[env.calls.length - 1].data.option === 'Choose...',
+    env.calls.map((c) => c.data.option).join(' / '));
+  env.calls[env.calls.length - 1].settle.resolve();
+  await flush();
+  env.arrive(F(1), 'Choose...');
+  await flush();
+  check('and that leaves the form unanswered, which is what holds the words back',
+    card._complete === false);
 
   console.log('--- a slot that moves on its own ---');
 

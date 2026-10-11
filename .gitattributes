@@ -1,3 +1,15 @@
 # Shell scripts run on macOS and must keep LF line endings wherever they are checked out.
 *.sh text eol=lf
 bin/agent-ha-bridge text eol=lf
+
+# The reply card is published into Home Assistant byte for byte - install.ps1 copies
+# the working tree and Get-BridgeInlineReplyCardUrl base64s exactly those bytes - and
+# the publication fence compares their SHA-256. So the line endings a checkout happens
+# to use are part of the published artifact. With core.autocrlf on, a Windows working
+# copy hashes differently from the LF bytes git stores and every release download
+# carries, and the fence sees one CARD_VERSION with two contents: the conflict it is
+# built to refuse. That is not a conflict anybody can resolve, because bumping the
+# version produces the same two hashes one version later, and it paused publication
+# indefinitely while the dashboard went on rendering against whichever build got in
+# first - two Send buttons and answers that could never be confirmed (#110).
+frontend/agent-bridge-reply-card.js text eol=lf
