@@ -122,10 +122,15 @@ function Invoke-PairingPaste {
         Write-Host '    Check it against:'
         $member = Select-PairingMachine -Machines $members -Prompt '    Machine'
         if (-not (Initialize-BridgePairingHelper -Headers $headers)) { throw 'could not create the Pair a machine helper in Home Assistant' }
-        if (-not (Test-BridgeFleetSecretWithMember -Secret $pasted -Member $member -Headers $headers)) {
-            throw "that is not $($member.Machine)'s fleet secret - nothing was saved"
+        # One variable for the id that is checked and the id that is saved. The member
+        # refuses to answer for any fleet but its own and the tag covers it, so what is
+        # written here is an id the member agreed to - not one taken on the word of a
+        # retained MQTT message a broker could have rewritten (#85).
+        $verifiedFleetId = [string]$member.FleetId
+        if (-not (Test-BridgeFleetSecretWithMember -Secret $pasted -Member $member -FleetId $verifiedFleetId -Headers $headers)) {
+            throw "that is not $($member.Machine)'s fleet secret, or it is not in the fleet it advertised - nothing was saved"
         }
-        Save-BridgeFleetMembership -ConfigPath $configPath -Secret $pasted -FleetId $member.FleetId -Share $true
+        Save-BridgeFleetMembership -ConfigPath $configPath -Secret $pasted -FleetId $verifiedFleetId -Share $true
         Write-Host "    checked against $($member.Machine) and saved; sharing is on"
         return
     }

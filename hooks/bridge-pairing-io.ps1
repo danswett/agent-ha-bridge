@@ -234,10 +234,23 @@ function Add-BridgePairingRefusal {
 # ------------------------------------------------------------- the sponsor's daemon
 
 function Get-BridgePairingCheckTag {
-    <# The answer to a pasted secret's check: proves the sponsor holds the same secret, and reveals nothing about it. #>
-    param([Parameter(Mandatory)][string]$Secret, [Parameter(Mandatory)][string]$Nonce)
+    <#
+        The answer to a pasted secret's check: proves the sponsor holds the same secret,
+        and reveals nothing about it.
+
+        The fleet id is covered by the tag, not just carried beside it. Without that the
+        exchange authenticated the nonce and the secret but said nothing about which
+        fleet was being joined, so a broker that rewrote a real member's advertised
+        `fleet` had the joiner save a forged id while the tag still verified - a machine
+        holding the right secret, in a fleet of its own (#85).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Secret,
+        [Parameter(Mandatory)][string]$Nonce,
+        [Parameter(Mandatory)][string]$FleetId
+    )
     $mac = [Security.Cryptography.HMACSHA256]::new([Text.Encoding]::UTF8.GetBytes($Secret))
-    try { (ConvertTo-BridgePairingHex -Bytes $mac.ComputeHash((ConvertTo-BridgePairingFrame -Values @('check', $Nonce)))).Substring(0, 32) }
+    try { (ConvertTo-BridgePairingHex -Bytes $mac.ComputeHash((ConvertTo-BridgePairingFrame -Values @('check', $Nonce, $FleetId)))).Substring(0, 32) }
     finally { $mac.Dispose() }
 }
 
@@ -256,12 +269,21 @@ function Invoke-DaemonPairingRequest {
     $slug = Get-BridgeMachineSlug
     $membership = Get-BridgeFleetMembership
 
-    if ($value -match "^check:$([regex]::Escape($slug)):([0-9a-f]{32})$") {
+    if ($value -match "^check:$([regex]::Escape($slug)):([0-9a-f]{32}):([0-9a-f]{32})$") {
         if (-not $membership.HasSecret) { return 'no-secret' }
         $nonce = $Matches[1]
-        Set-BridgePairingHelperValue -Headers $Headers -Value "checked:${slug}:${nonce}:$(Get-BridgePairingCheckTag -Secret (Get-BridgeTransferSecret) -Nonce $nonce)"
+        $asked = $Matches[2]
+        # The fleet the joiner believes it is joining has to be this one. Answering for
+        # a fleet id that is not ours is what let a broker hand a joiner a forged id
+        # while the tag still verified (#85).
+        if ($asked -cne [string]$membership.FleetId) { return 'other-fleet' }
+        Set-BridgePairingHelperValue -Headers $Headers -Value "checked:${slug}:${nonce}:$(Get-BridgePairingCheckTag -Secret (Get-BridgeTransferSecret) -Nonce $nonce -FleetId $asked)"
         return 'checked'
     }
+    # A joiner still speaking the two-field form is asking for a tag that binds nothing.
+    # Refusing leaves it to time out and say so, which is the safe direction: answering
+    # would hand back exactly the unbound proof this format replaced.
+    if ($value -match "^check:$([regex]::Escape($slug)):([0-9a-f]{32})$") { return 'check-unbound' }
 
     $request = ConvertFrom-BridgePairingRequest -Value $value
     if ($null -eq $request -or $request.SponsorSlug -cne $slug) { return 'not-ours' }
@@ -479,19 +501,31 @@ function Test-BridgeFleetSecretWithMember {
     <#
         Checks a pasted secret against a member before it is saved: the member answers a
         fresh nonce with an HMAC under its own secret. Returns $true only on a match.
+
+        $FleetId is the fleet the caller is about to save. It travels in the challenge
+        and is covered by the tag, and the member refuses to answer for any other, so a
+        $true here means the member agreed to that exact id rather than merely proving
+        it holds the secret. A broker that rewrites the advertised fleet now gets no
+        answer instead of a verifying one (#85).
     #>
-    param([Parameter(Mandatory)][string]$Secret, [Parameter(Mandatory)]$Member, [Parameter(Mandatory)][hashtable]$Headers, [int]$TimeoutSeconds = 60)
+    param(
+        [Parameter(Mandatory)][string]$Secret,
+        [Parameter(Mandatory)]$Member,
+        [Parameter(Mandatory)][string]$FleetId,
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [int]$TimeoutSeconds = 60
+    )
     $current = Get-BridgePairingHelperValue -Headers $Headers
     if ($null -eq $current) { throw 'the Pair a machine helper is missing from Home Assistant' }
     if (-not [string]::IsNullOrEmpty($current)) { throw 'another pairing is in progress' }
     $nonce = New-BridgePairingId
-    Set-BridgePairingHelperValue -Headers $Headers -Value "check:$($Member.Slug):$nonce"
+    Set-BridgePairingHelperValue -Headers $Headers -Value "check:$($Member.Slug):${nonce}:$FleetId"
     try {
         $deadline = [DateTimeOffset]::Now.AddSeconds($TimeoutSeconds)
         while ([DateTimeOffset]::Now -lt $deadline) {
             $v = Get-BridgePairingHelperValue -Headers $Headers
             if ([string]$v -match "^checked:$([regex]::Escape($Member.Slug)):${nonce}:([0-9a-f]{32})$") {
-                return Test-BridgePairingEqual -A $Matches[1] -B (Get-BridgePairingCheckTag -Secret $Secret -Nonce $nonce)
+                return Test-BridgePairingEqual -A $Matches[1] -B (Get-BridgePairingCheckTag -Secret $Secret -Nonce $nonce -FleetId $FleetId)
             }
             Start-Sleep -Seconds 2
         }
@@ -500,7 +534,7 @@ function Test-BridgeFleetSecretWithMember {
     finally {
         try {
             $left = Get-BridgePairingHelperValue -Headers $Headers
-            if ($left -like "check:$($Member.Slug):$nonce" -or $left -like "checked:$($Member.Slug):${nonce}:*") { Set-BridgePairingHelperValue -Headers $Headers -Value '' }
+            if ($left -like "check:$($Member.Slug):${nonce}:*" -or $left -like "checked:$($Member.Slug):${nonce}:*") { Set-BridgePairingHelperValue -Headers $Headers -Value '' }
         }
         catch { if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw } }
     }
