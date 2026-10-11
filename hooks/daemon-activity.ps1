@@ -429,16 +429,37 @@ function Get-ActivityFromEvents {
         # unanchored, quoting a start marker invented a shell that no completion could
         # ever settle, and quoting a completion cleared a real one.
         if ($type -eq 'tool.execution_complete') {
-            if ($line -notmatch 'shellId') { continue }
+            # A cheap filter before the JSON parse, which is the expensive part across a
+            # transcript's worth of these. `shellId` covers every marker except the stop
+            # result, which spells it `id:` - and that discrepancy is why a stopped
+            # shell was invisible to this parser at all (#184).
+            if ($line -notmatch 'shellId' -and $line -notmatch 'command with id: ') { continue }
             try {
                 $parsed = $line | ConvertFrom-Json
                 $result = if ($parsed.data.PSObject.Properties['result']) { $parsed.data.result } else { $null }
                 $content = Get-BridgeEventField -Data $result -Name 'content'
                 if ([string]::IsNullOrWhiteSpace($content)) { continue }
+                # The two markers below are the whole result and nothing else, measured
+                # on real transcripts, so they are matched against the whole of it
+                # rather than a line within it. That costs nothing and closes the hazard
+                # the anchoring above only narrows: a command that prints transcript
+                # text back - this file, an issue body, a grep over a session's events -
+                # puts a marker at the start of a line in its own output.
+                $whole = ([string]$content).Trim()
                 # Finishes first: one read can collect an ended shell and report another
                 # as still running, and the ending is the older news of the two.
                 foreach ($match in [regex]::Matches($content, '(?m)^<shellId: (\S+?) completed with exit code')) {
                     [void]$shellsFinished.Add($match.Groups[1].Value)
+                }
+                # A shell ended with stop_powershell never completes and fires no
+                # shell_completed notification, so neither route above ever settled it:
+                # it stayed outstanding for the rest of the session and the card went on
+                # saying "waiting for 1 background command" with nothing running.
+                # Settling is about termination, not completion.
+                $match = [regex]::Match($whole, '\A<command with id: (\S+?) stopped>\z')
+                if ($match.Success) {
+                    [void]$shellsFinished.Add($match.Groups[1].Value)
+                    continue
                 }
                 $match = [regex]::Match($content, '(?m)^<command started in background with shellId: ([^>\r\n]+)>')
                 if ($match.Success) {
@@ -448,6 +469,20 @@ function Get-ActivityFromEvents {
                     continue
                 }
                 $match = [regex]::Match($content, '(?m)^<command with shellId: (\S+) is still running')
+                if ($match.Success) {
+                    $id = $match.Groups[1].Value
+                    [void]$shellsStarted.Add($id)
+                    if ($attached) { [void]$shellsSinceAttach.Add($id) }
+                    continue
+                }
+                # A sync command the user moves to the background is a background shell
+                # like any other, and says so only here. Untracked, it is #151 by a
+                # different door - a session reading idle while something runs under it -
+                # and it also left the card's count disagreeing with what the user sees
+                # in list_powershell, which is what made the stuck case above hard to
+                # recognise for what it was. Every one of these seen in real transcripts
+                # went on to complete normally, so it settles through the routes above.
+                $match = [regex]::Match($whole, '\A<command with shellId: (\S+?) moved to background by the user[^\r\n]*>\z')
                 if ($match.Success) {
                     $id = $match.Groups[1].Value
                     [void]$shellsStarted.Add($id)
