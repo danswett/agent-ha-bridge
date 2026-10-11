@@ -344,6 +344,33 @@ $script:DaemonUnaccountedReported = @{}
 # clock; retention only stops the table growing without end.
 $script:DaemonUnaccountedRetentionMinutes = 30
 
+function Resolve-DaemonProcessStartTicks {
+    <#
+        The start time that tells one generation of a pid from the next, in UTC ticks:
+        0 when nothing could say, and -1 for a process that has gone.
+
+        The inventory view normally carries it. When it does not - an adapter running
+        an older copy of bridge-platform.ps1 reports none, and a denied handle read
+        carries 0 - the platform is asked directly rather than the process being held
+        for ever. Holding for ever is what #144 was: a machine where nothing retired,
+        no orphan was swept and every launch was refused, for as long as one process
+        nobody could pin happened to be running.
+    #>
+    param([Parameter(Mandatory)][AllowNull()]$Process)
+
+    if ($null -eq $Process) { return [long]0 }
+    $ticks = [long]0
+    if ($Process.PSObject.Properties['StartedUtcTicks']) { $ticks = [long]$Process.StartedUtcTicks }
+    if ($ticks -gt 0) { return $ticks }
+    $processId = 0
+    try { $processId = [int]$Process.Id } catch { return [long]0 }
+    if ($processId -le 0) { return [long]0 }
+    $observation = Get-BridgeProcessStartObservation -ProcessId $processId
+    if ($observation.State -eq 'Absent') { return [long](-1) }
+    if ($observation.State -eq 'Readable') { return [long]$observation.StartedUtcTicks }
+    [long]0
+}
+
 function Select-DaemonHoldingProcesses {
     <#
         Of this pass's unaccounted processes, those that still hold discovery open.
@@ -370,11 +397,28 @@ function Select-DaemonHoldingProcesses {
     $prefix = "$Kind/"
     $seen = @{}
     $present = @{}
+    # Pids this kind already has a record for. A candidate whose view carries no start
+    # time is only read directly when it is one of these, because that read exists to
+    # let the loop below recognise - and forget - a record it is already keeping. Every
+    # other candidate is cheap and stays cheap: normally nothing is unaccounted at all.
+    $tracked = @{}
+    foreach ($key in $script:DaemonUnaccountedSince.Keys) {
+        if (-not $key.StartsWith($prefix, [StringComparison]::Ordinal)) { continue }
+        $parts = $key.Split('/')
+        if ($parts.Count -ge 2) { $tracked[$parts[1]] = $true }
+    }
     foreach ($process in $Candidates) {
         if ($null -eq $process) { continue }
         $candidateName = if ($process.PSObject.Properties['ProcessName']) { [string]$process.ProcessName } else { '' }
         $candidateStart = 0
         if ($process.PSObject.Properties['StartedUtcTicks']) { $candidateStart = [long]$process.StartedUtcTicks }
+        if ($candidateStart -le 0 -and $tracked.ContainsKey([string][int]$process.Id)) {
+            # Keyed the same way the record was, or "registered, so forget its clock"
+            # below never matches and the process keeps the minutes it ran before
+            # registering - which is the hazard #140's review found.
+            $resolved = Resolve-DaemonProcessStartTicks -Process $process
+            if ($resolved -gt 0) { $candidateStart = $resolved }
+        }
         $present['{0}{1}/{2}/{3}' -f $prefix, [int]$process.Id, $candidateName, $candidateStart] = $true
     }
     $holding = [Collections.Generic.List[object]]::new()
@@ -382,11 +426,15 @@ function Select-DaemonHoldingProcesses {
         if ($null -eq $process) { continue }
         $processId = [int]$process.Id
         $name = if ($process.PSObject.Properties['ProcessName']) { [string]$process.ProcessName } else { '' }
-        # Read defensively: an adapter carrying its own older copy of
-        # bridge-platform.ps1 reports no start time, and a denied StartTime read
-        # carries 0.
-        $started = 0
-        if ($process.PSObject.Properties['StartedUtcTicks']) { $started = [long]$process.StartedUtcTicks }
+        # Read defensively, then insistently: an adapter carrying its own older copy of
+        # bridge-platform.ps1 reports no start time, and a denied StartTime read carries
+        # 0, but neither means the start time is unknowable - see
+        # Resolve-DaemonProcessStartTicks.
+        $started = Resolve-DaemonProcessStartTicks -Process $process
+        # Gone between the inventory and this decision. Deliberately left out of $seen,
+        # so the retention loop below ages its record out instead of this pass holding
+        # everything up for a process that is not there to be identified.
+        if ($started -lt 0) { continue }
         $key = '{0}{1}/{2}/{3}' -f $prefix, $processId, $name, $started
         $seen[$key] = $true
         if (-not $script:DaemonUnaccountedSince.ContainsKey($key)) {
@@ -400,6 +448,12 @@ function Select-DaemonHoldingProcesses {
         # was still registering, which is the one outcome the grace exists to prevent.
         # Excusing takes positive identification here as it does everywhere else, so an
         # unidentifiable generation keeps holding.
+        #
+        # Reaching this now means no route could say, not merely that the caller's view
+        # did not carry one: Resolve-DaemonProcessStartTicks has already asked the
+        # platform directly. That is the difference between a machine wedged by an
+        # older adapter or a denied read - #144 - and one wedged by a process that is
+        # genuinely unidentifiable, which is rare and still worth refusing to guess at.
         if ($started -le 0) {
             $holding.Add($process)
             if (-not $script:DaemonUnaccountedReported.ContainsKey($key)) {

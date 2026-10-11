@@ -85,6 +85,20 @@ function Get-BridgeCommandLine {
     }
 }
 
+# What the platform can say about a process whose inventory view carried no start
+# time. Discovery asks only in that case, so an empty table means every fixture
+# process is pinned by its own view and nothing reaches here.
+$script:ProcessStarts = @{}
+$script:DefaultProcessStartState = 'Unknown'
+function Get-BridgeProcessStartObservation {
+    param([Parameter(Mandatory)][int]$ProcessId)
+    if ($script:ProcessStarts.ContainsKey($ProcessId)) { return $script:ProcessStarts[$ProcessId] }
+    [pscustomobject]@{
+        State = $script:DefaultProcessStartState; StartedUtcTicks = [long]0
+        ProcessId = $ProcessId; Code = 'Unreadable'
+    }
+}
+
 function New-FixtureSession {
     param([string]$SessionId, [int]$ProcessId, [string]$Kind)
     [pscustomobject]@{ SessionId = $SessionId; ProcessId = $ProcessId; Kind = $Kind; RegistrationPath = '' }
@@ -115,6 +129,8 @@ function Reset-FixtureState {
     $script:ProcessDiagnostics = @()
     $script:CommandLines = @{}
     $script:CommandLineState = 'Readable'
+    $script:ProcessStarts = @{}
+    $script:DefaultProcessStartState = 'Unknown'
     $script:SessionsByKind = @{}
     $script:FailingKinds = @{}
     $script:AgentProcessCalls = [Collections.Generic.List[object]]::new()
@@ -600,25 +616,87 @@ Test-That 'and a discovery that is holding nothing says nothing' {
     (Get-DaemonDiscoveryHoldSummary -Snapshot (Get-DaemonSessionDiscovery)) -eq ''
 }
 
-# A process whose start time cannot be read - an older adapter's copy of the platform
-# layer reports none, and a denied read carries 0 - has no generation to tell it apart
-# from a new session that reuses its pid and name between passes. That newcomer would
-# inherit the elapsed clock and be excused on sight, and discovery would go Complete
-# while it was still registering. Excusing takes positive identification here too.
+# A process whose start time the inventory view did not carry - an older adapter's
+# copy of the platform layer reports none, and a denied handle read carries 0 - used
+# to hold absence-based work for as long as it ran. Nothing retired, no orphan was
+# swept and every launch was refused, on a machine whose only fault was running one
+# process nobody had asked the right way about (#144). The view is not the only route
+# to a start time, so it is no longer the last word.
 Reset-FixtureState -Kinds @('copilot')
 $script:ProcessesByAgent = @{ copilot = @([pscustomobject]@{ Id = 31005; ProcessName = 'copilot' }) }
+$script:ProcessStarts = @{
+    31005 = [pscustomobject]@{ State = 'Readable'; StartedUtcTicks = [long]555; ProcessId = 31005; Code = '' }
+}
+$readDirectly = Get-DaemonSessionDiscovery
+
+Test-That 'a start time the view did not carry is read from the platform instead' {
+    @($script:DaemonUnaccountedSince.Keys | Where-Object { $_ -ceq 'copilot/31005/copilot/555' }).Count -eq 1
+} "keys: $(@($script:DaemonUnaccountedSince.Keys) -join ', ')"
+
+Test-That 'and it still serves its grace rather than being excused on sight' {
+    -not $readDirectly.Complete -and (Get-FixtureDiagnosticCodes -Snapshot $readDirectly) -contains 'UnaccountedProcess'
+} "complete=$($readDirectly.Complete) codes: $((Get-FixtureDiagnosticCodes -Snapshot $readDirectly) -join ', ')"
+
+foreach ($key in @($script:DaemonUnaccountedSince.Keys)) {
+    $script:DaemonUnaccountedSince[$key] = [DateTimeOffset]::Now.AddMinutes(-10)
+}
+$pinned = Get-DaemonSessionDiscovery
+
+Test-That 'so a machine an older adapter used to wedge for ever now ages it out' {
+    $pinned.Complete -and (Get-FixtureDiagnosticCodes -Snapshot $pinned) -notcontains 'UnaccountedProcess'
+} "complete=$($pinned.Complete) codes: $((Get-FixtureDiagnosticCodes -Snapshot $pinned) -join ', ')"
+
+# Reading the start time directly must key the record the same way for a process that
+# goes on to register, or "registered, so forget its clock" never matches and the
+# minutes it ran before registering survive - excusing it on sight if that
+# registration is ever lost again. The hazard #140's review found, by another road.
+Reset-FixtureState -Kinds @('copilot')
+$viewless = [pscustomobject]@{ Id = 31006; ProcessName = 'copilot' }
+$script:ProcessesByAgent = @{ copilot = @($viewless) }
+$script:ProcessStarts = @{
+    31006 = [pscustomobject]@{ State = 'Readable'; StartedUtcTicks = [long]666; ProcessId = 31006; Code = '' }
+}
+[void](Get-DaemonSessionDiscovery)
+$script:SessionsByKind = @{
+    copilot = @{ 'copilot-viewless' = New-FixtureSession -SessionId 'copilot-viewless' -ProcessId 31006 -Kind 'copilot' }
+}
+[void](Get-DaemonSessionDiscovery)
+
+Test-That 'registering clears that record too, however the start time was found' {
+    @($script:DaemonUnaccountedSince.Keys | Where-Object { $_ -like 'copilot/31006/*' }).Count -eq 0
+} "keys: $(@($script:DaemonUnaccountedSince.Keys) -join ', ')"
+
+# A process that has gone is not an identification problem, and holding everything up
+# until something can name a generation it no longer has is the stall by another name.
+Reset-FixtureState -Kinds @('copilot')
+$script:ProcessesByAgent = @{ copilot = @([pscustomobject]@{ Id = 31007; ProcessName = 'copilot' }) }
+$script:ProcessStarts = @{
+    31007 = [pscustomobject]@{ State = 'Absent'; StartedUtcTicks = [long]0; ProcessId = 31007; Code = 'ProcessNotFound' }
+}
+$departedStartless = Get-DaemonSessionDiscovery
+
+Test-That 'a process that has gone holds nothing, even with no start time to show' {
+    $departedStartless.Complete -and
+        (Get-FixtureDiagnosticCodes -Snapshot $departedStartless) -notcontains 'UnaccountedProcess'
+} "complete=$($departedStartless.Complete) codes: $((Get-FixtureDiagnosticCodes -Snapshot $departedStartless) -join ', ')"
+
+# When no route can say, the caution stands: a generation nothing can name is not
+# positive identification, and excusing it would let discovery go Complete while a
+# session that inherited the pid was still registering.
+Reset-FixtureState -Kinds @('copilot')
+$script:ProcessesByAgent = @{ copilot = @([pscustomobject]@{ Id = 31008; ProcessName = 'copilot' }) }
 [void](Get-DaemonSessionDiscovery)
 foreach ($key in @($script:DaemonUnaccountedSince.Keys)) {
     $script:DaemonUnaccountedSince[$key] = [DateTimeOffset]::Now.AddMinutes(-10)
 }
 $noGeneration = Get-DaemonSessionDiscovery
 
-Test-That 'a process with no readable start time is never aged out, however long it waits' {
+Test-That 'a process no route can date is never aged out, however long it waits' {
     -not $noGeneration.Complete -and (Get-FixtureDiagnosticCodes -Snapshot $noGeneration) -contains 'UnaccountedProcess'
 } "complete=$($noGeneration.Complete) codes: $((Get-FixtureDiagnosticCodes -Snapshot $noGeneration) -join ', ')"
 
 Test-That 'and says why, so a machine held for that reason can be diagnosed' {
-    (Get-FixtureLogText) -match 'holding for copilot process 31005 .*no readable start time'
+    (Get-FixtureLogText) -match 'holding for copilot process 31008 .*no readable start time'
 } (Get-FixtureLogText)
 
 # ------------------------------------------------------------- the test guard ----
