@@ -1889,3 +1889,34 @@ function Select-BridgeUpdateTokenCandidate {
     }
     [pscustomobject]@{ Token = ''; Source = ''; Note = $note }
 }
+
+function Get-BridgeUpdateTokenPromptReason {
+    <#
+        Why an interactive install should offer to replace the credential release
+        checks use, or '' when it should not ask: 'refused', 'unusable' or 'none'.
+
+        One value decides both whether to ask and what to say, because keeping those
+        two apart is what went wrong. The installer asked when there was no usable
+        source or when the last check had been refused, then chose its wording from a
+        separate cascade that also had a branch for an unsendable setting - a branch
+        nothing could reach. An `updates.token` carrying a smart quote alongside a
+        working $env:GH_TOKEN resolves to a nonempty source *and* a note, so the offer
+        was skipped while both `status` and `update` went on printing that note and
+        telling the operator to run the command that skips it. Raised by Codex on #190.
+
+        Order is by what is actually being sent. A refusal is about the credential the
+        last check used, so it comes first; an unsendable value is a setting being
+        skipped, which matters even while something else carries the checks; having
+        nothing at all is last because it is the only one that is not a mistake.
+    #>
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Source,
+        [AllowNull()][AllowEmptyString()][string]$RefusedNote,
+        [AllowNull()][AllowEmptyString()][string]$UnusableNote
+    )
+
+    if ($RefusedNote) { return 'refused' }
+    if ($UnusableNote) { return 'unusable' }
+    if (-not $Source) { return 'none' }
+    ''
+}

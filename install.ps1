@@ -3071,24 +3071,41 @@ $updateTokenUnusable = [string]$updateTokenChoice.Note
 $updateTokenNote = ''
 $lastUpdateCheck = Get-BridgeUpdateCheckSummary -Path (Get-BridgeRuntimePath -Name 'agent-bridge-update.json' -Context $installContext)
 if (Test-BridgeUpdateTokenRejected -Summary $lastUpdateCheck) { $updateTokenNote = [string]$lastUpdateCheck.TokenNote }
-# Only asked when the machine has nothing usable, or when what it has was refused. One
-# already in the environment needs no configuration, and a working configured one is an
-# answer already given.
-if (((-not $updateTokenSource) -or $updateTokenNote) -and -not $NonInteractive -and (Test-BridgeConsoleInteractive)) {
+# Only asked when the machine has nothing usable, when what it has was refused, or
+# when a stored value cannot be sent - that last one even if a later candidate is
+# carrying the checks, because both status surfaces print its note on every check and
+# name this command as the way to replace it. One function decides both whether to ask
+# and which of the three things to say, so the question and the wording cannot drift
+# apart again. Raised by Codex on #190.
+$updateTokenReason = Get-BridgeUpdateTokenPromptReason -Source $updateTokenSource `
+    -RefusedNote $updateTokenNote -UnusableNote $updateTokenUnusable
+if ($updateTokenReason -and -not $NonInteractive -and (Test-BridgeConsoleInteractive)) {
     Write-Host ''
     $askUpdateToken = $false
-    if ($updateTokenNote) {
+    # What is true if the offer is declined, settled with the reason rather than after
+    # it: "stays unauthenticated" is wrong when a later candidate is already carrying
+    # the checks, and wrong again when the thing being replaced is one GitHub refused.
+    $updateTokenSkipNote = 'release checks stay unauthenticated.'
+    if ($updateTokenReason -eq 'refused') {
         Write-Host 'The GitHub token used for release checks was refused.' -ForegroundColor Yellow
         Write-Host "    $updateTokenNote"
         Write-Host '    Until it is replaced, checks share 60 requests an hour with everything'
         Write-Host '    else behind this address.'
+        $updateTokenSkipNote = 'release checks stay refused until it is replaced.'
         $askUpdateToken = Read-BridgeYesNo -Prompt '    Replace it now?' -Default $true
     }
-    elseif ($updateTokenUnusable) {
+    elseif ($updateTokenReason -eq 'unusable') {
         Write-Host 'The GitHub token for release checks cannot be sent.' -ForegroundColor Yellow
         Write-Host "    $updateTokenUnusable"
-        Write-Host '    Checks are sharing 60 requests an hour with everything else behind'
-        Write-Host '    this address until it is replaced.'
+        if ($updateTokenSource) {
+            Write-Host "    Checks are authenticated from $updateTokenSource meanwhile, so this is a"
+            Write-Host '    stored setting being skipped rather than updates being stuck.'
+            $updateTokenSkipNote = "checks go on using $updateTokenSource, and the stored setting stays skipped."
+        }
+        else {
+            Write-Host '    Checks are sharing 60 requests an hour with everything else behind'
+            Write-Host '    this address until it is replaced.'
+        }
         $askUpdateToken = Read-BridgeYesNo -Prompt '    Replace it now?' -Default $true
     }
     else {
@@ -3104,7 +3121,7 @@ if (((-not $updateTokenSource) -or $updateTokenNote) -and -not $NonInteractive -
         Write-Host '       needs no account or repository permissions at all'
         $enteredUpdateToken = ([string](Read-BridgeSecret -Prompt '    Paste the token here (Enter to skip)')).Trim()
         if (-not $enteredUpdateToken) {
-            Write-Host '    nothing pasted; release checks stay unauthenticated.' -ForegroundColor DarkGray
+            Write-Host "    nothing pasted; $updateTokenSkipNote" -ForegroundColor DarkGray
         }
         elseif (-not (Test-BridgeUpdateTokenSendable -Value $enteredUpdateToken)) {
             Write-Host '    that cannot be sent as a header, so it was not stored - run' -ForegroundColor Yellow
@@ -3139,6 +3156,9 @@ Write-Host "    notifications: $(if ($config.notifications.enabled) { $config.no
 Write-Host "    update check : $(
     if ($updateTokenSource) { "authenticated from $updateTokenSource - 5,000 requests an hour" }
     else { 'unauthenticated - 60 requests an hour, shared with everything behind this address' })"
+# Said here too, because an install that leaves a skipped setting in place should say so
+# rather than let the next `status` be the first mention of it.
+if ($updateTokenUnusable) { Write-Host "                   $updateTokenUnusable" -ForegroundColor Yellow }
 if ($isDevBox) {
     Write-Host "    Dev Box      : $(if ($devBoxDecision.Enabled) { "keep-awake on - '$devBoxTaskName' every ${devBoxIntervalMinutes}m" } else { "keep-awake off ($($devBoxDecision.Reason))" })"
 }

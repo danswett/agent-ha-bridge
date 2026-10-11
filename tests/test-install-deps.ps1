@@ -379,6 +379,24 @@ Test-That 'and the one rule for that lives in one place, used by both' {
         -not (Test-BridgeUpdateTokenSendable -Value "ghp_token$([char]0x201D)") -and
         -not (Test-BridgeUpdateTokenSendable -Value '')
 }
+# The offer to replace a token, and the words it is made in, come from one decision.
+# They used to be two: the installer asked when nothing usable was configured or when
+# the last check had been refused, and chose its wording from a separate cascade whose
+# unsendable branch nothing could reach. Raised by Codex on #190.
+Test-That 'a stored token that cannot be sent is still offered for replacement while something else carries the checks' {
+    (Get-BridgeUpdateTokenPromptReason -Source '$env:GH_TOKEN' `
+        -UnusableNote 'updates.token is not a usable token: it contains characters that cannot be sent in a request header.') -eq 'unusable'
+}
+Test-That 'a refusal is raised ahead of an unsendable setting, being about the token actually sent' {
+    (Get-BridgeUpdateTokenPromptReason -Source 'updates.token' -RefusedNote 'GitHub refused it' `
+        -UnusableNote '$env:GH_TOKEN is not a usable token') -eq 'refused'
+}
+Test-That 'a machine with nothing to send is asked for a token rather than told one was refused' {
+    (Get-BridgeUpdateTokenPromptReason -Source '' -RefusedNote '' -UnusableNote '') -eq 'none'
+}
+Test-That 'and a working token is left alone, so re-running configure is not a nag' {
+    (Get-BridgeUpdateTokenPromptReason -Source 'updates.token' -RefusedNote '' -UnusableNote '') -eq ''
+}
 
 Write-Host '--- the entry points still parse on Windows PowerShell ---'
 # The whole point of offering to install PowerShell 7 is that the offer runs where
