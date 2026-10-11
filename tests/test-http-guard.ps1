@@ -155,6 +155,26 @@ Test-That 'nor a real WebSocket subscription' {
 }
 Test-That 'both WebSocket refusals are counted' { $script:BridgeBlockedHttpCalls -eq 2 }
 
+# The streaming release download is the one transport with no cmdlet behind it, so the
+# "has this been replaced by a function" test the others use cannot answer for it - a
+# function always looks replaced, and the guard would wave through the very call it
+# exists to refuse. It is therefore refused unconditionally, and a suite that means to
+# exercise its caller replaces Save-BridgeUpdateDownload itself (#155).
+function Invoke-WebRequest { param($Uri, $OutFile, $Headers, $UseBasicParsing, $TimeoutSec) 'stubbed' }
+Test-That 'the streaming downloader is refused under test, having no cmdlet to vouch for it' {
+    try { Assert-BridgeHttpAllowed -Uri 'https://codeload.github.com/x/y/zip/refs/tags/v1.0.0' -Transport Download; $false }
+    catch { $_.Exception.Data['BridgeTestNetworkBlocked'] -eq $true }
+}
+Test-That 'and a stubbed Invoke-WebRequest does not authorize it either' {
+    try { Assert-BridgeHttpAllowed -Uri 'https://codeload.github.com/x/y/zip/refs/tags/v1.0.0' -Transport Download; $false }
+    catch { $_.Exception.Message -match 'tried to reach a real Home Assistant' }
+}
+Test-That 'while the WebRequest transport the stub really does replace is allowed' {
+    $script:BridgeBlockedHttpCalls = 0
+    Assert-BridgeHttpAllowed -Uri 'https://codeload.github.com/x/y/zip/refs/tags/v1.0.0' -Transport WebRequest
+    $script:BridgeBlockedHttpCalls -eq 0
+} "blocked=$script:BridgeBlockedHttpCalls"
+
 Remove-Item -LiteralPath $script:DecisionBridgeConfig.LogFile -Force -ErrorAction SilentlyContinue
 if ($script:Failures) { Write-Host "`n$script:Failures check(s) failed" -ForegroundColor Red; exit 1 }
 Write-Host "`nAll HTTP-guard checks passed" -ForegroundColor Green

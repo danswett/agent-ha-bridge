@@ -232,7 +232,20 @@ Set-RecordedVersion '1.2.0'
 Write-Marker @{ success = $false; version = '1.2.0'; error = 'failed after recording version'; at = [DateTimeOffset]::Now.ToString('o') }
 [void](Invoke-DaemonUpdateOutcome -Headers $headers)
 Receive-UpdatePayload $consumer
-Assert-UpdateOutcome 'failure after mutation does not claim that the old version survived' ($consumer.installed_version -eq '1.2.0' -and $script:Notified[0].title -match '^Bridge update failed')
+# Recording the release is the installer's own statement that it got that far, and
+# `agent-ha-bridge status` straight afterwards reports the new version with every
+# check green. Calling that "Bridge update failed" is what sent people hunting for an
+# updater bug that did not exist, and made a successful update look like the thing to
+# retry (#124). The step that failed is still named; the install is not disowned, and
+# the entity still reports the version the installation now records.
+Assert-UpdateOutcome 'failure after mutation reports the recorded version, and is not called a failed update' (
+    $consumer.installed_version -eq '1.2.0' -and
+    $script:Notified[0].title -match 'but a later step failed' -and
+    $script:Notified[0].message -match 'failed after recording version' -and
+    $script:Notified[0].message -match 'agent-ha-bridge status')
+$terminal = Get-UpdateAttributesPayload | ConvertFrom-Json -AsHashtable
+Assert-UpdateOutcome 'and the entity says the release installed before the step that failed' (
+    $terminal['stage'] -ceq 'failed' -and $terminal['stage_detail'] -match '^Installed 1\.2\.0, but a step after it failed')
 
 Reset-UpdateCapture
 Write-Marker @{ success = $false; error = 'old marker without target'; at = [DateTimeOffset]::Now.ToString('o') }

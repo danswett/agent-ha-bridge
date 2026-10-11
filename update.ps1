@@ -15,6 +15,11 @@
     Home Assistant `update` entity, so you normally learn about a new version there
     rather than by running this.
 
+    Exits 0 when the release installed or nothing newer was found, 1 when the update
+    did not happen, and 2 when the release installed but a step after it failed. Those
+    were one exit code until a stale Codex marketplace made a successful update report
+    itself as a failure (#124).
+
 .PARAMETER Check
     Report what is available and exit without installing anything.
 
@@ -62,6 +67,22 @@ $status = Get-BridgeUpdateStatus -Force
 Write-Host "    repository : $(Get-BridgeUpdateRepository)"
 Write-Host "    installed  : $($status.Installed)"
 Write-Host "    latest     : $(if ($status.Latest) { $status.Latest } else { 'not established' })"
+# Which GitHub allowance this machine's checks are on. Unauthenticated is 60 requests
+# an hour shared by everything behind the same address, so a Dev Box or any other
+# shared egress can exhaust it without the bridge having made a request of its own -
+# and nothing ever said so, nor that there was a setting that fixes it (#153).
+if ($status.PSObject.Properties['TokenSource']) {
+    if ($status.TokenSource) {
+        Write-Host "    checks     : authenticated with $($status.TokenSource) - 5,000 requests an hour"
+    }
+    else {
+        Write-Host '    checks     : unauthenticated - 60 requests an hour, shared with everything behind this address' -ForegroundColor DarkGray
+        Write-Host '                 set updates.token for 5,000 of this machine''s own: agent-ha-bridge configure -UpdateToken' -ForegroundColor DarkGray
+    }
+}
+if ($status.PSObject.Properties['TokenNote'] -and $status.TokenNote) {
+    Write-Host "    token      : $($status.TokenNote)" -ForegroundColor Yellow
+}
 
 if (-not $status.PSObject.Properties['State']) {
     Write-Host '    this older update helper cannot establish lookup status; nothing will be installed' -ForegroundColor Red
@@ -105,6 +126,13 @@ Write-Host "    $($result.Detail)"
 if ($result.State -eq 'Current') { return }
 Write-Host ''
 Write-Host "Log: $(Get-BridgeRuntimePath -Name 'agent-bridge-update.log' -Context $updateContext)"
+# Three outcomes, three exit codes. A post-install step failing used to exit 1 exactly
+# like an update that never happened, so a successful install read as the thing to
+# retry and sent people looking for an updater bug that was not there (#124).
+if ($result.PSObject.Properties['State'] -and $result.State -eq 'Incomplete') {
+    Write-Host "The release is installed. Check what did not finish: agent-ha-bridge status" -ForegroundColor Yellow
+    exit 2
+}
 if ($result.Success -isnot [bool] -or -not $result.Success -or $result.State -ne 'Completed') {
     exit 1
 }

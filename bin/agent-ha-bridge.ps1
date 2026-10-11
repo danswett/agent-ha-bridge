@@ -277,6 +277,54 @@ function Show-Status {
         }
     }
 
+    # What the last release check actually found, and which GitHub allowance it was
+    # spending. Read from the cache the daemon already writes, so status makes no
+    # request of its own - and so that a machine whose checks are being refused stops
+    # looking identical to one that is current. On the dashboard it does: a refused
+    # check retains the last known latest_version and the entity goes on reporting it
+    # with no sign that nothing has been heard for days (#153).
+    if ($commandContext) {
+        $checkCache = Get-BridgeRuntimePath -Name 'agent-bridge-update.json' -Context $commandContext
+        $check = $null
+        if (Test-Path -LiteralPath $checkCache -PathType Leaf) {
+            try { $check = Get-Content -LiteralPath $checkCache -Raw -Encoding UTF8 | ConvertFrom-Json }
+            catch { $check = $null }
+        }
+        if ($check -and $check.PSObject.Properties['CheckedAt']) {
+            $checkedAt = [DateTimeOffset]::MinValue
+            $when = if ([DateTimeOffset]::TryParse([string]$check.CheckedAt, [ref]$checkedAt)) {
+                $checkedAt.ToLocalTime().ToString('MMM d HH:mm')
+            } else { 'at an unreadable time' }
+            $state = if ($check.PSObject.Properties['State']) { [string]$check.State } else { '' }
+            $tag = ''
+            if ($check.PSObject.Properties['Release'] -and $check.Release -and
+                $check.Release.PSObject.Properties['Tag']) { $tag = [string]$check.Release.Tag }
+            $verdict = switch ($state) {
+                'Found' { if ($tag) { "found $tag" } else { 'answered' } }
+                'RateLimited' { 'refused - GitHub is rate limiting this machine' }
+                'NotFound' { 'GitHub reported no release' }
+                default { 'could not establish the latest release' }
+            }
+            $source = ''
+            if ($check.PSObject.Properties['TokenSource']) { $source = [string]$check.TokenSource }
+            $allowance = if ($source) { "authenticated with $source, 5,000 requests an hour" }
+                         else { 'unauthenticated, 60 requests an hour shared with everything behind this address' }
+            if ($state -eq 'Found') {
+                Write-Host "    updates    : checked $when, $verdict ($allowance)" -ForegroundColor Green
+            }
+            else {
+                Write-Host "    updates    : checked $when, $verdict" -ForegroundColor Yellow
+                Write-Host "                 checks are $allowance" -ForegroundColor Yellow
+                if (-not $source) {
+                    Write-Host '                 set updates.token for 5,000 of this machine''s own: agent-ha-bridge configure -UpdateToken' -ForegroundColor Yellow
+                }
+            }
+            if ($check.PSObject.Properties['TokenNote'] -and $check.TokenNote) {
+                Write-Host "                 $($check.TokenNote)" -ForegroundColor Yellow
+            }
+        }
+    }
+
     $base = ([string]$config.homeAssistant.baseUrl).TrimEnd('/')
     $token = [string]$config.homeAssistant.token
     if (-not $token -and $config.homeAssistant.tokenEnvVar) {

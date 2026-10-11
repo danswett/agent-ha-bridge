@@ -184,6 +184,13 @@ function Invoke-DaemonUpdateOutcome {
         if (([DateTimeOffset]::Now - $outcome.At).TotalHours -gt 6) { return $false }
         if ($script:DaemonUpdatePendingAttempt -eq $outcome.AttemptId) { $script:DaemonUpdatePendingAttempt = '' }
         $installed = Get-BridgeInstalledVersion -Refresh
+        # An installer that got as far as recording this release did install it, and
+        # `agent-ha-bridge status` straight afterwards reports the new version with
+        # every check green. Saying "update failed" of that is what made a successful
+        # update look like the thing to retry (#124); the step that failed is still
+        # named, and nothing here claims the install is healthy.
+        $reachedInstall = -not $outcome.Success -and
+            (Test-BridgeUpdateReachedInstall -Attempted ([string]$outcome.Version) -Recorded $installed)
         # The same verdict the notification carries, on the entity, so the dashboard
         # says how the update ended rather than only that it is no longer running.
         # Worked out before publishing because the publish is what shows it.
@@ -191,6 +198,7 @@ function Invoke-DaemonUpdateOutcome {
         $verdictDetail = if ($outcome.Success) {
             if ($outcome.Version) { "Updated to $($outcome.Version)" } else { 'Updated' }
         }
+        elseif ($reachedInstall) { "Installed $($outcome.Version), but a step after it failed: $($outcome.Error)" }
         else { [string]$outcome.Error }
         Set-DaemonUpdateVerdict -Stage $verdictStage -Detail $verdictDetail -AttemptId ([string]$outcome.AttemptId)
         Publish-CopilotMqttUpdate -InstalledVersion $installed -LatestVersion $outcome.Version `
@@ -217,12 +225,20 @@ function Invoke-DaemonUpdateOutcome {
             $attempt = if ($outcome.Version) { "to $($outcome.Version)" } else { '(target not recorded)' }
             Invoke-HomeAssistantService -Domain 'persistent_notification' -Service 'create' `
                 -Data @{
-                    title = "Bridge update failed on $($script:DaemonMachineName)"
-                    message = "The bridge update $attempt did not complete: $($outcome.Error). Currently recorded version: $installed. The installation may be partially changed; no rollback is claimed."
+                    title = if ($reachedInstall) { "Bridge updated on $($script:DaemonMachineName), but a later step failed" }
+                            else { "Bridge update failed on $($script:DaemonMachineName)" }
+                    message = if ($reachedInstall) {
+                        "The bridge installed **$($outcome.Version)** and records it, but a step after the install did not finish: $($outcome.Error). Run ``agent-ha-bridge status`` to see what is affected."
+                    }
+                    else {
+                        "The bridge update $attempt did not complete: $($outcome.Error). Currently recorded version: $installed. The installation may be partially changed; no rollback is claimed."
+                    }
                     notification_id = "agent_bridge_update_$($script:DaemonMachineSlug)"
                 } `
                 -Headers $Headers
-            Write-DaemonLog -Message "self-update FAILED for $($outcome.Version): $($outcome.Error); recorded version $installed"
+            Write-DaemonLog -Message $(if ($reachedInstall) {
+                "self-update installed $($outcome.Version) but a later step FAILED: $($outcome.Error); recorded version $installed"
+            } else { "self-update FAILED for $($outcome.Version): $($outcome.Error); recorded version $installed" })
         }
         return $true
     }
