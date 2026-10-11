@@ -445,6 +445,19 @@ function Invoke-BridgeUninstall {
             Remove-Item -LiteralPath $instructionsDir -Force -ErrorAction SilentlyContinue
         }
     }
+    # The Claude and Codex guidance is a block inside the user's own file, so this takes
+    # the block out and leaves everything they wrote (#181).
+    foreach ($blockPath in @(
+        (Join-Path $installContext.ClaudeHome 'CLAUDE.md'),
+        (Join-Path $installContext.CodexHome 'AGENTS.md')
+    )) {
+        try {
+            if (Remove-BridgeManagedInstructionBlock -Path $blockPath -InstallationId $installContext.Id) {
+                Write-Host "    $blockPath"
+            }
+        }
+        catch { Write-Warning "Guidance was left unchanged in $blockPath : $($_.Exception.Message)" }
+    }
 
     if ($installContext.LegacyLayout -and (Test-Path -LiteralPath $legacySkillDir)) {
         Write-Step 'Removing the obsolete decision-notifier skill'
