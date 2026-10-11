@@ -175,6 +175,16 @@ $script:DecisionBridgeConfig = @{
     # iOS copes with about ten before its own action list misbehaves; the overflow is
     # left to the dashboard rather than shown badly.
     AnswerButtonMax = [int](Get-BridgeSetting 'answerButtons.maxButtons' 6)
+    # An icon plus a background colour turns the alert into a communication
+    # notification - the rounded-avatar style messaging apps use - which is both more
+    # legible at a glance and unmistakably not an ordinary Home Assistant alert.
+    AnswerButtonIcon = (Get-BridgeSetting 'answerButtons.icon' 'mdi:chat-question')
+    AnswerButtonIconColor = (Get-BridgeSetting 'answerButtons.iconColor' '#FFFFFF')
+    AnswerButtonColor = (Get-BridgeSetting 'answerButtons.color' '#FF9F0A')
+    # A session that cannot continue until you answer is the case Apple's
+    # time-sensitive level exists for, so it is the default; `active` keeps it inside
+    # Focus, and `passive` keeps it off the Lock Screen altogether.
+    AnswerButtonInterruption = (Get-BridgeSetting 'answerButtons.interruptionLevel' 'time-sensitive')
 
     # --- behaviour, rarely changed -------------------------------------------
     DecisionQuestionMaxChars = 6000

@@ -72,11 +72,16 @@ function Invoke-DaemonDecisionAnswer {
 }
 
 $script:DecisionBridgeConfig = @{
-    AnswerButtonsEnabled = $true
-    AnswerButtonServices = @('notify.mobile_app_test')
-    AnswerButtonMax      = 6
-    DashboardUrlPath     = 'agent-decisions'
+    AnswerButtonsEnabled     = $true
+    AnswerButtonServices     = @('notify.mobile_app_test')
+    AnswerButtonMax          = 6
+    AnswerButtonIcon         = 'mdi:chat-question'
+    AnswerButtonIconColor    = '#FFFFFF'
+    AnswerButtonColor        = '#FF9F0A'
+    AnswerButtonInterruption = 'time-sensitive'
+    DashboardUrlPath         = 'agent-decisions'
 }
+$script:DaemonMachineName = 'TESTBOX'
 
 . (Join-Path $repository 'hooks\daemon-decision-notify.ps1')
 
@@ -205,6 +210,52 @@ Test-That 'tapping the notification itself opens the decision view' {
 }
 
 Write-Host ''
+Write-Host '--- and it is styled as the session speaking, not as a stock alert ---'
+
+Test-That 'an icon and a background colour make it a communication notification' {
+    # Without these iOS shows the Home Assistant app icon and nothing distinguishes a
+    # question from any other alert the house sends.
+    $p = Get-BridgeAnswerButtonPayload -SessionId $session -SessionName 'bridge' -Marker (New-TestMarker) `
+        -Icon 'mdi:chat-question' -IconColor '#FFFFFF' -Color '#FF9F0A'
+    $p.data.notification_icon -eq 'mdi:chat-question' -and
+        $p.data.notification_icon_color -eq '#FFFFFF' -and $p.data.color -eq '#FF9F0A'
+}
+
+Test-That 'the session name is the sender, so the question reads as coming from it' {
+    $p = Get-BridgeAnswerButtonPayload -SessionId $session -SessionName 'agent-ha-bridge' -Marker (New-TestMarker)
+    $p.title -eq 'agent-ha-bridge'
+}
+
+Test-That 'the machine is named in the subtitle rather than crowding the title' {
+    $p = Get-BridgeAnswerButtonPayload -SessionId $session -SessionName 'bridge' -Marker (New-TestMarker) -MachineName 'DSWETT-HOME'
+    $p.data.subtitle -match 'DSWETT-HOME'
+}
+
+Test-That 'a blocked session is time-sensitive, so Focus does not hide it' {
+    $p = Get-BridgeAnswerButtonPayload -SessionId $session -SessionName 'bridge' -Marker (New-TestMarker) `
+        -InterruptionLevel 'time-sensitive'
+    $p.data.'interruption-level' -eq 'time-sensitive'
+}
+
+Test-That 'the level can be turned down without touching the code' {
+    $p = Get-BridgeAnswerButtonPayload -SessionId $session -SessionName 'bridge' -Marker (New-TestMarker) `
+        -InterruptionLevel 'passive'
+    $p.data.'interruption-level' -eq 'passive'
+}
+
+Test-That 'several questions stack under one heading' {
+    $p = Get-BridgeAnswerButtonPayload -SessionId $session -SessionName 'bridge' -Marker (New-TestMarker)
+    $p.data.group -eq 'agent-bridge'
+}
+
+Test-That 'clearing the icon leaves a plain notification rather than a broken one' {
+    # An empty icon must not send an empty notification_icon, which iOS would render
+    # as a communication notification with no avatar at all.
+    $p = Get-BridgeAnswerButtonPayload -SessionId $session -SessionName 'bridge' -Marker (New-TestMarker) -Icon ''
+    -not $p.data.ContainsKey('notification_icon')
+}
+
+Write-Host ''
 Write-Host '--- a real tap from a real phone is understood ---'
 
 # Captured from a physical iPhone on 2026-10-10 against this exact payload builder.
@@ -228,6 +279,17 @@ Test-That 'an action with no data at all is ignored rather than guessed at' {
 Test-That 'typed text is carried back with the event' {
     $typed = '{"action":"BRIDGE_abc_text","reply_text":"use develop","action_data":{"bridge":"decision","decision":"d1","session":"s1"}}' | ConvertFrom-Json
     (Get-BridgeAnswerButtonChoice -EventData $typed).ReplyText -eq 'use develop'
+}
+
+# Also captured from the same physical iPhone, using the notification's text action.
+# Kept beside the button payload because the two differ in exactly the way that
+# matters: this one ends in _text, so the option index must decline to match it.
+$realTyped = ('{"action":"style-448cdd14_text","action_data":{"bridge":"decision",' +
+    '"decision":"style-448cdd14","session":"probe"},"reply_text":"Yes"}') | ConvertFrom-Json
+
+Test-That 'a typed reply from the phone is read as words, not as an option number' {
+    $c = Get-BridgeAnswerButtonChoice -EventData $realTyped
+    $c.ReplyText -eq 'Yes' -and $c.Index -eq -1
 }
 
 Write-Host ''
