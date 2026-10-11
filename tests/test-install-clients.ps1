@@ -794,6 +794,179 @@ try {
     Test-That 'and says the reclaimer refusals protect work rather than obstruct it' {
         $script:InstrText -match '--force' -and $script:InstrText -match 'not yours'
     }
+
+    # Claude and Codex have no drop-in directory the bridge can own, so the same
+    # guidance goes into ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md as a marked block.
+    # Those files are the user's, so every case below is really one question: did
+    # anything they wrote change? (#181)
+    Write-Host '--- global guidance as a block in a file the user owns ---'
+    $script:OwnerId = 'a' * 32
+    $script:OtherId = 'b' * 32
+    $script:BlockFile = Join-Path $script:InstrRoot 'claude\CLAUDE.md'
+
+    Test-That 'it creates the file when the client has none, holding just the block' {
+        $wrote = Set-BridgeManagedInstructionBlock -Path $script:BlockFile -Content 'GUIDANCE ONE' -InstallationId $script:OwnerId
+        $text = [IO.File]::ReadAllText($script:BlockFile)
+        $wrote -and $text -match "^<!-- agent-ha-bridge-owner:$($script:OwnerId) -->" -and
+            $text -match 'GUIDANCE ONE' -and $text -match '<!-- /agent-ha-bridge -->'
+    }
+    Test-That 'and writing the same block again changes nothing' {
+        (Set-BridgeManagedInstructionBlock -Path $script:BlockFile -Content 'GUIDANCE ONE' -InstallationId $script:OwnerId) -eq $false
+    }
+
+    $script:UserText = "# My notes`n`nAlways use tabs.`n"
+    Test-That 'it appends to a file the user already had, keeping every word of it' {
+        [IO.File]::WriteAllText($script:BlockFile, $script:UserText)
+        [void](Set-BridgeManagedInstructionBlock -Path $script:BlockFile -Content 'GUIDANCE ONE' -InstallationId $script:OwnerId)
+        $text = [IO.File]::ReadAllText($script:BlockFile)
+        $text.StartsWith('# My notes') -and $text -match 'Always use tabs\.' -and $text -match 'GUIDANCE ONE'
+    }
+    Test-That 'and an update rewrites the block without disturbing their text' {
+        [void](Set-BridgeManagedInstructionBlock -Path $script:BlockFile -Content 'GUIDANCE TWO' -InstallationId $script:OwnerId)
+        $text = [IO.File]::ReadAllText($script:BlockFile)
+        $text -match 'GUIDANCE TWO' -and $text -notmatch 'GUIDANCE ONE' -and
+            $text -match 'Always use tabs\.' -and
+            ([regex]::Matches($text, '<!-- /agent-ha-bridge -->')).Count -eq 1
+    }
+    Test-That 'and removing it gives the file back exactly as the user wrote it' {
+        $removed = Remove-BridgeManagedInstructionBlock -Path $script:BlockFile -InstallationId $script:OwnerId
+        $removed -and ([IO.File]::ReadAllText($script:BlockFile) -ceq $script:UserText)
+    }
+    Test-That 'and a file that held nothing but the block is taken away with it' {
+        Remove-Item -LiteralPath $script:BlockFile -Force -ErrorAction SilentlyContinue
+        [void](Set-BridgeManagedInstructionBlock -Path $script:BlockFile -Content 'GUIDANCE ONE' -InstallationId $script:OwnerId)
+        (Remove-BridgeManagedInstructionBlock -Path $script:BlockFile -InstallationId $script:OwnerId) -and
+            -not (Test-Path -LiteralPath $script:BlockFile)
+    }
+    Test-That 'removing from a file that never had one is not a change' {
+        [IO.File]::WriteAllText($script:BlockFile, $script:UserText)
+        (Remove-BridgeManagedInstructionBlock -Path $script:BlockFile -InstallationId $script:OwnerId) -eq $false -and
+            ([IO.File]::ReadAllText($script:BlockFile) -ceq $script:UserText)
+    }
+    # Anything ambiguous refuses rather than guesses: rewriting state that is not this
+    # installation's is how #148 started.
+    Test-That 'another installation block is refused rather than rewritten' {
+        [void](Set-BridgeManagedInstructionBlock -Path $script:BlockFile -Content 'THEIRS' -InstallationId $script:OtherId)
+        $before = [IO.File]::ReadAllText($script:BlockFile)
+        $threw = $false
+        try { [void](Set-BridgeManagedInstructionBlock -Path $script:BlockFile -Content 'MINE' -InstallationId $script:OwnerId) }
+        catch { $threw = $_.Exception.Message -match 'another installation' }
+        $threw -and ([IO.File]::ReadAllText($script:BlockFile) -ceq $before)
+    }
+    Test-That 'and neither is it removed on their behalf' {
+        $before = [IO.File]::ReadAllText($script:BlockFile)
+        $threw = $false
+        try { [void](Remove-BridgeManagedInstructionBlock -Path $script:BlockFile -InstallationId $script:OwnerId) }
+        catch { $threw = $_.Exception.Message -match 'another installation' }
+        $threw -and ([IO.File]::ReadAllText($script:BlockFile) -ceq $before)
+    }
+    Test-That 'a block with no end marker is left alone rather than guessed at' {
+        [IO.File]::WriteAllText($script:BlockFile, "<!-- agent-ha-bridge-owner:$($script:OwnerId) -->`nhalf written`n")
+        $threw = $false
+        try { [void](Set-BridgeManagedInstructionBlock -Path $script:BlockFile -Content 'MINE' -InstallationId $script:OwnerId) }
+        catch { $threw = $_.Exception.Message -match 'no end marker' }
+        $threw -and ([IO.File]::ReadAllText($script:BlockFile) -match 'half written')
+    }
+    Test-That 'and so is an end marker with nothing opening it' {
+        [IO.File]::WriteAllText($script:BlockFile, "notes`n<!-- /agent-ha-bridge -->`n")
+        $threw = $false
+        try { [void](Set-BridgeManagedInstructionBlock -Path $script:BlockFile -Content 'MINE' -InstallationId $script:OwnerId) }
+        catch { $threw = $_.Exception.Message -match 'no start' }
+        $threw -and ([IO.File]::ReadAllText($script:BlockFile) -match 'notes')
+    }
+    Test-That 'a file written with LF keeps LF rather than being switched to CRLF' {
+        [IO.File]::WriteAllText($script:BlockFile, "# Notes`n`nkeep lf`n")
+        [void](Set-BridgeManagedInstructionBlock -Path $script:BlockFile -Content "one`ntwo" -InstallationId $script:OwnerId)
+        $text = [IO.File]::ReadAllText($script:BlockFile)
+        $text -match 'one' -and $text -notmatch "`r`n"
+    }
+
+    # Everything below was found by review on #182: the guarantee was "byte for byte"
+    # and three of these quietly broke it. The first test only ever used a file ending
+    # in exactly one newline, which is the one case that happened to survive.
+    Test-That 'a file ending without a newline comes back without one' {
+        $original = "# Notes`nno trailing newline"
+        [IO.File]::WriteAllText($script:BlockFile, $original)
+        [void](Set-BridgeManagedInstructionBlock -Path $script:BlockFile -Content 'G' -InstallationId $script:OwnerId)
+        [void](Remove-BridgeManagedInstructionBlock -Path $script:BlockFile -InstallationId $script:OwnerId)
+        [IO.File]::ReadAllText($script:BlockFile) -ceq $original
+    }
+    Test-That 'and one ending in several keeps every one of them' {
+        $original = "# Notes`n`n`n`n"
+        [IO.File]::WriteAllText($script:BlockFile, $original)
+        [void](Set-BridgeManagedInstructionBlock -Path $script:BlockFile -Content 'G' -InstallationId $script:OwnerId)
+        [void](Remove-BridgeManagedInstructionBlock -Path $script:BlockFile -InstallationId $script:OwnerId)
+        [IO.File]::ReadAllText($script:BlockFile) -ceq $original
+    }
+    Test-That 'a UTF-8 file with a byte order mark still has one afterwards' {
+        [IO.File]::WriteAllText($script:BlockFile, "# Notes`nkeep bom`n", [Text.UTF8Encoding]::new($true))
+        [void](Set-BridgeManagedInstructionBlock -Path $script:BlockFile -Content 'G' -InstallationId $script:OwnerId)
+        $bytes = [IO.File]::ReadAllBytes($script:BlockFile)
+        $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF -and
+            ([IO.File]::ReadAllText($script:BlockFile) -match 'keep bom')
+    }
+    Test-That 'and a UTF-16 one is not silently rewritten as UTF-8' {
+        [IO.File]::WriteAllText($script:BlockFile, "# Notes`nwide`n", [Text.UnicodeEncoding]::new($false, $true))
+        [void](Set-BridgeManagedInstructionBlock -Path $script:BlockFile -Content 'G' -InstallationId $script:OwnerId)
+        $bytes = [IO.File]::ReadAllBytes($script:BlockFile)
+        $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE -and
+            ([IO.File]::ReadAllText($script:BlockFile, [Text.UnicodeEncoding]::new($false, $true)) -match 'wide')
+    }
+
+    # Codex reads AGENTS.override.md in its home first and ignores AGENTS.md entirely
+    # when the override has anything in it, so writing to the wrong one puts the
+    # guidance where Codex never looks - silently, which is the failure this whole
+    # change exists to prevent.
+    $script:CodexCtx = [pscustomobject]@{
+        ClaudeHome = (Join-Path $script:InstrRoot 'c-home')
+        CodexHome  = (Join-Path $script:InstrRoot 'x-home')
+    }
+    [void][IO.Directory]::CreateDirectory($script:CodexCtx.CodexHome)
+    $script:Override = Join-Path $script:CodexCtx.CodexHome 'AGENTS.override.md'
+    $script:Standard = Join-Path $script:CodexCtx.CodexHome 'AGENTS.md'
+
+    Test-That 'with no override, Codex guidance goes to AGENTS.md' {
+        Remove-Item -LiteralPath $script:Override -Force -ErrorAction SilentlyContinue
+        (Get-BridgeClientInstructionPath -Client 'codex' -Context $script:CodexCtx).Active -eq $script:Standard
+    }
+    Test-That 'an empty override is skipped, exactly as Codex skips it' {
+        [IO.File]::WriteAllText($script:Override, "   `n")
+        (Get-BridgeClientInstructionPath -Client 'codex' -Context $script:CodexCtx).Active -eq $script:Standard
+    }
+    Test-That 'but a non-empty override is where the guidance has to go' {
+        [IO.File]::WriteAllText($script:Override, "# my override`n")
+        (Get-BridgeClientInstructionPath -Client 'codex' -Context $script:CodexCtx).Active -eq $script:Override
+    }
+    Test-That 'and Claude has no override to consider' {
+        $claude = Get-BridgeClientInstructionPath -Client 'claude' -Context $script:CodexCtx
+        $claude.Active -eq (Join-Path $script:CodexCtx.ClaudeHome 'CLAUDE.md') -and $claude.All.Count -eq 1
+    }
+    Test-That 'both Codex candidates are offered, so a block in the inactive one can be cleared' {
+        $all = (Get-BridgeClientInstructionPath -Client 'codex' -Context $script:CodexCtx).All
+        $all -contains $script:Override -and $all -contains $script:Standard
+    }
+
+    if ($IsWindows -or $IsLinux -or $IsMacOS) {
+        $script:LinkTarget = Join-Path $script:InstrRoot 'link-target.md'
+        $script:LinkPath = Join-Path $script:InstrRoot 'linked-CLAUDE.md'
+        [IO.File]::WriteAllText($script:LinkTarget, '')
+        $script:MadeLink = $false
+        try {
+            New-Item -ItemType SymbolicLink -Path $script:LinkPath -Target $script:LinkTarget -ErrorAction Stop | Out-Null
+            $script:MadeLink = $true
+        }
+        catch { $script:MadeLink = $false }
+        if ($script:MadeLink) {
+            Test-That 'a symlinked instruction file is emptied rather than unlinked' {
+                [void](Set-BridgeManagedInstructionBlock -Path $script:LinkPath -Content 'G' -InstallationId $script:OwnerId)
+                [void](Remove-BridgeManagedInstructionBlock -Path $script:LinkPath -InstallationId $script:OwnerId)
+                (Test-Path -LiteralPath $script:LinkPath) -and
+                    (Get-Item -LiteralPath $script:LinkPath -Force).LinkType -and
+                    -not ([IO.File]::ReadAllText($script:LinkTarget)).Trim()
+            }
+        }
+        else { Write-Host '  SKIP  symbolic links are not available to this account' }
+    }
 }
 finally {
     Remove-Item -LiteralPath $script:InstrRoot -Recurse -Force -ErrorAction SilentlyContinue

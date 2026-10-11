@@ -3233,6 +3233,41 @@ if (-not ($selectedClients -contains 'copilot') -and (Test-Path -LiteralPath $ag
     }
 }
 
+# Claude and Codex read one global file each, and both belong to the user, so the same
+# guidance goes in as a marked block rather than a file the bridge owns. Without this
+# a machine configured for Claude alone got no bridge guidance at all - including the
+# rule about not sweeping the shared worktree root (#181).
+foreach ($instructionClient in @('claude', 'codex')) {
+    $choice = Get-BridgeClientInstructionPath -Client $instructionClient -Context $installContext
+    try {
+        if ($selectedClients -contains $instructionClient) {
+            if (Set-BridgeManagedInstructionBlock -Path $choice.Active -InstallationId $installContext.Id `
+                    -Content (Get-BridgeAgentInstructions `
+                        -EnvVarName ([string]$config.homeAssistant.agentTokenEnvVar) -HasAgentToken:$hasAgentToken)) {
+                Write-Host "    $($choice.Active)"
+            }
+            # An override that appeared or went away moves which file Codex reads, so a
+            # block left in the other one is guidance nothing will ever load.
+            foreach ($stale in @($choice.All | Where-Object { $_ -ne $choice.Active })) {
+                if (Remove-BridgeManagedInstructionBlock -Path $stale -InstallationId $installContext.Id) {
+                    Write-Host "    $stale"
+                }
+            }
+        }
+        else {
+            foreach ($path in $choice.All) {
+                if (Remove-BridgeManagedInstructionBlock -Path $path -InstallationId $installContext.Id) {
+                    Write-Host "    $path"
+                }
+            }
+        }
+    }
+    catch {
+        # Never fail an install over someone else's instruction file.
+        Write-Warning "The $instructionClient guidance was left unchanged: $($_.Exception.Message)"
+    }
+}
+
 # --------------------------------------------------------- configure adapters
 # Claude, Codex and the MCP server reuse the shared layer just installed, so configure
 # them by running their own installers. Each is idempotent and warns rather than fails

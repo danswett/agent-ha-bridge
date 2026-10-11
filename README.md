@@ -546,9 +546,19 @@ reach for that one rather than yours, and an agent driving the bridge is nearly 
 working in some unrelated repository, so this repository's `AGENTS.md` never reaches
 it. A Copilot install therefore also writes
 `~/.copilot/instructions/agent-ha-bridge.instructions.md` — a file the CLI reads in
-every session, wherever it is working. It is short, it says which token writes and
-where a session's answer is read back from, and it is removed on uninstall. Your own
+every session, wherever it is working. It is short, it says which token writes, where
+a session's answer is read back from and that the shared worktree root is never yours
+to sweep, and it is removed on uninstall. Your own
 `~/.copilot/copilot-instructions.md` is never touched.
+
+Claude and Codex read one global file each — `~/.claude/CLAUDE.md` and
+`~/.codex/AGENTS.md` — and both belong to you rather than to the bridge. They get the
+same guidance as a marked block inside those files, delimited by
+`<!-- agent-ha-bridge-owner:… -->` and `<!-- /agent-ha-bridge -->`. The block is
+updated in place, removed when the client is deselected or the bridge is uninstalled,
+and your own line endings and surrounding text are left exactly as you wrote them. A
+block belonging to another installation, or one left half-written, is reported and
+left alone rather than rewritten. If the file held nothing but the block, it goes too.
 
 **A non-administrator is genuinely enough**, and the split is deliberate. Driving a
 session is service calls and state reads, both of which a plain user may do. The MCP

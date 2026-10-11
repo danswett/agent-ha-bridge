@@ -606,3 +606,213 @@ function Assert-BridgeAdapterSelection {
         throw "The $Client client is not selected; automatic repair did not change its adapter."
     }
 }
+
+# --------------------------------------------- global guidance in a user's own file
+# Copilot has a drop-in directory the bridge can own outright, so its guidance is a
+# whole file the bridge writes and deletes. Claude and Codex have no equivalent: their
+# global instructions are ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md, which belong to
+# the user. Those get a marked block instead, so the bridge can update and remove its
+# own text without touching a word of theirs (#181).
+#
+# Anything ambiguous refuses rather than guesses. A half-written block or one left by a
+# different installation is someone else's state, and rewriting it blind is how the
+# incident in #148 started.
+
+$script:BridgeInstructionBlockEnd = '<!-- /agent-ha-bridge -->'
+
+function Read-BridgeInstructionFile {
+    <#
+        The file's text and the encoding it was actually stored in.
+
+        The encoding has to come back out with the text: writing UTF-8 without a BOM
+        unconditionally re-encoded a user's whole file the first time a block went into
+        it, which is not "the rest of the file is untouched" by any reading, and breaks
+        anything downstream that cares how the file is spelled on disk.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path)) {
+        return [pscustomobject]@{ Text = ''; Encoding = [Text.UTF8Encoding]::new($false) }
+    }
+    $bytes = [IO.File]::ReadAllBytes($Path)
+    $encoding = if ($bytes.Length -ge 3 -and $bytes[0] -eq 0xEF -and $bytes[1] -eq 0xBB -and $bytes[2] -eq 0xBF) {
+        [Text.UTF8Encoding]::new($true)
+    }
+    elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFF -and $bytes[1] -eq 0xFE) { [Text.UnicodeEncoding]::new($false, $true) }
+    elseif ($bytes.Length -ge 2 -and $bytes[0] -eq 0xFE -and $bytes[1] -eq 0xFF) { [Text.UnicodeEncoding]::new($true, $true) }
+    else { [Text.UTF8Encoding]::new($false) }
+    $text = $encoding.GetString($bytes)
+    # GetString keeps the byte order mark as a character; the preamble is written back
+    # by the encoding itself, so carrying it in the text too would double it.
+    if ($text.Length -and $text[0] -eq [char]0xFEFF) { $text = $text.Substring(1) }
+    [pscustomobject]@{ Text = $text; Encoding = $encoding }
+}
+
+function Write-BridgeInstructionFile {
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
+        [Parameter(Mandatory)][Text.Encoding]$Encoding
+    )
+    [IO.File]::WriteAllText($Path, $Text, $Encoding)
+}
+
+function Get-BridgeClientInstructionPath {
+    <#
+        The global instruction file a client actually reads.
+
+        Codex looks for AGENTS.override.md in its home first and ignores AGENTS.md
+        entirely when that one has anything in it, so writing to AGENTS.md on a machine
+        that has an override puts the guidance somewhere Codex never looks - silently,
+        which is the whole failure this guidance exists to prevent. Claude has no such
+        file and always reads CLAUDE.md.
+
+        Returns every candidate as well, so removal can clear a block left in the file
+        that is no longer the active one.
+    #>
+    param(
+        [Parameter(Mandatory)][ValidateSet('claude', 'codex')][string]$Client,
+        [Parameter(Mandatory)]$Context
+    )
+
+    if ($Client -eq 'claude') {
+        $only = Join-Path $Context.ClaudeHome 'CLAUDE.md'
+        return [pscustomobject]@{ Active = $only; All = @($only) }
+    }
+    $override = Join-Path $Context.CodexHome 'AGENTS.override.md'
+    $standard = Join-Path $Context.CodexHome 'AGENTS.md'
+    $overrideUsed = $false
+    if (Test-Path -LiteralPath $override) {
+        try { $overrideUsed = -not [string]::IsNullOrWhiteSpace((Read-BridgeInstructionFile -Path $override).Text) }
+        catch { $overrideUsed = $true }
+    }
+    [pscustomobject]@{
+        Active = if ($overrideUsed) { $override } else { $standard }
+        All    = @($override, $standard)
+    }
+}
+
+function Get-BridgeInstructionBlockBounds {
+    <#
+        Where this installation's block starts and ends in $Text, as character offsets,
+        or $null when it is not there. Throws when the file carries a bridge block that
+        cannot be safely rewritten.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
+        [Parameter(Mandatory)][string]$InstallationId
+    )
+
+    $owners = [regex]::Matches($Text, '(?m)^<!-- agent-ha-bridge-owner:([0-9a-f]{32}) -->[ \t]*\r?$')
+    if ($owners.Count -eq 0) {
+        if ($Text -match [regex]::Escape($script:BridgeInstructionBlockEnd)) {
+            throw 'The instruction file has a bridge block end with no start; it was left alone.'
+        }
+        return $null
+    }
+    if ($owners.Count -gt 1) {
+        throw 'The instruction file has more than one bridge block; it was left alone.'
+    }
+    $start = $owners[0]
+    if ($start.Groups[1].Value -cne $InstallationId) {
+        throw 'The instruction block belongs to another installation.'
+    }
+    $end = [regex]::Match($Text, '(?m)^' + [regex]::Escape($script:BridgeInstructionBlockEnd) + '(?=[ \t]*\r?$)')
+    if (-not $end.Success -or $end.Index -lt $start.Index) {
+        throw 'The instruction block has no end marker; it was left alone.'
+    }
+    [pscustomobject]@{ Start = $start.Index; End = $end.Index + $end.Length }
+}
+
+function Set-BridgeManagedInstructionBlock {
+    <#
+        Puts $Content in this installation's block in $Path, creating the file when it
+        is absent and appending the block when the file exists without one. Everything
+        the user wrote is preserved byte for byte, including their line endings.
+
+        Returns $true when the file changed.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Content,
+        [Parameter(Mandatory)][string]$InstallationId
+    )
+
+    $file = Read-BridgeInstructionFile -Path $Path
+    $existing = $file.Text
+    $bounds = Get-BridgeInstructionBlockBounds -Text $existing -InstallationId $InstallationId
+    # The user's own line endings win; only a file this call creates gets the
+    # platform's. Rewriting a whole file to CRLF to insert one block would show up as
+    # an unrelated diff in whatever they keep it in.
+    $newline = if ($existing -match "`r`n") { "`r`n" } elseif ($existing) { "`n" } else { [Environment]::NewLine }
+    $block = "<!-- agent-ha-bridge-owner:$InstallationId -->" + $newline +
+        (($Content.Trim() -replace "`r`n", "`n") -replace "`n", $newline) + $newline +
+        $script:BridgeInstructionBlockEnd
+
+    if ($bounds) {
+        $wanted = $existing.Substring(0, $bounds.Start) + $block + $existing.Substring($bounds.End)
+    }
+    elseif ($existing.Trim()) {
+        # Exactly one newline of separator, and the prefix is left alone. Trimming the
+        # user's own trailing newlines here and restoring "one" on removal silently
+        # rewrote their file across an install/uninstall cycle - a file ending without
+        # a newline, or with three, never came back the way they left it.
+        $wanted = $existing + $newline + $block + $newline
+    }
+    else { $wanted = $block + $newline }
+
+    if ($existing -ceq $wanted) { return $false }
+    $parent = Split-Path -Parent $Path
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+    Write-BridgeInstructionFile -Path $Path -Text $wanted -Encoding $file.Encoding
+    $true
+}
+
+function Remove-BridgeManagedInstructionBlock {
+    <#
+        Takes this installation's block back out of $Path, leaving the rest of the file
+        exactly as it was - including the trailing newlines it had before the block was
+        ever added. A file that held nothing but the block is removed; one with anything
+        else in it is kept, and a symbolic link is emptied rather than unlinked.
+
+        Returns $true when the file changed.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$InstallationId
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    $file = Read-BridgeInstructionFile -Path $Path
+    $existing = $file.Text
+    # Another installation's block, or one too damaged to read, is not this one's to
+    # remove - and saying so beats silently leaving stale guidance behind.
+    $bounds = Get-BridgeInstructionBlockBounds -Text $existing -InstallationId $InstallationId
+    if (-not $bounds) { return $false }
+
+    # Undo exactly what insertion added: the one separator newline before the block and
+    # the one after it. Anything either side of those is the user's.
+    $before = $existing.Substring(0, $bounds.Start)
+    foreach ($ending in @("`r`n", "`n", "`r")) {
+        if ($before.EndsWith($ending)) { $before = $before.Substring(0, $before.Length - $ending.Length); break }
+    }
+    $after = $existing.Substring($bounds.End)
+    foreach ($ending in @("`r`n", "`n", "`r")) {
+        if ($after.StartsWith($ending)) { $after = $after.Substring($ending.Length); break }
+    }
+    $remainder = $before + $after
+
+    if (-not $remainder.Trim()) {
+        # A link is the user's, even when what it points at is only ours: deleting it
+        # would take their link away and leave the target behind.
+        if ((Get-Item -LiteralPath $Path -Force).LinkType) {
+            Write-BridgeInstructionFile -Path $Path -Text '' -Encoding $file.Encoding
+        }
+        else { Remove-Item -LiteralPath $Path -Force }
+        return $true
+    }
+    Write-BridgeInstructionFile -Path $Path -Text $remainder -Encoding $file.Encoding
+    $true
+}
