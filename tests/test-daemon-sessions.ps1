@@ -107,7 +107,17 @@ function Invoke-RestMethod {
         }
         # Only last_reported moves for a message that repeats the state an entity
         # already holds, and this sensor only ever says 'online' - so it is the one
-        # field that can tell a beat that landed from one that went nowhere.
+        # field that can tell a beat that landed from one that went nowhere. 'none'
+        # models a Home Assistant too old to publish it, which discarded a repeated
+        # write outright, so the other two stand still for a perfectly healthy sensor.
+        if ($script:DaemonOnlineReported -ceq 'none') {
+            return [pscustomobject]@{
+                entity_id = $script:DaemonOnlineEntity; state = 'on'
+                attributes = [pscustomobject]@{}
+                last_changed = '2026-10-10T10:37:34.733325-07:00'
+                last_updated = '2026-10-10T10:37:34.733325-07:00'
+            }
+        }
         $reported = if ($script:DaemonOnlineReported -ceq 'advancing') {
             [DateTimeOffset]::Now.ToString('o')
         } else { $script:DaemonOnlineReported }
@@ -747,7 +757,7 @@ Write-Host '--- a liveness sensor that has stopped taking its beats ---'
 # could not tell, expire_after never fired because a sensor in that state has no expiry
 # timer, and restarting the daemon changed nothing because the config it republished
 # was the one Home Assistant already held. (#177)
-$script:DaemonOnlineSeen = @{ Reported = ''; At = [DateTimeOffset]::MinValue }
+$script:DaemonOnlineSeen = @{ Reported = ''; At = [DateTimeOffset]::MinValue; Unanswered = 0 }
 $script:DaemonOnlineLastPublish = [DateTimeOffset]::MinValue
 $script:DaemonOnlineReported = 'advancing'
 $script:DaemonOnlineReadStatus = 200
@@ -769,6 +779,7 @@ function Invoke-TestOnlineBeat {
         $script:DaemonOnlineSeen = @{
             Reported = $script:DaemonOnlineSeen.Reported
             At = $script:DaemonOnlineSeen.At.AddSeconds(-$ApartSeconds)
+            Unanswered = $script:DaemonOnlineSeen.Unanswered
         }
     }
     Publish-DaemonOnlineHeartbeat -Headers $headers
@@ -790,7 +801,7 @@ Test-That 'a sensor that keeps reporting its beats is left alone' {
 
 $script:ReportingMessages.Clear()
 $script:Log = @()
-$script:DaemonOnlineSeen = @{ Reported = ''; At = [DateTimeOffset]::MinValue }
+$script:DaemonOnlineSeen = @{ Reported = ''; At = [DateTimeOffset]::MinValue; Unanswered = 0 }
 $script:DaemonOnlineReported = '2026-10-10T10:37:34.733325-07:00'
 1..3 | ForEach-Object { Invoke-TestOnlineBeat }
 Test-That 'a sensor that has gone quiet for less than the expiry window is given the benefit of the doubt' {
@@ -820,7 +831,7 @@ Test-That 'a rebuild that did not take is not repeated on the next beat, which w
 
 $script:ReportingMessages.Clear()
 $script:Log = @()
-$script:DaemonOnlineSeen = @{ Reported = ''; At = [DateTimeOffset]::MinValue }
+$script:DaemonOnlineSeen = @{ Reported = ''; At = [DateTimeOffset]::MinValue; Unanswered = 0 }
 $script:DaemonOnlineReadStatus = 500
 1..6 | ForEach-Object { Invoke-TestOnlineBeat }
 Test-That 'a Home Assistant that cannot be read starts no clock, so an outage never rebuilds anything' {
@@ -829,7 +840,7 @@ Test-That 'a Home Assistant that cannot be read starts no clock, so an outage ne
 
 $script:ReportingMessages.Clear()
 $script:Log = @()
-$script:DaemonOnlineSeen = @{ Reported = ''; At = [DateTimeOffset]::MinValue }
+$script:DaemonOnlineSeen = @{ Reported = ''; At = [DateTimeOffset]::MinValue; Unanswered = 0 }
 $script:DaemonOnlineReadStatus = 404
 $script:DaemonOnlineReads = 0
 1..4 | ForEach-Object { Invoke-TestOnlineBeat }
@@ -843,7 +854,47 @@ Test-That 'and the replacement beat waits for discovery rather than outrunning i
 } "reads=$($script:DaemonOnlineReads) beats=$(Get-TestOnlineBeatCount) | $(($script:Log | Select-Object -Last 2) -join ' | ')"
 $script:DaemonOnlineReadStatus = 200
 $script:DaemonOnlineReported = 'advancing'
-$script:DaemonOnlineSeen = @{ Reported = ''; At = [DateTimeOffset]::MinValue }
+$script:DaemonOnlineSeen = @{ Reported = ''; At = [DateTimeOffset]::MinValue; Unanswered = 0 }
+$script:Log = @()
+
+# Elapsed time on its own is not evidence. A daemon that has been asleep - a laptop
+# lid, a suspended VM - wakes with a clock saying the window passed hours ago and
+# exactly one read since, taken before its first beat could finish its trip through
+# the broker. That read is not a stall; it is a round trip in progress.
+$script:ReportingMessages.Clear()
+$script:DaemonOnlineReported = '2026-10-10T10:37:34.733325-07:00'
+Invoke-TestOnlineBeat
+$script:DaemonOnlineSeen = @{ Reported = $script:DaemonOnlineSeen.Reported
+    At = [DateTimeOffset]::Now.AddHours(-6); Unanswered = 0 }
+Invoke-TestOnlineBeat
+Test-That 'a daemon resuming from hours asleep does not rebuild on its first unanswered beat' {
+    (Get-TestOnlineRetractionCount) -eq 0
+} "unanswered=$($script:DaemonOnlineSeen.Unanswered)"
+Invoke-TestOnlineBeat
+Test-That 'nor on the second, since the window alone says nothing about the beats' {
+    (Get-TestOnlineRetractionCount) -eq 0
+} "unanswered=$($script:DaemonOnlineSeen.Unanswered)"
+Invoke-TestOnlineBeat
+Test-That 'but it does once enough beats have gone unanswered as well' {
+    (Get-TestOnlineRetractionCount) -eq 1
+} "unanswered=$($script:DaemonOnlineSeen.Unanswered)"
+
+# Home Assistant has only published last_reported since 2024.4, and the README sets no
+# minimum version. Before it, a write repeating the state an entity already held was
+# discarded, so last_changed and last_updated stand still for a sensor that is taking
+# every beat - and falling back to them would rebuild a healthy sensor every few
+# minutes for ever, which is worse than the fault being fixed.
+$script:ReportingMessages.Clear()
+$script:Log = @()
+$script:DaemonOnlineSeen = @{ Reported = ''; At = [DateTimeOffset]::MinValue; Unanswered = 0 }
+$script:DaemonOnlineReported = 'none'
+1..6 | ForEach-Object { Invoke-TestOnlineBeat }
+Test-That 'a Home Assistant too old to say when a state arrived is left alone rather than rebuilt on a loop' {
+    (Get-TestOnlineRetractionCount) -eq 0 -and (Get-TestOnlineBeatCount) -eq 6
+} (($script:Log | Select-Object -Last 2) -join ' | ')
+
+$script:DaemonOnlineReported = 'advancing'
+$script:DaemonOnlineSeen = @{ Reported = ''; At = [DateTimeOffset]::MinValue; Unanswered = 0 }
 $script:Log = @()
 
 Write-Host ''

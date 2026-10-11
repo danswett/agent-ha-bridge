@@ -127,6 +127,11 @@ $script:DaemonConfig = @{
     # broker was always going to catch up with - and a rebuild is destructive, so the
     # bar is "demonstrably not listening", not "quiet for a moment".
     DetachedEntitySeconds = 180
+    # And how many beats have to go unanswered in that time. Elapsed time alone is not
+    # enough: a daemon resuming from hours asleep has a clock saying the window passed
+    # long ago and exactly one read since, taken before its first beat could finish its
+    # trip through the broker - which rebuilt a perfectly healthy sensor.
+    DetachedEntityBeats = 3
     # MCP-client presence changes slowly and only affects rendering (the MCP server
     # owns its own decision entities), so its full /api/states discovery scan is cached
     # for this long rather than repeated on every reconcile.
@@ -253,12 +258,13 @@ $script:DaemonStateLastWritten = $null
 $script:DaemonGlobalSignature = $null
 $script:DaemonGlobalLastPublish = [DateTimeOffset]::MinValue
 $script:DaemonOnlineLastPublish = [DateTimeOffset]::MinValue
-# What the online sensor last said about when it took a beat, and when the daemon
-# first saw it say that. A beat that Home Assistant accepts and never applies is
-# invisible from the publishing end, so liveness is confirmed by watching this move
-# rather than by the publish returning. MinValue for At means nothing has been
-# observed yet, which is distinct from having observed an entity that is not there.
-$script:DaemonOnlineSeen = @{ Reported = ''; At = [DateTimeOffset]::MinValue }
+# What the online sensor last said about when it took a beat, when the daemon first
+# saw it say that, and how many beats have gone unanswered since. A beat that Home
+# Assistant accepts and never applies is invisible from the publishing end, so liveness
+# is confirmed by watching this move rather than by the publish returning. MinValue for
+# At means nothing has been observed yet, which is distinct from having observed an
+# entity that is not there.
+$script:DaemonOnlineSeen = @{ Reported = ''; At = [DateTimeOffset]::MinValue; Unanswered = 0 }
 
 # Short-lived cache of the MCP-client discovery scan (a full /api/states read) and
 # a consecutive-failure counter for the WebSocket watch backoff. Initialised for
