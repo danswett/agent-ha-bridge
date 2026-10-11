@@ -331,6 +331,29 @@ Test-That 'an empty value is dropped' {
     @(ConvertTo-BridgeArgumentList -BoundParameters @{ NotifyService = '' }).Count -eq 0
 }
 
+Write-Host '--- the setting that makes release checks reliable is reachable ---'
+# Until now `updates.token` could only be hand-edited into config.json, so in practice
+# no machine had one and every release check went out on the 60-requests-an-hour pool
+# shared with everything behind the same address - measured at 51/60 on one machine
+# against 5000/5000 for the identical authenticated call (#153). Both
+# `agent-ha-bridge update` and `agent-ha-bridge status` now tell people to run this.
+Test-That 'install.ps1 accepts the -UpdateToken that status and update point people at' {
+    (Get-Command (Join-Path $PSScriptRoot '..\install.ps1')).Parameters.ContainsKey('UpdateToken')
+}
+Test-That 'and it is kept off a relaunched command line, like the other two tokens' {
+    @(ConvertTo-BridgeArgumentList -BoundParameters @{
+        Token = 'a'; AgentToken = 'b'; UpdateToken = 'c'
+    } -Exclude @('Token', 'AgentToken', 'UpdateToken')).Count -eq 0
+}
+Test-That 'a config written before the setting existed gains it rather than silently lacking it' {
+    $examplePath = Join-Path $PSScriptRoot '..\config.example.json'
+    $defaults = Get-Content -LiteralPath $examplePath -Raw | ConvertFrom-Json
+    $older = Get-Content -LiteralPath $examplePath -Raw | ConvertFrom-Json
+    $older.updates.PSObject.Properties.Remove('token')
+    $added = @(Merge-BridgeConfigDefaults -Config $older -Defaults $defaults)
+    ($added -contains 'updates.token') -and $older.updates.token -eq ''
+}
+
 Write-Host '--- the entry points still parse on Windows PowerShell ---'
 # The whole point of offering to install PowerShell 7 is that the offer runs where
 # PowerShell 7 is absent. PowerShell parses an entire file before executing any of it,

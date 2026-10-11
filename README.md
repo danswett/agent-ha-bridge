@@ -295,10 +295,10 @@ If you already know the details, skip the prompts entirely:
 ```
 
 For unattended setup, supply `AGENT_HA_TOKEN` through your process's secret/environment
-configuration. `-Token` and `-AgentToken` remain supported, but their values can appear
-in shell history, process listings, and automation logs; do not put literal secrets
-in a command line. Omitting `-NonInteractive` lets the installer mask token entry.
-Redirected stdin remains supported and is read without echoing the token.
+configuration. `-Token`, `-AgentToken` and `-UpdateToken` remain supported, but their
+values can appear in shell history, process listings, and automation logs; do not put
+literal secrets in a command line. Omitting `-NonInteractive` lets the installer mask
+token entry. Redirected stdin remains supported and is read without echoing the token.
 
 Then `/restart` any running Copilot sessions so they pick up the hooks, and open the
 **Agent Sessions** dashboard in Home Assistant.
@@ -402,7 +402,7 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `updates.repository` | Repository to check for releases (default `danswett/agent-ha-bridge`) |
 | `updates.checkForUpdates` | Set to `false` to disable the update check |
 | `updates.checkHours` | How often to check GitHub for a release (default `6`, i.e. 4×/day) |
-| `updates.token` | Optional GitHub token for release checks only, sent to `api.github.com` and never logged. Unauthenticated callers share **60 requests an hour per IP**, so a Dev Box or anything else behind shared egress can be refused without the bridge having made a request of its own. `AGENT_HA_BRIDGE_UPDATE_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN` in the environment are used too, in that order, when the setting is empty - a machine that already has one needs no configuration. If a token is rejected as bad credentials, the check is retried without one rather than failing - an ambient `GITHUB_TOKEN` expires when its workflow job ends, and these are public releases. A read-only token with no scopes is enough for them |
+| `updates.token` | Optional GitHub token for release checks only, sent to `api.github.com` and never logged. Unauthenticated callers share **60 requests an hour per IP**, so a Dev Box or anything else behind shared egress can be refused without the bridge having made a request of its own. Set it with `agent-ha-bridge configure -UpdateToken`, or answer the installer's prompt; the installer offers it only when the machine has nothing to use. `AGENT_HA_BRIDGE_UPDATE_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN` in the environment are used when this setting is empty - a machine that already has one needs no configuration - and this setting wins over all three, because it is the one chosen for this machine. If a token is rejected as bad credentials, the check is retried without one rather than failing, and says which credential was refused instead of going quietly back to the shared pool - an ambient `GITHUB_TOKEN` expires when its workflow job ends, and these are public releases. A value that cannot be sent as a request header at all - a paste carrying a newline or a smart quote - is skipped with a reason rather than breaking the check. A read-only token with no scopes is enough |
 | `usage.publish` | Set to `false` to stop collecting and publishing each agent's remaining allowance (default `true`). This stops the vendor calls, not just the card |
 | `usage.intervalSeconds` | How often to re-read an agent's allowance while a session of that agent is open on this machine (default `120`). Copilot's figure moves continuously while a session runs, so this is a poll rather than a cache read |
 | `usage.idleIntervalSeconds` | How often to re-read it while none is (default `900`, and never less than `usage.intervalSeconds`). An allowance belongs to the account, not the machine, so a machine with nothing open is not what is spending it. A session opening or closing asks at once — see [How current it is](#how-current-it-is) |
@@ -1388,6 +1388,13 @@ From a terminal:
 
 Or, from anywhere, `agent-ha-bridge update`.
 
+It distinguishes three outcomes, where it used to report two. Exit **0** means the
+release installed or nothing newer was found; **1** means the update did not happen;
+**2** means the release installed but a step after it failed, and names that step
+rather than calling the update a failure. A stale Codex marketplace once made every
+`codex plugin` command exit 1 *after* the installer had printed "All good", so a
+successful update reported itself as broken and looked like the thing to retry.
+
 Either way your configuration is preserved: the installer reads the existing config,
 backs it up, and keeps your URL, token and settings.
 
@@ -1433,9 +1440,36 @@ Four things keep that from becoming a failed update:
   install nor in the release. The machine's row says **Update check failed**
   rather than going quiet, so a refused check does not read as nothing to install.
 
-A token raises the limit to 5,000 requests an hour. One already in the environment as
-`GH_TOKEN` or `GITHUB_TOKEN` is used automatically; `updates.token` sets one
-explicitly.
+A token raises the limit to 5,000 requests an hour for this machine alone. One already
+in the environment as `AGENT_HA_BRIDGE_UPDATE_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN` is
+used automatically. Otherwise the installer offers to set `updates.token`, and
+`agent-ha-bridge configure -UpdateToken` sets it later. These are public releases, so a
+token with no scopes at all is enough.
+
+The difference is measurable rather than theoretical: on one machine the same call
+reported **51/60 remaining unauthenticated** and **5000/5000 authenticated**. Both
+`agent-ha-bridge status` and `agent-ha-bridge update` print which of the two this
+machine is on, so a machine quietly sharing the small pool is visible without opening
+an entity:
+
+```
+    updates    : checked Oct 10 19:42, refused - GitHub is rate limiting this machine
+                 checks are unauthenticated, 60 requests an hour shared with everything behind this address
+                 set updates.token for 5,000 of this machine's own: agent-ha-bridge configure -UpdateToken
+```
+
+Only the *name* of the credential is ever reported - `updates.token`, or
+`$env:GH_TOKEN`. The token itself goes into a request header and nowhere else: not a
+log line, not the cache, not a dashboard field. A token GitHub rejects is retried
+without, and the machine says which credential was refused rather than going quietly
+back to the shared pool.
+
+**While a release downloads**, the machine's row reports how far it has got. The
+archive is streamed and the proportion comes from the response's own `Content-Length` -
+measured at 1,625,940 bytes for v1.33.14. A server that states no length (a `HEAD` to
+`codeload` does not, and a `Range` request is ignored) gets no bar rather than one stuck
+at 0 or 100%. The bar covers the archive only and ends with it: the native hook is
+fetched afterwards by the installer, under **Installing**.
 
 ---
 

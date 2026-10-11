@@ -33,6 +33,15 @@
     you. Omit it to keep an existing one, or to supply one via the
     AGENT_HA_AGENT_TOKEN environment variable instead.
 
+.PARAMETER UpdateToken
+    A GitHub token used for release checks only, sent to api.github.com and never
+    logged. Unauthenticated callers share 60 requests an hour per IP, so a Dev Box or
+    anything else behind shared egress can exhaust it without the bridge having made a
+    request of its own; a token gives this machine 5,000 of its own. Public releases
+    need no scopes at all. Omit it to keep an existing one, to be offered a prompt, or
+    to supply one via AGENT_HA_BRIDGE_UPDATE_TOKEN, GH_TOKEN or GITHUB_TOKEN in the
+    environment.
+
 .PARAMETER NotifyService
     Optional Home Assistant notify-style service for out-of-band alerts, e.g.
     notify.mobile_app_pixel. Omit to disable notifications.
@@ -103,6 +112,7 @@ param(
     [string]$HomeAssistantUrl,
     [string]$Token,
     [string]$AgentToken,
+    [string]$UpdateToken,
     [string]$NotifyService,
     [string]$TickerCategory,
     [string]$TargetHome,
@@ -2575,14 +2585,15 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
                (Get-BridgeDependencyCommand -Name 'pwsh'))
     }
     if (($PSBoundParameters.ContainsKey('Token') -and $Token) -or
-        ($PSBoundParameters.ContainsKey('AgentToken') -and $AgentToken)) {
+        ($PSBoundParameters.ContainsKey('AgentToken') -and $AgentToken) -or
+        ($PSBoundParameters.ContainsKey('UpdateToken') -and $UpdateToken)) {
         throw ('PowerShell 7 is ready, but token arguments are not forwarded to a child process. ' +
                'Re-run in PowerShell 7 using the masked prompts or token environment variables.')
     }
 
     Write-Step "Restarting under PowerShell 7 ($pwshPath)"
     $forwarded = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath) +
-                 @(ConvertTo-BridgeArgumentList -BoundParameters $PSBoundParameters -Exclude @('Token', 'AgentToken'))
+                 @(ConvertTo-BridgeArgumentList -BoundParameters $PSBoundParameters -Exclude @('Token', 'AgentToken', 'UpdateToken'))
     & $pwshPath @forwarded
     exit $LASTEXITCODE
 }
@@ -2690,7 +2701,8 @@ if ($PSBoundParameters.ContainsKey('Token') -and $Token) {
     $config.homeAssistant.token = $Token
 }
 if (($PSBoundParameters.ContainsKey('Token') -and $Token) -or
-    ($PSBoundParameters.ContainsKey('AgentToken') -and $AgentToken)) {
+    ($PSBoundParameters.ContainsKey('AgentToken') -and $AgentToken) -or
+    ($PSBoundParameters.ContainsKey('UpdateToken') -and $UpdateToken)) {
     Write-Warning 'Token arguments can appear in shell history and process listings. Prefer masked prompts or environment variables.'
 }
 # -AgentToken is deliberately NOT stored here. It is a *candidate* until the agent
@@ -3001,7 +3013,7 @@ if ($homeAssistantReady) {
 # release without guessing.
 if (-not $config.PSObject.Properties.Name.Contains('updates')) {
     $config | Add-Member -NotePropertyName 'updates' -NotePropertyValue ([pscustomobject]@{
-        repository = 'danswett/agent-ha-bridge'; installedVersion = ''; checkForUpdates = $true
+        repository = 'danswett/agent-ha-bridge'; installedVersion = ''; checkForUpdates = $true; token = ''
     })
 }
 $config.updates.installedVersion = $version
@@ -3012,6 +3024,65 @@ if ($config.updates.PSObject.Properties.Name -contains 'installedFromSource') {
 }
 else {
     $config.updates | Add-Member -NotePropertyName 'installedFromSource' -NotePropertyValue $installedFromSource
+}
+# ------------------------------------------------- which GitHub allowance this is on
+#
+# An unauthenticated release check shares 60 requests an hour with everything else
+# behind the same address, so a Dev Box - or any shared egress - can exhaust it
+# without the bridge having made a request of its own, and then no machine behind that
+# address can take any release at all. A token is 5,000 an hour of this machine's own:
+# measured on one machine, the same call reported 51/60 unauthenticated and 5000/5000
+# authenticated.
+#
+# The cure already existed. Nothing ever offered it, so in practice no machine had
+# one and `updates.token` had to be hand-edited into config.json (#153).
+if ($config.updates.PSObject.Properties.Name -notcontains 'token') {
+    $config.updates | Add-Member -NotePropertyName 'token' -NotePropertyValue ''
+}
+# The same rule Get-BridgeUpdateToken applies at check time: a token is a request
+# header, so a value carrying a newline or a smart quote from a paste cannot be sent
+# at all. Refused here, where it can still be retyped.
+$updateTokenShape = '^[\x21-\x7E]+$'
+if ($PSBoundParameters.ContainsKey('UpdateToken') -and $UpdateToken) {
+    $offeredUpdateToken = $UpdateToken.Trim()
+    if ($offeredUpdateToken -notmatch $updateTokenShape) {
+        Write-Warning ('-UpdateToken contains characters that cannot be sent in a request header, so it was not ' +
+                       'stored. Release checks stay unauthenticated rather than failing.')
+    }
+    else { $config.updates.token = $offeredUpdateToken }
+}
+$updateTokenSource = if ($config.updates.token) { 'updates.token' } else { '' }
+foreach ($name in @('AGENT_HA_BRIDGE_UPDATE_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')) {
+    if ($updateTokenSource) { break }
+    if (-not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
+        $updateTokenSource = "`$env:$name"
+    }
+}
+# Only asked when the machine has nothing to use. One already in the environment needs
+# no configuration, and a configured one is an answer already given.
+if (-not $updateTokenSource -and -not $NonInteractive -and (Test-BridgeConsoleInteractive)) {
+    Write-Host ''
+    Write-Host 'Optional: give this machine its own GitHub rate limit for release checks.' -ForegroundColor Yellow
+    Write-Host '    Without one, checks share 60 requests an hour with everything else behind'
+    Write-Host '    this address, and the machine can sit unable to take a release for hours.'
+    Write-Host '    A token raises that to 5,000 an hour for this machine alone.'
+    if (Read-BridgeYesNo -Prompt '    Set one up now?' -Default $false) {
+        Write-Host '    1. Open https://github.com/settings/personal-access-tokens'
+        Write-Host '    2. Generate a fine-grained token - these are public releases, so it'
+        Write-Host '       needs no account or repository permissions at all'
+        $enteredUpdateToken = ([string](Read-BridgeSecret -Prompt '    Paste the token here (Enter to skip)')).Trim()
+        if (-not $enteredUpdateToken) {
+            Write-Host '    nothing pasted; release checks stay unauthenticated.' -ForegroundColor DarkGray
+        }
+        elseif ($enteredUpdateToken -notmatch $updateTokenShape) {
+            Write-Host '    that cannot be sent as a header, so it was not stored - paste it again later with:' -ForegroundColor Yellow
+            Write-Host '        agent-ha-bridge configure -UpdateToken' -ForegroundColor Yellow
+        }
+        else {
+            $config.updates.token = $enteredUpdateToken
+            $updateTokenSource = 'updates.token'
+        }
+    }
 }
 
 Write-Step "Writing bridge config to $configPath"
@@ -3028,6 +3099,11 @@ Write-Host "    agent account: $(
     elseif ($config.homeAssistant.agentToken -or @($config.homeAssistant.agentUserIds).Count) { 'half set - see the warning below' }
     else { 'none - an agent drives the bridge as you' })"
 Write-Host "    notifications: $(if ($config.notifications.enabled) { $config.notifications.service } else { 'disabled' })"
+# Never the token, only where one came from - the same distinction Get-BridgeUpdateToken
+# keeps, and the reason `agent-ha-bridge status` can report this at all.
+Write-Host "    update check : $(
+    if ($updateTokenSource) { "authenticated from $updateTokenSource - 5,000 requests an hour" }
+    else { 'unauthenticated - 60 requests an hour, shared with everything behind this address' })"
 if ($isDevBox) {
     Write-Host "    Dev Box      : $(if ($devBoxDecision.Enabled) { "keep-awake on - '$devBoxTaskName' every ${devBoxIntervalMinutes}m" } else { "keep-awake off ($($devBoxDecision.Reason))" })"
 }
