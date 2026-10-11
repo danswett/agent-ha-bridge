@@ -3039,25 +3039,29 @@ else {
 if ($config.updates.PSObject.Properties.Name -notcontains 'token') {
     $config.updates | Add-Member -NotePropertyName 'token' -NotePropertyValue ''
 }
-# The same rule Get-BridgeUpdateToken applies at check time: a token is a request
-# header, so a value carrying a newline or a smart quote from a paste cannot be sent
-# at all. Refused here, where it can still be retyped.
-$updateTokenShape = '^[\x21-\x7E]+$'
+# The same rule the request path applies, from the same function: a token is a request
+# header, so a value carrying a newline or a smart quote from a paste cannot be sent at
+# all. Refused here, where it can still be retyped - and never accepted here only to be
+# skipped at check time.
 if ($PSBoundParameters.ContainsKey('UpdateToken') -and $UpdateToken) {
     $offeredUpdateToken = $UpdateToken.Trim()
-    if ($offeredUpdateToken -notmatch $updateTokenShape) {
+    if (-not (Test-BridgeUpdateTokenSendable -Value $offeredUpdateToken)) {
         Write-Warning ('-UpdateToken contains characters that cannot be sent in a request header, so it was not ' +
                        'stored. Release checks stay unauthenticated rather than failing.')
     }
     else { $config.updates.token = $offeredUpdateToken }
 }
-$updateTokenSource = if ($config.updates.token) { 'updates.token' } else { '' }
-foreach ($name in @('AGENT_HA_BRIDGE_UPDATE_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')) {
-    if ($updateTokenSource) { break }
-    if (-not [string]::IsNullOrWhiteSpace([Environment]::GetEnvironmentVariable($name))) {
-        $updateTokenSource = "`$env:$name"
-    }
-}
+$updateTokenSource = ''
+$updateTokenUnusable = ''
+# Resolved by the very function the request path uses, so the installer and the check
+# can never disagree about which credential this machine will actually authenticate
+# with. They did: a stored value carrying a newline was reported here as
+# "authenticated", and suppressed the prompt, while every check skipped it and went out
+# unauthenticated. Raised by Codex on #190. Only the name and the note are used; the
+# token itself is never read out of the result.
+$updateTokenChoice = Select-BridgeUpdateTokenCandidate -Configured ([string]$config.updates.token)
+$updateTokenSource = [string]$updateTokenChoice.Source
+$updateTokenUnusable = [string]$updateTokenChoice.Note
 # A token GitHub has refused needs replacing, and the prompt below would otherwise skip
 # exactly the machine that needs it: a nonempty `updates.token` is not empty, and a
 # refused ambient GH_TOKEN still counts as "this machine has one". The last check
@@ -3067,7 +3071,7 @@ foreach ($name in @('AGENT_HA_BRIDGE_UPDATE_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN'))
 $updateTokenNote = ''
 $lastUpdateCheck = Get-BridgeUpdateCheckSummary -Path (Get-BridgeRuntimePath -Name 'agent-bridge-update.json' -Context $installContext)
 if (Test-BridgeUpdateTokenRejected -Summary $lastUpdateCheck) { $updateTokenNote = [string]$lastUpdateCheck.TokenNote }
-# Only asked when the machine has nothing to use, or when what it has was refused. One
+# Only asked when the machine has nothing usable, or when what it has was refused. One
 # already in the environment needs no configuration, and a working configured one is an
 # answer already given.
 if (((-not $updateTokenSource) -or $updateTokenNote) -and -not $NonInteractive -and (Test-BridgeConsoleInteractive)) {
@@ -3078,6 +3082,13 @@ if (((-not $updateTokenSource) -or $updateTokenNote) -and -not $NonInteractive -
         Write-Host "    $updateTokenNote"
         Write-Host '    Until it is replaced, checks share 60 requests an hour with everything'
         Write-Host '    else behind this address.'
+        $askUpdateToken = Read-BridgeYesNo -Prompt '    Replace it now?' -Default $true
+    }
+    elseif ($updateTokenUnusable) {
+        Write-Host 'The GitHub token for release checks cannot be sent.' -ForegroundColor Yellow
+        Write-Host "    $updateTokenUnusable"
+        Write-Host '    Checks are sharing 60 requests an hour with everything else behind'
+        Write-Host '    this address until it is replaced.'
         $askUpdateToken = Read-BridgeYesNo -Prompt '    Replace it now?' -Default $true
     }
     else {
@@ -3095,7 +3106,7 @@ if (((-not $updateTokenSource) -or $updateTokenNote) -and -not $NonInteractive -
         if (-not $enteredUpdateToken) {
             Write-Host '    nothing pasted; release checks stay unauthenticated.' -ForegroundColor DarkGray
         }
-        elseif ($enteredUpdateToken -notmatch $updateTokenShape) {
+        elseif (-not (Test-BridgeUpdateTokenSendable -Value $enteredUpdateToken)) {
             Write-Host '    that cannot be sent as a header, so it was not stored - run' -ForegroundColor Yellow
             Write-Host '        agent-ha-bridge configure' -ForegroundColor Yellow
             Write-Host '    to be asked again.' -ForegroundColor Yellow
@@ -3104,6 +3115,7 @@ if (((-not $updateTokenSource) -or $updateTokenNote) -and -not $NonInteractive -
             $config.updates.token = $enteredUpdateToken
             $updateTokenSource = 'updates.token'
             $updateTokenNote = ''
+            $updateTokenUnusable = ''
         }
     }
 }

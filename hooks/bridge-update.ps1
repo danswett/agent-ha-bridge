@@ -266,55 +266,17 @@ function Get-BridgeUpdateToken {
         The credential a release check should authenticate with, and where it came
         from: { Token, Source, Note }.
 
-        Source is a *name* - 'updates.token', or '$env:GH_TOKEN' - and never the
-        value. That distinction is the whole point of having this as a function:
-        everything outside it wants to say whether checks are authenticated and what
-        to change when they are not, and none of that needs the credential. Token
-        goes straight into a request header and nowhere else - never a log line, a
-        detail string, a dashboard field or an exception message.
-
-        Order matters. The configured setting wins over the environment, because it
-        is the one somebody chose for this machine: an ambient CI token that happens
-        to be exported should not quietly displace it.
-
-        An unusable value is skipped with a reason rather than sent. A token is an
-        HTTP header, so one carrying a newline or a smart quote from a paste cannot be
-        sent at all - .NET refuses the header, and the check then fails complaining
-        about header syntax on a machine whose unauthenticated check would have
-        worked. Degrading to that check, and naming what to fix, beats breaking
-        updates over a paste.
+        Only reads the setting; Select-BridgeUpdateTokenCandidate decides. They are
+        separate because the installer has to answer the same question - which
+        credential will this machine's checks actually use - before the runtime exists
+        to ask, and the two disagreeing is its own bug: a stored value with a newline
+        in it was reported as "authenticated" while every check skipped it. Raised by
+        Codex on #190.
     #>
 
     $configured = ''
     try { $configured = [string](Get-BridgeSetting 'updates.token' '') } catch { $configured = '' }
-    $candidates = @([pscustomobject]@{ Value = $configured; Source = 'updates.token' })
-    foreach ($name in @('AGENT_HA_BRIDGE_UPDATE_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')) {
-        # The machine very often already holds one of these, and a release check only
-        # needs public read. Taking one that is already there is the difference between
-        # 60 requests an hour shared with everything else behind the same address and
-        # 5,000 of this machine's own - without asking anyone to configure anything.
-        $candidates += [pscustomobject]@{
-            Value  = [string][Environment]::GetEnvironmentVariable($name)
-            Source = "`$env:$name"
-        }
-    }
-
-    $note = ''
-    foreach ($candidate in $candidates) {
-        $value = ([string]$candidate.Value).Trim()
-        if (-not $value) { continue }
-        # Visible ASCII, which every GitHub token is. Anything else is paste damage
-        # rather than a credential; the next candidate still gets its turn, so one
-        # mistyped setting cannot cost a machine a working ambient token.
-        if ($value -notmatch '^[\x21-\x7E]+$') {
-            if (-not $note) {
-                $note = "$($candidate.Source) is not a usable token: it contains characters that cannot be sent in a request header."
-            }
-            continue
-        }
-        return [pscustomobject]@{ Token = $value; Source = $candidate.Source; Note = $note }
-    }
-    [pscustomobject]@{ Token = ''; Source = ''; Note = $note }
+    Select-BridgeUpdateTokenCandidate -Configured $configured
 }
 
 function Get-BridgeReleaseRequestHeaders {

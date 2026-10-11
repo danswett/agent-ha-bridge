@@ -353,6 +353,32 @@ Test-That 'a config written before the setting existed gains it rather than sile
     $added = @(Merge-BridgeConfigDefaults -Config $older -Defaults $defaults)
     ($added -contains 'updates.token') -and $older.updates.token -eq ''
 }
+# The installer decides whether to prompt, and prints which allowance the machine will
+# be on, from the same function the request path selects with. They did not always
+# agree: a stored value carrying a newline was reported here as "authenticated" and
+# suppressed the prompt, while every actual check skipped it and went out
+# unauthenticated. Raised by Codex on #190.
+Test-That 'a stored token that cannot be sent is not reported as the one in use' {
+    $prior = @{}
+    foreach ($name in @('AGENT_HA_BRIDGE_UPDATE_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')) {
+        $prior[$name] = [Environment]::GetEnvironmentVariable($name)
+        [Environment]::SetEnvironmentVariable($name, $null)
+    }
+    try {
+        $broken = Select-BridgeUpdateTokenCandidate -Configured "ghp_pasted$([char]0x201C)`n"
+        $broken.Source -eq '' -and $broken.Note -match 'updates\.token is not a usable token'
+    }
+    finally { foreach ($name in $prior.Keys) { [Environment]::SetEnvironmentVariable($name, $prior[$name]) } }
+}
+Test-That 'and the one rule for that lives in one place, used by both' {
+    # Surrounding whitespace is trimmed first - a trailing newline is the commonest
+    # thing a paste adds, and is harmless once removed. What survives that must be
+    # sendable.
+    (Test-BridgeUpdateTokenSendable -Value " ghp_realtoken`n") -and
+        -not (Test-BridgeUpdateTokenSendable -Value "ghp_to`nken") -and
+        -not (Test-BridgeUpdateTokenSendable -Value "ghp_token$([char]0x201D)") -and
+        -not (Test-BridgeUpdateTokenSendable -Value '')
+}
 
 Write-Host '--- the entry points still parse on Windows PowerShell ---'
 # The whole point of offering to install PowerShell 7 is that the offer runs where

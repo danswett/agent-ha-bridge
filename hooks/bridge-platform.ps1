@@ -1811,3 +1811,81 @@ function Test-BridgeUpdateTokenRejected {
     [bool]($Summary.AllowanceKnown -and -not $Summary.TokenSource -and
         [string]$Summary.TokenNote -match 'was rejected by GitHub')
 }
+
+function Test-BridgeUpdateTokenSendable {
+    <#
+        Whether a token can be sent as a request header at all.
+
+        Surrounding whitespace is trimmed first, because a trailing newline is the
+        commonest thing a paste adds and is harmless once removed. What is left must
+        be visible ASCII, which every GitHub token is: anything else - an internal
+        newline, the smart quotes a chat client substitutes - makes .NET refuse the
+        header outright, so the release check fails complaining about header syntax on
+        a machine whose unauthenticated check would have worked.
+
+        One rule, used by the request path and by the installer that offers to set the
+        token, so a value the installer accepts is never one the checker then skips.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Value)
+
+    [bool](([string]$Value).Trim() -match '^[\x21-\x7E]+$')
+}
+
+function Select-BridgeUpdateTokenCandidate {
+    <#
+        Which credential a release check will authenticate with, given what is
+        configured: { Token, Source, Note }.
+
+        Source is a *name* - 'updates.token', or '$env:GH_TOKEN' - and never the
+        value. That distinction is the point: everything outside this wants to say
+        whether checks are authenticated and what to change when they are not, and
+        none of that needs the credential. Token goes straight into a request header
+        and nowhere else - never a log line, a detail string, a dashboard field or an
+        exception message.
+
+        Order matters. The configured setting wins over the environment, because it is
+        the one somebody chose for this machine: an ambient CI token that happens to be
+        exported should not quietly displace it. The environment is still taken when
+        the setting is empty - a machine very often already holds one of these, a
+        release check only needs public read, and taking what is there is the
+        difference between 60 requests an hour shared with everything else behind the
+        same address and 5,000 of this machine's own.
+
+        An unusable value is skipped with a reason rather than sent. A token is an HTTP
+        header, so one carrying a newline or a smart quote from a paste cannot be sent
+        at all - .NET refuses the header, and the check then fails complaining about
+        header syntax on a machine whose unauthenticated check would have worked.
+        Degrading to that check, and naming what to fix, beats breaking updates over a
+        paste. The next candidate still gets its turn, so one mistyped setting cannot
+        cost a machine a working ambient token.
+
+        Here rather than in bridge-update.ps1 because the installer must answer the
+        same question before the runtime exists to ask it. The two disagreeing is its
+        own bug: a stored value with a newline in it was reported as "authenticated"
+        and suppressed the prompt, while every actual check skipped it and went out
+        unauthenticated. Raised by Codex on #190.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Configured)
+
+    $candidates = @([pscustomobject]@{ Value = [string]$Configured; Source = 'updates.token' })
+    foreach ($name in @('AGENT_HA_BRIDGE_UPDATE_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')) {
+        $candidates += [pscustomobject]@{
+            Value  = [string][Environment]::GetEnvironmentVariable($name)
+            Source = "`$env:$name"
+        }
+    }
+
+    $note = ''
+    foreach ($candidate in $candidates) {
+        $value = ([string]$candidate.Value).Trim()
+        if (-not $value) { continue }
+        if (-not (Test-BridgeUpdateTokenSendable -Value $value)) {
+            if (-not $note) {
+                $note = "$($candidate.Source) is not a usable token: it contains characters that cannot be sent in a request header."
+            }
+            continue
+        }
+        return [pscustomobject]@{ Token = $value; Source = $candidate.Source; Note = $note }
+    }
+    [pscustomobject]@{ Token = ''; Source = ''; Note = $note }
+}
