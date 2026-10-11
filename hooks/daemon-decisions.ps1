@@ -145,8 +145,14 @@ function Complete-DaemonAnsweredDecision {
     # The question's own baseline goes with its marker. Naming it matters: without an
     # id the baseline is deliberately left alone, so every answered question would
     # leave one behind for the life of the session.
-    Remove-CopilotDecisionMarker -SessionId $sessionId `
-        -DecisionId $(if ($null -ne $Marker -and $Marker.PSObject.Properties['decisionId']) { [string]$Marker.decisionId } else { '' })
+    $answeredId = ''
+    if ($null -ne $Marker -and $Marker.PSObject.Properties['decisionId']) { $answeredId = [string]$Marker.decisionId }
+    Remove-CopilotDecisionMarker -SessionId $sessionId -DecisionId $answeredId
+    # And so does any note of it having been slow to appear, which is only of interest
+    # while it is still waiting to be answered.
+    if ($answeredId -and $script:DaemonDecisionUnarmedSince.ContainsKey($answeredId)) {
+        $script:DaemonDecisionUnarmedSince.Remove($answeredId)
+    }
     $entry = $State[$sessionId]
     if ($entry.PSObject.Properties['LastReply']) { $entry.LastReply = '' }
     Write-DaemonLog -Message "decision answered (either input); cleared card for $($sessionId.Substring(0,8))"
@@ -154,7 +160,8 @@ function Complete-DaemonAnsweredDecision {
 
 function Confirm-DaemonDecisionArmed {
     <#
-        Arms a question's card from its marker when the card is not armed.
+        Arms a question's card from its marker when the card is not armed, and rebuilds
+        the selector when arming it keeps making no difference.
 
         A hook whose Home Assistant work was cut short by its deadline leaves a marker
         with no card behind it, so an outage during the hook would otherwise silently
@@ -165,6 +172,15 @@ function Confirm-DaemonDecisionArmed {
         options treated every freeform card as unarmed and re-published it on every
         reconcile - observed as the same line repeating every 18 seconds for minutes on
         end, each one resetting the card the user was looking at.
+
+        Re-publishing is not always enough. A Home Assistant restart can leave a
+        selector in place but no longer subscribed to anything, and in that state it
+        takes neither the discovery config nor the state that goes with it - while
+        every publish still returns 200. In #178 a question raised 40 minutes after a
+        restart was re-armed on that selector for over three hours, which left the
+        session blocked on an answer that had nowhere to appear. So a question still
+        unarmed after the detached-entity window is republished with the selector
+        rebuilt, which is the only thing that brings one of those back.
     #>
     param(
         [Parameter(Mandatory)][string]$SessionId,
@@ -175,17 +191,47 @@ function Confirm-DaemonDecisionArmed {
 
     $node = Get-CopilotMqttNodeId -SessionId $SessionId
     try {
+        # Guarded rather than read straight off: a marker written before decision ids
+        # existed has no such property, and under StrictMode reading it throws.
+        $decisionId = ''
+        if ($null -ne $Marker -and $Marker.PSObject.Properties['decisionId']) { $decisionId = [string]$Marker.decisionId }
         $armed = Get-HomeAssistantState -EntityId "select.${node}_decision" -Headers $Headers
-        if ([string]::IsNullOrWhiteSpace((Get-BridgeStateAttribute -State $armed -Name 'question'))) {
-            $shown = Set-CopilotMqttDecision -SessionId $SessionId `
-                -SessionName ([string]$State[$SessionId].Name) `
-                -Machine ([string]$State[$SessionId].Machine) `
-                -Question ([string]$Marker.question) `
-                -Choices @($Marker.choices) -Fields @($Marker.fields) `
-                -DecisionId ([string]$Marker.decisionId) -Headers $Headers
-            if ($null -ne $shown) {
-                Write-DaemonLog -Message "armed card from marker for $($SessionId.Substring(0,8)) (hook could not reach Home Assistant)"
+        if (-not [string]::IsNullOrWhiteSpace((Get-BridgeStateAttribute -State $armed -Name 'question'))) {
+            # On screen, so nothing is owed. Forgetting it here is what keeps a session
+            # whose second question is slow to appear from inheriting the first one's
+            # clock and being rebuilt on its first pass.
+            if ($decisionId -and $script:DaemonDecisionUnarmedSince.ContainsKey($decisionId)) {
+                $script:DaemonDecisionUnarmedSince.Remove($decisionId)
             }
+            return
+        }
+
+        $rebuild = $false
+        $now = [DateTimeOffset]::Now
+        # A question with no id cannot be tracked between passes, so it is re-armed the
+        # way it always was and never escalated; it has no baseline either.
+        if ($decisionId) {
+            if (-not $script:DaemonDecisionUnarmedSince.ContainsKey($decisionId)) {
+                $script:DaemonDecisionUnarmedSince[$decisionId] = $now
+            }
+            elseif (($now - $script:DaemonDecisionUnarmedSince[$decisionId]).TotalSeconds -ge $script:DaemonConfig.DetachedEntitySeconds) {
+                $rebuild = $true
+                $script:DaemonDecisionUnarmedSince[$decisionId] = $now
+            }
+        }
+
+        $shown = Set-CopilotMqttDecision -SessionId $SessionId `
+            -SessionName ([string]$State[$SessionId].Name) `
+            -Machine ([string]$State[$SessionId].Machine) `
+            -Question ([string]$Marker.question) `
+            -Choices @($Marker.choices) -Fields @($Marker.fields) `
+            -DecisionId $decisionId -Headers $Headers -Rebuild:$rebuild
+        if ($null -eq $shown) { return }
+        if ($rebuild) {
+            Write-DaemonLog -Message "rebuilt the decision selector for $($SessionId.Substring(0,8)) and armed it again; the question was not reaching the dashboard"
+        }
+        else {
+            Write-DaemonLog -Message "armed card from marker for $($SessionId.Substring(0,8)) (hook could not reach Home Assistant)"
         }
     }
     catch {

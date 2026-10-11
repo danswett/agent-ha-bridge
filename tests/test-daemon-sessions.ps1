@@ -50,6 +50,12 @@ $script:DaemonFieldEntities = @(
         ForEach-Object { "select.agent_bridge_1111111100004000_f$_" }
 )
 $script:DaemonProbeFieldEntity = $script:DaemonFieldEntities[-1]
+# The liveness sensor, which every beat now reads back: publishing one proves nothing,
+# because Home Assistant answers 200 for a topic it has stopped listening to (#177).
+# 'advancing' is a sensor taking its beats; a fixed timestamp is one that is not.
+$script:DaemonOnlineEntity = Get-BridgeMachineEntityId -Domain 'binary_sensor' -Key 'online' -Slug $script:DaemonMachineSlug
+$script:DaemonOnlineReported = 'advancing'
+$script:DaemonOnlineReadStatus = 200
 function Invoke-RestMethod {
     param([string]$Method, [string]$Uri, [hashtable]$Headers, [object]$Body, [string]$ContentType, [int]$TimeoutSec)
 
@@ -87,6 +93,25 @@ function Invoke-RestMethod {
         $request.Unexpected = $false
         $response = [Net.Http.HttpResponseMessage]::new([Net.HttpStatusCode]::NotFound)
         throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('Synthetic reporting entity not found', $response)
+    }
+    elseif ($args.Count -eq 0 -and $Method -eq 'Get' -and
+        $Uri -ceq "http://publication.invalid:8123/api/states/$($script:DaemonOnlineEntity)" -and
+        -not $PSBoundParameters.ContainsKey('Body') -and -not $PSBoundParameters.ContainsKey('ContentType')) {
+        $request.Unexpected = $false
+        if ($script:DaemonOnlineReadStatus -ne 200) {
+            $response = [Net.Http.HttpResponseMessage]::new([Net.HttpStatusCode]$script:DaemonOnlineReadStatus)
+            throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('Synthetic online sensor read', $response)
+        }
+        # Only last_reported moves for a message that repeats the state an entity
+        # already holds, and this sensor only ever says 'online' - so it is the one
+        # field that can tell a beat that landed from one that went nowhere.
+        $reported = if ($script:DaemonOnlineReported -ceq 'advancing') {
+            [DateTimeOffset]::Now.ToString('o')
+        } else { $script:DaemonOnlineReported }
+        return [pscustomobject]@{
+            entity_id = $script:DaemonOnlineEntity; state = 'on'
+            attributes = [pscustomobject]@{}; last_reported = $reported
+        }
     }
     elseif ($args.Count -eq 0 -and $Method -eq 'Get' -and
         -not [string]::IsNullOrWhiteSpace([string]$script:DaemonConfig.VerboseToggle) -and
@@ -708,6 +733,110 @@ Test-That 'the actual reply initializer sends one exact blank byte-JSON service 
         $actions[0].Data.entity_id -ceq "text.${reportingNode}_reply" -and
         $actions[0].Data.value -is [string] -and $actions[0].Data.value -ceq $script:DaemonConfig.ReplyBlankValue
 }
+
+Write-Host ''
+Write-Host '--- a liveness sensor that has stopped taking its beats ---'
+# Home Assistant restarted at 10:37:33 on 2026-10-10 and three machines' online sensors
+# froze on `on` with a last_reported of the restart itself. Read back over
+# mqtt/subscribe nearly nine hours later, the broker still had every beat since, on
+# exactly the topic named in the retained discovery config, and `mqtt.publish` had
+# answered 200 for each one - Home Assistant had simply stopped listening. The daemon
+# could not tell, expire_after never fired because a sensor in that state has no expiry
+# timer, and restarting the daemon changed nothing because the config it republished
+# was the one Home Assistant already held. (#177)
+$script:DaemonOnlineSeen = @{ Reported = ''; At = [DateTimeOffset]::MinValue }
+$script:DaemonOnlineLastPublish = [DateTimeOffset]::MinValue
+$script:DaemonOnlineReported = 'advancing'
+$script:DaemonOnlineReadStatus = 200
+$script:Log = @()
+$script:ReportingMessages.Clear()
+# Built from the discovery primitives rather than taken from the publisher's own
+# helper, so a topic the daemon stops publishing to is a failure here rather than a
+# rename both sides follow quietly.
+$onlineConfigTopic = "$($script:CopilotMqttConfig.DiscoveryPrefix)/binary_sensor/$(Get-CopilotMqttMachineNode -Slug $script:DaemonMachineSlug)/online/config"
+$onlineStateTopic = "$(Get-CopilotMqttMachineTopicRoot -Slug $script:DaemonMachineSlug)/online/state"
+function Invoke-TestOnlineBeat {
+    <#
+        One beat, with the clock wound back a heartbeat interval, so a run of them
+        models the minutes a real stall takes without the test taking them.
+    #>
+    param([int]$ApartSeconds = 60)
+    $script:DaemonOnlineLastPublish = [DateTimeOffset]::Now.AddSeconds(-$ApartSeconds - 1)
+    if ($script:DaemonOnlineSeen.At -ne [DateTimeOffset]::MinValue) {
+        $script:DaemonOnlineSeen = @{
+            Reported = $script:DaemonOnlineSeen.Reported
+            At = $script:DaemonOnlineSeen.At.AddSeconds(-$ApartSeconds)
+        }
+    }
+    Publish-DaemonOnlineHeartbeat -Headers $headers
+}
+function Get-TestOnlineRetractionCount {
+    # A count, not the matches themselves: a function returning an empty array bare
+    # yields $null, and `.Count` on that throws rather than reading as "none found".
+    @($script:ReportingMessages | Where-Object { $_.Topic -ceq $onlineConfigTopic -and [string]$_.Payload -eq '' }).Count
+}
+function Get-TestOnlineBeatCount {
+    @($script:ReportingMessages | Where-Object { $_.Topic -ceq $onlineStateTopic -and [string]$_.Payload -ceq 'online' }).Count
+}
+
+1..5 | ForEach-Object { Invoke-TestOnlineBeat }
+Test-That 'a sensor that keeps reporting its beats is left alone' {
+    (Get-TestOnlineRetractionCount) -eq 0 -and (Get-TestOnlineBeatCount) -eq 5 -and
+        @($script:Log | Where-Object { $_ -match 'rebuilding' }).Count -eq 0
+} (($script:Log | Select-Object -Last 3) -join ' | ')
+
+$script:ReportingMessages.Clear()
+$script:Log = @()
+$script:DaemonOnlineSeen = @{ Reported = ''; At = [DateTimeOffset]::MinValue }
+$script:DaemonOnlineReported = '2026-10-10T10:37:34.733325-07:00'
+1..3 | ForEach-Object { Invoke-TestOnlineBeat }
+Test-That 'a sensor that has gone quiet for less than the expiry window is given the benefit of the doubt' {
+    (Get-TestOnlineRetractionCount) -eq 0 -and (Get-TestOnlineBeatCount) -eq 3
+} (($script:Log | Select-Object -Last 3) -join ' | ')
+
+Invoke-TestOnlineBeat
+$onlineConfigMessages = @($script:ReportingMessages | Where-Object { $_.Topic -ceq $onlineConfigTopic })
+Test-That 'one that has taken no beat for the whole window is retracted and declared again' {
+    (Get-TestOnlineRetractionCount) -eq 1 -and $onlineConfigMessages.Count -eq 2 -and
+        [string]$onlineConfigMessages[0].Payload -eq '' -and
+        [string]$onlineConfigMessages[1].Payload -match '"expire_after":180' -and
+        [string]$onlineConfigMessages[1].Payload -match "\`"state_topic\`":\`"$([regex]::Escape($onlineStateTopic))\`""
+} (($script:ReportingMessages | ForEach-Object { "$($_.Topic)=$([string]$_.Payload.Length)" }) -join ' | ')
+Test-That 'and a beat follows it, so the sensor is not left unavailable for a whole interval' {
+    (Get-TestOnlineBeatCount) -eq 5 -and $script:ReportingMessages[-1].Topic -ceq $onlineStateTopic
+}
+Test-That 'with the operator told which entity it was and how long it had been silent' {
+    @($script:Log | Where-Object { $_ -clike "$($script:DaemonOnlineEntity) has taken no beat for *s; rebuilding it" }).Count -eq 1
+} (($script:Log | Select-Object -Last 3) -join ' | ')
+
+$script:ReportingMessages.Clear()
+Invoke-TestOnlineBeat
+Invoke-TestOnlineBeat
+Test-That 'a rebuild that did not take is not repeated on the next beat, which would never stop' {
+    (Get-TestOnlineRetractionCount) -eq 0
+}
+
+$script:ReportingMessages.Clear()
+$script:Log = @()
+$script:DaemonOnlineSeen = @{ Reported = ''; At = [DateTimeOffset]::MinValue }
+$script:DaemonOnlineReadStatus = 500
+1..6 | ForEach-Object { Invoke-TestOnlineBeat }
+Test-That 'a Home Assistant that cannot be read starts no clock, so an outage never rebuilds anything' {
+    (Get-TestOnlineRetractionCount) -eq 0 -and (Get-TestOnlineBeatCount) -eq 6
+} (($script:Log | Select-Object -Last 3) -join ' | ')
+
+$script:ReportingMessages.Clear()
+$script:Log = @()
+$script:DaemonOnlineSeen = @{ Reported = ''; At = [DateTimeOffset]::MinValue }
+$script:DaemonOnlineReadStatus = 404
+1..4 | ForEach-Object { Invoke-TestOnlineBeat }
+Test-That 'while a sensor Home Assistant says is not there is declared again, which is the same repair' {
+    (Get-TestOnlineRetractionCount) -eq 1
+} (($script:Log | Select-Object -Last 3) -join ' | ')
+$script:DaemonOnlineReadStatus = 200
+$script:DaemonOnlineReported = 'advancing'
+$script:DaemonOnlineSeen = @{ Reported = ''; At = [DateTimeOffset]::MinValue }
+$script:Log = @()
 
 Write-Host ''
 Write-Host '--- a live session whose entities were torn down ---'
