@@ -206,7 +206,29 @@ function Get-BridgeStateTriggerHit {
     $variables = $payload.variables
     if ($null -eq $variables -or $null -eq $variables.PSObject.Properties['trigger']) { return $null }
     $trigger = $variables.trigger
-    if ($null -eq $trigger -or $null -eq $trigger.PSObject.Properties['entity_id']) { return $null }
+    if ($null -eq $trigger) { return $null }
+
+    # An event trigger carries no entity at all. The daemon subscribes to one so that
+    # a button tapped on a phone arrives on the socket it is already sitting on,
+    # rather than needing a second connection of its own. Returned with an empty
+    # EntityId so the suffix dispatch in Invoke-DaemonHit cannot match it by accident.
+    if ($null -ne $trigger.PSObject.Properties['platform'] -and [string]$trigger.platform -ceq 'event') {
+        if ($null -eq $trigger.PSObject.Properties['event']) { return $null }
+        $fired = $trigger.event
+        if ($null -eq $fired -or $null -eq $fired.PSObject.Properties['data']) { return $null }
+        $firedType = ''
+        if ($null -ne $fired.PSObject.Properties['event_type']) { $firedType = [string]$fired.event_type }
+        return [pscustomobject]@{
+            Kind = 'Event'
+            EntityId = ''
+            EventType = $firedType
+            Data = $fired.data
+            State = ''
+            Attributes = $null
+        }
+    }
+
+    if ($null -eq $trigger.PSObject.Properties['entity_id']) { return $null }
 
     $entityId = [string]$trigger.entity_id
     if ([string]::IsNullOrWhiteSpace($entityId)) { return $null }
@@ -222,6 +244,7 @@ function Get-BridgeStateTriggerHit {
     if ($null -ne $toState.PSObject.Properties['attributes']) { $attributes = $toState.attributes }
 
     [pscustomobject]@{
+        Kind = 'State'
         EntityId = $entityId
         State = $newState
         Attributes = $attributes
@@ -252,6 +275,11 @@ function Wait-CopilotHaStateChange {
         [int]$TimeoutSeconds,
 
         [string[]]$IgnoreStates = @('unknown', 'unavailable', ''),
+
+        # Home Assistant event types to receive on this same socket, alongside the
+        # entity watch. The daemon uses it for mobile_app_notification_action, so an
+        # answer tapped on a phone arrives without a second connection.
+        [AllowEmptyCollection()][string[]]$EventTypes = @(),
 
         # Run every TickMilliseconds while waiting. The daemon streams transcript
         # activity from here, so it reaches Home Assistant within a tick instead of
@@ -329,10 +357,16 @@ function Wait-CopilotHaStateChange {
         }
         Register-BridgeAuthAccepted
 
+        $triggers = [System.Collections.Generic.List[object]]::new()
+        $triggers.Add(@{ platform = 'state'; entity_id = @($EntityIds) })
+        foreach ($eventType in @($EventTypes)) {
+            if ([string]::IsNullOrWhiteSpace($eventType)) { continue }
+            $triggers.Add(@{ platform = 'event'; event_type = [string]$eventType })
+        }
         & $send @{
             type = 'subscribe_trigger'
             id = 1
-            trigger = @{ platform = 'state'; entity_id = @($EntityIds) }
+            trigger = @($triggers)
         }
         [void](& $receive 30)
 

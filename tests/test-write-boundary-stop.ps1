@@ -94,12 +94,16 @@ function Stop-BridgeCopilotSession {
     [pscustomobject]@{ Stopped = $true; Forced = $false; Detail = 'synthetic stop recorder' }
 }
 function Wait-CopilotHaStateChange {
-    param($EntityIds, $TimeoutSeconds, [scriptblock]$OnTick, $TickMilliseconds)
+    param($EntityIds, $TimeoutSeconds, [scriptblock]$OnTick, $TickMilliseconds, $EventTypes)
     $script:StopWaits++
     if ($script:StopWaitFails) { throw [IO.IOException]::new('synthetic wait failure') }
     & $OnTick | Out-Null
     $null
 }
+# The wait asks which Home Assistant events to subscribe to as well as which
+# entities. Stubbed rather than loaded: this suite is about the stop boundary, and
+# the real one reads the answer-button configuration.
+function Get-DaemonWatchEventTypes { @() }
 function Start-Sleep {
     param([int]$Seconds, [int]$Milliseconds)
     $script:StopSleeps += $Seconds

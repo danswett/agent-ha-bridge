@@ -54,6 +54,12 @@ function Invoke-PendingDecisions {
 
         Confirm-DaemonDecisionArmed -SessionId $sessionId -Marker $marker -State $State -Headers $Headers
 
+        # Once the card is armed and the question is confirmed still waiting, offer it
+        # on the phone too. Sent from here rather than from each client's hook because
+        # this is the one place that sees every pending question, for every agent, and
+        # because a question answered earlier in this same pass never reaches it.
+        Sync-DaemonAnswerButtons -SessionId $sessionId -Marker $marker -State $State -Headers $Headers
+
         # What the card already held when this question arrived. Until that is known,
         # nothing on it can be told apart from an answer, so nothing is read as one.
         if (-not (Confirm-DaemonDecisionBaseline -SessionId $sessionId -Marker $marker -Headers $Headers)) { continue }
@@ -142,6 +148,9 @@ function Complete-DaemonAnsweredDecision {
     catch {
         Write-DaemonLog -Message "decision clear failed for $sessionId : $($_.Exception.Message)"
     }
+    # The notification goes with the card. Left behind it would keep offering buttons
+    # that are now refused, which reads as the answer having been lost.
+    Clear-DaemonAnswerButtons -SessionId $sessionId -Marker $Marker -Headers $Headers
     # The question's own baseline goes with its marker. Naming it matters: without an
     # id the baseline is deliberately left alone, so every answered question would
     # leave one behind for the life of the session.
