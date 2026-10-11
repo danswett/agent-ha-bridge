@@ -135,6 +135,13 @@ silent:
   `HA_TOKEN` keeps doing the provisioning, which is administrator-only. Without an
   agent token everything still works and the server says on stderr that actions will
   be recorded as you.
+
+  `mqtt.publish` is administrator-only as well, and the agent deliberately is not an
+  administrator, so the two paths that carry unbounded text — a reply over 255
+  characters, and a launch prompt of any length — publish with `HA_TOKEN` and then
+  press with `HA_AGENT_TOKEN`. Attribution is unaffected, because Home Assistant
+  records the account on the press and an MQTT-published state carries none either
+  way. Done by hand on the agent token alone, both come back `401`.
 - **Waiting on a notification.** Home Assistant does not expose persistent
   notifications through `GET /api/states`, so asking a session to answer with one and
   then polling finds nothing however long you wait — which looks exactly like the

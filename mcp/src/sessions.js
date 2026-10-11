@@ -8,7 +8,16 @@
  *   - Writing with the user's token instead of the agent's. Both authenticate and both
  *     are authorised, so nothing errors; Home Assistant simply records the action
  *     against the user, and the session card is styled as theirs. The server therefore
- *     holds two clients and every write below goes through the agent one.
+ *     holds two clients and every *attributed* write below goes through the agent one.
+ *
+ *     The exception is `mqtt.publish`, which Home Assistant restricts to
+ *     administrators. The agent account is deliberately not one, so publishing on the
+ *     agent client fails with 401 and the two paths that carry unbounded text - a long
+ *     reply and a launch prompt - could not be used by an agent at all. Those take a
+ *     `publisher` client, the user's, while the press that follows stays the agent's.
+ *     Attribution is unaffected: Home Assistant records the account on the press, and
+ *     an MQTT-published state carries no account either way, which is why the launch
+ *     payload is followed by a press and the long reply marks itself.
  *
  *   - Expecting an answer in a persistent notification. Home Assistant does not expose
  *     those through GET /api/states, so polling finds nothing however long you wait,
@@ -87,6 +96,30 @@ export function launchPromptTopic(slug) {
 
 function attr(state, name) {
   return state?.attributes?.[name];
+}
+
+/**
+ * Publishes on the client allowed to, and explains it when that is refused.
+ *
+ * `mqtt.publish` is administrator-only. A plain 401 here reads as a bad token, which
+ * sends anyone diagnosing it to the one place the fault is not: the agent token is
+ * valid and is authorised for every other call in the sequence - reads, `text.set_value`
+ * and `button.press` all succeed with it. Measured on DSWETT-DEV-VM1: agent token 401,
+ * user token OK.
+ */
+async function publishVia(publisher, topic, payload, retain) {
+  try {
+    return await publisher.publishMqtt(topic, payload, retain);
+  } catch (error) {
+    if (error?.status === 401 || error?.status === 403) {
+      throw new Error(
+        'Home Assistant refused mqtt.publish, which it restricts to administrators. ' +
+          "This path needs the user's token (homeAssistant.token), not the agent's; " +
+          'the agent token is valid and is what presses the button afterwards.',
+      );
+    }
+    throw error;
+  }
 }
 
 /**
@@ -196,7 +229,7 @@ export async function readSession(ha, sessionId, { since = '' } = {}) {
  * and publishing at all already needs a token - but it is the weaker of the two, so
  * the press stays the way a reply that fits is sent.
  */
-export async function replyToSession(ha, sessionId, text) {
+export async function replyToSession(ha, sessionId, text, { publisher } = {}) {
   const body = String(text ?? '');
   if (!body.trim()) throw new Error('A reply needs some text.');
 
@@ -219,7 +252,8 @@ export async function replyToSession(ha, sessionId, text) {
   // Not retained, matching the reply card: the daemon's guard against re-delivering a
   // payload is in memory, so a retained one restored by the broker after a restart
   // would be read as a new submission and injected again.
-  await ha.publishMqtt(
+  await publishVia(
+    publisher ?? ha,
     replyPayloadTopic(sessionId),
     { at: new Date().toISOString(), text: body, driver: 'agent' },
     false,
@@ -235,16 +269,18 @@ export async function replyToSession(ha, sessionId, text) {
  * payload wins over the text box whenever it holds anything, so one left behind by an
  * earlier launch would silently open the next session instead.
  */
-export async function launchSession(ha, slug, { prompt } = {}) {
+export async function launchSession(ha, slug, { prompt, publisher } = {}) {
   const ids = machineEntities(slug);
   const online = await ha.getState(ids.online);
   if (!online) throw new Error(`No machine ${slug} in Home Assistant.`);
   if (online.state !== 'on') throw new Error(`${slug} is offline.`);
 
   const text = String(prompt ?? '').trim();
-  await ha.publishMqtt(
+  await publishVia(
+    publisher ?? ha,
     launchPromptTopic(slug),
     text ? { at: new Date().toISOString(), text } : '',
+    true,
   );
   await ha.callService('button', 'press', { entity_id: ids.newSession });
   return { machine: slug, prompt: text.length };
