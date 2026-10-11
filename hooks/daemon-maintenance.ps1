@@ -189,8 +189,19 @@ function Invoke-DaemonUpdateOutcome {
         # every check green. Saying "update failed" of that is what made a successful
         # update look like the thing to retry (#124); the step that failed is still
         # named, and nothing here claims the install is healthy.
-        $reachedInstall = -not $outcome.Success -and
-            (Test-BridgeUpdateReachedInstall -Attempted ([string]$outcome.Version) -Recorded $installed)
+        #
+        # Judged against what *this* attempt found recorded when it launched, where the
+        # outcome says so. Nothing rejects a second press while a child is running, and
+        # an unexplained failure is precisely what invites a second press - so two
+        # children can target the same release, and the shared installed-version record
+        # would otherwise credit the one that failed during download with the other's
+        # install. An outcome written before the field existed carries no pre-version;
+        # omitting -Before leaves that case behaving as it did. Raised by Codex on #190.
+        $reachedArgs = @{ Attempted = [string]$outcome.Version; Recorded = $installed }
+        if ($outcome.PSObject.Properties['BeforeVersion'] -and $outcome.BeforeVersion) {
+            $reachedArgs['Before'] = [string]$outcome.BeforeVersion
+        }
+        $reachedInstall = -not $outcome.Success -and (Test-BridgeUpdateReachedInstall @reachedArgs)
         # The same verdict the notification carries, on the entity, so the dashboard
         # says how the update ended rather than only that it is no longer running.
         # Worked out before publishing because the publish is what shows it.

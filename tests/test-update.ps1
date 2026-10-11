@@ -1179,6 +1179,34 @@ Test-That 'and a record this attempt did not change proves nothing about how far
     (Test-BridgeUpdateReachedInstall -Attempted '1.2.3' -Recorded '1.2.3' -Before '1.2.2') -and
         -not (Test-BridgeUpdateReachedInstall -Attempted '1.2.3' -Recorded '1.2.3' -Before '1.2.3')
 }
+# The detached child is the one that needs this carried for it: the daemon reads its
+# outcome long after it exited, and cannot otherwise tell its install from a
+# concurrent attempt's. An outcome written before the field existed must still read,
+# and must not acquire a pre-version by implication. Raised by Codex on #190.
+& {
+    $outcomePath = Join-Path $env:TEMP "bridge-before-$([guid]::NewGuid().ToString('N')).json"
+    try {
+        Set-Content -LiteralPath $outcomePath -Encoding UTF8 -Value (@{
+            schemaVersion = 1; attemptId = ('d' * 32); success = $false; exitCode = 1
+            version = '1.2.3'; beforeVersion = '1.2.2'; error = 'later step failed'
+            at = [DateTimeOffset]::Now.ToString('o')
+        } | ConvertTo-Json)
+        $carried = Read-BridgeUpdateOutcome -Path $outcomePath
+        Test-That 'an outcome carries what the installation recorded when its attempt launched' {
+            $carried.BeforeVersion -ceq '1.2.2'
+        } "got '$($carried.BeforeVersion)'"
+
+        Set-Content -LiteralPath $outcomePath -Encoding UTF8 -Value (@{
+            schemaVersion = 1; attemptId = ('e' * 32); success = $false; exitCode = 1
+            version = '1.2.3'; error = 'later step failed'; at = [DateTimeOffset]::Now.ToString('o')
+        } | ConvertTo-Json)
+        $older = Read-BridgeUpdateOutcome -Path $outcomePath
+        Test-That 'and one written before the field existed still reads, claiming no pre-version' {
+            $older.BeforeVersion -ceq ''
+        } "got '$($older.BeforeVersion)'"
+    }
+    finally { Remove-Item -LiteralPath $outcomePath -Force -ErrorAction SilentlyContinue }
+}
 
 Write-Host '--- the Install button path really launches the updater ---'
 # -Detached is used only by the dashboard button, which is why this being broken never
@@ -1412,6 +1440,32 @@ try {
     Test-That 'a transfer that keeps arriving is never cut off for taking many reads' {
         $slowButSteady.Bytes -eq $payload.Length
     } "wrote $($slowButSteady.Bytes) of $($payload.Length)"
+
+    # The seam no suite could reach: the Download transport is refused outright under
+    # test, so not one line of Save-BridgeUpdateDownload's body ever ran, and the line
+    # reading the stated size was wrong the whole time. `.HasValue` looks right - the
+    # property is Nullable<long> in C# - but PowerShell unwraps it on the way in, so
+    # under StrictMode that threw PropertyNotFoundException for a stated length *and*
+    # an absent one, failing every real self-update the moment the headers arrived.
+    # Driven against real HttpResponseMessage headers rather than a hand-made stand-in,
+    # because the boxing is the whole bug. Raised by Codex on #190.
+    Add-Type -AssemblyName System.Net.Http
+    $stated = [Net.Http.HttpResponseMessage]::new(200)
+    $stated.Content = [Net.Http.ByteArrayContent]::new([byte[]]@(1, 2, 3, 4, 5))
+    # A non-seekable stream is the honest "server stated no length" case: .NET cannot
+    # compute one, so the header is genuinely absent rather than removed.
+    $silent = [Net.Http.HttpResponseMessage]::new(200)
+    $pipe = [IO.Pipes.AnonymousPipeServerStream]::new([IO.Pipes.PipeDirection]::In)
+    $silent.Content = [Net.Http.StreamContent]::new($pipe)
+    try {
+        Test-That 'a stated content length survives the trip through PowerShell as a total' {
+            (Get-BridgeDownloadTotal -ContentLength $stated.Content.Headers.ContentLength) -eq 5
+        }
+        Test-That 'and a response that states none asks for no proportion rather than throwing' {
+            (Get-BridgeDownloadTotal -ContentLength $silent.Content.Headers.ContentLength) -eq 0
+        }
+    }
+    finally { $stated.Dispose(); $silent.Dispose(); $pipe.Dispose() }
 }
 finally {
     $script:BridgeDownloadBufferSize = $priorBuffer

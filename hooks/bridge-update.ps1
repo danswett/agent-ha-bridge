@@ -832,9 +832,12 @@ function Test-BridgeUpdateReachedInstall {
         # download or a corrupt archive would be reported as "installed, then a later
         # step failed" when nothing was installed at all. Raised by Codex on #190.
         #
-        # The daemon omits it legitimately: its press only ever runs when the release
-        # is newer than the recorded version, so the record naming the target is itself
-        # proof that this attempt wrote it.
+        # The detached path carries it in the outcome file, for a second reason: two
+        # presses can have two children going for the same release, and without
+        # attempt-specific proof the shared installed-version record credits a child
+        # that failed during download with the other's install. Only an outcome
+        # written before that field existed omits it, and omission keeps the old
+        # behaviour rather than inventing a pre-version.
         [AllowNull()][AllowEmptyString()][string]$Before
     )
 
@@ -882,7 +885,7 @@ function Read-BridgeUpdateOutcome {
         }
     }
     $allowed = @('success', 'version', 'releaseUrl', 'error', 'at')
-    if ($schema) { $allowed += @('schemaVersion', 'attemptId', 'exitCode') }
+    if ($schema) { $allowed += @('schemaVersion', 'attemptId', 'exitCode', 'beforeVersion') }
     if (@($record.Keys | Where-Object { $_ -cnotin $allowed }).Count) { throw 'The update outcome contains unsupported fields.' }
     if ($AttemptId -and ($schema -ne 1 -or $record['attemptId'] -cne $AttemptId)) {
         throw 'The update outcome does not belong to this attempt.'
@@ -897,6 +900,12 @@ function Read-BridgeUpdateOutcome {
         if (-not [version]::TryParse(($target -split '[-+]')[0], [ref]$parsedTarget)) { throw 'The attempted version is not parseable.' }
     }
     if ($Version -and $target -cne $Version) { throw 'The update outcome names a different release.' }
+    # What the installation recorded when *this* attempt launched, so the daemon can
+    # tell its own install apart from one a concurrent attempt made. Absent from an
+    # outcome written before the field existed, and absent is not a value: the daemon
+    # then omits -Before and behaves exactly as it did. Raised by Codex on #190.
+    $before = if ($record.Contains('beforeVersion')) { $record['beforeVersion'] } else { '' }
+    if ($before -isnot [string]) { throw 'The update outcome has an invalid pre-attempt version.' }
     $url = if ($record.Contains('releaseUrl')) { $record['releaseUrl'] } else { '' }
     $errorText = if ($record.Contains('error')) { $record['error'] } else { '' }
     if ($url -isnot [string] -or $errorText -isnot [string] -or
@@ -913,6 +922,7 @@ function Read-BridgeUpdateOutcome {
         AttemptId = if ($schema) { $record['attemptId'] } else { '' }
         Success = $record['success']
         Version = $target
+        BeforeVersion = $before
         ReleaseUrl = $url
         Error = $errorText
         At = $at
@@ -1045,6 +1055,7 @@ function Write-UpdateOutcome {
 `$outcome = @{
     schemaVersion = 1; attemptId = '$($result.AttemptId)'; success = `$false; exitCode = 1
     version = '$($status.Latest)'; releaseUrl = '$($status.Url.Replace("'", "''"))'
+    beforeVersion = '$(([string]$status.Installed).Replace("'", "''"))'
     error = ''; at = ''
 }
 function Write-UpdateStage {

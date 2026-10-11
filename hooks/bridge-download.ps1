@@ -114,6 +114,31 @@ function Write-BridgeDownloadStream {
     }
 }
 
+function Get-BridgeDownloadTotal {
+    <#
+        The size the server stated, or 0 when it stated none.
+
+        Its own function because it is otherwise unreachable from a test: the Download
+        transport is refused outright under test, so no suite ever executes a line of
+        Save-BridgeUpdateDownload's body. Something had to be wrong there before that
+        mattered, and something was.
+
+        HttpContentHeaders.ContentLength is Nullable<long> in C#, but PowerShell
+        unwraps it on the way in - a stated length arrives boxed as Int64, an absent
+        one as $null. `.HasValue` exists on neither, so under StrictMode it threw
+        PropertyNotFoundException for *both*, failing every real self-update the
+        instant the headers arrived. Raised by Codex on #190. The two shapes are
+        pinned by tests against real HttpResponseMessage headers rather than described
+        here, because a comment is what was already wrong.
+    #>
+    param([AllowNull()]$ContentLength)
+
+    if ($null -eq $ContentLength) { return 0L }
+    $value = [long]$ContentLength
+    if ($value -gt 0) { return $value }
+    0L
+}
+
 function Save-BridgeUpdateDownload {
     <#
         Downloads $Uri to $OutFile, calling -OnProgress with the fraction completed.
@@ -146,9 +171,7 @@ function Save-BridgeUpdateDownload {
             GetAwaiter().GetResult()
         [void]$response.EnsureSuccessStatusCode()
 
-        $total = 0L
-        $length = $response.Content.Headers.ContentLength
-        if ($length.HasValue -and $length.Value -gt 0) { $total = [long]$length.Value }
+        $total = Get-BridgeDownloadTotal -ContentLength $response.Content.Headers.ContentLength
         $source = $response.Content.ReadAsStream()
         # The same seconds twice, for the two halves HttpClient.Timeout no longer
         # covers together: it stops applying once ResponseHeadersRead has returned, so
