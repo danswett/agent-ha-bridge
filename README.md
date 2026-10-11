@@ -373,6 +373,11 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `dashboard.publication.writer` | The one designated publisher's identity, shared by participating configurations; only that participant may write |
 | `dashboard.publication.generation` | Explicit positive integer policy generation. A manual policy change requires exactly the next generation; ordinary publication must match the established generation |
 | `notifications.enabled` / `.service` | Optional notify-style service |
+| `answerButtons.enabled` | Put a question's options on the phone as notification buttons, so it can be answered without opening the dashboard (default `false`). See [Answering from the notification](#answering-from-the-notification) |
+| `answerButtons.services` | The `notify.mobile_app_<device>` services to send to, one per device. Empty means the feature does nothing |
+| `answerButtons.maxButtons` | How many options to offer as buttons (default `6`). The rest are left to the dashboard |
+| `answerButtons.icon` / `.iconColor` / `.color` | The MDI glyph, its colour, and the background behind it (defaults `mdi:chat-question`, `#FFFFFF`, `#FF9F0A`). Setting an icon makes iOS render the alert as a communication notification; clear `icon` for a plain one |
+| `answerButtons.interruptionLevel` | `time-sensitive` (default) breaks through Focus, because a session cannot continue until you answer. `active` stays inside Focus, `passive` keeps it off the Lock Screen |
 | `copilot.sessionStateRoot` | Override the Copilot CLI's session-state location if not `~/.copilot/session-state` |
 | `newSession.enabled` | Set to `false` to hide the "Start a new session" controls (default `true`) |
 | `newSession.launcher` | Default agent: `auto` (default: the installed agent used most recently on this machine, else one that is signed in), `agency`, `copilot`, `claude` or `codex`. With more than one installed, the card also gets an Agent dropdown |
@@ -566,6 +571,64 @@ ever marked, which is deliberate: a glow that lies is worse than no glow.
 
 The same change makes Home Assistant's own logbook honest, since those actions are
 then attributed to the agent rather than to you.
+
+---
+
+### Answering from the notification
+
+A question already reaches the phone as a notification. Switched on, its options
+become buttons on that notification, so it can be answered from the Lock Screen
+without opening the dashboard at all.
+
+```json
+"answerButtons": {
+  "enabled": true,
+  "services": ["notify.mobile_app_your_phone"],
+  "maxButtons": 6,
+  "icon": "mdi:chat-question",
+  "iconColor": "#FFFFFF",
+  "color": "#FF9F0A",
+  "interruptionLevel": "time-sensitive"
+}
+```
+
+The buttons are only shown when the notification is **expanded** — long-press it, or
+pull it down. That is Apple's behaviour for every app, not something the bridge
+chooses. **Type an answer** is always offered as well, because every Copilot option
+list ends in "Other (type your answer)", and it is the only way to answer a freeform
+question.
+
+**How it looks.** Giving the notification an icon and a background colour makes iOS
+render it as a *communication* notification — the rounded-avatar style messaging apps
+use, with the title as the sender. The session name is therefore the title, so a
+question arrives looking like the session itself saying something rather than like one
+more alert from the house; the machine goes in the subtitle, and several questions
+group together. `interruptionLevel` defaults to `time-sensitive` because a session
+genuinely cannot continue until you answer, which is the case Apple's level exists
+for; turn it down to `active` to keep questions inside Focus.
+
+A tap is not a separate route into the session. It is handed to the same
+`Invoke-DaemonDecisionAnswer` the dashboard's answers go through, so the attempt
+claiming, the double-answer guard and the terminal-only refusal all apply unchanged.
+A question is simply gaining a third input beside the card and the native prompt.
+
+**Three questions get no buttons**, each because a button would otherwise be offered
+for something that cannot be delivered: one that must be
+[answered in the terminal](#question-shapes), one with more than one field (a single
+tap cannot fill in a form), and a freeform one, which gets the text action instead.
+
+**Several at once.** The notification is tagged per session, so two sessions asking at
+the same time produce two notifications rather than one replacing the other, and the
+same session asking again replaces only its own. A tap is routed by the session and
+question identity carried in the notification, so it answers the session it came from
+and not whichever asked most recently. Answering withdraws that question from every
+configured device, and a button tapped from a notification whose question has already
+been answered is refused rather than delivered to whatever is being asked now.
+
+> Live Activities — the persistent Lock Screen card — were evaluated for this and
+> deliberately not used. The companion app renders a fixed template with no buttons,
+> so a card could only ever say that a question existed and send you to the dashboard
+> to answer it.
 
 ---
 
@@ -1684,6 +1747,7 @@ mid-write. Real arguments always win over recovered ones.
 | `decision-inject.ps1` | `AttachConsole` + `WriteConsoleInput` delivery, with session→pid lookup from `inuse.<pid>.lock` |
 | `session-launch.ps1` | Starting a new CLI session: the workspace allowlist, argument quoting, and the launch itself |
 | `agent-bridge-daemon.ps1` | The loop: reconcile sessions, stream activity, sweep orphans, deliver answers |
+| `daemon-decision-notify.ps1` | A question's options as notification buttons, and the tap that answers it |
 | `daemon-usage.ps1` | Each agent's remaining allowance, normalised from three vendors into one shape |
 | `agent-bridge-supervisor.ps1` | Keeps one daemon alive with backoff; a named mutex prevents a second instance |
 | `route-ask-user-v3.ps1` | The non-blocking `ask_user` router |

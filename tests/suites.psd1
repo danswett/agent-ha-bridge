@@ -1,6 +1,7 @@
 @{
     Offline = @(
         'tests\test-agent-launched.ps1'
+        'tests\test-answer-buttons.ps1'
         'tests\test-answer-match.ps1'
         'tests\test-auth-backoff.ps1'
         'tests\test-bootstrap-download.ps1'

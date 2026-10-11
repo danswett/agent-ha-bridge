@@ -16,6 +16,15 @@
     "service": "notify.notify",
     "tickerCategory": ""
   },
+  "answerButtons": {
+    "enabled": false,
+    "services": [],
+    "maxButtons": 6,
+    "icon": "mdi:chat-question",
+    "iconColor": "#FFFFFF",
+    "color": "#FF9F0A",
+    "interruptionLevel": "time-sensitive"
+  },
   "copilot": {
     "sessionStateRoot": ""
   },

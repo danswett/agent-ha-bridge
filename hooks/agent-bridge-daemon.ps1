@@ -834,6 +834,19 @@ function Get-DaemonWatchEntities {
     , $watchEntities
 }
 
+function Get-DaemonWatchEventTypes {
+    <#
+        Home Assistant events the watch should also deliver.
+
+        Only subscribed when answer buttons are configured: an unused subscription is
+        a message stream to decode for nothing, which is exactly what the entity watch
+        was changed away from.
+    #>
+    if (-not $script:DecisionBridgeConfig.AnswerButtonsEnabled) { return @() }
+    if (@($script:DecisionBridgeConfig.AnswerButtonServices).Count -eq 0) { return @() }
+    , @('mobile_app_notification_action')
+}
+
 function Wait-DaemonChange {
     # Waits for a watched entity to change, or for the reconcile interval to pass,
     # streaming activity meanwhile. Returns the change, or $null.
@@ -850,7 +863,8 @@ function Wait-DaemonChange {
         # It returns $true to end the wait early when a reconcile is wanted now.
         $fastLane = { Invoke-DaemonFastActivity -Headers $headers -State $state | Out-Null; [bool]$script:DaemonReconcileNow }
         $hit = Wait-CopilotHaStateChange -EntityIds $WatchEntities `
-            -TimeoutSeconds $ReconcileSeconds -OnTick $fastLane -TickMilliseconds 100
+            -TimeoutSeconds $ReconcileSeconds -OnTick $fastLane -TickMilliseconds 100 `
+            -EventTypes (Get-DaemonWatchEventTypes)
         $script:DaemonWatchFailures = 0
     }
     catch {
@@ -873,6 +887,24 @@ function Invoke-DaemonHit {
     $headers = $Headers
     $state = $State
     if ($null -eq $hit) { return }
+
+    # A button tapped on a phone arrives here as an event rather than as a state
+    # change, so it is dispatched before the suffix tests below - it has no entity id
+    # for them to match, and waiting for the reconcile would leave someone looking at
+    # a notification that appeared to do nothing.
+    if ($hit.PSObject.Properties['Kind'] -and [string]$hit.Kind -ceq 'Event') {
+        if ([string]$hit.EventType -ceq 'mobile_app_notification_action') {
+            try {
+                [void](Invoke-DaemonAnswerButton -EventData $hit.Data -State $state `
+                    -Live $script:DaemonLive -Headers $headers)
+            }
+            catch {
+                if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+                Write-DaemonLog -Message "answer button failed: $($_.Exception.Message)"
+            }
+        }
+        return
+    }
 
     # A reply from the dashboard is delivered before anything else. The reconcile
     # below would get to it too, but only after a string of unrelated Home
@@ -1060,6 +1092,7 @@ function Start-BridgeDaemon {
 . (Join-Path $PSScriptRoot 'daemon-maintenance.ps1')
 . (Join-Path $PSScriptRoot 'daemon-usage.ps1')
 . (Join-Path $PSScriptRoot 'daemon-hookspool.ps1')
+. (Join-Path $PSScriptRoot 'daemon-decision-notify.ps1')
 
 
 # A second daemon would publish duplicate activity and race on reply delivery.
