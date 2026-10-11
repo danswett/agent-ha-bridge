@@ -166,6 +166,15 @@ $script:DecisionBridgeConfig = @{
     NotifyEnabled = [bool](Get-BridgeSetting 'notifications.enabled' $false)
     NotifyService = (Get-BridgeSetting 'notifications.service' 'notify.notify')
     TickerCategory = (Get-BridgeSetting 'notifications.tickerCategory' '')
+    # Answer buttons: the question's options as buttons on an ordinary notification,
+    # so it can be answered without opening the dashboard. `services` is a list of
+    # mobile_app notify services, because one phone is one service.
+    # @() around the read because a bare empty array yields $null under StrictMode.
+    AnswerButtonsEnabled = [bool](Get-BridgeSetting 'answerButtons.enabled' $false)
+    AnswerButtonServices = @(Get-BridgeSetting 'answerButtons.services' @())
+    # iOS copes with about ten before its own action list misbehaves; the overflow is
+    # left to the dashboard rather than shown badly.
+    AnswerButtonMax = [int](Get-BridgeSetting 'answerButtons.maxButtons' 6)
 
     # --- behaviour, rarely changed -------------------------------------------
     DecisionQuestionMaxChars = 6000
