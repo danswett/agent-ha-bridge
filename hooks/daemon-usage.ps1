@@ -1214,12 +1214,25 @@ function Test-BridgeUsageCovered {
         redundant request - no state list, no account key, a reading with no timestamp,
         or one stamped more than an interval into the future, which is a peer's clock
         running ahead and would otherwise hold this machine off indefinitely.
+
+        -Since is when this machine last published the same client, and a reading has to
+        be newer than that to count. Without it two machines that take over together are
+        symmetric: both read, both publish, and from then on each stands down for the
+        other's reading until it ages out - so the account was refreshed every eight
+        minutes by two machines at once rather than every two by one of them, which is
+        worse than what it replaced and beyond the takeover it promises. Requiring a
+        reading newer than one's own breaks that by the readings themselves rather than
+        by electing anybody: whichever machine published last keeps asking, the others
+        stand down for it, and if it goes away the next one is only three intervals
+        behind. Three machines converge the same way, and a machine that has never
+        published stands down for anybody, which is what a new one joining should do.
     #>
     param(
         [Parameter(Mandatory)][string]$Client,
         [Parameter(Mandatory)][AllowEmptyString()][string]$Key,
         [AllowNull()]$States,
         [Parameter(Mandatory)][DateTimeOffset]$Now,
+        [Parameter(Mandatory)][DateTimeOffset]$Since,
         [Parameter(Mandatory)][double]$Pace
     )
 
@@ -1253,6 +1266,10 @@ function Test-BridgeUsageCovered {
 
         $at = ConvertTo-BridgeUsageInstant $attributes.updated
         if ($null -eq $at) { continue }
+        # Older than this machine's own last reading is not somebody keeping the account
+        # current; it is the ageing half of a pair of machines standing down for each
+        # other. See -Since.
+        if ($at -le $Since) { continue }
         $age = ($instant - $at).TotalSeconds
         if ($age -gt $covered -or $age -lt -$Pace) { continue }
         return $true
@@ -1344,12 +1361,13 @@ function Sync-DaemonUsage {
 
         The allowance belongs to the account, so on an installation with an explicitly
         configured dashboard.publication the designated writer does the asking and every
-        other machine asks only when nothing fresh has been published for its account
-        (Test-BridgeUsageCovered). That decides redundant vendor calls and nothing else:
-        no writer is elected here, and a machine that ends up asking gains no authority
-        to publish anything but its own per-machine sensors. -States is the Home
-        Assistant state list the reconcile already read, and $null - or publication not
-        configured at all - leaves every machine asking for itself as before.
+        other machine asks only when nothing fresher than its own last reading has been
+        published for its account (Test-BridgeUsageCovered). That decides redundant
+        vendor calls and nothing else: no writer is elected here, and a machine that ends
+        up asking gains no authority to publish anything but its own per-machine sensors.
+        -States is the Home Assistant state list the reconcile already read, and $null -
+        or publication not configured at all - leaves every machine asking for itself as
+        before.
 
         Off by default for nobody: the figures are already on the dashboard's own
         machine, and `usage.publish: false` turns it off for anyone who would rather
@@ -1413,7 +1431,8 @@ function Sync-DaemonUsage {
                 # against anybody else's reading, so this machine reads it itself.
                 $key = ''
             }
-            $covered = Test-BridgeUsageCovered -Client $client -Key $key -States $States -Now $Now -Pace $pace
+            $covered = Test-BridgeUsageCovered -Client $client -Key $key -States $States -Now $Now `
+                -Since $state.PublishedAt -Pace $pace
         }
         # Said when it changes rather than every pass: a machine that has quietly
         # stopped asking is the thing somebody debugging a flat gauge needs to be told.

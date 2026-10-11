@@ -1483,6 +1483,99 @@ Test-That 'and turning the whole thing off still stops the collecting, designate
     (Invoke-UsageAt 0 $copilotOpen (New-PeerCopilotState 0)) -ceq ''
 }
 
+# Two machines that take over together are symmetric, and that symmetry was a bug: both
+# read, both published, and from then on each stood down for the other's ageing reading
+# until it timed out - so the account was refreshed every eight minutes by two machines
+# at once instead of every two by one of them, which is worse than the polling it
+# replaced and past the takeover it promises. Driven here against a store of what each
+# machine has actually published, with each machine keeping its own pacing.
+$script:World = @{}
+$script:FleetState = @{}
+$script:FleetEntityIds = @{}
+$script:SimNow = $paceStart
+$script:ThisSlug = 'one'
+$script:RealMachineSlug = (Get-Item function:Get-BridgeMachineSlug).ScriptBlock
+function Get-BridgeMachineSlug { param([string]$MachineName = '') $script:ThisSlug }
+function Publish-CopilotMqttUsage {
+    param([object[]]$Records, [string]$Slug, [string]$MachineName, [hashtable]$Headers)
+    foreach ($record in $Records) { $script:Published.Add([string]$record.client) }
+    $script:PeerMessages.Clear()
+    & $script:RealUsagePublisher -Records $Records -Slug $script:ThisSlug -MachineName $script:ThisSlug -Headers $Headers
+    foreach ($entry in @(ConvertTo-PeerUsageState)) {
+        # Stamped on the simulated clock the passes run on, not the wall clock the
+        # publisher reaches for.
+        if ($null -ne $entry.attributes) { $entry.attributes.updated = $script:SimNow.ToString('o') }
+        $script:World[$entry.entity_id] = $entry
+    }
+}
+function Invoke-FleetUsageAt {
+    <# One machine's pass: its own pacing, and the sensors every machine has published
+       so far unless a particular view of them is given. #>
+    param(
+        [Parameter(Mandatory)][string]$Slug,
+        [Parameter(Mandatory)][double]$Seconds,
+        $Live,
+        $States = $null
+    )
+    $script:ThisSlug = $Slug
+    $script:SimNow = $paceStart.AddSeconds($Seconds)
+    if (-not $script:FleetState.ContainsKey($Slug)) {
+        $script:FleetState[$Slug] = @{}
+        $script:FleetEntityIds[$Slug] = ''
+    }
+    $script:DaemonUsageClients = $script:FleetState[$Slug]
+    $script:DaemonUsageEntityIds = $script:FleetEntityIds[$Slug]
+    $script:AskLog.Clear()
+    $script:Published.Clear()
+    $view = if ($null -ne $States) { $States } else { @($script:World.Values) }
+    [void](Sync-DaemonUsage -Headers $headers -Live $Live -States $view -Now $script:SimNow)
+    $script:FleetState[$Slug] = $script:DaemonUsageClients
+    $script:FleetEntityIds[$Slug] = $script:DaemonUsageEntityIds
+    $script:AskLog -join ';'
+}
+
+$script:Settings = @{ 'dashboard.publication' = $writerElsewhere }
+# A real Copilot record names the account it belongs to, and that is what the machines
+# match each other's readings on.
+$script:Readings = @{
+    copilot = New-BridgeUsageRecord -Client 'copilot' -Account 'work_account' -Source 'api' `
+        -Windows @(Get-BridgeUsageWindow -Key 'main' -Label 'Main' -PercentUsed 10)
+}
+$script:Selected = @('copilot')
+Test-That 'with the writer gone, two machines becoming due at the same instant both read' {
+    # The same view of Home Assistant for both, which is what "at the same instant"
+    # means: neither can see a reading the other has not published yet.
+    $race = @($script:World.Values)
+    $first = Invoke-FleetUsageAt -Slug 'one' -Seconds 0 -Live $copilotOpen -States $race
+    $second = Invoke-FleetUsageAt -Slug 'two' -Seconds 1 -Live $copilotOpen -States $race
+    $first -ceq 'copilot' -and $second -ceq 'copilot'
+}
+Test-That 'and from then on exactly one of them keeps the account current' {
+    $one = Invoke-FleetUsageAt -Slug 'one' -Seconds 120 -Live $copilotOpen
+    $two = Invoke-FleetUsageAt -Slug 'two' -Seconds 121 -Live $copilotOpen
+    ($one -ceq 'copilot') -xor ($two -ceq 'copilot')
+} "one=$(@($script:FleetState['one'].copilot.Covered)) two=$(@($script:FleetState['two'].copilot.Covered))"
+$script:FleetRounds = @()
+Test-That 'at the pace a session open needs, rather than the two of them in bursts twice as far apart' {
+    $script:FleetRounds = @()
+    foreach ($second in 240, 360, 480) {
+        $script:FleetRounds += , @(
+            (Invoke-FleetUsageAt -Slug 'one' -Seconds $second -Live $copilotOpen),
+            (Invoke-FleetUsageAt -Slug 'two' -Seconds ($second + 1) -Live $copilotOpen))
+    }
+    # Whichever published last is the one asking; the other never does.
+    $polls = @($script:FleetRounds | ForEach-Object { @($_ | Where-Object { $_ -ceq 'copilot' }).Count })
+    @($polls | Where-Object { $_ -ne 1 }).Count -eq 0
+} "rounds: $(@($script:FleetRounds | ForEach-Object { $_ -join '+' }) -join ' / ')"
+Test-That 'and when that one goes away the other takes over within three of its intervals' {
+    # 'two' stops here; 'one' has been standing down for it throughout.
+    $early = Invoke-FleetUsageAt -Slug 'one' -Seconds 720 -Live $copilotOpen
+    $due = Invoke-FleetUsageAt -Slug 'one' -Seconds 960 -Live $copilotOpen
+    $early -ceq '' -and $due -ceq 'copilot'
+}
+
+Set-Item -LiteralPath function:Get-BridgeMachineSlug -Value $script:RealMachineSlug
+
 # The constraint that matters more than the saving: this reads who the writer is and
 # decides nothing else. A machine that starts asking must not thereby start publishing.
 Test-That 'the module reads the configured writer and never writes anything shared' {
