@@ -153,8 +153,13 @@ foreach ($name in @(
     'Sync-DaemonNewSession', 'Sync-DaemonClients', 'Sync-DaemonUsage', 'Clear-DaemonStaleNote',
     'Invoke-DaemonAnswerButtonQueue'
 )) {
-    Set-Item -LiteralPath "function:$name" -Value { param($Headers, $State, $Live) }
+    Set-Item -LiteralPath "function:$name" -Value { param($Headers, $State, $Live, $States) }
 }
+# Declared by daemon-discovery.ps1, which this fixture does not load: the reconcile
+# hands the pass's snapshot to the usage sync, and under StrictMode reading a variable
+# that was never declared throws into the reconcile's own catch - which looks exactly
+# like the ordinary log-only outcome these checks exist to tell apart.
+$script:DaemonReconcileStates = $null
 function Get-LiveBridgeSessions {
     $live = @{}
     [pscustomobject]@{ Complete = $true; Live = $live; PositiveLive = $live; OwnerCatalogue = @{}; UncertainIds = @{} }

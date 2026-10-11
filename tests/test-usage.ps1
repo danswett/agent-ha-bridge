@@ -841,6 +841,11 @@ Write-Host '--- how often the daemon asks ---'
 
 # Stubbed after everything above has used the real ones. Every publish is retained, so
 # a poll that found nothing new must stay off the bus entirely.
+#
+# The real publisher is kept first: section 6c builds the retained sensors a peer
+# machine leaves behind with it, so renaming an attribute there fails a check here
+# rather than quietly stopping every machine standing down for another one.
+$script:RealUsagePublisher = (Get-Item function:Publish-CopilotMqttUsage).ScriptBlock
 $script:Settings = @{}
 function Get-BridgeSetting { param([string]$Name, $Default) if ($script:Settings.ContainsKey($Name)) { $script:Settings[$Name] } else { $Default } }
 function Get-BridgeSelectedClients { , @('copilot', 'mcp') }
@@ -989,11 +994,11 @@ function New-LiveSessions {
 }
 $paceStart = [DateTimeOffset]::Parse('2026-10-07T12:00:00Z')
 function Invoke-UsageAt {
-    param([double]$Seconds, $Live)
+    param([double]$Seconds, $Live, $States = $null)
     $script:AskLog.Clear()
     $script:Published.Clear()
     $script:ForcedWith.Clear()
-    [void](Sync-DaemonUsage -Headers $headers -Live $Live -Now $paceStart.AddSeconds($Seconds))
+    [void](Sync-DaemonUsage -Headers $headers -Live $Live -States $States -Now $paceStart.AddSeconds($Seconds))
     $script:AskLog -join ';'
 }
 $none = New-LiveSessions
@@ -1236,12 +1241,365 @@ Test-That 'an install that never chose its clients is asked about all three' {
     (Invoke-UsageAt 0 $none) -ceq 'copilot,claude,codex'
 }
 
+# --- 6c. one machine reads the account, not all of them ---------------------------
+
+Write-Host ''
+Write-Host '--- standing down while another machine reads the same account ---'
+
+# Five machines signed in to one account asked three vendors the same question every
+# two minutes and the card then discarded four of the five answers (#142). The machine
+# named in dashboard.publication.writer does the asking; the others ask only when
+# nothing fresh has been published for their account. What this must never become is a
+# say in who publishes the dashboard, so the role is read from the explicit
+# configuration and used for nothing but whether to repeat somebody else's vendor call.
+
+# Which account is mine has to be decided before the vendor call, and on a Mac an
+# identity that reached the login keychain would put back on every machine the
+# authorization panel this is removing (#122). So it comes from the agents' own files.
+Test-That 'the account key for Copilot is the login its own config names' {
+    (Get-BridgeUsageAccountKey -Client 'copilot' -CopilotConfigPath $copilotConfig) -ceq 'work_account'
+}
+Test-That 'and for Claude the opaque id the card groups its rows on' {
+    (Get-BridgeUsageAccountKey -Client 'claude' -ClaudeAccountPath $claudeAccountPath) -ceq $claudeId
+}
+Test-That 'Codex has none, its figures coming from this machine''s own transcripts' {
+    (Get-BridgeUsageAccountKey -Client 'codex') -ceq ''
+}
+Test-That 'and an agent that has never run here has none either' {
+    (Get-BridgeUsageAccountKey -Client 'copilot' -CopilotConfigPath (Join-Path $root 'no-config.json')) -ceq '' -and
+        (Get-BridgeUsageAccountKey -Client 'claude' -ClaudeAccountPath (Join-Path $root 'no-account.json')) -ceq ''
+}
+
+# Held so sections 7 and 8 get the real readers back; what the checks below vary is
+# which account this machine is signed in to, not how it finds out.
+$script:RealCopilotAccount = (Get-Item function:Get-BridgeCopilotAccount).ScriptBlock
+$script:RealClaudeAccountId = (Get-Item function:Get-BridgeClaudeAccountId).ScriptBlock
+$script:LocalCopilot = 'work_account'
+$script:LocalClaude = '95adb0b680fe'
+function Get-BridgeCopilotAccount {
+    param([AllowEmptyString()][string]$ConfigPath = '')
+    if ($script:LocalCopilot) { [pscustomobject]@{ Login = $script:LocalCopilot; Host = 'https://github.com' } } else { $null }
+}
+function Get-BridgeClaudeAccountId { param([AllowEmptyString()][string]$Path = '') $script:LocalClaude }
+
+$script:PeerMessages = [System.Collections.Generic.List[object]]::new()
+function Publish-CopilotMqttMessage {
+    param([string]$Topic, [string]$Payload, [hashtable]$Headers, [switch]$Retain)
+    $script:PeerMessages.Add([pscustomobject]@{ Topic = $Topic; Payload = $Payload; Retain = [bool]$Retain })
+}
+
+function ConvertTo-PeerUsageState {
+    <# What Home Assistant holds for the sensors a publish left behind, in the shape a
+       state read hands back. #>
+    $states = @()
+    foreach ($message in $script:PeerMessages) {
+        if ($message.Topic -notmatch '^homeassistant/([a-z_]+)/[^/]+/[^/]+/config$') { continue }
+        $domain = $Matches[1]
+        $config = $message.Payload | ConvertFrom-Json
+        $raw = @($script:PeerMessages | Where-Object { $_.Topic -ceq [string]$config.state_topic } | Select-Object -Last 1)
+        $attrRaw = @($script:PeerMessages | Where-Object { $_.Topic -ceq [string]$config.json_attributes_topic } | Select-Object -Last 1)
+        $states += [pscustomobject]@{
+            entity_id  = "$domain.$($config.object_id)"
+            state      = if ($raw.Count -eq 0) { 'unavailable' } else { [string]$raw[0].Payload }
+            attributes = if ($attrRaw.Count -eq 0) { $null } else { $attrRaw[0].Payload | ConvertFrom-Json }
+        }
+    }
+    $states
+}
+
+function New-PeerUsageState {
+    <# One other machine's retained reading, published by the real publisher and then
+       stamped with the moment it was taken. #>
+    param(
+        [Parameter(Mandatory)][string]$Client,
+        [AllowEmptyString()][string]$Account = '',
+        [AllowEmptyString()][string]$AccountId = '',
+        [string]$Slug = 'otherbox',
+        [Parameter(Mandatory)][DateTimeOffset]$Updated
+    )
+    $record = New-BridgeUsageRecord -Client $Client -Account $Account -AccountId $AccountId -Source 'api' `
+        -Windows @(Get-BridgeUsageWindow -Key 'main' -Label 'Main' -PercentUsed 42)
+    $script:PeerMessages.Clear()
+    & $script:RealUsagePublisher -Records @($record) -Slug $Slug -MachineName 'Other box' -Headers $headers
+    $states = @(ConvertTo-PeerUsageState)
+    foreach ($entry in $states) {
+        if ($null -ne $entry.attributes) { $entry.attributes.updated = $Updated.ToString('o') }
+    }
+    $states
+}
+# The Copilot account this machine is signed in to, read somewhere else at a moment on
+# the same clock the passes below run on.
+function New-PeerCopilotState {
+    param([double]$Seconds)
+    New-PeerUsageState -Client 'copilot' -Account 'work_account' -Updated $paceStart.AddSeconds($Seconds)
+}
+
+$writerHere = @{ authority = 'bridge-fleet'; participant = 'dev-vm1'; writer = 'dev-vm1'; generation = 1 }
+$writerElsewhere = @{ authority = 'bridge-fleet'; participant = 'home-desk'; writer = 'dev-vm1'; generation = 1 }
+$copilotOpen = New-LiveSessions 'copilot'
+
+Reset-UsagePacing
+$script:Settings['dashboard.publication'] = $writerElsewhere
+Test-That 'a machine that is not the designated writer leaves an account another one just read' {
+    (Invoke-UsageAt 0 $copilotOpen (New-PeerCopilotState 0)) -ceq 'claude,codex'
+}
+Test-That 'and still leaves it two intervals on, inside the three it takes to take over' {
+    # Due at 120 on the busy pace, against a reading taken six minutes before that.
+    (Invoke-UsageAt 120 $copilotOpen (New-PeerCopilotState -240)) -ceq ''
+}
+Test-That 'but once nothing has been published for three of them, the gauge is this machine''s to keep current' {
+    (Invoke-UsageAt 240 $copilotOpen (New-PeerCopilotState -121)) -ceq 'copilot'
+}
+
+Reset-UsagePacing
+$script:Settings['dashboard.publication'] = $writerHere
+Test-That 'the designated writer asks whatever anybody else has published' {
+    (Invoke-UsageAt 0 $copilotOpen (New-PeerCopilotState 0)) -ceq 'copilot,claude,codex'
+}
+
+Reset-UsagePacing
+Test-That 'and an installation that has designated nobody asks from every machine, as it always has' {
+    (Invoke-UsageAt 0 $copilotOpen (New-PeerCopilotState 0)) -ceq 'copilot,claude,codex'
+}
+
+Reset-UsagePacing
+$script:Settings['dashboard.publication'] = 'dev-vm1'
+Test-That 'a publication setting that is not a configuration asks rather than throwing out of the pass' {
+    (Invoke-UsageAt 0 $copilotOpen (New-PeerCopilotState 0)) -ceq 'copilot,claude,codex'
+}
+
+Reset-UsagePacing
+$script:Settings['dashboard.publication'] = $writerElsewhere
+Test-That 'another account''s reading is not this account''s, however fresh' {
+    $peer = New-PeerUsageState -Client 'copilot' -Account 'someone_else' -Updated $paceStart
+    (Invoke-UsageAt 0 $copilotOpen $peer) -ceq 'copilot,claude,codex'
+}
+
+Reset-UsagePacing
+$script:Settings['dashboard.publication'] = $writerElsewhere
+Test-That 'and neither is this machine''s own retained reading, which is the one being replaced' {
+    $mine = New-PeerUsageState -Client 'copilot' -Account 'work_account' -Slug (Get-BridgeMachineSlug) -Updated $paceStart
+    (Invoke-UsageAt 0 $copilotOpen $mine) -ceq 'copilot,claude,codex'
+}
+
+Reset-UsagePacing
+$script:Settings['dashboard.publication'] = $writerElsewhere
+Test-That 'a pass that could not read Home Assistant asks rather than assuming it is covered' {
+    (Invoke-UsageAt 0 $copilotOpen $null) -ceq 'copilot,claude,codex'
+}
+
+Reset-UsagePacing
+$script:Settings['dashboard.publication'] = $writerElsewhere
+Test-That 'a reading with no timestamp on it says nothing about when it was taken' {
+    $peer = New-PeerCopilotState 0
+    foreach ($entry in $peer) { $entry.attributes.updated = '' }
+    (Invoke-UsageAt 0 $copilotOpen $peer) -ceq 'copilot,claude,codex'
+}
+
+# A peer whose clock runs ahead would otherwise look permanently current and hold every
+# other machine off indefinitely, which is the one way this could flatten a gauge.
+Reset-UsagePacing
+$script:Settings['dashboard.publication'] = $writerElsewhere
+Test-That 'a reading stamped further ahead than a whole interval is a clock, not a figure' {
+    (Invoke-UsageAt 0 $copilotOpen (New-PeerCopilotState 121)) -ceq 'copilot,claude,codex'
+}
+Reset-UsagePacing
+$script:Settings['dashboard.publication'] = $writerElsewhere
+Test-That 'while seconds of skew between two machines are not worth asking twice over' {
+    (Invoke-UsageAt 0 $copilotOpen (New-PeerCopilotState 20)) -ceq 'claude,codex'
+}
+
+# How current a reading has to be is the pace the client is being asked about on: a
+# machine with a session open needs one inside six minutes, one with nothing open does
+# not, and its own slower interval is what three of them are counted from.
+Reset-UsagePacing
+$script:Settings['dashboard.publication'] = $writerElsewhere
+Test-That 'a machine with nothing open is content with a reading three of its slower intervals old' {
+    (Invoke-UsageAt 0 $none (New-PeerCopilotState -2699)) -ceq 'claude,codex'
+}
+Reset-UsagePacing
+$script:Settings['dashboard.publication'] = $writerElsewhere
+Test-That 'and asks once even that has lapsed' {
+    (Invoke-UsageAt 0 $none (New-PeerCopilotState -2701)) -ceq 'copilot,claude,codex'
+}
+
+Reset-UsagePacing
+$script:Settings['dashboard.publication'] = $writerElsewhere
+Test-That 'Claude is matched on the opaque id, there being no account name to match on' {
+    $peer = New-PeerUsageState -Client 'claude' -AccountId $script:LocalClaude -Updated $paceStart
+    (Invoke-UsageAt 0 $claudeOpen $peer) -ceq 'copilot,codex'
+}
+Reset-UsagePacing
+$script:Settings['dashboard.publication'] = $writerElsewhere
+Test-That 'and a machine signed in to another Claude account is another allowance entirely' {
+    $peer = New-PeerUsageState -Client 'claude' -AccountId '9f8e7d6c5b4a' -Updated $paceStart
+    (Invoke-UsageAt 0 $claudeOpen $peer) -ceq 'copilot,claude,codex'
+}
+
+# Codex costs no vendor call at all - the figures are read out of this machine's own
+# transcripts - so deferring would trade a free local read for somebody else's staler
+# number, and there is no account on the record to match it by in any case.
+Reset-UsagePacing
+$script:Settings['dashboard.publication'] = $writerElsewhere
+Test-That 'Codex is never stood down for, however recently another machine published one' {
+    $peer = New-PeerUsageState -Client 'codex' -Updated $paceStart
+    (Invoke-UsageAt 0 $none $peer) -ceq 'copilot,claude,codex'
+}
+
+# An unchanged reading that is never republished looks exactly like a machine that has
+# stopped reading, and every machine standing down for it would take over.
+Reset-UsagePacing
+$script:Settings['dashboard.publication'] = $writerHere
+Test-That 'the machine doing the asking republishes an unchanged reading, so being quiet is not mistaken for being gone' {
+    [void](Invoke-UsageAt 0 $copilotOpen @())
+    [void](Invoke-UsageAt 120 $copilotOpen @())
+    $quiet = @($script:Published) -join ','
+    [void](Invoke-UsageAt 240 $copilotOpen @())
+    $quiet -ceq '' -and (@($script:Published) -join ',') -ceq 'copilot'
+}
+Reset-UsagePacing
+Test-That 'while an installation where nobody defers keeps an unchanged reading off the bus, as before' {
+    [void](Invoke-UsageAt 0 $copilotOpen @())
+    [void](Invoke-UsageAt 240 $copilotOpen @())
+    $first = @($script:Published) -join ','
+    [void](Invoke-UsageAt 480 $copilotOpen @())
+    $first -ceq '' -and (@($script:Published) -join ',') -ceq ''
+}
+
+Reset-UsagePacing
+$script:Settings['dashboard.publication'] = $writerElsewhere
+Test-That 'a machine that has stopped asking says so once, and says so again when it takes over' {
+    [void](Invoke-UsageAt 0 $copilotOpen (New-PeerCopilotState 0))
+    [void](Invoke-UsageAt 120 $copilotOpen (New-PeerCopilotState 0))
+    $stood = @($script:Logged | Where-Object { $_ -match 'not asking from here' }).Count
+    [void](Invoke-UsageAt 240 $copilotOpen (New-PeerCopilotState -1000))
+    $stood -eq 1 -and @($script:Logged | Where-Object { $_ -match 'no longer being read' }).Count -eq 1
+} "log: $(@($script:Logged) -join ' | ')"
+
+Reset-UsagePacing
+$script:Settings['dashboard.publication'] = $writerElsewhere
+$script:Settings['usage.publish'] = $false
+Test-That 'and turning the whole thing off still stops the collecting, designated writer or not' {
+    (Invoke-UsageAt 0 $copilotOpen (New-PeerCopilotState 0)) -ceq ''
+}
+
+# Two machines that take over together are symmetric, and that symmetry was a bug: both
+# read, both published, and from then on each stood down for the other's ageing reading
+# until it timed out - so the account was refreshed every eight minutes by two machines
+# at once instead of every two by one of them, which is worse than the polling it
+# replaced and past the takeover it promises. Driven here against a store of what each
+# machine has actually published, with each machine keeping its own pacing.
+$script:World = @{}
+$script:FleetState = @{}
+$script:FleetEntityIds = @{}
+$script:SimNow = $paceStart
+$script:ThisSlug = 'one'
+$script:RealMachineSlug = (Get-Item function:Get-BridgeMachineSlug).ScriptBlock
+function Get-BridgeMachineSlug { param([string]$MachineName = '') $script:ThisSlug }
+function Publish-CopilotMqttUsage {
+    param([object[]]$Records, [string]$Slug, [string]$MachineName, [hashtable]$Headers)
+    foreach ($record in $Records) { $script:Published.Add([string]$record.client) }
+    $script:PeerMessages.Clear()
+    & $script:RealUsagePublisher -Records $Records -Slug $script:ThisSlug -MachineName $script:ThisSlug -Headers $Headers
+    foreach ($entry in @(ConvertTo-PeerUsageState)) {
+        # Stamped on the simulated clock the passes run on, not the wall clock the
+        # publisher reaches for.
+        if ($null -ne $entry.attributes) { $entry.attributes.updated = $script:SimNow.ToString('o') }
+        $script:World[$entry.entity_id] = $entry
+    }
+}
+function Invoke-FleetUsageAt {
+    <# One machine's pass: its own pacing, and the sensors every machine has published
+       so far unless a particular view of them is given. #>
+    param(
+        [Parameter(Mandatory)][string]$Slug,
+        [Parameter(Mandatory)][double]$Seconds,
+        $Live,
+        $States = $null
+    )
+    $script:ThisSlug = $Slug
+    $script:SimNow = $paceStart.AddSeconds($Seconds)
+    if (-not $script:FleetState.ContainsKey($Slug)) {
+        $script:FleetState[$Slug] = @{}
+        $script:FleetEntityIds[$Slug] = ''
+    }
+    $script:DaemonUsageClients = $script:FleetState[$Slug]
+    $script:DaemonUsageEntityIds = $script:FleetEntityIds[$Slug]
+    $script:AskLog.Clear()
+    $script:Published.Clear()
+    $view = if ($null -ne $States) { $States } else { @($script:World.Values) }
+    [void](Sync-DaemonUsage -Headers $headers -Live $Live -States $view -Now $script:SimNow)
+    $script:FleetState[$Slug] = $script:DaemonUsageClients
+    $script:FleetEntityIds[$Slug] = $script:DaemonUsageEntityIds
+    $script:AskLog -join ';'
+}
+
+$script:Settings = @{ 'dashboard.publication' = $writerElsewhere }
+# A real Copilot record names the account it belongs to, and that is what the machines
+# match each other's readings on.
+$script:Readings = @{
+    copilot = New-BridgeUsageRecord -Client 'copilot' -Account 'work_account' -Source 'api' `
+        -Windows @(Get-BridgeUsageWindow -Key 'main' -Label 'Main' -PercentUsed 10)
+}
+$script:Selected = @('copilot')
+Test-That 'with the writer gone, two machines becoming due at the same instant both read' {
+    # The same view of Home Assistant for both, which is what "at the same instant"
+    # means: neither can see a reading the other has not published yet.
+    $race = @($script:World.Values)
+    $first = Invoke-FleetUsageAt -Slug 'one' -Seconds 0 -Live $copilotOpen -States $race
+    $second = Invoke-FleetUsageAt -Slug 'two' -Seconds 1 -Live $copilotOpen -States $race
+    $first -ceq 'copilot' -and $second -ceq 'copilot'
+}
+Test-That 'and from then on exactly one of them keeps the account current' {
+    $one = Invoke-FleetUsageAt -Slug 'one' -Seconds 120 -Live $copilotOpen
+    $two = Invoke-FleetUsageAt -Slug 'two' -Seconds 121 -Live $copilotOpen
+    ($one -ceq 'copilot') -xor ($two -ceq 'copilot')
+} "one=$(@($script:FleetState['one'].copilot.Covered)) two=$(@($script:FleetState['two'].copilot.Covered))"
+$script:FleetRounds = @()
+Test-That 'at the pace a session open needs, rather than the two of them in bursts twice as far apart' {
+    $script:FleetRounds = @()
+    foreach ($second in 240, 360, 480) {
+        $script:FleetRounds += , @(
+            (Invoke-FleetUsageAt -Slug 'one' -Seconds $second -Live $copilotOpen),
+            (Invoke-FleetUsageAt -Slug 'two' -Seconds ($second + 1) -Live $copilotOpen))
+    }
+    # Whichever published last is the one asking; the other never does.
+    $polls = @($script:FleetRounds | ForEach-Object { @($_ | Where-Object { $_ -ceq 'copilot' }).Count })
+    @($polls | Where-Object { $_ -ne 1 }).Count -eq 0
+} "rounds: $(@($script:FleetRounds | ForEach-Object { $_ -join '+' }) -join ' / ')"
+Test-That 'and when that one goes away the other takes over within three of its intervals' {
+    # 'two' stops here; 'one' has been standing down for it throughout.
+    $early = Invoke-FleetUsageAt -Slug 'one' -Seconds 720 -Live $copilotOpen
+    $due = Invoke-FleetUsageAt -Slug 'one' -Seconds 960 -Live $copilotOpen
+    $early -ceq '' -and $due -ceq 'copilot'
+}
+
+Set-Item -LiteralPath function:Get-BridgeMachineSlug -Value $script:RealMachineSlug
+
+# The constraint that matters more than the saving: this reads who the writer is and
+# decides nothing else. A machine that starts asking must not thereby start publishing.
+Test-That 'the module reads the configured writer and never writes anything shared' {
+    $source = [IO.File]::ReadAllText((Join-Path $PSScriptRoot '..\hooks\daemon-usage.ps1'))
+    $source -match 'Get-BridgePublicationSettings' -and
+        $source -notmatch 'Set-BridgePublicationPolicy|Save-BridgePublicationReceipt|Save-CopilotSessionDashboard|Set-BridgeDashboardView'
+}
+Test-That 'and settles the role from that configuration alone, never from a hostname or a presence sensor' {
+    $script:Settings = @{ 'dashboard.publication' = $writerElsewhere }
+    $asParticipant = Get-BridgeUsagePollRole
+    $script:Settings = @{ 'dashboard.publication' = $writerHere }
+    $asWriter = Get-BridgeUsagePollRole
+    $script:Settings = @{}
+    $asParticipant -ceq 'participant' -and $asWriter -ceq 'writer' -and (Get-BridgeUsagePollRole) -ceq 'none'
+}
+
+Set-Item -LiteralPath function:Get-BridgeCopilotAccount -Value $script:RealCopilotAccount
+Set-Item -LiteralPath function:Get-BridgeClaudeAccountId -Value $script:RealClaudeAccountId
+
 $script:Settings = $settingsBefore
 function Get-BridgeSelectedClients { , @('copilot', 'mcp') }
 function Write-DaemonLog { param([string]$Message) }
 
 # --- 7. the keychain the Copilot token comes from ---------------------------------
-
 Write-Host ''
 Write-Host '--- reading the Copilot token on macOS ---'
 
