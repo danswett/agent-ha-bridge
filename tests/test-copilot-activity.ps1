@@ -509,6 +509,17 @@ function New-ShellResult {
 function New-ShellStarted { param([string]$Id) New-ShellResult "<command started in background with shellId: $Id>" }
 function New-ShellStillRunning { param([string]$Id) New-ShellResult "<command with shellId: $Id is still running after 240 seconds. The command is still running.>" }
 function New-ShellCollected { param([string]$Id) New-ShellResult "output here`n<shellId: $Id completed with exit code 0>" }
+# Both taken verbatim from real transcripts. The stop result says `id:` where every
+# other marker here says `shellId:`, and each of these is the whole result and nothing
+# else - which is what lets them be matched against the whole of it.
+function New-ShellStopped { param([string]$Id) New-ShellResult "<command with id: $Id stopped>" }
+function New-ShellMovedToBackground {
+    param([string]$Id)
+    New-ShellResult ("<command with shellId: $Id moved to background by the user. You will be " +
+        'automatically notified when it completes. The user has already seen a UI confirmation ' +
+        "- do NOT respond to them about this and do NOT call any more tools for this command. " +
+        "Wait for the user's next instruction.>")
+}
 # Ordered deliberately. The reducer reads the event type from the first "type" in the
 # line, exactly as Copilot writes it; an unordered hashtable put the nested
 # shell_completed first and the event was read as that instead.
@@ -553,6 +564,47 @@ $activity = Get-ActivityFromEvents -Lines @(
 Test-That 'and one quoting a finish does not settle a command still running' {
     @($activity.ShellsFinished).Count -eq 0
 } (@($activity.ShellsFinished) -join ',')
+
+# A shell ended with stop_powershell never completes and fires no shell_completed
+# notification, so neither settling route reached it: it stayed outstanding and the
+# card read "waiting for 1 background command" for the rest of the session with
+# nothing running anywhere. Settling is about termination, not completion (#184).
+$activity = Get-ActivityFromEvents -Lines @((New-ShellStopped 'cflogin')) -VerboseMode $false
+Test-That 'a shell ended with stop_powershell is settled, since nothing will ever complete it' {
+    (@($activity.ShellsFinished) -join ',') -eq 'cflogin' -and @($activity.ShellsStarted).Count -eq 0
+} "finished=$(@($activity.ShellsFinished) -join ',') started=$(@($activity.ShellsStarted) -join ',')"
+$activity = Get-ActivityFromEvents -Lines @((New-ShellStarted 'cflogin'), (New-ShellStopped 'cflogin')) -VerboseMode $false
+Test-That 'so one started and then killed leaves nothing outstanding' {
+    (@($activity.ShellsStarted) -join ',') -eq 'cflogin' -and (@($activity.ShellsFinished) -join ',') -eq 'cflogin'
+} "started=$(@($activity.ShellsStarted) -join ',') finished=$(@($activity.ShellsFinished) -join ',')"
+
+# A sync command the user moves to the background is a background shell like any
+# other, and says so only here. Untracked, it is #151 by a different door - and it
+# left the card's count disagreeing with what the user sees in list_powershell.
+$activity = Get-ActivityFromEvents -Lines @((New-ShellMovedToBackground '32')) -VerboseMode $false
+Test-That 'a sync command the user moved to the background is tracked like any other' {
+    (@($activity.ShellsStarted) -join ',') -eq '32' -and @($activity.ShellsFinished).Count -eq 0
+} "started=$(@($activity.ShellsStarted) -join ',')"
+$activity = Get-ActivityFromEvents -Lines @(
+    (New-ShellMovedToBackground '32'), (New-ShellCollected '32')) -VerboseMode $false
+Test-That 'and settles through the ordinary completion, which is what real ones do' {
+    (@($activity.ShellsFinished) -join ',') -eq '32'
+} (@($activity.ShellsFinished) -join ',')
+
+# Both of these are the whole result when they are real, so quoting one inside other
+# output is not one - the hazard the anchored matching above only narrows, since a
+# grep over a transcript prints a marker at the start of a line in its own output.
+$activity = Get-ActivityFromEvents -Lines @(
+    (New-ShellStarted 'ci164'),
+    (New-ShellResult "found these:`n<command with id: ci164 stopped>`nin the log")) -VerboseMode $false
+Test-That 'a command that merely prints a stop marker settles nothing' {
+    @($activity.ShellsFinished).Count -eq 0 -and (@($activity.ShellsStarted) -join ',') -eq 'ci164'
+} "finished=$(@($activity.ShellsFinished) -join ',')"
+$activity = Get-ActivityFromEvents -Lines @(
+    (New-ShellResult "<command with shellId: phantom moved to background by the user. ...>`nquoted above")) -VerboseMode $false
+Test-That 'nor does one printing a moved-to-background marker start anything' {
+    @($activity.ShellsStarted).Count -eq 0
+} (@($activity.ShellsStarted) -join ',')
 
 $shellLog = Join-Path ([IO.Path]::GetTempPath()) "copilot-shells-$([guid]::NewGuid().ToString('N')).jsonl"
 $shellSessionId = 'cccccccc-1111-2222-3333-444444444444'
@@ -611,6 +663,22 @@ try {
     Test-That 'and says so, rather than leaving the card waiting on nothing' {
         $script:StatusPublishes[-1].Status -eq 'idle'
     }
+
+    # End to end, which is where this was actually seen: forty minutes after an OAuth
+    # helper was killed, every other shell had finished and list_powershell showed none
+    # - and the card still said the session was waiting on a background command.
+    $script:StatusPublishes = @()
+    StepShells -Lines @((New-ShellStarted 'cflogin'), '{"type":"assistant.turn_end"}')
+    Test-That 'a command later killed is outstanding first, so the check below is not vacuous' {
+        $shellEntry.Status -eq 'shell' -and @($shellEntry.BackgroundShells).Count -eq 1
+    } "$($shellEntry.Status), outstanding=$(@($shellEntry.BackgroundShells) -join ',')"
+    StepShells -Lines @((New-ShellStopped 'cflogin'))
+    Test-That 'and killing it hands the session back instead of waiting on it for ever' {
+        $shellEntry.Status -eq 'idle' -and @($shellEntry.BackgroundShells).Count -eq 0
+    } "$($shellEntry.Status), outstanding=$(@($shellEntry.BackgroundShells) -join ',')"
+    Test-That 'with the card told, since nothing else will ever move it off shell' {
+        $script:StatusPublishes[-1].Status -eq 'idle'
+    } "$($script:StatusPublishes[-1].Status)"
 
     StepShells -Lines @((New-ShellStarted 'rel137'), '{"type":"assistant.turn_end"}')
     Test-That 'and a restart finds it waiting, not idle' {
