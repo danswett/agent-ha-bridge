@@ -747,11 +747,17 @@ function Read-DaemonFormAnswer {
         # reading of it is turned into words.
         if (Test-DecisionFieldIsMultiSelect -Field $markerField) {
             $indexes = @(Resolve-DecisionMultiSelectIndexes -Field $markerField -Value $v)
-            if ($indexes.Count -eq 0) {
+            # Nothing ticked is a real answer where the field's schema allows it, and
+            # it arrives in a carrier of its own so it stays distinguishable from the
+            # 'Choose...' placeholder above, which is how an unanswered field is
+            # recognised. Without that carrier the two were the same string, and Send
+            # refused a form the terminal would have taken (#81).
+            if ($indexes.Count -eq 0 -and -not (Test-DecisionMultiSelectEmptyChoice -Field $markerField -Choice $v)) {
                 $missingChoice = $true
                 break
             }
-            $picked += (Get-DecisionMultiSelectLabel -Field $markerField -Indexes ([int[]]$indexes))
+            $picked += $(if ($indexes.Count -eq 0) { $script:DecisionMultiSelectEmptyLabel }
+                         else { Get-DecisionMultiSelectLabel -Field $markerField -Indexes ([int[]]$indexes) })
             $identity += $v
             continue
         }

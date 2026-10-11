@@ -1237,6 +1237,21 @@ $script:DecisionMultiSelectMaxCodes = 1023
 $script:DecisionMultiSelectMaxOptions = 10
 $script:DecisionMultiSelectCodePattern = '^#[1-9][0-9]*(,[1-9][0-9]*)*$'
 
+# What a slot holds when the answer to a multi-select field is "none of these".
+#
+# A Home Assistant select holds one value from a published list, so the empty set has
+# to be an entry in that list like any other subset. The placeholder cannot be it:
+# 'Choose...' is how the daemon tells a field nobody has answered yet from one that
+# has been, so unticking the last row wrote the placeholder and Send then refused the
+# form as incomplete - while the terminal prompt accepted the very same answer by
+# pressing Enter with nothing checked (#81).
+#
+# Both carriers exist for the same reason the subsets have both: the publisher cannot
+# see which card is being served. '#0' names no option, because positions are
+# one-based, and '(none)' is what the degraded dropdown reads as.
+$script:DecisionMultiSelectEmptyLabel = '(none)'
+$script:DecisionMultiSelectEmptyCode = '#0'
+
 function Test-DecisionFieldIsMultiSelect {
     <#
         True when a field lets the user pick several of its options at once.
@@ -1339,6 +1354,12 @@ function Test-DecisionMultiSelectCodeSafe {
         then a perfectly ordinary answer would decode as a different one. Vanishingly
         unlikely and cheap to rule out; guessing wrong would record an answer nobody
         gave.
+
+        The empty set's carrier is deliberately not asked about here. It is not a
+        position - they are one-based, so it names no option - and tying the two
+        together took the position carrier away from a field merely because one of its
+        options was spelled like the empty set, which is how a perfectly ordinary
+        six-option question would have been sent back to the terminal.
     #>
     param([AllowNull()][object]$Field)
 
@@ -1346,6 +1367,21 @@ function Test-DecisionMultiSelectCodeSafe {
         if ([string]$option -match $script:DecisionMultiSelectCodePattern) { return $false }
     }
     $true
+}
+
+function Test-DecisionMultiSelectAllowsEmpty {
+    <#
+        Whether this field's own schema accepts an answer with nothing chosen.
+
+        Recorded by Get-DecisionSchemaFields from `minItems`, and absent from every
+        marker written before it was - and from Claude's parser, whose prompt has
+        never been seen to accept one. Absent means no, so a question captured by an
+        older bridge keeps behaving exactly as it did.
+    #>
+    param([AllowNull()][object]$Field)
+
+    if ($null -eq $Field -or -not $Field.PSObject.Properties['AllowsEmpty']) { return $false }
+    [bool]$Field.AllowsEmpty
 }
 
 function Resolve-DecisionMultiSelectIndexes {
@@ -1492,10 +1528,96 @@ function Get-DecisionMultiSelectCodes {
     $codes.ToArray()
 }
 
+function Get-DecisionMultiSelectEmptyCode {
+    <#
+        The position-shaped carrier for "nothing ticked" on this field: '#0', with as
+        many more zeros as it takes for no option to be spelled like it.
+
+        Position-shaped but never a position, because positions are one-based - so it
+        names no option and can never be confused with a subset. That makes it
+        available to a field carrying its subsets as words just as much as to one
+        carrying them as positions, which is why it is what the card is told to write.
+
+        Lengthened rather than withheld when an option collides with it. Withholding
+        it left a field offering an option called '#0' with no way to say "none" at
+        all, and there are always more of these than there are options to collide
+        with, so one of them is always free.
+    #>
+    param([AllowNull()][object]$Field)
+
+    $options = @($Field.Options | ForEach-Object { [string]$_ })
+    $code = $script:DecisionMultiSelectEmptyCode
+    while ($options -ccontains $code) { $code += '0' }
+    $code
+}
+
+function Get-DecisionMultiSelectEmptyChoices {
+    <#
+        Every carrier this field's slot may hold for "nothing ticked", words first,
+        or an empty list when the field cannot be answered that way.
+
+        Published only beside the subsets themselves: the empty set must never be
+        what makes an otherwise unofferable field look answerable.
+
+        The words are dropped where an option is itself spelled '(none)', because the
+        entry would then stand for two different answers and a dropdown offering it
+        twice means one of the two readings is wrong. The position form is always
+        there, so dropping them never leaves the field unable to say "none".
+    #>
+    param(
+        [AllowNull()][object]$Field,
+        [int]$MaxChoices = $script:DecisionMultiSelectMaxChoices
+    )
+
+    if (-not (Test-DecisionMultiSelectAllowsEmpty -Field $Field)) { return @() }
+    if (@(Get-DecisionMultiSelectSpelledChoices -Field $Field -MaxChoices $MaxChoices).Count -eq 0 -and
+        @(Get-DecisionMultiSelectCodes -Field $Field).Count -eq 0) { return @() }
+    $carriers = @()
+    if (@($Field.Options | ForEach-Object { [string]$_ }) -cnotcontains $script:DecisionMultiSelectEmptyLabel) {
+        $carriers += $script:DecisionMultiSelectEmptyLabel
+    }
+    @($carriers) + @(Get-DecisionMultiSelectEmptyCode -Field $Field)
+}
+
+function Get-DecisionMultiSelectEmptyChoice {
+    <#
+        The one carrier a card should write for "nothing ticked", or '' when this
+        field cannot be answered that way and the placeholder has to stand.
+
+        Always the position form. It is the one that can never be an option's own
+        text, so it is available whatever this field's subsets are carried as, and
+        naming the exact value here keeps the spelling of the empty set in one place
+        rather than repeating it in the card.
+    #>
+    param([AllowNull()][object]$Field)
+
+    if (@(Get-DecisionMultiSelectEmptyChoices -Field $Field).Count -eq 0) { return '' }
+    Get-DecisionMultiSelectEmptyCode -Field $Field
+}
+
+function Test-DecisionMultiSelectEmptyChoice {
+    <#
+        Whether a slot value is this field's own way of saying "nothing is ticked".
+
+        Asked per field rather than against the two spellings, because a field that
+        does not allow an empty answer must never resolve one: there, '(none)' is a
+        value nobody could have written and reading it as an answer would submit a
+        form the prompt would refuse.
+    #>
+    param(
+        [AllowNull()][object]$Field,
+        [AllowEmptyString()][AllowNull()][string]$Choice
+    )
+
+    if ([string]::IsNullOrEmpty($Choice)) { return $false }
+    @(Get-DecisionMultiSelectEmptyChoices -Field $Field) -ccontains $Choice
+}
+
 function Get-DecisionMultiSelectChoices {
     <#
         Everything this field's slot is allowed to hold: the subsets in words where
-        they fit, then the same subsets as positions.
+        they fit, then the same subsets as positions, then the empty set in whichever
+        of those forms were published.
 
         Both, because the publisher cannot see which card Home Assistant is serving -
         it runs in the hook, before any of that is known - and a select rejects a
@@ -1506,6 +1628,8 @@ function Get-DecisionMultiSelectChoices {
 
         Empty only when the field genuinely cannot be offered this way, which now
         means too many options rather than options that were worded at any length.
+        The empty set never makes an unofferable field offerable: it is published only
+        alongside the carrier its subsets already use.
     #>
     param(
         [AllowNull()][object]$Field,
@@ -1514,7 +1638,7 @@ function Get-DecisionMultiSelectChoices {
 
     $spelled = @(Get-DecisionMultiSelectSpelledChoices -Field $Field -MaxChoices $MaxChoices)
     $codes = @(Get-DecisionMultiSelectCodes -Field $Field)
-    @($spelled) + @($codes)
+    @($spelled) + @($codes) + @(Get-DecisionMultiSelectEmptyChoices -Field $Field -MaxChoices $MaxChoices)
 }
 
 function Resolve-DecisionMultiSelectChoice {
@@ -1585,7 +1709,8 @@ function Get-DecisionSchemaFields {
         DefaultIndex is the initial scalar focus, not the dashboard placeholder. A
         `type: array` field is captured as multi-select, with the positions its default
         already checks; its value list is what the answer is checked against, so an
-        array is never inferred back from the labels on screen.
+        array is never inferred back from the labels on screen. AllowsEmpty records
+        whether its `minItems` lets the answer be nothing at all.
     #>
     param(
         [AllowNull()][psobject]$Schema
@@ -1597,6 +1722,22 @@ function Get-DecisionSchemaFields {
 
     $fields = @()
     $labelsSeen = [Collections.Generic.HashSet[string]]::new([StringComparer]::OrdinalIgnoreCase)
+    # Whether an array field's own schema accepts nothing at all. `minItems` defaults
+    # to 0 in JSON Schema and the ask_user form really does leave it off, so absent is
+    # a yes - that is the ordinary "pick any of these, or none" field, and the terminal
+    # prompt commits it with Enter on an untouched list.
+    #
+    # Anything that is not plainly a whole number is read as "no". It only decides
+    # whether an extra option is offered, and offering one where the prompt would
+    # actually refuse the answer is the expensive direction to be wrong in: the
+    # keystrokes would be driven in and the form rejected under somebody's name.
+    $allowsNothing = {
+        param($SchemaField)
+        if (-not $SchemaField.PSObject.Properties['minItems']) { return $true }
+        $minItems = $SchemaField.minItems
+        if ($minItems -isnot [int] -and $minItems -isnot [long]) { return $false }
+        ([long]$minItems -le 0)
+    }
     foreach ($name in $names) {
         $field = $Schema.properties.$name
         $label = if ($field.PSObject.Properties['title']) { [string]$field.title } else { '' }
@@ -1668,6 +1809,7 @@ function Get-DecisionSchemaFields {
             # is answered with cannot drift from the prompt it was captured off.
             MultiSelectStyle = $(if ($isArray -and $choices.Count -gt 0) { 'space-toggle' } else { '' })
             DefaultIndexes   = @($defaultIndexes.ToArray())
+            AllowsEmpty      = ($isArray -and $choices.Count -gt 0 -and (& $allowsNothing $field))
         }
     }
     @($fields)
@@ -3628,12 +3770,21 @@ function Test-CopilotAnswerMatchesSelections {
         $options = @($field.Options)
         $wanted = if ($multi) { @(Resolve-DecisionMultiSelectChoice -Field $field -Choice $selectionList[$i]) }
                   else { @($selectionList[$i]) }
+        # Nothing chosen, where the field's own schema says nothing is an answer. It
+        # has to be told apart from a selection that resolved to nothing at all, which
+        # is unreadable and stays unconfirmed - otherwise an answer the prompt accepted
+        # would be reported back as "unconfirmed, check the terminal" (#81).
+        #
+        # @() around $wanted, not $wanted.Count: an if that yields an empty array
+        # assigns $null, and reading Count off that is a terminating error here.
+        $emptyAnswer = $multi -and @($wanted).Count -eq 0 -and
+            (Test-DecisionMultiSelectEmptyChoice -Field $field -Choice $selectionList[$i])
         $expected = [Collections.Generic.HashSet[int]]::new()
         foreach ($option in $wanted) {
             $index = [Array]::IndexOf($options, $option)
             if ($index -lt 0 -or -not $expected.Add($index)) { return (& $finish 'Unconfirmed') }
         }
-        if ($expected.Count -eq 0) { return (& $finish 'Unconfirmed') }
+        if ($expected.Count -eq 0 -and -not $emptyAnswer) { return (& $finish 'Unconfirmed') }
         $identities = [Collections.Generic.Dictionary[string, int]]::new([StringComparer]::Ordinal)
         $commaSpellings = [Collections.Generic.List[string]]::new()
         for ($index = 0; $index -lt $options.Count; $index++) {
@@ -3677,7 +3828,12 @@ function Test-CopilotAnswerMatchesSelections {
         }
         $actualValue = $answers[$key]
         $parts = [object[]]::new(1)
-        if ($multi -and $textMode) {
+        # An empty answer recorded as an empty field. Only where this card sent one:
+        # elsewhere a blank value is a result that said nothing about the field, which
+        # is not the same as one that said "none", and reading the two alike would
+        # confirm an answer the session may never have been given.
+        if ($emptyAnswer -and $textMode -and [string]::IsNullOrWhiteSpace([string]$actualValue)) { $parts = @() }
+        elseif ($multi -and $textMode) {
             $parts = @(([string]$actualValue).Split(',') | ForEach-Object { $_.Trim() })
             # A dropped label that spelled a comma is ambiguous only where the recorded
             # text could actually be it: with "a,b" among the options, a recorded "a,b"

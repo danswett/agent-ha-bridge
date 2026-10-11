@@ -52,8 +52,16 @@
  * words were gone from everywhere. The daemon now publishes answer_consumed_at
  * naming the publish it used, and the card holds the words until it sees that name
  * or sees the question go without it - see _checkAnswerConsumed (#104).
+ *
+ * 1.36.0 lets a multi-select field be answered with nothing ticked, where its own
+ * schema says that is an answer. Unticking the last row used to write the field
+ * slot's 'Choose...' placeholder, which is the one value the daemon reads as "not
+ * answered yet", so Send refused a form the terminal would have accepted. The bridge
+ * now publishes the carrier to write instead, in field_<n>_empty, and the card writes
+ * that - keeping the placeholder for a field that must have something chosen, and for
+ * any bridge old enough not to send the attribute (#81).
  */
-const CARD_VERSION = '1.35.0';
+const CARD_VERSION = '1.36.0';
 
 /*
  * How large a non-image attachment may be.
@@ -1262,9 +1270,17 @@ function multiSelectCode(options, picked) {
  * The joined form is matched whole rather than split on the separator: an option's
  * own text may contain " + ", and then two different answers look identical. The
  * bridge refuses to split for the same reason.
+ *
+ * emptyValue is this field's own way of saying nothing is ticked, where its schema
+ * accepts that; absent otherwise, and from every bridge older than the attribute.
  */
-function multiSelectPick(options, separator, state, useCodes) {
+function multiSelectPick(options, separator, state, useCodes, emptyValue) {
   if (!state || options.length === 0 || options.length > 20) { return []; }
+  // The carrier the bridge published for "nothing ticked". Recognised before the
+  // shapes below rather than left to fall through them: it is a value no subset can
+  // produce, so a scan would only ever end up here anyway, and saying so is what
+  // keeps an answered-with-nothing field from reading like an unresolvable one.
+  if (emptyValue && state === emptyValue) { return []; }
   if (useCodes && CHOICE_CODE_PATTERN.test(state)) {
     const seen = new Set();
     const picked = [];
@@ -1553,9 +1569,13 @@ class AgentBridgeChoicesCard extends HTMLElement {
           // Whether this slot will take positions. Absent from an older bridge, which
           // only ever published the options written out, so the words stay the default.
           armed.codes = !!decisionAttrs[`field_${i + 1}_codes`];
+          // What to write when every row is unticked. Absent unless this field's own
+          // schema accepts an empty answer, and absent from any bridge older than the
+          // attribute - and then the placeholder stands, as it always did.
+          armed.emptyValue = String(decisionAttrs[`field_${i + 1}_empty`] || '');
           armed.slotOptions = armed.options;
           armed.options = base;
-          armed.picked = multiSelectPick(base, armed.separator, armed.chosen, armed.codes);
+          armed.picked = multiSelectPick(base, armed.separator, armed.chosen, armed.codes, armed.emptyValue);
         }
       }
       fields.push(armed);
@@ -1746,9 +1766,12 @@ class AgentBridgeChoicesCard extends HTMLElement {
       picked = group.picked.indexOf(option) >= 0
         ? group.picked.filter((o) => o !== option)
         : group.options.filter((o) => group.picked.indexOf(o) >= 0 || o === option);
-      // Nothing ticked is not an answer, so the slot goes back to its placeholder and
-      // the daemon reads the field as still unanswered rather than as an empty set.
-      if (picked.length === 0) { value = CHOICE_FIELD_PLACEHOLDER; }
+      // Nothing ticked. Where the field's schema accepts that, the bridge publishes a
+      // carrier of its own for it and the slot holds that, so the daemon reads an
+      // answer rather than an unanswered field. Where it does not, the slot goes back
+      // to its placeholder and the field is unanswered again - which is also what
+      // happens against a bridge too old to publish the carrier.
+      if (picked.length === 0) { value = group.emptyValue || CHOICE_FIELD_PLACEHOLDER; }
       // Positions where the bridge said the slot will take them, because the options
       // written out may be far longer than a select entry can hold - which is what
       // used to send an ordinarily-worded question to the terminal instead.

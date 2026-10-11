@@ -54,7 +54,14 @@
 # the bridge armed up to twelve - a five-field question whose fifth field has no
 # control, waiting for an answer that cannot be given. Get-BridgeRenderArtifact now
 # fingerprints the ceiling too, so the next change to it cannot repeat this quietly.
-$script:BridgeDashboardRenderVersion = '1.9.0'
+#
+# 1.10.0, not 1.9.0: Test-BridgeActivityCardServed no longer believes the version
+# string on its own. It is one of the helpers Get-BridgeRenderArtifact fingerprints,
+# and Test-BridgeServedCardContent - which it now consults, and which is fingerprinted
+# beside it for the same reason the slot ceiling is - makes every gate answer false
+# when the served bytes are a different build of the version they claim. That changes
+# what Save-CopilotSessionDashboard emits, so the fence needs a version to move to.
+$script:BridgeDashboardRenderVersion = '1.10.0'
 $script:BridgeDashboardObservation = $null
 
 function Invoke-CopilotHaWebSocket {
@@ -972,7 +979,7 @@ function Get-BridgePublicationHash {
 
 function Get-BridgeRenderArtifact {
     $source = @(
-        foreach ($name in @('Save-CopilotSessionDashboard', 'Test-BridgeActivityCardServed', 'Get-BridgeDashboardInputSignature', 'ConvertTo-BridgePublicationJson')) {
+        foreach ($name in @('Save-CopilotSessionDashboard', 'Test-BridgeActivityCardServed', 'Test-BridgeServedCardContent', 'Get-BridgeDashboardInputSignature', 'ConvertTo-BridgePublicationJson')) {
             (Get-Command $name).ScriptBlock.ToString().Replace("`r`n", "`n")
         }
         # The renderer writes one field-slot entity id per slot, so this ceiling
@@ -1402,8 +1409,25 @@ function Set-BridgePublicationPolicy {
 }
 
 function Get-BridgeDashboardInputSignature {
+    <#
+        Everything the rendered dashboard depends on, as one digest. Reconciliation
+        compares it against the accepted receipt to decide whether to rebuild.
+
+        Whether the served card is this build belongs in it, because the renderer now
+        asks that question and changes what it emits on the answer. The two can move
+        independently: an install replacing the local card with different bytes at an
+        unchanged CARD_VERSION leaves the registered resource - and so the URL, and so
+        every other input here - exactly as it was. Without this the receipt stayed
+        verified, the rebuild was skipped, and the dashboard went on showing the
+        feature-specific layout for a card this bridge had stopped vouching for, which
+        is the state the gate exists to leave behind.
+
+        CardTrusted is the answer when the caller already has it, and is how the
+        binding is tested; left alone it is worked out here.
+    #>
     param([AllowEmptyCollection()][object[]]$Sessions, [AllowEmptyCollection()][object[]]$Machines,
-        [AllowEmptyString()][string]$MachineSelector, [AllowEmptyString()][string]$ReplyCardUrl)
+        [AllowEmptyString()][string]$MachineSelector, [AllowEmptyString()][string]$ReplyCardUrl,
+        [AllowNull()][object]$CardTrusted = $null)
     $sessionInputs = @($Sessions | Sort-Object Node | ForEach-Object {
         $entry = $_
         $item = @{}
@@ -1421,8 +1445,13 @@ function Get-BridgeDashboardInputSignature {
         $item.SessionNodes = if ($entry.PSObject.Properties['SessionNodes']) { @($entry.SessionNodes | Sort-Object) } else { @() }
         $item
     })
+    # No card at all is already the fallback, so there is nothing left to distrust.
+    $trusted = if ($null -ne $CardTrusted) { [bool]$CardTrusted }
+               elseif ([string]::IsNullOrWhiteSpace($ReplyCardUrl)) { $true }
+               else { [bool](Test-BridgeServedCardContent -ReplyCardUrl $ReplyCardUrl) }
     Get-BridgePublicationHash (ConvertTo-BridgePublicationJson @{
         sessions = $sessionInputs; machines = $machineInputs; selector = $MachineSelector; cardUrl = $ReplyCardUrl
+        cardTrusted = $trusted
     })
 }
 
@@ -1505,6 +1534,97 @@ function Initialize-BridgeDashboard {
     $script:BridgeDashboardReady = $true
 }
 
+$script:BridgeServedCardTrustKey = ''
+$script:BridgeServedCardTrusted = $true
+
+function Test-BridgeServedCardContent {
+    <#
+        Whether the card Home Assistant is serving really is the build this renderer
+        was written against, rather than merely something calling itself that version.
+
+        The two halves of the contract disagreed about what "the same card" means. The
+        publication fence compares a version *and* a content hash, and refuses an equal
+        version whose bytes differ. Save-CopilotSessionDashboard read the version alone
+        off the resource URL and believed it - so while publication of the correct card
+        sat paused, the generator went on emitting the layout that version implies.
+        The served card drew its own send control and the generated one drew another:
+        two Send buttons, and an answer submitted in a shape the running bridge did not
+        recognise as confirmation, reported as "Answer unconfirmed" (#110).
+
+        Only a card this cannot vouch for is distrusted: an equal version whose bytes
+        differ, or an inline resource that cannot be read as a coherent version and
+        content at all. A served card that is genuinely older or newer is a version
+        this renderer can reason about, and that fallback is the whole point of the
+        gating. An unreadable local file, or a file resource whose bytes are served
+        from the Home Assistant host and cannot be seen from here, leaves the version
+        alone to decide - the same answer as before any of this existed.
+
+        Read from the local card file rather than from the publication policy: the
+        policy records what was last accepted, which during a paused standoff is the
+        wrong card. The file beside these hooks is the build this code shipped with.
+    #>
+    param([Parameter(Mandatory)][string]$ReplyCardUrl)
+
+    $source = Join-Path (Split-Path -Parent $PSScriptRoot) 'frontend/agent-bridge-reply-card.js'
+    # Keyed on the local card's actual content, never on its size and timestamp. Those
+    # are metadata about bytes, and "looks right, hashes differently" is the whole
+    # failure this gate exists for - a copy that preserves the source's timestamp,
+    # which Copy-Item does, can put different bytes of the same length in place and
+    # leave a stale answer cached behind them. Hashing the file every time is cheap;
+    # what the cache is really saving is decoding the 220 KB inline resource on each
+    # of the fifteen or so gates a single render asks about.
+    $bytes = $null
+    try { $bytes = [IO.File]::ReadAllBytes($source) } catch { }
+    $localHash = if ($null -ne $bytes) {
+        [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+    } else { '' }
+    $key = "$ReplyCardUrl`u{0001}$localHash"
+    if ($script:BridgeServedCardTrustKey -ceq $key) { return $script:BridgeServedCardTrusted }
+
+    $trusted = $true
+    $detail = ''
+    $served = $null
+    try { $served = Get-BridgeRegisteredCardArtifact -Url $ReplyCardUrl }
+    catch {
+        if ($_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        # An inline resource carries its own bytes, so one that cannot be read as a
+        # coherent version and content - malformed base64, or a CARD_VERSION its own
+        # body contradicts - is not a card whose number means anything. Letting that
+        # fall back to the version would re-create exactly the layout mismatch this
+        # exists to prevent, on content nothing has verified.
+        #
+        # A file resource is different: it is served from the Home Assistant host and
+        # its bytes were never readable from here, which is the ordinary case.
+        if ($ReplyCardUrl.StartsWith('data:', [StringComparison]::Ordinal)) {
+            $trusted = $false
+            $detail = "the inline resource could not be read: $($_.Exception.Message)"
+        }
+    }
+    if ($trusted -and $served -and $served.hash -and $localHash) {
+        # The local card is what the comparison is against. Not having it, or not being
+        # able to read a version out of it, is not evidence of a conflict - refusing
+        # every custom card over that would turn a bad read into a downgraded dashboard.
+        $text = ''
+        try { $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes) } catch { }
+        if ($text -match "CARD_VERSION\s*=\s*'([^']+)'" -and $served.version -ceq $Matches[1] -and
+            $served.hash -cne $localHash) {
+            $trusted = $false
+            $detail = "a different build of the same version: served $($served.hash.Substring(0, 12)), local $($localHash.Substring(0, 12))"
+        }
+    }
+
+    $script:BridgeServedCardTrustKey = $key
+    $script:BridgeServedCardTrusted = $trusted
+    if (-not $trusted) {
+        # The only signal this state produced was the installer's "publication paused"
+        # line on whichever machine happened to run an install, and a dashboard that
+        # misbehaved in a way nothing explained.
+        Write-DecisionBridgeLog ("the served reply card is not the build this renderer was written against " +
+            "($detail); rendering the fallback layout until the correct card is published")
+    }
+    $trusted
+}
+
 function Test-BridgeActivityCardServed {
     <#
         True when the served reply-card file includes agent-bridge-activity-card (or,
@@ -1514,6 +1634,10 @@ function Test-BridgeActivityCardServed {
         agent-bridge-choices-card in 1.13.0, its whole-form shape - a labelled
         group of rows per field, replacing the per-field dropdowns - in 1.15.0, and
         agent-bridge-status-card in 1.19.0.
+
+        False for every version when the bytes behind that number are not this build's
+        (Test-BridgeServedCardContent), because then the number says nothing about what
+        the browser will actually draw.
     #>
     param(
         [AllowEmptyString()][AllowNull()][string]$ReplyCardUrl,
@@ -1524,6 +1648,7 @@ function Test-BridgeActivityCardServed {
     if ($ReplyCardUrl -notmatch '[?&]v=([0-9]+(\.[0-9]+){1,3})') { return $false }
     $served = $null
     if (-not [version]::TryParse($Matches[1], [ref]$served)) { return $false }
+    if (-not (Test-BridgeServedCardContent -ReplyCardUrl $ReplyCardUrl)) { return $false }
     $served -ge [version]$MinimumVersion
 }
 

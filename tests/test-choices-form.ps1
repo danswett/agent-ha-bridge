@@ -759,6 +759,116 @@ Test-That 'so what it starts on really does mean those two rows' {
         -Choice ([string]$script:HaStates["select.${node}_f1"].state)) -join '|') -eq 'A|B'
 } "resolves=[$(@(Resolve-DecisionMultiSelectChoice -Field $literalCodeField[0] -Choice ([string]$script:HaStates["select.${node}_f1"].state)) -join '|')]"
 
+# --- 6d. a question whose schema says nothing is an answer -----------------------
+
+Write-Host ''
+Write-Host '--- a multi-select that may be answered with nothing ticked ---'
+# The terminal prompt opens on an unchecked list and Enter commits exactly that, but
+# the dashboard had no way to say it. Unticking the last row wrote the field slot's
+# 'Choose...' placeholder, which is the one value the daemon reads as "not answered
+# yet", so Send refused a form the session would have accepted - and from a list
+# nobody had touched there was no row to untick in the first place (#81).
+$script:HaStates = @{}
+$emptyField = @([pscustomobject]@{
+    Label = 'Features'; Options = @('Auth', 'Billing', 'Search'); IsText = $false
+    MultiSelect = $true; MultiSelectStyle = 'space-toggle'; DefaultIndexes = @(); AllowsEmpty = $true
+})
+$armedEmpty = [DateTimeOffset]::Now.AddSeconds(-5)
+Set-CopilotMqttDecision -SessionId $sessionId -SessionName 'Copilot: a task' -Machine 'BOX' `
+    -Question 'Which features?' -Choices @() -Fields $emptyField `
+    -DecisionId 'd3e' -Headers $headers | Out-Null
+
+Test-That 'the empty set gets an entry of its own, in both carriers, beside the placeholder' {
+    $offered = @($script:HaStates["select.${node}_f1"].attributes.options)
+    $offered[0] -ceq 'Choose...' -and $offered -ccontains '(none)' -and $offered -ccontains '#0'
+} "f1=[$(@($script:HaStates["select.${node}_f1"].attributes.options) -join ',')]"
+Test-That 'and the card is told exactly which of them to write' {
+    $script:HaStates["select.${node}_decision"].attributes['field_1_empty'] -ceq '#0'
+} "attrs=[$(@($script:HaStates["select.${node}_decision"].attributes.Keys) -join ',')]"
+Test-That 'the slot starts there, because that is the state the prompt already opens in' {
+    [string]$script:HaStates["select.${node}_f1"].state -ceq '#0'
+} "state=[$($script:HaStates["select.${node}_f1"].state)]"
+$emptyDrawn = Invoke-ChoicesCard -Taps @()
+Test-That 'which the card draws as the options with none of them ticked' {
+    @($emptyDrawn.rows | Where-Object { @($_.classes) -contains 'chosen' }).Count -eq 0 -and
+    (@($emptyDrawn.rows | Where-Object { $_.tag -eq 'BUTTON' } | ForEach-Object { $_.text }) -join '|') -eq
+        'Auth|Billing|Search|Send answer|Cancel request'
+} "rows=[$(@($emptyDrawn.rows | ForEach-Object { $_.text }) -join '|')] chosen=[$(@($emptyDrawn.rows | Where-Object { @($_.classes) -contains 'chosen' }).Count)]"
+
+# And back again, which is the gesture the report was actually about.
+$ticked = Invoke-ChoicesCard -Taps @('Billing')
+Test-That 'ticking a row moves the slot off the empty set' {
+    [string]@($ticked.calls)[-1].data.option -ceq '#2'
+} "calls=[$(@($ticked.calls) | ForEach-Object { $_.data.option })]"
+$script:HaStates["select.${node}_f1"].state = '#2'
+$untickedLast = Invoke-ChoicesCard -Taps @('Billing')
+Test-That 'and unticking the last one returns it there rather than to the placeholder' {
+    [string]@($untickedLast.calls)[-1].data.option -ceq '#0'
+} "calls=[$(@($untickedLast.calls) | ForEach-Object { $_.data.option })]"
+
+$script:HaStates["select.${node}_f1"].state = '#0'
+$script:HaStates["text.${node}_reply"] = [ordered]@{ state = ' '; attributes = @{} }
+$script:HaStates["button.${node}_submit"] = [ordered]@{ state = [DateTimeOffset]::Now.ToString('o'); attributes = @{} }
+$emptyMarker = [pscustomobject]@{ decisionId = 'd3e'; mode = 'multiple_choice'; armedAt = $armedEmpty.ToString('o'); fields = $emptyField }
+Set-Baseline -DecisionId 'd3e'
+$emptyState = @{ $sessionId = [pscustomobject]@{ Name = 'Copilot: a task'; Machine = 'BOX'; LastSubmitAt = '' } }
+$emptyAnswer = Read-DaemonDecisionAnswer -SessionId $sessionId -Marker $emptyMarker -State $emptyState -Headers $headers
+Test-That 'the daemon reads it as an answer, not as a field nobody filled in' {
+    (@($emptyAnswer.Selections) -join '|') -ceq '#0' -and $emptyAnswer.Answer -ceq '(none)'
+} "selections=[$(@($emptyAnswer.Selections) -join '|')] answer=[$($emptyAnswer.Answer)]"
+Test-That 'and sending it walks the list pressing nothing, leaving Enter to accept it' {
+    @(Get-BridgeFormPayloads -Fields $emptyField -Selections @($emptyAnswer.Selections))[0].Payload -eq ''
+} ((@(Get-BridgeFormPayloads -Fields $emptyField -Selections @($emptyAnswer.Selections))[0].Payload) -replace [regex]::Escape([string][char]27), '<esc>')
+Test-That 'and the result the session records for it confirms rather than mystifies' {
+    (Test-CopilotAnswerMatchesSelections -ResultContent '{"Features":[]}' `
+        -Fields $emptyField -Selections @($emptyAnswer.Selections) -Detailed).Status -ceq 'Matched'
+}
+Test-That 'while an answer that recorded something is still the mismatch it is' {
+    (Test-CopilotAnswerMatchesSelections -ResultContent '{"Features":["Billing"]}' `
+        -Fields $emptyField -Selections @($emptyAnswer.Selections) -Detailed).Status -ceq 'Mismatch'
+}
+
+# The other side of the gate. A field whose schema requires a choice must be no
+# different from before: no entry for the empty set, nothing told to the card, and
+# unticking the last row still leaving it unanswered.
+$script:HaStates = @{}
+$requiredField = @([pscustomobject]@{
+    Label = 'Features'; Options = @('Auth', 'Billing', 'Search'); IsText = $false
+    MultiSelect = $true; MultiSelectStyle = 'space-toggle'; DefaultIndexes = @()
+})
+Set-CopilotMqttDecision -SessionId $sessionId -SessionName 'Copilot: a task' -Machine 'BOX' `
+    -Question 'Which features?' -Choices @() -Fields $requiredField `
+    -DecisionId 'd3f' -Headers $headers | Out-Null
+Test-That 'a field that must have something chosen offers no entry for the empty set' {
+    $offered = @($script:HaStates["select.${node}_f1"].attributes.options)
+    -not ($offered -ccontains '(none)') -and -not ($offered -ccontains '#0') -and
+    [string]$script:HaStates["select.${node}_f1"].state -ceq 'Choose...'
+} "f1=[$(@($script:HaStates["select.${node}_f1"].attributes.options) -join ',')] state=[$($script:HaStates["select.${node}_f1"].state)]"
+Test-That 'and the card is told nothing to write, so it keeps the placeholder' {
+    -not $script:HaStates["select.${node}_decision"].attributes.Contains('field_1_empty')
+} "attrs=[$(@($script:HaStates["select.${node}_decision"].attributes.Keys) -join ',')]"
+$script:HaStates["select.${node}_f1"].state = '#2'
+$requiredUntick = Invoke-ChoicesCard -Taps @('Billing')
+Test-That 'unticking its last row writes the placeholder, exactly as it always did' {
+    [string]@($requiredUntick.calls)[-1].data.option -ceq 'Choose...'
+} "calls=[$(@($requiredUntick.calls) | ForEach-Object { $_.data.option })]"
+$script:HaStates["select.${node}_f1"].state = 'Choose...'
+$script:HaStates["text.${node}_reply"] = [ordered]@{ state = ' '; attributes = @{} }
+$script:HaStates["button.${node}_submit"] = [ordered]@{ state = [DateTimeOffset]::Now.ToString('o'); attributes = @{} }
+$requiredMarker = [pscustomobject]@{ decisionId = 'd3f'; mode = 'multiple_choice'; armedAt = $armedEmpty.ToString('o'); fields = $requiredField }
+Set-Baseline -DecisionId 'd3f'
+$requiredState = @{ $sessionId = [pscustomobject]@{ Name = 'Copilot: a task'; Machine = 'BOX'; LastSubmitAt = '' } }
+$requiredAnswer = Read-DaemonDecisionAnswer -SessionId $sessionId -Marker $requiredMarker -State $requiredState -Headers $headers
+Test-That 'which the daemon still reads as unanswered, so Send still refuses it' {
+    @($requiredAnswer.Selections).Count -eq 0 -and [string]$requiredAnswer.Answer -eq ''
+} "selections=[$(@($requiredAnswer.Selections) -join '|')] answer=[$($requiredAnswer.Answer)]"
+# A value only the other field could have produced must not become an answer here.
+Test-That 'and a carrier it never published is not read as one either' {
+    $script:HaStates["select.${node}_f1"].state = '(none)'
+    $strayAnswer = Read-DaemonDecisionAnswer -SessionId $sessionId -Marker $requiredMarker -State $requiredState -Headers $headers
+    @($strayAnswer.Selections).Count -eq 0
+}
+
 # --- 6c. the question that actually failed on the dashboard ---------------------
 
 Write-Host ''

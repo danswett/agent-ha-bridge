@@ -156,6 +156,27 @@ function New-TestPublicationCard {
     $path
 }
 
+function Get-TestInlineCardUrl {
+    <#
+        A card source as the inline resource Home Assistant would actually serve.
+
+        The real encoder, because what is under test is a comparison of the bytes
+        behind the resource against the bytes on disk, and a stand-in encoder would
+        be comparing the test against itself. Loaded in this function's scope for the
+        same reason Initialize-TestPublicationAuthority does it: dot-sourcing the
+        checker rebinds every switch it declares, -Json among them.
+    #>
+    param([Parameter(Mandatory)][string]$SourcePath, [Parameter(Mandatory)][string]$Version)
+    if (-not (Get-Command Get-BridgeInlineReplyCardUrl -ErrorAction SilentlyContinue)) {
+        $previousFrontendNoRun = $env:BRIDGE_FRONTEND_NORUN
+        $env:BRIDGE_FRONTEND_NORUN = '1'
+        . (Join-Path $PSScriptRoot '..\hooks\bridge-frontend-cards.ps1')
+        if ($null -eq $previousFrontendNoRun) { Remove-Item Env:\BRIDGE_FRONTEND_NORUN }
+        else { $env:BRIDGE_FRONTEND_NORUN = $previousFrontendNoRun }
+    }
+    Get-BridgeInlineReplyCardUrl -SourcePath $SourcePath -Version $Version
+}
+
 function New-TestPublicationPolicy {
     param([string]$CardSource, [string]$Mode = 'advance', [long]$Generation = 1, [string]$Writer = 'writer-a')
     $card = @{ version = (Get-BridgeReplyCardFileVersion $CardSource); hash = (Get-FileHash -LiteralPath $CardSource -Algorithm SHA256).Hash.ToLowerInvariant() }
@@ -604,6 +625,94 @@ Save-CopilotSessionDashboard -Sessions $sessions -Machines $twoMachines -ReplyCa
 Test-That "the card this checkout ships ($shippedCard) is new enough for every card it gates on" {
     @(Find-TestCardsOfType 'custom:agent-bridge-session-card').Count -gt 0 -and
     @(Find-TestCardsOfType 'custom:agent-bridge-activity-card').Count -gt 0
+}
+
+Write-Host '--- and on the bytes behind that number, not the number alone ---'
+# The fence and the generator disagreed about what "the same card" means. The fence
+# compares a version *and* a content hash and refuses an equal version whose bytes
+# differ; the generator read the number off the resource URL and believed it. So while
+# publication of the correct card sat paused - which is the fence working - the
+# dashboard was built for features the served card did not have: two Send buttons on
+# screen at once, and answers reported as unconfirmed because the one that drew them
+# submitted in a shape this bridge does not recognise (#110).
+$shippedCardPath = (Join-Path $PSScriptRoot '..\frontend\agent-bridge-reply-card.js')
+$inlineShipped = Get-TestInlineCardUrl -SourcePath $shippedCardPath -Version $shippedCard
+Test-That 'this build, served inline, answers every gate up to its own version' {
+    (Test-BridgeActivityCardServed -ReplyCardUrl $inlineShipped -MinimumVersion '1.10.0') -and
+    (Test-BridgeActivityCardServed -ReplyCardUrl $inlineShipped -MinimumVersion $shippedCard)
+}
+$impostorSource = New-TestPublicationCard $shippedCard 'export const notThisBuild = true;'
+$impostorUrl = Get-TestInlineCardUrl -SourcePath $impostorSource -Version $shippedCard
+Test-That "a different build calling itself $shippedCard answers no gate at all" {
+    -not (Test-BridgeActivityCardServed -ReplyCardUrl $impostorUrl -MinimumVersion '1.10.0') -and
+    -not (Test-BridgeActivityCardServed -ReplyCardUrl $impostorUrl -MinimumVersion '1.13.0')
+}
+Test-That 'and the standoff is said out loud somewhere other than installer stdout' {
+    (Get-Content -LiteralPath $script:DecisionBridgeConfig.LogFile -Raw) -match 'different build of the same version'
+}
+# An inline resource is its own bytes, so one that cannot be read as a coherent
+# version and content is not a card whose number means anything. Falling back to the
+# number there would hand it every feature that number implies, on content nothing
+# has verified - which is the mismatch this whole check exists to prevent.
+$lyingSource = New-TestPublicationCard '1.19.0' 'export const bodyDisagreesWithItsLabel = true;'
+$lyingUrl = (Get-TestInlineCardUrl -SourcePath $lyingSource -Version '1.19.0') -replace '\?v=1\.19\.0$', "?v=$shippedCard"
+Test-That 'an inline card whose body contradicts its own version number answers nothing' {
+    -not (Test-BridgeActivityCardServed -ReplyCardUrl $lyingUrl -MinimumVersion '1.10.0')
+}
+$truncatedUrl = 'data:text/javascript;base64,bm90IGJhc2U2NCBhdCBhbGw!!!#agent-bridge-reply-card.js?v=1.19.0'
+Test-That 'and so does one whose inline body cannot be decoded at all' {
+    -not (Test-BridgeActivityCardServed -ReplyCardUrl $truncatedUrl -MinimumVersion '1.10.0')
+}
+# Only an equal version is ambiguous. A number this renderer can reason about is still
+# the thing to reason about, however the bytes behind it were built - otherwise every
+# machine whose card is simply older than its bridge would lose the whole dashboard.
+$olderSource = New-TestPublicationCard '1.19.0' 'export const alsoNotThisBuild = true;'
+$olderUrl = Get-TestInlineCardUrl -SourcePath $olderSource -Version '1.19.0'
+Test-That 'a genuinely older card is judged by its version, as it always was' {
+    (Test-BridgeActivityCardServed -ReplyCardUrl $olderUrl -MinimumVersion '1.19.0') -and
+    -not (Test-BridgeActivityCardServed -ReplyCardUrl $olderUrl -MinimumVersion '1.20.0')
+}
+# A file resource is served from the Home Assistant host, so its bytes cannot be read
+# from here at all. Distrusting what cannot be compared would hand every such install
+# the fallback for ever, over nothing.
+Test-That 'and so is a file resource, whose bytes are not readable from here' {
+    Test-BridgeActivityCardServed -ReplyCardUrl "/local/agent-bridge-reply-card.js?v=$shippedCard" -MinimumVersion $shippedCard
+}
+
+Set-TestPublicationCardUrl -Url $impostorUrl
+Save-CopilotSessionDashboard -Sessions $sessions -Machines $twoMachines -ReplyCardUrl $impostorUrl
+Test-That 'so the dashboard generated against it falls back instead of trusting the number' {
+    @(Find-TestCardsOfType 'custom:agent-bridge-session-card').Count -eq 0 -and
+    @(Find-TestCardsOfType 'custom:agent-bridge-activity-card').Count -eq 0
+}
+Test-That 'and the fallback still leaves somewhere to reply from' {
+    @(Find-TestCardsOfType 'custom:agent-bridge-reply-card').Count -gt 0
+}
+Set-TestPublicationCardUrl -Url "/local/agent-bridge-reply-card.js?v=$shippedCard"
+Save-CopilotSessionDashboard -Sessions $sessions -Machines $twoMachines -ReplyCardUrl "/local/agent-bridge-reply-card.js?v=$shippedCard"
+Test-That 'while the same version it can vouch for is given the custom cards as before' {
+    @(Find-TestCardsOfType 'custom:agent-bridge-session-card').Count -gt 0 -and
+    @(Find-TestCardsOfType 'custom:agent-bridge-activity-card').Count -gt 0
+}
+
+# Rebuilding is what runs the gate, so reconciliation has to know the answer can
+# change on its own. An install replacing the local card with different bytes at an
+# unchanged CARD_VERSION leaves the registered resource - and so the URL, and so every
+# other input to the signature - exactly as it was, and a verified receipt then skipped
+# the rebuild and kept serving the layout for a card this bridge no longer vouches for.
+$signatureArgs = @{ Sessions = $sessions; Machines = $twoMachines; MachineSelector = ''
+    ReplyCardUrl = "/local/agent-bridge-reply-card.js?v=$shippedCard" }
+Test-That 'the same inputs signed for a card that is no longer this build differ' {
+    (Get-BridgeDashboardInputSignature @signatureArgs -CardTrusted $true) -cne
+        (Get-BridgeDashboardInputSignature @signatureArgs -CardTrusted $false)
+}
+Test-That 'and working the answer out gives the same signature as stating it' {
+    (Get-BridgeDashboardInputSignature @signatureArgs) -ceq
+        (Get-BridgeDashboardInputSignature @signatureArgs -CardTrusted $true)
+}
+Test-That 'a dashboard with no card at all signs as the fallback it already is' {
+    (Get-BridgeDashboardInputSignature -Sessions $sessions -Machines $twoMachines -MachineSelector '' -ReplyCardUrl '') -ceq
+        (Get-BridgeDashboardInputSignature -Sessions $sessions -Machines $twoMachines -MachineSelector '' -ReplyCardUrl '' -CardTrusted $true)
 }
 
 Write-Host '--- a live session produces a card ---'
@@ -1754,8 +1863,12 @@ Test-That 'and a blank entry never matches a blank user' { -not (Test-BridgeAgen
 # emitted while every byte of source stayed the same. An upgraded machine verified its
 # old receipt and skipped the rebuild, leaving a card that could draw four fields for
 # questions the bridge had started arming twelve slots for.
-$script:ExpectedRenderVersion = '1.9.0'
-$script:ExpectedRenderHash = 'b3b4bdfe199e29a82738e4c5fb9ad7efe315823a5982108315e7c23c98591d7f'
+#
+# Test-BridgeServedCardContent is fingerprinted for the same reason: Test-BridgeActivityCardServed
+# now asks it whether the served bytes are this build at all, so what it decides is
+# part of what the renderer emits even though its own text sits in another function.
+$script:ExpectedRenderVersion = '1.10.0'
+$script:ExpectedRenderHash = '02510878cd04c3cf7831a663d1e7697218de5d945d5a467fb1b7a2d28bc13e2a'
 $artifact = Get-BridgeRenderArtifact
 
 Test-That 'the renderer is still the one this version was pinned to' {
@@ -1765,8 +1878,9 @@ renderer fingerprint moved without a version bump.
   pinned : $($script:ExpectedRenderVersion) / $($script:ExpectedRenderHash)
   actual : $($artifact.version) / $($artifact.hash)
 If you changed Save-CopilotSessionDashboard, Test-BridgeActivityCardServed,
-Get-BridgeDashboardInputSignature, ConvertTo-BridgePublicationJson or the form-field
-ceiling, bump `$script:BridgeDashboardRenderVersion in hooks/decision-ha-websocket.ps1
+Test-BridgeServedCardContent, Get-BridgeDashboardInputSignature,
+ConvertTo-BridgePublicationJson or the form-field ceiling, bump
+`$script:BridgeDashboardRenderVersion in hooks/decision-ha-websocket.ps1
 and update both constants above. Shipping the change without the bump freezes
 publication on every already-fenced machine, or leaves it serving the old dashboard.
 "@

@@ -1920,6 +1920,17 @@ function Publish-CopilotMqttDecisionFields {
                     }
                 }
             }
+            # Nothing checked, on a field whose schema says nothing is an answer. The
+            # same argument as above: the prompt in the terminal opens on exactly this
+            # and Enter commits it, so parking the slot on 'Choose...' showed the field
+            # as unanswered when it was already sitting on a valid answer - and the
+            # only way to reach that answer from the card was to tick a row and untick
+            # it again (#81). Still nothing sent; Send remains the only thing that
+            # answers. A field that must have something chosen keeps the placeholder.
+            else {
+                $emptyStart = Get-DecisionMultiSelectEmptyChoice -Field $slotField
+                if (-not [string]::IsNullOrEmpty($emptyStart)) { $start = $emptyStart }
+            }
         }
         try {
             Invoke-HomeAssistantService -Domain 'select' -Service 'select_option' -Headers $Headers -Data @{
@@ -2325,6 +2336,16 @@ function Set-CopilotMqttDecision {
             # and so is not limited by how long somebody's options happen to be.
             if (@(Get-DecisionMultiSelectCodes -Field $slotField).Count -gt 0) {
                 $questionAttrs["field_${fi}_codes"] = $true
+            }
+            # What to write when every row is unticked, for a field whose schema says
+            # that is an answer. The exact value rather than a flag, so the naming of
+            # the empty set lives here with the rest of the carrier rules instead of
+            # being spelled a second time in the card. Absent for a field that must
+            # have something chosen, and a card old enough not to know it keeps writing
+            # the placeholder - which is what the daemon still reads as unanswered.
+            $emptyChoice = Get-DecisionMultiSelectEmptyChoice -Field $slotField
+            if (-not [string]::IsNullOrEmpty($emptyChoice)) {
+                $questionAttrs["field_${fi}_empty"] = $emptyChoice
             }
         }
     }

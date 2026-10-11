@@ -1379,6 +1379,60 @@ the fencing protocol and the operator policy generation are different things.
 Ordinary authorized publication may advance compatible artifact versions, but never
 silently replaces equal-version/different-content artifacts or lowers a fence.
 
+##### When publication is paused on an equal-version conflict
+
+Every install run prints the refusal, which is the fence working:
+
+```
+==> Checking the dashboard frontend cards
+    reply card publication paused (Equal card versions have conflicting content; bump the version or explicitly authorize a pinned generation.)
+```
+
+Until it is resolved, Home Assistant goes on serving whichever build got there
+first. The dashboard generator no longer trusts the version string on its own in
+that state - it compares the served bytes against the card beside its own hooks, and
+falls back to the layout every card version can draw when they differ, rather than
+emitting one built for features the served card may not have. That fallback is
+logged to `agent-decision-bridge.log` as `the served reply card is a different build
+of the same version`. Expect a plainer dashboard while it lasts; that is the
+symptom, not a second fault.
+
+Resolving it is one of two deliberate acts, and neither is a `-Version` argument:
+
+* **Ship a genuinely new card.** Bump `CARD_VERSION`, install, and let the fence
+  advance past both builds. This is the ordinary remedy and what skipping a
+  contaminated number is for.
+* **Authorize an exact pin**, as below, when the build that must win is one that
+  already exists.
+
+Checking a suspected conflict is a read. The served card's own bytes are in its
+resource URL, so the two can be compared without writing anything:
+
+```powershell
+$servedCard = Get-BridgeRegisteredCardArtifact -Url (Read-BridgePublicationState).CardUrl
+$servedCard
+Get-BridgePublicationTarget | ForEach-Object { $_.card }
+```
+
+Equal `version` with different `hash` is the conflict. A frequent and avoidable
+cause is line endings: the card is published byte for byte, so a checkout that
+rewrites it to CRLF produces a different hash from the same source at the same
+version, and no bump ever reconciles the two. `.gitattributes` pins that file to LF,
+but adding an attribute does not rewrite a file already sitting in the working tree.
+A checkout made before that pin needs refreshing once, by deleting the file and
+letting git write it back under the current attributes:
+
+```powershell
+Remove-Item frontend/agent-bridge-reply-card.js
+git checkout -- frontend/agent-bridge-reply-card.js
+git ls-files --eol frontend/agent-bridge-reply-card.js   # expect i/lf w/lf
+```
+
+The index entry is left alone, which is what makes this work: `git checkout --`
+restores the path from the index, so removing it from the index first would leave
+nothing to restore and the original CRLF file untracked beside it. A fresh clone
+does the same job.
+
 The composed renderer that includes End-session confirmation uses publication version
 `1.1.0`. The earlier frozen `1.0.0` candidate is a different render artifact, even
 when bridge/card versions or session inputs match. Inspect targets again from the
@@ -1772,6 +1826,14 @@ Two `ask_user` argument shapes are handled. Current builds pass **`message`** pl
   behind it has to enumerate every combination: up to **ten options**. Beyond that the
   question says to answer it in the terminal rather than offering a list that could
   only take one.
+* **Nothing ticked is an answer**, where the field's `minItems` allows one - which,
+  absent or zero, is the ordinary "pick any of these" field. The empty set gets an
+  entry of its own in the slot (`(none)`, or `#0` as a position) rather than sharing
+  the `Choose...` placeholder, because that placeholder is how an unanswered field is
+  recognised. Such a field opens on it, since the terminal prompt opens on an
+  unchecked list and Enter commits exactly that, and unticking the last row returns
+  there instead of making the form unanswerable. A field that requires a choice is
+  unchanged: no such entry, and unticking the last row leaves it waiting.
 * **The set rides as positions, not as words.** A slot carries `#1,3` rather than the
   picked options joined together. Spelling them out meant a select entry had to hold
   every chosen option's full text, and six ordinarily-worded options ran to 350

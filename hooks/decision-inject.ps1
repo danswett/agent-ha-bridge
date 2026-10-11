@@ -644,7 +644,12 @@ function Get-BridgeFormPayloads {
         # draw a different one (Get-DecisionMultiSelectStyle).
         if (Test-DecisionFieldIsMultiSelect -Field $Fields[$i]) {
             $picked = @(Resolve-DecisionMultiSelectChoice -Field $Fields[$i] -Choice ([string]$Selections[$i]))
-            if ($picked.Count -eq 0) { throw "combination '$($Selections[$i])' not found in field $i" }
+            # Nothing chosen, where the field's schema says that is an answer. It is
+            # the one selection that resolves to no options and is still valid, so it
+            # has to be recognised before the refusal below rather than inside the
+            # walks, which both already do the right thing with an empty wanted set.
+            $wantsNothing = (Test-DecisionMultiSelectEmptyChoice -Field $Fields[$i] -Choice ([string]$Selections[$i]))
+            if ($picked.Count -eq 0 -and -not $wantsNothing) { throw "combination '$($Selections[$i])' not found in field $i" }
 
             if ((Get-DecisionMultiSelectStyle -Field $Fields[$i]) -eq 'space-toggle') {
                 # Copilot CLI: "↑/↓ select · space toggle · enter accept". There is no
@@ -713,7 +718,17 @@ function Get-BridgeFormPayloads {
             # as a way to reach Submit without counting - the decompiled handler
             # ignores it once Submit has focus - but overshooting with Tab tore the
             # prompt down, so the count is exact and deliberate.
+            #
+            # Answering it with nothing is therefore the walk to Submit on its own.
+            # This branch has always assumed the list opens with no row checked, which
+            # is true of every Claude question seen - it publishes no defaults at all -
+            # and harmless while something is being checked. It is not harmless when
+            # the answer is "none": a row left checked would be submitted as the
+            # answer. Refused rather than guessed at, like the Copilot walk above.
             $keys = New-Object System.Collections.Generic.List[string]
+            if ($picked.Count -eq 0 -and @(Get-DecisionMultiSelectChecked -Field $Fields[$i]).Count -gt 0) {
+                throw "field $i opens with options checked and cannot be emptied by number"
+            }
             foreach ($option in $picked) {
                 $at = [Array]::IndexOf($options, [string]$option)
                 # Only the first nine rows have a number to type.
