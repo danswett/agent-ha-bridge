@@ -299,6 +299,101 @@ function Get-BridgeProcessPresenceObservation {
     [pscustomobject]@{ State = 'PresentOrUnknown'; Code = '' }
 }
 
+function Get-BridgeProcessStartObservation {
+    <#
+        When a process started, as an observation: Readable carries StartedUtcTicks,
+        Absent means it has gone, and Unknown means no route could say.
+
+        Discovery needs a start time to tell one generation of a pid from the next, and
+        a process it cannot pin that way holds absence-based work - retirement, the
+        orphan sweep, every launch - for as long as it runs (#144). The point of asking
+        here is that the read which fails is not the only one there is. `.StartTime`
+        opens a handle on the process, which Windows denies for another user's or a
+        more privileged one, and an adapter running an older copy of this file reports
+        no start time at all even though the daemon could read one perfectly well.
+        WMI's CreationDate answers the same question without that handle.
+
+        Unknown still means "keep holding", exactly as before: excusing a process takes
+        positive identification, and a generation nothing can name is not one. What
+        changes is that far fewer processes end up there.
+    #>
+    param([Parameter(Mandatory)][int]$ProcessId)
+
+    $observation = [pscustomobject]@{
+        State = 'Unknown'; StartedUtcTicks = [long]0; ProcessId = $ProcessId; Code = 'Unreadable'
+    }
+    if ($ProcessId -le 0) { $observation.Code = 'InvalidProcessId'; return $observation }
+
+    # Cheapest, in-process, and the whole answer whenever the caller's view simply did
+    # not carry a start time it could have read itself.
+    $readErrors = @()
+    $process = $null
+    try { $process = Get-Process -Id $ProcessId -ErrorAction SilentlyContinue -ErrorVariable readErrors }
+    catch {
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        $process = $null
+    }
+    foreach ($readError in $readErrors) {
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $readError) { throw $readError }
+    }
+    if ($null -ne $process) {
+        try {
+            $ticks = [long]([datetime]$process.StartTime).ToUniversalTime().Ticks
+            if ($ticks -gt 0) {
+                $observation.State = 'Readable'
+                $observation.StartedUtcTicks = $ticks
+                $observation.Code = ''
+                return $observation
+            }
+        }
+        catch {
+            if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+            # Denied, which is exactly the case the handle-free route below exists for.
+        }
+    }
+    elseif (@($readErrors | Where-Object { $_.FullyQualifiedErrorId -like 'NoProcessFoundForGivenId,*' }).Count) {
+        $observation.State = 'Absent'
+        $observation.Code = 'ProcessNotFound'
+        return $observation
+    }
+
+    # Only Windows gets a second route, because only Windows has shown the first one
+    # failing on a live agent process. Off Windows an unreadable start time stays
+    # unreadable rather than being guessed: `ps -o etime=` is relative to the moment it
+    # is read, so the absolute start it implies drifts by up to a second between
+    # passes - a different generation key every pass, a clock that restarts every pass,
+    # and a process that never matures. That is the #140 failure wearing a new hat.
+    if (-not $script:BridgeIsWindows) { return $observation }
+
+    $queryErrors = @()
+    $row = $null
+    try {
+        $row = Get-CimInstance Win32_Process -Filter "ProcessId=$ProcessId" -ErrorAction SilentlyContinue -ErrorVariable queryErrors
+    }
+    catch {
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        $observation.Code = 'StartQueryFailed'
+        return $observation
+    }
+    foreach ($queryError in $queryErrors) {
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $queryError) { throw $queryError }
+    }
+    if ($queryErrors.Count) { $observation.Code = 'StartQueryFailed'; return $observation }
+    $rows = @($row)
+    if ($rows.Count -eq 0) {
+        # A filter matching nothing is not a failed query: the process has gone.
+        $observation.State = 'Absent'
+        $observation.Code = 'ProcessNotFound'
+        return $observation
+    }
+    if ($rows.Count -eq 1 -and $rows[0].PSObject.Properties['CreationDate'] -and $rows[0].CreationDate -is [datetime]) {
+        $observation.State = 'Readable'
+        $observation.StartedUtcTicks = [long]([datetime]$rows[0].CreationDate).ToUniversalTime().Ticks
+        $observation.Code = ''
+    }
+    $observation
+}
+
 function ConvertFrom-BridgeProcessObject {
     <#
         A Windows Get-Process object in Get-BridgeProcessInfo's shape.
