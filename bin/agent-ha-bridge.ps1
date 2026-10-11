@@ -277,6 +277,41 @@ function Show-Status {
         }
     }
 
+    # What the last release check actually found, and which GitHub allowance it was
+    # spending. Read from the cache the daemon already writes, so status makes no
+    # request of its own - and so that a machine whose checks are being refused stops
+    # looking identical to one that is current. On the dashboard it does: a refused
+    # check retains the last known latest_version and the entity goes on reporting it
+    # with no sign that nothing has been heard for days (#153).
+    if ($commandContext -and (Get-Command Get-BridgeUpdateCheckSummary -ErrorAction SilentlyContinue)) {
+        $check = Get-BridgeUpdateCheckSummary -Path (Get-BridgeRuntimePath -Name 'agent-bridge-update.json' -Context $commandContext)
+        if ($check) {
+            # Silent rather than wrong when the record predates the field: a cache
+            # written by an older version cannot say how its check authenticated, and
+            # that version could already be using a token.
+            $allowance = if (-not $check.AllowanceKnown) { '' }
+                elseif ($check.TokenSource) { "authenticated with $($check.TokenSource)" }
+                else { 'unauthenticated, 60 requests an hour shared with everything behind this address' }
+            if ($check.Answered) {
+                Write-Host "    updates    : checked $($check.When), $($check.Verdict)$(if ($allowance) { " ($allowance)" })" -ForegroundColor Green
+            }
+            else {
+                Write-Host "    updates    : checked $($check.When), $($check.Verdict)" -ForegroundColor Yellow
+                if ($allowance) { Write-Host "                 checks are $allowance" -ForegroundColor Yellow }
+                if ($check.AllowanceKnown -and -not $check.TokenSource) {
+                    # Plain `configure`, which offers a masked prompt: `-UpdateToken`
+                    # takes a value, so naming it here would both fail to bind without
+                    # one and invite putting a credential on a command line.
+                    Write-Host '                 set a personal access token in updates.token for 5,000 of this machine''s own: agent-ha-bridge configure' -ForegroundColor Yellow
+                }
+            }
+            if ($check.TokenNote) {
+                Write-Host "                 $($check.TokenNote)" -ForegroundColor Yellow
+                Write-Host '                 replace it with: agent-ha-bridge configure' -ForegroundColor Yellow
+            }
+        }
+    }
+
     $base = ([string]$config.homeAssistant.baseUrl).TrimEnd('/')
     $token = [string]$config.homeAssistant.token
     if (-not $token -and $config.homeAssistant.tokenEnvVar) {

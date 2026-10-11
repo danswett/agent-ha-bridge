@@ -20,6 +20,9 @@ Assert-BridgeTestEnvironment -Required
 
 . (Join-Path $PSScriptRoot '..\hooks\decision-bridge-common.ps1')
 . (Join-Path $PSScriptRoot '..\hooks\bridge-update.ps1')
+# The streaming download the generated updater uses, so its progress reporting can be
+# driven here against an ordinary Stream rather than a socket (#155).
+. (Join-Path $PSScriptRoot '..\hooks\bridge-download.ps1')
 
 $script:Failures = 0
 function Test-That {
@@ -770,6 +773,221 @@ try {
     function Invoke-RestMethod { throw 'network disabled in test' }
     function Invoke-WebRequest { throw 'network disabled in test' }
 
+    # --- which GitHub allowance the check is on -------------------------------------
+    # Measured on DSWETT-HOME at 17:48 PT on 2026-10-10: the unauthenticated pool for
+    # this address stood at 51/60 and resets hourly, while the identical call
+    # authenticated reported 5000/5000. That 83-fold difference is the whole of #153,
+    # and until now the only way to take it was to hand-edit config.json.
+    Write-Host '--- the configured token wins, and only its name is ever reported ---'
+    function Invoke-WithUpdateTokenEnvironment {
+        param([hashtable]$Values, [Parameter(Mandatory)][scriptblock]$Body)
+        $prior = @{}
+        foreach ($name in @('AGENT_HA_BRIDGE_UPDATE_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')) {
+            $prior[$name] = [Environment]::GetEnvironmentVariable($name)
+            [Environment]::SetEnvironmentVariable($name, $(if ($Values.ContainsKey($name)) { $Values[$name] } else { $null }))
+        }
+        try { & $Body }
+        finally { foreach ($name in $prior.Keys) { [Environment]::SetEnvironmentVariable($name, $prior[$name]) } }
+    }
+
+    $configuredToken = 'ghp_configuredaaaaaaaaaaaaaaaaaaaaaaaa'
+    $ambientToken = 'ghp_ambientbbbbbbbbbbbbbbbbbbbbbbbbbbbb'
+    # Shadowed inside a scriptblock, never at script scope: Get-BridgeSetting is a real
+    # function dot-sourced into this scope, so defining one here and then removing it
+    # deletes the real one for every test that follows.
+    & {
+        function Get-BridgeSetting {
+            param($Path, $Default)
+            if ($Path -eq 'updates.token') { return $configuredToken }
+            $Default
+        }
+        Invoke-WithUpdateTokenEnvironment @{ GH_TOKEN = $ambientToken } {
+            $chosen = Get-BridgeUpdateToken
+            Test-That 'a configured updates.token beats one the shell merely happened to export' {
+                $chosen.Source -eq 'updates.token' -and $chosen.Token -ceq $configuredToken
+            } $chosen.Source
+            Test-That 'and the reported source is a name, never the credential' {
+                $chosen.Source -notmatch 'ghp_'
+            } $chosen.Source
+        }
+    }
+
+    # A token is an HTTP header value. One pasted with a trailing newline, or with the
+    # smart quotes a chat client substitutes, cannot be sent at all: .NET refuses the
+    # header and the check fails complaining about header syntax, on a machine whose
+    # unauthenticated check would have worked perfectly well.
+    & {
+        function Get-BridgeSetting {
+            param($Path, $Default)
+            if ($Path -eq 'updates.token') { return "ghp_pasted$([char]0x201C)`n" }
+            $Default
+        }
+        Invoke-WithUpdateTokenEnvironment @{ GH_TOKEN = $ambientToken } {
+            $fallback = Get-BridgeUpdateToken
+            Test-That 'an unsendable updates.token does not cost the machine a usable ambient one' {
+                $fallback.Source -eq '$env:GH_TOKEN' -and $fallback.Token -ceq $ambientToken
+            } $fallback.Source
+            Test-That 'and it names the setting to fix without quoting what was in it' {
+                $fallback.Note -match 'updates\.token is not a usable token' -and $fallback.Note -notmatch 'ghp_'
+            } $fallback.Note
+        }
+        Invoke-WithUpdateTokenEnvironment @{} {
+            $alone = Get-BridgeUpdateToken
+            Test-That 'with nothing to fall back to it degrades to an unauthenticated check, not a failure' {
+                $alone.Token -eq '' -and $alone.Source -eq '' -and $alone.Note -match 'not a usable token'
+            } "[$($alone.Source)] $($alone.Note)"
+            $degraded = Get-BridgeReleaseRequestHeaders
+            Test-That 'and sends no Authorization header at all rather than a malformed one' {
+                -not $degraded.ContainsKey('Authorization')
+            }
+        }
+    }
+
+    Write-Host '--- the check says which allowance it spent, and the cache remembers ---'
+    function New-SyntheticRelease {
+        [pscustomobject]@{
+            tag_name = 'v9.9.7'; name = 'synthetic'; body = ''; published_at = ''
+            html_url = 'https://github.com/danswett/agent-ha-bridge/releases/tag/v9.9.7'
+            zipball_url = 'https://api.github.com/repos/danswett/agent-ha-bridge/zipball/v9.9.7'
+        }
+    }
+    function Invoke-RestMethod { param($Uri, $Headers, $TimeoutSec) New-SyntheticRelease }
+    Invoke-WithUpdateTokenEnvironment @{ GH_TOKEN = $ambientToken } {
+        Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+        $authenticated = Get-BridgeUpdateStatus -Force
+        Test-That 'a successful check reports the credential that authenticated it, by name' {
+            $authenticated.TokenSource -eq '$env:GH_TOKEN' -and -not $authenticated.TokenNote
+        } "[$($authenticated.TokenSource)] $($authenticated.TokenNote)"
+        $recorded = Get-Content -LiteralPath $cachePath -Raw -Encoding UTF8
+        Test-That 'and the cache keeps the name so status can read it without a request' {
+            $recorded -match 'GH_TOKEN'
+        }
+        Test-That 'but never the credential itself, which only ever reaches a request header' {
+            $recorded -notmatch 'ghp_'
+        }
+    }
+
+    # The anonymous retry on a bad credential is right - these are public releases -
+    # but it used to be silent, so a machine whose token had been revoked went back to
+    # the 60-an-hour shared pool while its configuration said otherwise (#153).
+    function Invoke-RestMethod {
+        param($Uri, $Headers, $TimeoutSec)
+        if ($Headers.ContainsKey('Authorization')) {
+            $response = [System.Net.Http.HttpResponseMessage]::new([System.Net.HttpStatusCode]::Unauthorized)
+            throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('Bad credentials', $response)
+        }
+        New-SyntheticRelease
+    }
+    Invoke-WithUpdateTokenEnvironment @{ GH_TOKEN = $ambientToken } {
+        Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+        $rejected = Get-BridgeUpdateStatus -Force
+        Test-That 'a rejected token still yields an answer, and admits it was unauthenticated' {
+            $rejected.Latest -eq '9.9.7' -and $rejected.TokenSource -eq ''
+        } "$($rejected.State) source=[$($rejected.TokenSource)]"
+        Test-That 'and says which credential GitHub refused, so the downgrade is not silent' {
+            $rejected.TokenNote -match '\$env:GH_TOKEN was rejected' -and $rejected.TokenNote -notmatch 'ghp_'
+        } $rejected.TokenNote
+    }
+
+    # A configured token GitHub refuses is the case plain `configure` would skip - the
+    # setting is not empty - so the installer has to be able to tell it apart from a
+    # machine that simply has none, and offer to replace it. Produced end to end here
+    # rather than by writing the note by hand, so the installer and the check that
+    # writes it cannot drift apart on the wording. Raised by Codex on #190.
+    & {
+        $rejectedConfigured = 'ghp_revokedccccccccccccccccccccccccc'
+        function Get-BridgeSetting {
+            param($Path, $Default)
+            if ($Path -eq 'updates.token') { return $rejectedConfigured }
+            $Default
+        }
+        Invoke-WithUpdateTokenEnvironment @{} {
+            Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+            $configuredRejection = Get-BridgeUpdateStatus -Force
+            Test-That 'a refused configured token is reported against the setting that holds it' {
+                $configuredRejection.Latest -eq '9.9.7' -and
+                    $configuredRejection.TokenNote -match '^updates\.token was rejected' -and
+                    $configuredRejection.TokenNote -notmatch 'ghp_'
+            } $configuredRejection.TokenNote
+            Test-That 'and the installer can tell that apart from a machine that simply has none' {
+                (Test-BridgeUpdateTokenRejected -Summary (Get-BridgeUpdateCheckSummary -Path $cachePath))
+            }
+        }
+    }
+    # The same has to hold for a token the machine merely had in its environment. It is
+    # re-sent and refused on every check, the operator cannot edit the environment from
+    # the installer - and storing a working updates.token does fix it, because the
+    # configured setting wins over the environment. Raised by Codex on #190.
+    Invoke-WithUpdateTokenEnvironment @{ GH_TOKEN = $ambientToken } {
+        Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+        $ambientRejection = Get-BridgeUpdateStatus -Force
+        Test-That 'a refused ambient token is offered a replacement too, not only a configured one' {
+            $ambientRejection.TokenNote -match '^\$env:GH_TOKEN was rejected' -and
+                (Test-BridgeUpdateTokenRejected -Summary (Get-BridgeUpdateCheckSummary -Path $cachePath))
+        } $ambientRejection.TokenNote
+    }
+    Invoke-WithUpdateTokenEnvironment @{} {
+        Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+        $noTokenAtAll = Get-BridgeUpdateStatus -Force
+        Test-That 'a machine with no token at all is not offered a replacement for one' {
+            $noTokenAtAll.TokenNote -eq '' -and
+                -not (Test-BridgeUpdateTokenRejected -Summary (Get-BridgeUpdateCheckSummary -Path $cachePath))
+        } "[$($noTokenAtAll.TokenNote)]"
+    }
+
+    # The advice on a refused check has to be true of the machine reading it. Told to
+    # set updates.token while already using one, an operator sets it again and is
+    # refused again.
+    $limitResetAt = [DateTimeOffset]::Now.AddMinutes(23)
+    function Invoke-RestMethod {
+        param($Uri, $Headers, $TimeoutSec)
+        $response = New-RateLimitedResponse -Code 403 -Remaining '0' -Reset ([string]$limitResetAt.ToUnixTimeSeconds())
+        throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('rate limit exceeded', $response)
+    }
+    function Invoke-WebRequest {
+        param($Uri, $Headers, $TimeoutSec, $MaximumRedirection)
+        throw 'the redirect endpoint is unreachable too'
+    }
+    Invoke-WithUpdateTokenEnvironment @{} {
+        Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+        $unauthenticated = Get-BridgeUpdateStatus -Force
+        Test-That 'a refused unauthenticated check names the setting that raises the limit' {
+            $unauthenticated.Detail -match 'personal access token in updates\.token raises this machine to 5,000'
+        } $unauthenticated.Detail
+    }
+    Invoke-WithUpdateTokenEnvironment @{ GH_TOKEN = $ambientToken } {
+        Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+        $alreadyAuthenticated = Get-BridgeUpdateStatus -Force
+        # Named, never numbered. Actions' own GITHUB_TOKEN gets 1,000 an hour per
+        # repository rather than 5,000, and the source name does not say which kind of
+        # credential this is - so quoting a figure at whatever happens to be exported
+        # would misreport the allowance in either direction. Raised by Codex on #190.
+        Test-That 'but a machine already using one is not told to set it again, nor promised a figure' {
+            $alreadyAuthenticated.Detail -notmatch 'updates\.token raises' -and
+                $alreadyAuthenticated.Detail -match 'authenticated with \$env:GH_TOKEN' -and
+                $alreadyAuthenticated.Detail -notmatch '5,000'
+        } $alreadyAuthenticated.Detail
+    }
+
+    # A press whose forced re-check is refused used to come back "already on 1.29.0" -
+    # the same words as a press that found nothing to do - and the machine then read as
+    # current on the dashboard while being a release behind (#56). The refusal has to
+    # answer for itself.
+    Invoke-WithUpdateTokenEnvironment @{} {
+        Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+        $refusedPress = Invoke-BridgeSelfUpdate
+        Test-That 'a press whose re-check is refused is not reported as being up to date' {
+            $refusedPress.Started -eq $false -and $refusedPress.State -eq 'RateLimited' -and
+                $refusedPress.Detail -notmatch 'already on' -and $refusedPress.Detail -notmatch 'no newer release'
+        } "$($refusedPress.State): $($refusedPress.Detail)"
+        Test-That 'and says it is a queue to wait in, with the time it can be tried again' {
+            $refusedPress.Detail -match 'rate limiting' -and $refusedPress.Detail -match '\d\d:\d\d'
+        } $refusedPress.Detail
+    }
+
+    function Invoke-RestMethod { throw 'network disabled in test' }
+    function Invoke-WebRequest { throw 'network disabled in test' }
+
     Write-Host '--- failure is survivable ---'
     Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
     $script:DecisionBridgeConfig.UpdateRepositoryOverride = $null
@@ -846,6 +1064,28 @@ Test-That 'and ends on a terminal stage that distinguishes success from failure'
     $generated -match "Write-UpdateStage -Stage \`$\(if \(\`$outcome\.success\) \{ 'completed' \} else \{ 'failed' \}\)"
 }
 
+# Downloading was the one stage that could never say how far it had got, because
+# Invoke-WebRequest -OutFile blocks until the file is complete and reports nothing on
+# the way. Everything downstream was already built for a proportion - the stage
+# record validates one, the update entity publishes stage_proportion, the card draws
+# the bar - and only the emitter was missing (#155).
+Test-That 'the downloading stage emits a proportion as the archive arrives' {
+    ($generated -match 'Save-BridgeUpdateDownload') -and
+        ($generated -match "Write-UpdateStage -Stage 'downloading' -Proportion")
+}
+Test-That 'and no longer hands the transfer to a call that can only report the word' {
+    $generated -notmatch '(?m)^\s*Invoke-WebRequest\b'
+}
+# The native hook is fetched afterwards, by the installer, under Installing. A bar
+# that reached 100% and then sat there for the larger half of the wait would be worse
+# than no bar, so the proportion ends when the archive does.
+Test-That 'the installing stage carries no proportion, so the bar ends with the archive' {
+    $generated -notmatch "Write-UpdateStage -Stage 'installing' -Proportion"
+}
+Test-That 'and the downloader library is verified before it is loaded' {
+    $generated -match "RelativePaths @\('bridge-platform\.ps1', 'bridge-test-guard\.ps1', 'bridge-download\.ps1'\)"
+}
+
 $genValid = Invoke-BridgeSelfUpdate -ScriptOnly -TargetHome $env:TEMP
 Test-That 'a valid TargetHome is passed through to the installer' {
     $genValid -match "-TargetHome '"
@@ -864,6 +1104,126 @@ finally {
 $bogus = Invoke-BridgeSelfUpdate -TargetHome (Join-Path $env:TEMP ('missing-update-home-' + [guid]::NewGuid().ToString('N')))
 Test-That 'a non-existent TargetHome is refused, never interpolated' {
     ($bogus.Started -eq $false) -and ($bogus.Detail -match 'not an existing directory')
+}
+
+# --- installed, then something after it failed -------------------------------------
+# Three different things used to come out as one undifferentiated `child exit 1`:
+# nothing installed, installed but a follow-up step failed, and installed and healthy.
+# A stale Codex marketplace made every `codex plugin` command exit 1 *after* the
+# installer had printed "All good", and the update reported itself failed while
+# `agent-ha-bridge status` showed the new version with every check green (#124).
+& {
+    # The real generator runs; only the child process is replaced, and it writes the
+    # terminal result the child would have written - a failure, after the installer
+    # recorded the new version.
+    function New-StubbedUpdateChild {
+        param([string]$ScriptPath, [string]$FailureText)
+        $text = Get-Content -LiteralPath $ScriptPath -Raw
+        $resultFile = ([regex]::Match($text, "(?m)^\`$resultFile = '(?<p>.*)'\s*$").Groups['p'].Value) -replace "''", "'"
+        $attemptId = [regex]::Match($text, "attemptId = '(?<id>[a-f0-9]{32})'").Groups['id'].Value
+        @{
+            schemaVersion = 1; attemptId = $attemptId; success = $false; exitCode = 1
+            version = '9.9.9'; releaseUrl = 'https://github.com/x/y/releases/tag/v9.9.9'
+            error = $FailureText; at = [DateTimeOffset]::Now.ToString('o')
+        } | ConvertTo-Json -Compress | Set-Content -LiteralPath $resultFile -Encoding UTF8
+        [pscustomobject]@{ ExitCode = 1 }
+    }
+
+    function Start-Process {
+        param($FilePath, $ArgumentList, $WindowStyle, $RedirectStandardOutput, $RedirectStandardError,
+              [switch]$PassThru, [switch]$Wait, $ErrorAction)
+        New-StubbedUpdateChild -ScriptPath (([string]@($ArgumentList)[-1]).Trim('"')) `
+            -FailureText 'codex plugin list exited 1'
+    }
+
+    function Get-BridgeInstalledVersion { param([switch]$Refresh) '9.9.9' }
+    $afterInstall = Invoke-BridgeSelfUpdate
+    Test-That 'a step failing after the install is not reported as the update failing' {
+        $afterInstall.State -eq 'Incomplete' -and -not $afterInstall.Success
+    } "$($afterInstall.State): $($afterInstall.Detail)"
+    Test-That 'it says the release installed, names the step that failed, and says what to run' {
+        $afterInstall.Detail -match 'installed 9\.9\.9' -and
+            $afterInstall.Detail -match 'codex plugin list exited 1' -and
+            $afterInstall.Detail -match 'agent-ha-bridge status'
+    } $afterInstall.Detail
+
+    # And the distinction has to be the recorded version, not optimism: an installer
+    # that never got that far really did fail, and must still say so.
+    function Get-BridgeInstalledVersion { param([switch]$Refresh) '1.0.0' }
+    $neverInstalled = Invoke-BridgeSelfUpdate
+    Test-That 'while an update that never recorded the release is still a failure' {
+        $neverInstalled.State -eq 'Failed' -and $neverInstalled.Detail -match 'update to 9\.9\.9 failed'
+    } "$($neverInstalled.State): $($neverInstalled.Detail)"
+
+    # `update.ps1 -Force` repairs an installation that already records the target, so
+    # the record names it however early the child failed - a refused download or a
+    # corrupt archive would be reported as "installed, then a later step failed" when
+    # nothing was installed at all. Raised by Codex on #190.
+    function Get-BridgeUpdateStatus {
+        param([switch]$Force)
+        [pscustomobject]@{
+            Installed = '9.9.9'; Latest = '9.9.9'; Available = $false
+            Url = 'https://github.com/x/y/releases/tag/v9.9.9'
+            Notes = ''; Zip = 'https://api.github.com/repos/x/y/zipball/v9.9.9'
+        }
+    }
+    function Get-BridgeInstalledVersion { param([switch]$Refresh) '9.9.9' }
+    $forcedRepair = Invoke-BridgeSelfUpdate -Force
+    Test-That 'a forced repair that failed before the installer ran is not called installed' {
+        $forcedRepair.State -eq 'Failed' -and $forcedRepair.Detail -match 'update to 9\.9\.9 failed'
+    } "$($forcedRepair.State): $($forcedRepair.Detail)"
+}
+
+Test-That 'a pre-release is not mistaken for the release it is named after' {
+    (Test-BridgeUpdateReachedInstall -Attempted '1.2.3' -Recorded 'v1.2.3') -and
+        -not (Test-BridgeUpdateReachedInstall -Attempted '1.2.3' -Recorded '1.2.3-rc.1') -and
+        -not (Test-BridgeUpdateReachedInstall -Attempted '1.2.3' -Recorded '') -and
+        -not (Test-BridgeUpdateReachedInstall -Attempted '' -Recorded '1.2.3')
+}
+Test-That 'and a record this attempt did not change proves nothing about how far it got' {
+    (Test-BridgeUpdateReachedInstall -Attempted '1.2.3' -Recorded '1.2.3' -Before '1.2.2') -and
+        -not (Test-BridgeUpdateReachedInstall -Attempted '1.2.3' -Recorded '1.2.3' -Before '1.2.3')
+}
+# Two presses launched while 1.1.0 is installed both record 1.1.0 as what they found,
+# so if one installs 1.2.0 while the other dies during download, pre/post comparison
+# alone still credits the one that installed nothing. Whether a child handed control to
+# an installer at all is a fact about its own execution that no concurrent attempt can
+# supply. Raised by Codex on #190.
+Test-That 'a child that never reached an installer is not credited with a concurrent one''s install' {
+    -not (Test-BridgeUpdateReachedInstall -Attempted '1.2.0' -Recorded '1.2.0' -Before '1.1.0' -RanInstaller $false)
+}
+Test-That 'while the child that did run one, and moved the record, still is' {
+    Test-BridgeUpdateReachedInstall -Attempted '1.2.0' -Recorded '1.2.0' -Before '1.1.0' -RanInstaller $true
+}
+# The detached child is the one that needs this carried for it: the daemon reads its
+# outcome long after it exited, and cannot otherwise tell its install from a
+# concurrent attempt's. An outcome written before the field existed must still read,
+# and must not acquire a pre-version by implication. Raised by Codex on #190.
+& {
+    $outcomePath = Join-Path $env:TEMP "bridge-before-$([guid]::NewGuid().ToString('N')).json"
+    try {
+        Set-Content -LiteralPath $outcomePath -Encoding UTF8 -Value (@{
+            schemaVersion = 1; attemptId = ('d' * 32); success = $false; exitCode = 1
+            version = '1.2.3'; beforeVersion = '1.2.2'; ranInstaller = $true; error = 'later step failed'
+            at = [DateTimeOffset]::Now.ToString('o')
+        } | ConvertTo-Json)
+        $carried = Read-BridgeUpdateOutcome -Path $outcomePath
+        Test-That 'an outcome carries what the installation recorded when its attempt launched' {
+            $carried.BeforeVersion -ceq '1.2.2' -and $carried.RanInstaller -eq $true
+        } "got '$($carried.BeforeVersion)' / '$($carried.RanInstaller)'"
+
+        Set-Content -LiteralPath $outcomePath -Encoding UTF8 -Value (@{
+            schemaVersion = 1; attemptId = ('e' * 32); success = $false; exitCode = 1
+            version = '1.2.3'; error = 'later step failed'; at = [DateTimeOffset]::Now.ToString('o')
+        } | ConvertTo-Json)
+        $older = Read-BridgeUpdateOutcome -Path $outcomePath
+        # $null, not $false: "written before the field existed" is a different claim
+        # from "this child never ran an installer", and only the latter denies credit.
+        Test-That 'and one written before the fields existed still reads, claiming neither' {
+            $older.BeforeVersion -ceq '' -and $null -eq $older.RanInstaller
+        } "got '$($older.BeforeVersion)' / '$($older.RanInstaller)'"
+    }
+    finally { Remove-Item -LiteralPath $outcomePath -Force -ErrorAction SilentlyContinue }
 }
 
 Write-Host '--- the Install button path really launches the updater ---'
@@ -926,6 +1286,210 @@ $stagingAfter = @(Get-ChildItem -LiteralPath $fixtureRuntime -Directory -Filter 
 Test-That 'and no half-written staging folder is left behind' {
     ($stagingAfter -join "`n") -ceq ($stagingBefore -join "`n")
 } "before=$(@($stagingBefore).Count) after=$(@($stagingAfter).Count)"
+
+# --- what `status` reads back without making a request ----------------------------
+# A refused check retains the last known release, so on the dashboard a machine that
+# has not successfully checked in days looks exactly like one that is current (#153).
+# `status` reads the cache the daemon already wrote rather than asking GitHub again.
+$summaryDir = Join-Path $env:TEMP ("bridge-summary-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $summaryDir -Force | Out-Null
+$summaryPath = Join-Path $summaryDir 'agent-bridge-update.json'
+try {
+    Test-That 'no cache at all is nothing to report, not a fault' {
+        $null -eq (Get-BridgeUpdateCheckSummary -Path (Join-Path $summaryDir 'absent.json'))
+    }
+    'not json at all' | Set-Content -LiteralPath $summaryPath -Encoding UTF8
+    Test-That 'and neither is one that cannot be read' {
+        $null -eq (Get-BridgeUpdateCheckSummary -Path $summaryPath)
+    }
+
+    [pscustomobject]@{
+        CheckedAt = [DateTimeOffset]::Now.ToString('o'); Reached = $true; State = 'Found'
+        Detail = ''; RetryAt = $null; RateLimitStrikes = 0; TokenSource = '$env:GH_TOKEN'; TokenNote = ''
+        Release = [pscustomobject]@{ Tag = 'v9.9.7' }
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $summaryPath -Encoding UTF8
+    $answered = Get-BridgeUpdateCheckSummary -Path $summaryPath
+    Test-That 'an answered check names the release and the credential that got it' {
+        $answered.Answered -and $answered.Verdict -eq 'found v9.9.7' -and
+            $answered.AllowanceKnown -and $answered.TokenSource -eq '$env:GH_TOKEN'
+    } "$($answered.Verdict) / $($answered.TokenSource)"
+
+    [pscustomobject]@{
+        CheckedAt = [DateTimeOffset]::Now.ToString('o'); Reached = $false; State = 'RateLimited'
+        Detail = 'x'; RetryAt = $null; RateLimitStrikes = 1; TokenSource = ''
+        TokenNote = 'updates.token was rejected by GitHub (bad credentials); the check ran unauthenticated instead.'
+        Release = $null
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $summaryPath -Encoding UTF8
+    $refused = Get-BridgeUpdateCheckSummary -Path $summaryPath
+    Test-That 'a refused check reads as refused rather than as current' {
+        -not $refused.Answered -and $refused.Verdict -match 'rate limiting'
+    } $refused.Verdict
+    Test-That 'and an empty source is a check that really did go out unauthenticated' {
+        $refused.AllowanceKnown -and $refused.TokenSource -eq '' -and $refused.TokenNote -match 'rejected'
+    } "known=$($refused.AllowanceKnown) note=$($refused.TokenNote)"
+
+    # The cache a machine is carrying the moment it takes this release was written by
+    # the version before it, which had no TokenSource field - and *could* already
+    # authenticate from updates.token or an ambient GH_TOKEN. Reading that absence as
+    # "unauthenticated" would tell a machine that already has a token to go and
+    # configure one, for as long as that cache lasts. Raised by Codex on #153.
+    [pscustomobject]@{
+        CheckedAt = [DateTimeOffset]::Now.ToString('o'); Reached = $false; State = 'RateLimited'
+        Detail = 'x'; RetryAt = $null; RateLimitStrikes = 1; Release = $null
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $summaryPath -Encoding UTF8
+    $legacy = Get-BridgeUpdateCheckSummary -Path $summaryPath
+    Test-That 'a cache written before the field is unknown, not proof of an unauthenticated check' {
+        -not $legacy.AllowanceKnown -and $legacy.TokenSource -eq '' -and $legacy.Verdict -match 'rate limiting'
+    } "known=$($legacy.AllowanceKnown)"
+}
+finally { Remove-Item -LiteralPath $summaryDir -Recurse -Force -ErrorAction SilentlyContinue }
+
+# --- where the download has got to -------------------------------------------------
+# The emitter #155 was missing, driven against an ordinary Stream. The socket is not
+# the interesting part - what gets reported while bytes arrive is - and the buffer and
+# throttle are script-scope so this is deterministic rather than timed with sleeps.
+$downloadDir = Join-Path $env:TEMP ("bridge-download-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $downloadDir -Force | Out-Null
+$downloadFile = Join-Path $downloadDir 'release.zip'
+$payload = [byte[]]::new(10000)
+[Random]::new(1155).NextBytes($payload)
+$priorBuffer = $script:BridgeDownloadBufferSize
+$priorInterval = $script:BridgeDownloadReportIntervalMs
+try {
+    # One hundred reads of one percent each.
+    $script:BridgeDownloadBufferSize = 100
+
+    $script:BridgeDownloadReportIntervalMs = 0
+    $reports = [Collections.Generic.List[double]]::new()
+    $source = [IO.MemoryStream]::new($payload)
+    $result = Write-BridgeDownloadStream -Source $source -OutFile $downloadFile -Total $payload.Length `
+        -OnProgress { param([double]$p) $reports.Add($p) }
+    $source.Dispose()
+
+    Test-That 'the whole body is written, byte for byte' {
+        $result.Bytes -eq $payload.Length -and
+            ((Get-FileHash -LiteralPath $downloadFile -Algorithm SHA256).Hash -eq
+             [BitConverter]::ToString([Security.Cryptography.SHA256]::HashData($payload)).Replace('-', ''))
+    } "wrote $($result.Bytes) of $($payload.Length)"
+    Test-That 'a stated length is reported one whole percent at a time' {
+        $reports.Count -eq 100
+    } "reports=$($reports.Count)"
+    Test-That 'every proportion is inside the range the card will draw, and never zero' {
+        @($reports | Where-Object { $_ -le 0 -or $_ -gt 1 }).Count -eq 0
+    } "first=$($reports[0]) last=$($reports[$reports.Count - 1])"
+    Test-That 'and they only ever move forwards, ending on a full bar' {
+        $ascending = $true
+        for ($i = 1; $i -lt $reports.Count; $i++) { if ($reports[$i] -le $reports[$i - 1]) { $ascending = $false } }
+        $ascending -and $reports[$reports.Count - 1] -eq 1
+    } "last=$($reports[$reports.Count - 1])"
+
+    # Every chunk would rewrite the progress record continuously for the whole
+    # download, on the disk the installer is about to write to.
+    $script:BridgeDownloadReportIntervalMs = 1000
+    $throttled = [Collections.Generic.List[double]]::new()
+    $source = [IO.MemoryStream]::new($payload)
+    [void](Write-BridgeDownloadStream -Source $source -OutFile $downloadFile -Total $payload.Length `
+        -OnProgress { param([double]$p) $throttled.Add($p) })
+    $source.Dispose()
+    Test-That 'a second between reports holds an instant transfer to a single one' {
+        $throttled.Count -eq 1
+    } "reports=$($throttled.Count)"
+
+    # codeload sends no Content-Length on a HEAD and ignores a Range request, so a
+    # body whose length the server never stated has to read as no proportion - never
+    # as 0 and never as 100, either of which is a bar that cannot be believed.
+    $script:BridgeDownloadReportIntervalMs = 0
+    $silent = [Collections.Generic.List[double]]::new()
+    $source = [IO.MemoryStream]::new($payload)
+    $unknown = Write-BridgeDownloadStream -Source $source -OutFile $downloadFile -Total 0 `
+        -OnProgress { param([double]$p) $silent.Add($p) }
+    $source.Dispose()
+    Test-That 'a body with no stated length downloads with no proportion at all' {
+        $silent.Count -eq 0 -and -not $unknown.Proportioned -and $unknown.Bytes -eq $payload.Length
+    } "reports=$($silent.Count) proportioned=$($unknown.Proportioned)"
+
+    # The progress report drives a best-effort stage writer. One that throws must not
+    # be able to fail an update that is otherwise fine.
+    $source = [IO.MemoryStream]::new($payload)
+    $despiteThrow = Write-BridgeDownloadStream -Source $source -OutFile $downloadFile -Total $payload.Length `
+        -OnProgress { param([double]$p) throw 'the progress file is locked' }
+    $source.Dispose()
+    Test-That 'a progress report that throws does not fail the download it describes' {
+        $despiteThrow.Bytes -eq $payload.Length
+    } "wrote $($despiteThrow.Bytes)"
+
+    # A truncated archive is worse than none: Expand-Archive fails on it with a ZIP
+    # error, and the update is then reported as a corrupt release rather than as an
+    # interrupted download.
+    Remove-Item -LiteralPath $downloadFile -Force -ErrorAction SilentlyContinue
+    $broken = [IO.MemoryStream]::new($payload)
+    $broken.Dispose()
+    $threw = $false
+    try { [void](Write-BridgeDownloadStream -Source $broken -OutFile $downloadFile -Total $payload.Length) }
+    catch { $threw = $true }
+    Test-That 'an interrupted transfer throws and leaves no half-written archive behind' {
+        $threw -and -not (Test-Path -LiteralPath $downloadFile)
+    } "threw=$threw exists=$(Test-Path -LiteralPath $downloadFile)"
+
+    # HttpClient.Timeout stops applying once ResponseHeadersRead has handed the headers
+    # back - .NET documents this - and Stream.Read cannot be cancelled, so a server that
+    # sent headers and then stalled had no timeout at all and left the card on
+    # Downloading for ever. Raised by Codex on #190.
+    Remove-Item -LiteralPath $downloadFile -Force -ErrorAction SilentlyContinue
+    $stalled = [IO.Pipes.AnonymousPipeServerStream]::new([IO.Pipes.PipeDirection]::In, [IO.HandleInheritability]::None)
+    $elapsed = [Diagnostics.Stopwatch]::StartNew()
+    $stallError = ''
+    try { [void](Write-BridgeDownloadStream -Source $stalled -OutFile $downloadFile -Total 1000 -StallSeconds 1) }
+    catch { $stallError = $_.Exception.Message }
+    finally { $elapsed.Stop(); $stalled.Dispose() }
+    Test-That 'a transfer that sends nothing is given up on rather than waited on for ever' {
+        $stallError -match 'stalled for more than 1 seconds' -and $elapsed.Elapsed.TotalSeconds -lt 30
+    } "after $([Math]::Round($elapsed.Elapsed.TotalSeconds, 2))s: $stallError"
+    Test-That 'and leaves no half-written archive behind either' {
+        -not (Test-Path -LiteralPath $downloadFile)
+    }
+
+    # The clock restarts on every chunk that arrives, so it is an idle timeout and
+    # never a cap on a slow but progressing download - a hundred reads here, with a
+    # stall budget shorter than any plausible whole transfer.
+    $patient = [IO.MemoryStream]::new($payload)
+    $slowButSteady = Write-BridgeDownloadStream -Source $patient -OutFile $downloadFile -Total $payload.Length -StallSeconds 1
+    $patient.Dispose()
+    Test-That 'a transfer that keeps arriving is never cut off for taking many reads' {
+        $slowButSteady.Bytes -eq $payload.Length
+    } "wrote $($slowButSteady.Bytes) of $($payload.Length)"
+
+    # The seam no suite could reach: the Download transport is refused outright under
+    # test, so not one line of Save-BridgeUpdateDownload's body ever ran, and the line
+    # reading the stated size was wrong the whole time. `.HasValue` looks right - the
+    # property is Nullable<long> in C# - but PowerShell unwraps it on the way in, so
+    # under StrictMode that threw PropertyNotFoundException for a stated length *and*
+    # an absent one, failing every real self-update the moment the headers arrived.
+    # Driven against real HttpResponseMessage headers rather than a hand-made stand-in,
+    # because the boxing is the whole bug. Raised by Codex on #190.
+    Add-Type -AssemblyName System.Net.Http
+    $stated = [Net.Http.HttpResponseMessage]::new(200)
+    $stated.Content = [Net.Http.ByteArrayContent]::new([byte[]]@(1, 2, 3, 4, 5))
+    # A non-seekable stream is the honest "server stated no length" case: .NET cannot
+    # compute one, so the header is genuinely absent rather than removed.
+    $silent = [Net.Http.HttpResponseMessage]::new(200)
+    $pipe = [IO.Pipes.AnonymousPipeServerStream]::new([IO.Pipes.PipeDirection]::In)
+    $silent.Content = [Net.Http.StreamContent]::new($pipe)
+    try {
+        Test-That 'a stated content length survives the trip through PowerShell as a total' {
+            (Get-BridgeDownloadTotal -ContentLength $stated.Content.Headers.ContentLength) -eq 5
+        }
+        Test-That 'and a response that states none asks for no proportion rather than throwing' {
+            (Get-BridgeDownloadTotal -ContentLength $silent.Content.Headers.ContentLength) -eq 0
+        }
+    }
+    finally { $stated.Dispose(); $silent.Dispose(); $pipe.Dispose() }
+}
+finally {
+    $script:BridgeDownloadBufferSize = $priorBuffer
+    $script:BridgeDownloadReportIntervalMs = $priorInterval
+    Remove-Item -LiteralPath $downloadDir -Recurse -Force -ErrorAction SilentlyContinue
+}
 
 # --- reading progress back ---------------------------------------------------------
 # A display, not a verdict. Read-BridgeUpdateOutcome throws on anything unexpected

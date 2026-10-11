@@ -88,10 +88,21 @@ if ($IsWindows) {
         Write-UpdateResultDiagnostic -Result $result -Expected @{ Success = ($case -in @('valid', 'daemon-race', 'record-race')); AttemptedVersion = '1.2.0' }
         Assert-UpdateIntake "$case does not hide a fixture timeout" (-not $fixtureState.ChildTimedOut)
         $success = $case -in @('valid', 'daemon-race', 'record-race')
+        # "Installed, then a step after it failed" is a third outcome, not a shade of
+        # failure. Both of these cases record the release and then fail - one throws
+        # after mutating the version, the other cannot stop the daemon it has just
+        # replaced - and reporting them as plain failures is what made a successful
+        # install look like the thing to retry (#124).
+        $afterInstall = $case -in @('partial-failure', 'restart-denied')
         Assert-UpdateIntake "$case has a typed, attempt-attributable outcome" (
             $result.Success -is [bool] -and $result.Success -eq $success -and
-            $result.State -eq $(if ($success) { 'Completed' } else { 'Failed' }) -and
+            $result.State -eq $(if ($success) { 'Completed' } elseif ($afterInstall) { 'Incomplete' } else { 'Failed' }) -and
             $result.AttemptedVersion -eq '1.2.0')
+        if ($afterInstall) {
+            Assert-UpdateIntake "$case says the release installed and names the step that failed" (
+                $result.Detail -match '^installed 1\.2\.0, but a step after the install failed' -and
+                $result.Detail -match 'agent-ha-bridge status')
+        }
         if ($case -eq 'corrupt-zip') {
             Assert-UpdateIntake 'a corrupt archive supplies its actual private terminal receipt' (
                 $fixtureState.PrivateProofRaw -is [string] -and -not [string]::IsNullOrWhiteSpace($fixtureState.PrivateProofRaw))

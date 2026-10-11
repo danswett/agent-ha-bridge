@@ -1727,3 +1727,196 @@ function Get-BridgeRegistrationHealth {
     }
 }
 
+
+function Get-BridgeUpdateCheckSummary {
+    <#
+        What the last release check found and which GitHub allowance it spent, read
+        from the cache the daemon already writes - so `agent-ha-bridge status` can say
+        it without making a request of its own. $null when there is no readable
+        record, because a missing or corrupt display file is nothing to show.
+
+        The allowance is deliberately three-valued, not two. A cache written by a
+        version before TokenSource existed says nothing about how its check
+        authenticated, and that version could already use updates.token or an ambient
+        GH_TOKEN - so reading the absent field as "unauthenticated" would tell a
+        machine that already has a token to go and configure one, for as long as that
+        cache lasts. AllowanceKnown is what separates "went out unauthenticated" from
+        "this record cannot say". Raised by Codex on #153.
+
+        Lives here beside Get-BridgeRegistrationHealth, which is the other thing
+        `status` reports by reading rather than asking.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    $record = $null
+    try { $record = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json }
+    catch { return $null }
+    if ($null -eq $record -or -not $record.PSObject.Properties['CheckedAt']) { return $null }
+
+    $checkedAt = [DateTimeOffset]::MinValue
+    $when = if ([DateTimeOffset]::TryParse([string]$record.CheckedAt, [ref]$checkedAt)) {
+        $checkedAt.ToLocalTime().ToString('MMM d HH:mm')
+    } else { 'at an unreadable time' }
+    $state = if ($record.PSObject.Properties['State']) { [string]$record.State } else { '' }
+    $tag = ''
+    if ($record.PSObject.Properties['Release'] -and $record.Release -and
+        $record.Release.PSObject.Properties['Tag']) { $tag = [string]$record.Release.Tag }
+
+    [pscustomobject]@{
+        When     = $when
+        State    = $state
+        Answered = ($state -eq 'Found')
+        Verdict  = switch ($state) {
+            'Found' { if ($tag) { "found $tag" } else { 'answered' } }
+            'RateLimited' { 'refused - GitHub is rate limiting this machine' }
+            'NotFound' { 'GitHub reported no release' }
+            default { 'could not establish the latest release' }
+        }
+        AllowanceKnown = [bool]$record.PSObject.Properties['TokenSource']
+        # A name - 'updates.token', '$env:GH_TOKEN' - or '' for a check that went out
+        # unauthenticated. Never a credential: the cache has never held one.
+        TokenSource = if ($record.PSObject.Properties['TokenSource']) { [string]$record.TokenSource } else { '' }
+        TokenNote   = if ($record.PSObject.Properties['TokenNote']) { [string]$record.TokenNote } else { '' }
+    }
+}
+
+function Test-BridgeUpdateTokenRejected {
+    <#
+        Whether the last release check had its token refused by GitHub, wherever that
+        token came from.
+
+        A rejected token is worse than none: the check falls back to the anonymous
+        retry that works, so nothing breaks, and the machine is back on the 60-an-hour
+        shared pool while something claims otherwise. The installer uses this to offer
+        a replacement, because it would otherwise skip the prompt for exactly the
+        machine that needs it - a nonempty `updates.token` is not empty, and a rejected
+        ambient GH_TOKEN still counts as "this machine has one". Both were raised by
+        Codex on #190.
+
+        Deliberately not limited to the configured setting. A refused `$env:GH_TOKEN`
+        is re-sent and refused on every check, and the operator cannot edit the
+        environment from here - but storing a working `updates.token` does fix it,
+        because the configured setting wins over the environment.
+
+        One place decides it, so the installer and the check that writes the note can
+        never drift apart on the wording.
+    #>
+    param([AllowNull()]$Summary)
+
+    if ($null -eq $Summary) { return $false }
+    foreach ($name in @('AllowanceKnown', 'TokenSource', 'TokenNote')) {
+        if (-not $Summary.PSObject.Properties[$name]) { return $false }
+    }
+    [bool]($Summary.AllowanceKnown -and -not $Summary.TokenSource -and
+        [string]$Summary.TokenNote -match 'was rejected by GitHub')
+}
+
+function Test-BridgeUpdateTokenSendable {
+    <#
+        Whether a token can be sent as a request header at all.
+
+        Surrounding whitespace is trimmed first, because a trailing newline is the
+        commonest thing a paste adds and is harmless once removed. What is left must
+        be visible ASCII, which every GitHub token is: anything else - an internal
+        newline, the smart quotes a chat client substitutes - makes .NET refuse the
+        header outright, so the release check fails complaining about header syntax on
+        a machine whose unauthenticated check would have worked.
+
+        One rule, used by the request path and by the installer that offers to set the
+        token, so a value the installer accepts is never one the checker then skips.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Value)
+
+    [bool](([string]$Value).Trim() -match '^[\x21-\x7E]+$')
+}
+
+function Select-BridgeUpdateTokenCandidate {
+    <#
+        Which credential a release check will authenticate with, given what is
+        configured: { Token, Source, Note }.
+
+        Source is a *name* - 'updates.token', or '$env:GH_TOKEN' - and never the
+        value. That distinction is the point: everything outside this wants to say
+        whether checks are authenticated and what to change when they are not, and
+        none of that needs the credential. Token goes straight into a request header
+        and nowhere else - never a log line, a detail string, a dashboard field or an
+        exception message.
+
+        Order matters. The configured setting wins over the environment, because it is
+        the one somebody chose for this machine: an ambient CI token that happens to be
+        exported should not quietly displace it. The environment is still taken when
+        the setting is empty - a machine very often already holds one of these, a
+        release check only needs public read, and taking what is there is the
+        difference between 60 requests an hour shared with everything else behind the
+        same address and 5,000 of this machine's own.
+
+        An unusable value is skipped with a reason rather than sent. A token is an HTTP
+        header, so one carrying a newline or a smart quote from a paste cannot be sent
+        at all - .NET refuses the header, and the check then fails complaining about
+        header syntax on a machine whose unauthenticated check would have worked.
+        Degrading to that check, and naming what to fix, beats breaking updates over a
+        paste. The next candidate still gets its turn, so one mistyped setting cannot
+        cost a machine a working ambient token.
+
+        Here rather than in bridge-update.ps1 because the installer must answer the
+        same question before the runtime exists to ask it. The two disagreeing is its
+        own bug: a stored value with a newline in it was reported as "authenticated"
+        and suppressed the prompt, while every actual check skipped it and went out
+        unauthenticated. Raised by Codex on #190.
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Configured)
+
+    $candidates = @([pscustomobject]@{ Value = [string]$Configured; Source = 'updates.token' })
+    foreach ($name in @('AGENT_HA_BRIDGE_UPDATE_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')) {
+        $candidates += [pscustomobject]@{
+            Value  = [string][Environment]::GetEnvironmentVariable($name)
+            Source = "`$env:$name"
+        }
+    }
+
+    $note = ''
+    foreach ($candidate in $candidates) {
+        $value = ([string]$candidate.Value).Trim()
+        if (-not $value) { continue }
+        if (-not (Test-BridgeUpdateTokenSendable -Value $value)) {
+            if (-not $note) {
+                $note = "$($candidate.Source) is not a usable token: it contains characters that cannot be sent in a request header."
+            }
+            continue
+        }
+        return [pscustomobject]@{ Token = $value; Source = $candidate.Source; Note = $note }
+    }
+    [pscustomobject]@{ Token = ''; Source = ''; Note = $note }
+}
+
+function Get-BridgeUpdateTokenPromptReason {
+    <#
+        Why an interactive install should offer to replace the credential release
+        checks use, or '' when it should not ask: 'refused', 'unusable' or 'none'.
+
+        One value decides both whether to ask and what to say, because keeping those
+        two apart is what went wrong. The installer asked when there was no usable
+        source or when the last check had been refused, then chose its wording from a
+        separate cascade that also had a branch for an unsendable setting - a branch
+        nothing could reach. An `updates.token` carrying a smart quote alongside a
+        working $env:GH_TOKEN resolves to a nonempty source *and* a note, so the offer
+        was skipped while both `status` and `update` went on printing that note and
+        telling the operator to run the command that skips it. Raised by Codex on #190.
+
+        Order is by what is actually being sent. A refusal is about the credential the
+        last check used, so it comes first; an unsendable value is a setting being
+        skipped, which matters even while something else carries the checks; having
+        nothing at all is last because it is the only one that is not a mistake.
+    #>
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Source,
+        [AllowNull()][AllowEmptyString()][string]$RefusedNote,
+        [AllowNull()][AllowEmptyString()][string]$UnusableNote
+    )
+
+    if ($RefusedNote) { return 'refused' }
+    if ($UnusableNote) { return 'unusable' }
+    if (-not $Source) { return 'none' }
+    ''
+}

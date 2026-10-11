@@ -261,6 +261,24 @@ function Get-BridgeRateLimitWait {
     [pscustomobject]@{ Limited = $true; RetryAt = $retryAt; Suffix = $suffix; Explicit = $explicit }
 }
 
+function Get-BridgeUpdateToken {
+    <#
+        The credential a release check should authenticate with, and where it came
+        from: { Token, Source, Note }.
+
+        Only reads the setting; Select-BridgeUpdateTokenCandidate decides. They are
+        separate because the installer has to answer the same question - which
+        credential will this machine's checks actually use - before the runtime exists
+        to ask, and the two disagreeing is its own bug: a stored value with a newline
+        in it was reported as "authenticated" while every check skipped it. Raised by
+        Codex on #190.
+    #>
+
+    $configured = ''
+    try { $configured = [string](Get-BridgeSetting 'updates.token' '') } catch { $configured = '' }
+    Select-BridgeUpdateTokenCandidate -Configured $configured
+}
+
 function Get-BridgeReleaseRequestHeaders {
     <#
         The headers for a GitHub release lookup, with an optional token.
@@ -278,23 +296,16 @@ function Get-BridgeReleaseRequestHeaders {
         and sending one of those turns a release check that would have succeeded
         unauthenticated into a 401. The caller retries without it on exactly that.
     #>
-    param([switch]$Anonymous)
+    param([switch]$Anonymous, [AllowNull()]$ResolvedToken)
 
     $headers = @{
         'User-Agent' = $script:BridgeUpdateConfig.UserAgent
         Accept       = 'application/vnd.github+json'
     }
     if ($Anonymous) { return $headers }
-    $token = ''
-    try { $token = [string](Get-BridgeSetting 'updates.token' '') } catch { $token = '' }
-    foreach ($name in @('AGENT_HA_BRIDGE_UPDATE_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')) {
-        if (-not [string]::IsNullOrWhiteSpace($token)) { break }
-        # The machine very often already holds one of these, and a release check only
-        # needs public read. Taking one that is already there is the difference between
-        # 60 requests an hour shared with everything else behind the same address and
-        # 5,000 of this machine's own - without asking anyone to configure anything.
-        $token = [string][Environment]::GetEnvironmentVariable($name)
-    }
+    # Resolved once by the caller when it also wants to report the source, so that the
+    # headers and what is said about them can never describe different credentials.
+    $token = if ($null -ne $ResolvedToken) { [string]$ResolvedToken.Token } else { [string](Get-BridgeUpdateToken).Token }
     if (-not [string]::IsNullOrWhiteSpace($token)) {
         $headers['Authorization'] = "Bearer $($token.Trim())"
     }
@@ -500,7 +511,13 @@ function Get-BridgeLatestRelease {
         }
     }
 
-    $lookup = [pscustomobject]@{ State = 'Unavailable'; Release = $null; Detail = 'The latest release could not be established.'; RetryAt = $null }
+    $lookup = [pscustomobject]@{
+        State = 'Unavailable'; Release = $null
+        Detail = 'The latest release could not be established.'; RetryAt = $null
+        # A name, never a value. '' means the check went out unauthenticated, which is
+        # the 60-requests-an-hour-per-IP pool everything behind this address shares.
+        TokenSource = ''; TokenNote = ''
+    }
     # Carried across checks so a limit that names no time of its own backs off instead
     # of being asked again at the same fixed interval for as long as it lasts.
     $strikes = 0
@@ -513,6 +530,11 @@ function Get-BridgeLatestRelease {
         try { $checkedAt = ConvertTo-BridgeUpdateTime $cache.CheckedAt }
         catch [FormatException] { Write-Warning 'The update cache has an invalid check time; checking again.' }
         if ($null -ne $checkedAt) {
+            # Describes the check that produced this entry, so it is served with it
+            # rather than being recomputed from whatever the environment holds now.
+            foreach ($field in @('TokenSource', 'TokenNote')) {
+                if ($cache.PSObject.Properties[$field]) { $lookup.$field = [string]$cache.$field }
+            }
             $rateLimitExpired = $false
             $cachedRetryAt = $null
             $cachedRelease = if ($cache.PSObject.Properties['Release']) { $cache.Release } else { $null }
@@ -587,12 +609,19 @@ function Get-BridgeLatestRelease {
     $lookup.State = 'Unavailable'
     $lookup.Release = $null
     $lookup.Detail = 'The latest release could not be established.'
+    $lookup.TokenSource = ''
+    $lookup.TokenNote = ''
     try {
         $repository = Get-BridgeUpdateRepository
         if ($repository -notmatch '^[\w.-]+/[\w.-]+$') { throw 'The update repository must be owner/name.' }
         $uri = "https://api.github.com/repos/$repository/releases/latest"
         Assert-BridgeHttpAllowed -Uri $uri -Transport Rest
-        $headers = Get-BridgeReleaseRequestHeaders
+        # Resolved once and handed to the header builder, so what is reported about
+        # this check and what was actually sent on it cannot disagree.
+        $resolvedToken = Get-BridgeUpdateToken
+        $lookup.TokenSource = $resolvedToken.Source
+        $lookup.TokenNote = $resolvedToken.Note
+        $headers = Get-BridgeReleaseRequestHeaders -ResolvedToken $resolvedToken
         $sentToken = $headers.ContainsKey('Authorization')
         try {
             $response = Invoke-RestMethod -Uri $uri -Headers $headers `
@@ -619,6 +648,13 @@ function Get-BridgeLatestRelease {
                 ($failureStatus -eq 403 -and -not (Get-BridgeRateLimitWait -Response $_.Exception.Response `
                     -Status $failureStatus -Detail $failureDetail).Limited)
             if (-not $sentToken -or -not $badCredential) { throw }
+            # Said out loud, because the retry hides it otherwise. A rejected token
+            # that silently falls back leaves the machine on the 60-an-hour shared
+            # pool while its configuration claims otherwise, and nothing anywhere
+            # says which of the two it is on - which is the quiet half of #153.
+            $lookup.TokenNote = "$($lookup.TokenSource) was rejected by GitHub (bad credentials); " +
+                'the check ran unauthenticated instead.'
+            $lookup.TokenSource = ''
             $response = Invoke-RestMethod -Uri $uri -Headers (Get-BridgeReleaseRequestHeaders -Anonymous) `
                 -TimeoutSec $script:BridgeUpdateConfig.RequestTimeout
         }
@@ -672,9 +708,24 @@ function Get-BridgeLatestRelease {
             # days behind looked exactly like one that was current.
             $lookup.State = 'RateLimited'
             $lookup.RetryAt = if ($rateLimit.RetryAt) { $rateLimit.RetryAt.ToString('o') } else { $null }
+            # The last sentence is advice, so it has to be true of this machine. Told
+            # to set updates.token while already using one, an operator sets it again
+            # and is refused again; a machine that has none is the only one for which
+            # that is the remedy, and naming the 83-fold difference is what makes it
+            # worth doing (#153).
             $lookup.Detail = "GitHub is rate limiting this machine's release checks$($rateLimit.Suffix). " +
                 'The install is fine; the check will work again once the limit resets. ' +
-                'Setting updates.token raises the limit.'
+                $(if ($lookup.TokenSource) {
+                    # No number for a credential whose type is unknown. A personal
+                    # access token gets 5,000 an hour, but GITHUB_TOKEN inside Actions
+                    # gets 1,000 per repository - so quoting 5,000 at whatever happens
+                    # to be exported would misreport the allowance in either direction.
+                    # Raised by Codex on #190.
+                    "Checks are authenticated with $($lookup.TokenSource), which has an allowance of its own."
+                } else {
+                    'Unauthenticated checks share 60 requests an hour per IP with everything else behind this address; ' +
+                    'a personal access token in updates.token raises this machine to 5,000 of its own.'
+                })
             try {
                 $fallback = Get-BridgeLatestReleaseWithoutApi -Repository $repository
                 if (Test-BridgeUpdateRelease $fallback) {
@@ -711,6 +762,12 @@ function Get-BridgeLatestRelease {
         Detail    = $lookup.Detail
         RetryAt   = $lookup.RetryAt
         RateLimitStrikes = $strikes
+        # The *name* of what authenticated the check, so `agent-ha-bridge status` can
+        # say which allowance this machine is on without making a request of its own -
+        # and without ever holding the credential. A rejected or unusable token leaves
+        # a note here rather than vanishing into a silent anonymous retry.
+        TokenSource = $lookup.TokenSource
+        TokenNote   = $lookup.TokenNote
         Release   = $lookup.Release
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
 
@@ -744,10 +801,74 @@ function Get-BridgeUpdateStatus {
         LookupState = $lookup.State
         State     = if ($release) { if ($available) { 'Available' } else { 'Current' } } else { $lookup.State }
         Detail    = $lookup.Detail
+        # Which allowance this machine's checks are on, by name, and anything that
+        # went wrong reaching for a credential. Never the credential.
+        TokenSource = if ($lookup.PSObject.Properties['TokenSource']) { [string]$lookup.TokenSource } else { '' }
+        TokenNote   = if ($lookup.PSObject.Properties['TokenNote']) { [string]$lookup.TokenNote } else { '' }
         Url       = if ($release) { [string]$release.Url } else { "https://github.com/$(Get-BridgeUpdateRepository)/releases" }
         Notes     = if ($release -and $release.PSObject.Properties['Notes']) { [string]$release.Notes } else { '' }
         Zip       = if ($release) { [string]$release.Zip } else { '' }
     }
+}
+
+function Test-BridgeUpdateReachedInstall {
+    <#
+        Whether a failed update nonetheless installed the release it was going for,
+        judged by the version the installation now records for itself.
+
+        The installer writes that record before it registers agent clients, re-checks
+        the Home Assistant connection or restarts anything, so a recorded version
+        equal to the target means the payload is in place and what failed came after
+        it. `agent-ha-bridge status` run straight afterwards says so too: the new
+        version, every check green (#124).
+
+        Reporting that as "update to X failed (child exit 1)" is how a stale Codex
+        marketplace (#119) and a racy LaunchAgent shutdown each sent someone hunting
+        for an updater bug that did not exist - and, worse, made a successful update
+        look like the thing to retry. It is not a claim that the install is healthy,
+        only that it happened; the failing step still gets named.
+    #>
+    param(
+        [AllowNull()][AllowEmptyString()][string]$Attempted,
+        [AllowNull()][AllowEmptyString()][string]$Recorded,
+        # What the installation recorded *before* this attempt, where the caller knows
+        # it. Without it, `update.ps1 -Force` repairing an installation already on the
+        # target satisfies the comparison however early the child failed - a refused
+        # download or a corrupt archive would be reported as "installed, then a later
+        # step failed" when nothing was installed at all. Raised by Codex on #190.
+        #
+        # The detached path carries it in the outcome file, for a second reason: two
+        # presses can have two children going for the same release, and without
+        # attempt-specific proof the shared installed-version record credits a child
+        # that failed during download with the other's install. Only an outcome
+        # written before that field existed omits it, and omission keeps the old
+        # behaviour rather than inventing a pre-version.
+        [AllowNull()][AllowEmptyString()][string]$Before,
+        # Whether this child ever handed control to an installer. Unlike the version
+        # record, that is a fact about its own execution, so a concurrent attempt
+        # cannot supply it: two presses launched while 1.1.0 is installed both record
+        # 1.1.0, and if one installs 1.2.0 while the other dies during download, the
+        # pre/post comparison alone still credits the one that installed nothing.
+        # Raised by Codex on #190. Omitted by an outcome written before the field
+        # existed, which keeps the old behaviour rather than assuming either answer.
+        [bool]$RanInstaller
+    )
+
+    if ($PSBoundParameters.ContainsKey('RanInstaller') -and -not $RanInstaller) { return $false }
+    $target = ([string]$Attempted).Trim() -replace '^[vV]', ''
+    $actual = ([string]$Recorded).Trim() -replace '^[vV]', ''
+    # Compared as written rather than through ConvertTo-BridgeVersion, which parses
+    # 1.2.3-rc.1 and 1.2.3 alike: those are different releases and only one of them
+    # is the one that was being installed.
+    if (-not $target -or -not $actual -or $target -cne $actual) { return $false }
+    if ($PSBoundParameters.ContainsKey('Before')) {
+        # Unchanged means this attempt did not write it, so it proves nothing about
+        # how far this attempt got. Under-reporting a same-version repair as a plain
+        # failure is the safe direction; claiming an install that never happened is
+        # not.
+        if ((([string]$Before).Trim() -replace '^[vV]', '') -ceq $target) { return $false }
+    }
+    $true
 }
 
 function Read-BridgeUpdateOutcome {
@@ -778,7 +899,7 @@ function Read-BridgeUpdateOutcome {
         }
     }
     $allowed = @('success', 'version', 'releaseUrl', 'error', 'at')
-    if ($schema) { $allowed += @('schemaVersion', 'attemptId', 'exitCode') }
+    if ($schema) { $allowed += @('schemaVersion', 'attemptId', 'exitCode', 'beforeVersion', 'ranInstaller') }
     if (@($record.Keys | Where-Object { $_ -cnotin $allowed }).Count) { throw 'The update outcome contains unsupported fields.' }
     if ($AttemptId -and ($schema -ne 1 -or $record['attemptId'] -cne $AttemptId)) {
         throw 'The update outcome does not belong to this attempt.'
@@ -793,6 +914,19 @@ function Read-BridgeUpdateOutcome {
         if (-not [version]::TryParse(($target -split '[-+]')[0], [ref]$parsedTarget)) { throw 'The attempted version is not parseable.' }
     }
     if ($Version -and $target -cne $Version) { throw 'The update outcome names a different release.' }
+    # What the installation recorded when *this* attempt launched, so the daemon can
+    # tell its own install apart from one a concurrent attempt made. Absent from an
+    # outcome written before the field existed, and absent is not a value: the daemon
+    # then omits -Before and behaves exactly as it did. Raised by Codex on #190.
+    $before = if ($record.Contains('beforeVersion')) { $record['beforeVersion'] } else { '' }
+    if ($before -isnot [string]) { throw 'The update outcome has an invalid pre-attempt version.' }
+    # Tri-state deliberately: $null is "this outcome predates the field", which is not
+    # the same claim as "this child never ran an installer".
+    $ran = $null
+    if ($record.Contains('ranInstaller')) {
+        if ($record['ranInstaller'] -isnot [bool]) { throw 'The update outcome has an invalid installer record.' }
+        $ran = [bool]$record['ranInstaller']
+    }
     $url = if ($record.Contains('releaseUrl')) { $record['releaseUrl'] } else { '' }
     $errorText = if ($record.Contains('error')) { $record['error'] } else { '' }
     if ($url -isnot [string] -or $errorText -isnot [string] -or
@@ -809,6 +943,8 @@ function Read-BridgeUpdateOutcome {
         AttemptId = if ($schema) { $record['attemptId'] } else { '' }
         Success = $record['success']
         Version = $target
+        BeforeVersion = $before
+        RanInstaller = $ran
         ReleaseUrl = $url
         Error = $errorText
         At = $at
@@ -941,6 +1077,7 @@ function Write-UpdateOutcome {
 `$outcome = @{
     schemaVersion = 1; attemptId = '$($result.AttemptId)'; success = `$false; exitCode = 1
     version = '$($status.Latest)'; releaseUrl = '$($status.Url.Replace("'", "''"))'
+    beforeVersion = '$(([string]$status.Installed).Replace("'", "''"))'; ranInstaller = `$false
     error = ''; at = ''
 }
 function Write-UpdateStage {
@@ -974,15 +1111,25 @@ try {
         if (`$resultFile) { `$paths += `$resultFile }
         Assert-BridgeTestPath -Path `$paths
     }
-    Assert-BridgeInstallPayload -Root `$ownedContext.HooksDir -RelativePaths @('bridge-platform.ps1', 'bridge-test-guard.ps1')
+    Assert-BridgeInstallPayload -Root `$ownedContext.HooksDir -RelativePaths @('bridge-platform.ps1', 'bridge-test-guard.ps1', 'bridge-download.ps1')
     . '$((Join-Path $updateContext.HooksDir 'bridge-platform.ps1').Replace("'", "''"))'
     . '$((Join-Path $updateContext.HooksDir 'bridge-test-guard.ps1').Replace("'", "''"))'
+    . '$((Join-Path $updateContext.HooksDir 'bridge-download.ps1').Replace("'", "''"))'
     `$pathsVerified = `$true
     Write-UpdateStage -Stage 'downloading'
     Write-UpdateLog 'downloading $($status.Latest)'
     `$zip = Join-Path `$staging 'release.zip'
-    Assert-BridgeHttpAllowed -Uri '$($status.Zip.Replace("'", "''"))' -Transport WebRequest
-    Invoke-WebRequest -Uri '$($status.Zip.Replace("'", "''"))' -OutFile `$zip -Headers @{ 'User-Agent' = 'agent-ha-bridge' } -UseBasicParsing
+    # Streamed rather than handed to Invoke-WebRequest -OutFile, which blocks until
+    # the file is complete and so can only ever report the word "downloading". The
+    # proportion covers this archive alone: the native hook is fetched later, by the
+    # installer, under the Installing stage - which carries no proportion, so the bar
+    # disappears there rather than sitting full for the larger half of the wait (#155).
+    `$fetched = Save-BridgeUpdateDownload -Uri '$($status.Zip.Replace("'", "''"))' -OutFile `$zip ``
+        -UserAgent 'agent-ha-bridge' -OnProgress {
+            param([double]`$Proportion)
+            Write-UpdateStage -Stage 'downloading' -Proportion `$Proportion
+        }
+    Write-UpdateLog "downloaded `$(`$fetched.Bytes) bytes`$(if (`$fetched.Proportioned) { '' } else { ' (no Content-Length, so no progress was reported)' })"
     Expand-Archive -LiteralPath `$zip -DestinationPath `$staging -Force
     `$roots = @(Get-ChildItem -LiteralPath `$staging -Directory)
     if (`$roots.Count -ne 1) { throw 'the archive did not contain exactly one expected folder' }
@@ -1010,6 +1157,12 @@ try {
         throw 'The release installer cannot preserve this installation root; it was not run.'
     }
     `$global:LASTEXITCODE = 0
+    # Recorded before the call, not after, and never unset: the question it answers is
+    # whether *this* child ever handed control to an installer, which is the one thing
+    # about its own progress no shared version record can tell anyone. A child that
+    # failed during download or archive validation cannot then be credited with a
+    # concurrent child's install. Raised by Codex on #190.
+    `$outcome.ranInstaller = `$true
     & (Join-Path `$root.FullName 'install.ps1') -NonInteractive -SkipVerify$targetArgument$rootArgument
     if (`$LASTEXITCODE -ne 0) { throw "the installer exited with code `$LASTEXITCODE" }
     # Restart the daemon so the new code and config take effect. The installer cannot:
@@ -1117,6 +1270,21 @@ exit `$outcome.exitCode
         $outcome = Read-BridgeUpdateOutcome -Path $resultPath -AttemptId $result.AttemptId -Version $status.Latest
         if ($outcome.At -lt $attemptStartedAt.AddSeconds(-1)) { throw 'The foreground update outcome predates this attempt.' }
         if ($exitCode -ne 0 -or -not $outcome.Success) {
+            # "Installed, then something after it failed" is a different thing from
+            # "nothing was installed", and until now both came out as the same
+            # undifferentiated `child exit 1` (#124). Returned rather than thrown,
+            # because throwing is how the caller is told the update did not happen.
+            $foregroundArgs = @{
+                Attempted = $status.Latest; Recorded = $result.InstalledVersion; Before = $status.Installed
+            }
+            if ($null -ne $outcome.RanInstaller) { $foregroundArgs['RanInstaller'] = [bool]$outcome.RanInstaller }
+            if (Test-BridgeUpdateReachedInstall @foregroundArgs) {
+                $result.State = 'Incomplete'
+                $result.Detail = "installed $($status.Latest), but a step after the install failed " +
+                    "(child exit $exitCode): $($outcome.Error) - the recorded version is " +
+                    "$($result.InstalledVersion), so run 'agent-ha-bridge status' to see what did not finish"
+                return $result
+            }
             throw "update to $($status.Latest) failed (child exit $exitCode): $($outcome.Error)"
         }
         $result.Success = $true

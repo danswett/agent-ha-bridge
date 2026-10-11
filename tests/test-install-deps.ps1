@@ -331,6 +331,73 @@ Test-That 'an empty value is dropped' {
     @(ConvertTo-BridgeArgumentList -BoundParameters @{ NotifyService = '' }).Count -eq 0
 }
 
+Write-Host '--- the setting that makes release checks reliable is reachable ---'
+# Until now `updates.token` could only be hand-edited into config.json, so in practice
+# no machine had one and every release check went out on the 60-requests-an-hour pool
+# shared with everything behind the same address - measured at 51/60 on one machine
+# against 5000/5000 for the identical authenticated call (#153). Both
+# `agent-ha-bridge update` and `agent-ha-bridge status` now tell people to run this.
+Test-That 'install.ps1 accepts the -UpdateToken that status and update point people at' {
+    (Get-Command (Join-Path $PSScriptRoot '..\install.ps1')).Parameters.ContainsKey('UpdateToken')
+}
+Test-That 'and it is kept off a relaunched command line, like the other two tokens' {
+    @(ConvertTo-BridgeArgumentList -BoundParameters @{
+        Token = 'a'; AgentToken = 'b'; UpdateToken = 'c'
+    } -Exclude @('Token', 'AgentToken', 'UpdateToken')).Count -eq 0
+}
+Test-That 'a config written before the setting existed gains it rather than silently lacking it' {
+    $examplePath = Join-Path $PSScriptRoot '..\config.example.json'
+    $defaults = Get-Content -LiteralPath $examplePath -Raw | ConvertFrom-Json
+    $older = Get-Content -LiteralPath $examplePath -Raw | ConvertFrom-Json
+    $older.updates.PSObject.Properties.Remove('token')
+    $added = @(Merge-BridgeConfigDefaults -Config $older -Defaults $defaults)
+    ($added -contains 'updates.token') -and $older.updates.token -eq ''
+}
+# The installer decides whether to prompt, and prints which allowance the machine will
+# be on, from the same function the request path selects with. They did not always
+# agree: a stored value carrying a newline was reported here as "authenticated" and
+# suppressed the prompt, while every actual check skipped it and went out
+# unauthenticated. Raised by Codex on #190.
+Test-That 'a stored token that cannot be sent is not reported as the one in use' {
+    $prior = @{}
+    foreach ($name in @('AGENT_HA_BRIDGE_UPDATE_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')) {
+        $prior[$name] = [Environment]::GetEnvironmentVariable($name)
+        [Environment]::SetEnvironmentVariable($name, $null)
+    }
+    try {
+        $broken = Select-BridgeUpdateTokenCandidate -Configured "ghp_pasted$([char]0x201C)`n"
+        $broken.Source -eq '' -and $broken.Note -match 'updates\.token is not a usable token'
+    }
+    finally { foreach ($name in $prior.Keys) { [Environment]::SetEnvironmentVariable($name, $prior[$name]) } }
+}
+Test-That 'and the one rule for that lives in one place, used by both' {
+    # Surrounding whitespace is trimmed first - a trailing newline is the commonest
+    # thing a paste adds, and is harmless once removed. What survives that must be
+    # sendable.
+    (Test-BridgeUpdateTokenSendable -Value " ghp_realtoken`n") -and
+        -not (Test-BridgeUpdateTokenSendable -Value "ghp_to`nken") -and
+        -not (Test-BridgeUpdateTokenSendable -Value "ghp_token$([char]0x201D)") -and
+        -not (Test-BridgeUpdateTokenSendable -Value '')
+}
+# The offer to replace a token, and the words it is made in, come from one decision.
+# They used to be two: the installer asked when nothing usable was configured or when
+# the last check had been refused, and chose its wording from a separate cascade whose
+# unsendable branch nothing could reach. Raised by Codex on #190.
+Test-That 'a stored token that cannot be sent is still offered for replacement while something else carries the checks' {
+    (Get-BridgeUpdateTokenPromptReason -Source '$env:GH_TOKEN' `
+        -UnusableNote 'updates.token is not a usable token: it contains characters that cannot be sent in a request header.') -eq 'unusable'
+}
+Test-That 'a refusal is raised ahead of an unsendable setting, being about the token actually sent' {
+    (Get-BridgeUpdateTokenPromptReason -Source 'updates.token' -RefusedNote 'GitHub refused it' `
+        -UnusableNote '$env:GH_TOKEN is not a usable token') -eq 'refused'
+}
+Test-That 'a machine with nothing to send is asked for a token rather than told one was refused' {
+    (Get-BridgeUpdateTokenPromptReason -Source '' -RefusedNote '' -UnusableNote '') -eq 'none'
+}
+Test-That 'and a working token is left alone, so re-running configure is not a nag' {
+    (Get-BridgeUpdateTokenPromptReason -Source 'updates.token' -RefusedNote '' -UnusableNote '') -eq ''
+}
+
 Write-Host '--- the entry points still parse on Windows PowerShell ---'
 # The whole point of offering to install PowerShell 7 is that the offer runs where
 # PowerShell 7 is absent. PowerShell parses an entire file before executing any of it,

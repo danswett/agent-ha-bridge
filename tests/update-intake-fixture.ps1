@@ -138,29 +138,6 @@ function Invoke-WebRequest {
 if ($FixtureMode -eq 'Updater') {
     if (-not $IsWindows) { throw 'This generated-child fixture has no non-Windows process boundary.' }
     Assert-BridgeTestPath -Path $UpdaterEntry
-    function Invoke-WebRequest {
-        param($Uri, $OutFile, $Headers, $TimeoutSec, $MaximumRedirection, [switch]$UseBasicParsing)
-        $fixtureState = Get-UpdateFixtureState
-        # This mode replaces the stub above, so it has to keep refusing the fallback
-        # endpoint too - an unstubbed call there reaches the boundary guard, not the
-        # assertion below.
-        if ($Uri -eq 'https://github.com/fixture-owner/fixture-bridge/releases/latest') {
-            throw [IO.IOException]::new('synthetic release-redirect outage')
-        }
-        Assert-BridgeTestPath -Path @($OutFile, $fixtureState.Fixture.Archive)
-        # The archive now comes from codeload rather than the API's zipball_url, so
-        # that pressing Update neither spends nor is refused by the 60-an-hour API
-        # allowance. Still asserted exactly: a download that went anywhere else - in
-        # particular back to api.github.com - is the regression this guards.
-        $expected = "https://codeload.github.com/fixture-owner/fixture-bridge/zip/refs/tags/v$($fixtureState.Fixture.Target)"
-        if ($Uri -cne $expected) { throw "Unexpected download fixture endpoint: $Uri" }
-        Copy-Item -LiteralPath $fixtureState.Fixture.Archive -Destination $OutFile
-        if ($fixtureState.Fixture.Case -eq 'guard-child-write') {
-            # The real post-extraction path guard sees the corrupted environment.
-            # No file is read or written at this deliberately out-of-bound name.
-            $env:AGENT_HA_BRIDGE_CONFIG = Join-Path (Split-Path $env:AGENT_HA_BRIDGE_TEST_ROOT -Parent) 'forbidden-config.json'
-        }
-    }
     function Get-Process {
         param($Id, $Name, $ErrorAction)
         $fixtureState = Get-UpdateFixtureState
@@ -184,8 +161,12 @@ if ($FixtureMode -eq 'Updater') {
         throw [IO.IOException]::new('synthetic restart denied')
     }
     if ($fixtureState.Fixture.Case -eq 'guard-child-network') {
-        # A REST stub is deliberately still present. It must not authorize WebRequest.
-        Remove-Item Function:\Invoke-WebRequest
+        # Both the REST and WebRequest stubs are deliberately still present. Neither
+        # may authorize the streaming download, which is what the sandbox install's
+        # fixture bridge-download.ps1 defers to the real guard for in this one case.
+        Write-UpdateIntakeDiagnostic -Kind UPDATE -Data ([ordered]@{
+            stage = 'download-guard'; case = $fixtureState.Fixture.Case
+        })
     }
     & $UpdaterEntry
     exit $LASTEXITCODE
@@ -342,6 +323,49 @@ function Initialize-UpdateIntakeSuite {
         Assert-BridgeTestPath -Path $destination
         Copy-Item -LiteralPath $source.FullName -Destination $destination
     }
+    # The generated child dot-sources the installed hooks' bridge-download.ps1 *by
+    # path* and then calls Save-BridgeUpdateDownload, so stubbing that function in this
+    # process cannot work - the dot-source replaces the stub a moment later. Replacing
+    # the library the sandbox install carries is the same idea one layer out, and
+    # leaves the child's own code path (verify the payload, load it, call it, report
+    # the proportion) running exactly as it ships.
+    $fixtureDownloader = Join-Path $fixtureHooks 'bridge-download.ps1'
+    Assert-BridgeTestPath -Path $fixtureDownloader
+    @'
+Set-StrictMode -Version Latest
+
+function Save-BridgeUpdateDownload {
+    param($Uri, $OutFile, $UserAgent, $TimeoutSeconds, [scriptblock]$OnProgress)
+
+    $fixtureFile = Join-Path $env:AGENT_HA_BRIDGE_TEST_ROOT 'update-fixture.json'
+    Assert-BridgeTestPath -Path $fixtureFile
+    $fixture = Get-Content -LiteralPath $fixtureFile -Raw | ConvertFrom-Json -AsHashtable
+    # This case means to prove the Download transport is refused outright - it has no
+    # cmdlet behind it, so "has a function replaced this" cannot answer for it - and so
+    # it goes through the real guard rather than round it.
+    if ($fixture['Case'] -eq 'guard-child-network') {
+        Assert-BridgeHttpAllowed -Uri $Uri -Transport Download
+        throw 'the Download transport was not refused inside a suite.'
+    }
+    Assert-BridgeTestPath -Path @($OutFile, $fixture['Archive'])
+    # The archive comes from codeload rather than the API's zipball_url, so that
+    # pressing Update neither spends nor is refused by the 60-an-hour API allowance.
+    # Still asserted exactly: a download that went anywhere else - in particular back
+    # to api.github.com - is the regression this guards.
+    $expected = "https://codeload.github.com/fixture-owner/fixture-bridge/zip/refs/tags/v$($fixture['Target'])"
+    if ($Uri -cne $expected) { throw "Unexpected download fixture endpoint: $Uri" }
+    Copy-Item -LiteralPath $fixture['Archive'] -Destination $OutFile
+    if ($fixture['Case'] -eq 'guard-child-write') {
+        # The real post-extraction path guard sees the corrupted environment. No file
+        # is read or written at this deliberately out-of-bound name.
+        $env:AGENT_HA_BRIDGE_CONFIG = Join-Path (Split-Path $env:AGENT_HA_BRIDGE_TEST_ROOT -Parent) 'forbidden-config.json'
+    }
+    $bytes = (Get-Item -LiteralPath $OutFile).Length
+    # Driven for real, so the child's progress emitter runs rather than being assumed.
+    if ($OnProgress) { & $OnProgress 0.42; & $OnProgress 1 }
+    [pscustomobject]@{ Bytes = $bytes; Total = $bytes; Proportioned = $true }
+}
+'@ | Set-Content -LiteralPath $fixtureDownloader -Encoding UTF8
     $fixtureState.InertInstaller = @'
 param([switch]$NonInteractive, [switch]$SkipVerify, [string]$TargetHome,
     [string]$InstallRoot, [switch]$SkipTask, [switch]$SkipPath, [switch]$SkipDependencies)

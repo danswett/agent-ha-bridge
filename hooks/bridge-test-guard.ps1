@@ -21,10 +21,19 @@ function Assert-BridgeHttpAllowed {
 
         Keep this outside transport catches. The exception marker lets best-effort
         callers propagate a test-boundary violation without changing normal failures.
+
+        Download is Save-BridgeUpdateDownload's HttpClient streaming read, and is the
+        one transport with no stub detection at all. The check below asks whether a
+        cmdlet has been replaced by a function, which only answers "is this unstubbed"
+        for a command that is a cmdlet to begin with; a function would always look
+        replaced, and the guard would permit the very call it exists to refuse. So a
+        Download reaching here under test is always refused, and a suite that means to
+        exercise its caller replaces Save-BridgeUpdateDownload itself - in which case
+        nothing inside it, including this, ever runs.
     #>
     param(
         [string]$Uri,
-        [ValidateSet('Rest', 'WebRequest', 'WebSocket', 'Discovery', 'ChildProcess')]
+        [ValidateSet('Rest', 'WebRequest', 'WebSocket', 'Discovery', 'ChildProcess', 'Download')]
         [string]$Transport = 'Rest'
     )
 

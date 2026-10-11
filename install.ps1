@@ -33,6 +33,16 @@
     you. Omit it to keep an existing one, or to supply one via the
     AGENT_HA_AGENT_TOKEN environment variable instead.
 
+.PARAMETER UpdateToken
+    A GitHub token used for release checks only, sent to api.github.com and never
+    logged. Unauthenticated callers share 60 requests an hour per IP, so a Dev Box or
+    anything else behind shared egress can exhaust it without the bridge having made a
+    request of its own; a personal access token gives this machine 5,000 of its own.
+    Public releases
+    need no scopes at all. Omit it to keep an existing one, to be offered a prompt, or
+    to supply one via AGENT_HA_BRIDGE_UPDATE_TOKEN, GH_TOKEN or GITHUB_TOKEN in the
+    environment.
+
 .PARAMETER NotifyService
     Optional Home Assistant notify-style service for out-of-band alerts, e.g.
     notify.mobile_app_pixel. Omit to disable notifications.
@@ -103,6 +113,7 @@ param(
     [string]$HomeAssistantUrl,
     [string]$Token,
     [string]$AgentToken,
+    [string]$UpdateToken,
     [string]$NotifyService,
     [string]$TickerCategory,
     [string]$TargetHome,
@@ -2575,14 +2586,15 @@ if ($PSVersionTable.PSVersion.Major -lt 7) {
                (Get-BridgeDependencyCommand -Name 'pwsh'))
     }
     if (($PSBoundParameters.ContainsKey('Token') -and $Token) -or
-        ($PSBoundParameters.ContainsKey('AgentToken') -and $AgentToken)) {
+        ($PSBoundParameters.ContainsKey('AgentToken') -and $AgentToken) -or
+        ($PSBoundParameters.ContainsKey('UpdateToken') -and $UpdateToken)) {
         throw ('PowerShell 7 is ready, but token arguments are not forwarded to a child process. ' +
                'Re-run in PowerShell 7 using the masked prompts or token environment variables.')
     }
 
     Write-Step "Restarting under PowerShell 7 ($pwshPath)"
     $forwarded = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', $PSCommandPath) +
-                 @(ConvertTo-BridgeArgumentList -BoundParameters $PSBoundParameters -Exclude @('Token', 'AgentToken'))
+                 @(ConvertTo-BridgeArgumentList -BoundParameters $PSBoundParameters -Exclude @('Token', 'AgentToken', 'UpdateToken'))
     & $pwshPath @forwarded
     exit $LASTEXITCODE
 }
@@ -2690,7 +2702,8 @@ if ($PSBoundParameters.ContainsKey('Token') -and $Token) {
     $config.homeAssistant.token = $Token
 }
 if (($PSBoundParameters.ContainsKey('Token') -and $Token) -or
-    ($PSBoundParameters.ContainsKey('AgentToken') -and $AgentToken)) {
+    ($PSBoundParameters.ContainsKey('AgentToken') -and $AgentToken) -or
+    ($PSBoundParameters.ContainsKey('UpdateToken') -and $UpdateToken)) {
     Write-Warning 'Token arguments can appear in shell history and process listings. Prefer masked prompts or environment variables.'
 }
 # -AgentToken is deliberately NOT stored here. It is a *candidate* until the agent
@@ -3001,7 +3014,7 @@ if ($homeAssistantReady) {
 # release without guessing.
 if (-not $config.PSObject.Properties.Name.Contains('updates')) {
     $config | Add-Member -NotePropertyName 'updates' -NotePropertyValue ([pscustomobject]@{
-        repository = 'danswett/agent-ha-bridge'; installedVersion = ''; checkForUpdates = $true
+        repository = 'danswett/agent-ha-bridge'; installedVersion = ''; checkForUpdates = $true; token = ''
     })
 }
 $config.updates.installedVersion = $version
@@ -3012,6 +3025,119 @@ if ($config.updates.PSObject.Properties.Name -contains 'installedFromSource') {
 }
 else {
     $config.updates | Add-Member -NotePropertyName 'installedFromSource' -NotePropertyValue $installedFromSource
+}
+# ------------------------------------------------- which GitHub allowance this is on
+#
+# An unauthenticated release check shares 60 requests an hour with everything else
+# behind the same address, so a Dev Box - or any shared egress - can exhaust it
+# without the bridge having made a request of its own, and then no machine behind that
+# address can take any release at all. A personal access token is 5,000 an hour of this
+# machine's own: measured on one machine, the same call reported 51/60 unauthenticated
+# and 5000/5000 authenticated. Nothing reports a figure for a token it did not ask for,
+# though - Actions' GITHUB_TOKEN has 1,000 per repository, so an ambient credential is
+# reported by name only.
+#
+# The cure already existed. Nothing ever offered it, so in practice no machine had
+# one and `updates.token` had to be hand-edited into config.json (#153).
+if ($config.updates.PSObject.Properties.Name -notcontains 'token') {
+    $config.updates | Add-Member -NotePropertyName 'token' -NotePropertyValue ''
+}
+# The same rule the request path applies, from the same function: a token is a request
+# header, so a value carrying a newline or a smart quote from a paste cannot be sent at
+# all. Refused here, where it can still be retyped - and never accepted here only to be
+# skipped at check time.
+if ($PSBoundParameters.ContainsKey('UpdateToken') -and $UpdateToken) {
+    $offeredUpdateToken = $UpdateToken.Trim()
+    if (-not (Test-BridgeUpdateTokenSendable -Value $offeredUpdateToken)) {
+        Write-Warning ('-UpdateToken contains characters that cannot be sent in a request header, so it was not ' +
+                       'stored. Release checks stay unauthenticated rather than failing.')
+    }
+    else { $config.updates.token = $offeredUpdateToken }
+}
+$updateTokenSource = ''
+$updateTokenUnusable = ''
+# Resolved by the very function the request path uses, so the installer and the check
+# can never disagree about which credential this machine will actually authenticate
+# with. They did: a stored value carrying a newline was reported here as
+# "authenticated", and suppressed the prompt, while every check skipped it and went out
+# unauthenticated. Raised by Codex on #190. Only the name and the note are used; the
+# token itself is never read out of the result.
+$updateTokenChoice = Select-BridgeUpdateTokenCandidate -Configured ([string]$config.updates.token)
+$updateTokenSource = [string]$updateTokenChoice.Source
+$updateTokenUnusable = [string]$updateTokenChoice.Note
+# A token GitHub has refused needs replacing, and the prompt below would otherwise skip
+# exactly the machine that needs it: a nonempty `updates.token` is not empty, and a
+# refused ambient GH_TOKEN still counts as "this machine has one". The last check
+# already recorded the refusal, whichever of the two it was, so the offer is made when
+# it is wanted. Storing a working `updates.token` fixes the ambient case too, because
+# the configured setting wins over the environment. Raised by Codex on #190.
+$updateTokenNote = ''
+$lastUpdateCheck = Get-BridgeUpdateCheckSummary -Path (Get-BridgeRuntimePath -Name 'agent-bridge-update.json' -Context $installContext)
+if (Test-BridgeUpdateTokenRejected -Summary $lastUpdateCheck) { $updateTokenNote = [string]$lastUpdateCheck.TokenNote }
+# Only asked when the machine has nothing usable, when what it has was refused, or
+# when a stored value cannot be sent - that last one even if a later candidate is
+# carrying the checks, because both status surfaces print its note on every check and
+# name this command as the way to replace it. One function decides both whether to ask
+# and which of the three things to say, so the question and the wording cannot drift
+# apart again. Raised by Codex on #190.
+$updateTokenReason = Get-BridgeUpdateTokenPromptReason -Source $updateTokenSource `
+    -RefusedNote $updateTokenNote -UnusableNote $updateTokenUnusable
+if ($updateTokenReason -and -not $NonInteractive -and (Test-BridgeConsoleInteractive)) {
+    Write-Host ''
+    $askUpdateToken = $false
+    # What is true if the offer is declined, settled with the reason rather than after
+    # it: "stays unauthenticated" is wrong when a later candidate is already carrying
+    # the checks, and wrong again when the thing being replaced is one GitHub refused.
+    $updateTokenSkipNote = 'release checks stay unauthenticated.'
+    if ($updateTokenReason -eq 'refused') {
+        Write-Host 'The GitHub token used for release checks was refused.' -ForegroundColor Yellow
+        Write-Host "    $updateTokenNote"
+        Write-Host '    Until it is replaced, checks share 60 requests an hour with everything'
+        Write-Host '    else behind this address.'
+        $updateTokenSkipNote = 'release checks stay refused until it is replaced.'
+        $askUpdateToken = Read-BridgeYesNo -Prompt '    Replace it now?' -Default $true
+    }
+    elseif ($updateTokenReason -eq 'unusable') {
+        Write-Host 'The GitHub token for release checks cannot be sent.' -ForegroundColor Yellow
+        Write-Host "    $updateTokenUnusable"
+        if ($updateTokenSource) {
+            Write-Host "    Checks are authenticated from $updateTokenSource meanwhile, so this is a"
+            Write-Host '    stored setting being skipped rather than updates being stuck.'
+            $updateTokenSkipNote = "checks go on using $updateTokenSource, and the stored setting stays skipped."
+        }
+        else {
+            Write-Host '    Checks are sharing 60 requests an hour with everything else behind'
+            Write-Host '    this address until it is replaced.'
+        }
+        $askUpdateToken = Read-BridgeYesNo -Prompt '    Replace it now?' -Default $true
+    }
+    else {
+        Write-Host 'Optional: give this machine its own GitHub rate limit for release checks.' -ForegroundColor Yellow
+        Write-Host '    Without one, checks share 60 requests an hour with everything else behind'
+        Write-Host '    this address, and the machine can sit unable to take a release for hours.'
+        Write-Host '    A personal access token raises that to 5,000 an hour for this machine alone.'
+        $askUpdateToken = Read-BridgeYesNo -Prompt '    Set one up now?' -Default $false
+    }
+    if ($askUpdateToken) {
+        Write-Host '    1. Open https://github.com/settings/personal-access-tokens'
+        Write-Host '    2. Generate a fine-grained token - these are public releases, so it'
+        Write-Host '       needs no account or repository permissions at all'
+        $enteredUpdateToken = ([string](Read-BridgeSecret -Prompt '    Paste the token here (Enter to skip)')).Trim()
+        if (-not $enteredUpdateToken) {
+            Write-Host "    nothing pasted; $updateTokenSkipNote" -ForegroundColor DarkGray
+        }
+        elseif (-not (Test-BridgeUpdateTokenSendable -Value $enteredUpdateToken)) {
+            Write-Host '    that cannot be sent as a header, so it was not stored - run' -ForegroundColor Yellow
+            Write-Host '        agent-ha-bridge configure' -ForegroundColor Yellow
+            Write-Host '    to be asked again.' -ForegroundColor Yellow
+        }
+        else {
+            $config.updates.token = $enteredUpdateToken
+            $updateTokenSource = 'updates.token'
+            $updateTokenNote = ''
+            $updateTokenUnusable = ''
+        }
+    }
 }
 
 Write-Step "Writing bridge config to $configPath"
@@ -3028,6 +3154,14 @@ Write-Host "    agent account: $(
     elseif ($config.homeAssistant.agentToken -or @($config.homeAssistant.agentUserIds).Count) { 'half set - see the warning below' }
     else { 'none - an agent drives the bridge as you' })"
 Write-Host "    notifications: $(if ($config.notifications.enabled) { $config.notifications.service } else { 'disabled' })"
+# Never the token, only where one came from - the same distinction Get-BridgeUpdateToken
+# keeps, and the reason `agent-ha-bridge status` can report this at all.
+Write-Host "    update check : $(
+    if ($updateTokenSource) { "authenticated from $updateTokenSource" }
+    else { 'unauthenticated - 60 requests an hour, shared with everything behind this address' })"
+# Said here too, because an install that leaves a skipped setting in place should say so
+# rather than let the next `status` be the first mention of it.
+if ($updateTokenUnusable) { Write-Host "                   $updateTokenUnusable" -ForegroundColor Yellow }
 if ($isDevBox) {
     Write-Host "    Dev Box      : $(if ($devBoxDecision.Enabled) { "keep-awake on - '$devBoxTaskName' every ${devBoxIntervalMinutes}m" } else { "keep-awake off ($($devBoxDecision.Reason))" })"
 }

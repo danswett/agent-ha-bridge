@@ -232,7 +232,61 @@ Set-RecordedVersion '1.2.0'
 Write-Marker @{ success = $false; version = '1.2.0'; error = 'failed after recording version'; at = [DateTimeOffset]::Now.ToString('o') }
 [void](Invoke-DaemonUpdateOutcome -Headers $headers)
 Receive-UpdatePayload $consumer
-Assert-UpdateOutcome 'failure after mutation does not claim that the old version survived' ($consumer.installed_version -eq '1.2.0' -and $script:Notified[0].title -match '^Bridge update failed')
+# Recording the release is the installer's own statement that it got that far, and
+# `agent-ha-bridge status` straight afterwards reports the new version with every
+# check green. Calling that "Bridge update failed" is what sent people hunting for an
+# updater bug that did not exist, and made a successful update look like the thing to
+# retry (#124). The step that failed is still named; the install is not disowned, and
+# the entity still reports the version the installation now records.
+Assert-UpdateOutcome 'failure after mutation reports the recorded version, and is not called a failed update' (
+    $consumer.installed_version -eq '1.2.0' -and
+    $script:Notified[0].title -match 'but a later step failed' -and
+    $script:Notified[0].message -match 'failed after recording version' -and
+    $script:Notified[0].message -match 'agent-ha-bridge status')
+$terminal = Get-UpdateAttributesPayload | ConvertFrom-Json -AsHashtable
+Assert-UpdateOutcome 'and the entity says the release installed before the step that failed' (
+    $terminal['stage'] -ceq 'failed' -and $terminal['stage_detail'] -match '^Installed 1\.2\.0, but a step after it failed')
+
+# Nothing rejects a second press while a child is still running, and an unexplained
+# failure is exactly what invites one - so two children can go for the same release.
+# Judged against the shared version record alone, the one that died during download is
+# credited with the other's install and announced as "installed, but a later step
+# failed" having installed nothing. Its own outcome says what it found recorded when
+# it launched, and that settles it. Raised by Codex on #190.
+Reset-UpdateCapture
+Set-RecordedVersion '1.2.0'
+Write-Marker @{ schemaVersion = 1; attemptId = ('b' * 32); success = $false; exitCode = 1; version = '1.2.0'
+                beforeVersion = '1.2.0'; error = 'download refused'; at = [DateTimeOffset]::Now.ToString('o') }
+[void](Invoke-DaemonUpdateOutcome -Headers $headers)
+Receive-UpdatePayload $consumer
+Assert-UpdateOutcome 'a child that found the release already recorded is not credited with installing it' (
+    $script:Notified[0].title -match '^Bridge update failed' -and
+    $script:Notified[0].message -match 'download refused')
+
+Reset-UpdateCapture
+Set-RecordedVersion '1.2.0'
+Write-Marker @{ schemaVersion = 1; attemptId = ('c' * 32); success = $false; exitCode = 1; version = '1.2.0'
+                beforeVersion = '1.1.0'; error = 'client registration failed'; at = [DateTimeOffset]::Now.ToString('o') }
+[void](Invoke-DaemonUpdateOutcome -Headers $headers)
+Receive-UpdatePayload $consumer
+Assert-UpdateOutcome 'while the child that moved the record off the old version still is' (
+    $script:Notified[0].title -match 'but a later step failed' -and
+    $script:Notified[0].message -match 'client registration failed')
+
+# Both children launched while 1.1.0 was installed, so both recorded 1.1.0 as what they
+# found: the pre-version alone cannot separate them. Whether a child handed control to
+# an installer is a fact about its own execution, and the one that died fetching the
+# archive never did. Raised by Codex on #190.
+Reset-UpdateCapture
+Set-RecordedVersion '1.2.0'
+Write-Marker @{ schemaVersion = 1; attemptId = ('f' * 32); success = $false; exitCode = 1; version = '1.2.0'
+                beforeVersion = '1.1.0'; ranInstaller = $false; error = 'the archive was not readable'
+                at = [DateTimeOffset]::Now.ToString('o') }
+[void](Invoke-DaemonUpdateOutcome -Headers $headers)
+Receive-UpdatePayload $consumer
+Assert-UpdateOutcome 'a child that never ran an installer is not credited with the install it raced' (
+    $script:Notified[0].title -match '^Bridge update failed' -and
+    $script:Notified[0].message -match 'the archive was not readable')
 
 Reset-UpdateCapture
 Write-Marker @{ success = $false; error = 'old marker without target'; at = [DateTimeOffset]::Now.ToString('o') }
