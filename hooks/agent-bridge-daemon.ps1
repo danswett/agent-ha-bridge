@@ -872,7 +872,16 @@ function Wait-DaemonChange {
         # block, not a closure: GetNewClosure() would run it in a new module scope
         # that cannot see this script's functions.
         # It returns $true to end the wait early when a reconcile is wanted now.
-        $fastLane = { Invoke-DaemonFastActivity -Headers $headers -State $state | Out-Null; [bool]$script:DaemonReconcileNow }
+        $fastLane = {
+            Invoke-DaemonFastActivity -Headers $headers -State $state | Out-Null
+            # Taps are acted on within a tick while the daemon is otherwise idle.
+            # Skipped rather than drained when there is no live set to resolve them
+            # against: dequeuing a tap we cannot act on would discard it.
+            if ($null -ne $script:DaemonLive) {
+                Invoke-DaemonAnswerButtonQueue -Headers $headers -State $state -Live $script:DaemonLive | Out-Null
+            }
+            [bool]$script:DaemonReconcileNow
+        }
         $hit = Wait-CopilotHaStateChange -EntityIds $WatchEntities `
             -TimeoutSeconds $ReconcileSeconds -OnTick $fastLane -TickMilliseconds 100
         $script:DaemonWatchFailures = 0
@@ -977,6 +986,10 @@ function Invoke-DaemonReconcile {
         Repair-CopilotSessionEntities -Headers $headers -State $state -Live $live
         Invoke-DaemonFastActivity -Headers $headers -State $state
         Invoke-PendingDecisions -Headers $headers -State $state -Live $live
+        # Anything tapped while the previous pass was running. The listener holds the
+        # subscription across reconciles, so these are queued rather than lost, and
+        # this is where a pass picks up whatever arrived during the last one.
+        [void](Invoke-DaemonAnswerButtonQueue -Headers $headers -State $state -Live $live)
         Invoke-PendingReplies -Headers $headers -State $state -Live $live
         Invoke-DaemonFastActivity -Headers $headers -State $state
         Invoke-PendingCodexApprovals -Headers $headers -State $state -Live $live
@@ -1046,29 +1059,40 @@ function Start-BridgeDaemon {
 
     $lastReconcile = [DateTimeOffset]::Now
 
-    while ($true) {
-        $watchEntities = Get-DaemonWatchEntities -State $state
-        $hit = Wait-DaemonChange -Headers $headers -State $state -WatchEntities $watchEntities
-        Invoke-DaemonHit -Hit $hit -Headers $headers -State $state
+    # Held for the life of the daemon rather than per wait. A notification action is
+    # delivered once, to whoever is subscribed at that instant, and leaves nothing
+    # behind for a later sweep to find - so the subscription cannot be allowed to
+    # lapse between reconciles the way the entity watch's socket does.
+    [void](Start-DaemonAnswerButtonListener)
 
-        # A push hit only shortcuts latency; the sweep in the reconcile does the
-        # authoritative delivery, so both paths funnel through the same guarded code.
-        if (([DateTimeOffset]::Now - $lastReconcile).TotalSeconds -ge $ReconcileSeconds -or
-            $null -ne $hit -or $script:DaemonReconcileNow) {
-            $script:DaemonReconcileNow = $false
-            Invoke-DaemonReconcile -Headers $headers -State $state
-            $lastReconcile = [DateTimeOffset]::Now
-            # Straight after the reconcile, when the collector holds most in reserve.
-            try { $null = Invoke-DaemonMemoryTrim } catch { }
+    try {
+        while ($true) {
+            $watchEntities = Get-DaemonWatchEntities -State $state
+            $hit = Wait-DaemonChange -Headers $headers -State $state -WatchEntities $watchEntities
+            Invoke-DaemonHit -Hit $hit -Headers $headers -State $state
 
-            # A newly installed adapter is only loaded at startup, so the daemon ends
-            # here and the supervisor starts it again a few seconds later. State was
-            # just written, so the new daemon carries straight on.
-            if ($script:DaemonRestartRequested) {
-                Write-DaemonLog -Message "restarting to $($script:DaemonRestartRequested)"
-                return
+            # A push hit only shortcuts latency; the sweep in the reconcile does the
+            # authoritative delivery, so both paths funnel through the same guarded code.
+            if (([DateTimeOffset]::Now - $lastReconcile).TotalSeconds -ge $ReconcileSeconds -or
+                $null -ne $hit -or $script:DaemonReconcileNow) {
+                $script:DaemonReconcileNow = $false
+                Invoke-DaemonReconcile -Headers $headers -State $state
+                $lastReconcile = [DateTimeOffset]::Now
+                # Straight after the reconcile, when the collector holds most in reserve.
+                try { $null = Invoke-DaemonMemoryTrim } catch { }
+
+                # A newly installed adapter is only loaded at startup, so the daemon ends
+                # here and the supervisor starts it again a few seconds later. State was
+                # just written, so the new daemon carries straight on.
+                if ($script:DaemonRestartRequested) {
+                    Write-DaemonLog -Message "restarting to $($script:DaemonRestartRequested)"
+                    return
+                }
             }
         }
+    }
+    finally {
+        Stop-DaemonAnswerButtonListener
     }
 }
 
@@ -1084,6 +1108,7 @@ function Start-BridgeDaemon {
 . (Join-Path $PSScriptRoot 'daemon-maintenance.ps1')
 . (Join-Path $PSScriptRoot 'daemon-usage.ps1')
 . (Join-Path $PSScriptRoot 'daemon-hookspool.ps1')
+. (Join-Path $PSScriptRoot 'daemon-decision-notify.ps1')
 
 
 # A second daemon would publish duplicate activity and race on reply delivery.

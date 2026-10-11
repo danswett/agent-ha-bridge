@@ -100,6 +100,9 @@ function Wait-CopilotHaStateChange {
     & $OnTick | Out-Null
     $null
 }
+# The fast lane also drains taps collected by the answer-button listener. Stubbed
+# rather than loaded: this suite is about the stop boundary and its backoff.
+function Invoke-DaemonAnswerButtonQueue { param($Headers, $State, $Live) 0 }
 function Start-Sleep {
     param([int]$Seconds, [int]$Milliseconds)
     $script:StopSleeps += $Seconds
