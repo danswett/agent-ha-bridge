@@ -170,7 +170,7 @@ $script:DecisionBridgeConfig = @{
     # so it can be answered without opening the dashboard. `services` is a list of
     # mobile_app notify services, because one phone is one service.
     # @() around the read because a bare empty array yields $null under StrictMode.
-    AnswerButtonsEnabled = [bool](Get-BridgeSetting 'answerButtons.enabled' $false)
+    AnswerButtonsEnabled = [bool](Get-BridgeSetting 'answerButtons.enabled' $true)
     AnswerButtonServices = @(Get-BridgeSetting 'answerButtons.services' @())
     # iOS copes with about ten before its own action list misbehaves; the overflow is
     # left to the dashboard rather than shown badly.

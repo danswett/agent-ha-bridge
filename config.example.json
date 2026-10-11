@@ -17,7 +17,7 @@
     "tickerCategory": ""
   },
   "answerButtons": {
-    "enabled": false,
+    "enabled": true,
     "services": [],
     "maxButtons": 6,
     "icon": "mdi:chat-question",

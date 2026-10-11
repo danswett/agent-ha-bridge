@@ -37,6 +37,185 @@ if (-not (Get-Variable -Name DaemonAnswerButtonSent -Scope Script -ErrorAction S
     $script:DaemonAnswerButtonSent = @{}
 }
 
+# Taps that have arrived but not yet been acted on.
+#
+# This queue is the whole reason the listener exists. The daemon's entity watch opens
+# a socket, waits, and disposes it before each reconcile - which is harmless for a
+# state change, because the state is still in Home Assistant for the next sweep to
+# read. An event is not like that. It is delivered once, to whoever is subscribed at
+# that instant, and leaves nothing behind. A tap landing while the reconcile ran was
+# therefore lost outright, with the notification still sitting on the phone looking
+# as though nothing had happened.
+#
+# So the subscription is held permanently by a thread of its own and taps are queued.
+# Draining can then be as late as it likes; what matters is that nothing is dropped.
+if (-not (Get-Variable -Name DaemonAnswerButtonQueue -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:DaemonAnswerButtonQueue = [System.Collections.Concurrent.ConcurrentQueue[string]]::new()
+}
+if (-not (Get-Variable -Name DaemonAnswerButtonListener -Scope Script -ErrorAction SilentlyContinue)) {
+    $script:DaemonAnswerButtonListener = $null
+}
+
+function Get-DaemonAnswerButtonListenerScript {
+    <#
+        The listener's body, kept separate so its shape can be inspected by a test
+        without a socket.
+
+        It is deliberately self-contained and uses only .NET types: it runs in its own
+        runspace, where none of the bridge's functions or configuration exist. It never
+        cancels an outstanding receive - cancelling one aborts the socket, which is the
+        trap that made an earlier hand-rolled listener go deaf after its first idle
+        period - and it reconnects on any failure rather than ending.
+    #>
+    {
+        param($Uri, $Token, $Queue, $Stop)
+
+        while (-not $Stop.IsCancellationRequested) {
+            $socket = $null
+            try {
+                $socket = [Net.WebSockets.ClientWebSocket]::new()
+                $socket.ConnectAsync([Uri]$Uri, $Stop.Token).GetAwaiter().GetResult()
+
+                $frame = [byte[]]::new(65536)
+                $text = [Text.StringBuilder]::new()
+                $pending = $null
+                $authed = $false
+
+                $send = {
+                    param($payload)
+                    $bytes = [Text.Encoding]::UTF8.GetBytes(($payload | ConvertTo-Json -Depth 8 -Compress))
+                    $socket.SendAsync([ArraySegment[byte]]::new($bytes),
+                        [Net.WebSockets.WebSocketMessageType]::Text, $true, $Stop.Token).GetAwaiter().GetResult()
+                }
+
+                while (-not $Stop.IsCancellationRequested -and $socket.State -eq 'Open') {
+                    if ($null -eq $pending) {
+                        $pending = $socket.ReceiveAsync([ArraySegment[byte]]::new($frame), $Stop.Token)
+                    }
+                    # Polled, never cancelled.
+                    if (-not $pending.Wait(500)) { continue }
+                    $result = $pending.Result
+                    $pending = $null
+                    [void]$text.Append([Text.Encoding]::UTF8.GetString($frame, 0, $result.Count))
+                    if (-not $result.EndOfMessage) { continue }
+                    $raw = $text.ToString()
+                    [void]$text.Clear()
+
+                    $message = $null
+                    try { $message = $raw | ConvertFrom-Json } catch { continue }
+                    if ($null -eq $message -or -not $message.PSObject.Properties['type']) { continue }
+
+                    switch ([string]$message.type) {
+                        'auth_required' { & $send @{ type = 'auth'; access_token = $Token } }
+                        'auth_ok' {
+                            if (-not $authed) {
+                                $authed = $true
+                                & $send @{ id = 1; type = 'subscribe_events'; event_type = 'mobile_app_notification_action' }
+                            }
+                        }
+                        'event' {
+                            if ($message.PSObject.Properties['event'] -and
+                                $message.event.PSObject.Properties['data']) {
+                                $Queue.Enqueue(($message.event.data | ConvertTo-Json -Depth 8 -Compress))
+                            }
+                        }
+                    }
+                }
+            }
+            catch { }
+            finally {
+                if ($null -ne $socket) { try { $socket.Dispose() } catch { } }
+            }
+            # A dropped socket must not become a spin. The notification is still on the
+            # phone throughout, so a tap during the gap can simply be made again.
+            if (-not $Stop.IsCancellationRequested) { Start-Sleep -Seconds 3 }
+        }
+    }
+}
+
+function Start-DaemonAnswerButtonListener {
+    <#
+        Holds the notification-action subscription for as long as the daemon runs.
+
+        Started only when answer buttons are actually configured: an unused
+        subscription is a message stream to decode for nothing.
+    #>
+    if (-not $script:DecisionBridgeConfig.AnswerButtonsEnabled) { return $false }
+    if (@($script:DecisionBridgeConfig.AnswerButtonServices).Count -eq 0) { return $false }
+    if ($null -ne $script:DaemonAnswerButtonListener) { return $true }
+
+    $uri = ($script:DecisionBridgeConfig.HomeAssistantBaseUrl -replace '^http', 'ws').TrimEnd('/') + '/api/websocket'
+    # The same boundary the rest of the bridge goes through, evaluated here rather
+    # than inside the runspace, where the test guard does not exist.
+    Assert-BridgeHttpAllowed -Uri $uri -Transport WebSocket
+    $token = (Get-HomeAssistantHeaders).Authorization -replace '^Bearer ', ''
+
+    try {
+        $stop = [Threading.CancellationTokenSource]::new()
+        $runspace = [RunspaceFactory]::CreateRunspace()
+        $runspace.Open()
+        $shell = [PowerShell]::Create()
+        $shell.Runspace = $runspace
+        [void]$shell.AddScript((Get-DaemonAnswerButtonListenerScript)).
+            AddArgument($uri).AddArgument($token).
+            AddArgument($script:DaemonAnswerButtonQueue).AddArgument($stop)
+        $handle = $shell.BeginInvoke()
+        $script:DaemonAnswerButtonListener = [pscustomobject]@{
+            Shell = $shell; Runspace = $runspace; Stop = $stop; Handle = $handle
+        }
+        Write-DaemonLog -Message 'answer button listener started'
+        return $true
+    }
+    catch {
+        Write-DaemonLog -Message "answer button listener failed to start: $($_.Exception.Message)"
+        $script:DaemonAnswerButtonListener = $null
+        return $false
+    }
+}
+
+function Stop-DaemonAnswerButtonListener {
+    <# Ends the listener with the daemon that owns it. #>
+    $listener = $script:DaemonAnswerButtonListener
+    if ($null -eq $listener) { return }
+    $script:DaemonAnswerButtonListener = $null
+    try { $listener.Stop.Cancel() } catch { }
+    try { [void]$listener.Shell.Stop() } catch { }
+    try { $listener.Shell.Dispose() } catch { }
+    try { $listener.Runspace.Dispose() } catch { }
+    try { $listener.Stop.Dispose() } catch { }
+}
+
+function Invoke-DaemonAnswerButtonQueue {
+    <#
+        Acts on every tap the listener has collected.
+
+        Called from the wait's fast lane and again after each reconcile, so a tap is
+        acted on within a tick while idle and is still never missed during a pass that
+        takes seconds.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [Parameter(Mandatory)][hashtable]$State,
+        [Parameter(Mandatory)][hashtable]$Live
+    )
+
+    $handled = 0
+    $raw = ''
+    while ($script:DaemonAnswerButtonQueue.TryDequeue([ref]$raw)) {
+        try {
+            $data = $raw | ConvertFrom-Json
+            if (Invoke-DaemonAnswerButton -EventData $data -State $State -Live $Live -Headers $Headers) {
+                $handled++
+            }
+        }
+        catch {
+            if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+            Write-DaemonLog -Message "answer button event failed: $($_.Exception.Message)"
+        }
+    }
+    $handled
+}
+
 function Get-BridgeAnswerButtonTag {
     <# The notification this question owns, so answering it can withdraw it. #>
     param([Parameter(Mandatory)][string]$SessionId)
@@ -83,7 +262,12 @@ function Get-BridgeAnswerButtonOptions {
         }
     }
 
-    @($choices)
+    # The CLI renders its own trailing "Other (type your answer)" entry, and that is
+    # not a declared option, so it does not normally reach here. An agent that spells
+    # one out in its own option list would otherwise get two buttons meaning the same
+    # thing - that label, which selects a literal answer, beside the text action that
+    # actually opens a box. Dropped, because the text action is the one that works.
+    @($choices | Where-Object { [string]$_ -notmatch '^\s*other\s*\(type your answer\)\s*$' })
 }
 
 function Get-BridgeAnswerButtonActions {
@@ -120,8 +304,16 @@ function Get-BridgeAnswerButtonActions {
         })
     }
 
+    # A form is answered slot by slot at an arrow-key prompt, and characters typed at
+    # one are discarded. Offering a text box for it would take an answer, deliver it
+    # as free text for a multiple_choice marker, and submit a partial or wrong form -
+    # so a form gets no text action either, and is left to the card or the terminal.
+    $fields = @()
+    if ($Marker.PSObject.Properties['fields']) { $fields = @($Marker.fields | Where-Object { $null -ne $_ }) }
+    $isForm = $fields.Count -gt 1
+
     $terminalOnly = $Marker.PSObject.Properties['terminalOnly'] -and [bool]$Marker.terminalOnly
-    if (-not $terminalOnly) {
+    if (-not $terminalOnly -and -not $isForm) {
         $actions.Add(@{
             action               = "BRIDGE_${key}_text"
             title                = 'Type an answer'
@@ -308,11 +500,20 @@ function Clear-DaemonAnswerButtons {
 
         Without this an answered question keeps a notification offering buttons that
         would be refused if tapped, which reads as the bridge having lost the answer.
+
+        `Forget` is deliberately separate from withdrawing. Injection does not wait for
+        the transcript to confirm the answer, and the loop reconciles immediately
+        afterwards - so for a client whose injector returns early, the very next sweep
+        can still see the question as pending. Dropping the de-duplication entry at the
+        same time as the notification therefore re-sent the question that had just been
+        answered. Only Complete-DaemonAnsweredDecision, which runs once the question is
+        actually finished, forgets it.
     #>
     param(
         [Parameter(Mandatory)][string]$SessionId,
         [AllowNull()]$Marker,
-        [Parameter(Mandatory)][hashtable]$Headers
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [switch]$Forget
     )
 
     if (-not $script:DecisionBridgeConfig.AnswerButtonsEnabled) { return }
@@ -333,7 +534,7 @@ function Clear-DaemonAnswerButtons {
         Write-DaemonLog -Message "answer button clear failed for $SessionId : $($_.Exception.Message)"
     }
     finally {
-        if ($decisionId) { $script:DaemonAnswerButtonSent.Remove($decisionId) }
+        if ($Forget -and $decisionId) { $script:DaemonAnswerButtonSent.Remove($decisionId) }
     }
 }
 

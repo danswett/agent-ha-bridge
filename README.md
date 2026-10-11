@@ -373,8 +373,8 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `dashboard.publication.writer` | The one designated publisher's identity, shared by participating configurations; only that participant may write |
 | `dashboard.publication.generation` | Explicit positive integer policy generation. A manual policy change requires exactly the next generation; ordinary publication must match the established generation |
 | `notifications.enabled` / `.service` | Optional notify-style service |
-| `answerButtons.enabled` | Put a question's options on the phone as notification buttons, so it can be answered without opening the dashboard (default `false`). See [Answering from the notification](#answering-from-the-notification) |
-| `answerButtons.services` | The `notify.mobile_app_<device>` services to send to, one per device. Empty means the feature does nothing |
+| `answerButtons.enabled` | Put a question's options on the phone as notification buttons, so it can be answered without opening the dashboard (default `true`, but inert until `services` names a device). See [Answering from the notification](#answering-from-the-notification) |
+| `answerButtons.services` | The `notify.mobile_app_<device>` services to send to, one per device. **Empty means nothing is sent** — this is what you set on each machine |
 | `answerButtons.maxButtons` | How many options to offer as buttons (default `6`). The rest are left to the dashboard |
 | `answerButtons.icon` / `.iconColor` / `.color` | The MDI glyph, its colour, and the background behind it (defaults `mdi:chat-question`, `#FFFFFF`, `#FF9F0A`). Setting an icon makes iOS render the alert as a communication notification; clear `icon` for a plain one |
 | `answerButtons.interruptionLevel` | `time-sensitive` (default) breaks through Focus, because a session cannot continue until you answer. `active` stays inside Focus, `passive` keeps it off the Lock Screen |
@@ -621,6 +621,21 @@ A tap is not a separate route into the session. It is handed to the same
 `Invoke-DaemonDecisionAnswer` the dashboard's answers go through, so the attempt
 claiming, the double-answer guard and the terminal-only refusal all apply unchanged.
 A question is simply gaining a third input beside the card and the native prompt.
+
+**Why a tap is never lost.** A notification action is a Home Assistant *event*: it is
+delivered once, to whoever is subscribed at that instant, and leaves nothing behind.
+The entity watch's socket is opened and disposed around each reconcile, which is
+harmless for a state change because the state is still there to read afterwards - but
+an event arriving during a reconcile would simply be gone, with the notification still
+sitting on the phone looking as though nothing had happened. So the subscription is
+held for the life of the daemon by a listener of its own, and taps are queued. Acting
+on one can be late; losing it cannot be allowed.
+
+**Every machine notifies for its own sessions.** A daemon only sees sessions on its
+own machine, so a question is notified once, by the machine running it - there are no
+duplicates. The corollary is that coverage is per machine: set `services` on each one,
+because a machine you miss is silent, and silence looks exactly like having no
+questions waiting.
 
 **Three questions get no buttons**, each because a button would otherwise be offered
 for something that cannot be delivered: one that must be

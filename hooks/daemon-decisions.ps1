@@ -149,8 +149,10 @@ function Complete-DaemonAnsweredDecision {
         Write-DaemonLog -Message "decision clear failed for $sessionId : $($_.Exception.Message)"
     }
     # The notification goes with the card. Left behind it would keep offering buttons
-    # that are now refused, which reads as the answer having been lost.
-    Clear-DaemonAnswerButtons -SessionId $sessionId -Marker $Marker -Headers $Headers
+    # that are now refused, which reads as the answer having been lost. This is the
+    # one place that also forgets the question, because it is the only one that knows
+    # the question is actually finished rather than merely answered-at.
+    Clear-DaemonAnswerButtons -SessionId $sessionId -Marker $Marker -Headers $Headers -Forget
     # The question's own baseline goes with its marker. Naming it matters: without an
     # id the baseline is deliberately left alone, so every answered question would
     # leave one behind for the life of the session.

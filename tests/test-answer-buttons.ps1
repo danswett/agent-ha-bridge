@@ -85,17 +85,6 @@ $script:DaemonMachineName = 'TESTBOX'
 
 . (Join-Path $repository 'hooks\daemon-decision-notify.ps1')
 
-# Loaded on its own, by name, rather than dot-sourcing the whole websocket file:
-# this suite is about what a tapped button means, not about connecting to anything.
-$wsAst = [Management.Automation.Language.Parser]::ParseFile(
-    (Join-Path $repository 'hooks\decision-ha-websocket.ps1'), [ref]$null, [ref]$null)
-$hitFunction = $wsAst.Find({
-    param($node)
-    $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Get-BridgeStateTriggerHit'
-}, $true)
-if (-not $hitFunction) { throw 'The actual trigger-hit parser is missing.' }
-. ([scriptblock]::Create($hitFunction.Extent.Text))
-
 $headers = @{ Authorization = '******' }
 $session = 'a92623ed40334467b5d0342e27557c09'
 
@@ -121,6 +110,8 @@ function Reset-TestWorld {
     $script:AskPending = $true
     $script:InjectResult = $true
     $script:DaemonAnswerButtonSent.Clear()
+    $drain = ''
+    while ($script:DaemonAnswerButtonQueue.TryDequeue([ref]$drain)) { }
 }
 
 Write-Host '--- the options become the buttons ---'
@@ -145,6 +136,16 @@ Test-That 'a form with several fields offers no choice buttons at all' {
     @(Get-BridgeAnswerButtonOptions -Marker (New-TestMarker -Choices @() -Fields @($a, $b))).Count -eq 0
 }
 
+Test-That 'and no text box either, which would submit a partial form' {
+    # A form is answered slot by slot at an arrow-key prompt and characters typed at
+    # one are discarded, so typed words would be delivered as free text for a
+    # multiple_choice marker and answer the form wrongly.
+    $a = [pscustomobject]@{ Label = 'A'; Options = @('x'); IsText = $false }
+    $b = [pscustomobject]@{ Label = 'B'; Options = @('y'); IsText = $false }
+    $m = New-TestMarker -Choices @() -Fields @($a, $b)
+    @(Get-BridgeAnswerButtonActions -Marker $m -DecisionId 'd1' -Options @(Get-BridgeAnswerButtonOptions -Marker $m)).Count -eq 0
+}
+
 Test-That 'a question that must be answered in the terminal offers nothing' {
     # The daemon refuses to inject one of these, so a button would be a lie.
     $m = New-TestMarker -TerminalOnly $true
@@ -163,6 +164,21 @@ Test-That 'words are offered as an answer to a choice question too' {
     $m = New-TestMarker
     $actions = @(Get-BridgeAnswerButtonActions -Marker $m -DecisionId 'd1' -Options @(Get-BridgeAnswerButtonOptions -Marker $m))
     $actions.Count -eq 3 -and $actions[2].behavior -eq 'textInput'
+}
+
+Test-That 'an option spelling out the prompt-s own text entry is not duplicated' {
+    # The CLI renders that entry itself and it is not a declared option, so it does
+    # not normally reach the buttons. An agent that writes one out anyway would get a
+    # button selecting the literal label beside the text action that opens a box.
+    $m = New-TestMarker -Choices @('Keep', 'Drop', 'Other (type your answer)')
+    $options = @(Get-BridgeAnswerButtonOptions -Marker $m)
+    $options.Count -eq 2 -and $options -notcontains 'Other (type your answer)'
+}
+
+Test-That 'but an ordinary option merely called Other is left alone' {
+    # It is a real declared answer, and the dashboard dropdown offers it too.
+    $m = New-TestMarker -Choices @('Keep', 'Other')
+    @(Get-BridgeAnswerButtonOptions -Marker $m) -contains 'Other'
 }
 
 Test-That 'more options than will fit are capped rather than shown badly' {
@@ -383,6 +399,30 @@ Test-That 'and is not sent again on every pass' {
     $script:Sent.Count -eq 1
 }
 
+Test-That 'withdrawing the notification does not yet forget the question' {
+    # Injection does not wait for the transcript to confirm, and the loop reconciles
+    # straight afterwards - so a sweep can still see the question as pending. Forget
+    # it here and that sweep re-sends the question that was just answered.
+    Reset-TestWorld
+    $m = New-TestMarker -DecisionId 'd-keep'
+    $state = @{ $session = [pscustomobject]@{ Name = 'bridge'; Status = 'idle' } }
+    Sync-DaemonAnswerButtons -SessionId $session -Marker $m -State $state -Headers $headers
+    Clear-DaemonAnswerButtons -SessionId $session -Marker $m -Headers $headers
+    Sync-DaemonAnswerButtons -SessionId $session -Marker $m -State $state -Headers $headers
+    # One send, one clear, and no second send.
+    @($script:Sent | Where-Object { $_.Data.message -ne 'clear_notification' }).Count -eq 1
+}
+
+Test-That 'completing the question does forget it' {
+    # Otherwise a session asking a second question with a recycled id would be silent.
+    Reset-TestWorld
+    $m = New-TestMarker -DecisionId 'd-done'
+    $state = @{ $session = [pscustomobject]@{ Name = 'bridge'; Status = 'idle' } }
+    Sync-DaemonAnswerButtons -SessionId $session -Marker $m -State $state -Headers $headers
+    Clear-DaemonAnswerButtons -SessionId $session -Marker $m -Headers $headers -Forget
+    -not $script:DaemonAnswerButtonSent.ContainsKey('d-done')
+}
+
 Test-That 'nothing is sent when the feature is switched off' {
     Reset-TestWorld
     $script:DecisionBridgeConfig.AnswerButtonsEnabled = $false
@@ -402,34 +442,57 @@ Test-That 'nothing is sent when no phone has been named' {
 }
 
 Write-Host ''
-Write-Host '--- the socket tells an event apart from a state change ---'
+Write-Host '--- a tap is queued, never dropped for want of a listener ---'
 
-Test-That 'an event trigger is reported as an event, with its data' {
-    $message = ('{"type":"event","event":{"variables":{"trigger":{"platform":"event","event":' +
-        '{"event_type":"mobile_app_notification_action","data":{"action":"BRIDGE_x_0"}}}}}}') | ConvertFrom-Json
-    $hit = Get-BridgeStateTriggerHit -Message $message
-    $null -ne $hit -and $hit.Kind -ceq 'Event' -and $hit.EventType -ceq 'mobile_app_notification_action'
+Test-That 'a tap that arrives between reconciles is still acted on' {
+    # The entity watch disposes its socket before every reconcile, which is harmless
+    # for a state change because the state is still in Home Assistant afterwards. An
+    # event is delivered once and leaves nothing behind, so the subscription is held
+    # for the life of the daemon and taps are queued until a pass can act on them.
+    Reset-TestWorld
+    $script:Markers[$session] = New-TestMarker -DecisionId 'probe-433e5b50'
+    $live = @{ $session = [pscustomobject]@{ Id = $session } }
+    $script:DaemonAnswerButtonQueue.Enqueue(($realTap | ConvertTo-Json -Depth 8 -Compress))
+    $handled = Invoke-DaemonAnswerButtonQueue -Headers $headers -State @{} -Live $live
+    $handled -eq 1 -and $script:Injected.Count -eq 1 -and $script:Injected[0].Answer -eq 'Open the PR now'
 }
 
-Test-That 'and carries no entity id, so the press dispatch cannot match it' {
-    $message = ('{"type":"event","event":{"variables":{"trigger":{"platform":"event","event":' +
-        '{"event_type":"mobile_app_notification_action","data":{"action":"BRIDGE_x_0"}}}}}}') | ConvertFrom-Json
-    $hit = Get-BridgeStateTriggerHit -Message $message
-    [string]$hit.EntityId -eq '' -and -not ([string]$hit.EntityId -match '_(reply|submit|stop)$')
+Test-That 'several taps queued at once are all acted on' {
+    Reset-TestWorld
+    $other = 'bbbbbbbb11112222333344445555cccc'
+    $script:Markers[$session] = New-TestMarker -DecisionId 'd-a' -Choices @('yes')
+    $script:Markers[$other] = New-TestMarker -DecisionId 'd-b' -Choices @('no')
+    $live = @{
+        $session = [pscustomobject]@{ Id = $session }
+        $other   = [pscustomobject]@{ Id = $other }
+    }
+    $script:DaemonAnswerButtonQueue.Enqueue('{"action":"BRIDGE_x_0","action_data":{"bridge":"decision","decision":"d-a","session":"' + $session + '"}}')
+    $script:DaemonAnswerButtonQueue.Enqueue('{"action":"BRIDGE_y_0","action_data":{"bridge":"decision","decision":"d-b","session":"' + $other + '"}}')
+    [void](Invoke-DaemonAnswerButtonQueue -Headers $headers -State @{} -Live $live)
+    $script:Injected.Count -eq 2
 }
 
-Test-That 'an ordinary state change is still reported as one' {
-    $message = ('{"type":"event","event":{"variables":{"trigger":{"entity_id":"button.abc_stop",' +
-        '"to_state":{"state":"2026-10-10T12:00:00+00:00"}}}}}') | ConvertFrom-Json
-    $hit = Get-BridgeStateTriggerHit -Message $message
-    $null -ne $hit -and $hit.Kind -ceq 'State' -and $hit.EntityId -eq 'button.abc_stop'
+Test-That 'a malformed queued event does not stop the ones behind it' {
+    Reset-TestWorld
+    $script:Markers[$session] = New-TestMarker -DecisionId 'probe-433e5b50'
+    $live = @{ $session = [pscustomobject]@{ Id = $session } }
+    $script:DaemonAnswerButtonQueue.Enqueue('{ this is not json')
+    $script:DaemonAnswerButtonQueue.Enqueue(($realTap | ConvertTo-Json -Depth 8 -Compress))
+    [void](Invoke-DaemonAnswerButtonQueue -Headers $headers -State @{} -Live $live)
+    $script:Injected.Count -eq 1
 }
 
-Test-That 'an entity being removed is still skipped rather than thrown' {
-    # The 2026-10-07 trap: reading .state off a null to_state was thrown out of the
-    # whole wait and counted as a dropped socket.
-    $message = '{"type":"event","event":{"variables":{"trigger":{"entity_id":"button.abc_stop","to_state":null}}}}' | ConvertFrom-Json
-    $null -eq (Get-BridgeStateTriggerHit -Message $message)
+Test-That 'the listener never cancels an outstanding receive' {
+    # Cancelling a WebSocket receive aborts the socket. A hand-rolled listener written
+    # while building this did exactly that and went deaf after its first idle period,
+    # which looked precisely like the feature being broken.
+    $body = (Get-DaemonAnswerButtonListenerScript).ToString()
+    $body -match '\$pending\.Wait\(' -and $body -notmatch 'CancelAfter'
+}
+
+Test-That 'and reconnects rather than ending when the socket drops' {
+    $body = (Get-DaemonAnswerButtonListenerScript).ToString()
+    $body -match 'IsCancellationRequested' -and $body -match 'Start-Sleep'
 }
 
 Write-Host ''
