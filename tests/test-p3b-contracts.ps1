@@ -183,7 +183,7 @@ try {
         -not (Test-DecisionFieldsAnswerable -Fields @($unofferable))
     }
     # An option spelled exactly like a carrier would make the dropdown offer the same
-    # entry for two different answers, so that carrier is withheld rather than guessed.
+    # entry for two different answers, so that carrier gives way rather than guessing.
     $collidingWords = [pscustomobject]@{
         Label = 'Rows'; Options = @('(none)', 'B'); IsText = $false
         MultiSelect = $true; MultiSelectStyle = 'space-toggle'; DefaultIndexes = @(); AllowsEmpty = $true
@@ -192,14 +192,38 @@ try {
         $carriers = @(Get-DecisionMultiSelectEmptyChoices -Field $collidingWords)
         ($carriers -join '|') -ceq '#0' -and (Get-DecisionMultiSelectEmptyChoice -Field $collidingWords) -ceq '#0'
     } "carriers=[$(@(Get-DecisionMultiSelectEmptyChoices -Field $collidingWords) -join '|')]"
+    # The position form lengthens instead of giving way, because there is nothing left
+    # behind it. Withholding it left such a field unable to say "none" at all - and
+    # tying it to Test-DecisionMultiSelectCodeSafe would have taken the *subsets'*
+    # positions away too, sending an ordinary six-option question to the terminal.
     $collidingCode = [pscustomobject]@{
         Label = 'Rows'; Options = @('#0', 'B'); IsText = $false
         MultiSelect = $true; MultiSelectStyle = 'space-toggle'; DefaultIndexes = @(); AllowsEmpty = $true
     }
-    Test-That 'and one written like its position form leaves only the words' {
-        $carriers = @(Get-DecisionMultiSelectEmptyChoices -Field $collidingCode)
-        ($carriers -join '|') -ceq '(none)' -and (Get-DecisionMultiSelectEmptyChoice -Field $collidingCode) -ceq '(none)'
+    Test-That 'and one written like its position form lengthens that rather than losing it' {
+        (@(Get-DecisionMultiSelectEmptyChoices -Field $collidingCode) -join '|') -ceq '(none)|#00' -and
+        (Get-DecisionMultiSelectEmptyChoice -Field $collidingCode) -ceq '#00'
     } "carriers=[$(@(Get-DecisionMultiSelectEmptyChoices -Field $collidingCode) -join '|')]"
+    Test-That 'while the subsets keep the positions they always had' {
+        @(Get-DecisionMultiSelectCodes -Field $collidingCode).Count -gt 0
+    }
+    # Both reserved spellings at once. A carrier still has to come out of it: the field
+    # is answerable, so refusing it the empty set would leave a schema-valid answer
+    # with nowhere to go.
+    $collidingBoth = [pscustomobject]@{
+        Label = 'Rows'; Options = @('(none)', '#0', '#00', 'B'); IsText = $false
+        MultiSelect = $true; MultiSelectStyle = 'space-toggle'; DefaultIndexes = @(); AllowsEmpty = $true
+    }
+    Test-That 'a field spelling every reserved carrier still gets one of its own' {
+        (@(Get-DecisionMultiSelectEmptyChoices -Field $collidingBoth) -join '|') -ceq '#000' -and
+        (Get-DecisionMultiSelectEmptyChoice -Field $collidingBoth) -ceq '#000' -and
+        @(Get-DecisionMultiSelectChoices -Field $collidingBoth) -ccontains '#000'
+    } "carriers=[$(@(Get-DecisionMultiSelectEmptyChoices -Field $collidingBoth) -join '|')]"
+    Test-That 'and what it gets really does resolve back to nothing on that field' {
+        $carrier = Get-DecisionMultiSelectEmptyChoice -Field $collidingBoth
+        (Test-DecisionMultiSelectEmptyChoice -Field $collidingBoth -Choice $carrier) -and
+        @(Resolve-DecisionMultiSelectChoice -Field $collidingBoth -Choice $carrier).Count -eq 0
+    }
     Test-That 'a field that must have a choice never resolves either carrier as one' {
         $required = [pscustomobject]@{
             Label = 'Rows'; Options = @('A', 'B'); IsText = $false

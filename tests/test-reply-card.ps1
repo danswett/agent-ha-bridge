@@ -514,12 +514,25 @@ Test-That 'a successful read that finds nothing still means no card' {
 }
 
 # An inline card's base64 body contains slashes, so it is recognised by its fragment.
+# Deliberately not decodable: what this fixture is for is proving that the matching
+# looks at the fragment and nothing else, so it carries the characters that break both
+# path and query splitting.
 $inlineCard = 'data:text/javascript;base64,Ly8gYS9iL2M/ZD0x/abc+/=#agent-bridge-reply-card.js?v=1.10.0'
 Test-That 'an inline card resource is found' {
     (Get-BridgeServedReplyCardUrl -CacheSeconds 0 -Resources { @([pscustomobject]@{ url = $inlineCard }) }) -eq $inlineCard
 }
+# Which is why the version gate gets a real one. An inline resource is its own bytes,
+# so Test-BridgeActivityCardServed reads them and refuses a body it cannot verify -
+# the fixture above is exactly such a body, and gating on it would be asserting that
+# an unreadable card is trusted.
+$realInlineBody = [Convert]::ToBase64String(
+    [Text.Encoding]::UTF8.GetBytes("const CARD_VERSION = '1.10.0';`nexport {};`n"))
+$realInlineCard = "data:text/javascript;base64,$realInlineBody#agent-bridge-reply-card.js?v=1.10.0"
 Test-That 'an inline card of 1.10.0 or later gets the activity header' {
-    Test-BridgeActivityCardServed -ReplyCardUrl $inlineCard
+    Test-BridgeActivityCardServed -ReplyCardUrl $realInlineCard
+}
+Test-That 'while one whose body cannot be read is not trusted on its number alone' {
+    -not (Test-BridgeActivityCardServed -ReplyCardUrl $inlineCard)
 }
 Test-That 'some other inline resource is not mistaken for the card' {
     (Get-BridgeServedReplyCardUrl -CacheSeconds 0 -Resources {

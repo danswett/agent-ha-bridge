@@ -1354,17 +1354,17 @@ function Test-DecisionMultiSelectCodeSafe {
         then a perfectly ordinary answer would decode as a different one. Vanishingly
         unlikely and cheap to rule out; guessing wrong would record an answer nobody
         gave.
+
+        The empty set's carrier is deliberately not asked about here. It is not a
+        position - they are one-based, so it names no option - and tying the two
+        together took the position carrier away from a field merely because one of its
+        options was spelled like the empty set, which is how a perfectly ordinary
+        six-option question would have been sent back to the terminal.
     #>
     param([AllowNull()][object]$Field)
 
-    # The empty-set code is only ever published for a field that can be answered with
-    # nothing, so only such a field is confused by an option that happens to spell it.
-    # Asked of the field rather than of the pattern because '#0' names no position and
-    # so is not one of the codes the pattern describes.
-    $allowsEmpty = Test-DecisionMultiSelectAllowsEmpty -Field $Field
     foreach ($option in @($Field.Options)) {
         if ([string]$option -match $script:DecisionMultiSelectCodePattern) { return $false }
-        if ($allowsEmpty -and [string]$option -ceq $script:DecisionMultiSelectEmptyCode) { return $false }
     }
     $true
 }
@@ -1528,16 +1528,41 @@ function Get-DecisionMultiSelectCodes {
     $codes.ToArray()
 }
 
+function Get-DecisionMultiSelectEmptyCode {
+    <#
+        The position-shaped carrier for "nothing ticked" on this field: '#0', with as
+        many more zeros as it takes for no option to be spelled like it.
+
+        Position-shaped but never a position, because positions are one-based - so it
+        names no option and can never be confused with a subset. That makes it
+        available to a field carrying its subsets as words just as much as to one
+        carrying them as positions, which is why it is what the card is told to write.
+
+        Lengthened rather than withheld when an option collides with it. Withholding
+        it left a field offering an option called '#0' with no way to say "none" at
+        all, and there are always more of these than there are options to collide
+        with, so one of them is always free.
+    #>
+    param([AllowNull()][object]$Field)
+
+    $options = @($Field.Options | ForEach-Object { [string]$_ })
+    $code = $script:DecisionMultiSelectEmptyCode
+    while ($options -ccontains $code) { $code += '0' }
+    $code
+}
+
 function Get-DecisionMultiSelectEmptyChoices {
     <#
         Every carrier this field's slot may hold for "nothing ticked", words first,
         or an empty list when the field cannot be answered that way.
 
-        One entry per carrier the subsets themselves were published under, so a card
-        of any age finds the empty set written in the form it already understands.
-        The words are dropped where an option is itself spelled '(none)', because then
-        the entry would be that option as well, and a dropdown offering it twice means
-        one of the two readings is wrong.
+        Published only beside the subsets themselves: the empty set must never be
+        what makes an otherwise unofferable field look answerable.
+
+        The words are dropped where an option is itself spelled '(none)', because the
+        entry would then stand for two different answers and a dropdown offering it
+        twice means one of the two readings is wrong. The position form is always
+        there, so dropping them never leaves the field unable to say "none".
     #>
     param(
         [AllowNull()][object]$Field,
@@ -1545,32 +1570,29 @@ function Get-DecisionMultiSelectEmptyChoices {
     )
 
     if (-not (Test-DecisionMultiSelectAllowsEmpty -Field $Field)) { return @() }
+    if (@(Get-DecisionMultiSelectSpelledChoices -Field $Field -MaxChoices $MaxChoices).Count -eq 0 -and
+        @(Get-DecisionMultiSelectCodes -Field $Field).Count -eq 0) { return @() }
     $carriers = @()
-    if (@(Get-DecisionMultiSelectSpelledChoices -Field $Field -MaxChoices $MaxChoices).Count -gt 0 -and
-        -not (@($Field.Options | ForEach-Object { [string]$_ }) -ccontains $script:DecisionMultiSelectEmptyLabel)) {
+    if (@($Field.Options | ForEach-Object { [string]$_ }) -cnotcontains $script:DecisionMultiSelectEmptyLabel) {
         $carriers += $script:DecisionMultiSelectEmptyLabel
     }
-    if (@(Get-DecisionMultiSelectCodes -Field $Field).Count -gt 0) {
-        $carriers += $script:DecisionMultiSelectEmptyCode
-    }
-    $carriers
+    @($carriers) + @(Get-DecisionMultiSelectEmptyCode -Field $Field)
 }
 
 function Get-DecisionMultiSelectEmptyChoice {
     <#
         The one carrier a card should write for "nothing ticked", or '' when this
-        field has none and the placeholder has to stand.
+        field cannot be answered that way and the placeholder has to stand.
 
-        Positions where the slot takes them, words otherwise - the same rule the card
-        applies to a non-empty set, so the two are written the same way and a field
-        whose options are too long to spell out is no worse off empty than it is full.
+        Always the position form. It is the one that can never be an option's own
+        text, so it is available whatever this field's subsets are carried as, and
+        naming the exact value here keeps the spelling of the empty set in one place
+        rather than repeating it in the card.
     #>
     param([AllowNull()][object]$Field)
 
-    $carriers = @(Get-DecisionMultiSelectEmptyChoices -Field $Field)
-    if ($carriers.Count -eq 0) { return '' }
-    if ($carriers -ccontains $script:DecisionMultiSelectEmptyCode) { return $script:DecisionMultiSelectEmptyCode }
-    $carriers[0]
+    if (@(Get-DecisionMultiSelectEmptyChoices -Field $Field).Count -eq 0) { return '' }
+    Get-DecisionMultiSelectEmptyCode -Field $Field
 }
 
 function Test-DecisionMultiSelectEmptyChoice {

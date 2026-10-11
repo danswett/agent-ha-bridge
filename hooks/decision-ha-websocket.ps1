@@ -1529,11 +1529,13 @@ function Test-BridgeServedCardContent {
         two Send buttons, and an answer submitted in a shape the running bridge did not
         recognise as confirmation, reported as "Answer unconfirmed" (#110).
 
-        Only an equal version with different content is distrusted. A served card that
-        is genuinely older or newer is a version this renderer can reason about, and
-        that fallback is the whole point of the gating. An unreadable local file, or a
-        file resource whose bytes cannot be seen from here, leaves the version alone to
-        decide - the same answer as before any of this existed.
+        Only a card this cannot vouch for is distrusted: an equal version whose bytes
+        differ, or an inline resource that cannot be read as a coherent version and
+        content at all. A served card that is genuinely older or newer is a version
+        this renderer can reason about, and that fallback is the whole point of the
+        gating. An unreadable local file, or a file resource whose bytes are served
+        from the Home Assistant host and cannot be seen from here, leaves the version
+        alone to decide - the same answer as before any of this existed.
 
         Read from the local card file rather than from the publication policy: the
         policy records what was last accepted, which during a paused standoff is the
@@ -1552,30 +1554,41 @@ function Test-BridgeServedCardContent {
 
     $trusted = $true
     $detail = ''
-    try {
-        if ($info) {
+    $served = $null
+    try { $served = Get-BridgeRegisteredCardArtifact -Url $ReplyCardUrl }
+    catch {
+        if ($_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        # An inline resource carries its own bytes, so one that cannot be read as a
+        # coherent version and content - malformed base64, or a CARD_VERSION its own
+        # body contradicts - is not a card whose number means anything. Letting that
+        # fall back to the version would re-create exactly the layout mismatch this
+        # exists to prevent, on content nothing has verified.
+        #
+        # A file resource is different: it is served from the Home Assistant host and
+        # its bytes were never readable from here, which is the ordinary case.
+        if ($ReplyCardUrl.StartsWith('data:', [StringComparison]::Ordinal)) {
+            $trusted = $false
+            $detail = "the inline resource could not be read: $($_.Exception.Message)"
+        }
+    }
+    if ($trusted -and $served -and $served.hash -and $info) {
+        try {
             $bytes = [IO.File]::ReadAllBytes($source)
             $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
-            if ($text -match "CARD_VERSION\s*=\s*'([^']+)'") {
-                $localVersion = $Matches[1]
-                $served = Get-BridgeRegisteredCardArtifact -Url $ReplyCardUrl
-                # No hash means a file resource, whose bytes live on the Home Assistant
-                # host and are not readable here. Nothing to compare, so nothing to say.
-                if ($served.hash -and $served.version -ceq $localVersion) {
-                    $localHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
-                    if ($served.hash -cne $localHash) {
-                        $trusted = $false
-                        $detail = "served $($served.hash.Substring(0, 12)), local $($localHash.Substring(0, 12))"
-                    }
+            if ($text -match "CARD_VERSION\s*=\s*'([^']+)'" -and $served.version -ceq $Matches[1]) {
+                $localHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+                if ($served.hash -cne $localHash) {
+                    $trusted = $false
+                    $detail = "a different build of the same version: served $($served.hash.Substring(0, 12)), local $($localHash.Substring(0, 12))"
                 }
             }
         }
-    }
-    catch {
-        if ($_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
-        # Unreadable is not evidence of a conflict, and refusing every custom card over
-        # it would turn a transient read failure into a visibly downgraded dashboard.
-        $trusted = $true
+        catch {
+            if ($_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+            # The local card is what the comparison is against. Not having it is not
+            # evidence of a conflict, and refusing every custom card over a read that
+            # failed would turn that into a visibly downgraded dashboard.
+        }
     }
 
     $script:BridgeServedCardTrustKey = $key
@@ -1584,8 +1597,8 @@ function Test-BridgeServedCardContent {
         # The only signal this state produced was the installer's "publication paused"
         # line on whichever machine happened to run an install, and a dashboard that
         # misbehaved in a way nothing explained.
-        Write-DecisionBridgeLog ("the served reply card is a different build of the same version ($detail); " +
-            'rendering the fallback layout until the correct card is published')
+        Write-DecisionBridgeLog ("the served reply card is not the build this renderer was written against " +
+            "($detail); rendering the fallback layout until the correct card is published")
     }
     $trusted
 }

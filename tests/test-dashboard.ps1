@@ -650,6 +650,19 @@ Test-That "a different build calling itself $shippedCard answers no gate at all"
 Test-That 'and the standoff is said out loud somewhere other than installer stdout' {
     (Get-Content -LiteralPath $script:DecisionBridgeConfig.LogFile -Raw) -match 'different build of the same version'
 }
+# An inline resource is its own bytes, so one that cannot be read as a coherent
+# version and content is not a card whose number means anything. Falling back to the
+# number there would hand it every feature that number implies, on content nothing
+# has verified - which is the mismatch this whole check exists to prevent.
+$lyingSource = New-TestPublicationCard '1.19.0' 'export const bodyDisagreesWithItsLabel = true;'
+$lyingUrl = (Get-TestInlineCardUrl -SourcePath $lyingSource -Version '1.19.0') -replace '\?v=1\.19\.0$', "?v=$shippedCard"
+Test-That 'an inline card whose body contradicts its own version number answers nothing' {
+    -not (Test-BridgeActivityCardServed -ReplyCardUrl $lyingUrl -MinimumVersion '1.10.0')
+}
+$truncatedUrl = 'data:text/javascript;base64,bm90IGJhc2U2NCBhdCBhbGw!!!#agent-bridge-reply-card.js?v=1.19.0'
+Test-That 'and so does one whose inline body cannot be decoded at all' {
+    -not (Test-BridgeActivityCardServed -ReplyCardUrl $truncatedUrl -MinimumVersion '1.10.0')
+}
 # Only an equal version is ambiguous. A number this renderer can reason about is still
 # the thing to reason about, however the bytes behind it were built - otherwise every
 # machine whose card is simply older than its bridge would lose the whole dashboard.
@@ -1835,7 +1848,7 @@ Test-That 'and a blank entry never matches a blank user' { -not (Test-BridgeAgen
 # now asks it whether the served bytes are this build at all, so what it decides is
 # part of what the renderer emits even though its own text sits in another function.
 $script:ExpectedRenderVersion = '1.10.0'
-$script:ExpectedRenderHash = '2013d76da2876d7ea073e0ed3b599f9b487c479789025d8d88042d71be7ea87d'
+$script:ExpectedRenderHash = 'e1bcde6b024d665eb9d58eab040accb22fd7357075cbd695159386c3469a2c99'
 $artifact = Get-BridgeRenderArtifact
 
 Test-That 'the renderer is still the one this version was pinned to' {
