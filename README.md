@@ -1080,6 +1080,54 @@ can lag it by up to `usage.idleIntervalSeconds`. Set that to the same as
 A reading that could not be published is asked for again at the quick pace, not the idle
 one.
 
+### Only one machine asks
+
+The pace above is per machine, and a per-machine pace on an account-scoped figure is
+still the same question several times over: five machines signed in to one account
+fetched the same allowance every two minutes and the card then discarded four of the
+five answers. So where `dashboard.publication` names a designated writer, that machine
+does the asking, and the others ask only when no machine has published a reading of
+*their* account recently — three of their own poll intervals, which is six minutes at
+the quick pace and proportionately longer at the idle one, since a machine with a
+session open needs a current figure and one with nothing open does not.
+
+Nothing is elected and nothing takes a turn. The writer is read from the explicit
+`dashboard.publication` configuration and from nothing else; a machine that ends up
+asking gains no authority to publish anything but its own per-machine sensors, and the
+guards over the shared card, the dashboard and the policy never consult any of this. An
+installation that has configured no publication asks from every machine exactly as it
+always has.
+
+The parts that keep a gauge from quietly going flat:
+
+- **The writer being switched off is the case this is built for.** When it stops
+  publishing, the next machine that is due asks for itself within three of its
+  intervals, publishes, and the rest then stand down for *it*. Ownership follows
+  whoever needs the figure most: a machine with a session open wants a reading inside
+  six minutes, so it takes over from an idle machine that cannot supply one.
+- **Anything unknown means ask.** No state list from Home Assistant, no publication
+  configured, an account that cannot be identified, a reading with no timestamp — all
+  of them fall back to asking, because a redundant request is cheaper than a flat gauge.
+- **A clock running ahead cannot silence anybody.** A reading stamped more than one
+  interval into the future is treated as a clock rather than a figure, so a machine
+  whose time is wrong makes the others ask more often, never less.
+- **The machine that is asking republishes an unchanged reading** every couple of
+  intervals, so standing down for it is never mistaken for it having stopped. Without
+  that, a figure nobody is spending would look exactly like a machine that went away.
+- **Codex is never stood down for.** Its figures are not a vendor call at all — they are
+  read out of this machine's own transcripts — so another machine's Codex row is not a
+  reading of the same thing.
+
+Which account a machine is on is read from the agents' own files
+(`~/.copilot/config.json` and `~/.claude.json`), never from a credential store, because
+the decision has to be made *before* the vendor call: an identity that reached the macOS
+login keychain would put the authorization panel back on every machine that this is
+meant to remove.
+
+A machine that stops asking says so in its daemon log, and says so again when it takes
+over. `usage.publish: false` still means what it always did — no collecting at all on
+that machine, designated writer or not.
+
 The card also runs a half-minute timer of its own, purely so the relative text —
 `37m ago`, `resets in 3h` — keeps up when nothing is being pushed. Codex's figures can
 sit unchanged for days, so without it that row would never redraw at all. The timer is

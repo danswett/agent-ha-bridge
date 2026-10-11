@@ -16,7 +16,11 @@
     How often it asks is per client and follows the sessions. A figure only moves while
     somebody is spending, and the allowance belongs to the account rather than the
     machine, so a machine with a session of a client open asks about it every couple of
-    minutes and one with none asks rarely; see Sync-DaemonUsage.
+    minutes and one with none asks rarely; see Sync-DaemonUsage. The same reasoning
+    across machines: where a dashboard writer is explicitly configured, the other
+    machines signed in to the same account stand down while it is publishing readings,
+    and take over when it stops. That is about repeated vendor calls only - nothing
+    here elects anybody or confers any authority to publish.
 
     Part of agent-bridge-daemon.ps1, which dot-sources it into its own scope after
     declaring the shared $script: state; see docs/daemon-split.md.
@@ -75,6 +79,13 @@ $script:BridgeUsageConfig = @{
     # forward. Without it a session that keeps crashing and restarting would ask on
     # every reconcile, which is more often than the pace it is meant to relieve.
     MinimumGapSeconds = 30
+    # How many of a client's own poll intervals another machine's published reading of
+    # the same account stands for before this one asks the vendor itself, and how old
+    # the machine that is asking lets its own retained reading get before publishing it
+    # again unchanged. Three and two, so the re-assert is always a whole interval inside
+    # the takeover whatever pace is configured; see Test-BridgeUsageCovered.
+    CoveredIntervals = 3
+    ReassertIntervals = 2
     RequestTimeout  = 15
     # One attempt is not a reading, it is a coin toss on any path that is less than
     # perfect. Measured on DSWETT-HOME on 2026-10-07: api.github.com completed 6 of 14
@@ -1099,13 +1110,154 @@ function Get-BridgeUsageClientState {
 
     if (-not $script:DaemonUsageClients.ContainsKey($Client)) {
         $script:DaemonUsageClients[$Client] = @{
-            CheckedAt = [DateTimeOffset]::MinValue
-            Busy      = $false
-            Signature = ''
-            Retry     = $false
+            CheckedAt   = [DateTimeOffset]::MinValue
+            Busy        = $false
+            Signature   = ''
+            Retry       = $false
+            # When this machine last put the reading on the bus, as opposed to when it
+            # last read it: an unchanged reading is normally not republished, and that
+            # is the one thing another machine deciding whether this one is still
+            # reading has to go on. See Sync-DaemonUsage.
+            PublishedAt = [DateTimeOffset]::MinValue
+            Covered     = $false
         }
     }
     $script:DaemonUsageClients[$Client]
+}
+
+function Get-BridgeUsagePollRole {
+    <#
+        What this machine is to the configured dashboard publication - 'writer',
+        'participant' or 'none' - read for one purpose only: deciding whether to repeat
+        a vendor call another machine has already made.
+
+        It comes from the explicit dashboard.publication and from nothing else. No
+        hostname, installation id, retained sensor, presence or clock is consulted,
+        nothing is elected, and the answer carries no publication authority whatever. A
+        participant that ends up doing the polling still publishes only its own
+        per-machine usage sensors, exactly as it does today; it does not write the
+        shared card, the Lovelace dashboard or the policy, and the guards over those
+        never ask this function anything. See AGENTS.md, "Publication authority,
+        versions and rollback".
+
+        'none' for an installation that has not configured publication, or whose
+        configuration cannot be read: there is no designated writer to stand down for,
+        so every machine asks for itself exactly as it always has.
+    #>
+
+    try {
+        if ($null -eq (Get-BridgeSetting 'dashboard.publication' $null)) { return 'none' }
+        $settings = Get-BridgePublicationSettings
+        $writer = [string]$settings.writer
+        $participant = [string]$settings.participant
+        if (-not $writer -or -not $participant) { return 'none' }
+        if ($participant -ceq $writer) { return 'writer' }
+        'participant'
+    }
+    catch { 'none' }
+}
+
+function Get-BridgeUsageAccountKey {
+    <#
+        Whose allowance this machine would be reading for one client, in the key the
+        card groups its rows on - the account id where a vendor publishes one, the
+        account name where it does not - or '' when it cannot be told.
+
+        Read from the agent's own files and nothing else, which is the whole point of
+        having it. Deciding "has another machine already read my account recently" has
+        to happen before the vendor call, so an identity that cost a credential read
+        would reintroduce on every machine exactly the macOS authorization panel this
+        deferral exists to remove (#122, #142). Copilot's login is in
+        ~/.copilot/config.json and Claude's account in ~/.claude.json; neither reaches a
+        keychain, and Get-BridgeCopilotToken - which does - is not called from here.
+
+        Codex has no key and is given none, so it is never deferred. It names no
+        account anywhere, and its figures are not a vendor call at all: they are read
+        out of this machine's own transcripts, so another machine's Codex row is not a
+        reading of the same thing and standing down for it would trade a free local
+        read for somebody else's staler number. An unreadable Copilot config or Claude
+        account lands in the same place, which is the safe direction: unknown means ask.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Client,
+        [AllowEmptyString()][string]$CopilotConfigPath = (Get-BridgeCopilotStatePath -Kind Config),
+        [AllowEmptyString()][string]$ClaudeAccountPath = (Join-Path $HOME '.claude.json')
+    )
+
+    switch ($Client) {
+        'copilot' {
+            $account = Get-BridgeCopilotAccount -ConfigPath $CopilotConfigPath
+            if ($account) { return [string]$account.Login }
+            ''
+        }
+        'claude' { [string](Get-BridgeClaudeAccountId -Path $ClaudeAccountPath) }
+        default { '' }
+    }
+}
+
+function Test-BridgeUsageCovered {
+    <#
+        Whether another machine has already published a reading of this account recently
+        enough that this one need not ask the vendor again.
+
+        The allowance belongs to the account rather than to the computer, so five
+        machines signed in to one account asked three vendors the same question every
+        two minutes and the card then threw four of the five answers away (#142). What
+        counts is a reading of the same client and the same account, from a different
+        machine, no older than three of this client's own poll intervals - six minutes
+        at the busy pace, and proportionately longer at the idle one, because a machine
+        with a session open needs a current figure and one with nothing open does not.
+
+        Only the reading matters, never who published it: this decides whether to repeat
+        work, and nothing about who may publish the dashboard. Everything unknown or
+        unusable means "ask", because a gauge that silently goes flat is worse than a
+        redundant request - no state list, no account key, a reading with no timestamp,
+        or one stamped more than an interval into the future, which is a peer's clock
+        running ahead and would otherwise hold this machine off indefinitely.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Client,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Key,
+        [AllowNull()]$States,
+        [Parameter(Mandatory)][DateTimeOffset]$Now,
+        [Parameter(Mandatory)][double]$Pace
+    )
+
+    if ($null -eq $States -or [string]::IsNullOrWhiteSpace($Key)) { return $false }
+
+    $self = Get-BridgeMachineSlug
+    $covered = $Pace * $script:BridgeUsageConfig.CoveredIntervals
+    $instant = $Now.ToUniversalTime()
+    foreach ($entry in @($States)) {
+        if ($null -eq $entry -or -not $entry.PSObject.Properties['attributes']) { continue }
+        $attributes = $entry.attributes
+        if ($null -eq $attributes) { continue }
+        $names = @($attributes.PSObject.Properties.Name)
+        # A usage reading and not some other bridge sensor: client says which agent,
+        # measured_at belongs to no other published entity, and machine_slug says who
+        # read it. Matched on the attributes rather than on the entity id, because a
+        # machine whose id correction has not landed yet is still reporting correctly.
+        if ($names -notcontains 'client' -or $names -notcontains 'measured_at' -or
+            $names -notcontains 'machine_slug' -or $names -notcontains 'updated') { continue }
+        if ([string]$attributes.client -cne $Client) { continue }
+        $slug = [string]$attributes.machine_slug
+        if ([string]::IsNullOrWhiteSpace($slug) -or $slug -ceq $self) { continue }
+
+        # The card's own grouping key, so two machines agree about what one account is.
+        $published = ''
+        if ($names -contains 'account_id' -and -not [string]::IsNullOrWhiteSpace([string]$attributes.account_id)) {
+            $published = [string]$attributes.account_id
+        }
+        elseif ($names -contains 'account') { $published = [string]$attributes.account }
+        if ($published -cne $Key) { continue }
+
+        $at = ConvertTo-BridgeUsageInstant $attributes.updated
+        if ($null -eq $at) { continue }
+        $age = ($instant - $at).TotalSeconds
+        if ($age -gt $covered -or $age -lt -$Pace) { continue }
+        return $true
+    }
+    $false
 }
 
 function Test-BridgeUsageBusy {
@@ -1180,7 +1332,8 @@ function Get-BridgeUsageSignature {
 
 function Sync-DaemonUsage {
     <#
-        Publishes this machine's usage, each client at the pace its sessions set.
+        Publishes this machine's usage, each client at the pace its sessions set, and
+        only when no other machine is already reading the same account.
 
         A client is asked about every usage.intervalSeconds while a session of it is
         open on this machine and every usage.idleIntervalSeconds while none is; see
@@ -1189,15 +1342,30 @@ function Sync-DaemonUsage {
         client having one open. Each client keeps its own clock, so a Claude session
         does not make Copilot's figure be asked for.
 
+        The allowance belongs to the account, so on an installation with an explicitly
+        configured dashboard.publication the designated writer does the asking and every
+        other machine asks only when nothing fresh has been published for its account
+        (Test-BridgeUsageCovered). That decides redundant vendor calls and nothing else:
+        no writer is elected here, and a machine that ends up asking gains no authority
+        to publish anything but its own per-machine sensors. -States is the Home
+        Assistant state list the reconcile already read, and $null - or publication not
+        configured at all - leaves every machine asking for itself as before.
+
         Off by default for nobody: the figures are already on the dashboard's own
         machine, and `usage.publish: false` turns it off for anyone who would rather
         not have an allowance on a screen. The signature check keeps an unchanged
         reading off the MQTT bus between polls, which matters because every publish is
         retained; it is kept per client, so one that moved does not republish the rest.
+        The one exception is the machine actually doing the asking, which republishes an
+        unchanged reading every ReassertIntervals so that the machines standing down for
+        it can tell it apart from one that has stopped reading - an unchanged figure
+        that is never republished looks exactly like a machine that went away, and every
+        one of them would take over. Nothing is re-asserted where nobody defers.
     #>
     param(
         [Parameter(Mandatory)][hashtable]$Headers,
         [AllowNull()]$Live = $null,
+        [AllowNull()]$States = $null,
         [DateTimeOffset]$Now = [DateTimeOffset]::Now
     )
 
@@ -1207,6 +1375,9 @@ function Sync-DaemonUsage {
     # one doing something would be backwards.
     $idleInterval = [Math]::Max($interval, (Get-BridgeUsageSetting 'usage.idleIntervalSeconds' $script:BridgeUsageConfig.IdleIntervalSeconds))
     $gap = [Math]::Min($interval, $script:BridgeUsageConfig.MinimumGapSeconds)
+    # Read once for the pass rather than per client, and only ever read: see
+    # Get-BridgeUsagePollRole for why this cannot become publication authority.
+    $role = Get-BridgeUsagePollRole
 
     $clients = Get-BridgeSelectedClients
     if ($null -eq $clients) { $clients = @('copilot', 'claude', 'codex') }
@@ -1219,13 +1390,41 @@ function Sync-DaemonUsage {
         $state = Get-BridgeUsageClientState -Client $client
         $busy = Test-BridgeUsageBusy -Client $client -Live $Live
         if (-not (Test-BridgeUsageDue -State $state -Busy $busy -Known $known -Now $Now -Interval $interval -IdleInterval $idleInterval -Gap $gap)) { continue }
+        # The pace Test-BridgeUsageDue has just judged it by, which is also how current
+        # somebody else's reading has to be before this machine will stand down for it.
+        $pace = if ($busy -or [bool]$state.Retry) { $interval } else { $idleInterval }
         # Stamped before asking, so an ask that fails still waits its turn rather than
-        # being repeated on every pass until one works.
+        # being repeated on every pass until one works. Standing down counts as taking
+        # its turn too: the account key behind the decision is a file read, and on a
+        # reconcile loop rather than a poll clock it would be paid for every few seconds.
         $state.CheckedAt = $Now
         # What discovery could not see is not remembered as the state of the sessions,
         # or the pass after it would be compared against a state that never existed.
         if ($known) { $state.Busy = $busy }
         $state.Retry = $false
+
+        $covered = $false
+        if ($role -ceq 'participant') {
+            $key = ''
+            try { $key = [string](Get-BridgeUsageAccountKey -Client $client) }
+            catch {
+                if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+                # An account that cannot be identified is one that cannot be matched
+                # against anybody else's reading, so this machine reads it itself.
+                $key = ''
+            }
+            $covered = Test-BridgeUsageCovered -Client $client -Key $key -States $States -Now $Now -Pace $pace
+        }
+        # Said when it changes rather than every pass: a machine that has quietly
+        # stopped asking is the thing somebody debugging a flat gauge needs to be told.
+        if ($covered -ne [bool]$state.Covered) {
+            Write-DaemonLog -Message $(if ($covered) {
+                    "$client usage is being read for this account by another machine; not asking from here"
+                }
+                else { "$client usage is no longer being read for this account elsewhere; asking from here" })
+        }
+        $state.Covered = $covered
+        if ($covered) { continue }
         $due += $client
     }
     if ($due.Count -eq 0) { return $false }
@@ -1240,12 +1439,19 @@ function Sync-DaemonUsage {
     }
     if ($records.Count -eq 0) { return $false }
 
+    # Infinite where no machine defers to any other, so an installation without a
+    # configured publication keeps an unchanged reading off the bus exactly as before.
+    $reassert = if ($role -ceq 'none') { [double]::PositiveInfinity }
+        else { $interval * $script:BridgeUsageConfig.ReassertIntervals }
+
     $changed = @()
     $signatures = @{}
     foreach ($record in $records) {
         $client = [string]$record.client
+        $clientState = Get-BridgeUsageClientState -Client $client
         $signature = Get-BridgeUsageSignature -Record $record
-        if ($signature -ceq (Get-BridgeUsageClientState -Client $client).Signature) { continue }
+        if ($signature -ceq $clientState.Signature -and
+            ($Now - $clientState.PublishedAt).TotalSeconds -lt $reassert) { continue }
         $changed += $record
         $signatures[$client] = $signature
     }
@@ -1254,7 +1460,11 @@ function Sync-DaemonUsage {
     if ($changed.Count -gt 0) {
         try {
             Publish-CopilotMqttUsage -Records $changed -Headers $Headers
-            foreach ($client in $signatures.Keys) { (Get-BridgeUsageClientState -Client $client).Signature = $signatures[$client] }
+            foreach ($client in $signatures.Keys) {
+                $clientState = Get-BridgeUsageClientState -Client $client
+                $clientState.Signature = $signatures[$client]
+                $clientState.PublishedAt = $Now
+            }
             $published = $true
         }
         catch {

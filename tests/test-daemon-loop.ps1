@@ -142,7 +142,7 @@ Test-That 'the daemon marks itself alive last' { $script:Calls[$script:Calls.Cou
 # the quick pace for ever, and a partial one passed as complete lets a figure go stale
 # behind a session that was simply missed.
 $script:UsageCall = $null
-function Sync-DaemonUsage { param($Headers, $Live) $script:UsageCall = [pscustomobject]@{ Live = $Live } }
+function Sync-DaemonUsage { param($Headers, $Live, $States) $script:UsageCall = [pscustomobject]@{ Live = $Live; States = $States } }
 $script:DiscoveryLive = @{ 'claude-1' = [pscustomobject]@{ SessionId = 'claude-1'; Kind = 'claude' } }
 Invoke-DaemonReconcile -Headers $headers -State $state
 Test-That 'the usage step is handed the sessions discovery found' {
@@ -163,6 +163,34 @@ Test-That 'discovery that could not account for everything passes nothing, not w
 }
 $script:DiscoveryComplete = $true
 $script:DiscoveryLive = @{}
+
+# The pass's state snapshot goes to the usage step as well. It is how a machine sees
+# whether another one has already read the same account, so a pass whose snapshot
+# failed has to hand over nothing rather than an empty list: "nobody has published a
+# reading" and "I could not look" mean opposite things, and the second must leave this
+# machine reading for itself (#142).
+$script:SnapshotStates = $null
+function Set-DaemonReconcileSnapshot {
+    param($Headers)
+    $script:Calls.Add('Set-DaemonReconcileSnapshot')
+    $script:DaemonReconcileStates = $script:SnapshotStates
+}
+$script:SnapshotStates = @{
+    'sensor.agent_bridge_other_usage_copilot' = [pscustomobject]@{ entity_id = 'sensor.agent_bridge_other_usage_copilot' }
+}
+$script:UsageCall = $null
+Invoke-DaemonReconcile -Headers $headers -State $state
+Test-That 'the usage step is handed the entities this pass already read' {
+    @($script:UsageCall.States).Count -eq 1 -and
+        ([string]@($script:UsageCall.States)[0].entity_id) -ceq 'sensor.agent_bridge_other_usage_copilot'
+}
+$script:SnapshotStates = $null
+$script:UsageCall = $null
+Invoke-DaemonReconcile -Headers $headers -State $state
+Test-That 'while a pass whose snapshot failed hands over nothing, not an empty list' {
+    $null -ne $script:UsageCall -and $null -eq $script:UsageCall.States
+}
+
 function Sync-DaemonSessions { throw 'ha down' }
 $script:Calls.Clear()
 Invoke-DaemonReconcile -Headers $headers -State $state
