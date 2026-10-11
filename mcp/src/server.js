@@ -236,15 +236,19 @@ async function main() {
     structuredContent: value,
   });
 
-  // Reads use the user's token, writes the agent's - see loadConfig.
+  // Reads use the user's token, writes the agent's - see loadConfig. The exception is
+  // `publisher`: Home Assistant restricts mqtt.publish to administrators, which the
+  // agent deliberately is not, so the two paths carrying unbounded text publish on the
+  // user's client. A launch then presses Launch as the agent, which is what carries
+  // the account; a long reply presses nothing and marks itself instead.
   const sessionTools = {
     list_agent_sessions: () => listSessions(ha),
     read_agent_session: (args) =>
       readSession(ha, String(args?.session_id ?? ''), { since: String(args?.since ?? '') }),
     reply_to_agent_session: (args) =>
-      replyToSession(agentHa, String(args?.session_id ?? ''), args?.text),
+      replyToSession(agentHa, String(args?.session_id ?? ''), args?.text, { publisher: ha }),
     launch_agent_session: (args) =>
-      launchSession(agentHa, String(args?.machine ?? ''), { prompt: args?.prompt }),
+      launchSession(agentHa, String(args?.machine ?? ''), { prompt: args?.prompt, publisher: ha }),
   };
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {

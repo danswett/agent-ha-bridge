@@ -35,7 +35,7 @@ function check(name, condition, detail = '') {
   }
 }
 
-function stubHa(states = []) {
+function stubHa(states = [], { refusePublish = false } = {}) {
   const byId = new Map(states.map((s) => [s.entity_id, s]));
   return {
     calls: [],
@@ -51,6 +51,12 @@ function stubHa(states = []) {
       return null;
     },
     async publishMqtt(topic, payload, retain = true) {
+      // What a non-administrator token actually gets back from mqtt.publish.
+      if (refusePublish) {
+        const error = new Error('Home Assistant POST /api/services/mqtt/publish failed: 401');
+        error.status = 401;
+        throw error;
+      }
       this.published.push({ topic, payload, retain });
       return null;
     },
@@ -264,6 +270,111 @@ console.log('\n--- launching ---');
     missing = e.message;
   });
   check('and an unknown one says so', missing.includes('nope'));
+}
+
+console.log('\n--- publishing on the only client allowed to ---');
+{
+  // mqtt.publish is administrator-only and the agent account deliberately is not one,
+  // so both unbounded-text paths published on the agent client and came back 401 -
+  // an agent could not send a launch prompt or a long reply at all (#183). The press
+  // still has to be the agent's, because that is what Home Assistant records.
+  const agent = stubHa(states, { refusePublish: true });
+  const user = stubHa(states);
+  await launchSession(agent, 'dswett_dev_vm1', { prompt: 'do the thing', publisher: user });
+  check(
+    'a launch prompt is published on the user client',
+    user.published.find((p) => p.topic === launchPromptTopic('dswett_dev_vm1'))?.payload?.text ===
+      'do the thing',
+  );
+  check('and not on the agent one, which may not publish', agent.published.length === 0);
+  check(
+    'while Launch is still pressed as the agent, which is what carries the account',
+    agent.calls.find((c) => c.domain === 'button')?.data?.entity_id ===
+      machineEntities('dswett_dev_vm1').newSession,
+  );
+  check('so the user client presses nothing', user.calls.length === 0);
+  check(
+    'and the prompt is still retained, as the launch card does it',
+    user.published[0]?.retain === true,
+  );
+
+  const agent2 = stubHa(states, { refusePublish: true });
+  const user2 = stubHa(states);
+  const big = await replyToSession(agent2, SESSION, 'x'.repeat(400), { publisher: user2 });
+  check(
+    'a long reply is published on the user client too',
+    user2.published.find((p) => p.topic === replyPayloadTopic(SESSION))?.payload?.text.length === 400,
+  );
+  check(
+    'still marking itself as the agent, which is what MQTT cannot carry',
+    user2.published[0]?.payload?.driver === 'agent',
+    'publishing as the user must not turn the session blue',
+  );
+  check('and it is reported as attributed', big.attributed === true);
+  check('with neither client pressing anything', agent2.calls.length === 0 && user2.calls.length === 0);
+
+  // A reply that fits must not move: the press is the stronger proof of who sent it.
+  const agent3 = stubHa(states, { refusePublish: true });
+  const user3 = stubHa(states);
+  const short = await replyToSession(agent3, SESSION, 'hello there', { publisher: user3 });
+  check('a short reply still goes in the box as the agent', short.attributed === true);
+  check(
+    'through the agent client, which never has to publish for it',
+    agent3.calls.length === 2 && agent3.published.length === 0,
+  );
+  check('and the user client is untouched', user3.calls.length === 0 && user3.published.length === 0);
+}
+
+console.log('\n--- when publishing is refused anyway ---');
+{
+  // A bare 401 here reads as a bad token and sends anyone diagnosing it to the one
+  // place the fault is not: an agent token succeeds at every other call in the
+  // sequence. But which credential to name depends on which one was used.
+  let fellBack = '';
+  await launchSession(stubHa(states, { refusePublish: true }), 'dswett_dev_vm1', {
+    prompt: 'anything',
+  }).catch((e) => {
+    fellBack = e.message;
+  });
+  check('a refused publish says it is an administrator-only call', fellBack.includes('administrator'));
+  check(
+    'and with no publisher given, points at the client that should have been passed',
+    fellBack.includes('publisher'),
+    fellBack,
+  );
+  check(
+    'rather than leaving a bare 401 to be read as a bad token',
+    !/^Home Assistant POST/.test(fellBack),
+    fellBack,
+  );
+
+  // Through the MCP server a publisher is always supplied, and it is the user's. So a
+  // refusal means *that* token was rejected - expired, revoked, or not an
+  // administrator's - and naming the agent token would send an operator to a
+  // credential that was never used.
+  let supplied = '';
+  await launchSession(stubHa(states), 'dswett_dev_vm1', {
+    prompt: 'anything',
+    publisher: stubHa(states, { refusePublish: true }),
+  }).catch((e) => {
+    supplied = e.message;
+  });
+  check(
+    'but a supplied publisher that is refused names that credential',
+    supplied.includes('homeAssistant.token'),
+    supplied,
+  );
+  check(
+    'and does not send the operator to the agent token, which was never used',
+    !supplied.includes('`publisher`'),
+    supplied,
+  );
+
+  let refusedReply = '';
+  await replyToSession(stubHa(states, { refusePublish: true }), SESSION, 'x'.repeat(400)).catch((e) => {
+    refusedReply = e.message;
+  });
+  check('a refused long reply explains itself the same way', refusedReply.includes('administrator'));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
