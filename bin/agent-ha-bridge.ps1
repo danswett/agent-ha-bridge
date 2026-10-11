@@ -299,10 +299,16 @@ function Show-Status {
                 Write-Host "    updates    : checked $($check.When), $($check.Verdict)" -ForegroundColor Yellow
                 if ($allowance) { Write-Host "                 checks are $allowance" -ForegroundColor Yellow }
                 if ($check.AllowanceKnown -and -not $check.TokenSource) {
-                    Write-Host '                 set updates.token for 5,000 of this machine''s own: agent-ha-bridge configure -UpdateToken' -ForegroundColor Yellow
+                    # Plain `configure`, which offers a masked prompt: `-UpdateToken`
+                    # takes a value, so naming it here would both fail to bind without
+                    # one and invite putting a credential on a command line.
+                    Write-Host '                 set updates.token for 5,000 of this machine''s own: agent-ha-bridge configure' -ForegroundColor Yellow
                 }
             }
-            if ($check.TokenNote) { Write-Host "                 $($check.TokenNote)" -ForegroundColor Yellow }
+            if ($check.TokenNote) {
+                Write-Host "                 $($check.TokenNote)" -ForegroundColor Yellow
+                Write-Host '                 replace it with: agent-ha-bridge configure' -ForegroundColor Yellow
+            }
         }
     }
 

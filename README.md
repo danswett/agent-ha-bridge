@@ -402,7 +402,7 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `updates.repository` | Repository to check for releases (default `danswett/agent-ha-bridge`) |
 | `updates.checkForUpdates` | Set to `false` to disable the update check |
 | `updates.checkHours` | How often to check GitHub for a release (default `6`, i.e. 4×/day) |
-| `updates.token` | Optional GitHub token for release checks only, sent to `api.github.com` and never logged. Unauthenticated callers share **60 requests an hour per IP**, so a Dev Box or anything else behind shared egress can be refused without the bridge having made a request of its own. Set it with `agent-ha-bridge configure -UpdateToken`, or answer the installer's prompt; the installer offers it only when the machine has nothing to use. `AGENT_HA_BRIDGE_UPDATE_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN` in the environment are used when this setting is empty - a machine that already has one needs no configuration - and this setting wins over all three, because it is the one chosen for this machine. If a token is rejected as bad credentials, the check is retried without one rather than failing, and says which credential was refused instead of going quietly back to the shared pool - an ambient `GITHUB_TOKEN` expires when its workflow job ends, and these are public releases. A value that cannot be sent as a request header at all - a paste carrying a newline or a smart quote - is skipped with a reason rather than breaking the check. A read-only token with no scopes is enough |
+| `updates.token` | Optional GitHub token for release checks only, sent to `api.github.com` and never logged. Unauthenticated callers share **60 requests an hour per IP**, so a Dev Box or anything else behind shared egress can be refused without the bridge having made a request of its own. `agent-ha-bridge configure` offers a masked prompt for one when the machine has nothing to use, and again when a configured one has been refused; `-UpdateToken <token>` sets it in one go, at the usual command-line risk. `AGENT_HA_BRIDGE_UPDATE_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN` in the environment are used when this setting is empty - a machine that already has one needs no configuration - and this setting wins over all three, because it is the one chosen for this machine. If a token is rejected as bad credentials, the check is retried without one rather than failing, and says which credential was refused instead of going quietly back to the shared pool - an ambient `GITHUB_TOKEN` expires when its workflow job ends, and these are public releases. A value that cannot be sent as a request header at all - a paste carrying a newline or a smart quote - is skipped with a reason rather than breaking the check. A read-only token with no scopes is enough |
 | `usage.publish` | Set to `false` to stop collecting and publishing each agent's remaining allowance (default `true`). This stops the vendor calls, not just the card |
 | `usage.intervalSeconds` | How often to re-read an agent's allowance while a session of that agent is open on this machine (default `120`). Copilot's figure moves continuously while a session runs, so this is a poll rather than a cache read |
 | `usage.idleIntervalSeconds` | How often to re-read it while none is (default `900`, and never less than `usage.intervalSeconds`). An allowance belongs to the account, not the machine, so a machine with nothing open is not what is spending it. A session opening or closing asks at once — see [How current it is](#how-current-it-is) |
@@ -1442,9 +1442,12 @@ Four things keep that from becoming a failed update:
 
 A token raises the limit to 5,000 requests an hour for this machine alone. One already
 in the environment as `AGENT_HA_BRIDGE_UPDATE_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN` is
-used automatically. Otherwise the installer offers to set `updates.token`, and
-`agent-ha-bridge configure -UpdateToken` sets it later. These are public releases, so a
-token with no scopes at all is enough.
+used automatically. Otherwise `agent-ha-bridge configure` offers a masked prompt for
+one — and offers to **replace** it when the configured one has been refused, which is
+the case plain `configure` would otherwise skip, since the setting is not empty.
+`-UpdateToken <token>` sets it in one go for scripted installs, at the usual risk of
+putting a secret on a command line. These are public releases, so a token with no
+scopes at all is enough.
 
 The difference is measurable rather than theoretical: on one machine the same call
 reported **51/60 remaining unauthenticated** and **5000/5000 authenticated**. Both
@@ -1455,8 +1458,11 @@ an entity:
 ```
     updates    : checked Oct 10 19:42, refused - GitHub is rate limiting this machine
                  checks are unauthenticated, 60 requests an hour shared with everything behind this address
-                 set updates.token for 5,000 of this machine's own: agent-ha-bridge configure -UpdateToken
+                 set updates.token for 5,000 of this machine's own: agent-ha-bridge configure
 ```
+
+A record written before this version said nothing about how its check authenticated,
+so those two lines are simply absent rather than guessed at.
 
 Only the *name* of the credential is ever reported - `updates.token`, or
 `$env:GH_TOKEN`. The token itself goes into a request header and nowhere else: not a

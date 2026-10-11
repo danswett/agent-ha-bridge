@@ -3058,15 +3058,36 @@ foreach ($name in @('AGENT_HA_BRIDGE_UPDATE_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN'))
         $updateTokenSource = "`$env:$name"
     }
 }
-# Only asked when the machine has nothing to use. One already in the environment needs
-# no configuration, and a configured one is an answer already given.
-if (-not $updateTokenSource -and -not $NonInteractive -and (Test-BridgeConsoleInteractive)) {
+# A configured token GitHub has refused needs replacing, and plain `configure` would
+# skip the prompt below because the setting is not empty - leaving the secret on a
+# command line as the only way to change it. The last check already recorded the
+# refusal, so the offer is made exactly when it is wanted. Raised by Codex on #190.
+$updateTokenNote = ''
+if ($config.updates.token) {
+    $lastCheck = Get-BridgeUpdateCheckSummary -Path (Get-BridgeRuntimePath -Name 'agent-bridge-update.json' -Context $installContext)
+    if (Test-BridgeUpdateTokenRejected -Summary $lastCheck) { $updateTokenNote = [string]$lastCheck.TokenNote }
+}
+# Only asked when the machine has nothing to use, or when what it has was refused. One
+# already in the environment needs no configuration, and a working configured one is an
+# answer already given.
+if (((-not $updateTokenSource) -or $updateTokenNote) -and -not $NonInteractive -and (Test-BridgeConsoleInteractive)) {
     Write-Host ''
-    Write-Host 'Optional: give this machine its own GitHub rate limit for release checks.' -ForegroundColor Yellow
-    Write-Host '    Without one, checks share 60 requests an hour with everything else behind'
-    Write-Host '    this address, and the machine can sit unable to take a release for hours.'
-    Write-Host '    A token raises that to 5,000 an hour for this machine alone.'
-    if (Read-BridgeYesNo -Prompt '    Set one up now?' -Default $false) {
+    $askUpdateToken = $false
+    if ($updateTokenNote) {
+        Write-Host 'The GitHub token configured for release checks was refused.' -ForegroundColor Yellow
+        Write-Host "    $updateTokenNote"
+        Write-Host '    Until it is replaced, checks share 60 requests an hour with everything'
+        Write-Host '    else behind this address.'
+        $askUpdateToken = Read-BridgeYesNo -Prompt '    Replace it now?' -Default $true
+    }
+    else {
+        Write-Host 'Optional: give this machine its own GitHub rate limit for release checks.' -ForegroundColor Yellow
+        Write-Host '    Without one, checks share 60 requests an hour with everything else behind'
+        Write-Host '    this address, and the machine can sit unable to take a release for hours.'
+        Write-Host '    A token raises that to 5,000 an hour for this machine alone.'
+        $askUpdateToken = Read-BridgeYesNo -Prompt '    Set one up now?' -Default $false
+    }
+    if ($askUpdateToken) {
         Write-Host '    1. Open https://github.com/settings/personal-access-tokens'
         Write-Host '    2. Generate a fine-grained token - these are public releases, so it'
         Write-Host '       needs no account or repository permissions at all'
@@ -3075,12 +3096,14 @@ if (-not $updateTokenSource -and -not $NonInteractive -and (Test-BridgeConsoleIn
             Write-Host '    nothing pasted; release checks stay unauthenticated.' -ForegroundColor DarkGray
         }
         elseif ($enteredUpdateToken -notmatch $updateTokenShape) {
-            Write-Host '    that cannot be sent as a header, so it was not stored - paste it again later with:' -ForegroundColor Yellow
-            Write-Host '        agent-ha-bridge configure -UpdateToken' -ForegroundColor Yellow
+            Write-Host '    that cannot be sent as a header, so it was not stored - run' -ForegroundColor Yellow
+            Write-Host '        agent-ha-bridge configure' -ForegroundColor Yellow
+            Write-Host '    to be asked again.' -ForegroundColor Yellow
         }
         else {
             $config.updates.token = $enteredUpdateToken
             $updateTokenSource = 'updates.token'
+            $updateTokenNote = ''
         }
     }
 }

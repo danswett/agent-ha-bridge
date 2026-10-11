@@ -77,11 +77,12 @@ if ($status.PSObject.Properties['TokenSource']) {
     }
     else {
         Write-Host '    checks     : unauthenticated - 60 requests an hour, shared with everything behind this address' -ForegroundColor DarkGray
-        Write-Host '                 set updates.token for 5,000 of this machine''s own: agent-ha-bridge configure -UpdateToken' -ForegroundColor DarkGray
+        Write-Host '                 set updates.token for 5,000 of this machine''s own: agent-ha-bridge configure' -ForegroundColor DarkGray
     }
 }
 if ($status.PSObject.Properties['TokenNote'] -and $status.TokenNote) {
     Write-Host "    token      : $($status.TokenNote)" -ForegroundColor Yellow
+    Write-Host '                 replace it with: agent-ha-bridge configure' -ForegroundColor Yellow
 }
 
 if (-not $status.PSObject.Properties['State']) {

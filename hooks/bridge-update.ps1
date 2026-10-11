@@ -863,7 +863,17 @@ function Test-BridgeUpdateReachedInstall {
     #>
     param(
         [AllowNull()][AllowEmptyString()][string]$Attempted,
-        [AllowNull()][AllowEmptyString()][string]$Recorded
+        [AllowNull()][AllowEmptyString()][string]$Recorded,
+        # What the installation recorded *before* this attempt, where the caller knows
+        # it. Without it, `update.ps1 -Force` repairing an installation already on the
+        # target satisfies the comparison however early the child failed - a refused
+        # download or a corrupt archive would be reported as "installed, then a later
+        # step failed" when nothing was installed at all. Raised by Codex on #190.
+        #
+        # The daemon omits it legitimately: its press only ever runs when the release
+        # is newer than the recorded version, so the record naming the target is itself
+        # proof that this attempt wrote it.
+        [AllowNull()][AllowEmptyString()][string]$Before
     )
 
     $target = ([string]$Attempted).Trim() -replace '^[vV]', ''
@@ -871,7 +881,15 @@ function Test-BridgeUpdateReachedInstall {
     # Compared as written rather than through ConvertTo-BridgeVersion, which parses
     # 1.2.3-rc.1 and 1.2.3 alike: those are different releases and only one of them
     # is the one that was being installed.
-    [bool]($target -and $actual -and $target -ceq $actual)
+    if (-not $target -or -not $actual -or $target -cne $actual) { return $false }
+    if ($PSBoundParameters.ContainsKey('Before')) {
+        # Unchanged means this attempt did not write it, so it proves nothing about
+        # how far this attempt got. Under-reporting a same-version repair as a plain
+        # failure is the safe direction; claiming an install that never happened is
+        # not.
+        if ((([string]$Before).Trim() -replace '^[vV]', '') -ceq $target) { return $false }
+    }
+    $true
 }
 
 function Read-BridgeUpdateOutcome {
@@ -1255,7 +1273,8 @@ exit `$outcome.exitCode
             # "nothing was installed", and until now both came out as the same
             # undifferentiated `child exit 1` (#124). Returned rather than thrown,
             # because throwing is how the caller is told the update did not happen.
-            if (Test-BridgeUpdateReachedInstall -Attempted $status.Latest -Recorded $result.InstalledVersion) {
+            if (Test-BridgeUpdateReachedInstall -Attempted $status.Latest -Recorded $result.InstalledVersion `
+                    -Before $status.Installed) {
                 $result.State = 'Incomplete'
                 $result.Detail = "installed $($status.Latest), but a step after the install failed " +
                     "(child exit $exitCode): $($outcome.Error) - the recorded version is " +

@@ -889,6 +889,40 @@ try {
         } $rejected.TokenNote
     }
 
+    # A configured token GitHub refuses is the case plain `configure` would skip - the
+    # setting is not empty - so the installer has to be able to tell it apart from a
+    # machine that simply has none, and offer to replace it. Produced end to end here
+    # rather than by writing the note by hand, so the installer and the check that
+    # writes it cannot drift apart on the wording. Raised by Codex on #190.
+    & {
+        $rejectedConfigured = 'ghp_revokedccccccccccccccccccccccccc'
+        function Get-BridgeSetting {
+            param($Path, $Default)
+            if ($Path -eq 'updates.token') { return $rejectedConfigured }
+            $Default
+        }
+        Invoke-WithUpdateTokenEnvironment @{} {
+            Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+            $configuredRejection = Get-BridgeUpdateStatus -Force
+            Test-That 'a refused configured token is reported against the setting that holds it' {
+                $configuredRejection.Latest -eq '9.9.7' -and
+                    $configuredRejection.TokenNote -match '^updates\.token was rejected' -and
+                    $configuredRejection.TokenNote -notmatch 'ghp_'
+            } $configuredRejection.TokenNote
+            Test-That 'and the installer can tell that apart from a machine that simply has none' {
+                (Test-BridgeUpdateTokenRejected -Summary (Get-BridgeUpdateCheckSummary -Path $cachePath))
+            }
+        }
+    }
+    Invoke-WithUpdateTokenEnvironment @{} {
+        Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+        $noTokenAtAll = Get-BridgeUpdateStatus -Force
+        Test-That 'a machine with no token at all is not offered a replacement for one' {
+            $noTokenAtAll.TokenNote -eq '' -and
+                -not (Test-BridgeUpdateTokenRejected -Summary (Get-BridgeUpdateCheckSummary -Path $cachePath))
+        } "[$($noTokenAtAll.TokenNote)]"
+    }
+
     # The advice on a refused check has to be true of the machine reading it. Told to
     # set updates.token while already using one, an operator sets it again and is
     # refused again.
@@ -1103,6 +1137,24 @@ Test-That 'a non-existent TargetHome is refused, never interpolated' {
     Test-That 'while an update that never recorded the release is still a failure' {
         $neverInstalled.State -eq 'Failed' -and $neverInstalled.Detail -match 'update to 9\.9\.9 failed'
     } "$($neverInstalled.State): $($neverInstalled.Detail)"
+
+    # `update.ps1 -Force` repairs an installation that already records the target, so
+    # the record names it however early the child failed - a refused download or a
+    # corrupt archive would be reported as "installed, then a later step failed" when
+    # nothing was installed at all. Raised by Codex on #190.
+    function Get-BridgeUpdateStatus {
+        param([switch]$Force)
+        [pscustomobject]@{
+            Installed = '9.9.9'; Latest = '9.9.9'; Available = $false
+            Url = 'https://github.com/x/y/releases/tag/v9.9.9'
+            Notes = ''; Zip = 'https://api.github.com/repos/x/y/zipball/v9.9.9'
+        }
+    }
+    function Get-BridgeInstalledVersion { param([switch]$Refresh) '9.9.9' }
+    $forcedRepair = Invoke-BridgeSelfUpdate -Force
+    Test-That 'a forced repair that failed before the installer ran is not called installed' {
+        $forcedRepair.State -eq 'Failed' -and $forcedRepair.Detail -match 'update to 9\.9\.9 failed'
+    } "$($forcedRepair.State): $($forcedRepair.Detail)"
 }
 
 Test-That 'a pre-release is not mistaken for the release it is named after' {
@@ -1110,6 +1162,10 @@ Test-That 'a pre-release is not mistaken for the release it is named after' {
         -not (Test-BridgeUpdateReachedInstall -Attempted '1.2.3' -Recorded '1.2.3-rc.1') -and
         -not (Test-BridgeUpdateReachedInstall -Attempted '1.2.3' -Recorded '') -and
         -not (Test-BridgeUpdateReachedInstall -Attempted '' -Recorded '1.2.3')
+}
+Test-That 'and a record this attempt did not change proves nothing about how far it got' {
+    (Test-BridgeUpdateReachedInstall -Attempted '1.2.3' -Recorded '1.2.3' -Before '1.2.2') -and
+        -not (Test-BridgeUpdateReachedInstall -Attempted '1.2.3' -Recorded '1.2.3' -Before '1.2.3')
 }
 
 Write-Host '--- the Install button path really launches the updater ---'
