@@ -3233,6 +3233,33 @@ if (-not ($selectedClients -contains 'copilot') -and (Test-Path -LiteralPath $ag
     }
 }
 
+# Claude and Codex read one global file each, and both belong to the user, so the same
+# guidance goes in as a marked block rather than a file the bridge owns. Without this
+# a machine configured for Claude alone got no bridge guidance at all - including the
+# rule about not sweeping the shared worktree root (#181).
+foreach ($instructionClient in @(
+    @{ Client = 'claude'; Path = (Join-Path $installContext.ClaudeHome 'CLAUDE.md') },
+    @{ Client = 'codex'; Path = (Join-Path $installContext.CodexHome 'AGENTS.md') }
+)) {
+    $instructionPath = $instructionClient.Path
+    try {
+        if ($selectedClients -contains $instructionClient.Client) {
+            if (Set-BridgeManagedInstructionBlock -Path $instructionPath -InstallationId $installContext.Id `
+                    -Content (Get-BridgeAgentInstructions `
+                        -EnvVarName ([string]$config.homeAssistant.agentTokenEnvVar) -HasAgentToken:$hasAgentToken)) {
+                Write-Host "    $instructionPath"
+            }
+        }
+        elseif (Remove-BridgeManagedInstructionBlock -Path $instructionPath -InstallationId $installContext.Id) {
+            Write-Host "    $instructionPath"
+        }
+    }
+    catch {
+        # Never fail an install over someone else's instruction file.
+        Write-Warning "The $($instructionClient.Client) guidance was left unchanged: $($_.Exception.Message)"
+    }
+}
+
 # --------------------------------------------------------- configure adapters
 # Claude, Codex and the MCP server reuse the shared layer just installed, so configure
 # them by running their own installers. Each is idempotent and warns rather than fails

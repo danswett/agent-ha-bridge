@@ -606,3 +606,120 @@ function Assert-BridgeAdapterSelection {
         throw "The $Client client is not selected; automatic repair did not change its adapter."
     }
 }
+
+# --------------------------------------------- global guidance in a user's own file
+# Copilot has a drop-in directory the bridge can own outright, so its guidance is a
+# whole file the bridge writes and deletes. Claude and Codex have no equivalent: their
+# global instructions are ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md, which belong to
+# the user. Those get a marked block instead, so the bridge can update and remove its
+# own text without touching a word of theirs (#181).
+#
+# Anything ambiguous refuses rather than guesses. A half-written block or one left by a
+# different installation is someone else's state, and rewriting it blind is how the
+# incident in #148 started.
+
+$script:BridgeInstructionBlockEnd = '<!-- /agent-ha-bridge -->'
+
+function Get-BridgeInstructionBlockBounds {
+    <#
+        Where this installation's block starts and ends in $Text, as character offsets,
+        or $null when it is not there. Throws when the file carries a bridge block that
+        cannot be safely rewritten.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Text,
+        [Parameter(Mandatory)][string]$InstallationId
+    )
+
+    $owners = [regex]::Matches($Text, '(?m)^<!-- agent-ha-bridge-owner:([0-9a-f]{32}) -->[ \t]*\r?$')
+    if ($owners.Count -eq 0) {
+        if ($Text -match [regex]::Escape($script:BridgeInstructionBlockEnd)) {
+            throw 'The instruction file has a bridge block end with no start; it was left alone.'
+        }
+        return $null
+    }
+    if ($owners.Count -gt 1) {
+        throw 'The instruction file has more than one bridge block; it was left alone.'
+    }
+    $start = $owners[0]
+    if ($start.Groups[1].Value -cne $InstallationId) {
+        throw 'The instruction block belongs to another installation.'
+    }
+    $end = [regex]::Match($Text, '(?m)^' + [regex]::Escape($script:BridgeInstructionBlockEnd) + '(?=[ \t]*\r?$)')
+    if (-not $end.Success -or $end.Index -lt $start.Index) {
+        throw 'The instruction block has no end marker; it was left alone.'
+    }
+    [pscustomobject]@{ Start = $start.Index; End = $end.Index + $end.Length }
+}
+
+function Set-BridgeManagedInstructionBlock {
+    <#
+        Puts $Content in this installation's block in $Path, creating the file when it
+        is absent and appending the block when the file exists without one. Everything
+        the user wrote is preserved byte for byte, including their line endings.
+
+        Returns $true when the file changed.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$Content,
+        [Parameter(Mandatory)][string]$InstallationId
+    )
+
+    $existing = if (Test-Path -LiteralPath $Path) { [IO.File]::ReadAllText($Path) } else { '' }
+    $bounds = Get-BridgeInstructionBlockBounds -Text $existing -InstallationId $InstallationId
+    # The user's own line endings win; only a file this call creates gets the
+    # platform's. Rewriting a whole file to CRLF to insert one block would show up as
+    # an unrelated diff in whatever they keep it in.
+    $newline = if ($existing -match "`r`n") { "`r`n" } elseif ($existing) { "`n" } else { [Environment]::NewLine }
+    $block = "<!-- agent-ha-bridge-owner:$InstallationId -->" + $newline +
+        (($Content.Trim() -replace "`r`n", "`n") -replace "`n", $newline) + $newline +
+        $script:BridgeInstructionBlockEnd
+
+    if ($bounds) {
+        $wanted = $existing.Substring(0, $bounds.Start) + $block + $existing.Substring($bounds.End)
+    }
+    elseif ($existing.Trim()) {
+        $wanted = $existing.TrimEnd("`r", "`n") + $newline + $newline + $block + $newline
+    }
+    else { $wanted = $block + $newline }
+
+    if ($existing -ceq $wanted) { return $false }
+    $parent = Split-Path -Parent $Path
+    if ($parent -and -not (Test-Path -LiteralPath $parent)) {
+        New-Item -ItemType Directory -Path $parent -Force | Out-Null
+    }
+    [IO.File]::WriteAllText($Path, $wanted, [Text.UTF8Encoding]::new($false))
+    $true
+}
+
+function Remove-BridgeManagedInstructionBlock {
+    <#
+        Takes this installation's block back out of $Path, leaving the rest of the file
+        as it was. A file that held nothing but the block is removed; one with anything
+        else in it is kept.
+
+        Returns $true when the file changed.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][string]$InstallationId
+    )
+
+    if (-not (Test-Path -LiteralPath $Path)) { return $false }
+    $existing = [IO.File]::ReadAllText($Path)
+    # Another installation's block, or one too damaged to read, is not this one's to
+    # remove - and saying so beats silently leaving stale guidance behind.
+    $bounds = Get-BridgeInstructionBlockBounds -Text $existing -InstallationId $InstallationId
+    if (-not $bounds) { return $false }
+
+    $remainder = ($existing.Substring(0, $bounds.Start).TrimEnd("`r", "`n") +
+        $existing.Substring($bounds.End))
+    if (-not $remainder.Trim()) {
+        Remove-Item -LiteralPath $Path -Force
+        return $true
+    }
+    $newline = if ($existing -match "`r`n") { "`r`n" } else { "`n" }
+    [IO.File]::WriteAllText($Path, $remainder.TrimEnd("`r", "`n") + $newline, [Text.UTF8Encoding]::new($false))
+    $true
+}
