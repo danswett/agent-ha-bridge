@@ -1566,12 +1566,19 @@ function Test-BridgeServedCardContent {
     param([Parameter(Mandatory)][string]$ReplyCardUrl)
 
     $source = Join-Path (Split-Path -Parent $PSScriptRoot) 'frontend/agent-bridge-reply-card.js'
-    $info = $null
-    try { $info = Get-Item -LiteralPath $source -ErrorAction Stop } catch { }
-    # Keyed on the file as well as the URL. An update rewrites the card in place while
-    # the resource still points at the old one, and a decision cached on the URL alone
-    # would go on answering for the build that was replaced.
-    $key = if ($info) { "$ReplyCardUrl`u{0001}$($info.LastWriteTimeUtc.Ticks)`u{0001}$($info.Length)" } else { $ReplyCardUrl }
+    # Keyed on the local card's actual content, never on its size and timestamp. Those
+    # are metadata about bytes, and "looks right, hashes differently" is the whole
+    # failure this gate exists for - a copy that preserves the source's timestamp,
+    # which Copy-Item does, can put different bytes of the same length in place and
+    # leave a stale answer cached behind them. Hashing the file every time is cheap;
+    # what the cache is really saving is decoding the 220 KB inline resource on each
+    # of the fifteen or so gates a single render asks about.
+    $bytes = $null
+    try { $bytes = [IO.File]::ReadAllBytes($source) } catch { }
+    $localHash = if ($null -ne $bytes) {
+        [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
+    } else { '' }
+    $key = "$ReplyCardUrl`u{0001}$localHash"
     if ($script:BridgeServedCardTrustKey -ceq $key) { return $script:BridgeServedCardTrusted }
 
     $trusted = $true
@@ -1593,23 +1600,16 @@ function Test-BridgeServedCardContent {
             $detail = "the inline resource could not be read: $($_.Exception.Message)"
         }
     }
-    if ($trusted -and $served -and $served.hash -and $info) {
-        try {
-            $bytes = [IO.File]::ReadAllBytes($source)
-            $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes)
-            if ($text -match "CARD_VERSION\s*=\s*'([^']+)'" -and $served.version -ceq $Matches[1]) {
-                $localHash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData($bytes)).ToLowerInvariant()
-                if ($served.hash -cne $localHash) {
-                    $trusted = $false
-                    $detail = "a different build of the same version: served $($served.hash.Substring(0, 12)), local $($localHash.Substring(0, 12))"
-                }
-            }
-        }
-        catch {
-            if ($_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
-            # The local card is what the comparison is against. Not having it is not
-            # evidence of a conflict, and refusing every custom card over a read that
-            # failed would turn that into a visibly downgraded dashboard.
+    if ($trusted -and $served -and $served.hash -and $localHash) {
+        # The local card is what the comparison is against. Not having it, or not being
+        # able to read a version out of it, is not evidence of a conflict - refusing
+        # every custom card over that would turn a bad read into a downgraded dashboard.
+        $text = ''
+        try { $text = [Text.UTF8Encoding]::new($false, $true).GetString($bytes) } catch { }
+        if ($text -match "CARD_VERSION\s*=\s*'([^']+)'" -and $served.version -ceq $Matches[1] -and
+            $served.hash -cne $localHash) {
+            $trusted = $false
+            $detail = "a different build of the same version: served $($served.hash.Substring(0, 12)), local $($localHash.Substring(0, 12))"
         }
     }
 

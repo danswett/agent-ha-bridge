@@ -1868,7 +1868,7 @@ Test-That 'and a blank entry never matches a blank user' { -not (Test-BridgeAgen
 # now asks it whether the served bytes are this build at all, so what it decides is
 # part of what the renderer emits even though its own text sits in another function.
 $script:ExpectedRenderVersion = '1.10.0'
-$script:ExpectedRenderHash = 'b231f2b20c72921ec0cfbc746bb3f7366c5fb20d31e41234f511e8596001529a'
+$script:ExpectedRenderHash = '02510878cd04c3cf7831a663d1e7697218de5d945d5a467fb1b7a2d28bc13e2a'
 $artifact = Get-BridgeRenderArtifact
 
 Test-That 'the renderer is still the one this version was pinned to' {
