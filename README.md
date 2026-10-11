@@ -1417,10 +1417,21 @@ Get-BridgePublicationTarget | ForEach-Object { $_.card }
 Equal `version` with different `hash` is the conflict. A frequent and avoidable
 cause is line endings: the card is published byte for byte, so a checkout that
 rewrites it to CRLF produces a different hash from the same source at the same
-version, and no bump ever reconciles the two. `.gitattributes` pins that file to
-LF; a working copy made before it did needs refreshing once
-(`git rm --cached frontend/agent-bridge-reply-card.js` then `git checkout -- .`,
-or a fresh clone) before installing from it.
+version, and no bump ever reconciles the two. `.gitattributes` pins that file to LF,
+but adding an attribute does not rewrite a file already sitting in the working tree.
+A checkout made before that pin needs refreshing once, by deleting the file and
+letting git write it back under the current attributes:
+
+```powershell
+Remove-Item frontend/agent-bridge-reply-card.js
+git checkout -- frontend/agent-bridge-reply-card.js
+git ls-files --eol frontend/agent-bridge-reply-card.js   # expect i/lf w/lf
+```
+
+The index entry is left alone, which is what makes this work: `git checkout --`
+restores the path from the index, so removing it from the index first would leave
+nothing to restore and the original CRLF file untracked beside it. A fresh clone
+does the same job.
 
 The composed renderer that includes End-session confirmation uses publication version
 `1.1.0`. The earlier frozen `1.0.0` candidate is a different render artifact, even
