@@ -794,6 +794,92 @@ try {
     Test-That 'and says the reclaimer refusals protect work rather than obstruct it' {
         $script:InstrText -match '--force' -and $script:InstrText -match 'not yours'
     }
+
+    # Claude and Codex have no drop-in directory the bridge can own, so the same
+    # guidance goes into ~/.claude/CLAUDE.md and ~/.codex/AGENTS.md as a marked block.
+    # Those files are the user's, so every case below is really one question: did
+    # anything they wrote change? (#181)
+    Write-Host '--- global guidance as a block in a file the user owns ---'
+    $script:OwnerId = 'a' * 32
+    $script:OtherId = 'b' * 32
+    $script:BlockFile = Join-Path $script:InstrRoot 'claude\CLAUDE.md'
+
+    Test-That 'it creates the file when the client has none, holding just the block' {
+        $wrote = Set-BridgeManagedInstructionBlock -Path $script:BlockFile -Content 'GUIDANCE ONE' -InstallationId $script:OwnerId
+        $text = [IO.File]::ReadAllText($script:BlockFile)
+        $wrote -and $text -match "^<!-- agent-ha-bridge-owner:$($script:OwnerId) -->" -and
+            $text -match 'GUIDANCE ONE' -and $text -match '<!-- /agent-ha-bridge -->'
+    }
+    Test-That 'and writing the same block again changes nothing' {
+        (Set-BridgeManagedInstructionBlock -Path $script:BlockFile -Content 'GUIDANCE ONE' -InstallationId $script:OwnerId) -eq $false
+    }
+
+    $script:UserText = "# My notes`n`nAlways use tabs.`n"
+    Test-That 'it appends to a file the user already had, keeping every word of it' {
+        [IO.File]::WriteAllText($script:BlockFile, $script:UserText)
+        [void](Set-BridgeManagedInstructionBlock -Path $script:BlockFile -Content 'GUIDANCE ONE' -InstallationId $script:OwnerId)
+        $text = [IO.File]::ReadAllText($script:BlockFile)
+        $text.StartsWith('# My notes') -and $text -match 'Always use tabs\.' -and $text -match 'GUIDANCE ONE'
+    }
+    Test-That 'and an update rewrites the block without disturbing their text' {
+        [void](Set-BridgeManagedInstructionBlock -Path $script:BlockFile -Content 'GUIDANCE TWO' -InstallationId $script:OwnerId)
+        $text = [IO.File]::ReadAllText($script:BlockFile)
+        $text -match 'GUIDANCE TWO' -and $text -notmatch 'GUIDANCE ONE' -and
+            $text -match 'Always use tabs\.' -and
+            ([regex]::Matches($text, '<!-- /agent-ha-bridge -->')).Count -eq 1
+    }
+    Test-That 'and removing it gives the file back exactly as the user wrote it' {
+        $removed = Remove-BridgeManagedInstructionBlock -Path $script:BlockFile -InstallationId $script:OwnerId
+        $removed -and ([IO.File]::ReadAllText($script:BlockFile) -ceq $script:UserText)
+    }
+    Test-That 'and a file that held nothing but the block is taken away with it' {
+        Remove-Item -LiteralPath $script:BlockFile -Force -ErrorAction SilentlyContinue
+        [void](Set-BridgeManagedInstructionBlock -Path $script:BlockFile -Content 'GUIDANCE ONE' -InstallationId $script:OwnerId)
+        (Remove-BridgeManagedInstructionBlock -Path $script:BlockFile -InstallationId $script:OwnerId) -and
+            -not (Test-Path -LiteralPath $script:BlockFile)
+    }
+    Test-That 'removing from a file that never had one is not a change' {
+        [IO.File]::WriteAllText($script:BlockFile, $script:UserText)
+        (Remove-BridgeManagedInstructionBlock -Path $script:BlockFile -InstallationId $script:OwnerId) -eq $false -and
+            ([IO.File]::ReadAllText($script:BlockFile) -ceq $script:UserText)
+    }
+    # Anything ambiguous refuses rather than guesses: rewriting state that is not this
+    # installation's is how #148 started.
+    Test-That 'another installation block is refused rather than rewritten' {
+        [void](Set-BridgeManagedInstructionBlock -Path $script:BlockFile -Content 'THEIRS' -InstallationId $script:OtherId)
+        $before = [IO.File]::ReadAllText($script:BlockFile)
+        $threw = $false
+        try { [void](Set-BridgeManagedInstructionBlock -Path $script:BlockFile -Content 'MINE' -InstallationId $script:OwnerId) }
+        catch { $threw = $_.Exception.Message -match 'another installation' }
+        $threw -and ([IO.File]::ReadAllText($script:BlockFile) -ceq $before)
+    }
+    Test-That 'and neither is it removed on their behalf' {
+        $before = [IO.File]::ReadAllText($script:BlockFile)
+        $threw = $false
+        try { [void](Remove-BridgeManagedInstructionBlock -Path $script:BlockFile -InstallationId $script:OwnerId) }
+        catch { $threw = $_.Exception.Message -match 'another installation' }
+        $threw -and ([IO.File]::ReadAllText($script:BlockFile) -ceq $before)
+    }
+    Test-That 'a block with no end marker is left alone rather than guessed at' {
+        [IO.File]::WriteAllText($script:BlockFile, "<!-- agent-ha-bridge-owner:$($script:OwnerId) -->`nhalf written`n")
+        $threw = $false
+        try { [void](Set-BridgeManagedInstructionBlock -Path $script:BlockFile -Content 'MINE' -InstallationId $script:OwnerId) }
+        catch { $threw = $_.Exception.Message -match 'no end marker' }
+        $threw -and ([IO.File]::ReadAllText($script:BlockFile) -match 'half written')
+    }
+    Test-That 'and so is an end marker with nothing opening it' {
+        [IO.File]::WriteAllText($script:BlockFile, "notes`n<!-- /agent-ha-bridge -->`n")
+        $threw = $false
+        try { [void](Set-BridgeManagedInstructionBlock -Path $script:BlockFile -Content 'MINE' -InstallationId $script:OwnerId) }
+        catch { $threw = $_.Exception.Message -match 'no start' }
+        $threw -and ([IO.File]::ReadAllText($script:BlockFile) -match 'notes')
+    }
+    Test-That 'a file written with LF keeps LF rather than being switched to CRLF' {
+        [IO.File]::WriteAllText($script:BlockFile, "# Notes`n`nkeep lf`n")
+        [void](Set-BridgeManagedInstructionBlock -Path $script:BlockFile -Content "one`ntwo" -InstallationId $script:OwnerId)
+        $text = [IO.File]::ReadAllText($script:BlockFile)
+        $text -match 'one' -and $text -notmatch "`r`n"
+    }
 }
 finally {
     Remove-Item -LiteralPath $script:InstrRoot -Recurse -Force -ErrorAction SilentlyContinue
