@@ -56,6 +56,8 @@ $script:DaemonProbeFieldEntity = $script:DaemonFieldEntities[-1]
 $script:DaemonOnlineEntity = Get-BridgeMachineEntityId -Domain 'binary_sensor' -Key 'online' -Slug $script:DaemonMachineSlug
 $script:DaemonOnlineReported = 'advancing'
 $script:DaemonOnlineReadStatus = 200
+# Every read of it, so a test can tell one look from the poll that waits for discovery.
+$script:DaemonOnlineReads = 0
 function Invoke-RestMethod {
     param([string]$Method, [string]$Uri, [hashtable]$Headers, [object]$Body, [string]$ContentType, [int]$TimeoutSec)
 
@@ -98,6 +100,7 @@ function Invoke-RestMethod {
         $Uri -ceq "http://publication.invalid:8123/api/states/$($script:DaemonOnlineEntity)" -and
         -not $PSBoundParameters.ContainsKey('Body') -and -not $PSBoundParameters.ContainsKey('ContentType')) {
         $request.Unexpected = $false
+        $script:DaemonOnlineReads++
         if ($script:DaemonOnlineReadStatus -ne 200) {
             $response = [Net.Http.HttpResponseMessage]::new([Net.HttpStatusCode]$script:DaemonOnlineReadStatus)
             throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('Synthetic online sensor read', $response)
@@ -808,7 +811,6 @@ Test-That 'and a beat follows it, so the sensor is not left unavailable for a wh
 Test-That 'with the operator told which entity it was and how long it had been silent' {
     @($script:Log | Where-Object { $_ -clike "$($script:DaemonOnlineEntity) has taken no beat for *s; rebuilding it" }).Count -eq 1
 } (($script:Log | Select-Object -Last 3) -join ' | ')
-
 $script:ReportingMessages.Clear()
 Invoke-TestOnlineBeat
 Invoke-TestOnlineBeat
@@ -829,10 +831,16 @@ $script:ReportingMessages.Clear()
 $script:Log = @()
 $script:DaemonOnlineSeen = @{ Reported = ''; At = [DateTimeOffset]::MinValue }
 $script:DaemonOnlineReadStatus = 404
+$script:DaemonOnlineReads = 0
 1..4 | ForEach-Object { Invoke-TestOnlineBeat }
 Test-That 'while a sensor Home Assistant says is not there is declared again, which is the same repair' {
     (Get-TestOnlineRetractionCount) -eq 1
 } (($script:Log | Select-Object -Last 3) -join ' | ')
+Test-That 'and the replacement beat waits for discovery rather than outrunning it, since an unretained beat is dropped' {
+    # Four passes read it once each; the rest are the poll waiting for it to come back.
+    $script:DaemonOnlineReads -gt 5 -and (Get-TestOnlineBeatCount) -eq 4 -and
+        @($script:Log | Where-Object { $_ -clike "$($script:DaemonOnlineEntity) did not come back after the rebuild*" }).Count -eq 1
+} "reads=$($script:DaemonOnlineReads) beats=$(Get-TestOnlineBeatCount) | $(($script:Log | Select-Object -Last 2) -join ' | ')"
 $script:DaemonOnlineReadStatus = 200
 $script:DaemonOnlineReported = 'advancing'
 $script:DaemonOnlineSeen = @{ Reported = ''; At = [DateTimeOffset]::MinValue }

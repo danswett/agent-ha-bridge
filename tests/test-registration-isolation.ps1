@@ -294,6 +294,18 @@ function Invoke-RestMethod {
             if ($id -ceq 'input_text.agent_bridge_pairing') {
                 return [pscustomobject]@{ entity_id = $id; state = ''; attributes = [pscustomobject]@{} }
             }
+            # And the liveness sensor, which every beat reads back to find out whether
+            # Home Assistant actually took it: a publish succeeds for a topic nothing is
+            # listening to, so the beat itself proves nothing (#177). Answered here for
+            # the same reason as the pairing helper - its id begins agent_bridge_, so
+            # seeding it would change what the state-list reads count. A last_reported
+            # that moves is a sensor taking its beats, so nothing is rebuilt.
+            if ($id -ceq (Get-BridgeMachineEntityId -Domain 'binary_sensor' -Key 'online' -Slug $script:DaemonMachineSlug)) {
+                return [pscustomobject]@{
+                    entity_id = $id; state = 'on'; attributes = [pscustomobject]@{}
+                    last_reported = [DateTimeOffset]::Now.ToString('o')
+                }
+            }
             if (-not $script:A14States.ContainsKey($id)) { Stop-A14Boundary 'unlisted state read' -Shape $shape }
             return $script:A14States[$id]
         }

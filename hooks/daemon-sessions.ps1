@@ -1446,6 +1446,48 @@ function Get-DaemonStateReportedAt {
     ''
 }
 
+function Wait-DaemonEntityRegistered {
+    <#
+        Waits, briefly, for Home Assistant to have an entity again after its discovery
+        config was republished, and says whether it got there.
+
+        Discovery is asynchronous: the retained config goes to the broker, Home
+        Assistant consumes it, and only then does the entity exist. The liveness beat is
+        deliberately unretained, so one that arrives before that is dropped outright -
+        which is exactly why Initialize-DaemonStartup declares the sensor well ahead of
+        the first beat. A rebuild that published its replacement beat immediately would
+        repeat that race and leave the repaired sensor unavailable for a further minute.
+
+        Read straight from Home Assistant: this is waiting for a change the reconcile
+        snapshot was taken before, so answering from the snapshot would say "present"
+        of the entity that has just been retracted.
+
+        Bounded. Waiting longer costs the reconcile more than a missed beat costs the
+        dashboard, and the caller has a cadence of its own to fall back on.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$EntityId,
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [ValidateRange(1, 40)][int]$Attempts = 12,
+        [ValidateRange(25, 2000)][int]$DelayMs = 250
+    )
+
+    foreach ($attempt in 1..$Attempts) {
+        try {
+            if ($null -ne (Get-HomeAssistantState -EntityId $EntityId -Headers $Headers)) { return $true }
+        }
+        catch {
+            if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+            # A 404 is discovery not having got there yet, which is the whole point of
+            # waiting. Anything else is a Home Assistant that cannot answer, and
+            # another two seconds of asking will not change that.
+            if ((Get-BridgeHttpStatusCode -ErrorRecord $_) -ne 404) { return $false }
+        }
+        if ($attempt -lt $Attempts) { Start-Sleep -Milliseconds $DelayMs }
+    }
+    $false
+}
+
 function Confirm-DaemonOnlineHeartbeat {
     <#
         Checks that the beat just published actually reached the sensor, and rebuilds
@@ -1502,10 +1544,16 @@ function Confirm-DaemonOnlineHeartbeat {
         Publish-CopilotMqttMachineOnlineConfig -Headers $Headers `
             -ExpireAfter $script:DaemonConfig.OnlineExpireSeconds -Rebuild
         [void](Set-CopilotMqttOnlineEntityId)
-        # The config has just been retracted and republished, so the beat that was lost
-        # has something to land on again; the next one is a minute away and until it
-        # arrives the sensor reads unavailable.
-        Publish-CopilotMqttMachineHeartbeat -Slug $script:DaemonMachineSlug -Headers $Headers
+        # Only once the sensor is actually back. The beat is unretained, so one sent
+        # while discovery is still catching up is dropped and the repaired sensor reads
+        # unavailable for another whole interval - the same race the startup path
+        # avoids by declaring the sensor well before its first beat.
+        if (Wait-DaemonEntityRegistered -EntityId $entityId -Headers $Headers) {
+            Publish-CopilotMqttMachineHeartbeat -Slug $script:DaemonMachineSlug -Headers $Headers
+        }
+        else {
+            Write-DaemonLog -Message "$entityId did not come back after the rebuild; trying again next beat"
+        }
     }
     catch {
         Write-DaemonLog -Message "online sensor rebuild failed: $($_.Exception.Message)"
