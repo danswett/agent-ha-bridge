@@ -986,7 +986,12 @@ Write-Host '--- re-arming a card from its marker, when the card is idle ---'
 # which is more generous than Home Assistant is.
 $script:Rearmed = $false
 $script:RearmLog = @()
-function Set-CopilotMqttDecision { param($SessionId, $SessionName, $Machine, $Question, $Choices, $Fields, $DecisionId, $Headers) $script:Rearmed = $true; 'shown' }
+$script:RearmRebuilds = @()
+function Set-CopilotMqttDecision {
+    param($SessionId, $SessionName, $Machine, $Question, $Choices, $Fields, $DecisionId, $Headers,
+        [switch]$PublishWithoutBaseline, [switch]$AnswerOnTap, [switch]$Rebuild)
+    $script:Rearmed = $true; $script:RearmRebuilds += [bool]$Rebuild; 'shown'
+}
 function Write-DaemonLog { param([string]$Message) $script:RearmLog += $Message }
 $rearmState = @{ $sid = [pscustomobject]@{ Name = 'Copilot: x'; Machine = 'M' } }
 $rearmMarker = [pscustomobject]@{ question = 'Which branch?'; choices = @('a', 'b'); fields = @(); decisionId = 'd9' }
@@ -1010,6 +1015,73 @@ Confirm-DaemonDecisionArmed -SessionId $sid -Marker $rearmMarker -State $rearmSt
 Test-That 'a card that truly cannot be read is still reported rather than armed blindly' {
     -not $script:Rearmed -and @($script:RearmLog | Where-Object { $_ -like 'marker re-arm check failed*' }).Count -eq 1
 }
+
+Write-Host ''
+Write-Host '--- a question published at a selector that is not listening ---'
+# On 2026-10-10 a question raised 40 minutes after a Home Assistant restart never
+# reached the dashboard: the selector was still there, reading Idle with a last_changed
+# of the restart, and took neither the discovery config nor the state published to it
+# while every publish went on returning 200. Re-arming it cannot help - Home Assistant
+# ignores a discovery update whose payload matches the one it already holds - so the
+# daemon re-armed the same dead selector for three hours and the session stayed blocked
+# on an answer with nowhere to appear. (#178)
+$script:DaemonDecisionUnarmedSince = @{}
+$script:Rearmed = $false
+$script:RearmLog = @()
+$script:RearmRebuilds = @()
+$script:Ha = @{ "select.${node}_decision" = [pscustomobject]@{ state = 'Idle'; attributes = [pscustomobject]@{ options = @('Idle') } } }
+function Invoke-TestUnarmedPass {
+    <#
+        One reconcile's worth of re-arming, with the clock wound back so a question
+        that goes on not appearing reaches the window without the test waiting for it.
+    #>
+    param([string]$DecisionId = 'd9', [int]$ApartSeconds = 60)
+    if ($script:DaemonDecisionUnarmedSince.ContainsKey($DecisionId)) {
+        $script:DaemonDecisionUnarmedSince[$DecisionId] =
+            $script:DaemonDecisionUnarmedSince[$DecisionId].AddSeconds(-$ApartSeconds)
+    }
+    Confirm-DaemonDecisionArmed -SessionId $sid -Marker $rearmMarker -State $rearmState -Headers $headers
+}
+
+1..3 | ForEach-Object { Invoke-TestUnarmedPass }
+Test-That 'a question that has not appeared yet is published again, as it always was' {
+    $script:RearmRebuilds.Count -eq 3 -and @($script:RearmRebuilds | Where-Object { $_ }).Count -eq 0
+} ($script:RearmRebuilds -join ',')
+
+Invoke-TestUnarmedPass
+Test-That 'one still missing after the detached-entity window has the selector rebuilt under it' {
+    $script:RearmRebuilds.Count -eq 4 -and $script:RearmRebuilds[3]
+} ($script:RearmRebuilds -join ',')
+Test-That 'and that is reported as a rebuild, not as another ordinary re-arm' {
+    @($script:RearmLog | Where-Object { $_ -like 'rebuilt the decision selector for 11111111*' }).Count -eq 1 -and
+        @($script:RearmLog | Where-Object { $_ -like 'armed card from marker*' }).Count -eq 3
+} (($script:RearmLog | Select-Object -Last 2) -join ' | ')
+
+Invoke-TestUnarmedPass
+Test-That 'a rebuild is not repeated on the very next pass, which would reset the card every 18 seconds' {
+    $script:RearmRebuilds.Count -eq 5 -and -not $script:RearmRebuilds[4]
+} ($script:RearmRebuilds -join ',')
+
+$script:RearmRebuilds = @()
+$script:Ha = @{ "select.${node}_decision" = [pscustomobject]@{ state = 'Awaiting answer...'; attributes = [pscustomobject]@{ question = 'Which branch?' } } }
+Confirm-DaemonDecisionArmed -SessionId $sid -Marker $rearmMarker -State $rearmState -Headers $headers
+$clockCleared = -not $script:DaemonDecisionUnarmedSince.ContainsKey('d9')
+$script:Ha = @{ "select.${node}_decision" = [pscustomobject]@{ state = 'Idle'; attributes = [pscustomobject]@{ options = @('Idle') } } }
+1..2 | ForEach-Object { Invoke-TestUnarmedPass }
+Test-That 'a question that does appear clears the clock, so the next one is not rebuilt on sight' {
+    $clockCleared -and $script:RearmRebuilds.Count -eq 2 -and
+        @($script:RearmRebuilds | Where-Object { $_ }).Count -eq 0
+} ($script:RearmRebuilds -join ',')
+
+$script:RearmRebuilds = @()
+$script:RearmLog = @()
+$script:DaemonDecisionUnarmedSince = @{}
+$idlessMarker = [pscustomobject]@{ question = 'Which branch?'; choices = @('a', 'b'); fields = @() }
+1..6 | ForEach-Object { Confirm-DaemonDecisionArmed -SessionId $sid -Marker $idlessMarker -State $rearmState -Headers $headers }
+Test-That 'a question with no id is re-armed the way it always was and never escalated' {
+    $script:RearmRebuilds.Count -eq 6 -and @($script:RearmRebuilds | Where-Object { $_ }).Count -eq 0 -and
+        $script:DaemonDecisionUnarmedSince.Count -eq 0
+} ($script:RearmRebuilds -join ',')
 
 Remove-Item -LiteralPath $script:DaemonConfig.LogFile -Force -ErrorAction SilentlyContinue
 Write-Host ''

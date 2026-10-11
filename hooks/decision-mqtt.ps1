@@ -34,6 +34,12 @@ $script:CopilotMqttConfig = @{
     ReplyMaxChars = 255
 }
 
+# How long to leave between retracting a retained discovery config and publishing it
+# again. The two messages ride the same topic, and sent back to back the broker can
+# deliver them together - which collapses the pair back into the "nothing changed"
+# case the retraction exists to escape.
+$script:CopilotMqttDiscoveryResetMs = 1500
+
 # The resume selector's "start fresh" option. Shared because the daemon compares the
 # selector's state against it and the dashboard shows it as the default.
 $script:CopilotMqttNewSessionOption = 'New session'
@@ -234,6 +240,46 @@ function Publish-CopilotMqttMessage {
         retain = [bool]$Retain
         qos = 1
     }
+}
+
+function Reset-CopilotMqttDiscoveryConfig {
+    <#
+        Retracts a retained discovery config so Home Assistant drops the entity, in
+        order that the config published next builds it again from nothing.
+
+        Republishing a config does not repair an entity that has come adrift, because
+        Home Assistant ignores a discovery update whose payload matches the one it
+        already holds. A daemon that republishes exactly what it published before
+        therefore changes nothing at all - which is why restarting the daemon did not
+        bring the liveness sensor back in #177.
+
+        Measured against a live instance on 2026-10-10. A Home Assistant restart at
+        10:37:33 left the machine's online sensor answering `on` with a last_reported
+        of the restart itself, and it was still saying so nearly nine hours later. Read
+        back over mqtt/subscribe, the broker had every beat since on exactly the topic
+        named in the retained discovery config, that config was intact and correct, and
+        `mqtt.publish` answered 200 for each beat; Home Assistant had simply stopped
+        listening. Publishing the same config again did nothing. Retracting it and
+        publishing it again brought the entity back, and the very next beat landed.
+
+        Expensive and destructive compared with an ordinary publish - the entity really
+        does disappear in between, and an optimistic one loses whatever it was holding -
+        so this is for an entity already shown not to be listening, never a routine
+        refresh.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Topic,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $topics = @($Topic | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+    if ($topics.Count -eq 0) { return }
+    foreach ($entry in $topics) {
+        Publish-CopilotMqttMessage -Topic $entry -Payload '' -Headers $Headers -Retain
+    }
+    # Once for the batch, not once per topic: the gap is there to keep the retraction
+    # and the republish apart, and they are all retracted before any is republished.
+    Start-Sleep -Milliseconds $script:CopilotMqttDiscoveryResetMs
 }
 
 function New-CopilotMqttDeviceBlock {
@@ -1318,6 +1364,19 @@ function Get-CopilotMqttUsageTopics {
     $topics
 }
 
+function Get-CopilotMqttMachineOnlineTopic {
+    <#
+        The liveness sensor's discovery topic.
+
+        Derived in one place because it is named twice now: by the publisher, and by
+        the repair that retracts it. Two literals would be one rename away from a
+        repair that clears a topic nothing is published to.
+    #>
+    param([string]$Slug)
+    if (-not $Slug) { $Slug = Get-BridgeMachineSlug }
+    "$($script:CopilotMqttConfig.DiscoveryPrefix)/binary_sensor/$(Get-CopilotMqttMachineNode -Slug $Slug)/online/config"
+}
+
 function Publish-CopilotMqttMachineOnlineConfig {
     <#
         Declares this machine's liveness sensor.
@@ -1335,13 +1394,18 @@ function Publish-CopilotMqttMachineOnlineConfig {
         [string]$Slug,
         [string]$MachineName,
         [int]$ExpireAfter = 180,
-        [Parameter(Mandatory)][hashtable]$Headers
+        [Parameter(Mandatory)][hashtable]$Headers,
+
+        # Retract the retained config first, so Home Assistant builds the sensor again
+        # rather than recognising the payload and leaving it as it is. For a sensor
+        # that has stopped taking its beats; see Reset-CopilotMqttDiscoveryConfig for
+        # why an ordinary republish cannot heal one.
+        [switch]$Rebuild
     )
 
     if (-not $Slug) { $Slug = Get-BridgeMachineSlug }
     if (-not $MachineName) { $MachineName = [Environment]::MachineName }
 
-    $node = Get-CopilotMqttMachineNode -Slug $Slug
     $config = @{
         name = 'Online'
         unique_id = "agent_bridge_${Slug}_online"
@@ -1353,8 +1417,9 @@ function Publish-CopilotMqttMachineOnlineConfig {
         expire_after = $ExpireAfter
         device = Get-CopilotMqttMachineDevice -Slug $Slug -MachineName $MachineName
     }
-    Publish-CopilotMqttMessage `
-        -Topic "$($script:CopilotMqttConfig.DiscoveryPrefix)/binary_sensor/$node/online/config" `
+    $topic = Get-CopilotMqttMachineOnlineTopic -Slug $Slug
+    if ($Rebuild) { Reset-CopilotMqttDiscoveryConfig -Topic $topic -Headers $Headers }
+    Publish-CopilotMqttMessage -Topic $topic `
         -Payload ($config | ConvertTo-Json -Depth 6 -Compress) -Headers $Headers -Retain
 }
 
@@ -1519,7 +1584,7 @@ function Get-CopilotMqttMachineTopic {
         "$prefix/button/$node/new_session/config"
         "$prefix/sensor/$node/new_session_result/config"
         "$prefix/sensor/$node/sessions/config"
-        "$prefix/binary_sensor/$node/online/config"
+        Get-CopilotMqttMachineOnlineTopic -Slug $Slug
         "$root/update/state"
         # Added with the stage attributes (#129). Retained like the rest, so a machine
         # recreated under the same slug would otherwise come back briefly wearing the
@@ -2102,7 +2167,15 @@ function Set-CopilotMqttDecision {
         # from -PublishWithoutBaseline, which happens to be set by the same caller
         # today: one is about what the daemon can verify, the other about what the
         # card draws, and a later question could want either on its own.
-        [switch]$AnswerOnTap
+        [switch]$AnswerOnTap,
+
+        # Retract the selector's retained config before republishing it, so Home
+        # Assistant builds the entity again instead of recognising a payload it
+        # already holds. For a selector that has stopped taking what is published to
+        # it - the state that stranded a session for three hours in #178 - never a
+        # routine re-arm: the selector really does disappear in between, and it is
+        # optimistic, so it comes back holding nothing.
+        [switch]$Rebuild
     )
 
     [void](Get-DecisionSchemaFieldChoices -Field ([pscustomobject]@{ enum = @($Choices) }))
@@ -2179,6 +2252,10 @@ function Set-CopilotMqttDecision {
     }
 
     $topic = "$($script:CopilotMqttConfig.DiscoveryPrefix)/select/$node/decision/config"
+    # After the baseline check, never before it. A question with no snapshot returns
+    # above without publishing anything, and retracting the config first would leave
+    # the selector deleted with nothing to put it back.
+    if ($Rebuild) { Reset-CopilotMqttDiscoveryConfig -Topic $topic -Headers $Headers }
     Publish-CopilotMqttMessage -Topic $topic `
         -Payload ($decision | ConvertTo-Json -Depth 8 -Compress) -Headers $Headers -Retain
 

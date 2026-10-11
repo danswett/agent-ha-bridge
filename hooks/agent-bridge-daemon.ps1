@@ -121,6 +121,17 @@ $script:DaemonConfig = @{
     # running machine flicker out of the launch picker.
     OnlineHeartbeatSeconds = 60
     OnlineExpireSeconds = 180
+    # How long an entity has to go on ignoring everything published to it before the
+    # daemon stops believing Home Assistant is listening and rebuilds it. The same
+    # three beats expire_after allows, so a sensor is never rebuilt over a stall the
+    # broker was always going to catch up with - and a rebuild is destructive, so the
+    # bar is "demonstrably not listening", not "quiet for a moment".
+    DetachedEntitySeconds = 180
+    # And how many beats have to go unanswered in that time. Elapsed time alone is not
+    # enough: a daemon resuming from hours asleep has a clock saying the window passed
+    # long ago and exactly one read since, taken before its first beat could finish its
+    # trip through the broker - which rebuilt a perfectly healthy sensor.
+    DetachedEntityBeats = 3
     # MCP-client presence changes slowly and only affects rendering (the MCP server
     # owns its own decision entities), so its full /api/states discovery scan is cached
     # for this long rather than repeated on every reconcile.
@@ -247,6 +258,13 @@ $script:DaemonStateLastWritten = $null
 $script:DaemonGlobalSignature = $null
 $script:DaemonGlobalLastPublish = [DateTimeOffset]::MinValue
 $script:DaemonOnlineLastPublish = [DateTimeOffset]::MinValue
+# What the online sensor last said about when it took a beat, when the daemon first
+# saw it say that, and how many beats have gone unanswered since. A beat that Home
+# Assistant accepts and never applies is invisible from the publishing end, so liveness
+# is confirmed by watching this move rather than by the publish returning. MinValue for
+# At means nothing has been observed yet, which is distinct from having observed an
+# entity that is not there.
+$script:DaemonOnlineSeen = @{ Reported = ''; At = [DateTimeOffset]::MinValue; Unanswered = 0 }
 
 # Short-lived cache of the MCP-client discovery scan (a full /api/states read) and
 # a consecutive-failure counter for the WebSocket watch backoff. Initialised for
@@ -301,6 +319,12 @@ $script:DaemonTransferServed = ''
 # Decisions already reported as terminal-only, so the daemon says it once per
 # question instead of on every reconcile. Initialised for StrictMode.
 $script:DaemonTerminalOnlyWarned = @{}
+
+# When each question was first seen published at a selector that is not showing it,
+# keyed by decision id. Re-arming cannot heal a selector Home Assistant has stopped
+# listening to, so a question that goes on not appearing is eventually answered with a
+# rebuild rather than another identical publish. Initialised for StrictMode.
+$script:DaemonDecisionUnarmedSince = @{}
 
 # Launcher process per session the bridge started itself, so End can close the
 # console it opened. A window the user opened is deliberately never touched - that

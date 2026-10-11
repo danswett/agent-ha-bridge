@@ -1399,17 +1399,185 @@ function Publish-DaemonOnlineHeartbeat {
         says it is actually running, so it has to keep arriving. The sensor itself is
         declared at startup, well before this, because an unretained beat that outruns
         its own discovery config is simply dropped.
+
+        Publishing it is only half the job - a beat that Home Assistant accepts and
+        never applies is indistinguishable from one that worked - so every beat is
+        followed by asking the sensor whether it took it.
     #>
     param([Parameter(Mandatory)][hashtable]$Headers)
 
-    if (([DateTimeOffset]::Now - $script:DaemonOnlineLastPublish).TotalSeconds -ge $script:DaemonConfig.OnlineHeartbeatSeconds) {
+    if (([DateTimeOffset]::Now - $script:DaemonOnlineLastPublish).TotalSeconds -lt $script:DaemonConfig.OnlineHeartbeatSeconds) {
+        return
+    }
+    try {
+        Publish-CopilotMqttMachineHeartbeat -Slug $script:DaemonMachineSlug -Headers $Headers
+        $script:DaemonOnlineLastPublish = [DateTimeOffset]::Now
+    }
+    catch {
+        Write-DaemonLog -Message "online heartbeat failed: $($_.Exception.Message)"
+        return
+    }
+    Confirm-DaemonOnlineHeartbeat -Headers $Headers
+}
+
+function Get-DaemonStateReportedAt {
+    <#
+        When Home Assistant last took a state message for an entity, or $null when it
+        does not say.
+
+        `last_reported` only, with no fallback to `last_updated` or `last_changed`. It
+        is the only one that moves for a message repeating the state an entity already
+        holds, which is every message this is used for: the liveness sensor only ever
+        says `online`. Home Assistant has published it since 2024.4; before that a
+        repeated write was discarded outright, so on an older installation the other
+        two stand still for a sensor that is perfectly healthy. Falling back to them
+        would class every beat there as a stall and rebuild the sensor on a loop,
+        flapping it to unavailable every few minutes for ever - a far worse failure
+        than the one being fixed, and inflicted on installations that never had it.
+        No field, no detection; the README sets no minimum version.
+
+        The string is returned as Home Assistant wrote it rather than parsed. Nothing
+        here does arithmetic on it - only "is this the same answer as last time" - and
+        a timestamp the daemon cannot parse would otherwise read as no timestamp at
+        all, which is a stall that is not happening.
+    #>
+    param([AllowNull()]$State)
+
+    if ($null -eq $State -or $null -eq $State.PSObject.Properties['last_reported']) { return $null }
+    $value = [string]$State.PSObject.Properties['last_reported'].Value
+    if ([string]::IsNullOrWhiteSpace($value)) { return $null }
+    $value
+}
+
+function Wait-DaemonEntityRegistered {
+    <#
+        Waits, briefly, for Home Assistant to have an entity again after its discovery
+        config was republished, and says whether it got there.
+
+        Discovery is asynchronous: the retained config goes to the broker, Home
+        Assistant consumes it, and only then does the entity exist. The liveness beat is
+        deliberately unretained, so one that arrives before that is dropped outright -
+        which is exactly why Initialize-DaemonStartup declares the sensor well ahead of
+        the first beat. A rebuild that published its replacement beat immediately would
+        repeat that race and leave the repaired sensor unavailable for a further minute.
+
+        Read straight from Home Assistant: this is waiting for a change the reconcile
+        snapshot was taken before, so answering from the snapshot would say "present"
+        of the entity that has just been retracted.
+
+        Bounded. Waiting longer costs the reconcile more than a missed beat costs the
+        dashboard, and the caller has a cadence of its own to fall back on.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$EntityId,
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [ValidateRange(1, 40)][int]$Attempts = 12,
+        [ValidateRange(25, 2000)][int]$DelayMs = 250
+    )
+
+    foreach ($attempt in 1..$Attempts) {
         try {
-            Publish-CopilotMqttMachineHeartbeat -Slug $script:DaemonMachineSlug -Headers $Headers
-            $script:DaemonOnlineLastPublish = [DateTimeOffset]::Now
+            if ($null -ne (Get-HomeAssistantState -EntityId $EntityId -Headers $Headers)) { return $true }
         }
         catch {
-            Write-DaemonLog -Message "online heartbeat failed: $($_.Exception.Message)"
+            if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+            # A 404 is discovery not having got there yet, which is the whole point of
+            # waiting. Anything else is a Home Assistant that cannot answer, and
+            # another two seconds of asking will not change that.
+            if ((Get-BridgeHttpStatusCode -ErrorRecord $_) -ne 404) { return $false }
         }
+        if ($attempt -lt $Attempts) { Start-Sleep -Milliseconds $DelayMs }
+    }
+    $false
+}
+
+function Confirm-DaemonOnlineHeartbeat {
+    <#
+        Checks that the beat just published actually reached the sensor, and rebuilds
+        the sensor when it has stopped taking them.
+
+        Publishing a beat proves nothing. `mqtt.publish` answers 200 for a topic Home
+        Assistant is no longer subscribed to, so the daemon recorded a beat it had not
+        delivered, logged nothing, and settled down to wait another minute - for most
+        of a day, while the dashboard went on showing `on` for three machines it had
+        heard nothing about since a restart (#177). `expire_after` does not catch it
+        either: an entity in that state has no expiry timer running at all, which is
+        why three missed beats never turned it unavailable.
+
+        So the sensor is asked. Read straight from Home Assistant rather than through
+        the reconcile snapshot - that snapshot comes from a template carrying the state
+        and attributes and nothing else, so it cannot say when the state last arrived.
+
+        Two things have to be true before anything is rebuilt, because either alone has
+        been wrong. Elapsed time alone rebuilds a healthy sensor the first time a daemon
+        resumes from hours asleep: the clock says the window has passed, and the single
+        read since says nothing only because the beat that went out a moment ago has
+        not finished its trip through the broker. A count of unanswered beats alone
+        would fire early on a daemon whose passes outrun its own heartbeat. So: silent
+        for the window Home Assistant was itself supposed to expire it in, *and* seen
+        to be silent on three separate beats.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Headers)
+
+    $entityId = Get-BridgeMachineEntityId -Domain 'binary_sensor' -Key 'online' -Slug $script:DaemonMachineSlug
+    $now = [DateTimeOffset]::Now
+
+    $reported = $null
+    $absent = $false
+    try {
+        $reported = Get-DaemonStateReportedAt -State (Get-HomeAssistantState -EntityId $entityId -Headers $Headers)
+    }
+    catch {
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        # Absence and unreadability are not the same answer. A sensor that is not there
+        # has reported nothing, which is exactly the stall this measures and is healed
+        # by the same republish; a read that failed says nothing about the sensor at
+        # all, so it starts no clock and stops none either.
+        if ((Get-BridgeHttpStatusCode -ErrorRecord $_) -ne 404) { return }
+        $absent = $true
+        $reported = ''
+    }
+    # A sensor that is there but will not say when it last took a message cannot be
+    # watched at all - see Get-DaemonStateReportedAt. Being silently switched off on
+    # such an installation is the only safe reading; the alternative is rebuilding a
+    # healthy sensor every few minutes.
+    if (-not $absent -and $null -eq $reported) { return }
+
+    if ($script:DaemonOnlineSeen.At -eq [DateTimeOffset]::MinValue -or
+        $reported -cne [string]$script:DaemonOnlineSeen.Reported) {
+        $script:DaemonOnlineSeen = @{ Reported = $reported; At = $now; Unanswered = 0 }
+        return
+    }
+    $unanswered = [int]$script:DaemonOnlineSeen.Unanswered + 1
+    $silentSince = [DateTimeOffset]$script:DaemonOnlineSeen.At
+    $script:DaemonOnlineSeen = @{ Reported = $reported; At = $silentSince; Unanswered = $unanswered }
+    $stalled = [int]($now - $silentSince).TotalSeconds
+    if ($stalled -lt $script:DaemonConfig.DetachedEntitySeconds -or
+        $unanswered -lt $script:DaemonConfig.DetachedEntityBeats) {
+        return
+    }
+
+    # A fresh window whether or not the rebuild works. One that does not take must not
+    # repeat on every beat, and one that does is proved by the next read, not by this.
+    $script:DaemonOnlineSeen = @{ Reported = $reported; At = $now; Unanswered = 0 }
+    Write-DaemonLog -Message "$entityId has taken no beat for ${stalled}s; rebuilding it"
+    try {
+        Publish-CopilotMqttMachineOnlineConfig -Headers $Headers `
+            -ExpireAfter $script:DaemonConfig.OnlineExpireSeconds -Rebuild
+        [void](Set-CopilotMqttOnlineEntityId)
+        # Only once the sensor is actually back. The beat is unretained, so one sent
+        # while discovery is still catching up is dropped and the repaired sensor reads
+        # unavailable for another whole interval - the same race the startup path
+        # avoids by declaring the sensor well before its first beat.
+        if (Wait-DaemonEntityRegistered -EntityId $entityId -Headers $Headers) {
+            Publish-CopilotMqttMachineHeartbeat -Slug $script:DaemonMachineSlug -Headers $Headers
+        }
+        else {
+            Write-DaemonLog -Message "$entityId did not come back after the rebuild; trying again next beat"
+        }
+    }
+    catch {
+        Write-DaemonLog -Message "online sensor rebuild failed: $($_.Exception.Message)"
     }
 }
 
