@@ -343,20 +343,57 @@ Reset-FakeHa
 $member = [pscustomobject]@{ Machine = 'DSWETT-HOME'; Slug = 'dswett_home'; FleetId = $fleet }
 # The member's daemon answers the check on the read after the joiner writes it.
 $script:OnHelperRead = {
-    if ($script:Helper -match '^check:dswett_home:([0-9a-f]{32})$') {
+    if ($script:Helper -match '^check:dswett_home:([0-9a-f]{32}):([0-9a-f]{32})$') {
         $script:OnHelperRead = $null
         [void](Invoke-DaemonPairingRequest -Headers $headers -StartSponsor $start)
     }
 }
-Test-That 'the right secret passes' { Test-BridgeFleetSecretWithMember -Secret $secret -Member $member -Headers $headers }
+Test-That 'the right secret passes' { Test-BridgeFleetSecretWithMember -Secret $secret -Member $member -FleetId $fleet -Headers $headers }
 Test-That 'leaving the helper empty' { $script:Helper -ceq '' }
 $script:OnHelperRead = {
     if ($script:Helper -match '^check:dswett_home:') { $script:OnHelperRead = $null; [void](Invoke-DaemonPairingRequest -Headers $headers -StartSponsor $start) }
 }
-Test-That 'a typo does not' { -not (Test-BridgeFleetSecretWithMember -Secret ($secret.Substring(1) + 'A') -Member $member -Headers $headers) }
+Test-That 'a typo does not' { -not (Test-BridgeFleetSecretWithMember -Secret ($secret.Substring(1) + 'A') -Member $member -FleetId $fleet -Headers $headers) }
 Test-That 'and the answer reveals nothing usable about the secret' {
-    $tag = Get-BridgePairingCheckTag -Secret $secret -Nonce ('0' * 32)
+    $tag = Get-BridgePairingCheckTag -Secret $secret -Nonce ('0' * 32) -FleetId $fleet
     $tag -match '^[0-9a-f]{32}$' -and -not $secret.Contains($tag)
+}
+
+# The broker is not trusted with capabilities.fleet, and the fleet id J saves comes from
+# there. Before the id was covered by the tag, a rewritten fleet got an honest answer
+# and J saved an id the broker chose - correct secret, fleet of its own (#85).
+Write-Host '--- a fleet id the member does not agree to ---'
+Test-That 'the tag changes with the fleet id, so it is inside the MAC and not beside it' {
+    (Get-BridgePairingCheckTag -Secret $secret -Nonce ('0' * 32) -FleetId $fleet) -cne
+        (Get-BridgePairingCheckTag -Secret $secret -Nonce ('0' * 32) -FleetId (New-BridgePairingId))
+}
+Reset-FakeHa
+$script:Answered = $null
+$forged = New-BridgePairingId
+$script:OnHelperRead = {
+    if ($script:Helper -match '^check:dswett_home:') {
+        $script:OnHelperRead = $null
+        $script:Answered = Invoke-DaemonPairingRequest -Headers $headers -StartSponsor $start
+    }
+}
+$forgedMember = [pscustomobject]@{ Machine = 'DSWETT-HOME'; Slug = 'dswett_home'; FleetId = $forged }
+$caughtForged = $null
+try { [void](Test-BridgeFleetSecretWithMember -Secret $secret -Member $forgedMember -FleetId $forged -Headers $headers -TimeoutSeconds 1) }
+catch { $caughtForged = $_ }
+Test-That 'a member asked about a fleet that is not its own refuses to answer' {
+    $script:Answered -eq 'other-fleet'
+} "answered: $script:Answered"
+Test-That 'so the joiner is told nobody answered rather than handed a verifying tag' {
+    $null -ne $caughtForged -and $caughtForged.Exception.Message -match 'did not answer'
+} "caught: $(if ($caughtForged) { $caughtForged.Exception.Message } else { '(nothing)' })"
+
+# Answering the old two-field form would hand back exactly the unbound proof this
+# format replaced, so a member running this code refuses it instead.
+Reset-FakeHa
+$script:Helper = "check:dswett_home:$('a' * 32)"
+Test-That 'and a two-field challenge is refused rather than answered unbound' {
+    (Invoke-DaemonPairingRequest -Headers $headers -StartSponsor $start) -eq 'check-unbound' -and
+        $script:Helper -ceq "check:dswett_home:$('a' * 32)"
 }
 
 Write-Host '--- a Home Assistant call the offline guard refuses ---'
@@ -412,14 +449,14 @@ $script:OnWebSocket = $null
 Reset-FakeHa
 $guardMember = [pscustomobject]@{ Machine = 'DSWETT-HOME'; Slug = 'dswett_home'; FleetId = $fleet }
 $script:OnHelperRead = {
-    if ($script:Helper -match '^check:dswett_home:([0-9a-f]{32})$') {
+    if ($script:Helper -match '^check:dswett_home:([0-9a-f]{32}):([0-9a-f]{32})$') {
         $script:OnHelperRead = $null
         [void](Invoke-DaemonPairingRequest -Headers $headers -StartSponsor $start)
         $script:OnHelperRead = $blockedRead
     }
 }
 $caught = $null
-try { [void](Test-BridgeFleetSecretWithMember -Secret $secret -Member $guardMember -Headers $headers) } catch { $caught = $_ }
+try { [void](Test-BridgeFleetSecretWithMember -Secret $secret -Member $guardMember -FleetId $fleet -Headers $headers) } catch { $caught = $_ }
 Test-That 'a refused tidy-up read fails the check instead of letting a pasted secret through' {
     $null -ne $caught -and (Test-BridgeObservationGuardFailure -ErrorRecord $caught)
 } "caught: $(if ($caught) { $caught.Exception.Message } else { '(nothing)' })"
