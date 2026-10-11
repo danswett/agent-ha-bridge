@@ -290,7 +290,7 @@ function Show-Status {
             # written by an older version cannot say how its check authenticated, and
             # that version could already be using a token.
             $allowance = if (-not $check.AllowanceKnown) { '' }
-                elseif ($check.TokenSource) { "authenticated with $($check.TokenSource), 5,000 requests an hour" }
+                elseif ($check.TokenSource) { "authenticated with $($check.TokenSource)" }
                 else { 'unauthenticated, 60 requests an hour shared with everything behind this address' }
             if ($check.Answered) {
                 Write-Host "    updates    : checked $($check.When), $($check.Verdict)$(if ($allowance) { " ($allowance)" })" -ForegroundColor Green
@@ -302,7 +302,7 @@ function Show-Status {
                     # Plain `configure`, which offers a masked prompt: `-UpdateToken`
                     # takes a value, so naming it here would both fail to bind without
                     # one and invite putting a credential on a command line.
-                    Write-Host '                 set updates.token for 5,000 of this machine''s own: agent-ha-bridge configure' -ForegroundColor Yellow
+                    Write-Host '                 set a personal access token in updates.token for 5,000 of this machine''s own: agent-ha-bridge configure' -ForegroundColor Yellow
                 }
             }
             if ($check.TokenNote) {

@@ -73,11 +73,14 @@ Write-Host "    latest     : $(if ($status.Latest) { $status.Latest } else { 'no
 # and nothing ever said so, nor that there was a setting that fixes it (#153).
 if ($status.PSObject.Properties['TokenSource']) {
     if ($status.TokenSource) {
-        Write-Host "    checks     : authenticated with $($status.TokenSource) - 5,000 requests an hour"
+        # Named, not numbered. A personal access token has 5,000 an hour, but Actions'
+        # own GITHUB_TOKEN has 1,000 per repository, and the source name does not say
+        # which kind this is. Raised by Codex on #190.
+        Write-Host "    checks     : authenticated with $($status.TokenSource)"
     }
     else {
         Write-Host '    checks     : unauthenticated - 60 requests an hour, shared with everything behind this address' -ForegroundColor DarkGray
-        Write-Host '                 set updates.token for 5,000 of this machine''s own: agent-ha-bridge configure' -ForegroundColor DarkGray
+        Write-Host '                 set a personal access token in updates.token for 5,000 of this machine''s own: agent-ha-bridge configure' -ForegroundColor DarkGray
     }
 }
 if ($status.PSObject.Properties['TokenNote'] -and $status.TokenNote) {

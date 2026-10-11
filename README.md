@@ -1440,11 +1440,15 @@ Four things keep that from becoming a failed update:
   install nor in the release. The machine's row says **Update check failed**
   rather than going quiet, so a refused check does not read as nothing to install.
 
-A token raises the limit to 5,000 requests an hour for this machine alone. One already
-in the environment as `AGENT_HA_BRIDGE_UPDATE_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN` is
-used automatically. Otherwise `agent-ha-bridge configure` offers a masked prompt for
-one — and offers to **replace** it when the configured one has been refused, which is
-the case plain `configure` would otherwise skip, since the setting is not empty.
+A personal access token raises the limit to 5,000 requests an hour for this machine
+alone. One already in the environment as `AGENT_HA_BRIDGE_UPDATE_TOKEN`, `GH_TOKEN` or
+`GITHUB_TOKEN` is used automatically — these report only that the check was
+authenticated and from where, never a figure, because the allowance depends on the kind
+of token and Actions' own `GITHUB_TOKEN` gets 1,000 per repository rather than 5,000.
+Otherwise `agent-ha-bridge configure` offers a masked prompt for
+one — and offers to **replace** it when the configured one has been refused or cannot
+be sent as a header, both of which plain `configure` would otherwise skip, since the
+setting is not empty.
 `-UpdateToken <token>` sets it in one go for scripted installs, at the usual risk of
 putting a secret on a command line. These are public releases, so a token with no
 scopes at all is enough.
@@ -1458,7 +1462,7 @@ an entity:
 ```
     updates    : checked Oct 10 19:42, refused - GitHub is rate limiting this machine
                  checks are unauthenticated, 60 requests an hour shared with everything behind this address
-                 set updates.token for 5,000 of this machine's own: agent-ha-bridge configure
+                 set a personal access token in updates.token for 5,000 of this machine's own: agent-ha-bridge configure
 ```
 
 A record written before this version said nothing about how its check authenticated,

@@ -273,6 +273,21 @@ Assert-UpdateOutcome 'while the child that moved the record off the old version 
     $script:Notified[0].title -match 'but a later step failed' -and
     $script:Notified[0].message -match 'client registration failed')
 
+# Both children launched while 1.1.0 was installed, so both recorded 1.1.0 as what they
+# found: the pre-version alone cannot separate them. Whether a child handed control to
+# an installer is a fact about its own execution, and the one that died fetching the
+# archive never did. Raised by Codex on #190.
+Reset-UpdateCapture
+Set-RecordedVersion '1.2.0'
+Write-Marker @{ schemaVersion = 1; attemptId = ('f' * 32); success = $false; exitCode = 1; version = '1.2.0'
+                beforeVersion = '1.1.0'; ranInstaller = $false; error = 'the archive was not readable'
+                at = [DateTimeOffset]::Now.ToString('o') }
+[void](Invoke-DaemonUpdateOutcome -Headers $headers)
+Receive-UpdatePayload $consumer
+Assert-UpdateOutcome 'a child that never ran an installer is not credited with the install it raced' (
+    $script:Notified[0].title -match '^Bridge update failed' -and
+    $script:Notified[0].message -match 'the archive was not readable')
+
 Reset-UpdateCapture
 Write-Marker @{ success = $false; error = 'old marker without target'; at = [DateTimeOffset]::Now.ToString('o') }
 [void](Invoke-DaemonUpdateOutcome -Headers $headers)

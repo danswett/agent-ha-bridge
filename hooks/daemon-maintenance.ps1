@@ -201,6 +201,9 @@ function Invoke-DaemonUpdateOutcome {
         if ($outcome.PSObject.Properties['BeforeVersion'] -and $outcome.BeforeVersion) {
             $reachedArgs['Before'] = [string]$outcome.BeforeVersion
         }
+        if ($outcome.PSObject.Properties['RanInstaller'] -and $null -ne $outcome.RanInstaller) {
+            $reachedArgs['RanInstaller'] = [bool]$outcome.RanInstaller
+        }
         $reachedInstall = -not $outcome.Success -and (Test-BridgeUpdateReachedInstall @reachedArgs)
         # The same verdict the notification carries, on the entity, so the dashboard
         # says how the update ended rather than only that it is no longer running.

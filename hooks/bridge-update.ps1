@@ -716,10 +716,15 @@ function Get-BridgeLatestRelease {
             $lookup.Detail = "GitHub is rate limiting this machine's release checks$($rateLimit.Suffix). " +
                 'The install is fine; the check will work again once the limit resets. ' +
                 $(if ($lookup.TokenSource) {
-                    "Checks are authenticated with $($lookup.TokenSource), which has 5,000 requests an hour of its own."
+                    # No number for a credential whose type is unknown. A personal
+                    # access token gets 5,000 an hour, but GITHUB_TOKEN inside Actions
+                    # gets 1,000 per repository - so quoting 5,000 at whatever happens
+                    # to be exported would misreport the allowance in either direction.
+                    # Raised by Codex on #190.
+                    "Checks are authenticated with $($lookup.TokenSource), which has an allowance of its own."
                 } else {
                     'Unauthenticated checks share 60 requests an hour per IP with everything else behind this address; ' +
-                    'setting updates.token raises this machine to 5,000 of its own.'
+                    'a personal access token in updates.token raises this machine to 5,000 of its own.'
                 })
             try {
                 $fallback = Get-BridgeLatestReleaseWithoutApi -Repository $repository
@@ -838,9 +843,18 @@ function Test-BridgeUpdateReachedInstall {
         # that failed during download with the other's install. Only an outcome
         # written before that field existed omits it, and omission keeps the old
         # behaviour rather than inventing a pre-version.
-        [AllowNull()][AllowEmptyString()][string]$Before
+        [AllowNull()][AllowEmptyString()][string]$Before,
+        # Whether this child ever handed control to an installer. Unlike the version
+        # record, that is a fact about its own execution, so a concurrent attempt
+        # cannot supply it: two presses launched while 1.1.0 is installed both record
+        # 1.1.0, and if one installs 1.2.0 while the other dies during download, the
+        # pre/post comparison alone still credits the one that installed nothing.
+        # Raised by Codex on #190. Omitted by an outcome written before the field
+        # existed, which keeps the old behaviour rather than assuming either answer.
+        [bool]$RanInstaller
     )
 
+    if ($PSBoundParameters.ContainsKey('RanInstaller') -and -not $RanInstaller) { return $false }
     $target = ([string]$Attempted).Trim() -replace '^[vV]', ''
     $actual = ([string]$Recorded).Trim() -replace '^[vV]', ''
     # Compared as written rather than through ConvertTo-BridgeVersion, which parses
@@ -885,7 +899,7 @@ function Read-BridgeUpdateOutcome {
         }
     }
     $allowed = @('success', 'version', 'releaseUrl', 'error', 'at')
-    if ($schema) { $allowed += @('schemaVersion', 'attemptId', 'exitCode', 'beforeVersion') }
+    if ($schema) { $allowed += @('schemaVersion', 'attemptId', 'exitCode', 'beforeVersion', 'ranInstaller') }
     if (@($record.Keys | Where-Object { $_ -cnotin $allowed }).Count) { throw 'The update outcome contains unsupported fields.' }
     if ($AttemptId -and ($schema -ne 1 -or $record['attemptId'] -cne $AttemptId)) {
         throw 'The update outcome does not belong to this attempt.'
@@ -906,6 +920,13 @@ function Read-BridgeUpdateOutcome {
     # then omits -Before and behaves exactly as it did. Raised by Codex on #190.
     $before = if ($record.Contains('beforeVersion')) { $record['beforeVersion'] } else { '' }
     if ($before -isnot [string]) { throw 'The update outcome has an invalid pre-attempt version.' }
+    # Tri-state deliberately: $null is "this outcome predates the field", which is not
+    # the same claim as "this child never ran an installer".
+    $ran = $null
+    if ($record.Contains('ranInstaller')) {
+        if ($record['ranInstaller'] -isnot [bool]) { throw 'The update outcome has an invalid installer record.' }
+        $ran = [bool]$record['ranInstaller']
+    }
     $url = if ($record.Contains('releaseUrl')) { $record['releaseUrl'] } else { '' }
     $errorText = if ($record.Contains('error')) { $record['error'] } else { '' }
     if ($url -isnot [string] -or $errorText -isnot [string] -or
@@ -923,6 +944,7 @@ function Read-BridgeUpdateOutcome {
         Success = $record['success']
         Version = $target
         BeforeVersion = $before
+        RanInstaller = $ran
         ReleaseUrl = $url
         Error = $errorText
         At = $at
@@ -1055,7 +1077,7 @@ function Write-UpdateOutcome {
 `$outcome = @{
     schemaVersion = 1; attemptId = '$($result.AttemptId)'; success = `$false; exitCode = 1
     version = '$($status.Latest)'; releaseUrl = '$($status.Url.Replace("'", "''"))'
-    beforeVersion = '$(([string]$status.Installed).Replace("'", "''"))'
+    beforeVersion = '$(([string]$status.Installed).Replace("'", "''"))'; ranInstaller = `$false
     error = ''; at = ''
 }
 function Write-UpdateStage {
@@ -1135,6 +1157,12 @@ try {
         throw 'The release installer cannot preserve this installation root; it was not run.'
     }
     `$global:LASTEXITCODE = 0
+    # Recorded before the call, not after, and never unset: the question it answers is
+    # whether *this* child ever handed control to an installer, which is the one thing
+    # about its own progress no shared version record can tell anyone. A child that
+    # failed during download or archive validation cannot then be credited with a
+    # concurrent child's install. Raised by Codex on #190.
+    `$outcome.ranInstaller = `$true
     & (Join-Path `$root.FullName 'install.ps1') -NonInteractive -SkipVerify$targetArgument$rootArgument
     if (`$LASTEXITCODE -ne 0) { throw "the installer exited with code `$LASTEXITCODE" }
     # Restart the daemon so the new code and config take effect. The installer cannot:
@@ -1246,8 +1274,11 @@ exit `$outcome.exitCode
             # "nothing was installed", and until now both came out as the same
             # undifferentiated `child exit 1` (#124). Returned rather than thrown,
             # because throwing is how the caller is told the update did not happen.
-            if (Test-BridgeUpdateReachedInstall -Attempted $status.Latest -Recorded $result.InstalledVersion `
-                    -Before $status.Installed) {
+            $foregroundArgs = @{
+                Attempted = $status.Latest; Recorded = $result.InstalledVersion; Before = $status.Installed
+            }
+            if ($null -ne $outcome.RanInstaller) { $foregroundArgs['RanInstaller'] = [bool]$outcome.RanInstaller }
+            if (Test-BridgeUpdateReachedInstall @foregroundArgs) {
                 $result.State = 'Incomplete'
                 $result.Detail = "installed $($status.Latest), but a step after the install failed " +
                     "(child exit $exitCode): $($outcome.Error) - the recorded version is " +

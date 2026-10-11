@@ -37,7 +37,8 @@
     A GitHub token used for release checks only, sent to api.github.com and never
     logged. Unauthenticated callers share 60 requests an hour per IP, so a Dev Box or
     anything else behind shared egress can exhaust it without the bridge having made a
-    request of its own; a token gives this machine 5,000 of its own. Public releases
+    request of its own; a personal access token gives this machine 5,000 of its own.
+    Public releases
     need no scopes at all. Omit it to keep an existing one, to be offered a prompt, or
     to supply one via AGENT_HA_BRIDGE_UPDATE_TOKEN, GH_TOKEN or GITHUB_TOKEN in the
     environment.
@@ -3030,9 +3031,11 @@ else {
 # An unauthenticated release check shares 60 requests an hour with everything else
 # behind the same address, so a Dev Box - or any shared egress - can exhaust it
 # without the bridge having made a request of its own, and then no machine behind that
-# address can take any release at all. A token is 5,000 an hour of this machine's own:
-# measured on one machine, the same call reported 51/60 unauthenticated and 5000/5000
-# authenticated.
+# address can take any release at all. A personal access token is 5,000 an hour of this
+# machine's own: measured on one machine, the same call reported 51/60 unauthenticated
+# and 5000/5000 authenticated. Nothing reports a figure for a token it did not ask for,
+# though - Actions' GITHUB_TOKEN has 1,000 per repository, so an ambient credential is
+# reported by name only.
 #
 # The cure already existed. Nothing ever offered it, so in practice no machine had
 # one and `updates.token` had to be hand-edited into config.json (#153).
@@ -3112,7 +3115,7 @@ if ($updateTokenReason -and -not $NonInteractive -and (Test-BridgeConsoleInterac
         Write-Host 'Optional: give this machine its own GitHub rate limit for release checks.' -ForegroundColor Yellow
         Write-Host '    Without one, checks share 60 requests an hour with everything else behind'
         Write-Host '    this address, and the machine can sit unable to take a release for hours.'
-        Write-Host '    A token raises that to 5,000 an hour for this machine alone.'
+        Write-Host '    A personal access token raises that to 5,000 an hour for this machine alone.'
         $askUpdateToken = Read-BridgeYesNo -Prompt '    Set one up now?' -Default $false
     }
     if ($askUpdateToken) {
@@ -3154,7 +3157,7 @@ Write-Host "    notifications: $(if ($config.notifications.enabled) { $config.no
 # Never the token, only where one came from - the same distinction Get-BridgeUpdateToken
 # keeps, and the reason `agent-ha-bridge status` can report this at all.
 Write-Host "    update check : $(
-    if ($updateTokenSource) { "authenticated from $updateTokenSource - 5,000 requests an hour" }
+    if ($updateTokenSource) { "authenticated from $updateTokenSource" }
     else { 'unauthenticated - 60 requests an hour, shared with everything behind this address' })"
 # Said here too, because an install that leaves a skipped setting in place should say so
 # rather than let the next `status` be the first mention of it.

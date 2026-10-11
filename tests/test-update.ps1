@@ -952,15 +952,20 @@ try {
         Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
         $unauthenticated = Get-BridgeUpdateStatus -Force
         Test-That 'a refused unauthenticated check names the setting that raises the limit' {
-            $unauthenticated.Detail -match 'setting updates\.token raises this machine to 5,000'
+            $unauthenticated.Detail -match 'personal access token in updates\.token raises this machine to 5,000'
         } $unauthenticated.Detail
     }
     Invoke-WithUpdateTokenEnvironment @{ GH_TOKEN = $ambientToken } {
         Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
         $alreadyAuthenticated = Get-BridgeUpdateStatus -Force
-        Test-That 'but a machine already using one is not told to set it again' {
-            $alreadyAuthenticated.Detail -notmatch 'setting updates\.token' -and
-                $alreadyAuthenticated.Detail -match 'authenticated with \$env:GH_TOKEN'
+        # Named, never numbered. Actions' own GITHUB_TOKEN gets 1,000 an hour per
+        # repository rather than 5,000, and the source name does not say which kind of
+        # credential this is - so quoting a figure at whatever happens to be exported
+        # would misreport the allowance in either direction. Raised by Codex on #190.
+        Test-That 'but a machine already using one is not told to set it again, nor promised a figure' {
+            $alreadyAuthenticated.Detail -notmatch 'updates\.token raises' -and
+                $alreadyAuthenticated.Detail -match 'authenticated with \$env:GH_TOKEN' -and
+                $alreadyAuthenticated.Detail -notmatch '5,000'
         } $alreadyAuthenticated.Detail
     }
 
@@ -1179,6 +1184,17 @@ Test-That 'and a record this attempt did not change proves nothing about how far
     (Test-BridgeUpdateReachedInstall -Attempted '1.2.3' -Recorded '1.2.3' -Before '1.2.2') -and
         -not (Test-BridgeUpdateReachedInstall -Attempted '1.2.3' -Recorded '1.2.3' -Before '1.2.3')
 }
+# Two presses launched while 1.1.0 is installed both record 1.1.0 as what they found,
+# so if one installs 1.2.0 while the other dies during download, pre/post comparison
+# alone still credits the one that installed nothing. Whether a child handed control to
+# an installer at all is a fact about its own execution that no concurrent attempt can
+# supply. Raised by Codex on #190.
+Test-That 'a child that never reached an installer is not credited with a concurrent one''s install' {
+    -not (Test-BridgeUpdateReachedInstall -Attempted '1.2.0' -Recorded '1.2.0' -Before '1.1.0' -RanInstaller $false)
+}
+Test-That 'while the child that did run one, and moved the record, still is' {
+    Test-BridgeUpdateReachedInstall -Attempted '1.2.0' -Recorded '1.2.0' -Before '1.1.0' -RanInstaller $true
+}
 # The detached child is the one that needs this carried for it: the daemon reads its
 # outcome long after it exited, and cannot otherwise tell its install from a
 # concurrent attempt's. An outcome written before the field existed must still read,
@@ -1188,22 +1204,24 @@ Test-That 'and a record this attempt did not change proves nothing about how far
     try {
         Set-Content -LiteralPath $outcomePath -Encoding UTF8 -Value (@{
             schemaVersion = 1; attemptId = ('d' * 32); success = $false; exitCode = 1
-            version = '1.2.3'; beforeVersion = '1.2.2'; error = 'later step failed'
+            version = '1.2.3'; beforeVersion = '1.2.2'; ranInstaller = $true; error = 'later step failed'
             at = [DateTimeOffset]::Now.ToString('o')
         } | ConvertTo-Json)
         $carried = Read-BridgeUpdateOutcome -Path $outcomePath
         Test-That 'an outcome carries what the installation recorded when its attempt launched' {
-            $carried.BeforeVersion -ceq '1.2.2'
-        } "got '$($carried.BeforeVersion)'"
+            $carried.BeforeVersion -ceq '1.2.2' -and $carried.RanInstaller -eq $true
+        } "got '$($carried.BeforeVersion)' / '$($carried.RanInstaller)'"
 
         Set-Content -LiteralPath $outcomePath -Encoding UTF8 -Value (@{
             schemaVersion = 1; attemptId = ('e' * 32); success = $false; exitCode = 1
             version = '1.2.3'; error = 'later step failed'; at = [DateTimeOffset]::Now.ToString('o')
         } | ConvertTo-Json)
         $older = Read-BridgeUpdateOutcome -Path $outcomePath
-        Test-That 'and one written before the field existed still reads, claiming no pre-version' {
-            $older.BeforeVersion -ceq ''
-        } "got '$($older.BeforeVersion)'"
+        # $null, not $false: "written before the field existed" is a different claim
+        # from "this child never ran an installer", and only the latter denies credit.
+        Test-That 'and one written before the fields existed still reads, claiming neither' {
+            $older.BeforeVersion -ceq '' -and $null -eq $older.RanInstaller
+        } "got '$($older.BeforeVersion)' / '$($older.RanInstaller)'"
     }
     finally { Remove-Item -LiteralPath $outcomePath -Force -ErrorAction SilentlyContinue }
 }
