@@ -49,19 +49,41 @@ function Write-BridgeDownloadStream {
         [Parameter(Mandatory)][IO.Stream]$Source,
         [Parameter(Mandatory)][string]$OutFile,
         [long]$Total = 0,
+        # How long the transfer may produce nothing before it is given up on. The clock
+        # restarts on every chunk that arrives, so this is an idle timeout and never a
+        # cap on a slow but progressing download. 0 reads without one.
+        [int]$StallSeconds = 0,
         [scriptblock]$OnProgress
     )
 
     $target = $null
+    $idle = $null
     $completed = $false
     try {
+        if ($StallSeconds -gt 0) {
+            $idle = [Threading.CancellationTokenSource]::new()
+            $idle.CancelAfter($StallSeconds * 1000)
+        }
         $target = [IO.File]::Open($OutFile, [IO.FileMode]::Create, [IO.FileAccess]::Write, [IO.FileShare]::None)
         $buffer = [byte[]]::new($script:BridgeDownloadBufferSize)
         $written = 0L
         $lastPercent = 0
         $lastReportAt = [DateTimeOffset]::MinValue
         while ($true) {
-            $read = $Source.Read($buffer, 0, $buffer.Length)
+            if ($null -eq $idle) { $read = $Source.Read($buffer, 0, $buffer.Length) }
+            else {
+                # Stream.Read cannot be cancelled, and HttpClient.Timeout stops applying
+                # once ResponseHeadersRead has handed the headers back - which .NET
+                # documents - so a server that sends headers and then stalls had no
+                # timeout at all and left the card on Downloading for ever. Raised by
+                # Codex on #190.
+                try { $read = $Source.ReadAsync($buffer, 0, $buffer.Length, $idle.Token).GetAwaiter().GetResult() }
+                catch [OperationCanceledException] {
+                    throw ("the download stalled for more than $StallSeconds seconds after " +
+                           "$written bytes$(if ($Total -gt 0) { " of $Total" })")
+                }
+                $idle.CancelAfter($StallSeconds * 1000)
+            }
             if ($read -le 0) { break }
             $target.Write($buffer, 0, $read)
             $written += $read
@@ -84,6 +106,7 @@ function Write-BridgeDownloadStream {
     }
     finally {
         if ($target -is [IDisposable]) { $target.Dispose() }
+        if ($idle -is [IDisposable]) { $idle.Dispose() }
         # A half-written archive is worse than none: Expand-Archive fails on it with a
         # ZIP error, and the update is then reported as a corrupt release rather than
         # as an interrupted download.
@@ -127,7 +150,11 @@ function Save-BridgeUpdateDownload {
         $length = $response.Content.Headers.ContentLength
         if ($length.HasValue -and $length.Value -gt 0) { $total = [long]$length.Value }
         $source = $response.Content.ReadAsStream()
-        Write-BridgeDownloadStream -Source $source -OutFile $OutFile -Total $total -OnProgress $OnProgress
+        # The same seconds twice, for the two halves HttpClient.Timeout no longer
+        # covers together: it stops applying once ResponseHeadersRead has returned, so
+        # the body gets its own idle timeout rather than none.
+        Write-BridgeDownloadStream -Source $source -OutFile $OutFile -Total $total `
+            -StallSeconds $TimeoutSeconds -OnProgress $OnProgress
     }
     finally {
         foreach ($disposable in @($source, $response, $client)) {

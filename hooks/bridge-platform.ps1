@@ -1783,16 +1783,23 @@ function Get-BridgeUpdateCheckSummary {
 
 function Test-BridgeUpdateTokenRejected {
     <#
-        Whether the last release check had the *configured* token refused by GitHub.
+        Whether the last release check had its token refused by GitHub, wherever that
+        token came from.
 
-        A configured token that GitHub rejects is worse than none: the check falls back
-        to the anonymous retry that works, so nothing breaks, and the machine is back
-        on the 60-an-hour shared pool while its configuration says otherwise. The
-        installer uses this to offer a replacement, because plain `configure` would
-        otherwise skip the prompt - the setting is not empty - leaving the secret on a
-        command line as the only remedy. Raised by Codex on #190.
+        A rejected token is worse than none: the check falls back to the anonymous
+        retry that works, so nothing breaks, and the machine is back on the 60-an-hour
+        shared pool while something claims otherwise. The installer uses this to offer
+        a replacement, because it would otherwise skip the prompt for exactly the
+        machine that needs it - a nonempty `updates.token` is not empty, and a rejected
+        ambient GH_TOKEN still counts as "this machine has one". Both were raised by
+        Codex on #190.
 
-        One place decides it, so the installer and the check that produces the note can
+        Deliberately not limited to the configured setting. A refused `$env:GH_TOKEN`
+        is re-sent and refused on every check, and the operator cannot edit the
+        environment from here - but storing a working `updates.token` does fix it,
+        because the configured setting wins over the environment.
+
+        One place decides it, so the installer and the check that writes the note can
         never drift apart on the wording.
     #>
     param([AllowNull()]$Summary)
@@ -1802,5 +1809,5 @@ function Test-BridgeUpdateTokenRejected {
         if (-not $Summary.PSObject.Properties[$name]) { return $false }
     }
     [bool]($Summary.AllowanceKnown -and -not $Summary.TokenSource -and
-        [string]$Summary.TokenNote -match 'updates\.token was rejected')
+        [string]$Summary.TokenNote -match 'was rejected by GitHub')
 }

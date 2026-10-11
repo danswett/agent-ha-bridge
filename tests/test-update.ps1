@@ -914,6 +914,18 @@ try {
             }
         }
     }
+    # The same has to hold for a token the machine merely had in its environment. It is
+    # re-sent and refused on every check, the operator cannot edit the environment from
+    # the installer - and storing a working updates.token does fix it, because the
+    # configured setting wins over the environment. Raised by Codex on #190.
+    Invoke-WithUpdateTokenEnvironment @{ GH_TOKEN = $ambientToken } {
+        Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+        $ambientRejection = Get-BridgeUpdateStatus -Force
+        Test-That 'a refused ambient token is offered a replacement too, not only a configured one' {
+            $ambientRejection.TokenNote -match '^\$env:GH_TOKEN was rejected' -and
+                (Test-BridgeUpdateTokenRejected -Summary (Get-BridgeUpdateCheckSummary -Path $cachePath))
+        } $ambientRejection.TokenNote
+    }
     Invoke-WithUpdateTokenEnvironment @{} {
         Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
         $noTokenAtAll = Get-BridgeUpdateStatus -Force
@@ -1372,6 +1384,34 @@ try {
     Test-That 'an interrupted transfer throws and leaves no half-written archive behind' {
         $threw -and -not (Test-Path -LiteralPath $downloadFile)
     } "threw=$threw exists=$(Test-Path -LiteralPath $downloadFile)"
+
+    # HttpClient.Timeout stops applying once ResponseHeadersRead has handed the headers
+    # back - .NET documents this - and Stream.Read cannot be cancelled, so a server that
+    # sent headers and then stalled had no timeout at all and left the card on
+    # Downloading for ever. Raised by Codex on #190.
+    Remove-Item -LiteralPath $downloadFile -Force -ErrorAction SilentlyContinue
+    $stalled = [IO.Pipes.AnonymousPipeServerStream]::new([IO.Pipes.PipeDirection]::In, [IO.HandleInheritability]::None)
+    $elapsed = [Diagnostics.Stopwatch]::StartNew()
+    $stallError = ''
+    try { [void](Write-BridgeDownloadStream -Source $stalled -OutFile $downloadFile -Total 1000 -StallSeconds 1) }
+    catch { $stallError = $_.Exception.Message }
+    finally { $elapsed.Stop(); $stalled.Dispose() }
+    Test-That 'a transfer that sends nothing is given up on rather than waited on for ever' {
+        $stallError -match 'stalled for more than 1 seconds' -and $elapsed.Elapsed.TotalSeconds -lt 30
+    } "after $([Math]::Round($elapsed.Elapsed.TotalSeconds, 2))s: $stallError"
+    Test-That 'and leaves no half-written archive behind either' {
+        -not (Test-Path -LiteralPath $downloadFile)
+    }
+
+    # The clock restarts on every chunk that arrives, so it is an idle timeout and
+    # never a cap on a slow but progressing download - a hundred reads here, with a
+    # stall budget shorter than any plausible whole transfer.
+    $patient = [IO.MemoryStream]::new($payload)
+    $slowButSteady = Write-BridgeDownloadStream -Source $patient -OutFile $downloadFile -Total $payload.Length -StallSeconds 1
+    $patient.Dispose()
+    Test-That 'a transfer that keeps arriving is never cut off for taking many reads' {
+        $slowButSteady.Bytes -eq $payload.Length
+    } "wrote $($slowButSteady.Bytes) of $($payload.Length)"
 }
 finally {
     $script:BridgeDownloadBufferSize = $priorBuffer

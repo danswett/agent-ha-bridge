@@ -3058,15 +3058,15 @@ foreach ($name in @('AGENT_HA_BRIDGE_UPDATE_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN'))
         $updateTokenSource = "`$env:$name"
     }
 }
-# A configured token GitHub has refused needs replacing, and plain `configure` would
-# skip the prompt below because the setting is not empty - leaving the secret on a
-# command line as the only way to change it. The last check already recorded the
-# refusal, so the offer is made exactly when it is wanted. Raised by Codex on #190.
+# A token GitHub has refused needs replacing, and the prompt below would otherwise skip
+# exactly the machine that needs it: a nonempty `updates.token` is not empty, and a
+# refused ambient GH_TOKEN still counts as "this machine has one". The last check
+# already recorded the refusal, whichever of the two it was, so the offer is made when
+# it is wanted. Storing a working `updates.token` fixes the ambient case too, because
+# the configured setting wins over the environment. Raised by Codex on #190.
 $updateTokenNote = ''
-if ($config.updates.token) {
-    $lastCheck = Get-BridgeUpdateCheckSummary -Path (Get-BridgeRuntimePath -Name 'agent-bridge-update.json' -Context $installContext)
-    if (Test-BridgeUpdateTokenRejected -Summary $lastCheck) { $updateTokenNote = [string]$lastCheck.TokenNote }
-}
+$lastUpdateCheck = Get-BridgeUpdateCheckSummary -Path (Get-BridgeRuntimePath -Name 'agent-bridge-update.json' -Context $installContext)
+if (Test-BridgeUpdateTokenRejected -Summary $lastUpdateCheck) { $updateTokenNote = [string]$lastUpdateCheck.TokenNote }
 # Only asked when the machine has nothing to use, or when what it has was refused. One
 # already in the environment needs no configuration, and a working configured one is an
 # answer already given.
@@ -3074,7 +3074,7 @@ if (((-not $updateTokenSource) -or $updateTokenNote) -and -not $NonInteractive -
     Write-Host ''
     $askUpdateToken = $false
     if ($updateTokenNote) {
-        Write-Host 'The GitHub token configured for release checks was refused.' -ForegroundColor Yellow
+        Write-Host 'The GitHub token used for release checks was refused.' -ForegroundColor Yellow
         Write-Host "    $updateTokenNote"
         Write-Host '    Until it is replaced, checks share 60 requests an hour with everything'
         Write-Host '    else behind this address.'
