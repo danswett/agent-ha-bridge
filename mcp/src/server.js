@@ -239,7 +239,8 @@ async function main() {
   // Reads use the user's token, writes the agent's - see loadConfig. The exception is
   // `publisher`: Home Assistant restricts mqtt.publish to administrators, which the
   // agent deliberately is not, so the two paths carrying unbounded text publish on the
-  // user's client and press on the agent's. Attribution rides on the press.
+  // user's client. A launch then presses Launch as the agent, which is what carries
+  // the account; a long reply presses nothing and marks itself instead.
   const sessionTools = {
     list_agent_sessions: () => listSessions(ha),
     read_agent_session: (args) =>

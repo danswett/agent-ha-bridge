@@ -328,20 +328,46 @@ console.log('\n--- publishing on the only client allowed to ---');
 console.log('\n--- when publishing is refused anyway ---');
 {
   // A bare 401 here reads as a bad token and sends anyone diagnosing it to the one
-  // place the fault is not: the same token succeeds at every other call in the
-  // sequence.
-  let refused = '';
+  // place the fault is not: an agent token succeeds at every other call in the
+  // sequence. But which credential to name depends on which one was used.
+  let fellBack = '';
   await launchSession(stubHa(states, { refusePublish: true }), 'dswett_dev_vm1', {
     prompt: 'anything',
   }).catch((e) => {
-    refused = e.message;
+    fellBack = e.message;
   });
-  check('a refused launch says it is an administrator-only call', refused.includes('administrator'));
-  check('and names the token that can make it', refused.includes('homeAssistant.token'));
+  check('a refused publish says it is an administrator-only call', fellBack.includes('administrator'));
+  check(
+    'and with no publisher given, points at the client that should have been passed',
+    fellBack.includes('publisher'),
+    fellBack,
+  );
   check(
     'rather than leaving a bare 401 to be read as a bad token',
-    !/^Home Assistant POST/.test(refused),
-    refused,
+    !/^Home Assistant POST/.test(fellBack),
+    fellBack,
+  );
+
+  // Through the MCP server a publisher is always supplied, and it is the user's. So a
+  // refusal means *that* token was rejected - expired, revoked, or not an
+  // administrator's - and naming the agent token would send an operator to a
+  // credential that was never used.
+  let supplied = '';
+  await launchSession(stubHa(states), 'dswett_dev_vm1', {
+    prompt: 'anything',
+    publisher: stubHa(states, { refusePublish: true }),
+  }).catch((e) => {
+    supplied = e.message;
+  });
+  check(
+    'but a supplied publisher that is refused names that credential',
+    supplied.includes('homeAssistant.token'),
+    supplied,
+  );
+  check(
+    'and does not send the operator to the agent token, which was never used',
+    !supplied.includes('`publisher`'),
+    supplied,
   );
 
   let refusedReply = '';

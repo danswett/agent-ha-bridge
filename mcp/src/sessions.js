@@ -14,10 +14,14 @@
  *     administrators. The agent account is deliberately not one, so publishing on the
  *     agent client fails with 401 and the two paths that carry unbounded text - a long
  *     reply and a launch prompt - could not be used by an agent at all. Those take a
- *     `publisher` client, the user's, while the press that follows stays the agent's.
- *     Attribution is unaffected: Home Assistant records the account on the press, and
- *     an MQTT-published state carries no account either way, which is why the launch
- *     payload is followed by a press and the long reply marks itself.
+ *     `publisher` client, the user's.
+ *
+ *     Attribution is unaffected, but the two are marked differently and only one of
+ *     them presses anything. A launch publishes the prompt and then presses Launch,
+ *     and Home Assistant records the account on that press. A long reply makes no
+ *     service call at all - sending one as well would deliver it twice - so it marks
+ *     itself with `driver` instead. Either way an MQTT-published state carries no
+ *     account, so publishing as the user cannot turn a session blue.
  *
  *   - Expecting an answer in a persistent notification. Home Assistant does not expose
  *     those through GET /api/states, so polling finds nothing however long you wait,
@@ -102,20 +106,32 @@ function attr(state, name) {
  * Publishes on the client allowed to, and explains it when that is refused.
  *
  * `mqtt.publish` is administrator-only. A plain 401 here reads as a bad token, which
- * sends anyone diagnosing it to the one place the fault is not: the agent token is
- * valid and is authorised for every other call in the sequence - reads, `text.set_value`
- * and `button.press` all succeed with it. Measured on DSWETT-DEV-VM1: agent token 401,
- * user token OK.
+ * sends anyone diagnosing it to the one place the fault is not: an agent token is
+ * valid and is authorised for every other call in the sequence - reads,
+ * `text.set_value` and `button.press` all succeed with it. Measured on DSWETT-DEV-VM1:
+ * agent token 401, user token OK.
+ *
+ * Which credential to name depends on which one was actually used. Called through the
+ * MCP server a publisher is always supplied and it is the user's, so a refusal there
+ * means *that* token was rejected - expired, revoked, or not an administrator's - and
+ * blaming the agent token would send an operator to a credential that was never used.
+ * Only the fallback, where no publisher was given and the caller's own client had to
+ * do it, is the case the split exists to fix.
  */
-async function publishVia(publisher, topic, payload, retain) {
+async function publishVia(publisher, topic, payload, retain, { fellBack = false } = {}) {
   try {
     return await publisher.publishMqtt(topic, payload, retain);
   } catch (error) {
     if (error?.status === 401 || error?.status === 403) {
       throw new Error(
-        'Home Assistant refused mqtt.publish, which it restricts to administrators. ' +
-          "This path needs the user's token (homeAssistant.token), not the agent's; " +
-          'the agent token is valid and is what presses the button afterwards.',
+        fellBack
+          ? 'Home Assistant refused mqtt.publish, which it restricts to administrators, ' +
+            'and this call was given no publisher client - it fell back to the one it was ' +
+            "called with. Pass the user's client as `publisher`; an agent token may not " +
+            'publish, though it is what presses afterwards.'
+          : 'Home Assistant refused mqtt.publish, which it restricts to administrators. ' +
+            'The publisher credential (homeAssistant.token) was the one refused: check it ' +
+            "is an administrator's token and has not expired or been revoked.",
       );
     }
     throw error;
@@ -257,6 +273,7 @@ export async function replyToSession(ha, sessionId, text, { publisher } = {}) {
     replyPayloadTopic(sessionId),
     { at: new Date().toISOString(), text: body, driver: 'agent' },
     false,
+    { fellBack: !publisher },
   );
   return { sessionId, sent: body.length, attributed: true, since };
 }
@@ -281,6 +298,7 @@ export async function launchSession(ha, slug, { prompt, publisher } = {}) {
     launchPromptTopic(slug),
     text ? { at: new Date().toISOString(), text } : '',
     true,
+    { fellBack: !publisher },
   );
   await ha.callService('button', 'press', { entity_id: ids.newSession });
   return { machine: slug, prompt: text.length };
