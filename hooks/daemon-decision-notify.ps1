@@ -157,31 +157,60 @@ function Get-BridgeAnswerButtonPayload {
     <#
         The notification body: an ordinary one, which is why it looks native, plus the
         buttons and the identity echoed back when one is tapped.
+
+        An icon and a background colour make iOS render it as a *communication*
+        notification - the rounded-avatar style messaging apps use, with `title` as
+        the sender. That is why the title is the session name: the question then
+        arrives looking like the session itself saying something, which is both more
+        legible on a Lock Screen and unmistakably not an ordinary alert.
     #>
     param(
         [Parameter(Mandatory)][string]$SessionId,
         [Parameter(Mandatory)][string]$SessionName,
         [Parameter(Mandatory)]$Marker,
         [AllowEmptyCollection()][object[]]$Actions = @(),
-        [string]$DashboardUrlPath = 'agent-decisions'
+        [string]$DashboardUrlPath = 'agent-decisions',
+        [string]$MachineName = '',
+        [string]$Icon = 'mdi:chat-question',
+        [string]$IconColor = '#FFFFFF',
+        [string]$Color = '#FF9F0A',
+        [string]$InterruptionLevel = 'time-sensitive'
     )
 
     $question = (([string]$Marker.question) -replace '\s+', ' ').Trim()
     if ([string]::IsNullOrWhiteSpace($question)) { $question = 'This session is waiting for an answer.' }
 
+    $data = @{
+        tag         = Get-BridgeAnswerButtonTag -SessionId $SessionId
+        url         = "/$DashboardUrlPath/decision"
+        actions     = @($Actions)
+        # Several questions at once stack under one heading instead of scattering.
+        group       = 'agent-bridge'
+        action_data = @{
+            bridge   = 'decision'
+            session  = $SessionId
+            decision = [string]$Marker.decisionId
+        }
+    }
+
+    if (-not [string]::IsNullOrWhiteSpace($Icon)) {
+        $data['notification_icon'] = $Icon
+        $data['notification_icon_color'] = $IconColor
+        $data['color'] = $Color
+    }
+    if (-not [string]::IsNullOrWhiteSpace($InterruptionLevel)) {
+        $data['interruption-level'] = $InterruptionLevel
+    }
+    # Which machine is asking, which the title cannot say without crowding out the
+    # session name it needs to carry.
+    if (-not [string]::IsNullOrWhiteSpace($MachineName)) {
+        $data['subtitle'] = "$MachineName - waiting on you"
+    }
+
     @{
         title   = $SessionName
         message = $question
-        data    = @{
-            tag         = Get-BridgeAnswerButtonTag -SessionId $SessionId
-            url         = "/$DashboardUrlPath/decision"
-            actions     = @($Actions)
-            action_data = @{
-                bridge   = 'decision'
-                session  = $SessionId
-                decision = [string]$Marker.decisionId
-            }
-        }
+        data    = $data
     }
 }
 
@@ -252,7 +281,12 @@ function Sync-DaemonAnswerButtons {
         $actions = Get-BridgeAnswerButtonActions -Marker $Marker -DecisionId $decisionId `
             -Options $options -MaxButtons ([int]$script:DecisionBridgeConfig.AnswerButtonMax)
         $payload = Get-BridgeAnswerButtonPayload -SessionId $SessionId -SessionName $name -Marker $Marker `
-            -Actions $actions -DashboardUrlPath ([string]$script:DecisionBridgeConfig.DashboardUrlPath)
+            -Actions $actions -DashboardUrlPath ([string]$script:DecisionBridgeConfig.DashboardUrlPath) `
+            -MachineName $script:DaemonMachineName `
+            -Icon ([string]$script:DecisionBridgeConfig.AnswerButtonIcon) `
+            -IconColor ([string]$script:DecisionBridgeConfig.AnswerButtonIconColor) `
+            -Color ([string]$script:DecisionBridgeConfig.AnswerButtonColor) `
+            -InterruptionLevel ([string]$script:DecisionBridgeConfig.AnswerButtonInterruption)
 
         $sent = Send-BridgeAnswerButtonNotification -Payload $payload -Headers $Headers
         if ($sent -gt 0) {

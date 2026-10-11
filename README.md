@@ -376,6 +376,8 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `answerButtons.enabled` | Put a question's options on the phone as notification buttons, so it can be answered without opening the dashboard (default `false`). See [Answering from the notification](#answering-from-the-notification) |
 | `answerButtons.services` | The `notify.mobile_app_<device>` services to send to, one per device. Empty means the feature does nothing |
 | `answerButtons.maxButtons` | How many options to offer as buttons (default `6`). The rest are left to the dashboard |
+| `answerButtons.icon` / `.iconColor` / `.color` | The MDI glyph, its colour, and the background behind it (defaults `mdi:chat-question`, `#FFFFFF`, `#FF9F0A`). Setting an icon makes iOS render the alert as a communication notification; clear `icon` for a plain one |
+| `answerButtons.interruptionLevel` | `time-sensitive` (default) breaks through Focus, because a session cannot continue until you answer. `active` stays inside Focus, `passive` keeps it off the Lock Screen |
 | `copilot.sessionStateRoot` | Override the Copilot CLI's session-state location if not `~/.copilot/session-state` |
 | `newSession.enabled` | Set to `false` to hide the "Start a new session" controls (default `true`) |
 | `newSession.launcher` | Default agent: `auto` (default: the installed agent used most recently on this machine, else one that is signed in), `agency`, `copilot`, `claude` or `codex`. With more than one installed, the card also gets an Agent dropdown |
@@ -582,7 +584,11 @@ without opening the dashboard at all.
 "answerButtons": {
   "enabled": true,
   "services": ["notify.mobile_app_your_phone"],
-  "maxButtons": 6
+  "maxButtons": 6,
+  "icon": "mdi:chat-question",
+  "iconColor": "#FFFFFF",
+  "color": "#FF9F0A",
+  "interruptionLevel": "time-sensitive"
 }
 ```
 
@@ -591,6 +597,15 @@ pull it down. That is Apple's behaviour for every app, not something the bridge
 chooses. **Type an answer** is always offered as well, because every Copilot option
 list ends in "Other (type your answer)", and it is the only way to answer a freeform
 question.
+
+**How it looks.** Giving the notification an icon and a background colour makes iOS
+render it as a *communication* notification — the rounded-avatar style messaging apps
+use, with the title as the sender. The session name is therefore the title, so a
+question arrives looking like the session itself saying something rather than like one
+more alert from the house; the machine goes in the subtitle, and several questions
+group together. `interruptionLevel` defaults to `time-sensitive` because a session
+genuinely cannot continue until you answer, which is the case Apple's level exists
+for; turn it down to `active` to keep questions inside Focus.
 
 A tap is not a separate route into the session. It is handed to the same
 `Invoke-DaemonDecisionAnswer` the dashboard's answers go through, so the attempt
