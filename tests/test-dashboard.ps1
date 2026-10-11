@@ -695,6 +695,26 @@ Test-That 'while the same version it can vouch for is given the custom cards as 
     @(Find-TestCardsOfType 'custom:agent-bridge-activity-card').Count -gt 0
 }
 
+# Rebuilding is what runs the gate, so reconciliation has to know the answer can
+# change on its own. An install replacing the local card with different bytes at an
+# unchanged CARD_VERSION leaves the registered resource - and so the URL, and so every
+# other input to the signature - exactly as it was, and a verified receipt then skipped
+# the rebuild and kept serving the layout for a card this bridge no longer vouches for.
+$signatureArgs = @{ Sessions = $sessions; Machines = $twoMachines; MachineSelector = ''
+    ReplyCardUrl = "/local/agent-bridge-reply-card.js?v=$shippedCard" }
+Test-That 'the same inputs signed for a card that is no longer this build differ' {
+    (Get-BridgeDashboardInputSignature @signatureArgs -CardTrusted $true) -cne
+        (Get-BridgeDashboardInputSignature @signatureArgs -CardTrusted $false)
+}
+Test-That 'and working the answer out gives the same signature as stating it' {
+    (Get-BridgeDashboardInputSignature @signatureArgs) -ceq
+        (Get-BridgeDashboardInputSignature @signatureArgs -CardTrusted $true)
+}
+Test-That 'a dashboard with no card at all signs as the fallback it already is' {
+    (Get-BridgeDashboardInputSignature -Sessions $sessions -Machines $twoMachines -MachineSelector '' -ReplyCardUrl '') -ceq
+        (Get-BridgeDashboardInputSignature -Sessions $sessions -Machines $twoMachines -MachineSelector '' -ReplyCardUrl '' -CardTrusted $true)
+}
+
 Write-Host '--- a live session produces a card ---'
 Test-That 'the control cards plus a session card are present' { @($cfg.views[0].cards).Count -ge 3 }
 
@@ -1848,7 +1868,7 @@ Test-That 'and a blank entry never matches a blank user' { -not (Test-BridgeAgen
 # now asks it whether the served bytes are this build at all, so what it decides is
 # part of what the renderer emits even though its own text sits in another function.
 $script:ExpectedRenderVersion = '1.10.0'
-$script:ExpectedRenderHash = 'e1bcde6b024d665eb9d58eab040accb22fd7357075cbd695159386c3469a2c99'
+$script:ExpectedRenderHash = 'b231f2b20c72921ec0cfbc746bb3f7366c5fb20d31e41234f511e8596001529a'
 $artifact = Get-BridgeRenderArtifact
 
 Test-That 'the renderer is still the one this version was pinned to' {

@@ -1409,8 +1409,25 @@ function Set-BridgePublicationPolicy {
 }
 
 function Get-BridgeDashboardInputSignature {
+    <#
+        Everything the rendered dashboard depends on, as one digest. Reconciliation
+        compares it against the accepted receipt to decide whether to rebuild.
+
+        Whether the served card is this build belongs in it, because the renderer now
+        asks that question and changes what it emits on the answer. The two can move
+        independently: an install replacing the local card with different bytes at an
+        unchanged CARD_VERSION leaves the registered resource - and so the URL, and so
+        every other input here - exactly as it was. Without this the receipt stayed
+        verified, the rebuild was skipped, and the dashboard went on showing the
+        feature-specific layout for a card this bridge had stopped vouching for, which
+        is the state the gate exists to leave behind.
+
+        CardTrusted is the answer when the caller already has it, and is how the
+        binding is tested; left alone it is worked out here.
+    #>
     param([AllowEmptyCollection()][object[]]$Sessions, [AllowEmptyCollection()][object[]]$Machines,
-        [AllowEmptyString()][string]$MachineSelector, [AllowEmptyString()][string]$ReplyCardUrl)
+        [AllowEmptyString()][string]$MachineSelector, [AllowEmptyString()][string]$ReplyCardUrl,
+        [AllowNull()][object]$CardTrusted = $null)
     $sessionInputs = @($Sessions | Sort-Object Node | ForEach-Object {
         $entry = $_
         $item = @{}
@@ -1428,8 +1445,13 @@ function Get-BridgeDashboardInputSignature {
         $item.SessionNodes = if ($entry.PSObject.Properties['SessionNodes']) { @($entry.SessionNodes | Sort-Object) } else { @() }
         $item
     })
+    # No card at all is already the fallback, so there is nothing left to distrust.
+    $trusted = if ($null -ne $CardTrusted) { [bool]$CardTrusted }
+               elseif ([string]::IsNullOrWhiteSpace($ReplyCardUrl)) { $true }
+               else { [bool](Test-BridgeServedCardContent -ReplyCardUrl $ReplyCardUrl) }
     Get-BridgePublicationHash (ConvertTo-BridgePublicationJson @{
         sessions = $sessionInputs; machines = $machineInputs; selector = $MachineSelector; cardUrl = $ReplyCardUrl
+        cardTrusted = $trusted
     })
 }
 
