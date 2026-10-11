@@ -1727,3 +1727,56 @@ function Get-BridgeRegistrationHealth {
     }
 }
 
+
+function Get-BridgeUpdateCheckSummary {
+    <#
+        What the last release check found and which GitHub allowance it spent, read
+        from the cache the daemon already writes - so `agent-ha-bridge status` can say
+        it without making a request of its own. $null when there is no readable
+        record, because a missing or corrupt display file is nothing to show.
+
+        The allowance is deliberately three-valued, not two. A cache written by a
+        version before TokenSource existed says nothing about how its check
+        authenticated, and that version could already use updates.token or an ambient
+        GH_TOKEN - so reading the absent field as "unauthenticated" would tell a
+        machine that already has a token to go and configure one, for as long as that
+        cache lasts. AllowanceKnown is what separates "went out unauthenticated" from
+        "this record cannot say". Raised by Codex on #153.
+
+        Lives here beside Get-BridgeRegistrationHealth, which is the other thing
+        `status` reports by reading rather than asking.
+    #>
+    param([Parameter(Mandatory)][string]$Path)
+
+    if (-not (Test-Path -LiteralPath $Path -PathType Leaf)) { return $null }
+    $record = $null
+    try { $record = Get-Content -LiteralPath $Path -Raw -Encoding UTF8 | ConvertFrom-Json }
+    catch { return $null }
+    if ($null -eq $record -or -not $record.PSObject.Properties['CheckedAt']) { return $null }
+
+    $checkedAt = [DateTimeOffset]::MinValue
+    $when = if ([DateTimeOffset]::TryParse([string]$record.CheckedAt, [ref]$checkedAt)) {
+        $checkedAt.ToLocalTime().ToString('MMM d HH:mm')
+    } else { 'at an unreadable time' }
+    $state = if ($record.PSObject.Properties['State']) { [string]$record.State } else { '' }
+    $tag = ''
+    if ($record.PSObject.Properties['Release'] -and $record.Release -and
+        $record.Release.PSObject.Properties['Tag']) { $tag = [string]$record.Release.Tag }
+
+    [pscustomobject]@{
+        When     = $when
+        State    = $state
+        Answered = ($state -eq 'Found')
+        Verdict  = switch ($state) {
+            'Found' { if ($tag) { "found $tag" } else { 'answered' } }
+            'RateLimited' { 'refused - GitHub is rate limiting this machine' }
+            'NotFound' { 'GitHub reported no release' }
+            default { 'could not establish the latest release' }
+        }
+        AllowanceKnown = [bool]$record.PSObject.Properties['TokenSource']
+        # A name - 'updates.token', '$env:GH_TOKEN' - or '' for a check that went out
+        # unauthenticated. Never a credential: the cache has never held one.
+        TokenSource = if ($record.PSObject.Properties['TokenSource']) { [string]$record.TokenSource } else { '' }
+        TokenNote   = if ($record.PSObject.Properties['TokenNote']) { [string]$record.TokenNote } else { '' }
+    }
+}

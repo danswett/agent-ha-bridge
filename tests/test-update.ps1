@@ -1173,6 +1173,63 @@ Test-That 'and no half-written staging folder is left behind' {
     ($stagingAfter -join "`n") -ceq ($stagingBefore -join "`n")
 } "before=$(@($stagingBefore).Count) after=$(@($stagingAfter).Count)"
 
+# --- what `status` reads back without making a request ----------------------------
+# A refused check retains the last known release, so on the dashboard a machine that
+# has not successfully checked in days looks exactly like one that is current (#153).
+# `status` reads the cache the daemon already wrote rather than asking GitHub again.
+$summaryDir = Join-Path $env:TEMP ("bridge-summary-" + [guid]::NewGuid().ToString('N').Substring(0, 8))
+New-Item -ItemType Directory -Path $summaryDir -Force | Out-Null
+$summaryPath = Join-Path $summaryDir 'agent-bridge-update.json'
+try {
+    Test-That 'no cache at all is nothing to report, not a fault' {
+        $null -eq (Get-BridgeUpdateCheckSummary -Path (Join-Path $summaryDir 'absent.json'))
+    }
+    'not json at all' | Set-Content -LiteralPath $summaryPath -Encoding UTF8
+    Test-That 'and neither is one that cannot be read' {
+        $null -eq (Get-BridgeUpdateCheckSummary -Path $summaryPath)
+    }
+
+    [pscustomobject]@{
+        CheckedAt = [DateTimeOffset]::Now.ToString('o'); Reached = $true; State = 'Found'
+        Detail = ''; RetryAt = $null; RateLimitStrikes = 0; TokenSource = '$env:GH_TOKEN'; TokenNote = ''
+        Release = [pscustomobject]@{ Tag = 'v9.9.7' }
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $summaryPath -Encoding UTF8
+    $answered = Get-BridgeUpdateCheckSummary -Path $summaryPath
+    Test-That 'an answered check names the release and the credential that got it' {
+        $answered.Answered -and $answered.Verdict -eq 'found v9.9.7' -and
+            $answered.AllowanceKnown -and $answered.TokenSource -eq '$env:GH_TOKEN'
+    } "$($answered.Verdict) / $($answered.TokenSource)"
+
+    [pscustomobject]@{
+        CheckedAt = [DateTimeOffset]::Now.ToString('o'); Reached = $false; State = 'RateLimited'
+        Detail = 'x'; RetryAt = $null; RateLimitStrikes = 1; TokenSource = ''
+        TokenNote = 'updates.token was rejected by GitHub (bad credentials); the check ran unauthenticated instead.'
+        Release = $null
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $summaryPath -Encoding UTF8
+    $refused = Get-BridgeUpdateCheckSummary -Path $summaryPath
+    Test-That 'a refused check reads as refused rather than as current' {
+        -not $refused.Answered -and $refused.Verdict -match 'rate limiting'
+    } $refused.Verdict
+    Test-That 'and an empty source is a check that really did go out unauthenticated' {
+        $refused.AllowanceKnown -and $refused.TokenSource -eq '' -and $refused.TokenNote -match 'rejected'
+    } "known=$($refused.AllowanceKnown) note=$($refused.TokenNote)"
+
+    # The cache a machine is carrying the moment it takes this release was written by
+    # the version before it, which had no TokenSource field - and *could* already
+    # authenticate from updates.token or an ambient GH_TOKEN. Reading that absence as
+    # "unauthenticated" would tell a machine that already has a token to go and
+    # configure one, for as long as that cache lasts. Raised by Codex on #153.
+    [pscustomobject]@{
+        CheckedAt = [DateTimeOffset]::Now.ToString('o'); Reached = $false; State = 'RateLimited'
+        Detail = 'x'; RetryAt = $null; RateLimitStrikes = 1; Release = $null
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $summaryPath -Encoding UTF8
+    $legacy = Get-BridgeUpdateCheckSummary -Path $summaryPath
+    Test-That 'a cache written before the field is unknown, not proof of an unauthenticated check' {
+        -not $legacy.AllowanceKnown -and $legacy.TokenSource -eq '' -and $legacy.Verdict -match 'rate limiting'
+    } "known=$($legacy.AllowanceKnown)"
+}
+finally { Remove-Item -LiteralPath $summaryDir -Recurse -Force -ErrorAction SilentlyContinue }
+
 # --- where the download has got to -------------------------------------------------
 # The emitter #155 was missing, driven against an ordinary Stream. The socket is not
 # the interesting part - what gets reported while bytes arrive is - and the buffer and
