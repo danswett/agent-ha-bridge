@@ -362,6 +362,21 @@ Test-That 'an unparseable address is not remembered rather than thrown over' {
     (Get-BridgeReplacedUrl -Current 'ha.test:8123' -Replacement 'https://remote.test') -eq '' -and
     (Get-BridgeReplacedUrl -Current 'http://ha.test:8123' -Replacement 'not-a-url') -eq ''
 }
+# A path is case-sensitive and a host is not, which is exactly how [Uri] normalizes
+# them - and exactly what PowerShell's own -eq would throw away. Behind a
+# path-prefixed reverse proxy these are two different Home Assistants, and treating
+# them as one meant typing the new one, confirming it, and silently keeping the old.
+Test-That 'a differently cased path is a different endpoint, because it is one' {
+    (Get-BridgeReplacedUrl -Current 'https://ha.test/ha' -Replacement 'https://ha.test/HA') -eq 'https://ha.test/ha'
+}
+Test-That 'a differently cased host is still the same endpoint' {
+    (Get-BridgeReplacedUrl -Current 'https://HA.test/ha' -Replacement 'https://ha.test/ha') -eq ''
+}
+Test-That 'the resolver takes a path-case change rather than quietly declining it' {
+    $r = Resolve-BridgeHomeAssistantUrl -Configured 'https://ha.test/ha' -Probe $yes `
+        -ChangePrompt { param($current, $reachable, $previous) 'https://ha.test/HA' }
+    $r.Url -eq 'https://ha.test/HA' -and $r.Source -eq 'changed'
+}
 
 Write-Host '--- the question itself ---'
 $script:AnswerQueue = [System.Collections.Generic.Queue[string]]::new()
@@ -436,6 +451,10 @@ Test-That 'a replacement nothing answers at has to be confirmed, and declining r
 Set-BridgeAnswer @('y', 'https://offline.test', 'y')
 Test-That 'confirming an endpoint that is simply switched off is still allowed' {
     (Read-BridgeHomeAssistantUrlChange -Current 'http://ha.test:8123' -Reachable $true -Previous '' -Probe $silent) -eq 'https://offline.test'
+}
+Set-BridgeAnswer @('y', 'https://ha.test/HA')
+Test-That 'the question accepts a path-case change too, rather than reading it as no change' {
+    (Read-BridgeHomeAssistantUrlChange -Current 'https://ha.test/ha' -Reachable $true -Previous '' -Probe $probeAnswers) -eq 'https://ha.test/HA'
 }
 Set-BridgeAnswer @('n')
 $said = (Read-BridgeHomeAssistantUrlChange -Current 'http://ha.test:8123' -Reachable $false -Previous '' `

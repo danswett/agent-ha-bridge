@@ -1737,6 +1737,26 @@ function Find-HomeAssistant {
     return $null
 }
 
+function Test-BridgeSameHomeAssistantUrl {
+    <#
+        Whether two already-normalized Home Assistant URLs name the same endpoint.
+
+        Ordinal, deliberately. ConvertTo-BridgeHomeAssistantUrl returns
+        [Uri]::AbsoluteUri, which has already lowercased the scheme and host and has
+        left the path alone - because a path is case-sensitive and a host is not.
+        PowerShell's own -eq would compare the whole string case-insensitively and
+        undo half of that, so https://ha.example/ha and https://ha.example/HA, two
+        different endpoints behind a path-prefixed reverse proxy, would read as no
+        change at all: the installer would accept the typed URL and silently keep the
+        old one. Raised by Codex on #198.
+    #>
+    param(
+        [AllowEmptyString()][AllowNull()][string]$Left,
+        [AllowEmptyString()][AllowNull()][string]$Right
+    )
+    ([string]$Left) -ceq ([string]$Right)
+}
+
 function Get-BridgeReplacedUrl {
     <#
         The endpoint a change is moving away from, or '' when nothing is moving.
@@ -1756,7 +1776,7 @@ function Get-BridgeReplacedUrl {
         $to = ConvertTo-BridgeHomeAssistantUrl -Value $Replacement
     }
     catch { return '' }
-    if ($from -eq $to) { return '' }
+    if (Test-BridgeSameHomeAssistantUrl -Left $from -Right $to) { return '' }
     $from
 }
 
@@ -1818,7 +1838,7 @@ function Read-BridgeHomeAssistantUrlChange {
             Write-Host "    $($_.Exception.Message)" -ForegroundColor DarkGray
             continue
         }
-        if ($candidate -eq $Current) { return '' }
+        if (Test-BridgeSameHomeAssistantUrl -Left $candidate -Right $Current) { return '' }
 
         if (& $Probe $candidate) {
             Write-Host "    $candidate answered" -ForegroundColor Green
@@ -1872,7 +1892,7 @@ function Resolve-BridgeHomeAssistantUrl {
                 # typed is worse than declining to change anything.
                 $replacement = ''
                 try { $replacement = ConvertTo-BridgeHomeAssistantUrl -Value $answer } catch { $replacement = '' }
-                if ($replacement -and $replacement -ne $configured) {
+                if ($replacement -and -not (Test-BridgeSameHomeAssistantUrl -Left $replacement -Right $configured)) {
                     return [pscustomobject]@{ Url = $replacement; Source = 'changed'; Prompted = $true }
                 }
             }
