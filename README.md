@@ -792,8 +792,13 @@ Claude has no context-window switch; `--autocompact`, which sets the window it c
 at, is the nearest equivalent and is what its Context row offers (`auto`, `200k`, `500k`,
 `1m`).
 
-Copilot's model list is read from `copilot help config` and cached for half an hour, so
-it stays current as models come and go. The other two ship with a short built-in list,
+Copilot's model list is read from `copilot help config`, with a 15-second startup
+deadline, and successful results are cached for half an hour. Failed probes retry
+after a minute and keep the last successful list in memory rather than removing the
+model choices. On a cold start with no previous successful discovery, *Agent default*
+and `auto` remain available until a retry succeeds. Failures and recovery are recorded
+in the daemon log (`agent-ha-bridge logs`), or the bridge log outside the daemon.
+The other two ship with a short built-in list,
 which `newSession.models.<agent>` replaces — worth doing for Copilot too, since
 twenty-six options on a phone is a scroll rather than a choice.
 

@@ -1712,8 +1712,9 @@ function Get-BridgeLauncherKind {
 # How long a discovered model list is kept. Only Copilot can be asked for one, and
 # that costs a process launch (about 0.7 s), which is far too much to spend on every
 # reconcile. Half an hour is well inside the time it takes to notice a new model
-# exists, and a bridge restart re-reads it anyway.
+# exists, but a failed probe must not hide the choices for that long.
 $script:BridgeModelCacheMinutes = 30
+$script:BridgeModelRetrySeconds = 60
 $script:BridgeModelCache = $null
 
 function Get-BridgeCopilotModelList {
@@ -1726,8 +1727,9 @@ function Get-BridgeCopilotModelList {
         because the set turns over quickly: a hard-coded list is wrong within weeks,
         and a wrong list here means a launch that fails at the command line.
 
-        Returns @() when Copilot is not installed or the output does not parse, and
-        the caller then falls back to its configured list.
+        Failed discovery keeps the last successful list and retries after a minute.
+        Without a previous list it returns @(), so the caller offers its defaults
+        until discovery succeeds. Failures and recovery are logged.
     #>
     param([string]$Path)
 
@@ -1737,17 +1739,27 @@ function Get-BridgeCopilotModelList {
     # cost on every cache hit, and the three axes ask once each per reconcile. This is
     # the same trap Get-BridgeAvailableLaunchers documents for the launcher list.
     $cached = $script:BridgeModelCache
-    if ($null -ne $cached -and ([DateTimeOffset]::Now - $cached.At).TotalMinutes -lt $script:BridgeModelCacheMinutes) {
-        return @($cached.Models)
+    if ($null -ne $cached) {
+        $cacheSeconds = if ($cached.Failed) { $script:BridgeModelRetrySeconds } else { $script:BridgeModelCacheMinutes * 60 }
+        if (([DateTimeOffset]::Now - $cached.At).TotalSeconds -lt $cacheSeconds) {
+            return @($cached.Models)
+        }
     }
 
-    if (-not $Path) { $Path = Get-BridgeCopilotPath }
-    if ([string]::IsNullOrWhiteSpace($Path)) { return @() }
-
     $models = @()
+    $failed = $false
+    $diagnostic = ''
     try {
-        $probe = Invoke-BridgeCommandProbe -Executable $Path -Arguments @('help', 'config')
-        if (-not $probe.Ran -or $probe.TimedOut -or $probe.ExitCode -ne 0) { throw "Model discovery failed: $($probe.Output)" }
+        if (-not $Path) { $Path = Get-BridgeCopilotPath }
+        if ([string]::IsNullOrWhiteSpace($Path)) { throw 'Copilot executable was not found' }
+
+        # Model help may need more startup time than a cheap version probe.
+        $timeoutMs = 15000
+        $probe = Invoke-BridgeCommandProbe -Executable $Path -Arguments @('help', 'config') -TimeoutMs $timeoutMs
+        if (-not $probe.Ran) { throw "command could not start: $($probe.Output)" }
+        if ($probe.TimedOut) { throw "command timed out after $($timeoutMs / 1000) seconds" }
+        if ($probe.ExitCode -ne 0) { throw "command exited with code $($probe.ExitCode): $($probe.Output)" }
+        if (-not $probe.PSObject.Properties['StandardOutput']) { throw 'command probe did not provide separate standard output' }
         $raw = $probe.StandardOutput
         # The block of quoted names directly under "`model`:" and nothing else: the
         # same file lists themes and modes in the same shape, so the match is anchored
@@ -1758,13 +1770,27 @@ function Get-BridgeCopilotModelList {
                 ForEach-Object { [string]$_.Groups[1].Value } |
                 Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
         }
+        if ($models.Count -eq 0) { throw 'model list is missing or unrecognised in help output' }
+        if ($null -ne $cached -and $cached.Failed) {
+            $diagnostic = "Copilot model discovery recovered: found $($models.Count) model(s) from '$Path'."
+        }
     }
-    catch { }
+    catch {
+        $failed = $true
+        if ($null -ne $cached) { $models = @($cached.Models) }
+        $detail = ($_.Exception.Message -replace '\s+', ' ').Trim()
+        if ($detail.Length -gt 600) { $detail = $detail.Substring(0, 600) + '...' }
+        $diagnostic = "Copilot model discovery failed for '$Path': $detail. Keeping $($models.Count) cached model(s); retrying in $($script:BridgeModelRetrySeconds)s."
+    }
 
-    # Cached either way, including an empty answer: a machine where the call fails
-    # should not retry it on every reconcile. A Copilot upgraded or installed in the
-    # meantime is picked up when this expires, which is what the half hour is for.
-    $script:BridgeModelCache = [pscustomobject]@{ At = [DateTimeOffset]::Now; Models = @($models) }
+    $script:BridgeModelCache = [pscustomobject]@{
+        At = [DateTimeOffset]::Now; Models = @($models); Failed = $failed
+    }
+    if ($diagnostic) {
+        $daemonLog = Get-Command Write-DaemonLog -ErrorAction SilentlyContinue
+        if ($daemonLog) { & $daemonLog -Message $diagnostic }
+        else { Write-DecisionBridgeLog -Message $diagnostic }
+    }
     @($models)
 }
 
@@ -1897,8 +1923,7 @@ function Get-BridgeTuningOptions {
         # Discovery adds to the built-in list rather than replacing it, so 'auto' -
         # which Copilot accepts but does not print among its models - stays offered.
         if ($entry[$Axis].ContainsKey('Discover')) {
-            $found = @()
-            try { $found = @(& $entry[$Axis].Discover) } catch { }
+            $found = @(& $entry[$Axis].Discover)
             if ($found.Count -gt 0) { $built = @($built) + @($found) }
         }
         $built
