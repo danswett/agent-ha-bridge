@@ -1709,27 +1709,265 @@ function Get-BridgeLauncherKind {
     'copilot'
 }
 
-# How long a discovered model list is kept. Only Copilot can be asked for one, and
-# that costs a process launch (about 0.7 s), which is far too much to spend on every
-# reconcile. Half an hour is well inside the time it takes to notice a new model
-# exists, but a failed probe must not hide the choices for that long.
-$script:BridgeModelCacheMinutes = 30
+function Get-BridgeJsonField {
+    <#
+        A field of an object parsed from the CLI's JSON, or $null when it has no such
+        field or is not an object at all. Nothing the CLI answers is trusted to have
+        the shape expected of it, and indexing the wrong shape throws.
+    #>
+    param([AllowNull()]$Object, [Parameter(Mandatory)][string]$Name)
+
+    if ($Object -is [Collections.IDictionary] -and $Object.Contains($Name)) { return , $Object[$Name] }
+    $null
+}
+
+function ConvertFrom-BridgeCopilotModelRoster {
+    <#
+        The model IDs worth offering from the CLI's answer to session.model.list, in
+        its order and once each.
+
+        It keeps what the CLI's own /model picker shows. A model whose policy is
+        anything but 'enabled' is left out - one the account's administrator has
+        disabled, one not yet configured, Fable on an account without access - while
+        one with no policy at all, such as 'auto', is kept. Anything served by another
+        provider is left out too: Microsoft 365 (Loki) and BYOK models need more than
+        --model to reach, so a launch naming one would fail.
+
+        The ID pattern is the command-line safety boundary. Resolve-BridgeTuningValue
+        accepts anything this list offers, so whatever the CLI sends, an ID is kept
+        only if it is plainly a name: no leading dash, and no spaces, slashes, colons
+        or control characters.
+    #>
+    param([AllowNull()]$Roster)
+
+    $list = Get-BridgeJsonField -Object $Roster -Name 'list'
+    if ($null -eq $list -or $list -is [string] -or $list -is [Collections.IDictionary] -or
+        $list -isnot [Collections.IEnumerable]) {
+        throw 'the CLI answered without a model list'
+    }
+
+    $models = [Collections.Generic.List[string]]::new()
+    $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $entries = 0
+    foreach ($entry in $list) {
+        $entries++
+        $id = Get-BridgeJsonField -Object $entry -Name 'id'
+        if ($id -isnot [string] -or $id -cnotmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\z') { continue }
+        $policy = Get-BridgeJsonField -Object $entry -Name 'policy'
+        if ($null -ne $policy) {
+            $state = Get-BridgeJsonField -Object $policy -Name 'state'
+            if ($state -isnot [string] -or $state -cne 'enabled') { continue }
+        }
+        $provider = Get-BridgeJsonField -Object $entry -Name 'provider'
+        if ($null -ne $provider) {
+            $kind = Get-BridgeJsonField -Object $provider -Name 'kind'
+            if ($kind -isnot [string] -or $kind -cne 'copilot') { continue }
+        }
+        if ($seen.Add($id)) { $models.Add($id) }
+    }
+    if ($models.Count -eq 0) { throw "the CLI listed no usable models ($entries entries)" }
+    $models.ToArray()
+}
+
+function Get-BridgeFolderSnapshot {
+    <#
+        Whether each folder exists, when it was last written to and what is in it, for
+        Restore-BridgeFolderSnapshot to put back.
+    #>
+    param([Parameter(Mandatory)][string[]]$Path)
+
+    foreach ($folder in $Path) {
+        $existed = [IO.Directory]::Exists($folder)
+        $written = $null
+        $names = $null
+        if ($existed) {
+            try {
+                $written = [IO.Directory]::GetLastWriteTimeUtc($folder)
+                $names = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+                foreach ($name in [IO.Directory]::EnumerateFileSystemEntries($folder)) { [void]$names.Add($name) }
+            }
+            catch { $names = $null }
+        }
+        [pscustomobject]@{ Path = $folder; Existed = $existed; LastWriteTimeUtc = $written; Names = $names }
+    }
+}
+
+function Restore-BridgeFolderSnapshot {
+    <#
+        Puts folders back the way Get-BridgeFolderSnapshot found them, as far as that
+        is safe. A folder that did not exist is removed again while it is empty, and
+        one holding the same entries as before gets its old write time back. One whose
+        entries changed keeps its new time: something else really did write there
+        meanwhile. Never throws.
+    #>
+    param([AllowEmptyCollection()][object[]]$Snapshot = @())
+
+    foreach ($folder in $Snapshot) {
+        if ($null -eq $folder) { continue }
+        try {
+            if (-not [IO.Directory]::Exists($folder.Path)) { continue }
+            if (-not $folder.Existed) {
+                # Not recursive: files in it now belong to whoever put them there.
+                try { [IO.Directory]::Delete($folder.Path, $false) } catch { }
+                continue
+            }
+            if ($null -eq $folder.Names) { continue }
+            $now = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+            foreach ($name in [IO.Directory]::EnumerateFileSystemEntries($folder.Path)) { [void]$now.Add($name) }
+            if ($now.SetEquals($folder.Names)) { [IO.Directory]::SetLastWriteTimeUtc($folder.Path, $folder.LastWriteTimeUtc) }
+        }
+        catch { }
+    }
+}
+
+function Get-BridgeCopilotModelRoster {
+    <#
+        The models this Copilot account can use, asked of the CLI the way its own
+        /model picker asks: start its headless server, open a throwaway session, list
+        that session's models and delete it again.
+
+        Nothing simpler gives the same answer. `copilot help config` prints a fixed
+        catalogue built into the CLI, which offered Fable to accounts without access
+        to it, and the server's session-less models.list leaves out models the picker
+        shows, Gemini among them.
+
+        It has to run against the user's own Copilot home, since that is where the
+        account is signed in, so the session is made as inert as the protocol allows
+        and tidied up after. It loads no hooks, skills, project config or custom
+        instructions, keeps no session store and starts in an empty scratch folder; no
+        MCP servers start for it (checked on 1.0.95), and since no prompt is sent it
+        uses no premium requests. The CLI deletes the session, and its lock and folder
+        are removed as well once the process has exited. The session-state folder
+        times that the launcher's 'auto' reads to tell when Copilot was last used are
+        put back, so the probe never looks like use.
+
+        While the session lives, the CLI keeps an inuse.<pid>.lock in its folder - the
+        mark Get-LiveCopilotSessions publishes a session card for. That is safe only
+        because every caller runs on the daemon's own thread, between discoveries; run
+        alongside one, as a background job would, the probe could appear as a session.
+
+        Throws, saying why, on any failure; gives up after -TimeoutMs, plus a few
+        seconds to clean up.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [int]$TimeoutMs = 20000
+    )
+
+    $copilotHome = if ($env:COPILOT_HOME) { $env:COPILOT_HOME } else { Join-Path $HOME '.copilot' }
+    $state = [IO.Path]::Combine($copilotHome, 'session-state')
+    $locks = [IO.Path]::Combine($state, '.session-operation-locks')
+    # Child first, so a lock folder the probe created is gone before its parent is tried.
+    $snapshot = @(Get-BridgeFolderSnapshot -Path @($locks, $state))
+    $root = [IO.Path]::Combine([IO.Path]::GetTempPath(), "agent-bridge-models-$([guid]::NewGuid().ToString('N'))")
+    $workingDirectory = [IO.Path]::Combine($root, 'wd')
+    $logs = [IO.Path]::Combine($root, 'logs')
+    $deadline = [DateTimeOffset]::Now.AddMilliseconds($TimeoutMs)
+
+    $connection = $null
+    $sessionId = $null
+    $version = ''
+    $models = @()
+    try {
+        [void][IO.Directory]::CreateDirectory($workingDirectory)
+        [void][IO.Directory]::CreateDirectory($logs)
+        $connection = Start-BridgeJsonRpcProcess -Executable $Path -WorkingDirectory $workingDirectory -Arguments @(
+            '--headless', '--no-auto-update', '--stdio', '--log-level', 'error', '--log-dir', $logs)
+
+        try {
+            $hello = Invoke-BridgeJsonRpcRequest -Connection $connection -Method 'connect' -Params @{} -Deadline $deadline
+            $reported = Get-BridgeJsonField -Object $hello -Name 'version'
+            if ($reported -is [string] -and $reported -cmatch '^[0-9A-Za-z.+-]{1,40}\z') { $version = $reported }
+        }
+        catch {
+            # A CLI from before connect existed still answers ping.
+            if ($_.Exception.Data['JsonRpcCode'] -ne -32601) { throw }
+            [void](Invoke-BridgeJsonRpcRequest -Connection $connection -Method 'ping' -Params @{} -Deadline $deadline)
+        }
+
+        $sessionId = [guid]::NewGuid().ToString()
+        [void](Invoke-BridgeJsonRpcRequest -Connection $connection -Method 'session.create' -Deadline $deadline -Params ([ordered]@{
+                    sessionId                          = $sessionId
+                    clientName                         = 'agent-ha-bridge-model-probe'
+                    workingDirectory                   = $workingDirectory
+                    requestPermission                  = $false
+                    requestUserInput                   = $false
+                    requestElicitation                 = $false
+                    requestExitPlanMode                = $false
+                    requestAutoModeSwitch              = $false
+                    hooks                              = $false
+                    envValueMode                       = 'direct'
+                    infiniteSessions                   = @{ enabled = $false }
+                    enableSessionStore                 = $false
+                    enableSessionTelemetry             = $false
+                    enableSkills                       = $false
+                    enableFileHooks                    = $false
+                    enableConfigDiscovery              = $false
+                    enableHostGitOperations            = $false
+                    enableOnDemandInstructionDiscovery = $false
+                    skipEmbeddingRetrieval             = $true
+                    streaming                          = $false
+                    includeSubAgentStreamingEvents     = $false
+                }))
+        $roster = Invoke-BridgeJsonRpcRequest -Connection $connection -Method 'session.model.list' -Params @{ sessionId = $sessionId } -Deadline $deadline
+        $models = @(ConvertFrom-BridgeCopilotModelRoster -Roster $roster)
+    }
+    catch {
+        if ($_.Exception.Data['JsonRpcCode'] -eq -32601) {
+            $cli = if ($version) { "Copilot CLI $version" } else { 'this Copilot CLI' }
+            throw "$cli cannot list its models over its SDK interface ($($_.Exception.Message)); update it"
+        }
+        throw
+    }
+    finally {
+        if ($null -ne $connection) {
+            if ($sessionId) {
+                # Its own few seconds, so a probe that ran out of time still asks.
+                try {
+                    [void](Invoke-BridgeJsonRpcRequest -Connection $connection -Method 'session.delete' -Params @{ sessionId = $sessionId } -Deadline ([DateTimeOffset]::Now.AddSeconds(3)))
+                }
+                catch { }
+            }
+            $stopped = Stop-BridgeJsonRpcProcess -Connection $connection
+            # Only once it has exited: a CLI still running may still hold its lock.
+            if ($stopped.Exited -and $sessionId) {
+                try { [IO.File]::Delete([IO.Path]::Combine($locks, "$sessionId.lock")) } catch { }
+                $sessionFolder = [IO.Path]::Combine($state, $sessionId)
+                try { if ([IO.Directory]::Exists($sessionFolder)) { [IO.Directory]::Delete($sessionFolder, $true) } } catch { }
+            }
+        }
+        Restore-BridgeFolderSnapshot -Snapshot $snapshot
+        try { if ([IO.Directory]::Exists($root)) { [IO.Directory]::Delete($root, $true) } } catch { }
+    }
+    $models
+}
+
+# How long a discovered model list is kept. Each refresh starts the Copilot CLI, opens
+# a throwaway session and waits for GitHub to say what the account can use - three or
+# four seconds, up to twelve when the CLI is slow to start - so an answer is kept for
+# six hours: four refreshes a day rather than the forty-eight a half-hour cache cost.
+# The list only moves when a model is added or the account's policy changes, and
+# restarting the daemon asks afresh. A failure is retried after a minute, the wait
+# doubling with each further failure up to half an hour, so a CLI that is signed out
+# or offline is not started every minute all day.
+$script:BridgeModelCacheHours = 6
 $script:BridgeModelRetrySeconds = 60
+$script:BridgeModelRetryMaxSeconds = 1800
 $script:BridgeModelCache = $null
 
 function Get-BridgeCopilotModelList {
     <#
-        The models Copilot will accept, read from `copilot help config`.
+        The models this Copilot account can use, as its own /model picker lists them
+        (see Get-BridgeCopilotModelRoster).
 
-        Copilot prints its model list under the `model` setting, which is the only
-        machine-readable list any of the agents offer - Claude and Codex document
-        theirs only in prose, so those stay configured lists. Discovering it matters
-        because the set turns over quickly: a hard-coded list is wrong within weeks,
-        and a wrong list here means a launch that fails at the command line.
+        Only Copilot can be asked - Claude and Codex document their models only in
+        prose, so those stay configured lists. Discovering it matters because the set
+        turns over quickly and differs by account: a hard-coded list is wrong within
+        weeks, and a model the account cannot use means a launch that fails.
 
-        Failed discovery keeps the last successful list and retries after a minute.
-        Without a previous list it returns @(), so the caller offers its defaults
-        until discovery succeeds. Failures and recovery are logged.
+        A failed refresh keeps the last successful list and retries, backing off as
+        described above. Without a previous list it returns @(), so the caller offers
+        its defaults until discovery succeeds. Failures and recovery are logged.
     #>
     param([string]$Path)
 
@@ -1740,7 +1978,7 @@ function Get-BridgeCopilotModelList {
     # the same trap Get-BridgeAvailableLaunchers documents for the launcher list.
     $cached = $script:BridgeModelCache
     if ($null -ne $cached) {
-        $cacheSeconds = if ($cached.Failed) { $script:BridgeModelRetrySeconds } else { $script:BridgeModelCacheMinutes * 60 }
+        $cacheSeconds = if ($cached.Failed) { [int]$cached.RetrySeconds } else { $script:BridgeModelCacheHours * 3600 }
         if (([DateTimeOffset]::Now - $cached.At).TotalSeconds -lt $cacheSeconds) {
             return @($cached.Models)
         }
@@ -1748,43 +1986,32 @@ function Get-BridgeCopilotModelList {
 
     $models = @()
     $failed = $false
+    $retrySeconds = 0
     $diagnostic = ''
     try {
         if (-not $Path) { $Path = Get-BridgeCopilotPath }
         if ([string]::IsNullOrWhiteSpace($Path)) { throw 'Copilot executable was not found' }
-
-        # Model help may need more startup time than a cheap version probe.
-        $timeoutMs = 15000
-        $probe = Invoke-BridgeCommandProbe -Executable $Path -Arguments @('help', 'config') -TimeoutMs $timeoutMs
-        if (-not $probe.Ran) { throw "command could not start: $($probe.Output)" }
-        if ($probe.TimedOut) { throw "command timed out after $($timeoutMs / 1000) seconds" }
-        if ($probe.ExitCode -ne 0) { throw "command exited with code $($probe.ExitCode): $($probe.Output)" }
-        if (-not $probe.PSObject.Properties['StandardOutput']) { throw 'command probe did not provide separate standard output' }
-        $raw = $probe.StandardOutput
-        # The block of quoted names directly under "`model`:" and nothing else: the
-        # same file lists themes and modes in the same shape, so the match is anchored
-        # to that heading rather than hunting for quoted strings anywhere.
-        $block = [regex]::Match($raw, '(?ms)^\s*`model`:.*?\r?\n((?:[ \t]*-[ \t]*"[^"]+"[ \t]*\r?\n)+)')
-        if ($block.Success) {
-            $models = @([regex]::Matches($block.Groups[1].Value, '"([^"]+)"') |
-                ForEach-Object { [string]$_.Groups[1].Value } |
-                Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
-        }
-        if ($models.Count -eq 0) { throw 'model list is missing or unrecognised in help output' }
+        $models = @(Get-BridgeCopilotModelRoster -Path $Path)
+        if ($models.Count -eq 0) { throw 'the CLI listed no models' }
         if ($null -ne $cached -and $cached.Failed) {
             $diagnostic = "Copilot model discovery recovered: found $($models.Count) model(s) from '$Path'."
         }
     }
     catch {
         $failed = $true
+        $models = @()
         if ($null -ne $cached) { $models = @($cached.Models) }
-        $detail = ($_.Exception.Message -replace '\s+', ' ').Trim()
-        if ($detail.Length -gt 600) { $detail = $detail.Substring(0, 600) + '...' }
-        $diagnostic = "Copilot model discovery failed for '$Path': $detail. Keeping $($models.Count) cached model(s); retrying in $($script:BridgeModelRetrySeconds)s."
+        $retrySeconds = $script:BridgeModelRetrySeconds
+        if ($null -ne $cached -and $cached.Failed) {
+            $retrySeconds = [Math]::Min([int]$cached.RetrySeconds * 2, $script:BridgeModelRetryMaxSeconds)
+        }
+        $detail = ($_.Exception.Message -replace '\s+', ' ').Trim().TrimEnd('.')
+        if ($detail.Length -gt 600) { $detail = $detail.Substring(0, 600).TrimEnd('.') + ' [...]' }
+        $diagnostic = "Copilot model discovery failed for '$Path': $detail. Keeping $($models.Count) cached model(s); retrying in ${retrySeconds}s."
     }
 
     $script:BridgeModelCache = [pscustomobject]@{
-        At = [DateTimeOffset]::Now; Models = @($models); Failed = $failed
+        At = [DateTimeOffset]::Now; Models = @($models); Failed = $failed; RetrySeconds = $retrySeconds
     }
     if ($diagnostic) {
         $daemonLog = Get-Command Write-DaemonLog -ErrorAction SilentlyContinue
@@ -1799,7 +2026,7 @@ function Get-BridgeCopilotModelList {
 # Copilot's entry.
 #
 #   Options     the values offered, beyond 'Agent default'
-#   Discover    an optional extra source of Options, merged ahead of the built-in list
+#   Discover    an optional extra source of Options, added after the built-in list
 #   Arguments   the flag form of a chosen value
 #
 # Verified against the installed CLIs rather than guessed: `copilot --reasoning-effort
@@ -1897,7 +2124,7 @@ function Get-BridgeTuningOptions {
         `newSession.<axis>s.<launcher>` replaces the built-in list outright, for the
         same reason `newSession.profiles` exists: the set of models worth offering is
         a matter of taste and of what an account can actually reach, and a list of
-        twenty-six on a phone is not a choice, it is a scroll. A configured list is
+        nearly thirty on a phone is not a choice, it is a scroll. A configured list is
         taken as given - it is the user's own - but is still validated on the way back
         in, so nothing here lets an arbitrary string reach a command line.
 
@@ -1920,8 +2147,9 @@ function Get-BridgeTuningOptions {
 
     $values = if ($configured.Count -gt 0) { $configured } else {
         $built = @($entry[$Axis].Options)
-        # Discovery adds to the built-in list rather than replacing it, so 'auto' -
-        # which Copilot accepts but does not print among its models - stays offered.
+        # Discovery adds to the built-in list rather than replacing it, so 'auto' is
+        # still offered while discovery is failing. The roster lists it too, and the
+        # de-duplication below keeps one.
         if ($entry[$Axis].ContainsKey('Discover')) {
             $found = @(& $entry[$Axis].Discover)
             if ($found.Count -gt 0) { $built = @($built) + @($found) }

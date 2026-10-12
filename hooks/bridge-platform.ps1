@@ -1374,6 +1374,273 @@ function Test-BridgeCommandRuns {
     [bool]($probe.Ran -and -not $probe.TimedOut -and $probe.ExitCode -eq 0)
 }
 
+function Start-BridgeJsonRpcProcess {
+    <#
+        Starts a child that speaks JSON-RPC 2.0 over its stdin and stdout, and returns
+        the connection that Invoke-BridgeJsonRpcRequest and Stop-BridgeJsonRpcProcess
+        take. Messages are framed the way the Language Server Protocol frames them: a
+        Content-Length header, a blank line, then that many bytes of UTF-8 JSON.
+
+        This is how the Copilot CLI's headless server talks (`copilot --headless
+        --stdio`), and that server is the only place the CLI says which models an
+        account can use. Stop-BridgeJsonRpcProcess must follow, whatever happens in
+        between.
+
+        The child is started here rather than by Start-BridgeWindowlessProcess, for
+        the same CREATE_NO_WINDOW reasons (see there), because that closes stdin and
+        this needs it open. A switch there to keep it open would not be safe to rely
+        on: adapters carry their own copy of this file, which the daemon dot-sources
+        too, so the Start-BridgeWindowlessProcess in force can be one from before the
+        switch existed (see tests/test-daemon-discovery.ps1). A function that only
+        exists in this copy cannot be shadowed that way.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Executable,
+        [string[]]$Arguments = @(),
+        [AllowEmptyString()][AllowNull()][string]$WorkingDirectory = ''
+    )
+
+    $start = [Diagnostics.ProcessStartInfo]::new($Executable)
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    $start.RedirectStandardInput = $true
+    $start.RedirectStandardOutput = $true
+    $start.RedirectStandardError = $true
+    foreach ($argument in $Arguments) { [void]$start.ArgumentList.Add($argument) }
+    if (-not [string]::IsNullOrWhiteSpace($WorkingDirectory) -and (Test-Path -LiteralPath $WorkingDirectory)) {
+        $start.WorkingDirectory = $WorkingDirectory
+    }
+
+    $process = [Diagnostics.Process]::new()
+    $process.StartInfo = $start
+    try {
+        [void]$process.Start()
+        [pscustomobject]@{
+            Process    = $process
+            Input      = $process.StandardInput.BaseStream
+            Output     = $process.StandardOutput.BaseStream
+            # Drained from the start, so a child with a lot to say on stderr cannot
+            # stall on a full pipe - and kept, for the message if it fails.
+            ErrorTask  = $process.StandardError.ReadToEndAsync()
+            Buffer     = [Collections.Generic.List[byte]]::new()
+            ReadBuffer = [byte[]]::new(65536)
+            ReadTask   = $null
+            NextId     = 1
+        }
+    }
+    catch {
+        try { $process.Kill($true) } catch { }
+        $process.Dispose()
+        throw
+    }
+}
+
+function Get-BridgeJsonRpcExitDetail {
+    <#
+        How a JSON-RPC child is doing, for an error message: whether it has exited and
+        with what code, and the start of what it wrote to stderr. Only asked once
+        something has gone wrong, so it can afford to wait a second for each.
+    #>
+    param([Parameter(Mandatory)]$Connection)
+
+    $state = 'is still running'
+    try {
+        if ($Connection.Process.WaitForExit(1000)) { $state = "exited with code $($Connection.Process.ExitCode)" }
+    }
+    catch { }
+    $stderr = ''
+    try { if ($Connection.ErrorTask.Wait(1000)) { $stderr = [string]$Connection.ErrorTask.Result } } catch { }
+    $stderr = ($stderr -replace '\s+', ' ').Trim()
+    if ($stderr.Length -gt 300) { $stderr = $stderr.Substring(0, 300) + ' [...]' }
+    if ($stderr) { "$state (stderr: $stderr)" } else { $state }
+}
+
+function Send-BridgeJsonRpcMessage {
+    <# Writes one framed message to a JSON-RPC child. #>
+    param(
+        [Parameter(Mandatory)]$Connection,
+        [Parameter(Mandatory)][Collections.IDictionary]$Message
+    )
+
+    $body = [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $Message -Depth 20 -Compress))
+    $header = [Text.Encoding]::ASCII.GetBytes("Content-Length: $($body.Length)`r`n`r`n")
+    try {
+        $Connection.Input.Write($header, 0, $header.Length)
+        $Connection.Input.Write($body, 0, $body.Length)
+        $Connection.Input.Flush()
+    }
+    catch {
+        $reason = $_.Exception.GetBaseException().Message
+        throw "could not write to the process, which $(Get-BridgeJsonRpcExitDetail -Connection $Connection): $reason"
+    }
+}
+
+function Get-BridgeJsonRpcBufferedMessage {
+    <#
+        The next whole message in a connection's buffer, taken out of it, or $null
+        while the rest of it has yet to arrive. Throws on framing it cannot trust,
+        rather than guessing where the next message starts.
+    #>
+    param([Parameter(Mandatory)]$Connection)
+
+    $buffer = $Connection.Buffer
+    if ($buffer.Count -eq 0) { return $null }
+    # Headers are a line or two; a kilobyte without the blank line that ends them
+    # means the child is writing something else to stdout.
+    $head = [Text.Encoding]::ASCII.GetString($buffer.GetRange(0, [Math]::Min($buffer.Count, 1024)).ToArray())
+    $end = $head.IndexOf("`r`n`r`n", [StringComparison]::Ordinal)
+    if ($end -lt 0) {
+        if ($buffer.Count -ge 1024) { throw 'the process wrote something other than a JSON-RPC message to stdout' }
+        return $null
+    }
+    $declared = [regex]::Match($head.Substring(0, $end), '(?im)^Content-Length:[ \t]*([0-9]{1,9})[ \t]*\r?$')
+    if (-not $declared.Success) { throw 'the process sent a JSON-RPC message without a Content-Length' }
+    $length = [int]$declared.Groups[1].Value
+    if ($length -gt 16MB) { throw "the process announced a $length-byte message, more than the bridge will read" }
+    $start = $end + 4
+    if ($buffer.Count -lt $start + $length) { return $null }
+
+    $json = [Text.Encoding]::UTF8.GetString($buffer.GetRange($start, $length).ToArray())
+    $buffer.RemoveRange(0, $start + $length)
+    $message = ConvertFrom-Json -InputObject $json -AsHashtable -Depth 64
+    if ($message -isnot [Collections.IDictionary]) { throw 'the process sent a JSON-RPC message that is not an object' }
+    $message
+}
+
+function Read-BridgeJsonRpcMessage {
+    <# The next message from a JSON-RPC child, waiting for it until -Deadline. #>
+    param(
+        [Parameter(Mandatory)]$Connection,
+
+        # Which request is waiting, for the error messages.
+        [Parameter(Mandatory)][string]$Method,
+        [Parameter(Mandatory)][DateTimeOffset]$Deadline
+    )
+
+    while ($true) {
+        $message = Get-BridgeJsonRpcBufferedMessage -Connection $Connection
+        if ($null -ne $message) { return $message }
+
+        # One read is kept outstanding and survives a timeout: a read abandoned
+        # instead would take whatever it later receives with it.
+        if ($null -eq $Connection.ReadTask) {
+            $Connection.ReadTask = $Connection.Output.ReadAsync($Connection.ReadBuffer, 0, $Connection.ReadBuffer.Length)
+        }
+        $remaining = ($Deadline - [DateTimeOffset]::Now).TotalMilliseconds
+        if ($remaining -le 0) { throw [TimeoutException]::new("timed out waiting for the answer to '$Method'") }
+        $done = $false
+        try { $done = $Connection.ReadTask.Wait([int][Math]::Min([Math]::Ceiling($remaining), 500)) }
+        catch {
+            $Connection.ReadTask = $null
+            throw "could not read the answer to '$Method': $($_.Exception.GetBaseException().Message)"
+        }
+        if (-not $done) { continue }
+
+        $read = [int]$Connection.ReadTask.Result
+        $Connection.ReadTask = $null
+        if ($read -le 0) {
+            throw "the process closed its output before answering '$Method': it $(Get-BridgeJsonRpcExitDetail -Connection $Connection)"
+        }
+        $Connection.Buffer.AddRange([ArraySegment[byte]]::new($Connection.ReadBuffer, 0, $read))
+    }
+}
+
+function Invoke-BridgeJsonRpcRequest {
+    <#
+        Sends one request to a JSON-RPC child and returns its result.
+
+        Whatever arrives first is dealt with on the way: notifications and replies to
+        other requests are skipped, and a request from the child - a permission
+        prompt, say - is refused rather than ignored, since the child would wait on
+        it.
+
+        An error reply is thrown with its JSON-RPC code in the exception's
+        Data['JsonRpcCode'], so a caller can tell "method not found" (-32601), which
+        means an older child, from a real failure. Past -Deadline this throws a
+        TimeoutException.
+    #>
+    param(
+        [Parameter(Mandatory)]$Connection,
+        [Parameter(Mandatory)][string]$Method,
+        [AllowNull()]$Params = @{},
+        [Parameter(Mandatory)][DateTimeOffset]$Deadline
+    )
+
+    $id = [int]$Connection.NextId
+    $Connection.NextId = $id + 1
+    Send-BridgeJsonRpcMessage -Connection $Connection -Message ([ordered]@{
+            jsonrpc = '2.0'; id = $id; method = $Method; params = $Params
+        })
+    while ($true) {
+        $message = Read-BridgeJsonRpcMessage -Connection $Connection -Method $Method -Deadline $Deadline
+        $replyId = $message['id']
+        if ($message.Contains('method')) {
+            if ($null -ne $replyId) {
+                Send-BridgeJsonRpcMessage -Connection $Connection -Message ([ordered]@{
+                        jsonrpc = '2.0'; id = $replyId
+                        error   = [ordered]@{ code = -32601; message = "agent-ha-bridge does not handle '$($message['method'])'" }
+                    })
+            }
+            continue
+        }
+
+        $failure = $message['error']
+        # An error with no id is the child saying it could not read a request at all,
+        # and only one is ever outstanding.
+        if ($null -eq $replyId) {
+            if ($null -eq $failure) { continue }
+        }
+        elseif ([string]$replyId -cne [string]$id) { continue }
+
+        if ($null -ne $failure) {
+            $code = $null
+            $text = [string]$failure
+            if ($failure -is [Collections.IDictionary]) {
+                $code = $failure['code']
+                $text = [string]$failure['message']
+            }
+            $exception = [InvalidOperationException]::new("'$Method' failed: $text$(if ($null -ne $code) { " (code $code)" })")
+            if ($null -ne $code) { $exception.Data['JsonRpcCode'] = $code }
+            throw $exception
+        }
+        if (-not $message.Contains('result')) { throw "the answer to '$Method' carried neither a result nor an error" }
+        return , $message['result']
+    }
+}
+
+function Stop-BridgeJsonRpcProcess {
+    <#
+        Ends a JSON-RPC child and releases what Start-BridgeJsonRpcProcess opened.
+        Closing its stdin is the polite request - a stdio server exits when its input
+        ends - and a child still running after -GraceMs is killed, with anything it
+        started. Never throws.
+    #>
+    param(
+        [Parameter(Mandatory)]$Connection,
+        [int]$GraceMs = 2000
+    )
+
+    $process = $Connection.Process
+    $result = [pscustomobject]@{ Exited = $false; Killed = $false; ExitCode = $null; StandardError = '' }
+    try { $process.StandardInput.Close() } catch { }
+    try {
+        if ($process.WaitForExit([Math]::Max($GraceMs, 0))) { $result.Exited = $true }
+        else {
+            $result.Killed = $true
+            try { $process.Kill($true) } catch { }
+            $result.Exited = $process.WaitForExit(5000)
+        }
+        if ($result.Exited) { $result.ExitCode = $process.ExitCode }
+    }
+    catch { }
+    try { if ($Connection.ErrorTask.Wait(1000)) { $result.StandardError = [string]$Connection.ErrorTask.Result } } catch { }
+    foreach ($stream in @($Connection.Output, $Connection.Input)) {
+        try { if ($null -ne $stream) { $stream.Dispose() } } catch { }
+    }
+    try { $process.Dispose() } catch { }
+    $result
+}
+
 function Get-BridgePwshPath {
     <#
         pwsh, wherever it is.
