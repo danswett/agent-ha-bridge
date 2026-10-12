@@ -262,11 +262,16 @@ function Restore-DaemonSessionEntities {
     if ($status -notin @('working', 'waiting', 'idle', 'agents', 'shell', 'error')) { $status = 'idle' }
     try {
         $card = Resolve-DaemonPrimedCard -Entry $entry -Status $status -VerboseOn (Test-VerboseStreaming -Headers $Headers)
-        Set-CopilotMqttStatus -SessionId $id -Status $status -Headers $Headers -Attributes @{
-            session = $name
-            machine = $machine
-            updated = $now.ToString('o')
-        } | Out-Null
+        # Through the helper, for the reason the restart re-prime uses it: this is a
+        # restore, and publishing a bare set replaces the attributes rather than
+        # leaving them alone - so rebuilding the entities would have cost the card its
+        # model, effort, context and counts until the session next moved.
+        Set-CopilotMqttStatus -SessionId $id -Status $status -Headers $Headers -Attributes (
+            Add-DaemonTuningAttributes -Attributes @{
+                session = $name
+                machine = $machine
+                updated = $now.ToString('o')
+            } -Tuning $entry) | Out-Null
         Set-CopilotMqttActivity -SessionId $id -Summary $card.Summary -Detail $card.Detail -Headers $Headers | Out-Null
 
         # A question that was live when the entities went is still waiting on an answer
@@ -1024,13 +1029,17 @@ function Update-DaemonKnownSession {
             $entry.Name = $refreshed.Name
             try {
                 # Discarded like every other publish here: this runs on any rename, and
-                # what it emits would otherwise ride out through the reconcile.
-                Set-CopilotMqttStatus -SessionId $id -Status ([string]$entry.Status) -Headers $Headers -Attributes @{
-                    session = $entry.Name
-                    machine = $entry.Machine
-                    process_id = $session.ProcessId
-                    updated = [DateTimeOffset]::Now.ToString('o')
-                } | Out-Null
+                # what it emits would otherwise ride out through the reconcile. Through
+                # the helper, because the attributes are replaced wholesale and a
+                # Copilot session is renamed as soon as it has a first prompt - so a
+                # bare set here erased the settings line moments after it appeared.
+                Set-CopilotMqttStatus -SessionId $id -Status ([string]$entry.Status) -Headers $Headers -Attributes (
+                    Add-DaemonTuningAttributes -Attributes @{
+                        session = $entry.Name
+                        machine = $entry.Machine
+                        process_id = $session.ProcessId
+                        updated = [DateTimeOffset]::Now.ToString('o')
+                    } -Tuning $entry) | Out-Null
                 # The card reads the name above; this is what carries it to the names
                 # Home Assistant itself shows, which are built from the device's.
                 Update-CopilotMqttSessionName -SessionId $id -SessionName ([string]$entry.Name) `
