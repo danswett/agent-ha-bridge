@@ -293,6 +293,39 @@ function Get-ClaudeAskUserState {
     $result
 }
 
+function Measure-ClaudeTranscriptCompaction {
+    <#
+        How many times a Claude session's conversation was compacted within a byte
+        range of its transcript, and how far the scan got.
+
+        Claude writes one boundary entry per compaction, verified against the
+        installed CLI (2.1.291):
+
+            {"type":"system","subtype":"compact_boundary","content":"Conversation
+             compacted","isMeta":false,"compactMetadata":{"trigger":...}}
+
+        A sub-agent's own compaction is its business, not the session's, so a
+        sidechain entry is skipped here exactly as it is in the batch reader.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$Path,
+        [long]$From = 0,
+        [long]$Through = -1,
+        [int]$ChunkBytes = 4194304
+    )
+
+    Measure-BridgeTranscriptLine -Path $Path -From $From -Through $Through -ChunkBytes $ChunkBytes -Match {
+        param($Line)
+        if (-not $Line.Contains('"compact_boundary"')) { return $false }
+        try {
+            $entry = $Line | ConvertFrom-Json
+            if ($entry.PSObject.Properties.Name -contains 'isSidechain' -and $entry.isSidechain) { return $false }
+            ([string]$entry.type -eq 'system') -and ([string]$entry.subtype -eq 'compact_boundary')
+        }
+        catch { $false }
+    }
+}
+
 function Read-ClaudeTranscriptAppend {
     <#
         Reads the bytes appended since the last offset.

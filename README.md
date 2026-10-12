@@ -27,6 +27,7 @@ prompt, so the terminal never stops working and nothing is ever answered twice.
 | **Dual input** | Answer in the terminal *or* Home Assistant. First one wins; the other clears. |
 | **Live activity** | Each session streams its status, current tool, and last response to its card. |
 | **Background agents** | A session whose turn has ended while agents it started are still running reads *waiting for N background agents*, not *idle*. |
+| **Compactions** | A card says how many times its conversation has been compacted, so a session running on a summary of itself says so. |
 | **Detailed activity** | Cards carry the model's reasoning and every tool call; fold a session card to keep it short. Off with `detailedActivity: false`. |
 | **Real forms** | Every question becomes rows you tap plus a Send button; multi-select questions take as many options as you like, and *Other (type your answer)* is there when none of them fit. |
 | **Continuation** | Reply to a finished turn from your phone; it's typed into the session. |

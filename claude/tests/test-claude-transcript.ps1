@@ -70,6 +70,90 @@ Test-That 'a tool result is not treated as a user message' {
     @($activity.History | Where-Object { $_ -eq 'Reading your message' }).Count -eq 1
 }
 
+Write-Host '--- how many times the conversation has been compacted ---'
+# Claude marks a compaction with one entry of its own. Read from the installed CLI
+# (2.1.291) rather than guessed:
+#   {"type":"system","subtype":"compact_boundary","content":"Conversation compacted",
+#    "isMeta":false,"compactMetadata":{"trigger":...,"preTokens":...}}
+# The boundary is what gets counted, not the summary that follows it, because it is
+# the one entry written exactly once per compaction. Counted over a byte range of the
+# file rather than over a batch of lines: the daemon reads a capped tail, and a total
+# cannot afford a record the cap skipped.
+function New-CompactBoundary {
+    param([string]$Trigger = 'auto', [bool]$Sidechain = $false)
+    $entry = @{
+        type = 'system'; subtype = 'compact_boundary'; content = 'Conversation compacted'
+        isMeta = $false; level = 'info'
+        compactMetadata = @{ trigger = $Trigger; preTokens = 154321; messagesSummarized = 612 }
+    }
+    if ($Sidechain) { $entry['isSidechain'] = $true }
+    ($entry | ConvertTo-Json -Depth 6 -Compress)
+}
+$say = '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"carrying on"}]}}'
+
+$compactFile = Join-Path ([IO.Path]::GetTempPath()) "claude-compactions-$([guid]::NewGuid().ToString('N').Substring(0,8)).jsonl"
+try {
+    $write = { param([string[]]$Lines) [IO.File]::WriteAllText($compactFile, (($Lines -join "`n") + "`n")) }
+
+    & $write @((New-CompactBoundary), $say)
+    Test-That 'a compaction boundary is counted' {
+        (Measure-ClaudeTranscriptCompaction -Path $compactFile).Count -eq 1
+    } "$((Measure-ClaudeTranscriptCompaction -Path $compactFile).Count)"
+    Test-That 'and the batch around it is read exactly as it was' {
+        (Get-ClaudeActivityFromTranscript -Lines @((New-CompactBoundary), $say)).Response -eq 'carrying on'
+    }
+    & $write @((New-CompactBoundary), $say, (New-CompactBoundary -Trigger 'manual'))
+    Test-That 'two are two, whatever triggered them' {
+        (Measure-ClaudeTranscriptCompaction -Path $compactFile).Count -eq 2
+    } "$((Measure-ClaudeTranscriptCompaction -Path $compactFile).Count)"
+    & $write @($say)
+    Test-That 'a transcript with none reports none, and says it read it' {
+        $r = Measure-ClaudeTranscriptCompaction -Path $compactFile
+        $r.Count -eq 0 -and $r.Known
+    }
+    # A sub-agent compacting its own context is its business; the session's count is
+    # the session's, exactly as its tool calls and messages already are.
+    & $write @((New-CompactBoundary -Sidechain $true))
+    Test-That 'a sub-agent compacting is not the session being compacted' {
+        (Measure-ClaudeTranscriptCompaction -Path $compactFile).Count -eq 0
+    }
+    # Another system entry - a hook's output, a warning - is not a compaction.
+    & $write @('{"type":"system","subtype":"hook_result","content":"ran"}', $say)
+    Test-That 'any other system entry still counts for nothing' {
+        (Measure-ClaudeTranscriptCompaction -Path $compactFile).Count -eq 0
+    }
+
+    # A session adopted part-way through is read from the end of its transcript, and a
+    # capped read skips the start of a large append - so the count is taken from a
+    # byte range, scanned exactly once whatever the reader did with it.
+    $head = @($say, (New-CompactBoundary))
+    $headBytes = [Text.Encoding]::UTF8.GetByteCount((($head -join "`n") + "`n"))
+    & $write @($head + @($say, (New-CompactBoundary -Trigger 'manual'), (New-CompactBoundary -Sidechain $true), $say))
+    Test-That 'the whole file counts both of the session''s own' {
+        (Measure-ClaudeTranscriptCompaction -Path $compactFile).Count -eq 2
+    } "$((Measure-ClaudeTranscriptCompaction -Path $compactFile).Count)"
+    Test-That 'a range ending after the first counts only that one' {
+        (Measure-ClaudeTranscriptCompaction -Path $compactFile -Through $headBytes).Count -eq 1
+    }
+    Test-That 'and the rest counts the other, so the two do not overlap' {
+        (Measure-ClaudeTranscriptCompaction -Path $compactFile -From $headBytes).Count -eq 1
+    }
+    Test-That 'and the scan says it read to the end of the file' {
+        (Measure-ClaudeTranscriptCompaction -Path $compactFile).Through -eq (Get-Item $compactFile).Length
+    }
+
+    # Accepting zero for a file that could not be read would put the session's history
+    # permanently behind the caller's cursor, so absence and failure are told apart.
+    Test-That 'a transcript that is not written yet has been through nothing' {
+        $r = Measure-ClaudeTranscriptCompaction -Path "$compactFile.absent"
+        $r.Count -eq 0 -and $r.Known
+    }
+    Test-That 'and neither has a session with no transcript at all' {
+        (Measure-ClaudeTranscriptCompaction -Path '').Known
+    }
+}
+finally { Remove-Item -LiteralPath $compactFile -Force -ErrorAction SilentlyContinue }
+
 Write-Host '--- which model is writing ---'
 # Claude records the model on every assistant entry. Reading it is what lets a
 # session's card say what it is running without the bridge having launched it: the

@@ -344,6 +344,96 @@ try {
             Test-That 'it starts at the transcript''s end' {
                 $foundEntry.Offset -eq (Get-Item -LiteralPath $quickTranscript).Length
             } ("offset: " + [string]$foundEntry.Offset)
+
+            Write-Host "`n--- but what it has been through is not skipped with it ---"
+            # Compactions are the one thing starting at the end gets wrong. They are a
+            # total rather than news, so a session adopted part-way through would claim
+            # it had never been compacted - and the long-running sessions most likely
+            # to be met part-way through are exactly the ones that have been.
+            $compactedTranscript = Join-Path ([IO.Path]::GetTempPath()) "compacted-$([guid]::NewGuid().ToString('N').Substring(0, 8)).jsonl"
+            $script:AdoptionAttributes = @()
+            function Set-CopilotMqttStatus { param($SessionId, $Status, $Headers, $Attributes) $script:AdoptionAttributes += $Attributes }
+            try {
+                Set-Content -LiteralPath $compactedTranscript -Encoding UTF8 -Value @(
+                    '{"type":"user.message"}'
+                    '{"type":"session.compaction_start","data":{"trigger":"threshold"}}'
+                    '{"type":"session.compaction_complete","data":{"success":true,"summaryContent":"what happened so far"}}'
+                    '{"type":"assistant.message","data":{"content":"carrying on"}}'
+                    '{"type":"session.compaction_start","data":{"trigger":"threshold"}}'
+                    '{"type":"session.compaction_complete","data":{"success":false,"error":"did not settle"}}'
+                    '{"type":"session.compaction_start","data":{"trigger":"context_limit_retry"}}'
+                    '{"type":"session.compaction_complete","data":{"success":true}}'
+                )
+                $script:DaemonLaunchedTuning = @{}
+                $longRunner = [pscustomobject]@{
+                    SessionId = 'running-long-before-anyone-looked'; Transcript = $compactedTranscript
+                    Kind = 'copilot'; ProcessId = $PID; WorkingDirectory = 'C:\repo'
+                }
+                $longEntry = Add-DaemonSession -Session $longRunner -Headers $headers
+                Test-That 'an adopted session is seeded from the history behind its cursor' {
+                    $longEntry.Compactions -eq 2
+                } ("compactions: " + [string]$longEntry.Compactions)
+                # Bounded by that cursor, not by the file's length now: the scan takes
+                # seconds on a large transcript, and a compaction appended while it ran
+                # would otherwise be counted here *and* read again from the cursor.
+                Test-That 'and knows exactly how far that count reaches' {
+                    $longEntry.CompactionsThrough -eq $longEntry.Offset
+                } ("through: $($longEntry.CompactionsThrough) offset: $($longEntry.Offset)")
+                Test-That 'and the very first publish already carries it' {
+                    @($script:AdoptionAttributes | Where-Object { $_['compactions'] -eq 2 }).Count -ge 1
+                } (($script:AdoptionAttributes | ForEach-Object { [string]$_['compactions'] }) -join ',')
+
+                # A fresh launch is read from byte zero, so the reader meets those same
+                # events itself. Seeding from the file as well would count every one of
+                # them twice.
+                $freshId = 'started-from-nothing'
+                $script:DaemonLaunchedTuning = @{ $freshId = [pscustomobject]@{
+                        Model = ''; Effort = ''; Context = ''; At = [DateTimeOffset]::Now; Resumed = $false
+                    }
+                }
+                $fresh = [pscustomobject]@{
+                    SessionId = $freshId; Transcript = $compactedTranscript; Kind = 'copilot'
+                    ProcessId = $PID; WorkingDirectory = 'C:\repo'
+                }
+                $freshEntry = Add-DaemonSession -Session $fresh -Headers $headers
+                Test-That 'a session read from the beginning is seeded with none' {
+                    $freshEntry.Offset -eq 0 -and $freshEntry.Compactions -eq 0 -and
+                        $freshEntry.CompactionsThrough -eq 0
+                } ("offset: $($freshEntry.Offset) compactions: $($freshEntry.Compactions)")
+                Update-DaemonSessionActivity -Id $freshId -Entry $freshEntry -Session $fresh -Headers $headers -VerboseOn $false
+                Test-That 'and reaches the same total by reading them, not twice over' {
+                    $freshEntry.Compactions -eq 2
+                } ("compactions: " + [string]$freshEntry.Compactions)
+
+                # A seed that could not be taken must not write the history off. The
+                # offset stays at zero, so the first pass that can read the file scans
+                # it rather than starting the count from behind the cursor.
+                $script:DaemonLaunchedTuning = @{}
+                $goneId = 'adopted-while-unreadable'
+                $gone = [pscustomobject]@{
+                    SessionId = $goneId; Transcript = $compactedTranscript; Kind = 'copilot'
+                    ProcessId = $PID; WorkingDirectory = 'C:\repo'
+                }
+                $originalCounter = ${function:Get-BridgeTranscriptCompactionCount}
+                function Get-BridgeTranscriptCompactionCount {
+                    param($Path, $Kind, $From, $Through)
+                    [pscustomobject]@{ Count = 0; Through = [long]$From; Known = $false }
+                }
+                $goneEntry = Add-DaemonSession -Session $gone -Headers $headers
+                ${function:Get-BridgeTranscriptCompactionCount} = $originalCounter
+                Test-That 'a seed that could not be read leaves the history in front of the count' {
+                    $goneEntry.Compactions -eq 0 -and $goneEntry.CompactionsThrough -eq 0 -and
+                        $goneEntry.Offset -eq (Get-Item -LiteralPath $compactedTranscript).Length
+                } ("through: $($goneEntry.CompactionsThrough) offset: $($goneEntry.Offset)")
+                Update-DaemonSessionActivity -Id $goneId -Entry $goneEntry -Session $gone -Headers $headers -VerboseOn $false
+                Test-That 'so the next pass picks it up instead of writing it off' {
+                    $goneEntry.Compactions -eq 2
+                } ("compactions: " + [string]$goneEntry.Compactions)
+            }
+            finally {
+                Remove-Item -LiteralPath $compactedTranscript -Force -ErrorAction SilentlyContinue
+                function Set-CopilotMqttStatus { param($SessionId, $Status, $Headers, $Attributes) }
+            }
         }
         finally { Remove-Item -LiteralPath $quickTranscript -Force -ErrorAction SilentlyContinue }
     }

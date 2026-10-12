@@ -896,7 +896,7 @@ console.log('--- a session waiting on background agents is not idle ---');
  * review ten minutes in was thrown away. The daemon publishes `agents` and how many,
  * and the card reads them out rather than leaving you to guess.
  */
-function renderActivity({ status, attributes = {}, question }) {
+function renderActivity({ status, attributes = {}, question, activity = '' }) {
   const card = Object.create(AgentBridgeActivityCard.prototype);
   card._last = {};
   const el = (tag) => new FakeElement(tag);
@@ -912,11 +912,16 @@ function renderActivity({ status, attributes = {}, question }) {
   card._hass = {
     states: {
       [S_STATUS]: { state: status, attributes },
-      [S_ACTIVITY]: { state: '', attributes: {} },
+      [S_ACTIVITY]: { state: activity, attributes: {} },
       [S_DECISION]: { state: 'Idle', attributes: question ? { question } : {} },
     },
   };
   card._render();
+  // A working session starts the spinner, which registers an interval and a
+  // visibility listener on the shared fakes. This helper renders once and throws the
+  // card away, so it hands both back - otherwise the first check here to use a
+  // working status quietly fails the interval bookkeeping further down.
+  card._stopSpinner();
   return { title: card._els.title.textContent, meta: card._els.meta.textContent };
 }
 
@@ -940,6 +945,39 @@ check('while a genuinely idle session reads exactly as it did',
 const asked = renderActivity({ status: 'agents', question: 'Which one?' });
 check('and a question still takes precedence, because that is waiting on you',
   asked.meta === 'DESK \u2022 status: waiting for you', asked.meta);
+
+/*
+ * How many times the conversation has been compacted.
+ *
+ * A compaction is the one thing that happens to a session with nothing on its card
+ * changing: the summary replaces the history, the session carries straight on, and
+ * nothing it says afterwards is evidence of what was lost. The bridge publishes it as
+ * a `compactions` attribute of the status entity once there is one to publish.
+ */
+const compactedOnce = renderActivity({ status: 'idle', attributes: { compactions: 1 } });
+check('one compaction reads as once, not as "1 times"',
+  compactedOnce.meta === 'DESK \u2022 status: idle \u2022 compacted once', compactedOnce.meta);
+const compactedTwice = renderActivity({ status: 'working', attributes: { compactions: 6 } });
+check('and more than one says how many',
+  compactedTwice.meta === 'DESK \u2022 status: working \u2022 compacted 6 times', compactedTwice.meta);
+// Omitted at zero by the bridge, so a session that has never been compacted reads
+// exactly as it did - and a card never announces "compacted 0 times".
+check('a session that has never been compacted says nothing about it',
+  renderActivity({ status: 'idle' }).meta === 'DESK \u2022 status: idle');
+check('nor does a bridge too old to publish the attribute',
+  renderActivity({ status: 'idle', attributes: { compactions: 0 } }).meta === 'DESK \u2022 status: idle');
+// It sits next to the status rather than at the end of the line: the activity text
+// beside it changes every few seconds, and a number that moves about is one nobody
+// reads.
+const withActivity = renderActivity({ status: 'working', attributes: { compactions: 2 }, activity: 'Running: edit' });
+check('the count sits between the status and what the session is doing',
+  withActivity.meta === 'DESK \u2022 status: working \u2022 compacted 2 times \u2022 Running: edit', withActivity.meta);
+// A question is what the card is for; it replaces the status and takes the line with
+// it, and the compaction count is not what anyone is being asked about.
+const askedWhileCompacted = renderActivity({ status: 'working', attributes: { compactions: 2 }, question: 'Which one?' });
+check('and a waiting question still takes the whole line',
+  askedWhileCompacted.meta === 'DESK \u2022 status: waiting for you \u2022 compacted 2 times',
+  askedWhileCompacted.meta);
 
 check('the frame marks it, rather than leaving it looking closed',
   renderSession({ status: 'agents' }).contains('delegating'));

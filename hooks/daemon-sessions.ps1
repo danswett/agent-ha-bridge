@@ -778,6 +778,45 @@ function Add-DaemonSession {
     # rather than guessing at the agent's defaults.
     $tuning = Get-DaemonSessionTuning -SessionId $id -Session $session
 
+    # Where to start reading. A session the bridge started from nothing is read from
+    # the beginning, so an answer it gave before it was adopted is still picked up;
+    # anything else starts at the transcript's end, since what was said before the
+    # daemon saw it is not news and a resumed conversation must not be replayed.
+    $startOffset = if (-not $startedFresh -and [IO.File]::Exists($session.Transcript)) {
+        (Get-Item -LiteralPath $session.Transcript).Length
+    } else { [long]0 }
+
+    # The compactions are the one thing the rule above gets wrong. They are a total
+    # rather than news, so starting at the end would have every adopted session claim
+    # it had never been compacted - and the sessions worth looking at are exactly the
+    # long ones the daemon is most likely to meet part-way through. So when reading
+    # starts at the end, the history behind the cursor is scanned once for them.
+    #
+    # Bounded by that same cursor, not by the file's length now. The scan takes
+    # seconds on a large transcript, the session goes on writing throughout, and a
+    # compaction appended while it ran would otherwise be counted here *and* read
+    # again from the cursor - double-counted for good.
+    #
+    # Nothing is seeded when reading starts at zero: a fresh launch meets the same
+    # records itself, and seeding as well would count every one of them twice.
+    $priorCompactions = 0
+    $compactionsThrough = [long]0
+    if ($startOffset -gt 0) {
+        $seed = Get-BridgeTranscriptCompactionCount -Path ([string]$session.Transcript) -Kind $kind `
+            -From 0 -Through $startOffset
+        if ($seed.Known) {
+            $priorCompactions = [int]$seed.Count
+            $compactionsThrough = [long]$seed.Through
+        }
+        # A scan that could not read the transcript leaves the offset at zero rather
+        # than at the cursor, so the first pass that can read it scans the history
+        # instead of writing it off. Accepting the zero here would put everything the
+        # session had been through permanently behind the cursor.
+    }
+    # So the very first publish below carries it, rather than the card showing nothing
+    # until the session next does something worth saying.
+    $tuning | Add-Member -NotePropertyName Compactions -NotePropertyValue $priorCompactions -Force
+
     # Who the card is born believing is driving. Without this the first publish
     # carries no driver at all, and a card with no driver reads as human - blue -
     # until the session's next activity update supplies one. For a session that
@@ -829,14 +868,7 @@ function Add-DaemonSession {
     }
 
     $entry = [pscustomobject]@{
-        # Where to start reading. A session the bridge started from nothing is read
-        # from the beginning, so an answer it gave before it was adopted is still
-        # picked up; anything else starts at the transcript's end, since what was
-        # said before the daemon saw it is not news and a resumed conversation must
-        # not be replayed.
-        Offset = if (-not $startedFresh -and [IO.File]::Exists($session.Transcript)) {
-            (Get-Item -LiteralPath $session.Transcript).Length
-        } else { 0 }
+        Offset = $startOffset
         Name = $display.Name
         Machine = $display.Machine
         Status = $initialStatus
@@ -846,6 +878,12 @@ function Add-DaemonSession {
         Model = [string]$tuning.Model
         Effort = [string]$tuning.Effort
         Context = [string]$tuning.Context
+        # Seeded from the transcript above and brought forward on every pass. The
+        # offset is what the count covers; keeping the two together is what lets a
+        # later pass scan exactly the bytes nothing has accounted for yet, whether
+        # they were skipped by a capped read or by a seed that could not be taken.
+        Compactions = $priorCompactions
+        CompactionsThrough = $compactionsThrough
     }
 
     # A session an agent launched is agent-driven from the moment it appears. The
@@ -915,7 +953,7 @@ function Add-DaemonTuningAttributes {
         Adds the three settings to a status attribute set, leaving out any that are
         empty so the card can tell "not known" from a real value, and the number of
         background agents and background shells the session is waiting on when it is
-        waiting on any.
+        waiting on any, and how many times its conversation has been compacted.
     #>
     param(
         [Parameter(Mandatory)][hashtable]$Attributes,
@@ -936,6 +974,11 @@ function Add-DaemonTuningAttributes {
     if ($running -gt 0) { $Attributes['background_agents'] = $running }
     $shells = Get-DaemonBackgroundShellCount -Entry $Tuning
     if ($shells -gt 0) { $Attributes['background_shells'] = $shells }
+    # How many times this conversation has been compacted. Omitted at zero, like the
+    # counts above: a session that has never been compacted carries nothing new, and
+    # the card then has nothing to draw rather than a line reading "0 compactions".
+    $compactions = Get-DaemonCompactionCount -Entry $Tuning
+    if ($compactions -gt 0) { $Attributes['compactions'] = $compactions }
     $Attributes
 }
 

@@ -10,6 +10,8 @@
       Display           a session's name and machine, for its card
       ReadAppend        transcript lines written since an offset
       Activity          what those lines say, for the card
+      CountCompactions  how many compactions its whole transcript records, for a
+                        session adopted part-way through one
       IsWorking         whether a session is busy when first seen
       PollRegistration  fast lane: has its hook registration changed? ($true = yes)
       FastActivity      fast lane: streams its own card, instead of the shared path
@@ -31,8 +33,9 @@
       SetupNote         what the launch note adds once its adapter is set up
 
     Copilot is the default: a slot an entry leaves out, or a kind that is blank or not
-    listed, gets Copilot's Display, ReadAppend, Activity, IsWorking and AskUserState. That is what the old
-    `else` branches did. Flags are never inherited.
+    listed, gets Copilot's Display, ReadAppend, Activity, CountCompactions, IsWorking
+    and AskUserState. That is what the old `else` branches did. Flags are never
+    inherited.
     An entry whose adapter is optional checks that it loaded and falls back the way
     those branches did.
 
@@ -48,6 +51,7 @@ $script:DaemonAgents = [ordered]@{
         Display = { param($SessionId, $WorkingDirectory) Get-CopilotSessionDisplay -SessionId $SessionId -WorkingDirectory $WorkingDirectory }
         ReadAppend = { param($Path, $Offset) Read-TranscriptAppend -Path $Path -Offset $Offset }
         Activity = { param($Lines, $VerboseMode) Get-ActivityFromEvents -Lines $Lines -VerboseMode $VerboseMode }
+        CountCompactions = { param($Path, $From, $Through) Measure-CopilotTranscriptCompaction -Path $Path -From $From -Through $Through }
         IsWorking = { param($SessionId, $Transcript, $Status) Test-CopilotSessionWorking -SessionId $SessionId }
         AskUserState = { param($Session, $Marker) Get-CopilotAskUserState -TranscriptPath ([string]$Session.Transcript) }
         AdapterInstalled = { Test-Path -LiteralPath (Join-Path (Get-BridgeInstallContext).CopilotHome 'hooks\decision-notifier.json') }
@@ -89,6 +93,11 @@ $script:DaemonAgents = [ordered]@{
             param($Lines, $VerboseMode)
             if (-not $script:ClaudeAdapterLoaded) { return Get-ActivityFromEvents -Lines $Lines -VerboseMode $VerboseMode }
             Get-ClaudeActivityFromTranscript -Lines $Lines -VerboseMode $VerboseMode
+        }
+        CountCompactions = {
+            param($Path, $From, $Through)
+            if (-not $script:ClaudeAdapterLoaded) { return [pscustomobject]@{ Count = 0; Through = [long]$From; Known = $false } }
+            Measure-ClaudeTranscriptCompaction -Path $Path -From $From -Through $Through
         }
         IsWorking = {
             param($SessionId, $Transcript, $Status)
@@ -174,6 +183,16 @@ $script:DaemonAgents = [ordered]@{
             if ($RequireReadable) { return Get-CodexApprovalMarker -SessionId $SessionId -RequireReadable }
             Get-CodexApprovalMarker -SessionId $SessionId
         }
+        # Codex auto-compacts, but nothing here has been able to verify what its
+        # rollout writes when it does - there is no Codex install to read and no
+        # rollout to measure. Rather than inherit Copilot's reader, which would scan a
+        # whole rollout for a marker it cannot contain, a Codex session reports no
+        # compactions and its card carries no such line. Known is true, because "none"
+        # is this agent's settled answer rather than a read that failed; a caller that
+        # retried it would retry it for ever. Replace this with a real counter once
+        # the rollout's marker has been read from a running Codex, the way Copilot's
+        # and Claude's were.
+        CountCompactions = { param($Path, $From, $Through) [pscustomobject]@{ Count = 0; Through = [long]$Through; Known = $true } }
         # Codex reports its own status: a turn begins at UserPromptSubmit and ends at
         # Stop, both of which the hook records, so there is nothing to infer.
         IsWorking = { param($SessionId, $Transcript, $Status) $Status -eq 'working' }
@@ -222,7 +241,7 @@ function Get-DaemonAgent {
         AdapterInstalled = $null; Installer = $null; SetupNote = $null
         HookStatus = $false; InlineReasoning = $false; RefreshName = $false; KnowsProcessId = $false; TranscriptConfirmsInput = $false
     }
-    foreach ($slot in 'Display', 'ReadAppend', 'Activity', 'IsWorking', 'AskUserState') { $agent[$slot] = $default[$slot] }
+    foreach ($slot in 'Display', 'ReadAppend', 'Activity', 'CountCompactions', 'IsWorking', 'AskUserState') { $agent[$slot] = $default[$slot] }
     foreach ($slot in $own.Keys) { $agent[$slot] = $own[$slot] }
     $script:DaemonAgentCache[$Kind] = $agent
     $agent

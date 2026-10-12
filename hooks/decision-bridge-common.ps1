@@ -3940,6 +3940,116 @@ function Get-DecisionFieldOptionValue {
     return ,$values[$found]
 }
 
+function Measure-BridgeTranscriptLine {
+    <#
+        Runs a predicate over the complete lines in a byte range of a transcript, and
+        reports how many matched and exactly how far it got.
+
+        This exists for totals, which the tail readers cannot produce. They answer
+        "what has this session just done", and for that a capped window is right: one
+        burst must not stall the loop, and a step nobody saw scroll past costs
+        nothing. A total is different. Every record that goes unread is a number that
+        stays wrong for the rest of the session, and the two ways a tail reader loses
+        one are both ordinary:
+
+          - adoption. A session the daemon merely found starts at the transcript's
+            end, so its whole history is behind the cursor from the first pass.
+          - the cap. When more than MaxTailBytes arrives between passes - a large tool
+            result, or a reconcile that was blocked - the framer skips the beginning
+            of the append and advances the cursor past it.
+
+        So the caller keeps the offset its count covers and asks for exactly the range
+        between that and where the reader has now got to. Nothing is counted twice,
+        because a range is scanned once; nothing is missed, because the range is every
+        byte, capped or not.
+
+        Through is the end of the last *complete* line read, which is what makes the
+        range resumable: a record still being written is left for the next call rather
+        than parsed in half and skipped. Known is false when the file could not be
+        read, and then the caller must not advance - a partial count silently becomes
+        a permanently wrong total, where a retry next pass costs one more read.
+
+        Measured against the largest real transcript here - 216 MB, 27,568 lines - at
+        2.1s for the whole of it, including the JSON parse of every candidate line.
+        That is the adoption case, paid once, beside the Home Assistant round-trips
+        adoption already makes; an ordinary pass scans the few KB just appended.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$Path,
+        [Parameter(Mandatory)][scriptblock]$Match,
+        [long]$From = 0,
+        # Where to stop. Negative means the end of the file as it is when opened.
+        [long]$Through = -1,
+        # How much to hold in memory at once. The framer allocates the window it is
+        # given, so the walk below is what keeps a 216 MB transcript from becoming a
+        # 216 MB buffer.
+        [int]$ChunkBytes = 4194304
+    )
+
+    $result = [pscustomobject]@{ Count = 0; Through = [long]$From; Known = $false }
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not [IO.File]::Exists($Path)) {
+        # Nothing written yet is a real answer, not a failure: a session between
+        # starting and its first event has been through nothing, and saying so lets
+        # the caller move on rather than re-asking every pass.
+        $result.Known = $true
+        return $result
+    }
+    if ($From -lt 0) { throw [ArgumentOutOfRangeException]::new('From') }
+
+    $stream = $null
+    try {
+        # Shared read/write for the same reason the tail readers ask for it: the CLI
+        # holds the transcript open while it writes.
+        $stream = [IO.File]::Open(
+            $Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite
+        )
+        $limit = $stream.Length
+        if ($Through -ge 0 -and $Through -lt $limit) { $limit = $Through }
+        # A file shorter than the caller's cursor is a session that was reset. Saying
+        # "known, nothing found, still at From" leaves the caller's own shrink policy
+        # to decide what that means, rather than guessing here.
+        if ($limit -le $From) {
+            $result.Known = $true
+            return $result
+        }
+
+        $cursor = [long]$From
+        $chunk = [Math]::Max(65536, $ChunkBytes)
+        while ($cursor -lt $limit) {
+            $snapshot = [Math]::Min($limit, $cursor + [long]$chunk)
+            $append = Read-BridgeTranscriptStream -Stream $stream -Offset $cursor `
+                -SnapshotLength $snapshot -MaxTailBytes $chunk
+            foreach ($line in @($append.Lines)) {
+                if (& $Match $line) { $result.Count++ }
+            }
+            if ([long]$append.Offset -gt $cursor) {
+                $cursor = [long]$append.Offset
+                continue
+            }
+            # No line boundary in the whole window. One record is longer than the
+            # chunk - a tool result that returned a file, say - so the window has to
+            # grow to hold it rather than the walk stalling on it. Doubling is bounded
+            # by the range itself: once the window reaches the remaining bytes the
+            # next pass either finds the newline or there genuinely is not one yet.
+            if ($snapshot -ge $limit) { break }
+            $chunk = $chunk * 2
+        }
+        $result.Through = $cursor
+        $result.Known = $true
+    }
+    catch {
+        # The offline guard must propagate rather than read as an ordinary unreadable
+        # transcript; everything else is one, and is reported as not known so the
+        # caller leaves its cursor alone and tries again.
+        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        return [pscustomobject]@{ Count = 0; Through = [long]$From; Known = $false }
+    }
+    finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+    $result
+}
+
 function Read-BridgeTranscriptStream {
     <#
         Frames a bounded append from a caller-owned stream. SnapshotLength is captured
