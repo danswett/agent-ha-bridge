@@ -15,11 +15,16 @@
     Commands:
 
       configure   Re-run the installer interactively, keeping your current settings
-                  as the defaults. Extra arguments are passed straight through, so
-                  `agent-ha-bridge configure -Clients copilot,claude` and
-                  `agent-ha-bridge configure -Workspace ~/repos,~/work` work too.
-                  Separate several values with commas and no spaces: arguments arrive
-                  here as literal strings, so a space would start a new one.
+                  as the defaults. It reports the configured Home Assistant, says
+                  whether it answered, and offers to point this machine at a
+                  different one - which is how you move between that instance's
+                  internal and external addresses. Extra arguments are passed
+                  straight through, so `agent-ha-bridge configure -Clients
+                  copilot,claude`, `agent-ha-bridge configure -Workspace
+                  ~/repos,~/work` and `agent-ha-bridge configure -HomeAssistantUrl
+                  https://ha.example.com` work too. Separate several values with
+                  commas and no spaces: arguments arrive here as literal strings, so
+                  a space would start a new one.
       pair        Join this machine to the fleet: shows a six-digit code to type into
                   Home Assistant, then receives the fleet secret from a machine
                   already in it, and turns session sharing on.
@@ -149,6 +154,7 @@ function Show-Help {
     Write-Host 'Usage: agent-ha-bridge <command> [options]'
     Write-Host ''
     Write-Host '  configure    Re-run the installer, keeping your settings as defaults'
+    Write-Host '               (including an offer to change the Home Assistant URL)'
     Write-Host '  pair         Join this machine to the fleet, so sessions can move between machines'
     Write-Host '  secret show  Print the fleet secret, for pasting where pairing cannot run'
     Write-Host '  secret rotate  Replace the fleet secret; the other machines then re-pair'
@@ -163,7 +169,12 @@ function Show-Help {
     Write-Host 'Examples:' -ForegroundColor Yellow
     Write-Host '  agent-ha-bridge configure'
     Write-Host '  agent-ha-bridge configure -Clients copilot,claude'
-    Write-Host '  agent-ha-bridge configure -Workspace ~/repos,~/work'    Write-Host '  agent-ha-bridge logs -Follow'
+    Write-Host '  agent-ha-bridge configure -Workspace ~/repos,~/work'
+    # Two statements shared this line, and Write-Host takes the remaining arguments
+    # as more things to print - so the second one was printed as the literal text
+    # "Write-Host   agent-ha-bridge logs -Follow" rather than run.
+    Write-Host '  agent-ha-bridge configure -HomeAssistantUrl https://ha.example.com'
+    Write-Host '  agent-ha-bridge logs -Follow'
 }
 
 function Show-HomeAssistantStatus {

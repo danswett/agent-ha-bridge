@@ -259,6 +259,212 @@ foreach ($mode in 'interactive', 'unattended', 'update') {
         $kept.Url -eq 'https://configured.test' -and $script:Discovered -eq 0 -and $script:Prompted -eq 0
     }
 }
+
+# A configured endpoint used to be returned and that was the end of it, so an install
+# whose Home Assistant had moved - or that had itself moved between that instance's
+# internal and external addresses - could only be corrected by somebody who knew
+# -HomeAssistantUrl existed. The question below fixes that without reopening the hole
+# the rule above closes: it is asked of a person, and only a typed answer moves
+# anything.
+Write-Host '--- a configured endpoint can be changed, but only by saying so ---'
+$script:Offered = @()
+$keepIt = { param($current, $reachable, $previous) $script:Offered += $current; '' }
+$changeIt = { param($current, $reachable, $previous) $script:Offered += $current; 'https://remote.test' }
+
+$script:Offered = @(); $script:Discovered = 0
+$resolved = Resolve-BridgeHomeAssistantUrl -Configured 'http://ha.test:8123' -Probe $yes `
+    -Discover $discoverSomething -ChangePrompt $changeIt
+Test-That 'a typed replacement is taken even though the configured one answers' {
+    $resolved.Url -eq 'https://remote.test' -and $resolved.Source -eq 'changed' -and $resolved.Prompted
+}
+Test-That 'changing an endpoint still never consults discovery' { $script:Discovered -eq 0 }
+Test-That 'the question is asked about the endpoint actually configured' {
+    @($script:Offered).Count -eq 1 -and $script:Offered[0] -eq 'http://ha.test:8123'
+}
+
+$script:Offered = @()
+$resolved = Resolve-BridgeHomeAssistantUrl -Configured 'http://ha.test:8123' -Probe $yes `
+    -Discover $discoverSomething -ChangePrompt $keepIt
+Test-That 'declining the question leaves the configured endpoint exactly as it was' {
+    $resolved.Url -eq 'http://ha.test:8123' -and $resolved.Source -eq 'config' -and -not $resolved.Prompted
+}
+
+$script:Offered = @()
+$resolved = Resolve-BridgeHomeAssistantUrl -Configured 'http://stale.test:8123' -Probe $no `
+    -Discover $discoverSomething -ChangePrompt $changeIt
+Test-That 'an endpoint that did not answer is the one most worth offering to change' {
+    @($script:Offered).Count -eq 1 -and $resolved.Url -eq 'https://remote.test' -and $resolved.Source -eq 'changed'
+}
+Test-That 'and a failed probe still does not change it by itself' {
+    $script:Offered = @()
+    $r = Resolve-BridgeHomeAssistantUrl -Configured 'http://stale.test:8123' -Probe $no `
+        -Discover $discoverSomething -ChangePrompt $keepIt
+    $r.Url -eq 'http://stale.test:8123' -and $r.Source -eq 'unverified' -and $script:Discovered -eq 0
+}
+
+Test-That 'whether the endpoint answered is passed to the question, not guessed by it' {
+    $script:Seen = @()
+    $record = { param($current, $reachable, $previous) $script:Seen += [bool]$reachable; '' }
+    [void](Resolve-BridgeHomeAssistantUrl -Configured 'http://ha.test:8123' -Probe $yes -ChangePrompt $record)
+    [void](Resolve-BridgeHomeAssistantUrl -Configured 'http://ha.test:8123' -Probe $no -ChangePrompt $record)
+    (@($script:Seen) -join ',') -eq 'True,False'
+}
+Test-That 'the remembered previous address is handed to the question' {
+    $script:SeenPrevious = 'not-called'
+    [void](Resolve-BridgeHomeAssistantUrl -Configured 'http://ha.test:8123' -Previous 'https://remote.test' `
+        -Probe $yes -ChangePrompt { param($current, $reachable, $previous) $script:SeenPrevious = $previous; '' })
+    $script:SeenPrevious -eq 'https://remote.test'
+}
+Test-That 'retyping the configured endpoint is not a change' {
+    $r = Resolve-BridgeHomeAssistantUrl -Configured 'http://ha.test:8123' -Probe $yes `
+        -ChangePrompt { param($current, $reachable, $previous) 'http://ha.test:8123/' }
+    $r.Url -eq 'http://ha.test:8123' -and $r.Source -eq 'config' -and -not $r.Prompted
+}
+Test-That 'a trailing slash on a replacement is trimmed like any other URL' {
+    $r = Resolve-BridgeHomeAssistantUrl -Configured 'http://ha.test:8123' -Probe $yes `
+        -ChangePrompt { param($current, $reachable, $previous) 'https://remote.test:8123/' }
+    $r.Url -eq 'https://remote.test:8123'
+}
+# The question validates what it accepts, so this is the backstop: ending an install
+# pointed at a URL nobody typed is worse than declining to change anything.
+foreach ($unusable in @('not-a-url', 'ftp://remote.test', 'https://remote.test/?token=synthetic-url-secret')) {
+    Test-That 'an unusable answer keeps the configured endpoint rather than ending the install' {
+        $r = Resolve-BridgeHomeAssistantUrl -Configured 'http://ha.test:8123' -Probe $yes `
+            -ChangePrompt { param($current, $reachable, $previous) $unusable }.GetNewClosure()
+        $r.Url -eq 'http://ha.test:8123' -and $r.Source -eq 'config'
+    }
+}
+Test-That 'a non-interactive run is never asked, because it has nobody to answer' {
+    $script:Offered = @()
+    $r = Resolve-BridgeHomeAssistantUrl -Configured 'http://ha.test:8123' -Probe $yes -Discover $discoverSomething
+    $r.Source -eq 'config' -and @($script:Offered).Count -eq 0
+}
+Test-That 'a first install has no configured endpoint to offer changing' {
+    $script:Offered = @()
+    $r = Resolve-BridgeHomeAssistantUrl -Configured '' -Probe $no -Discover $discoverSomething -ChangePrompt $changeIt
+    $r.Url -eq 'http://found.test:8123' -and $r.Source -eq 'discovered' -and @($script:Offered).Count -eq 0
+}
+
+Write-Host '--- what counts as the address being replaced ---'
+Test-That 'a real move reports the address being left behind' {
+    (Get-BridgeReplacedUrl -Current 'http://ha.test:8123' -Replacement 'https://remote.test') -eq 'http://ha.test:8123'
+}
+Test-That 'the same address written differently is not something to go back to' {
+    (Get-BridgeReplacedUrl -Current 'http://ha.test:8123/' -Replacement 'http://HA.test:8123') -eq ''
+}
+Test-That 'nothing is remembered on a first install' {
+    (Get-BridgeReplacedUrl -Current '' -Replacement 'https://remote.test') -eq ''
+}
+Test-That 'nothing is remembered when there is no replacement' {
+    (Get-BridgeReplacedUrl -Current 'http://ha.test:8123' -Replacement '') -eq ''
+}
+Test-That 'an unparseable address is not remembered rather than thrown over' {
+    (Get-BridgeReplacedUrl -Current 'ha.test:8123' -Replacement 'https://remote.test') -eq '' -and
+    (Get-BridgeReplacedUrl -Current 'http://ha.test:8123' -Replacement 'not-a-url') -eq ''
+}
+# A path is case-sensitive and a host is not, which is exactly how [Uri] normalizes
+# them - and exactly what PowerShell's own -eq would throw away. Behind a
+# path-prefixed reverse proxy these are two different Home Assistants, and treating
+# them as one meant typing the new one, confirming it, and silently keeping the old.
+Test-That 'a differently cased path is a different endpoint, because it is one' {
+    (Get-BridgeReplacedUrl -Current 'https://ha.test/ha' -Replacement 'https://ha.test/HA') -eq 'https://ha.test/ha'
+}
+Test-That 'a differently cased host is still the same endpoint' {
+    (Get-BridgeReplacedUrl -Current 'https://HA.test/ha' -Replacement 'https://ha.test/ha') -eq ''
+}
+Test-That 'the resolver takes a path-case change rather than quietly declining it' {
+    $r = Resolve-BridgeHomeAssistantUrl -Configured 'https://ha.test/ha' -Probe $yes `
+        -ChangePrompt { param($current, $reachable, $previous) 'https://ha.test/HA' }
+    $r.Url -eq 'https://ha.test/HA' -and $r.Source -eq 'changed'
+}
+
+Write-Host '--- the question itself ---'
+$script:AnswerQueue = [System.Collections.Generic.Queue[string]]::new()
+$script:AskedPrompts = @()
+function Read-Host {
+    <#
+        Stands in for the real cmdlet so the interactive question can be driven from
+        a test. An exhausted queue answers with Enter, which every prompt here treats
+        as "change nothing" - a test that runs out of answers fails rather than
+        hanging.
+    #>
+    param([string]$Prompt, [switch]$AsSecureString)
+    $script:AskedPrompts += [string]$Prompt
+    if ($script:AnswerQueue.Count -eq 0) { return '' }
+    $script:AnswerQueue.Dequeue()
+}
+function Set-BridgeAnswer {
+    param([string[]]$Values)
+    $script:AnswerQueue = [System.Collections.Generic.Queue[string]]::new()
+    foreach ($value in $Values) { $script:AnswerQueue.Enqueue($value) }
+    $script:AskedPrompts = @()
+}
+$probeAnswers = { param($u) $true }
+$silent = { param($u) $false }
+
+Set-BridgeAnswer @('n')
+Test-That 'declining the offer changes nothing' {
+    (Read-BridgeHomeAssistantUrlChange -Current 'http://ha.test:8123' -Reachable $true -Previous '' -Probe $probeAnswers) -eq ''
+}
+Set-BridgeAnswer @()
+Test-That 'Enter at the offer changes nothing, so the default is to leave it alone' {
+    (Read-BridgeHomeAssistantUrlChange -Current 'http://ha.test:8123' -Reachable $true -Previous '' -Probe $probeAnswers) -eq '' -and
+    @($script:AskedPrompts | Where-Object { $_ -match '\[y/N\]' }).Count -eq 1
+}
+Set-BridgeAnswer @('y', 'https://remote.test')
+Test-That 'a replacement that answers is accepted without further argument' {
+    (Read-BridgeHomeAssistantUrlChange -Current 'http://ha.test:8123' -Reachable $false -Previous '' -Probe $probeAnswers) -eq 'https://remote.test'
+}
+Set-BridgeAnswer @('y', '')
+Test-That 'Enter at the URL keeps the configured endpoint' {
+    (Read-BridgeHomeAssistantUrlChange -Current 'http://ha.test:8123' -Reachable $true -Previous '' -Probe $probeAnswers) -eq ''
+}
+Set-BridgeAnswer @('y', 'http://ha.test:8123/')
+Test-That 'retyping the configured endpoint is not treated as a change' {
+    (Read-BridgeHomeAssistantUrlChange -Current 'http://ha.test:8123' -Reachable $true -Previous '' -Probe $probeAnswers) -eq ''
+}
+Set-BridgeAnswer @('y', '1')
+Test-That 'the remembered address is one keystroke away, which is the point of keeping it' {
+    (Read-BridgeHomeAssistantUrlChange -Current 'http://ha.test:8123' -Reachable $false `
+        -Previous 'https://remote.test' -Probe $probeAnswers) -eq 'https://remote.test'
+}
+Set-BridgeAnswer @('y', '1', 'https://remote.test')
+Test-That 'with nothing remembered, 1 is an invalid URL and is re-asked rather than guessed at' {
+    $result = Read-BridgeHomeAssistantUrlChange -Current 'http://ha.test:8123' -Reachable $true -Previous '' -Probe $probeAnswers
+    $result -eq 'https://remote.test' -and @($script:AskedPrompts | Where-Object { $_ -match 'Home Assistant URL' }).Count -eq 2
+}
+Set-BridgeAnswer @('y', '1')
+Test-That 'the configured endpoint is never offered back to itself as the one you replaced' {
+    (Read-BridgeHomeAssistantUrlChange -Current 'http://ha.test:8123' -Reachable $true `
+        -Previous 'http://ha.test:8123/' -Probe $probeAnswers) -eq '' -and
+    @($script:AskedPrompts | Where-Object { $_ -match 'Home Assistant URL' }).Count -eq 2
+}
+Set-BridgeAnswer @('y', 'ftp://remote.test', 'https://remote.test')
+Test-That 'a mistyped URL is re-asked rather than carried into the install' {
+    (Read-BridgeHomeAssistantUrlChange -Current 'http://ha.test:8123' -Reachable $true -Previous '' -Probe $probeAnswers) -eq 'https://remote.test'
+}
+Set-BridgeAnswer @('y', 'https://typo.test', 'n', 'https://remote.test')
+Test-That 'a replacement nothing answers at has to be confirmed, and declining re-asks' {
+    $probe = { param($u) $u -eq 'https://remote.test' }
+    (Read-BridgeHomeAssistantUrlChange -Current 'http://ha.test:8123' -Reachable $true -Previous '' -Probe $probe) -eq 'https://remote.test'
+}
+Set-BridgeAnswer @('y', 'https://offline.test', 'y')
+Test-That 'confirming an endpoint that is simply switched off is still allowed' {
+    (Read-BridgeHomeAssistantUrlChange -Current 'http://ha.test:8123' -Reachable $true -Previous '' -Probe $silent) -eq 'https://offline.test'
+}
+Set-BridgeAnswer @('y', 'https://ha.test/HA')
+Test-That 'the question accepts a path-case change too, rather than reading it as no change' {
+    (Read-BridgeHomeAssistantUrlChange -Current 'https://ha.test/ha' -Reachable $true -Previous '' -Probe $probeAnswers) -eq 'https://ha.test/HA'
+}
+Set-BridgeAnswer @('n')
+$said = (Read-BridgeHomeAssistantUrlChange -Current 'http://ha.test:8123' -Reachable $false -Previous '' `
+    -Probe $probeAnswers 6>&1 | ForEach-Object { [string]$_ }) -join "`n"
+Test-That 'the question is printed rather than left to a prompt a redirected console may swallow' {
+    $said -match 'did not answer' -and $said -match 'Point this machine at a different Home Assistant'
+}
+# Scoped to this section: the rest of the suite must get the real cmdlet back.
+Remove-Item function:Read-Host
+
 foreach ($invalid in @(
     'file:///tmp/ha', 'ftp://ha.test', 'ha.test:8123', '//ha.test:8123',
     'https://user:synthetic-url-secret@ha.test', 'https://ha.test/?token=synthetic-url-secret',
