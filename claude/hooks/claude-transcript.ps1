@@ -65,6 +65,7 @@ function Get-ClaudeActivityFromTranscript {
     $latest = $null
     $latestIsThinking = $false
     $model = $null
+    $compactions = 0
     $history = New-Object System.Collections.Generic.List[string]
 
     foreach ($line in $Lines) {
@@ -78,6 +79,24 @@ function Get-ClaudeActivityFromTranscript {
         if ($entry.PSObject.Properties.Name -contains 'isMeta' -and $entry.isMeta) { continue }
 
         $type = [string]$entry.type
+
+        # Claude marks a compaction with one entry of its own:
+        # {"type":"system","subtype":"compact_boundary","content":"Conversation
+        # compacted","compactMetadata":{"trigger":...,"preTokens":...}}. Read from
+        # the installed CLI (2.1.291) rather than guessed, and it is the boundary
+        # that is counted rather than the summary message after it, because that is
+        # the one entry written exactly once per compaction.
+        #
+        # It carries isMeta:false, so the housekeeping skip above lets it through -
+        # and the sidechain skip still keeps a sub-agent's own compaction out of the
+        # session's count.
+        if ($type -eq 'system') {
+            if ($entry.PSObject.Properties.Name -contains 'subtype' -and
+                [string]$entry.subtype -eq 'compact_boundary') {
+                $compactions++
+            }
+            continue
+        }
 
         # The newest activity's time, so a caller can tell work that happened after a
         # hook set the status from the tail of the turn that hook just ended.
@@ -189,6 +208,9 @@ function Get-ClaudeActivityFromTranscript {
         # batch carried none - a batch of user entries alone says nothing about the
         # model, which is not the same as saying it changed.
         Model = $model
+        # How many compaction boundaries this batch crossed, for the session's running
+        # total. Counted the same way Copilot's are, so the card reads alike.
+        Compactions = $compactions
     }
 }
 
@@ -291,6 +313,34 @@ function Get-ClaudeAskUserState {
     $result.Pending = -not $answers.ContainsKey($latestId)
     if (-not $result.Pending) { $result.ResultContent = [string]$answers[$latestId] }
     $result
+}
+
+function Measure-ClaudeTranscriptCompaction {
+    <#
+        How many times a Claude session's conversation has been compacted, from the
+        whole transcript.
+
+        Claude writes one boundary entry per compaction, verified against the
+        installed CLI (2.1.291):
+
+            {"type":"system","subtype":"compact_boundary","content":"Conversation
+             compacted","isMeta":false,"compactMetadata":{"trigger":...}}
+
+        A sub-agent's own compaction is its business, not the session's, so a
+        sidechain entry is skipped here exactly as it is in the batch reader.
+    #>
+    param([Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$Path)
+
+    Measure-BridgeTranscriptLine -Path $Path -Match {
+        param($Line)
+        if (-not $Line.Contains('"compact_boundary"')) { return $false }
+        try {
+            $entry = $Line | ConvertFrom-Json
+            if ($entry.PSObject.Properties.Name -contains 'isSidechain' -and $entry.isSidechain) { return $false }
+            ([string]$entry.type -eq 'system') -and ([string]$entry.subtype -eq 'compact_boundary')
+        }
+        catch { $false }
+    }
 }
 
 function Read-ClaudeTranscriptAppend {

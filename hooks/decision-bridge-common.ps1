@@ -3940,6 +3940,62 @@ function Get-DecisionFieldOptionValue {
     return ,$values[$found]
 }
 
+function Measure-BridgeTranscriptLine {
+    <#
+        Runs a predicate over every line of a transcript and returns how many matched.
+
+        Reading the whole file, which the framer below deliberately never does - it
+        takes a capped tail so one burst cannot stall the daemon's loop. This is for
+        the single question a tail cannot answer: what a session did *before* the
+        bridge started watching it. A card that has to say how many times a session
+        has been compacted cannot start counting at adoption, or every session the
+        daemon merely found would claim a history it never had.
+
+        Called once per session, at adoption, alongside the Home Assistant round-trips
+        that provision its entities. Measured against the largest real transcript
+        here - 216 MB, 27,568 lines - at 2.1s including the JSON parse of every
+        candidate line, which is small beside them and is paid once.
+
+        A read that fails returns 0 rather than what it had got to. A partial count is
+        a wrong number that nothing afterwards corrects, where zero is simply the
+        starting point the incremental reader then builds on.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$Path,
+        [Parameter(Mandatory)][scriptblock]$Match
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Path) -or -not [IO.File]::Exists($Path)) { return 0 }
+
+    $count = 0
+    $stream = $null
+    $reader = $null
+    try {
+        # Shared read/write for the same reason the tail readers ask for it: the CLI
+        # holds the transcript open while it writes.
+        $stream = [IO.File]::Open(
+            $Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite
+        )
+        $reader = [IO.StreamReader]::new($stream)
+        while ($null -ne ($line = $reader.ReadLine())) {
+            if (& $Match $line) { $count++ }
+        }
+    }
+    catch {
+        # The offline guard must propagate rather than read as an ordinary unreadable
+        # transcript; everything else is one.
+        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        return 0
+    }
+    finally {
+        # The reader owns the stream once it has one, so disposing both would dispose
+        # it twice; the handle still has to be closed when it never got that far.
+        if ($null -ne $reader) { $reader.Dispose() }
+        elseif ($null -ne $stream) { $stream.Dispose() }
+    }
+    $count
+}
+
 function Read-BridgeTranscriptStream {
     <#
         Frames a bounded append from a caller-owned stream. SnapshotLength is captured

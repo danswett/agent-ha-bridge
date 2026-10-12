@@ -67,8 +67,15 @@
  * holds the reply card's Send down while a question is armed, a single-choice
  * question left the box on screen with no way whatsoever to send what was typed in
  * it. The bridge says which questions really have that entry, in takes_typed_answer.
+ *
+ * 1.38.0 puts the number of times a session's conversation has been compacted on its
+ * card, beside the status. A compaction is the one thing that happens to a session
+ * without anything on the card changing: the summary replaces the history, the
+ * session carries on, and nothing it says afterwards is evidence of what was lost.
+ * The bridge publishes it as a `compactions` attribute of the status entity and the
+ * card draws it when there is one to draw.
  */
-const CARD_VERSION = '1.37.0';
+const CARD_VERSION = '1.38.0';
 
 /*
  * How large a non-image attachment may be.
@@ -1136,7 +1143,16 @@ class AgentBridgeActivityCard extends HTMLElement {
     const squash = (s) => s.replace(/\s+/g, ' ').trim();
     const summaryCore = squash(activityText.replace(/\.\.\.$/, ''));
     if (summaryCore && squash(bodyText).startsWith(summaryCore)) { activityText = ''; }
-    const meta = `${this._config.machine}\u0001${shownStatus}\u0001${activityText}`;
+    // How many times this conversation has been compacted. Published only once there
+    // is one, so a session that has never been compacted reads exactly as it did and
+    // no card ever says "0 compactions". It sits next to the status rather than at the
+    // end of the line because the activity text beside it changes constantly, and a
+    // number that moves about is one nobody reads.
+    const compactions = Number(attr(status, 'compactions') || 0);
+    const compactionText = compactions > 0
+      ? `compacted ${compactions === 1 ? 'once' : `${compactions} times`}`
+      : '';
+    const meta = `${this._config.machine}\u0001${shownStatus}\u0001${compactionText}\u0001${activityText}`;
     if (this._changed('meta', meta)) {
       this._els.meta.textContent = '';
       const machine = document.createElement('i');
@@ -1144,6 +1160,7 @@ class AgentBridgeActivityCard extends HTMLElement {
       const bold = document.createElement('b');
       bold.textContent = shownStatus;
       this._els.meta.append(machine, ' • status: ', bold);
+      if (compactionText) { this._els.meta.append(` • ${compactionText}`); }
       if (activityText) { this._els.meta.append(` • ${activityText}`); }
     }
 

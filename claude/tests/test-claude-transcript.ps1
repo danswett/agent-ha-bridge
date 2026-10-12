@@ -70,6 +70,62 @@ Test-That 'a tool result is not treated as a user message' {
     @($activity.History | Where-Object { $_ -eq 'Reading your message' }).Count -eq 1
 }
 
+Write-Host '--- how many times the conversation has been compacted ---'
+# Claude marks a compaction with one entry of its own. Read from the installed CLI
+# (2.1.291) rather than guessed:
+#   {"type":"system","subtype":"compact_boundary","content":"Conversation compacted",
+#    "isMeta":false,"compactMetadata":{"trigger":...,"preTokens":...}}
+# The boundary is what gets counted, not the summary that follows it, because it is
+# the one entry written exactly once per compaction.
+function New-CompactBoundary {
+    param([string]$Trigger = 'auto', [bool]$Sidechain = $false)
+    $entry = @{
+        type = 'system'; subtype = 'compact_boundary'; content = 'Conversation compacted'
+        isMeta = $false; level = 'info'
+        compactMetadata = @{ trigger = $Trigger; preTokens = 154321; messagesSummarized = 612 }
+    }
+    if ($Sidechain) { $entry['isSidechain'] = $true }
+    ($entry | ConvertTo-Json -Depth 6 -Compress)
+}
+$say = '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"carrying on"}]}}'
+
+$compacted = Get-ClaudeActivityFromTranscript -Lines @((New-CompactBoundary), $say)
+Test-That 'a compaction boundary is counted' { $compacted.Compactions -eq 1 } "$($compacted.Compactions)"
+Test-That 'and the batch around it is read exactly as it was' { $compacted.Response -eq 'carrying on' }
+$twice = Get-ClaudeActivityFromTranscript -Lines @((New-CompactBoundary), $say, (New-CompactBoundary -Trigger 'manual'))
+Test-That 'two in one batch are two, whatever triggered them' { $twice.Compactions -eq 2 } "$($twice.Compactions)"
+$none = Get-ClaudeActivityFromTranscript -Lines @($say)
+Test-That 'a batch with none reports none, not nothing' { $none.Compactions -eq 0 }
+# A sub-agent compacting its own context is its business; the session's count is the
+# session's, exactly as its tool calls and messages already are.
+$sub = Get-ClaudeActivityFromTranscript -Lines @((New-CompactBoundary -Sidechain $true))
+Test-That 'a sub-agent compacting is not the session being compacted' { $sub.Compactions -eq 0 }
+# Another system entry - a hook's output, a warning - is not a compaction, and must
+# not be read as one now that system entries are looked at.
+$otherSystem = Get-ClaudeActivityFromTranscript -Lines @('{"type":"system","subtype":"hook_result","content":"ran"}', $say)
+Test-That 'any other system entry still counts for nothing' { $otherSystem.Compactions -eq 0 }
+Test-That 'and does not disturb what the batch says' { $otherSystem.Response -eq 'carrying on' }
+
+$compactFile = Join-Path ([IO.Path]::GetTempPath()) "claude-compactions-$([guid]::NewGuid().ToString('N').Substring(0,8)).jsonl"
+try {
+    # A session adopted part-way through is read from the end of its transcript, so a
+    # total has to come from the whole file or every long session claims it has never
+    # been compacted - and those are the ones worth asking about.
+    [IO.File]::WriteAllLines($compactFile, @(
+        $say, (New-CompactBoundary), $say, (New-CompactBoundary -Trigger 'manual'),
+        (New-CompactBoundary -Sidechain $true), $say))
+    Test-That 'the whole transcript is counted, not its tail' {
+        (Measure-ClaudeTranscriptCompaction -Path $compactFile) -eq 2
+    } "$(Measure-ClaudeTranscriptCompaction -Path $compactFile)"
+    Test-That 'a transcript that is not written yet has been through nothing' {
+        (Measure-ClaudeTranscriptCompaction -Path "$compactFile.absent") -eq 0
+    }
+    Test-That 'and neither has a session with no transcript at all' {
+        (Measure-ClaudeTranscriptCompaction -Path '') -eq 0
+    }
+}
+finally { Remove-Item -LiteralPath $compactFile -Force -ErrorAction SilentlyContinue }
+
 Write-Host '--- which model is writing ---'
 # Claude records the model on every assistant entry. Reading it is what lets a
 # session's card say what it is running without the bridge having launched it: the

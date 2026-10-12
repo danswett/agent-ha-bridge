@@ -813,6 +813,134 @@ finally {
 }
 
 Write-Host ''
+Write-Host '--- how many times the conversation has been compacted ---'
+# A compaction is the one thing that happens to a session with nothing on its card
+# changing: the summary replaces the history, the session carries straight on, and
+# nothing it says afterwards is evidence of what was lost.
+#
+# Copilot writes a start for every attempt and a completion carrying `success`. In one
+# real 216 MB transcript 225 starts produced 6 compactions that happened and 219
+# failures ("automatic compaction summarizer did not settle within 300s"), so a reader
+# that counted starts - or completions without reading success - would have claimed
+# that session had lost its history thirty-seven times over.
+function New-CompactionStart { (@{ type = 'session.compaction_start'; data = @{ currentTokens = 841305; tokenLimit = 1050000; trigger = 'threshold' } } | ConvertTo-Json -Depth 5 -Compress) }
+function New-CompactionDone {
+    param([bool]$Success, [string]$Summary = '')
+    $data = if ($Success) { @{ success = $true; preCompactionTokens = 938650; postCompactionTokens = 47868; summaryContent = $Summary } }
+        else { @{ success = $false; error = 'automatic compaction summarizer did not settle within 300s of starting; pending summary discarded' } }
+    (@{ type = 'session.compaction_complete'; data = $data } | ConvertTo-Json -Depth 5 -Compress)
+}
+
+$activity = Get-ActivityFromEvents -Lines @((New-CompactionStart), (New-CompactionDone -Success $true)) -VerboseMode $true
+Test-That 'a compaction that finished is counted' { $activity.Compactions -eq 1 }
+$activity = Get-ActivityFromEvents -Lines @((New-CompactionStart), (New-CompactionDone -Success $false)) -VerboseMode $true
+Test-That 'one that gave up is not, because nothing happened to the conversation' { $activity.Compactions -eq 0 }
+$activity = Get-ActivityFromEvents -Lines @((New-CompactionStart)) -VerboseMode $true
+Test-That 'and an attempt still running counts for nothing yet' { $activity.Compactions -eq 0 }
+$activity = Get-ActivityFromEvents -Lines @(
+    (New-CompactionDone -Success $true), (New-Reply 'carrying on'), (New-CompactionDone -Success $true)) -VerboseMode $true
+Test-That 'two in one batch are two' { $activity.Compactions -eq 2 }
+Test-That 'and the rest of the batch is read exactly as it was' { $activity.Response -eq 'carrying on' }
+$activity = Get-ActivityFromEvents -Lines @((New-Reply 'nothing to do with compaction')) -VerboseMode $true
+Test-That 'a batch with none reports none, not nothing' { $activity.Compactions -eq 0 }
+
+# The summary a compaction writes is the model's own prose about the session, and a
+# session about this bridge quotes the event's own shape back. Matching on the text
+# '"success":true' would then count a failure as a compaction.
+$quoting = New-CompactionDone -Success $false
+$quoting = $quoting -replace 'pending summary discarded', 'pending summary discarded while reading {\"success\":true}'
+$activity = Get-ActivityFromEvents -Lines @($quoting) -VerboseMode $true
+Test-That 'a failure whose text quotes a success is still a failure' { $activity.Compactions -eq 0 }
+
+Write-Host ''
+Write-Host '--- what a session had been through before the bridge saw it ---'
+# A session the daemon merely found is read from the end of its transcript, because
+# what was said before is not news. A total is the exception: start it at adoption and
+# every long-running session - the ones most likely to have been compacted, and most
+# likely to be met part-way through - claims it has never been compacted at all.
+$script:CompactionScratch = Join-Path ([IO.Path]::GetTempPath()) "compactions-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+New-Item -ItemType Directory -Path $script:CompactionScratch -Force | Out-Null
+try {
+    $history = Join-Path $script:CompactionScratch 'events.jsonl'
+    [IO.File]::WriteAllLines($history, @(
+        (New-Reply 'first'), (New-CompactionStart), (New-CompactionDone -Success $true -Summary 'what happened so far'),
+        (New-Reply 'second'), (New-CompactionStart), (New-CompactionDone -Success $false),
+        (New-CompactionStart), (New-CompactionDone -Success $true), (New-Reply 'third')))
+
+    Test-That 'the whole transcript is counted, not its tail' {
+        (Measure-CopilotTranscriptCompaction -Path $history) -eq 2
+    } "count=$(Measure-CopilotTranscriptCompaction -Path $history)"
+    Test-That 'through the dispatcher, for whichever agent the session belongs to' {
+        (Get-BridgeTranscriptCompactionCount -Path $history -Kind 'copilot') -eq 2
+    }
+    Test-That 'a session whose transcript is not written yet has been through nothing' {
+        (Measure-CopilotTranscriptCompaction -Path (Join-Path $script:CompactionScratch 'absent.jsonl')) -eq 0
+    }
+    Test-That 'and neither has one with no transcript at all' {
+        (Measure-CopilotTranscriptCompaction -Path '') -eq 0
+    }
+    # Codex auto-compacts too, but what its rollout writes has not been read from a
+    # running Codex - so it says nothing rather than scanning a rollout for a Copilot
+    # marker it cannot contain.
+    Test-That 'Codex reports none rather than guessing at a marker nobody has verified' {
+        (Get-BridgeTranscriptCompactionCount -Path $history -Kind 'codex') -eq 0
+    }
+}
+finally {
+    Remove-Item -LiteralPath $script:CompactionScratch -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host ''
+Write-Host '--- the count on the card ---'
+$script:StatusPublishes = @()
+function Set-CopilotMqttActivity { param($SessionId, $Summary, $Detail, $Headers) $script:Published = $Detail }
+function Set-CopilotMqttStatus { param($SessionId, $Status, $Headers, $Attributes) $script:StatusPublishes += [pscustomobject]@{ Status = $Status; Attributes = $Attributes } }
+function Write-DaemonLog { param([string]$Message) }
+
+$compactLog = Join-Path ([IO.Path]::GetTempPath()) "compaction-card-$([guid]::NewGuid().ToString('N')).jsonl"
+try {
+    $entry = [pscustomobject]@{ Offset = 0; Name = 'Copilot: long one'; Machine = 'DESK'; Status = 'working'; Kind = 'copilot'; Compactions = 3 }
+    $session = [pscustomobject]@{ SessionId = 's'; Transcript = $compactLog; ProcessId = 1 }
+    function StepCompaction { param([string[]]$Lines)
+        Add-Content -LiteralPath $compactLog -Value $Lines -Encoding utf8
+        Update-DaemonSessionActivity -Id 'dddddddd-1111-2222-3333-444444444444' -Entry $entry -Session $session -Headers @{} -VerboseOn $false
+    }
+
+    Test-That 'a count already on the session reaches the card' {
+        (Add-DaemonTuningAttributes -Attributes @{} -Tuning $entry)['compactions'] -eq 3
+    }
+    Test-That 'and a session that has never been compacted carries nothing at all' {
+        -not (Add-DaemonTuningAttributes -Attributes @{} -Tuning ([pscustomobject]@{ Name = 'fresh' })).ContainsKey('compactions')
+    }
+
+    $script:StatusPublishes = @()
+    StepCompaction -Lines @((New-CompactionStart), (New-CompactionDone -Success $true), (New-Reply 'back to work'))
+    Test-That 'a compaction adds to the running total rather than replacing it' { $entry.Compactions -eq 4 }
+    # A compaction changes no status - the session carries straight on - so without a
+    # publish of its own the card would keep the old number until the session next
+    # happened to go idle.
+    Test-That 'and is published even though the status did not change' {
+        @($script:StatusPublishes).Count -eq 1 -and $script:StatusPublishes[-1].Attributes['compactions'] -eq 4
+    } "publishes=$(@($script:StatusPublishes).Count)"
+    Test-That 'at the status it already had' { $script:StatusPublishes[-1].Status -eq 'working' }
+
+    $script:StatusPublishes = @()
+    StepCompaction -Lines @((New-Reply 'still going'))
+    Test-That 'a batch with no compaction publishes nothing and leaves the total alone' {
+        $entry.Compactions -eq 4 -and @($script:StatusPublishes).Count -eq 0
+    } "total=$($entry.Compactions) publishes=$(@($script:StatusPublishes).Count)"
+
+    $script:StatusPublishes = @()
+    StepCompaction -Lines @((New-CompactionStart), (New-CompactionDone -Success $false))
+    Test-That 'a failed attempt leaves it alone too' {
+        $entry.Compactions -eq 4 -and @($script:StatusPublishes).Count -eq 0
+    } "total=$($entry.Compactions)"
+}
+finally {
+    Remove-Item -LiteralPath $compactLog -Force -ErrorAction SilentlyContinue
+}
+
+Write-Host ''
 Write-Host '--- a session whose transcript is not there yet ---'
 # On 2026-10-07 a session between starting and writing its first event logged a read
 # failure about eight times a second. The fast lane runs on every 100 ms tick of the

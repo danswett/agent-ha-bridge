@@ -47,6 +47,23 @@ function Get-BridgeActivity {
     & (Get-DaemonAgent -Kind $Kind).Activity $Lines $VerboseMode
 }
 
+function Get-BridgeTranscriptCompactionCount {
+    <#
+        How many compactions a session's transcript records, from its start.
+
+        For the one moment a running total has nothing to build on: adoption of a
+        session the daemon did not launch, which is read from the end of its
+        transcript because what was said before is not news. The compaction count is
+        the exception - it is a total, not news - so it is taken from the whole file.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$Path,
+        [string]$Kind = 'copilot'
+    )
+
+    [int](& (Get-DaemonAgent -Kind $Kind).CountCompactions $Path)
+}
+
 function Test-BridgeSessionWorking {
     param(
         [Parameter(Mandatory)][string]$SessionId,
@@ -184,6 +201,28 @@ function Get-DaemonStartupStatus {
     'idle'
 }
 
+function Measure-CopilotTranscriptCompaction {
+    <# How many times a Copilot session's conversation has been compacted, from the whole transcript. #>
+    param([Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$Path)
+
+    Measure-BridgeTranscriptLine -Path $Path -Match {
+        param($Line)
+        # The cheap test first: these events are a handful of lines in a file that is
+        # mostly assistant messages and tool results.
+        if (-not $Line.Contains('"type":"session.compaction_complete"')) { return $false }
+        try {
+            $parsed = $Line | ConvertFrom-Json
+            if ([string]$parsed.type -ne 'session.compaction_complete') { return $false }
+            $data = $parsed.data
+            # Success, for the reason Get-ActivityFromEvents reads it: a long session
+            # fails far more compactions than it completes, and a failed one changed
+            # nothing.
+            ($null -ne $data) -and (@($data.PSObject.Properties.Name) -contains 'success') -and [bool]$data.success
+        }
+        catch { $false }
+    }
+}
+
 function Read-TranscriptAppend {
     <#
         Returns transcript lines appended since $Offset, plus the new offset.
@@ -310,6 +349,7 @@ function Get-ActivityFromEvents {
     # that already knows the attaching process is a different one.
     $shellsSinceAttach = New-Object System.Collections.Generic.List[string]
     $attached = $false
+    $compactions = 0
 
     foreach ($line in $Lines) {
         if ($line -notmatch '"type":"([^"]+)"') { continue }
@@ -326,6 +366,29 @@ function Get-ActivityFromEvents {
         if ($type -eq 'session.resume' -or $type -eq 'session.start') {
             $attached = $true
             $shellsSinceAttach.Clear()
+            continue
+        }
+
+        # A compaction that actually replaced the conversation with a summary. Only
+        # the completion counts, and only a successful one: Copilot writes a start for
+        # every attempt, and most attempts in a long session fail. One real transcript
+        # held 225 starts against 6 compactions that happened - counting starts, or
+        # counting completions without reading `success`, would have said the session
+        # had lost its history thirty-seven times over.
+        #
+        # Parsed rather than matched on '"success":true', because a successful
+        # completion also carries the summary the model just wrote, and that text is
+        # free to quote anything at all - including this event's own shape.
+        if ($type -eq 'session.compaction_complete') {
+            try {
+                $parsed = $line | ConvertFrom-Json
+                $data = $parsed.data
+                if ($null -ne $data -and @($data.PSObject.Properties.Name) -contains 'success' -and
+                    [bool]$data.success) {
+                    $compactions++
+                }
+            }
+            catch { }
             continue
         }
 
@@ -583,6 +646,11 @@ function Get-ActivityFromEvents {
         # for a process known to be new means the whole tail is the dead one's.
         ShellsSinceAttach = @($shellsSinceAttach)
         ShellAttachSeen = $attached
+        # How many times the conversation was compacted in this batch, to be added to
+        # the session's running total. A count rather than ids: nothing repeats a
+        # compaction the way a shutdown repeats a subagent.completed, and the number
+        # only ever goes up.
+        Compactions = $compactions
     }
 }
 
@@ -661,6 +729,53 @@ function Get-DaemonBackgroundShellCount {
     $value = $Entry.BackgroundShells
     if ($null -eq $value) { return 0 }
     @(@($value) | Where-Object { -not [string]::IsNullOrWhiteSpace([string]$_) }).Count
+}
+
+function Get-DaemonCompactionCount {
+    <#
+        How many times a session's conversation has been compacted.
+
+        Read as carefully as the counts above, for the same reason and a second one: a
+        property that is present but null throws under StrictMode when it is used as a
+        number, and a state file that has been restored, hand-edited or written by an
+        older build can hold something that is not one at all. Either way the answer
+        is "none recorded", not a card announcing a compaction that never happened.
+    #>
+    param([Parameter(Mandatory)]$Entry)
+
+    if (-not $Entry.PSObject.Properties['Compactions']) { return 0 }
+    $value = $Entry.Compactions
+    if ($null -eq $value) { return 0 }
+    try { [int]$value } catch { 0 }
+}
+
+function Update-DaemonCompactionCount {
+    <#
+        Adds a batch's compactions to the session's running total and returns it.
+
+        A total kept on the entry, not recomputed: the transcript is read as a capped
+        tail from wherever the last pass stopped, so the only place the whole history
+        is ever available is the one scan at adoption that seeds this.
+
+        It only ever goes up. A compaction is a thing that happened to the
+        conversation, not a state that can clear, so nothing here subtracts - and a
+        batch carrying none leaves the total exactly where it was.
+    #>
+    param(
+        [Parameter(Mandatory)]$Entry,
+        [Parameter(Mandatory)]$Activity
+    )
+
+    $total = Get-DaemonCompactionCount -Entry $Entry
+    $batch = 0
+    if ($Activity.PSObject.Properties['Compactions'] -and $null -ne $Activity.Compactions) {
+        try { $batch = [int]$Activity.Compactions } catch { $batch = 0 }
+    }
+    if ($batch -le 0) { return $total }
+
+    $total += $batch
+    Set-DaemonSessionProperty -Entry $Entry -Name 'Compactions' -Value $total
+    $total
 }
 
 function Get-DaemonBackgroundShellOwner {
@@ -946,6 +1061,12 @@ function Update-DaemonSessionActivity {
     # were running, until the session next moved for some other reason.
     $shellCountChanged = ($runningShells -ne $shellsBefore)
 
+    # A compaction never changes the status - the session carries straight on - so the
+    # count rides on the same republish the model and the shell count do, or the card
+    # would keep the old number until the session happened to go idle.
+    $compactionsBefore = Get-DaemonCompactionCount -Entry $entry
+    $compactionsChanged = (Update-DaemonCompactionCount -Entry $entry -Activity $activity) -ne $compactionsBefore
+
     # The model the transcript just named. Recorded before the status publish below,
     # so a batch that changes both spends one publish on the pair.
     $modelChanged = $false
@@ -974,13 +1095,14 @@ function Update-DaemonSessionActivity {
             Write-DaemonLog -Message "status publish failed for $id : $($_.Exception.Message)"
         }
     }
-    elseif ($modelChanged -or $shellCountChanged) {
+    elseif ($modelChanged -or $shellCountChanged -or $compactionsChanged) {
         # A model can change without the status doing so - a session already working
         # when the daemon first sees it, or a /model typed mid-turn - and the status
         # attributes are republished wholesale, so the card would otherwise carry the
         # old model until the next time the session happened to go idle. The number of
         # background commands moves the same way: a second one starting leaves the
-        # status on 'shell' while the count the card draws goes stale.
+        # status on 'shell' while the count the card draws goes stale. So does a
+        # compaction, which changes no status at all.
         #
         # Only from a status Set-CopilotMqttStatus accepts: an entry parked on
         # something else ('ending') is mid-retirement and its card is about to go.
