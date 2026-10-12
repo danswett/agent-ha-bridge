@@ -497,7 +497,7 @@ try {
     Test-That 'the token survives the upgrade' { $after.homeAssistant.token -eq 'kept' }
     Test-That 'an unattended update retains an offline configured endpoint without discovery' {
         $upgradeExit -eq 0 -and $after.homeAssistant.baseUrl -eq 'http://127.0.0.1:1' -and
-            ($upgradeLog -join "`n") -notmatch 'probing |not found automatically'
+            ($upgradeLog -join "`n") -notmatch 'probing |not found automatically|different Home Assistant'
     }
     Test-That 'the original and update backup remain owner-only' {
         (Test-BridgeSecretFileProtected -Path (Join-Path $legacyBridge 'config.json')) -and
@@ -517,6 +517,10 @@ try {
         $changed = Get-Content -LiteralPath (Join-Path $legacyBridge 'config.json') -Raw | ConvertFrom-Json
         $changeExit -eq 0 -and $changed.homeAssistant.baseUrl -eq 'http://127.0.0.1:1' -and
             $changed.homeAssistant.token -eq 'kept' -and ($changeLog -join "`n") -notmatch 'probing '
+    }
+    Test-That 'and leaves the address it replaced on offer for the next interactive run' {
+        $changed = Get-Content -LiteralPath (Join-Path $legacyBridge 'config.json') -Raw | ConvertFrom-Json
+        $changed.homeAssistant.previousBaseUrl -eq 'https://previous.invalid'
     }
     $beforeInvalid = Get-Content -LiteralPath (Join-Path $legacyBridge 'config.json') -Raw
     $invalidLog = & pwsh -NoProfile -File (Join-Path $repoRoot 'install.ps1') `
@@ -557,8 +561,10 @@ Write-Host '--- the prompts people actually see, driven through stdin ---'# Read
 # rather than only through its injectable seams. -HomeAssistantUrl keeps both of these
 # off the network.
 function Invoke-SandboxInstall {
-    param([string]$Answers, [string[]]$ExtraArgs)
-    $box = New-ScratchDir
+    param([string]$Answers, [string[]]$ExtraArgs, [string]$Root)
+    # -Root re-runs against a sandbox that already has a config, which is the only
+    # way to reach the questions an install only asks the second time.
+    $box = if ($Root) { $Root } else { New-ScratchDir }
     $installArgs = @(
         '-NoProfile', '-File', (Join-Path $repoRoot 'install.ps1'),
         '-TargetHome', $box, '-TestRegistryId', $suiteRegistryId, '-SkipTask', '-SkipPath', '-SkipDependencies'
@@ -621,10 +627,45 @@ finally {
     Remove-Item -LiteralPath $sandboxArpKey -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+# A configured endpoint used to be reported and moved past, so an install whose Home
+# Assistant had moved - or that had itself moved between that instance's internal and
+# external addresses - could only be corrected by somebody who knew -HomeAssistantUrl
+# existed. The question is put to a person and answered by one; an unattended run is
+# still never asked, and still never has its endpoint moved for it.
+Write-Host '--- changing a configured endpoint from an interactive re-run ---'
+$configured = Invoke-SandboxInstall -Answers '' -ExtraArgs @(
+    '-NonInteractive', '-SkipVerify', '-Clients', 'copilot', '-HomeAssistantUrl', 'http://127.0.0.1:1')
+try {
+    Test-That 'the install being re-run against succeeded' { $configured.Exit -eq 0 }
+
+    $kept = Invoke-SandboxInstall -Root $configured.Root -Answers "n`n" -ExtraArgs @(
+        '-SkipVerify', '-Clients', 'copilot', '-Workspace', $configured.Root)
+    Test-That 'an interactive re-run offers to change the configured endpoint' {
+        $kept.Output -match 'Point this machine at a different Home Assistant'
+    }
+    Test-That 'it says whether that endpoint answered, which is usually why you are changing it' {
+        $kept.Output -match 'http://127\.0\.0\.1:1 did not answer'
+    }
+    Test-That 'declining leaves the endpoint and the credential bound to it exactly as they were' {
+        $written = Get-Content -LiteralPath (Join-Path $configured.Home 'config.json') -Raw | ConvertFrom-Json
+        $kept.Exit -eq 0 -and $written.homeAssistant.baseUrl -eq 'http://127.0.0.1:1' -and
+            [string]$written.homeAssistant.previousBaseUrl -eq ''
+    }
+
+    $unattended = Invoke-SandboxInstall -Root $configured.Root -Answers '' -ExtraArgs @(
+        '-NonInteractive', '-SkipVerify', '-Clients', 'copilot', '-Workspace', $configured.Root)
+    Test-That 'an unattended re-run is never asked, because it has nobody to answer' {
+        $unattended.Exit -eq 0 -and $unattended.Output -notmatch 'Point this machine at a different Home Assistant'
+    }
+}
+finally {
+    Remove-Item -LiteralPath $configured.Root -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $sandboxArpKey -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 Test-That 'none of the interactive runs touched the real user PATH' {
     (Get-BridgeUserPath) -eq $pathBefore
 }
-
 Write-Host ''
 Write-Host '--- the command lands on PATH in a file the shell actually reads ---'
 # On a Mac whose shell is bash, the line went into ~/.zprofile alone - which bash never

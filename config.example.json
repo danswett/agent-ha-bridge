@@ -2,6 +2,7 @@
   "autoConfigureClients": true,
   "homeAssistant": {
     "baseUrl": "http://homeassistant.local:8123",
+    "previousBaseUrl": "",
     "token": "",
     "tokenEnvVar": "AGENT_HA_TOKEN",
     "agentUserIds": [],

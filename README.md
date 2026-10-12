@@ -271,8 +271,26 @@ A token that doesn't work is reported there and then, with another go at pasting
 into a masked prompt, rather than failing at the end of the install.
 
 An existing configured endpoint is never replaced by discovery, even when it is
-offline or its DNS/TLS probe fails. Use `agent-ha-bridge configure -HomeAssistantUrl
-<intended-url>` to deliberately change it; this explicitly authorizes using the
+offline or its DNS/TLS probe fails. Changing it is always something you say, never
+something a probe decides: run `agent-ha-bridge configure` and it reports the
+configured endpoint, says whether it answered, and offers to replace it —
+
+```
+==> Looking for Home Assistant
+    http://homeassistant.local:8123 did not answer
+    Point this machine at a different Home Assistant? [y/N] y
+      1) https://ha.example.com  (the address you replaced)
+    Type a URL or 1, or press Enter to keep http://homeassistant.local:8123.
+```
+
+which is how you move an install between a Home Assistant's internal and external
+addresses. The default is to change nothing, a replacement is probed before it is
+accepted (confirm it anyway and it is still used, for an instance that is simply off
+right now), and the address you replaced is remembered in
+`homeAssistant.previousBaseUrl` so the return trip is one keystroke. Unattended runs
+— including the self-updater — are never asked and never have their endpoint moved
+for them; `agent-ha-bridge configure -HomeAssistantUrl <intended-url>` is the way to
+change it from a script. Either way, changing it explicitly authorizes using the
 configured credentials at that URL. Installer verification does not follow redirects.
 HTTP on a trusted LAN remains supported, with the existing unencrypted-token warning.
 
@@ -350,8 +368,9 @@ agent-ha-bridge help
 ```
 
 Anything after the command goes straight to the underlying script, as a normal named
-parameter — so `agent-ha-bridge configure -Clients copilot,claude` and
-`agent-ha-bridge configure -NotifyService notify.mobile_app_pixel` both work.
+parameter — so `agent-ha-bridge configure -Clients copilot,claude`,
+`agent-ha-bridge configure -NotifyService notify.mobile_app_pixel` and
+`agent-ha-bridge configure -HomeAssistantUrl https://ha.example.com` all work.
 `--configure` and `/configure` are accepted too.
 
 ### Configuration
@@ -362,6 +381,7 @@ never in the repo). See [`config.example.json`](config.example.json).
 | Key | Meaning |
 |---|---|
 | `homeAssistant.baseUrl` | e.g. `http://homeassistant.local:8123` |
+| `homeAssistant.previousBaseUrl` | The endpoint `baseUrl` last replaced, written whenever it changes. Offered back by number at the next interactive `agent-ha-bridge configure`, so moving between a Home Assistant's internal and external addresses does not mean retyping both of them. Holds no credentials |
 | `homeAssistant.token` | Long-lived access token |
 | `homeAssistant.tokenEnvVar` | Read the token from this env var instead (default `AGENT_HA_TOKEN`; `COPILOT_HA_TOKEN` still works) |
 | `homeAssistant.agentUserIds` | Home Assistant user ids that count as an agent rather than you. A session an agent starts or replies to gets a purple edge on its card, so a session being driven remotely says so at a glance. Written for you from `agentToken` — see [Telling an agent's turn from yours](#telling-an-agents-turn-from-yours) |

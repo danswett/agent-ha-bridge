@@ -18,7 +18,11 @@
 
 .PARAMETER HomeAssistantUrl
     Base URL of Home Assistant, e.g. http://homeassistant.local:8123. Supplying this
-    explicitly authorizes using the configured credentials at that endpoint.
+    explicitly authorizes using the configured credentials at that endpoint. Omit it
+    on an interactive re-run and you are shown the configured endpoint, told whether
+    it answered, and offered the chance to replace it - which is how you move an
+    install between that instance's internal and external addresses without needing
+    to know this parameter exists.
 
 .PARAMETER Token
     A Home Assistant long-lived access token. Stored in the bridge config outside the
@@ -1733,22 +1737,121 @@ function Find-HomeAssistant {
     return $null
 }
 
+function Get-BridgeReplacedUrl {
+    <#
+        The endpoint a change is moving away from, or '' when nothing is moving.
+
+        Both ways of changing the URL - the question below and -HomeAssistantUrl -
+        go through this, so neither of them records a "previous" address that is
+        really the current one written differently. A trailing slash or a differently
+        cased host would otherwise be remembered as somewhere else to go back to.
+    #>
+    param(
+        [AllowEmptyString()][AllowNull()][string]$Current,
+        [AllowEmptyString()][AllowNull()][string]$Replacement
+    )
+    if (-not $Current -or -not $Replacement) { return '' }
+    try {
+        $from = ConvertTo-BridgeHomeAssistantUrl -Value $Current
+        $to = ConvertTo-BridgeHomeAssistantUrl -Value $Replacement
+    }
+    catch { return '' }
+    if ($from -eq $to) { return '' }
+    $from
+}
+
+function Read-BridgeHomeAssistantUrlChange {
+    <#
+        Offers to point this install at a different Home Assistant, and returns ''
+        for "leave it alone".
+
+        The offer is made whether or not the configured URL answered, because the
+        usual reason to want it is that it did not: a machine that has moved between
+        its Home Assistant's internal address and its external one has a perfectly
+        good config naming an endpoint it cannot currently reach. What the offer must
+        never be is automatic. The default is No, and nothing but a typed answer
+        replaces a URL that saved credentials are already bound to - the installer
+        still does not move a token somewhere a probe happened to find.
+
+        A replacement is probed before it is accepted. Confirming one that did not
+        answer stays possible, because it is how you point a laptop at the address it
+        will use tomorrow, but it has to be said out loud rather than discovered at
+        the connection check with the typed URL already gone.
+
+        -Probe is injectable so the question is testable without a Home Assistant on
+        the network.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Current,
+        [bool]$Reachable,
+        [AllowEmptyString()][AllowNull()][string]$Previous,
+        [scriptblock]$Probe
+    )
+    if (-not $Probe) { $Probe = { param($u) Test-IsHomeAssistant -BaseUrl $u } }
+
+    if ($Reachable) { Write-Host "    $Current answered" -ForegroundColor Green }
+    else { Write-Host "    $Current did not answer" -ForegroundColor Yellow }
+    if (-not (Read-BridgeYesNo -Prompt '    Point this machine at a different Home Assistant?' -Default $false)) {
+        return ''
+    }
+
+    # Offered by number rather than retyped. Moving between an internal and an
+    # external address is a round trip, so the address being replaced is the one
+    # overwhelmingly likely to be wanted next time. Asked the other way round here -
+    # "if this were a move from the remembered address to the current one, would it
+    # be worth remembering?" - so the same rule drops a stale entry that is really
+    # the current address written differently.
+    $previousUrl = Get-BridgeReplacedUrl -Current $Previous -Replacement $Current
+
+    while ($true) {
+        if ($previousUrl) { Write-Host "      1) $previousUrl  (the address you replaced)" }
+        Write-Host "    Type a URL$(if ($previousUrl) { ' or 1' }), or press Enter to keep $Current."
+        $answer = ([string](Read-Host '    Home Assistant URL')).Trim()
+        if (-not $answer) { return '' }
+        if ($previousUrl -and $answer -eq '1') { $answer = $previousUrl }
+
+        try { $candidate = ConvertTo-BridgeHomeAssistantUrl -Value $answer }
+        catch {
+            Write-Host "    $($_.Exception.Message)" -ForegroundColor DarkGray
+            continue
+        }
+        if ($candidate -eq $Current) { return '' }
+
+        if (& $Probe $candidate) {
+            Write-Host "    $candidate answered" -ForegroundColor Green
+            return $candidate
+        }
+        Write-Host "    nothing at $candidate identified itself as Home Assistant" -ForegroundColor Yellow
+        if (Read-BridgeYesNo -Prompt '    Use it anyway?' -Default $false) { return $candidate }
+    }
+}
+
 function Resolve-BridgeHomeAssistantUrl {
     <#
         Settles on a Home Assistant URL, and prompts only when it has to.
 
-        A failed probe does not authorize moving saved credentials. Discovery and a
-        URL prompt are only for an unconfigured setup; -HomeAssistantUrl is the
-        deliberate way to change an existing endpoint, including in automation.
+        A failed probe does not authorize moving saved credentials. Discovery and the
+        -Prompt question are only for an unconfigured setup; -HomeAssistantUrl is the
+        deliberate way to change an existing endpoint from automation.
 
-        -Probe, -Discover and -Prompt are injectable so the decision is testable
-        without a Home Assistant on the network.
+        -ChangePrompt is the third way in, and the only one an interactive re-run uses
+        on a configured install. It is asked of the user and answered by the user, so
+        the rule above survives it: a probe result decides what the question says, and
+        never what the answer is. Before it existed a configured URL was simply
+        returned, and a machine whose Home Assistant had moved - or that had itself
+        moved between that instance's internal and external addresses - had no way to
+        say so short of knowing -HomeAssistantUrl existed.
+
+        -Probe, -Discover, -Prompt and -ChangePrompt are injectable so the decision is
+        testable without a Home Assistant on the network.
     #>
     param(
         [AllowEmptyString()][AllowNull()][string]$Configured,
+        [AllowEmptyString()][AllowNull()][string]$Previous,
         [scriptblock]$Probe,
         [scriptblock]$Discover,
-        [scriptblock]$Prompt
+        [scriptblock]$Prompt,
+        [scriptblock]$ChangePrompt
     )
     if (-not $Probe)    { $Probe    = { param($u) Test-IsHomeAssistant -BaseUrl $u } }
     if (-not $Discover) { $Discover = { Find-HomeAssistant } }
@@ -1756,7 +1859,21 @@ function Resolve-BridgeHomeAssistantUrl {
     $configured = ([string]$Configured).Trim().TrimEnd('/')
     if ($configured) {
         $configured = ConvertTo-BridgeHomeAssistantUrl -Value $configured
-        $source = if (& $Probe $configured) { 'config' } else { 'unverified' }
+        $reachable = [bool](& $Probe $configured)
+        $source = if ($reachable) { 'config' } else { 'unverified' }
+        if ($ChangePrompt) {
+            $answer = ([string](& $ChangePrompt $configured $reachable ([string]$Previous))).Trim().TrimEnd('/')
+            if ($answer) {
+                # The question validates what it accepts; this is the backstop for a
+                # caller that does not, because ending an install at a URL nobody
+                # typed is worse than declining to change anything.
+                $replacement = ''
+                try { $replacement = ConvertTo-BridgeHomeAssistantUrl -Value $answer } catch { $replacement = '' }
+                if ($replacement -and $replacement -ne $configured) {
+                    return [pscustomobject]@{ Url = $replacement; Source = 'changed'; Prompted = $true }
+                }
+            }
+        }
         return [pscustomobject]@{ Url = $configured; Source = $source; Prompted = $false }
     }
 
@@ -2686,9 +2803,13 @@ if ($configExisted) {
 # merge an object into itself, and every later edit would mutate the defaults too.
 if (-not $config) { $config = $exampleRaw | ConvertFrom-Json }
 $configuredUrl = ''
+$previousConfiguredUrl = ''
 if ($configExisted -and $config.PSObject.Properties['homeAssistant'] -and $config.homeAssistant -and
     $config.homeAssistant.PSObject.Properties['baseUrl']) {
     $configuredUrl = [string]$config.homeAssistant.baseUrl
+    if ($config.homeAssistant.PSObject.Properties['previousBaseUrl']) {
+        $previousConfiguredUrl = [string]$config.homeAssistant.previousBaseUrl
+    }
 }
 
 # A config from an older version is missing keys this installer reaches straight into.
@@ -2696,6 +2817,11 @@ $filled = @(Merge-BridgeConfigDefaults -Config $config -Defaults $defaults)
 if ($filled) { Write-Host "    added missing setting(s): $($filled -join ', ')" }
 
 if ($PSBoundParameters.ContainsKey('HomeAssistantUrl') -and $HomeAssistantUrl) {
+    # Remembered through the same helper the interactive question uses, so changing
+    # the endpoint from automation still leaves the one it replaced on offer the next
+    # time somebody runs `agent-ha-bridge configure` by hand.
+    $replacedUrl = Get-BridgeReplacedUrl -Current $configuredUrl -Replacement $HomeAssistantUrl
+    if ($replacedUrl) { $config.homeAssistant.previousBaseUrl = $replacedUrl }
     $config.homeAssistant.baseUrl = ConvertTo-BridgeHomeAssistantUrl -Value $HomeAssistantUrl
 }
 if ($PSBoundParameters.ContainsKey('Token') -and $Token) {
@@ -2857,8 +2983,11 @@ if (-not $SkipDependencies) {
 }
 
 # ----------------------------------------------------------- Home Assistant
-# Settle the URL without asking a question that already has an answer, then make sure
-# the token actually works before the install carries on.
+# Settle the URL without asking a question that already has an answer - a configured
+# endpoint that answers is reported, not re-confirmed - then make sure the token
+# actually works before the install carries on. An interactive run still offers to
+# change it, because "already answered" and "still correct" are not the same thing
+# once a machine or its Home Assistant has moved.
 $effectiveToken = $config.homeAssistant.token
 if (-not $effectiveToken -and $config.homeAssistant.tokenEnvVar) {
     $effectiveToken = [Environment]::GetEnvironmentVariable($config.homeAssistant.tokenEnvVar)
@@ -2867,22 +2996,36 @@ if (-not $effectiveToken -and $config.homeAssistant.tokenEnvVar) {
 if (-not ($PSBoundParameters.ContainsKey('HomeAssistantUrl') -and $HomeAssistantUrl)) {
     Write-Step 'Looking for Home Assistant'
     $urlPrompt = $null
+    $urlChangePrompt = $null
     if (-not $NonInteractive) {
         $urlPrompt = {
             param($current)
             Write-Host '    not found automatically' -ForegroundColor Yellow
             Read-Host "    Home Assistant URL [$current]"
         }
+        # Only ever reached with a URL already configured, which outside an upgrade
+        # means somebody has deliberately run `agent-ha-bridge configure`. A re-run
+        # from the updater is -NonInteractive, so this costs an upgrade nothing.
+        $urlChangePrompt = {
+            param($current, $reachable, $previous)
+            Read-BridgeHomeAssistantUrlChange -Current $current -Reachable $reachable -Previous $previous
+        }
     }
     if ($configExisted -and -not $configuredUrl) {
         throw 'The existing configuration has no Home Assistant URL. Supply -HomeAssistantUrl explicitly before using its credentials.'
     }
-    $resolvedUrl = Resolve-BridgeHomeAssistantUrl -Configured $configuredUrl -Prompt $urlPrompt
+    $resolvedUrl = Resolve-BridgeHomeAssistantUrl -Configured $configuredUrl -Previous $previousConfiguredUrl `
+        -Prompt $urlPrompt -ChangePrompt $urlChangePrompt
     if ($resolvedUrl.Url) { $config.homeAssistant.baseUrl = $resolvedUrl.Url }
+    $replacedUrl = Get-BridgeReplacedUrl -Current $configuredUrl -Replacement $resolvedUrl.Url
+    if ($resolvedUrl.Source -eq 'changed' -and $replacedUrl) {
+        $config.homeAssistant.previousBaseUrl = $replacedUrl
+    }
     switch ($resolvedUrl.Source) {
         'config'     { Write-Host "    using $($resolvedUrl.Url) from the existing config" -ForegroundColor Green }
         'discovered' { Write-Host "    found $($resolvedUrl.Url)" -ForegroundColor Green }
         'typed'      { Write-Host "    using $($resolvedUrl.Url)" }
+        'changed'    { Write-Host "    now using $($resolvedUrl.Url); $replacedUrl is remembered for next time" -ForegroundColor Green }
         default      { Write-Host "    keeping $($resolvedUrl.Url), unverified" -ForegroundColor Yellow }
     }
 }
