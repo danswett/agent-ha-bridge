@@ -830,12 +830,20 @@ function Restore-DaemonSessionCards {
         $card = Resolve-DaemonPrimedCard -Entry $entry -Status $status -VerboseOn $primeVerbose
 
         try {
-            Set-CopilotMqttStatus -SessionId $sid -Status $status -Headers $headers -Attributes @{
-                session = $entry.Name
-                machine = $entry.Machine
-                process_id = $session.ProcessId
-                updated = [DateTimeOffset]::Now.ToString('o')
-            }
+            # Through the same helper every other status publish uses. A re-prime
+            # exists to put the card back exactly as it was, and the attributes it
+            # restores are replaced wholesale - so building a bare set here did not
+            # leave the model, effort, context and counts alone, it erased them.
+            # They only came back when the session next changed status, which for one
+            # that is idle at restart can be hours, and the restart an update
+            # triggers is precisely when a newly added attribute first appears.
+            Set-CopilotMqttStatus -SessionId $sid -Status $status -Headers $headers -Attributes (
+                Add-DaemonTuningAttributes -Attributes @{
+                    session = $entry.Name
+                    machine = $entry.Machine
+                    process_id = $session.ProcessId
+                    updated = [DateTimeOffset]::Now.ToString('o')
+                } -Tuning $entry)
             Set-CopilotMqttActivity -SessionId $sid -Summary $card.Summary -Detail $card.Detail -Headers $headers
             # Prime the reply box to empty so the card shows a blank field, not
             # 'unknown', for sessions restored from persisted state.

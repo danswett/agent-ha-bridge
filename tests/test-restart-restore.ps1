@@ -144,6 +144,65 @@ finally {
     Remove-Item -LiteralPath $tmpDir -Recurse -Force -ErrorAction SilentlyContinue
 }
 
+Write-Host '--- the restore keeps the settings line, rather than erasing it ---'
+# The attributes of a status publish replace what was there; nothing merges them. So a
+# re-prime that built a bare session/machine/updated set did not leave the model,
+# effort, context and counts alone - it erased them, and they only came back when the
+# session next changed status. For a session that is idle at restart that can be hours,
+# and the restart an update triggers is precisely when a newly added attribute is
+# supposed to appear for the first time.
+#
+# Seen on 2026-10-12: every session on a machine that had just updated read with no
+# model in Home Assistant while the daemon's own state held claude-opus-5 for all of
+# them, and the freshly released compaction count went the same way.
+$script:PrimedStatus = @()
+function Set-CopilotMqttStatus { param($SessionId, $Status, $Headers, $Attributes) $script:PrimedStatus += [pscustomobject]@{ Id = $SessionId; Status = $Status; Attributes = $Attributes } }
+function Set-CopilotMqttActivity { param($SessionId, $Summary, $Detail, $Headers) }
+function Sync-DaemonSessions { param($Headers, $State, $Live, $Discovery) }
+function Get-HomeAssistantState { param($EntityId, $Headers) [pscustomobject]@{ state = 'on'; attributes = [pscustomobject]@{} } }
+function Invoke-HomeAssistantService { param($Domain, $Service, $Headers, $Data) }
+function Test-VerboseStreaming { param($Headers) $false }
+function Get-DaemonStartupStatus { param($Session, $Entry) [string]$Entry.Status }
+
+$restoreId = 'abcdef01-2345-4678-9abc-def012345678'
+$restoreEntry = [pscustomobject]@{
+    Name = 'Copilot: a long one'; Machine = 'DESK'; Status = 'idle'; Kind = 'copilot'; Offset = 0
+    Model = 'claude-opus-5'; Effort = 'xhigh'; Context = 'long_context'
+    Compactions = 4; CompactionsThrough = [long]0
+}
+$restoreSession = [pscustomobject]@{ SessionId = $restoreId; Kind = 'copilot'; ProcessId = $PID; Transcript = '' }
+$restoreLive = @{ $restoreId = $restoreSession }
+Restore-DaemonSessionCards -Headers @{ Authorization = '******' } -State @{ $restoreId = $restoreEntry } `
+    -Live $restoreLive -Discovery ([pscustomobject]@{ Live = $restoreLive })
+
+$primed = @($script:PrimedStatus | Where-Object { $_.Id -eq $restoreId })
+Test-That 'the restart re-prime publishes the session''s status' { $primed.Count -ge 1 } "publishes=$($primed.Count)"
+Test-That 'and carries the model it had before the restart' {
+    $primed[-1].Attributes['model'] -eq 'claude-opus-5'
+} "model=$($primed[-1].Attributes['model'])"
+Test-That 'and the effort and context with it' {
+    $primed[-1].Attributes['effort'] -eq 'xhigh' -and $primed[-1].Attributes['context'] -eq 'long_context'
+}
+Test-That 'and how many times the conversation had been compacted' {
+    $primed[-1].Attributes['compactions'] -eq 4
+} "compactions=$($primed[-1].Attributes['compactions'])"
+Test-That 'while still saying what it always said' {
+    $primed[-1].Attributes['session'] -eq 'Copilot: a long one' -and $primed[-1].Attributes['machine'] -eq 'DESK'
+}
+
+# A session that has none of them is unchanged: the helper omits what is not known, so
+# a card carries nothing new rather than a row of empty values.
+$script:PrimedStatus = @()
+$bareId = 'bbbbbbbb-2345-4678-9abc-def012345678'
+$bareEntry = [pscustomobject]@{ Name = 'Copilot: fresh'; Machine = 'DESK'; Status = 'idle'; Kind = 'copilot'; Offset = 0 }
+$bareLive = @{ $bareId = [pscustomobject]@{ SessionId = $bareId; Kind = 'copilot'; ProcessId = $PID; Transcript = '' } }
+Restore-DaemonSessionCards -Headers @{ Authorization = '******' } -State @{ $bareId = $bareEntry } `
+    -Live $bareLive -Discovery ([pscustomobject]@{ Live = $bareLive })
+Test-That 'a session with nothing remembered gains no empty attributes' {
+    $attrs = @($script:PrimedStatus | Where-Object { $_.Id -eq $bareId })[-1].Attributes
+    -not $attrs.ContainsKey('model') -and -not $attrs.ContainsKey('compactions')
+}
+
 Write-Host '--- the MCP discovery scan is cached within its TTL ---'
 $script:McpScanCalls = 0
 function Invoke-DecisionHttpRequest { param($Parameters) $script:McpScanCalls++; @() }
