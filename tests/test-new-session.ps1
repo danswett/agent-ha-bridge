@@ -555,20 +555,131 @@ Write-Host ''
 Write-Host '--- model, effort and context ---'
 
 $savedProbeResult = $script:ProbeResult
-$script:BridgeModelCache = $null
-$script:ProbeResult = [pscustomobject]@{
-    Ran = $true; TimedOut = $false; ExitCode = 0; Output = ''
-    StandardOutput = '`model`:' + "`n" + '  - "test-model"' + "`n`n" + '`theme`:' + "`n" + '  - "test-theme"' + "`n"
+$savedModelProbe = ${function:Invoke-BridgeCommandProbe}
+$savedModelCopilotPath = ${function:Get-BridgeCopilotPath}
+$script:ModelProbeCalls = 0
+$script:ModelProbeMinimumTimeoutMs = 0
+function Invoke-BridgeCommandProbe {
+    param([string]$Executable, [string[]]$Arguments = @(), [int]$TimeoutMs = 5000)
+    $script:ModelProbeCalls++
+    if ($TimeoutMs -lt $script:ModelProbeMinimumTimeoutMs) {
+        return [pscustomobject]@{
+            Ran = $true; TimedOut = $true; ExitCode = -1; Output = ''; StandardOutput = ''
+        }
+    }
+    $script:ProbeResult
 }
+function Get-BridgeCopilotPath { 'C:\fake-copilot.exe' }
+
+$script:FakeSettings = @{}
+$script:BridgeModelCache = $null
+$modelHelp = '`model`:' + "`n" + '  - "test-model"' + "`n`n" + '`theme`:' + "`n" + '  - "test-theme"' + "`n"
+$goodModelProbe = [pscustomobject]@{
+    Ran = $true; TimedOut = $false; ExitCode = 0; Output = ''
+    StandardOutput = $modelHelp
+}
+$script:ProbeResult = $goodModelProbe
 Test-That 'model discovery parses the background command output, not other settings' {
     (@(Get-BridgeCopilotModelList -Path 'C:\fake-copilot.exe') -join ',') -eq 'test-model'
 }
+$modelCalls = $script:ModelProbeCalls
+$script:BridgeModelCache.At = [DateTimeOffset]::Now.AddSeconds(-61)
+Test-That 'a successful discovery does not adopt the shorter failure retry window' {
+    (@(Get-BridgeCopilotModelList) -join ',') -eq 'test-model' -and $script:ModelProbeCalls -eq $modelCalls
+}
+
 $script:BridgeModelCache = $null
-$script:ProbeResult.ExitCode = 1
+$script:ProbeResult = [pscustomobject]@{
+    Ran = $true; TimedOut = $false; ExitCode = 1; Output = 'simulated failure'; StandardOutput = $modelHelp
+}
 Test-That 'failed model discovery does not accept partial stdout' {
     @(Get-BridgeCopilotModelList -Path 'C:\fake-copilot.exe').Count -eq 0
 }
+
+$script:BridgeModelCache = $null
+$script:ProbeResult = [pscustomobject]@{
+    Ran = $true; TimedOut = $true; ExitCode = -1; Output = ''; StandardOutput = $modelHelp
+}
+Test-That 'a startup discovery timeout is recorded rather than silently losing the models' {
+    @(Get-BridgeCopilotModelList).Count -eq 0 -and
+        (Test-Path -LiteralPath $testLogFile) -and
+        (Get-Content -LiteralPath $testLogFile -Raw) -match 'Copilot model discovery failed.*timed out'
+}
+$modelCalls = $script:ModelProbeCalls
+Test-That 'repeated selector reads do not rerun a failed probe before its retry is due' {
+    @(Get-BridgeCopilotModelList).Count -eq 0 -and $script:ModelProbeCalls -eq $modelCalls
+}
+$script:ProbeResult = $goodModelProbe
+$script:BridgeModelCache.At = [DateTimeOffset]::Now.AddSeconds(-61)
+Test-That 'a failed first discovery retries within a minute and records its recovery' {
+    (@(Get-BridgeCopilotModelList) -join ',') -eq 'test-model' -and
+        $script:ModelProbeCalls -eq $modelCalls + 1 -and
+        (Test-Path -LiteralPath $testLogFile) -and
+        (Get-Content -LiteralPath $testLogFile -Raw) -match 'Copilot model discovery recovered'
+}
+
+$partialModelHelp = '`model`:' + "`n" + '  - "partial-model"' + "`n"
+$modelFailures = @(
+    @{ Name = 'a timeout'; Probe = [pscustomobject]@{
+        Ran = $true; TimedOut = $true; ExitCode = -1; Output = ''; StandardOutput = $partialModelHelp
+    } }
+    @{ Name = 'a command that cannot start'; Probe = [pscustomobject]@{
+        Ran = $false; TimedOut = $false; ExitCode = -1; Output = 'simulated start failure'; StandardOutput = ''
+    } }
+    @{ Name = 'a nonzero exit with partial stdout'; Probe = [pscustomobject]@{
+        Ran = $true; TimedOut = $false; ExitCode = 2; Output = 'simulated CLI failure'; StandardOutput = $partialModelHelp
+    } }
+    @{ Name = 'unrecognised help output'; Probe = [pscustomobject]@{
+        Ran = $true; TimedOut = $false; ExitCode = 0; Output = ''; StandardOutput = '`theme`: dark'
+    } }
+    @{ Name = 'an older probe without separate stdout'; Probe = [pscustomobject]@{
+        Ran = $true; TimedOut = $false; ExitCode = 0; Output = 'model: partial-model'
+    } }
+)
+foreach ($case in $modelFailures) {
+    $script:BridgeModelCache = $null
+    $script:ProbeResult = $goodModelProbe
+    [void](Get-BridgeCopilotModelList)
+    $script:BridgeModelCache.At = [DateTimeOffset]::Now.AddMinutes(-31)
+    $script:ProbeResult = $case.Probe
+    $offeredModels = @(Get-BridgeTuningOptions -Launcher 'agency' -Axis 'model')
+    $modelCalls = $script:ModelProbeCalls
+    Test-That "last good model choices survive $($case.Name), including subsequent selector reads" {
+        ($offeredModels -join ',') -eq 'Agent default,auto,test-model' -and
+            ((Get-BridgeTuningOptions -Launcher 'agency' -Axis 'model') -join ',') -eq 'Agent default,auto,test-model' -and
+            $script:ModelProbeCalls -eq $modelCalls
+    }
+}
+$script:ProbeResult = [pscustomobject]@{
+    Ran = $true; TimedOut = $false; ExitCode = 0; Output = ''
+    StandardOutput = '`model`:' + "`n" + '  - "updated-model"' + "`n"
+}
+$script:BridgeModelCache.At = [DateTimeOffset]::Now.AddSeconds(-61)
+Test-That 'a successful retry replaces the stale model list instead of accumulating removed models' {
+    ((Get-BridgeTuningOptions -Launcher 'copilot' -Axis 'model') -join ',') -eq 'Agent default,auto,updated-model'
+}
+
+$script:BridgeModelCache = $null
+$script:ProbeResult = $goodModelProbe
+$script:ModelProbeMinimumTimeoutMs = 10000
+Test-That 'a slower cold CLI can answer model discovery rather than hitting the version-probe deadline' {
+    (@(Get-BridgeCopilotModelList) -join ',') -eq 'test-model'
+}
+$script:ModelProbeMinimumTimeoutMs = 0
+
+$savedModelDiscoverer = $script:BridgeLauncherTuning.copilot.model.Discover
+try {
+    $script:BridgeLauncherTuning.copilot.model.Discover = { throw 'unexpected discovery failure' }
+    Test-That 'an unexpected discoverer failure is not hidden by another silent catch' {
+        try { [void](Get-BridgeTuningOptions -Launcher 'copilot' -Axis 'model'); $false }
+        catch { $_.Exception.Message -eq 'unexpected discovery failure' }
+    }
+}
+finally { $script:BridgeLauncherTuning.copilot.model.Discover = $savedModelDiscoverer }
+
 $script:ProbeResult = $savedProbeResult
+${function:Invoke-BridgeCommandProbe} = $savedModelProbe
+${function:Get-BridgeCopilotPath} = $savedModelCopilotPath
 $script:BridgeModelCache = $null
 
 # Three per-launch settings, spelled differently by every agent: Copilot has
