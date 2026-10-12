@@ -437,10 +437,11 @@ Set-BridgeAnswer @('y', 'https://offline.test', 'y')
 Test-That 'confirming an endpoint that is simply switched off is still allowed' {
     (Read-BridgeHomeAssistantUrlChange -Current 'http://ha.test:8123' -Reachable $true -Previous '' -Probe $silent) -eq 'https://offline.test'
 }
-Set-BridgeAnswer @('y', 'https://remote.test')
-Test-That 'the question says whether the configured endpoint answered, because that is why you are changing it' {
-    [void](Read-BridgeHomeAssistantUrlChange -Current 'http://ha.test:8123' -Reachable $false -Previous '' -Probe $probeAnswers)
-    @($script:AskedPrompts | Where-Object { $_ -match 'different Home Assistant' }).Count -eq 1
+Set-BridgeAnswer @('n')
+$said = (Read-BridgeHomeAssistantUrlChange -Current 'http://ha.test:8123' -Reachable $false -Previous '' `
+    -Probe $probeAnswers 6>&1 | ForEach-Object { [string]$_ }) -join "`n"
+Test-That 'the question is printed rather than left to a prompt a redirected console may swallow' {
+    $said -match 'did not answer' -and $said -match 'Point this machine at a different Home Assistant'
 }
 # Scoped to this section: the rest of the suite must get the real cmdlet back.
 Remove-Item function:Read-Host

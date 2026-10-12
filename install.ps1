@@ -1791,9 +1791,12 @@ function Read-BridgeHomeAssistantUrlChange {
 
     if ($Reachable) { Write-Host "    $Current answered" -ForegroundColor Green }
     else { Write-Host "    $Current did not answer" -ForegroundColor Yellow }
-    if (-not (Read-BridgeYesNo -Prompt '    Point this machine at a different Home Assistant?' -Default $false)) {
-        return ''
-    }
+    # The question is printed rather than left to Read-Host's own prompt. That prompt
+    # is written to the console, not to stdout, so a redirected run does not reliably
+    # reproduce it - on Windows it vanished entirely, taking this whole step out of
+    # the install log. Every other question here is printed for the same reason.
+    Write-Host '    Point this machine at a different Home Assistant?' -ForegroundColor Yellow
+    if (-not (Read-BridgeYesNo -Prompt '    Change it' -Default $false)) { return '' }
 
     # Offered by number rather than retyped. Moving between an internal and an
     # external address is a round trip, so the address being replaced is the one
