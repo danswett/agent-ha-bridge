@@ -60,8 +60,15 @@
  * now publishes the carrier to write instead, in field_<n>_empty, and the card writes
  * that - keeping the placeholder for a field that must have something chosen, and for
  * any bridge old enough not to send the attribute (#81).
+ *
+ * 1.37.0 draws the prompt's own "Other (type your answer)" entry as a row. Every
+ * Copilot option list ends in one and the daemon has always taken an answer typed
+ * through it, but nothing on the card ever offered it - and because the choices card
+ * holds the reply card's Send down while a question is armed, a single-choice
+ * question left the box on screen with no way whatsoever to send what was typed in
+ * it. The bridge says which questions really have that entry, in takes_typed_answer.
  */
-const CARD_VERSION = '1.36.0';
+const CARD_VERSION = '1.37.0';
 
 /*
  * How large a non-image attachment may be.
@@ -256,6 +263,22 @@ class AgentBridgeReplyCard extends HTMLElement {
   hasUnsentFormText() {
     if (!this._built || !this._els || !this._els.textarea) { return false; }
     return this._els.textarea.value.trim().length > 0;
+  }
+
+  /*
+   * Put the cursor in the box, for the choices card beside this one.
+   *
+   * Tapping "Other (type your answer)" there says the answer is going to be typed,
+   * and the box it has to be typed into is a separate card further down the session.
+   * On a phone that is a scroll and a second tap away from the row just pressed, so
+   * the row does it, exactly as selecting the prompt's own Other entry opens its text
+   * input. Failures are swallowed: a browser that refuses focus must not take the
+   * tap's real work - clearing the slot - down with it.
+   */
+  focusInput() {
+    if (!this._built || !this._els || !this._els.textarea) { return; }
+    try { this._els.textarea.focus(); }
+    catch (err) { /* focus is a convenience; the row still did its job */ }
   }
 
   /*
@@ -1211,10 +1234,31 @@ class AgentBridgeActivityCard extends HTMLElement {
  * accident. A selector carrying choices with no field behind it - a legacy `choices`
  * argument, an MCP client - still answers on the tap, because there is no slot for
  * it to wait in.
+ *
+ * The last row of a Copilot option list is the prompt's own "Other (type your
+ * answer)", and from 1.37.0 it is drawn here too, wherever the bridge says the
+ * question really has one (takes_typed_answer). The daemon has always taken an
+ * answer typed through it, but the card offered nothing that said so - and because
+ * this card holds the reply card's Send down while a question is armed, a
+ * single-choice question put the box on screen with no way at all to send what was
+ * typed into it. Picking it writes nothing to the slot: an answer in words is read
+ * only while the slot is still on its placeholder, so "I am going to type this one"
+ * is exactly the state of having picked no option.
  */
 const CHOICE_PLACEHOLDER = 'Awaiting answer...';
 const CHOICE_FIELD_PLACEHOLDER = 'Choose...';
 const CHOICE_CANCEL = 'Cancel request';
+// The prompt's own last entry, worded exactly as the terminal words it so the row on
+// screen and the row the keystrokes land on are plainly the same thing. Drawn only
+// where the bridge says the question really has one (takes_typed_answer): the daemon
+// takes a typed answer for a lone scalar choice, and for choices riding on the main
+// selector, and nowhere else.
+const CHOICE_OTHER = 'Other (type your answer)';
+const CHOICE_OTHER_HINT = 'Type your answer in the box below, then Send answer';
+// Pressing Send with Other picked and the box empty. Said out loud rather than left
+// as a Send that appears to do nothing, which is indistinguishable from a session
+// still thinking about it.
+const CHOICE_OTHER_EMPTY_NOTE = 'Nothing typed yet - write your answer in the box below';
 // What the bridge joins a multi-select field's picked options with. Published beside
 // the options so the label written back here is built exactly as the one the daemon
 // takes apart again; this is only the value to use when an older bridge sends none.
@@ -1323,6 +1367,14 @@ class AgentBridgeChoicesCard extends HTMLElement {
     this._complete = false;
     this._takesText = false;
     this._fields = [];
+    // Whether "Other (type your answer)" is picked, and on which question. Held here
+    // rather than written to the slot on purpose: the daemon reads a typed answer
+    // only while the slot is still on its placeholder (Read-DaemonFormAnswer's
+    // $missingChoice), so "I am going to type this one" is precisely the state of
+    // having chosen no option at all. Tying it to the question stops a pick made on
+    // one surviving into its replacement.
+    this._other = false;
+    this._otherAt = '';
     // What has been tapped but not yet seen coming back from Home Assistant.
     // {} when everything on screen is confirmed.
     //
@@ -1458,6 +1510,17 @@ class AgentBridgeChoicesCard extends HTMLElement {
           color: var(--secondary-text-color); background: none;
           min-height: 36px; font-size: 0.92em;
         }
+        /* The prompt's own "Other" entry. Drawn as an option because that is what it
+           is, but dashed, so it reads as "none of these" rather than as one more
+           answer to weigh against the real ones. */
+        button.other { border-style: dashed; }
+        button.other.chosen { border-style: solid; }
+        /* Where to type, said under the row that was just pressed: the box itself is
+           a separate card further down, which on a phone is off the screen. */
+        .hint {
+          font-size: 0.82em; color: var(--secondary-text-color);
+          margin: -2px 2px 2px 2px; overflow-wrap: anywhere;
+        }
         /* Send answer. A form is only sent when this is pressed, so it has to read
            as the one thing that acts rather than as another option to weigh. */
         button.send {
@@ -1525,6 +1588,13 @@ class AgentBridgeChoicesCard extends HTMLElement {
     if (this._committed && this._committedAt !== generation) {
       this._committed = false;
       this._committedAt = '';
+    }
+    // The same for "I am going to type this one". A replacement question is a
+    // different question, and carrying the pick across it would draw a row as chosen
+    // that nobody chose - and send the box's words as its answer.
+    if (this._other && this._otherAt !== generation) {
+      this._other = false;
+      this._otherAt = '';
     }
     // A write still in flight for a question that has been replaced cannot answer the
     // one now on screen, so it must not hold its Send either. Home Assistant refuses
@@ -1614,6 +1684,20 @@ class AgentBridgeChoicesCard extends HTMLElement {
     this._takesText = this._fields.some((entityId, i) =>
       !this._armed(entityId) && String(decisionAttrs[`field_${i + 1}_label`] || '') !== '');
 
+    // The group that gets the prompt's own "Other (type your answer)" row, when the
+    // bridge says this question really has one. Never derived from the shape of what
+    // this card was handed: the condition is the daemon's (Test-DecisionTakesTypedAnswer),
+    // and a row offering an answer the daemon will not take is worse than no row - the
+    // words would be published and then quietly dropped.
+    //
+    // There is exactly one group it can belong to, because the attribute is published
+    // only for a lone scalar field or for choices riding on the main selector, and the
+    // Cancel-only selector beside a field is not an option list at all.
+    const typedGroup = decisionAttrs.takes_typed_answer === true && !tapAnswers
+      ? groups.find((g) => g.options.some((o) => o !== CHOICE_CANCEL))
+      : null;
+    if (!typedGroup && this._other) { this._other = false; this._otherAt = ''; }
+
     const show = groups.length > 0;
     // Before the early return below, so a question that has gone releases the reply
     // card's Send on the same pass that stops drawing this one.
@@ -1621,6 +1705,7 @@ class AgentBridgeChoicesCard extends HTMLElement {
     this.hidden = !show;
     if (!show) {
       this._sent = ''; this._committed = false; this._committedAt = '';
+      this._other = false; this._otherAt = '';
       this._pending = {}; this._inflight = {}; this._note = '';
       return;
     }
@@ -1689,7 +1774,8 @@ class AgentBridgeChoicesCard extends HTMLElement {
     // note are in it too, so holding Send and saying why are drawn as they happen.
     const signature = groups
       .map((g) => `${g.entityId}\u0002${g.chosen}\u0002${g.label}\u0002${g.multi ? 'm' : 's'}\u0002${g.options.join('\u0001')}\u0002${g.multi ? g.picked.join('\u0001') : ''}`)
-      .join('\u0003') + `\u0004${sends}\u0004${held}\u0004${this._note}\u0004${this._committed}`;
+      .join('\u0003') + `\u0004${sends}\u0004${held}\u0004${this._note}\u0004${this._committed}` +
+      `\u0004${!!typedGroup}\u0004${this._other}`;
     if (signature === this._last) { return; }
     this._last = signature;
 
@@ -1716,12 +1802,33 @@ class AgentBridgeChoicesCard extends HTMLElement {
         else if (group.multi ? group.picked.indexOf(option) >= 0 : option === group.chosen) {
           button.classList.add('chosen');
         }
+        // Picking a real option is also the way back from Other: the two are the one
+        // choice, and leaving Other ticked beside it would send the box's words over
+        // the option just tapped. Cleared inside _choose, after its own guard, so a
+        // tap on frozen rows cannot quietly untick it either.
         button.addEventListener('click', () => this._choose(group, option));
         // Held back so it stays the quiet last row. Send is the thing being looked
         // for after a tap; withdrawing the question is not, and putting it in
         // between would make it the easiest row to hit by mistake.
         if (option === CHOICE_CANCEL) { cancel = button; continue; }
         this._els.list.appendChild(button);
+      }
+      // The prompt's own trailing entry, in the place the prompt puts it: last in
+      // this group's list, below every declared option.
+      if (group === typedGroup) {
+        const other = document.createElement('button');
+        other.type = 'button';
+        other.classList.add('other');
+        other.textContent = CHOICE_OTHER;
+        if (this._other) { other.classList.add('chosen'); }
+        other.addEventListener('click', () => this._chooseOther(group));
+        this._els.list.appendChild(other);
+        if (this._other) {
+          const hint = document.createElement('div');
+          hint.className = 'hint';
+          hint.textContent = CHOICE_OTHER_HINT;
+          this._els.list.appendChild(hint);
+        }
       }
     }
     if (sends) {
@@ -1750,9 +1857,15 @@ class AgentBridgeChoicesCard extends HTMLElement {
    *
    * The tap composes from the pending set rather than from the entity, so two taps
    * in a row build one answer instead of the second overwriting the first.
+   *
+   * KeepOther is set only by _chooseOther, which comes through here to clear the
+   * slot. Every other tap is a real option being picked, and that is also the way
+   * back from "Other": the two are the one choice, and leaving Other ticked beside a
+   * picked option would send the box's words over the option just tapped.
    */
-  _choose(group, option) {
+  _choose(group, option, keepOther) {
     if (this._sent || this._committed || !this._hass) { return; }
+    if (!keepOther) { this._other = false; this._otherAt = ''; }
     const generation = String(
       ((this._hass.states[this._config.decision] || {}).attributes || {}).decision_id || '');
     // Each tap is its own operation. The question id alone is not enough to tell
@@ -1812,6 +1925,34 @@ class AgentBridgeChoicesCard extends HTMLElement {
       (err) => { this._track(group.entityId, op, false); this._failPending(group.entityId, op, err); });
   }
 
+  /*
+   * "Other (type your answer)": the answer is going to be typed, not picked.
+   *
+   * Nothing about that is written to the slot, and that is the point. The daemon
+   * reads words as the answer only while the slot is still on its placeholder -
+   * Read-DaemonFormAnswer's $missingChoice, and the selector path in
+   * Read-DaemonDecisionAnswer - so "I am going to type this one" *is* the state of
+   * having picked no option. A slot still holding an option tapped earlier would be
+   * read as the answer instead, and the words would go nowhere, so this clears it.
+   *
+   * The box is a separate card further down the session, which on a phone is off the
+   * screen, so the cursor is put in it here - the same thing selecting the prompt's
+   * own Other entry does.
+   */
+  _chooseOther(group) {
+    if (this._sent || this._committed || !this._hass) { return; }
+    this._other = true;
+    this._otherAt = this._generationNow();
+    const reply = REPLY_CARDS.get(String((this._config && this._config.reply_topic) || ''));
+    if (reply && reply.focusInput) { reply.focusInput(); }
+    if (group.chosen !== '') {
+      this._choose(group, group.isDecision ? CHOICE_PLACEHOLDER : CHOICE_FIELD_PLACEHOLDER, true);
+      return;
+    }
+    this._last = '';
+    this._render();
+  }
+
   /* Adds or removes one outstanding write, tied to the question it was made on. */
   _track(entityId, op, outstanding, generation) {
     const set = this._inflight[entityId] || (this._inflight[entityId] = {});
@@ -1857,17 +1998,6 @@ class AgentBridgeChoicesCard extends HTMLElement {
     // click, and sending a choice nobody made here is exactly what must not happen.
     if (this._note === CHOICE_CHANGED_NOTE) { return; }
     const generation = this._generationNow();
-    // Frozen as the press is dispatched, not when Home Assistant acknowledges it.
-    // callService is a promise, and a tap landing while it was in flight reached the
-    // selector before the daemon read it - so the daemon submitted the changed value
-    // against a press made for the previous one, and the freeze then arrived too late
-    // and locked in what had already been changed.
-    if (this._complete) {
-      this._committed = true;
-      this._committedAt = generation;
-      this._last = '';
-      this._render();
-    }
     // Whatever is typed in the reply box has to be published before the form is sent.
     // The daemon reads a form's free-text field out of that payload
     // (Read-DaemonDecisionCardText); a submit arriving without one left the field
@@ -1881,10 +2011,37 @@ class AgentBridgeChoicesCard extends HTMLElement {
     // Send answer exists to prevent. An incomplete form keeps exactly the behaviour it
     // had: the press, which is what makes the daemon name the field it is waiting on,
     // and the words stay in the box until there is a finished form to carry them.
-    const reply = (this._complete && this._takesText)
+    //
+    // Or the whole answer, where "Other (type your answer)" is what was picked. The
+    // slot is deliberately still on its placeholder there, so the payload is the
+    // entire answer and the daemon takes it on its own - the same route, for the same
+    // reason, without a press to race the sensor with.
+    const reply = (this._other || (this._complete && this._takesText))
       ? REPLY_CARDS.get(String(this._config.reply_topic || ''))
       : null;
-    if (reply && reply.hasUnsentFormText()) {
+    const typed = !!(reply && reply.hasUnsentFormText());
+    // Other picked and nothing written. Pressing the submit entity here would reach
+    // the daemon as a question with no option chosen and no words to use, which it
+    // reports as "choose an option" - true, but not what was being attempted. Say
+    // where the words go instead, and send nothing.
+    if (this._other && !typed) {
+      this._note = CHOICE_OTHER_EMPTY_NOTE;
+      this._last = '';
+      this._render();
+      return;
+    }
+    // Frozen as the press is dispatched, not when Home Assistant acknowledges it.
+    // callService is a promise, and a tap landing while it was in flight reached the
+    // selector before the daemon read it - so the daemon submitted the changed value
+    // against a press made for the previous one, and the freeze then arrived too late
+    // and locked in what had already been changed.
+    if (this._complete || this._other) {
+      this._committed = true;
+      this._committedAt = generation;
+      this._last = '';
+      this._render();
+    }
+    if (typed) {
       reply.publishFormText(generation, this._config.decision).then(
         (published) => {
           // Only on a publish that landed. Submitting after a failed one is exactly

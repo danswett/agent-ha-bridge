@@ -1267,6 +1267,54 @@ function Test-DecisionFieldIsMultiSelect {
     [bool]$Field.MultiSelect
 }
 
+function Test-DecisionTakesTypedAnswer {
+    <#
+        True when words typed in the reply box are a real answer to this question, so
+        the card can offer "Other" beside the options.
+
+        Every Copilot option list ends in "Other (type your answer)", and that entry is
+        the one place words get into an arrow-key prompt - so a choice question can be
+        answered by typing as well as by tapping, and the daemon has taken such an
+        answer for a while (Read-DaemonFormAnswer's free-text route, and the selector
+        path in Read-DaemonDecisionAnswer). Nothing on the card ever said so. Worse,
+        the choices card holds the reply card's own Send down while a question is
+        armed, so on a single-choice question the box sat there looking usable with no
+        way at all to send what was typed into it.
+
+        The conditions are the daemon's, stated once here so the row the card draws
+        cannot drift from the answer the daemon will accept:
+
+          - A tap that is itself the answer (a Codex approval) is not an ask_user
+            option list and has no "Other" entry to reach.
+          - Exactly one field, neither free text nor multi-select. A free-text field
+            *is* the box, and a multi-select's "Other" row sits in a checkbox list
+            where Enter accepts what is ticked rather than opening a text input -
+            which has not been seen happen, and guessing would record an answer
+            nobody gave.
+          - More than one field is a tabbed form, answered slot by slot; a typed
+            answer would be delivered as the whole form.
+          - Choices with no field behind them - a legacy `choices` argument, an MCP
+            client, a lone Claude question - ride on the main selector, and Claude's
+            own prompt always offers "Other" too.
+          - A freeform question has no option list to be other than: the reply box is
+            already the whole answer, and its own Send is the way to send it.
+    #>
+    param(
+        [AllowNull()][object[]]$Fields = @(),
+        [AllowNull()][string[]]$Choices = @(),
+        [switch]$AnswerOnTap
+    )
+
+    if ($AnswerOnTap) { return $false }
+    $fieldList = @($Fields | Where-Object { $null -ne $_ })
+    if ($fieldList.Count -gt 1) { return $false }
+    if ($fieldList.Count -eq 1) {
+        if (Test-DecisionFieldIsText -Field $fieldList[0]) { return $false }
+        return (-not (Test-DecisionFieldIsMultiSelect -Field $fieldList[0]))
+    }
+    @($Choices | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }).Count -gt 0
+}
+
 function Get-DecisionMultiSelectStyle {
     <#
         How a client's own prompt takes several options at once: 'space-toggle' or

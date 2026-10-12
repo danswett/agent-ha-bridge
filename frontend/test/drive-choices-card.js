@@ -70,7 +70,7 @@ process.stdin.on('end', () => {
     const rows = card.shadowRoot.querySelector('.choices').children.map((r) => ({
       tag: r.tagName,
       text: r.textContent,
-      classes: ['label', 'cancel', 'chosen'].filter((c) => r.classList.contains(c)),
+      classes: ['label', 'cancel', 'chosen', 'other', 'hint'].filter((c) => r.classList.contains(c)),
     }));
 
     process.stdout.write(JSON.stringify({ hidden: !!card.hidden, rows, calls, missing }));
