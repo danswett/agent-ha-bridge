@@ -2313,6 +2313,21 @@ function Set-CopilotMqttDecision {
     # invited exactly the accidental approval it looked like it prevented. A card old
     # enough not to know this attribute goes on drawing Send, as it did before.
     if ($AnswerOnTap) { $questionAttrs['answer_on_tap'] = $true }
+    # Whether words typed in the reply box are a real answer to this question, which
+    # is what lets the card draw its own "Other (type your answer)" row beside the
+    # options. The prompt in the terminal has always offered that entry and the daemon
+    # has always taken an answer from it, but the card said nothing - and it holds the
+    # reply card's Send down while a question is armed, so on a single-choice question
+    # the box was on screen with no way to send what was typed into it.
+    #
+    # Decided here, from the fields that were actually published, rather than inferred
+    # in the card from the shape of what it was handed: the condition is the daemon's
+    # and must not drift from it. A card old enough not to know this attribute draws
+    # no such row, exactly as before.
+    $typedFields = if ($usesFieldSlots) { $fieldList } else { @() }
+    if (Test-DecisionTakesTypedAnswer -Fields $typedFields -Choices $Choices -AnswerOnTap:$AnswerOnTap) {
+        $questionAttrs['takes_typed_answer'] = $true
+    }
     # Field labels ride on the decision attributes so the dashboard can name each
     # dropdown after its field without rebuilding the whole Lovelace config.
     if ($usesFieldSlots) {

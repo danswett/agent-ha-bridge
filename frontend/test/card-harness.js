@@ -71,6 +71,11 @@ class FakeElement {
     }
   }
   addEventListener(type, fn) { (this._listeners[type] = this._listeners[type] || []).push(fn); }
+  // Recorded rather than modelled. The choices card puts the cursor in the reply box
+  // when "Other (type your answer)" is picked, because the box is a separate card
+  // further down the session and on a phone it is off the screen; `focused` is how a
+  // test sees that happen.
+  focus() { this.focused = true; }
   setAttribute(name, value) { this.attributes[name] = String(value); }
   getAttribute(name) { return Object.prototype.hasOwnProperty.call(this.attributes, name) ? this.attributes[name] : null; }
   click() { for (const fn of this._listeners.click || []) { fn(); } }

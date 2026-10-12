@@ -466,6 +466,9 @@ function Invoke-ChoicesCard {
     # hands the card a submit entity, and a view that stopped doing so has to fail
     # here rather than quietly leave a form with no way to send it.
     if ($cardConfig.PSObject.Properties['submit']) { $config.submit = [string]$cardConfig.submit }
+    # The same for the reply topic: it is how the card finds the box beside it, which
+    # is where an answer typed through "Other (type your answer)" is written.
+    if ($cardConfig.PSObject.Properties['reply_topic']) { $config.reply_topic = [string]$cardConfig.reply_topic }
     $job = @{
         config = $config
         states = $script:HaStates
@@ -608,6 +611,94 @@ $oneAnswer = Read-DaemonDecisionAnswer -SessionId $sessionId -Marker $oneMarker 
 Test-That 'and then the daemon reads exactly the option that was tapped' {
     $oneAnswer.Answer -eq 'SQLite' -and (@($oneAnswer.Selections) -join '|') -eq 'SQLite' -and -not $oneAnswer.IsFreeText
 } "answer=[$($oneAnswer.Answer)] selections=[$(@($oneAnswer.Selections) -join '|')]"
+
+# --- 5b. the prompt's own "Other (type your answer)" entry -----------------------
+
+Write-Host ''
+Write-Host '--- and the same question can be answered in words instead ---'
+# Every Copilot option list ends in that entry and the daemon has always taken an
+# answer typed through it, but nothing on the card offered it - and the choices card
+# holds the reply card's Send down while a question is armed, so the box sat there
+# with no way at all to send what was typed into it.
+Test-That 'the bridge says this question takes words as well as taps' {
+    [bool]$script:HaStates["select.${node}_decision"].attributes['takes_typed_answer']
+} "[$(@($script:HaStates["select.${node}_decision"].attributes.Keys) -join ',')]"
+
+$typedRows = Invoke-ChoicesCard -Taps @()
+Test-That 'so the card draws Other as a row of its own' {
+    @($typedRows.rows | Where-Object { @($_.classes) -contains 'other' }).Count -eq 1
+} "rows=[$(@($typedRows.rows | ForEach-Object { $_.text }) -join '|')]"
+Test-That 'worded as the terminal words it, below every declared option' {
+    $texts = @($typedRows.rows | ForEach-Object { [string]$_.text })
+    [array]::IndexOf($texts, 'Other (type your answer)') -gt [array]::IndexOf($texts, 'SQLite')
+} "rows=[$(@($typedRows.rows | ForEach-Object { $_.text }) -join '|')]"
+
+# The slot is still holding SQLite from the tap above, and an option the daemon can
+# read is read in preference to the words - so picking Other has to put it back.
+$otherTap = Invoke-ChoicesCard -Taps @('Other (type your answer)')
+Test-That 'picking it returns the field to its placeholder rather than choosing anything' {
+    @($otherTap.calls).Count -eq 1 -and
+    [string]@($otherTap.calls)[0].data.entity_id -eq "select.${node}_f1" -and
+    [string]@($otherTap.calls)[0].data.option -eq 'Choose...'
+} "calls=[$(@($otherTap.calls) | ForEach-Object { "$($_.data.entity_id)=$($_.data.option)" })]"
+
+foreach ($call in @($otherTap.calls)) { $script:HaStates[[string]$call.data.entity_id].state = [string]$call.data.option }
+$script:HaStates["sensor.${node}_reply_payload"] = [ordered]@{
+    state = [DateTimeOffset]::Now.ToString('o')
+    attributes = [pscustomobject]@{ text = 'DuckDB, actually'; images = @(); files = @() }
+}
+$viaOther = Read-DaemonDecisionAnswer -SessionId $sessionId -Marker $oneMarker -State $oneState -Headers $headers
+Test-That 'and the daemon then takes the words, marked as typed rather than chosen' {
+    $viaOther.Answer -eq 'DuckDB, actually' -and $viaOther.IsFreeText -and $viaOther.IsChoice
+} "answer=[$($viaOther.Answer)] freeText=[$($viaOther.IsFreeText)]"
+Test-That 'naming the publish it came from, so the words are not sent twice' {
+    -not [string]::IsNullOrWhiteSpace($viaOther.PayloadStamp)
+} "stamp=[$($viaOther.PayloadStamp)]"
+$script:HaStates.Remove("sensor.${node}_reply_payload")
+
+# A form of several fields is answered slot by slot, and words typed at one would be
+# delivered as the whole form - so it gets no such row, and the bridge never says it
+# can take one.
+$script:HaStates = @{}
+Set-CopilotMqttDecision -SessionId $sessionId -SessionName 'Copilot: a task' -Machine 'BOX' `
+    -Question 'How should this land?' -Choices @() -Fields $fields `
+    -DecisionId 'd2b' -Headers $headers | Out-Null
+Test-That 'a form of several fields says nothing about typing, and gets no Other row' {
+    -not $script:HaStates["select.${node}_decision"].attributes.Contains('takes_typed_answer') -and
+    @((Invoke-ChoicesCard -Taps @()).rows | Where-Object { @($_.classes) -contains 'other' }).Count -eq 0
+} "[$(@($script:HaStates["select.${node}_decision"].attributes.Keys) -join ',')]"
+
+# The rest of the daemon's conditions, asserted where the attribute is written rather
+# than only where it is read. Each is a question the card must not offer words for -
+# or, for the one that does, a shape the daemon has always taken them from.
+$typedCases = @(
+    @{  Name    = 'a lone free-text field is the box itself, so there is nothing to be other than'
+        Fields  = @([pscustomobject]@{ Label = 'Notes'; Options = @(); IsText = $true })
+        Choices = @(); Tap = $false; Expect = $false }
+    @{  Name    = 'a multi-select field commits what is ticked, so its Other row is not a text input'
+        Fields  = @([pscustomobject]@{
+            Label = 'Features'; Options = @('Auth', 'Billing'); IsText = $false
+            MultiSelect = $true; MultiSelectStyle = 'space-toggle'; DefaultIndexes = @() })
+        Choices = @('Auth', 'Billing'); Tap = $false; Expect = $false }
+    @{  Name    = 'choices with no field behind them ride on the selector, and do take words'
+        Fields  = @(); Choices = @('Keep it', 'Drop it'); Tap = $false; Expect = $true }
+    @{  Name    = 'but an approval answered by its own tap has no ask_user list behind it'
+        Fields  = @(); Choices = @('Approve', 'Deny'); Tap = $true; Expect = $false }
+)
+$caseNumber = 0
+foreach ($case in $typedCases) {
+    $caseNumber++
+    $script:HaStates = @{}
+    $armParams = @{
+        SessionId = $sessionId; SessionName = 'Copilot: a task'; Machine = 'BOX'
+        Question = 'Which?'; Choices = @($case.Choices); Fields = @($case.Fields)
+        DecisionId = "d2-typed-$caseNumber"; Headers = $headers
+    }
+    if ($case.Tap) { $armParams['AnswerOnTap'] = $true; $armParams['PublishWithoutBaseline'] = $true }
+    Set-CopilotMqttDecision @armParams | Out-Null
+    $said = $script:HaStates["select.${node}_decision"].attributes.Contains('takes_typed_answer')
+    Test-That ([string]$case.Name) { $said -eq $case.Expect } "said=[$said] expected=[$($case.Expect)]"
+}
 
 # --- 6. a question that takes several options -----------------------------------
 

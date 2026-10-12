@@ -2409,6 +2409,222 @@ async function checkReplySendStandsDown() {
     elsewhere.reply._els.send.hidden === true);
 }
 
+/*
+ * "Other (type your answer)": the prompt's own last entry, drawn as a row.
+ *
+ * Every Copilot option list ends in it, and the daemon has always taken an answer
+ * typed through it (Read-DaemonFormAnswer's free-text route, and the selector path in
+ * Read-DaemonDecisionAnswer). Nothing on the card said so - and because the choices
+ * card holds the reply card's Send down while a question is armed, a single-choice
+ * question put the box on screen with no way whatsoever to send what was typed in it.
+ *
+ * The bridge says which questions really have that entry, in takes_typed_answer
+ * (Test-DecisionTakesTypedAnswer), and the row is drawn on its word alone: a row
+ * offering an answer the daemon will not take is worse than no row, because the words
+ * are published and then quietly dropped.
+ */
+async function checkOtherRow() {
+  const TOPIC = 'copilot/cli/session/abc/replypayload';
+  const FIELD = 'select.agent_bridge_abc_f1';
+
+  let seq = 0;
+  function armed({ typed = '', takesTyped = true, tapAnswers = false, chosen = 'Choose...', onField = true, rejectSelect = false } = {}) {
+    const replyTopic = `${TOPIC}/${++seq}`;
+    const calls = [];
+    const attributes = { decision_id: 'd1' };
+    if (takesTyped) { attributes.takes_typed_answer = true; }
+    if (tapAnswers) { attributes.answer_on_tap = true; }
+    attributes.options = onField
+      ? ['Awaiting answer...', 'Cancel request']
+      : ['Awaiting answer...', 'Approve', 'Deny', 'Cancel request'];
+    if (onField) { attributes.field_1_label = 'Database'; }
+    const states = {
+      [DECISION]: { state: 'Awaiting answer...', attributes },
+      [FIELD]: onField
+        ? { state: chosen, attributes: { options: ['Choose...', 'PostgreSQL', 'SQLite'] } }
+        : { state: 'Idle', attributes: { options: ['Idle'] } },
+    };
+    const hass = {
+      states,
+      callService: (domain, service, data) => {
+        calls.push({ domain, service, data });
+        if (domain === 'select' && rejectSelect) { return Promise.reject(new Error('refused')); }
+        if (domain === 'select') { states[data.entity_id].state = data.option; }
+        return Promise.resolve();
+      },
+    };
+    const reply = new SharedReplyCard();
+    reply.setConfig({ topic: replyTopic });
+    reply.hass = hass;
+    reply._els.textarea.value = typed;
+    const choices = new AgentBridgeChoicesCard();
+    choices.setConfig({ decision: DECISION, fields: [FIELD], submit: SUBMIT, reply_topic: replyTopic });
+    choices.hass = hass;
+    return { calls, reply, choices, states, hass, update: () => { choices.hass = hass; } };
+  }
+
+  const OTHER = 'Other (type your answer)';
+  const row = (c, text) => buttons(c).find((b) => b.textContent === text);
+  const domains = (m) => m.calls.map((c) => c.domain).join(',');
+  const published = (m) => {
+    const call = m.calls.find((c) => c.domain === 'mqtt');
+    if (!call || !call.data) { return null; }
+    try { return JSON.parse(call.data.payload); } catch (err) { return null; }
+  };
+
+  let m = armed();
+  check('a question the bridge says takes words offers Other as a row',
+    !!row(m.choices, OTHER), labels(m.choices).join('|'));
+  check('below every declared option, where the prompt itself puts it',
+    labels(m.choices).indexOf(OTHER) > labels(m.choices).indexOf('SQLite'),
+    labels(m.choices).join('|'));
+  check('and it is not drawn as the answer until it is picked',
+    !row(m.choices, OTHER).classList.contains('chosen'));
+
+  // Said on the bridge's word alone. Older bridges publish no such attribute, and a
+  // row offering an answer the daemon will not take loses the words it collects.
+  check('a bridge that says nothing about typing gets no such row',
+    !row(armed({ takesTyped: false }).choices, OTHER));
+  // A Codex approval is answered by its own tap: there is no ask_user option list
+  // behind it, so there is no Other entry to reach either.
+  check('and neither does a question whose tap is itself the answer',
+    !row(armed({ tapAnswers: true, onField: false }).choices, OTHER));
+
+  // Picking it must write nothing to the slot. The daemon reads words as the answer
+  // only while the slot is still on its placeholder, so "I am going to type this one"
+  // is exactly the state of having picked no option at all.
+  m = armed();
+  row(m.choices, OTHER).click();
+  await flush();
+  check('picking Other sends no selection to Home Assistant',
+    m.calls.length === 0, domains(m));
+  check('but is drawn as the answer, so it reads as a choice that was made',
+    row(m.choices, OTHER).classList.contains('chosen'));
+  check('and says where the words go, the box being a card further down',
+    rows(m.choices).some((r) => r.className === 'hint' && /box below/i.test(r.textContent)),
+    rows(m.choices).map((r) => r.className).join('|'));
+  check('with the cursor put in that box',
+    m.reply._els.textarea.focused === true);
+
+  // An option tapped earlier is read as the answer in preference to the words, so
+  // the slot has to go back to its placeholder before anything is typed.
+  m = armed({ chosen: 'SQLite' });
+  row(m.choices, OTHER).click();
+  await flush();
+  m.update();
+  check('picking Other after an option puts the slot back on its placeholder',
+    m.states[FIELD].state === 'Choose...', m.states[FIELD].state);
+  check('so the daemon reads no chosen option and takes the words instead',
+    !row(m.choices, 'SQLite').classList.contains('chosen'));
+  check('and Other is what is ticked', row(m.choices, OTHER).classList.contains('chosen'));
+
+  // The write that clears the slot can be refused. Leaving Other ticked beside the
+  // option it failed to clear read as two answers at once, with Send live and the
+  // form reading as complete - and sending then published the words while
+  // Read-DaemonFormAnswer, seeing a chosen slot, would not take them as the answer.
+  m = armed({ chosen: 'SQLite', typed: 'DuckDB, actually', rejectSelect: true });
+  row(m.choices, OTHER).click();
+  await flush();
+  m.update();
+  check('a refused clear takes Other back off, rather than showing two answers at once',
+    !row(m.choices, OTHER).classList.contains('chosen'));
+  check('leaving the option that is really there, which is what the daemon would read',
+    row(m.choices, 'SQLite').classList.contains('chosen') && m.states[FIELD].state === 'SQLite',
+    m.states[FIELD].state);
+  check('and saying Home Assistant would not take it',
+    rows(m.choices).some((r) => r.classList.contains('err') && /would not take/i.test(r.textContent)),
+    rows(m.choices).map((r) => r.textContent).join('|'));
+  m.calls.length = 0;
+  row(m.choices, 'Send answer').click();
+  await flush();
+  check('so Send is the ordinary press for the option on screen, not a typed answer',
+    m.calls.map((c) => c.domain).join(',') === 'button', m.calls.map((c) => c.domain).join(','));
+
+  // The way back. Leaving Other ticked beside a picked option would send the box's
+  // words over the option just tapped.
+  m = armed();
+  row(m.choices, OTHER).click();
+  await flush();
+  row(m.choices, 'PostgreSQL').click();
+  await flush();
+  m.update();
+  check('tapping a real option afterwards un-picks Other',
+    !row(m.choices, OTHER).classList.contains('chosen'));
+  check('and picks the option, the way it always did',
+    m.states[FIELD].state === 'PostgreSQL', m.states[FIELD].state);
+
+  // The answer itself. The slot is on its placeholder, so the payload is the whole
+  // answer and the daemon takes it on its own - no press to race the sensor with.
+  m = armed({ typed: 'DuckDB, actually' });
+  row(m.choices, OTHER).click();
+  await flush();
+  row(m.choices, 'Send answer').click();
+  await flush();
+  check('Send publishes the typed words and presses nothing',
+    domains(m) === 'mqtt', domains(m));
+  check('carrying the words themselves',
+    (published(m) || {}).text === 'DuckDB, actually', JSON.stringify(published(m)));
+  check('tagged with the question they were typed for',
+    (published(m) || {}).decision_id === 'd1', JSON.stringify(published(m)));
+  check('and the rows freeze, so the answer cannot be changed under the send',
+    m.choices._committed === true);
+
+  // Pressing the submit entity here would reach the daemon as a question with no
+  // option chosen and no words to use - reported as "choose an option", which is true
+  // but not what was being attempted.
+  m = armed({ typed: '' });
+  row(m.choices, OTHER).click();
+  await flush();
+  row(m.choices, 'Send answer').click();
+  await flush();
+  check('Send with Other picked and nothing typed sends nothing at all',
+    m.calls.length === 0, domains(m));
+  check('and says so rather than looking like a session still thinking',
+    rows(m.choices).some((r) => r.classList.contains('err') && /nothing typed/i.test(r.textContent)),
+    rows(m.choices).map((r) => r.textContent).join('|'));
+  check('leaving the rows live, so the words can still be written',
+    m.choices._committed === false);
+
+  // A question answered by tapping is untouched by any of this.
+  m = armed({ typed: 'a draft I left lying about' });
+  row(m.choices, 'SQLite').click();
+  await flush();
+  m.update();
+  row(m.choices, 'Send answer').click();
+  await flush();
+  check('an option picked normally still presses, whatever is in the reply box',
+    domains(m) === 'select,button', domains(m));
+  check('and the draft is left where it was, for the reply path',
+    m.reply._els.textarea.value === 'a draft I left lying about', m.reply._els.textarea.value);
+
+  // A pick belongs to the question it was made on. Carried across a replacement it
+  // would draw a row as chosen that nobody chose, and send the box's words for it.
+  m = armed();
+  row(m.choices, OTHER).click();
+  await flush();
+  m.states[DECISION] = {
+    state: 'Awaiting answer...',
+    attributes: {
+      options: ['Awaiting answer...', 'Cancel request'], decision_id: 'd2',
+      field_1_label: 'Database', takes_typed_answer: true,
+    },
+  };
+  m.update();
+  check('a replacement question is drawn with Other un-picked',
+    !row(m.choices, OTHER).classList.contains('chosen'));
+
+  // Choices riding on the main selector - a legacy `choices` argument, an MCP client,
+  // a lone Claude question - reach the same free-text route in the daemon.
+  m = armed({ onField: false, typed: 'neither, actually' });
+  check('a selector carrying its own choices gets the row too',
+    !!row(m.choices, OTHER), labels(m.choices).join('|'));
+  row(m.choices, OTHER).click();
+  await flush();
+  row(m.choices, 'Send answer').click();
+  await flush();
+  check('and answers in words the same way', domains(m) === 'mqtt', domains(m));
+}
+
 // _launch awaits its service calls, so the checks that read them have to await it too.
 (async () => {
   await checkForgetRemoval();
@@ -2422,6 +2638,7 @@ async function checkReplySendStandsDown() {
   await checkSendAnswerCarriesTypedText();
   await checkAnswerConsumedStamp();
   await checkReplySendStandsDown();
+  await checkOtherRow();
 
   const pubEnv = launchEnv({});
   const pubCard = promptCard(pubEnv, { promptTopic: PROMPT_TOPIC });

@@ -28,7 +28,7 @@ prompt, so the terminal never stops working and nothing is ever answered twice.
 | **Live activity** | Each session streams its status, current tool, and last response to its card. |
 | **Background agents** | A session whose turn has ended while agents it started are still running reads *waiting for N background agents*, not *idle*. |
 | **Detailed activity** | Cards carry the model's reasoning and every tool call; fold a session card to keep it short. Off with `detailedActivity: false`. |
-| **Real forms** | Every question becomes rows you tap plus a Send button; multi-select questions take as many options as you like. |
+| **Real forms** | Every question becomes rows you tap plus a Send button; multi-select questions take as many options as you like, and *Other (type your answer)* is there when none of them fit. |
 | **Continuation** | Reply to a finished turn from your phone; it's typed into the session. |
 | **Paste an image** | Paste or attach a screenshot in the reply box and it's attached to the prompt. |
 | **Attach a file** | Attach a document, log or diff the same way; up to 256 KB travels in the reply itself. |
@@ -1929,8 +1929,17 @@ Two `ask_user` argument shapes are handled. Current builds pass **`message`** pl
   numbered outline of every field and its options, marking any default.
 * **Typing is answering.** Every Copilot option list ends in "Other (type your
   answer)", so words typed into the reply box and sent answer a choice question
-  through that entry. Where they cannot be used - a form with no free-text field, or
-  a choice already tapped - the card says so rather than dropping them.
+  through that entry. From card 1.37.0 that entry is a **row of its own** below the
+  options: tap it, write the answer in the reply box, press **Send answer**. Until
+  then nothing on screen said so, and because the choices card takes the reply box's
+  own Send away while a question is waiting, a single-choice question left the box
+  there with no way at all to send what was typed in it. Picking it writes nothing to
+  the field - a typed answer is only read while nothing is chosen - so it also puts
+  back an option tapped by mistake. The row is drawn only where the prompt really has
+  that entry: not on a multi-field form, not on a multi-select field, whose Enter
+  commits what is ticked, and not on a Codex approval. Where words cannot be used -
+  a form with no free-text field, or a choice already tapped - the card says so
+  rather than dropping them.
 * Questions are carried up to 6,000 characters and each choice up to 600; anything
   longer is truncated and the card says so.
 * **An answer is read by identity, never by a clock.** As a question is armed the
