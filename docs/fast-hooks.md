@@ -968,6 +968,14 @@ implied**, which was ordered by reasoning rather than by numbers.
   re-derives the same list to validate what the dropdown sent back, so a cached list
   would let a model removed from `newSession.models.<agent>` stay launchable.
 
+  A cache *miss* got dearer on 2026-10-12. The list is now the account's own roster,
+  read by starting the CLI's headless server and opening a throwaway session. On an
+  idle machine that takes **3-4 s** - half a second to connect, 1.3 s for the list
+  itself and a second or so for the CLI to exit - and 8-12 s when the CLI is slow to
+  connect, where `copilot help config` took about 0.5 s. It is paid inside a
+  reconcile, so a successful list is now kept for six hours rather than half an hour
+  (`$script:BridgeModelCacheHours`): four refreshes a day instead of forty-eight.
+
 **Done 2026-09-28.**
 
 - `Get-CopilotAskUserState` re-parsed the tail on every pass. A transcript is

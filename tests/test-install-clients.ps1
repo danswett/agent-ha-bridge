@@ -512,6 +512,132 @@ Test-That 'a command that never answers is killed, not waited on' { $probeSlow.T
 $probeMissing = Invoke-BridgeCommandProbe -Executable $missingExe
 Test-That 'a command that cannot be executed at all is not reported as run' { -not $probeMissing.Ran }
 
+Write-Host '--- talking JSON-RPC to a child over its stdin and stdout ---'
+# Copilot's model roster is only available from its headless JSON-RPC server, so the
+# daemon now holds a conversation with a child rather than just reading its output.
+# A small pwsh server stands in for the CLI: it splits its frames mid-header and
+# mid-character, interleaves the events and prompts the real one sends, and can fail,
+# hang or die on request.
+$rpcRoot = Join-Path ([IO.Path]::GetTempPath()) "rpc-fake-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
+[void][IO.Directory]::CreateDirectory($rpcRoot)
+$rpcServer = Join-Path $rpcRoot 'server.ps1'
+[IO.File]::WriteAllText($rpcServer, @'
+$ErrorActionPreference = 'Stop'
+$in = [Console]::OpenStandardInput()
+$out = [Console]::OpenStandardOutput()
+$buffer = [Collections.Generic.List[byte]]::new()
+$chunk = [byte[]]::new(4096)
+function Read-Message {
+    while ($true) {
+        $text = [Text.Encoding]::ASCII.GetString($buffer.ToArray())
+        $end = $text.IndexOf("`r`n`r`n")
+        if ($end -ge 0) {
+            $length = [int][regex]::Match($text, 'Content-Length: (\d+)').Groups[1].Value
+            if ($buffer.Count -ge $end + 4 + $length) {
+                $json = [Text.Encoding]::UTF8.GetString($buffer.GetRange($end + 4, $length).ToArray())
+                $buffer.RemoveRange(0, $end + 4 + $length)
+                return ConvertFrom-Json -InputObject $json -AsHashtable
+            }
+        }
+        $read = $in.Read($chunk, 0, $chunk.Length)
+        if ($read -le 0) { exit 0 }
+        $buffer.AddRange([ArraySegment[byte]]::new($chunk, 0, $read))
+    }
+}
+function Write-Message($Message, [int[]]$SplitAt = @()) {
+    $body = [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $Message -Depth 10 -Compress))
+    [byte[]]$frame = [Text.Encoding]::ASCII.GetBytes("Content-Length: $($body.Length)`r`n`r`n") + $body
+    $from = 0
+    foreach ($to in @($SplitAt) + $frame.Length) {
+        $out.Write($frame, $from, $to - $from)
+        $out.Flush()
+        $from = $to
+        if ($to -lt $frame.Length) { Start-Sleep -Milliseconds 150 }
+    }
+}
+while ($true) {
+    $request = Read-Message
+    switch ($request['method']) {
+        'echo' {
+            $reply = [ordered]@{ jsonrpc = '2.0'; id = $request['id']; result = $request['params'] }
+            $body = [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $reply -Depth 10 -Compress))
+            # Once inside the header, once between the two bytes of a UTF-8 character.
+            $headerLength = ("Content-Length: $($body.Length)`r`n`r`n").Length
+            $accent = [Array]::IndexOf($body, [byte]0xC3)
+            Write-Message $reply -SplitAt @(7, ($headerLength + $accent + 1))
+        }
+        'interleave' {
+            Write-Message ([ordered]@{ jsonrpc = '2.0'; method = 'session.event'; params = @{ type = 'noise' } })
+            Write-Message ([ordered]@{ jsonrpc = '2.0'; id = 'server-1'; method = 'permission.request'; params = @{} })
+            $answer = Read-Message
+            Write-Message ([ordered]@{ jsonrpc = '2.0'; id = 999; result = 'not this request' })
+            Write-Message ([ordered]@{ jsonrpc = '2.0'; id = $request['id']; result = [ordered]@{ answered = $answer['id']; code = $answer['error']['code'] } })
+        }
+        'fail' {
+            Write-Message ([ordered]@{ jsonrpc = '2.0'; id = $request['id']; error = [ordered]@{ code = -32001; message = 'simulated refusal' } })
+        }
+        # Stops reading altogether, so even closing its input will not end it.
+        'hang' { Start-Sleep -Seconds 120 }
+    }
+}
+'@)
+$rpcDead = Join-Path $rpcRoot 'dead.ps1'
+[IO.File]::WriteAllText($rpcDead, "[Console]::Error.WriteLine('fatal: simulated bad flag'); exit 7")
+
+$rpc = $null
+try {
+    $rpc = Start-BridgeJsonRpcProcess -Executable $probePwsh -Arguments @('-NoProfile', '-NonInteractive', '-File', $rpcServer) -WorkingDirectory $rpcRoot
+    $soon = { [DateTimeOffset]::Now.AddSeconds(60) }
+
+    $echoed = Invoke-BridgeJsonRpcRequest -Connection $rpc -Method 'echo' -Params ([ordered]@{ text = 'Café ☕'; n = 3 }) -Deadline (& $soon)
+    Test-That 'a reply split across reads, even inside a character, arrives whole' {
+        $echoed['text'] -ceq 'Café ☕' -and $echoed['n'] -eq 3
+    } "$(ConvertTo-Json -InputObject $echoed -Compress)"
+
+    $interleaved = Invoke-BridgeJsonRpcRequest -Connection $rpc -Method 'interleave' -Deadline (& $soon)
+    Test-That 'events and other replies on the way are skipped, and a prompt from the child is refused rather than left waiting' {
+        $interleaved['answered'] -ceq 'server-1' -and $interleaved['code'] -eq -32601
+    } "$(ConvertTo-Json -InputObject $interleaved -Compress)"
+
+    $refusal = $null
+    try { [void](Invoke-BridgeJsonRpcRequest -Connection $rpc -Method 'fail' -Deadline (& $soon)) }
+    catch { $refusal = $_.Exception }
+    Test-That 'an error reply is thrown with its message and its JSON-RPC code' {
+        $null -ne $refusal -and $refusal.Message -match 'simulated refusal' -and $refusal.Data['JsonRpcCode'] -eq -32001
+    } "$(if ($refusal) { $refusal.Message })"
+
+    $hung = $null
+    $hangClock = [Diagnostics.Stopwatch]::StartNew()
+    try { [void](Invoke-BridgeJsonRpcRequest -Connection $rpc -Method 'hang' -Deadline ([DateTimeOffset]::Now.AddMilliseconds(1500))) }
+    catch { $hung = $_.Exception }
+    Test-That 'a child that never answers is given up on at the deadline' {
+        $null -ne $hung -and $hung.GetBaseException() -is [TimeoutException] -and $hung.Message -match 'hang' -and
+            $hangClock.Elapsed.TotalSeconds -lt 15
+    } "$(if ($hung) { "$($hung.GetType().Name): $($hung.Message)" }) after $($hangClock.Elapsed.TotalSeconds)s"
+
+    $stopClock = [Diagnostics.Stopwatch]::StartNew()
+    $stopped = Stop-BridgeJsonRpcProcess -Connection $rpc -GraceMs 500
+    $rpc = $null
+    Test-That 'and one that ignores its input closing is killed rather than waited on' {
+        $stopped.Exited -and $stopped.Killed -and $stopClock.Elapsed.TotalSeconds -lt 15
+    } "exited=$($stopped.Exited) killed=$($stopped.Killed) after $($stopClock.Elapsed.TotalSeconds)s"
+
+    $rpc = Start-BridgeJsonRpcProcess -Executable $probePwsh -Arguments @('-NoProfile', '-NonInteractive', '-File', $rpcDead) -WorkingDirectory $rpcRoot
+    $died = $null
+    try { [void](Invoke-BridgeJsonRpcRequest -Connection $rpc -Method 'connect' -Deadline (& $soon)) }
+    catch { $died = $_.Exception }
+    $deadStop = Stop-BridgeJsonRpcProcess -Connection $rpc
+    $rpc = $null
+    Test-That 'a child that dies before answering is reported with its exit code and what it said' {
+        $null -ne $died -and $died.Message -match 'code 7' -and $died.Message -match 'simulated bad flag' -and
+            $deadStop.Exited -and -not $deadStop.Killed
+    } "$(if ($died) { $died.Message })"
+}
+finally {
+    if ($null -ne $rpc) { [void](Stop-BridgeJsonRpcProcess -Connection $rpc -GraceMs 0) }
+    Remove-Item -LiteralPath $rpcRoot -Recurse -Force -ErrorAction SilentlyContinue
+}
+
 if ($IsWindows) {
     # npm installs its clients as .cmd shims, and Get-BridgeCodexPath falls back to
     # %APPDATA%\npm\codex.cmd outright - so a probe that could not run a batch file

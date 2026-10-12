@@ -416,7 +416,7 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `newSession.resumeCount` | How many recent sessions the Resume dropdown offers (default `12`) |
 | `newSession.model` | Model preselected on the card (default: **Agent default** — the CLI's own choice). Applies to Copilot and Agency; `newSession.model.claude` / `.codex` do the same per agent |
 | `newSession.effort.<agent>` / `.context.<agent>` | Reasoning effort and context window preselected on the card, per agent (`copilot`, `claude`, `codex`; Agency reads Copilot's) |
-| `newSession.models.<agent>` | Replace the model list the card offers, e.g. `"models": { "copilot": ["auto", "claude-opus-5"] }`. Copilot's is otherwise read from `copilot help config`; `efforts.<agent>` and `contexts.<agent>` do the same for the other two axes |
+| `newSession.models.<agent>` | Replace the model list the card offers, e.g. `"models": { "copilot": ["auto", "claude-opus-5"] }`. Copilot's is otherwise asked of the CLI: the models this account can use; `efforts.<agent>` and `contexts.<agent>` do the same for the other two axes |
 | `newSession.allowAllTools` | What the card's **Permissions** row opens on (default `false`). **Allow all** launches without permission prompts: `--allow-all` for Copilot, `--dangerously-skip-permissions` for Claude, `--ask-for-approval never` for Codex, and it answers Claude's folder-trust dialog rather than waiting for a second press. The card decides each launch, so a session started on another machine no longer silently takes that machine's setting |
 | `newSession.extraArgs` | Extra CLI arguments for launched sessions, e.g. `["--plan"]` |
 | `newSession.copilotPath` | Full path to `copilot.exe` if it is not on the daemon's PATH |
@@ -812,15 +812,22 @@ Claude has no context-window switch; `--autocompact`, which sets the window it c
 at, is the nearest equivalent and is what its Context row offers (`auto`, `200k`, `500k`,
 `1m`).
 
-Copilot's model list is read from `copilot help config`, with a 15-second startup
-deadline, and successful results are cached for half an hour. Failed probes retry
-after a minute and keep the last successful list in memory rather than removing the
-model choices. On a cold start with no previous successful discovery, *Agent default*
-and `auto` remain available until a retry succeeds. Failures and recovery are recorded
-in the daemon log (`agent-ha-bridge logs`), or the bridge log outside the daemon.
+Copilot's model list is asked of the CLI the way its own `/model` picker asks: the
+daemon starts `copilot --headless`, opens a throwaway session, lists the models that
+session may use and deletes it again. That makes it the account's real list - a model
+the plan or an administrator has not enabled is left out - and only models Copilot
+itself serves are offered, since Microsoft 365 and bring-your-own-key models need more
+than `--model` to reach. The probe sends no prompt, so it uses no premium requests; it
+starts no MCP servers and leaves no session behind. It has 20 seconds to answer, and a
+successful list is kept for six hours (restarting the daemon asks again). A failed
+probe keeps the last successful list in memory rather than removing the model choices,
+and retries after a minute, the wait doubling up to half an hour. On a cold start with
+no previous successful discovery, *Agent default* and `auto` remain available until a
+retry succeeds. Failures and recovery are recorded in the daemon log
+(`agent-ha-bridge logs`), or the bridge log outside the daemon.
 The other two ship with a short built-in list,
 which `newSession.models.<agent>` replaces — worth doing for Copilot too, since
-twenty-six options on a phone is a scroll rather than a choice.
+nearly thirty options on a phone is a scroll rather than a choice.
 
 A value arriving from Home Assistant is validated against that agent's list before it
 reaches a command line, exactly as a workspace label is. An unrecognised one quietly

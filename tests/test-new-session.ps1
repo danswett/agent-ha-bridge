@@ -554,133 +554,413 @@ $script:FakeProfiles = [pscustomobject]@{ Ok = $true; Profiles = @('work', 'home
 Write-Host ''
 Write-Host '--- model, effort and context ---'
 
-$savedProbeResult = $script:ProbeResult
-$savedModelProbe = ${function:Invoke-BridgeCommandProbe}
+# Copilot's model list comes from a conversation with its headless server: a
+# throwaway session is asked for the roster its own /model picker shows. The transport
+# is tested against a real child process in test-install-clients.ps1; here a scripted
+# conversation stands in for the CLI, so what is asserted is what the bridge asks for,
+# what it keeps, and what it leaves behind on disk.
 $savedModelCopilotPath = ${function:Get-BridgeCopilotPath}
-$script:ModelProbeCalls = 0
-$script:ModelProbeMinimumTimeoutMs = 0
-function Invoke-BridgeCommandProbe {
-    param([string]$Executable, [string[]]$Arguments = @(), [int]$TimeoutMs = 5000)
-    $script:ModelProbeCalls++
-    if ($TimeoutMs -lt $script:ModelProbeMinimumTimeoutMs) {
-        return [pscustomobject]@{
-            Ran = $true; TimedOut = $true; ExitCode = -1; Output = ''; StandardOutput = ''
-        }
-    }
-    $script:ProbeResult
-}
+$savedRpcStart = ${function:Start-BridgeJsonRpcProcess}
+$savedRpcInvoke = ${function:Invoke-BridgeJsonRpcRequest}
+$savedRpcStop = ${function:Stop-BridgeJsonRpcProcess}
+$savedModelRoster = ${function:Get-BridgeCopilotModelRoster}
+$savedModelCopilotHome = $env:COPILOT_HOME
 function Get-BridgeCopilotPath { 'C:\fake-copilot.exe' }
 
-$script:FakeSettings = @{}
-$script:BridgeModelCache = $null
-$modelHelp = '`model`:' + "`n" + '  - "test-model"' + "`n`n" + '`theme`:' + "`n" + '  - "test-theme"' + "`n"
-$goodModelProbe = [pscustomobject]@{
-    Ran = $true; TimedOut = $false; ExitCode = 0; Output = ''
-    StandardOutput = $modelHelp
+function New-FakeRpcError {
+    param([int]$Code, [string]$Message)
+    $exception = [InvalidOperationException]::new("$Message (code $Code)")
+    $exception.Data['JsonRpcCode'] = $Code
+    $exception
 }
-$script:ProbeResult = $goodModelProbe
-Test-That 'model discovery parses the background command output, not other settings' {
-    (@(Get-BridgeCopilotModelList -Path 'C:\fake-copilot.exe') -join ',') -eq 'test-model'
+$script:RpcStarts = [Collections.Generic.List[object]]::new()
+$script:RpcCalls = [Collections.Generic.List[object]]::new()
+$script:RpcStops = 0
+$script:FakeExited = $true
+function Start-BridgeJsonRpcProcess {
+    param([string]$Executable, [string[]]$Arguments = @(), [string]$WorkingDirectory = '')
+    $script:RpcStarts.Add([pscustomobject]@{
+            Executable = $Executable; Arguments = @($Arguments); WorkingDirectory = $WorkingDirectory
+            Existed = [IO.Directory]::Exists($WorkingDirectory)
+        })
+    [pscustomobject]@{ Fake = $true }
 }
-$modelCalls = $script:ModelProbeCalls
-$script:BridgeModelCache.At = [DateTimeOffset]::Now.AddSeconds(-61)
-Test-That 'a successful discovery does not adopt the shorter failure retry window' {
-    (@(Get-BridgeCopilotModelList) -join ',') -eq 'test-model' -and $script:ModelProbeCalls -eq $modelCalls
+function Invoke-BridgeJsonRpcRequest {
+    param($Connection, [string]$Method, $Params = @{}, [DateTimeOffset]$Deadline)
+    $script:RpcCalls.Add([pscustomobject]@{
+            Method = $Method; Params = $Params; Remaining = ($Deadline - [DateTimeOffset]::Now).TotalSeconds
+        })
+    $handler = $script:RpcHandlers[$Method]
+    if ($null -eq $handler) { throw (New-FakeRpcError -Code -32601 -Message "Method not found: $Method") }
+    , (& $handler $Params)
 }
-
-$script:BridgeModelCache = $null
-$script:ProbeResult = [pscustomobject]@{
-    Ran = $true; TimedOut = $false; ExitCode = 1; Output = 'simulated failure'; StandardOutput = $modelHelp
+function Stop-BridgeJsonRpcProcess {
+    param($Connection, [int]$GraceMs = 2000)
+    $script:RpcStops++
+    [pscustomobject]@{ Exited = $script:FakeExited; Killed = $false; ExitCode = 0; StandardError = '' }
 }
-Test-That 'failed model discovery does not accept partial stdout' {
-    @(Get-BridgeCopilotModelList -Path 'C:\fake-copilot.exe').Count -eq 0
-}
-
-$script:BridgeModelCache = $null
-$script:ProbeResult = [pscustomobject]@{
-    Ran = $true; TimedOut = $true; ExitCode = -1; Output = ''; StandardOutput = $modelHelp
-}
-Test-That 'a startup discovery timeout is recorded rather than silently losing the models' {
-    @(Get-BridgeCopilotModelList).Count -eq 0 -and
-        (Test-Path -LiteralPath $testLogFile) -and
-        (Get-Content -LiteralPath $testLogFile -Raw) -match 'Copilot model discovery failed.*timed out'
-}
-$modelCalls = $script:ModelProbeCalls
-Test-That 'repeated selector reads do not rerun a failed probe before its retry is due' {
-    @(Get-BridgeCopilotModelList).Count -eq 0 -and $script:ModelProbeCalls -eq $modelCalls
-}
-$script:ProbeResult = $goodModelProbe
-$script:BridgeModelCache.At = [DateTimeOffset]::Now.AddSeconds(-61)
-Test-That 'a failed first discovery retries within a minute and records its recovery' {
-    (@(Get-BridgeCopilotModelList) -join ',') -eq 'test-model' -and
-        $script:ModelProbeCalls -eq $modelCalls + 1 -and
-        (Test-Path -LiteralPath $testLogFile) -and
-        (Get-Content -LiteralPath $testLogFile -Raw) -match 'Copilot model discovery recovered'
+function Get-FakeRpcMethods { @($script:RpcCalls | ForEach-Object { $_.Method }) -join ',' }
+function Get-FakeSessionId {
+    $created = @($script:RpcCalls | Where-Object { $_.Method -eq 'session.create' })
+    if ($created.Count -gt 0) { [string]$created[0].Params['sessionId'] } else { '' }
 }
 
-$partialModelHelp = '`model`:' + "`n" + '  - "partial-model"' + "`n"
-$modelFailures = @(
-    @{ Name = 'a timeout'; Probe = [pscustomobject]@{
-        Ran = $true; TimedOut = $true; ExitCode = -1; Output = ''; StandardOutput = $partialModelHelp
-    } }
-    @{ Name = 'a command that cannot start'; Probe = [pscustomobject]@{
-        Ran = $false; TimedOut = $false; ExitCode = -1; Output = 'simulated start failure'; StandardOutput = ''
-    } }
-    @{ Name = 'a nonzero exit with partial stdout'; Probe = [pscustomobject]@{
-        Ran = $true; TimedOut = $false; ExitCode = 2; Output = 'simulated CLI failure'; StandardOutput = $partialModelHelp
-    } }
-    @{ Name = 'unrecognised help output'; Probe = [pscustomobject]@{
-        Ran = $true; TimedOut = $false; ExitCode = 0; Output = ''; StandardOutput = '`theme`: dark'
-    } }
-    @{ Name = 'an older probe without separate stdout'; Probe = [pscustomobject]@{
-        Ran = $true; TimedOut = $false; ExitCode = 0; Output = 'model: partial-model'
-    } }
+# What an account like this one is offered, among the other shapes a roster can carry.
+$script:FullFakeRoster = @(
+    @{ id = 'auto' }
+    @{ id = 'claude-opus-5.5'; policy = @{ state = 'enabled' }; provider = @{ kind = 'copilot'; id = 'copilot' } }
+    @{ id = 'claude-fable-5'; policy = @{ state = 'disabled' } }
+    @{ id = 'gemini-3.8-flash'; policy = @{ state = 'enabled' } }
+    @{ id = 'needs-setup'; policy = @{ state = 'unconfigured' } }
+    @{ id = 'future-state'; policy = @{ state = 'something-new' } }
+    @{ id = 'm365-model'; provider = @{ kind = 'loki'; id = 'm365' } }
+    @{ id = 'ollama/llama3' }
+    @{ id = 'gpt-5.4:latest' }
+    @{ id = '-flag-like' }
+    @{ id = "trailing-newline`n" }
+    @{ id = 42 }
+    'not-an-object'
+    @{ id = 'claude-opus-5.5'; policy = @{ state = 'enabled' } }
+    @{ id = 'grok-4.7' }
 )
-foreach ($case in $modelFailures) {
-    $script:BridgeModelCache = $null
-    $script:ProbeResult = $goodModelProbe
-    [void](Get-BridgeCopilotModelList)
-    $script:BridgeModelCache.At = [DateTimeOffset]::Now.AddMinutes(-31)
-    $script:ProbeResult = $case.Probe
-    $offeredModels = @(Get-BridgeTuningOptions -Launcher 'agency' -Axis 'model')
-    $modelCalls = $script:ModelProbeCalls
-    Test-That "last good model choices survive $($case.Name), including subsequent selector reads" {
-        ($offeredModels -join ',') -eq 'Agent default,auto,test-model' -and
-            ((Get-BridgeTuningOptions -Launcher 'agency' -Axis 'model') -join ',') -eq 'Agent default,auto,test-model' -and
-            $script:ModelProbeCalls -eq $modelCalls
+
+$script:LongAgo = [datetime]::new(2020, 1, 1, 0, 0, 0, [DateTimeKind]::Utc)
+$script:ModelHome = [IO.Path]::Combine([IO.Path]::GetTempPath(), "bridge-models-$([guid]::NewGuid().ToString('N').Substring(0, 8))")
+$script:FakeState = [IO.Path]::Combine($script:ModelHome, 'session-state')
+$script:FakeLocks = [IO.Path]::Combine($script:FakeState, '.session-operation-locks')
+$script:EarlierSession = [IO.Path]::Combine($script:FakeState, 'earlier-session')
+$script:OtherLock = [IO.Path]::Combine($script:FakeLocks, 'other-session.lock')
+$emptyModelHome = [IO.Path]::Combine([IO.Path]::GetTempPath(), "bridge-models-$([guid]::NewGuid().ToString('N').Substring(0, 8))")
+$snapshotRoot = [IO.Path]::Combine([IO.Path]::GetTempPath(), "bridge-snapshot-$([guid]::NewGuid().ToString('N').Substring(0, 8))")
+
+function Reset-FakeCopilot {
+    $script:RpcStarts.Clear()
+    $script:RpcCalls.Clear()
+    $script:RpcStops = 0
+    $script:FakeExited = $true
+    $script:FakeRoster = $script:FullFakeRoster
+    # What the real CLI does on disk: a lock beside other sessions' locks, and a folder
+    # of its own that session.delete removes again.
+    $script:RpcHandlers = @{
+        'connect'            = { param($Params) @{ version = '1.0.95'; protocolVersion = 3 } }
+        'session.create'     = {
+            param($Params)
+            $state = [IO.Path]::Combine($env:COPILOT_HOME, 'session-state')
+            $locks = [IO.Path]::Combine($state, '.session-operation-locks')
+            [void][IO.Directory]::CreateDirectory($locks)
+            [IO.File]::WriteAllText([IO.Path]::Combine($locks, "$($Params['sessionId']).lock"), '')
+            [void][IO.Directory]::CreateDirectory([IO.Path]::Combine($state, [string]$Params['sessionId']))
+            @{ sessionId = $Params['sessionId'] }
+        }
+        'session.model.list' = { param($Params) @{ list = $script:FakeRoster } }
+        'session.delete'     = {
+            param($Params)
+            $folder = [IO.Path]::Combine($env:COPILOT_HOME, 'session-state', [string]$Params['sessionId'])
+            if ([IO.Directory]::Exists($folder)) { [IO.Directory]::Delete($folder, $true) }
+            @{}
+        }
+    }
+    # The launcher's 'auto' reads these times to tell when Copilot was last used.
+    [IO.File]::SetLastWriteTimeUtc($script:OtherLock, $script:LongAgo)
+    foreach ($folder in @($script:EarlierSession, $script:FakeLocks, $script:FakeState)) {
+        [IO.Directory]::SetLastWriteTimeUtc($folder, $script:LongAgo)
     }
 }
-$script:ProbeResult = [pscustomobject]@{
-    Ran = $true; TimedOut = $false; ExitCode = 0; Output = ''
-    StandardOutput = '`model`:' + "`n" + '  - "updated-model"' + "`n"
-}
-$script:BridgeModelCache.At = [DateTimeOffset]::Now.AddSeconds(-61)
-Test-That 'a successful retry replaces the stale model list instead of accumulating removed models' {
-    ((Get-BridgeTuningOptions -Launcher 'copilot' -Axis 'model') -join ',') -eq 'Agent default,auto,updated-model'
+function Invoke-FakeRosterProbe {
+    $script:RosterModels = @()
+    $script:RosterError = $null
+    try { $script:RosterModels = @(Get-BridgeCopilotModelRoster -Path 'C:\fake-copilot.exe') }
+    catch { $script:RosterError = $_.Exception.Message }
 }
 
-$script:BridgeModelCache = $null
-$script:ProbeResult = $goodModelProbe
-$script:ModelProbeMinimumTimeoutMs = 10000
-Test-That 'a slower cold CLI can answer model discovery rather than hitting the version-probe deadline' {
-    (@(Get-BridgeCopilotModelList) -join ',') -eq 'test-model'
-}
-$script:ModelProbeMinimumTimeoutMs = 0
-
-$savedModelDiscoverer = $script:BridgeLauncherTuning.copilot.model.Discover
 try {
-    $script:BridgeLauncherTuning.copilot.model.Discover = { throw 'unexpected discovery failure' }
-    Test-That 'an unexpected discoverer failure is not hidden by another silent catch' {
-        try { [void](Get-BridgeTuningOptions -Launcher 'copilot' -Axis 'model'); $false }
-        catch { $_.Exception.Message -eq 'unexpected discovery failure' }
-    }
-}
-finally { $script:BridgeLauncherTuning.copilot.model.Discover = $savedModelDiscoverer }
+    [void][IO.Directory]::CreateDirectory($script:EarlierSession)
+    [void][IO.Directory]::CreateDirectory($script:FakeLocks)
+    [IO.File]::WriteAllText($script:OtherLock, '')
+    [void][IO.Directory]::CreateDirectory($emptyModelHome)
+    $env:COPILOT_HOME = $script:ModelHome
 
-$script:ProbeResult = $savedProbeResult
-${function:Invoke-BridgeCommandProbe} = $savedModelProbe
-${function:Get-BridgeCopilotPath} = $savedModelCopilotPath
-$script:BridgeModelCache = $null
+    Reset-FakeCopilot
+    Invoke-FakeRosterProbe
+    $sessionId = Get-FakeSessionId
+    Test-That 'a model the account''s policy has not enabled - Fable, here - is not offered' {
+        $script:RosterModels -notcontains 'claude-fable-5' -and $script:RosterModels -notcontains 'needs-setup' -and
+            $script:RosterModels -notcontains 'future-state' -and $script:RosterModels -contains 'gemini-3.8-flash'
+    } "$($script:RosterError)"
+    Test-That 'nor is one from Microsoft 365 or a BYOK provider, which --model alone cannot reach' {
+        $script:RosterModels.Count -gt 0 -and $script:RosterModels -notcontains 'm365-model' -and
+            $script:RosterModels -notcontains 'ollama/llama3'
+    }
+    Test-That 'what remains keeps the CLI''s order, once each, without IDs unsafe on a command line' {
+        ($script:RosterModels -join ',') -ceq 'auto,claude-opus-5.5,gemini-3.8-flash,grok-4.7'
+    } "$($script:RosterModels -join ',')"
+    Test-That 'the throwaway session loads no hooks, skills or project config and stores nothing' {
+        $create = @($script:RpcCalls | Where-Object { $_.Method -eq 'session.create' })[0].Params
+        $create['hooks'] -eq $false -and $create['enableFileHooks'] -eq $false -and
+            $create['enableConfigDiscovery'] -eq $false -and $create['enableSkills'] -eq $false -and
+            $create['enableSessionStore'] -eq $false -and $create['requestPermission'] -eq $false
+    }
+    Test-That 'one fresh session is created, listed and deleted' {
+        $ids = @($script:RpcCalls | Where-Object { $_.Method -like 'session.*' } | ForEach-Object { [string]$_.Params['sessionId'] })
+        $parsed = [guid]::Empty
+        $ids.Count -eq 3 -and @($ids | Select-Object -Unique).Count -eq 1 -and [guid]::TryParse($ids[0], [ref]$parsed)
+    } "$(Get-FakeRpcMethods)"
+    Test-That 'the CLI runs headless over stdio in a scratch folder, without updating itself, and logs there' {
+        $start = $script:RpcStarts[0]
+        $arguments = @($start.Arguments)
+        $logIndex = [Array]::IndexOf($arguments, '--log-dir')
+        $script:RpcStarts.Count -eq 1 -and $start.Executable -eq 'C:\fake-copilot.exe' -and $start.Existed -and
+            $arguments -contains '--headless' -and $arguments -contains '--stdio' -and $arguments -contains '--no-auto-update' -and
+            $logIndex -ge 0 -and
+            [IO.Path]::GetDirectoryName($arguments[$logIndex + 1]) -eq [IO.Path]::GetDirectoryName($start.WorkingDirectory)
+    }
+    Test-That 'a slow cold start still has most of twenty seconds to answer in' {
+        $connect = @($script:RpcCalls | Where-Object { $_.Method -eq 'connect' })[0]
+        $connect.Remaining -ge 15 -and $connect.Remaining -le 21
+    }
+    Test-That 'afterwards nothing of the throwaway session is left: no lock, no session folder, no scratch folder' {
+        $sessionId -and $script:RpcStops -eq 1 -and
+            -not [IO.File]::Exists([IO.Path]::Combine($script:FakeLocks, "$sessionId.lock")) -and
+            -not [IO.Directory]::Exists([IO.Path]::Combine($script:FakeState, $sessionId)) -and
+            -not [IO.Directory]::Exists([IO.Path]::GetDirectoryName($script:RpcStarts[0].WorkingDirectory))
+    }
+    Test-That 'while other sessions'' locks and folders are left where they were' {
+        [IO.File]::Exists($script:OtherLock) -and [IO.Directory]::Exists($script:EarlierSession)
+    }
+    Test-That 'and Copilot does not look freshly used to the launcher, whose auto choice reads those folder times' {
+        (Get-BridgeCopilotUsage).LastUsed -eq $script:LongAgo
+    } "last used $((Get-BridgeCopilotUsage).LastUsed)"
+
+    Reset-FakeCopilot
+    $script:RpcHandlers.Remove('connect')
+    $script:RpcHandlers['ping'] = { param($Params) @{ message = 'pong'; timestamp = 0 } }
+    Invoke-FakeRosterProbe
+    Test-That 'a CLI too old to know connect is greeted with ping instead' {
+        $null -eq $script:RosterError -and
+            (Get-FakeRpcMethods) -eq 'connect,ping,session.create,session.model.list,session.delete'
+    } "$($script:RosterError) $(Get-FakeRpcMethods)"
+
+    Reset-FakeCopilot
+    $script:RpcHandlers['session.model.list'] = {
+        param($Params) throw (New-FakeRpcError -Code -32603 -Message 'simulated internal error')
+    }
+    Invoke-FakeRosterProbe
+    $sessionId = Get-FakeSessionId
+    Test-That 'a CLI that fails partway still has its session deleted and is stopped once, leaving nothing behind' {
+        $script:RosterError -match 'simulated internal error' -and (Get-FakeRpcMethods) -match 'session\.delete\z' -and
+            $script:RpcStops -eq 1 -and $sessionId -and
+            -not [IO.File]::Exists([IO.Path]::Combine($script:FakeLocks, "$sessionId.lock")) -and
+            -not [IO.Directory]::Exists([IO.Path]::Combine($script:FakeState, $sessionId)) -and
+            (Get-BridgeCopilotUsage).LastUsed -eq $script:LongAgo
+    } "$($script:RosterError)"
+
+    Reset-FakeCopilot
+    $script:RpcHandlers.Remove('session.model.list')
+    Invoke-FakeRosterProbe
+    Test-That 'a CLI without the roster says which version it is and to update it' {
+        $script:RosterError -match 'Copilot CLI 1\.0\.95 cannot list its models' -and $script:RosterError -match 'update it'
+    } "$($script:RosterError)"
+
+    Reset-FakeCopilot
+    $script:RpcHandlers.Remove('connect')
+    $script:RpcHandlers.Remove('session.create')
+    $script:RpcHandlers['ping'] = { param($Params) @{ message = 'pong'; timestamp = 0 } }
+    Invoke-FakeRosterProbe
+    Test-That 'and one too old even to report its version is told the same' {
+        $script:RosterError -match 'this Copilot CLI cannot list its models' -and $script:RosterError -match 'update it'
+    } "$($script:RosterError)"
+
+    Reset-FakeCopilot
+    $script:FakeRoster = @(@{ id = 'claude-fable-5'; policy = @{ state = 'disabled' } }, @{ id = 'ollama/llama3' })
+    Invoke-FakeRosterProbe
+    Test-That 'a roster with nothing usable in it is a failure rather than an empty choice' {
+        $script:RosterError -match 'no usable models'
+    } "$($script:RosterError)"
+
+    Reset-FakeCopilot
+    $script:RpcHandlers['session.model.list'] = { param($Params) @{ models = @('gpt-5.4') } }
+    Invoke-FakeRosterProbe
+    Test-That 'and so is an answer in a shape the bridge does not recognise' {
+        $script:RosterError -match 'without a model list'
+    } "$($script:RosterError)"
+
+    Reset-FakeCopilot
+    $script:FakeExited = $false
+    Invoke-FakeRosterProbe
+    $sessionId = Get-FakeSessionId
+    $runningLock = [IO.Path]::Combine($script:FakeLocks, "$sessionId.lock")
+    Test-That 'the lock of a CLI that could not be stopped is left alone, since it may still be held' {
+        $sessionId -and [IO.File]::Exists($runningLock)
+    }
+    if ($sessionId -and [IO.File]::Exists($runningLock)) { [IO.File]::Delete($runningLock) }
+
+    Reset-FakeCopilot
+    $script:RpcHandlers['session.delete'] = {
+        param($Params) throw (New-FakeRpcError -Code -32603 -Message 'simulated delete failure')
+    }
+    Invoke-FakeRosterProbe
+    $sessionId = Get-FakeSessionId
+    Test-That 'a session the CLI failed to delete is removed once it has exited, and its answer still counts' {
+        $null -eq $script:RosterError -and $script:RosterModels.Count -eq 4 -and $sessionId -and
+            -not [IO.Directory]::Exists([IO.Path]::Combine($script:FakeState, $sessionId)) -and
+            [IO.Directory]::Exists($script:EarlierSession) -and (Get-BridgeCopilotUsage).LastUsed -eq $script:LongAgo
+    } "$($script:RosterError)"
+
+    Reset-FakeCopilot
+    $env:COPILOT_HOME = $emptyModelHome
+    Invoke-FakeRosterProbe
+    $env:COPILOT_HOME = $script:ModelHome
+    Test-That 'where Copilot has never kept a session, the probe leaves no session store to make it look signed in' {
+        $null -eq $script:RosterError -and
+            -not [IO.Directory]::Exists([IO.Path]::Combine($emptyModelHome, 'session-state'))
+    } "$($script:RosterError)"
+
+    # The same restore on its own, against what a real session starting alongside the
+    # probe would leave.
+    $quietFolder = [IO.Path]::Combine($snapshotRoot, 'quiet')
+    $busyFolder = [IO.Path]::Combine($snapshotRoot, 'busy')
+    $freshFolder = [IO.Path]::Combine($snapshotRoot, 'fresh')
+    $claimedFolder = [IO.Path]::Combine($snapshotRoot, 'claimed')
+    foreach ($folder in @($quietFolder, $busyFolder)) {
+        [void][IO.Directory]::CreateDirectory($folder)
+        [IO.File]::WriteAllText([IO.Path]::Combine($folder, 'a'), '')
+        [IO.Directory]::SetLastWriteTimeUtc($folder, $script:LongAgo)
+    }
+    $snapshotError = $null
+    try {
+        $snapshot = Get-BridgeFolderSnapshot -Path @($quietFolder, $busyFolder, $freshFolder, $claimedFolder)
+        foreach ($folder in @($quietFolder, $busyFolder)) { [IO.File]::WriteAllText([IO.Path]::Combine($folder, 'b'), '') }
+        [IO.File]::Delete([IO.Path]::Combine($quietFolder, 'b'))
+        [void][IO.Directory]::CreateDirectory($freshFolder)
+        [void][IO.Directory]::CreateDirectory($claimedFolder)
+        [IO.File]::WriteAllText([IO.Path]::Combine($claimedFolder, 'c'), '')
+        Restore-BridgeFolderSnapshot -Snapshot $snapshot
+    }
+    catch { $snapshotError = $_.Exception.Message }
+    Test-That 'a folder whose entries end up as they were gets its old time back' {
+        $null -eq $snapshotError -and [IO.Directory]::GetLastWriteTimeUtc($quietFolder) -eq $script:LongAgo
+    } "$snapshotError"
+    Test-That 'one that gained an entry meanwhile keeps its new time, since that activity was real' {
+        $null -eq $snapshotError -and [IO.Directory]::GetLastWriteTimeUtc($busyFolder) -gt $script:LongAgo
+    }
+    Test-That 'a folder the probe created is removed again while it is empty' {
+        $null -eq $snapshotError -and -not [IO.Directory]::Exists($freshFolder)
+    }
+    Test-That 'but kept once something else has put files in it' {
+        $null -eq $snapshotError -and [IO.File]::Exists([IO.Path]::Combine($claimedFolder, 'c'))
+    }
+
+    # The cache in front of it. Every refresh costs a throwaway session, so an answer
+    # is kept for hours; a failure keeps the last good list and retries, backing off.
+    $script:RosterCalls = 0
+    $script:RosterPath = ''
+    $script:RosterResult = @('auto', 'test-model')
+    $script:RosterFailure = $null
+    function Get-BridgeCopilotModelRoster {
+        param([string]$Path, [int]$TimeoutMs = 20000)
+        $script:RosterCalls++
+        $script:RosterPath = $Path
+        if ($script:RosterFailure) { throw $script:RosterFailure }
+        $script:RosterResult
+    }
+    function Get-LastModelLog {
+        if (-not (Test-Path -LiteralPath $script:testLogFile)) { return '' }
+        [string](@(Get-Content -LiteralPath $script:testLogFile | Where-Object { $_ -match 'Copilot model discovery' }) |
+                Select-Object -Last 1)
+    }
+    function Get-LastModelRetry { [int][regex]::Match((Get-LastModelLog), 'retrying in (\d+)s').Groups[1].Value }
+
+    $script:FakeSettings = @{}
+    $script:BridgeModelCache = $null
+    Test-That 'a cold start asks the CLI once and offers what it answers' {
+        (@(Get-BridgeCopilotModelList) -join ',') -eq 'auto,test-model' -and $script:RosterCalls -eq 1 -and
+            $script:RosterPath -eq 'C:\fake-copilot.exe'
+    }
+    $script:BridgeModelCache.At = [DateTimeOffset]::Now.AddHours(-5)
+    Test-That 'the answer is reused for hours rather than costing a session every reconcile' {
+        (@(Get-BridgeCopilotModelList) -join ',') -eq 'auto,test-model' -and $script:RosterCalls -eq 1
+    }
+    $script:BridgeModelCache.At = [DateTimeOffset]::Now.AddHours(-6).AddSeconds(-1)
+    [void](Get-BridgeCopilotModelList)
+    Test-That 'and asked for again after six' { $script:RosterCalls -eq 2 }
+
+    $script:RosterFailure = 'simulated roster failure'
+    $script:BridgeModelCache.At = [DateTimeOffset]::Now.AddHours(-7)
+    $keptModels = @(Get-BridgeCopilotModelList)
+    Test-That 'a failed refresh keeps the last good list and logs why' {
+        ($keptModels -join ',') -eq 'auto,test-model' -and
+            (Get-LastModelLog) -match "failed for 'C:\\fake-copilot\.exe': simulated roster failure\. Keeping 2 cached model\(s\); retrying in 60s"
+    } "$(Get-LastModelLog)"
+    $modelCalls = $script:RosterCalls
+    Test-That 'selector reads after a failure do not ask again before the retry is due' {
+        ((Get-BridgeTuningOptions -Launcher 'agency' -Axis 'model') -join ',') -eq 'Agent default,auto,test-model' -and
+            $script:RosterCalls -eq $modelCalls
+    }
+    $retryWaits = foreach ($attempt in 1..6) {
+        $script:BridgeModelCache.At = [DateTimeOffset]::Now.AddSeconds(-(Get-LastModelRetry) - 1)
+        [void](Get-BridgeCopilotModelList)
+        Get-LastModelRetry
+    }
+    Test-That 'repeated failures back off, doubling up to half an hour, and keep the list throughout' {
+        ($retryWaits -join ',') -eq '120,240,480,960,1800,1800' -and
+            (@(Get-BridgeCopilotModelList) -join ',') -eq 'auto,test-model'
+    } "waits $($retryWaits -join ',')"
+    $modelCalls = $script:RosterCalls
+    $script:BridgeModelCache.At = [DateTimeOffset]::Now.AddSeconds(-1700)
+    [void](Get-BridgeCopilotModelList)
+    Test-That 'and a backed-off failure is not retried before its wait is up' { $script:RosterCalls -eq $modelCalls }
+
+    $script:RosterFailure = $null
+    $script:BridgeModelCache.At = [DateTimeOffset]::Now.AddSeconds(-1801)
+    $recoveredModels = @(Get-BridgeCopilotModelList)
+    Test-That 'recovery is logged' {
+        ($recoveredModels -join ',') -eq 'auto,test-model' -and (Get-LastModelLog) -match 'recovered: found 2 model\(s\)'
+    } "$(Get-LastModelLog)"
+    $script:RosterFailure = 'simulated roster failure'
+    $script:BridgeModelCache.At = [DateTimeOffset]::Now.AddHours(-7)
+    [void](Get-BridgeCopilotModelList)
+    Test-That 'and resets the back-off, so the next failure retries after a minute again' {
+        (Get-LastModelRetry) -eq 60
+    } "$(Get-LastModelLog)"
+
+    $script:BridgeModelCache = $null
+    $coldChoices = @(Get-BridgeTuningOptions -Launcher 'copilot' -Axis 'model')
+    Test-That 'a failure with nothing cached still offers Agent default and auto, and says so' {
+        ($coldChoices -join ',') -eq 'Agent default,auto' -and
+            (Get-LastModelLog) -match 'Keeping 0 cached model\(s\); retrying in 60s'
+    } "$(Get-LastModelLog)"
+
+    $script:RosterFailure = $null
+    $script:BridgeModelCache = $null
+    [void](Get-BridgeCopilotModelList)
+    $script:RosterResult = @('auto', 'updated-model')
+    $script:BridgeModelCache.At = [DateTimeOffset]::Now.AddHours(-7)
+    Test-That 'a refresh replaces the list rather than keeping models the account has since lost' {
+        ((Get-BridgeTuningOptions -Launcher 'copilot' -Axis 'model') -join ',') -eq 'Agent default,auto,updated-model'
+    }
+
+    $savedModelDiscoverer = $script:BridgeLauncherTuning.copilot.model.Discover
+    try {
+        $script:BridgeLauncherTuning.copilot.model.Discover = { throw 'unexpected discovery failure' }
+        Test-That 'an unexpected discoverer failure is not hidden by another silent catch' {
+            try { [void](Get-BridgeTuningOptions -Launcher 'copilot' -Axis 'model'); $false }
+            catch { $_.Exception.Message -eq 'unexpected discovery failure' }
+        }
+    }
+    finally { $script:BridgeLauncherTuning.copilot.model.Discover = $savedModelDiscoverer }
+}
+finally {
+    $env:COPILOT_HOME = $savedModelCopilotHome
+    foreach ($folder in @($script:ModelHome, $emptyModelHome, $snapshotRoot)) {
+        Remove-Item -LiteralPath $folder -Recurse -Force -ErrorAction SilentlyContinue
+    }
+    ${function:Get-BridgeCopilotPath} = $savedModelCopilotPath
+    ${function:Start-BridgeJsonRpcProcess} = $savedRpcStart
+    ${function:Invoke-BridgeJsonRpcRequest} = $savedRpcInvoke
+    ${function:Stop-BridgeJsonRpcProcess} = $savedRpcStop
+    ${function:Get-BridgeCopilotModelRoster} = $savedModelRoster
+    $script:BridgeModelCache = $null
+}
 
 # Three per-launch settings, spelled differently by every agent: Copilot has
 # --reasoning-effort and --context, Claude has --effort and (having no real context
@@ -688,8 +968,8 @@ $script:BridgeModelCache = $null
 # checked against the installed CLI, which rejects a bad value outright, so the option
 # lists here are what those parsers actually accept.
 #
-# Discovery is shadowed throughout: the real one shells out to `copilot help config`,
-# which is neither offline nor stable enough to assert on.
+# Discovery is shadowed throughout: the real one holds a throwaway session with the
+# Copilot CLI, which is neither offline nor stable enough to assert on.
 function Get-BridgeCopilotModelList { @('gpt-5.4', 'claude-opus-5') }
 
 $script:FakeSettings = @{}
