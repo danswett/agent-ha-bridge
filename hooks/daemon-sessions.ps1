@@ -8,7 +8,8 @@
     declaring the shared $script: state; see docs/daemon-split.md.
     Shared state it changes: DaemonDashboardSignature, DaemonEntityRestore,
     DaemonGlobalLastPublish, DaemonGlobalSignature, DaemonLive,
-    DaemonOnlineLastPublish, DaemonPayloadSensorChecked, DaemonPendingRetire,
+    DaemonOnlineLastPublish, DaemonOnlineRepairGivenUp, DaemonOnlineRepairs,
+    DaemonOnlineReporting, DaemonPayloadSensorChecked, DaemonPendingRetire,
     DaemonVerbose.
 #>
 
@@ -1516,6 +1517,15 @@ function Confirm-DaemonOnlineHeartbeat {
         would fire early on a daemon whose passes outrun its own heartbeat. So: silent
         for the window Home Assistant was itself supposed to expire it in, *and* seen
         to be silent on three separate beats.
+
+        And a rebuild is tried only so many times. Retracting and redeclaring the
+        sensor makes it unavailable for a moment, which takes its machine's cards off
+        the dashboard with it, so a rebuild that does not hold is not free to repeat.
+        It restores reception for the beat the repair sends itself and nothing after
+        it, so on 1.33.15 every machine flapped on a five-minute cycle without end
+        (#202). After DetachedEntityRepairLimit attempts the daemon stops, says so
+        once, and leaves the sensor alone: still wrong, but no longer flickering, and
+        the log names the topic Home Assistant stopped listening to.
     #>
     param([Parameter(Mandatory)][hashtable]$Headers)
 
@@ -1545,9 +1555,20 @@ function Confirm-DaemonOnlineHeartbeat {
 
     if ($script:DaemonOnlineSeen.At -eq [DateTimeOffset]::MinValue -or
         $reported -cne [string]$script:DaemonOnlineSeen.Reported) {
+        # Moving again - but one move is not recovery. A rebuild publishes a beat of
+        # its own the moment the sensor is back, and that beat lands; the next one, on
+        # the ordinary cadence, does not. Counting that single move as health reset the
+        # attempt counter on every cycle, which is what let the rebuild repeat for ever
+        # (#202). Two passes running means beats are arriving on their own.
+        $script:DaemonOnlineReporting = [int]$script:DaemonOnlineReporting + 1
+        if ([int]$script:DaemonOnlineReporting -ge 2) {
+            $script:DaemonOnlineRepairs = 0
+            $script:DaemonOnlineRepairGivenUp = $false
+        }
         $script:DaemonOnlineSeen = @{ Reported = $reported; At = $now; Unanswered = 0 }
         return
     }
+    $script:DaemonOnlineReporting = 0
     $unanswered = [int]$script:DaemonOnlineSeen.Unanswered + 1
     $silentSince = [DateTimeOffset]$script:DaemonOnlineSeen.At
     $script:DaemonOnlineSeen = @{ Reported = $reported; At = $silentSince; Unanswered = $unanswered }
@@ -1560,6 +1581,22 @@ function Confirm-DaemonOnlineHeartbeat {
     # A fresh window whether or not the rebuild works. One that does not take must not
     # repeat on every beat, and one that does is proved by the next read, not by this.
     $script:DaemonOnlineSeen = @{ Reported = $reported; At = $now; Unanswered = 0 }
+    if ([int]$script:DaemonOnlineRepairs -ge $script:DaemonConfig.DetachedEntityRepairLimit) {
+        # Said once, not every window: the condition persists and the point of stopping
+        # was to stop making noise about it. Naming the topic matters because that is
+        # what Home Assistant is no longer subscribed to, and restarting its MQTT
+        # integration is what resubscribes it - the daemon cannot do it from here.
+        if (-not $script:DaemonOnlineRepairGivenUp) {
+            $script:DaemonOnlineRepairGivenUp = $true
+            Write-DaemonLog -Message ("$entityId has ignored " +
+                "$($script:DaemonConfig.DetachedEntityRepairLimit) rebuilds; leaving it alone rather " +
+                "than flapping it. Home Assistant is not listening to " +
+                "$(Get-CopilotMqttMachineTopicRoot -Slug $script:DaemonMachineSlug)/online/state - " +
+                'reload its MQTT integration to resubscribe it.')
+        }
+        return
+    }
+    $script:DaemonOnlineRepairs = [int]$script:DaemonOnlineRepairs + 1
     Write-DaemonLog -Message "$entityId has taken no beat for ${stalled}s; rebuilding it"
     try {
         Publish-CopilotMqttMachineOnlineConfig -Headers $Headers `

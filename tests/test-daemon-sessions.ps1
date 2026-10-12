@@ -897,6 +897,56 @@ $script:DaemonOnlineReported = 'advancing'
 $script:DaemonOnlineSeen = @{ Reported = ''; At = [DateTimeOffset]::MinValue; Unanswered = 0 }
 $script:Log = @()
 
+# A rebuild that does not hold must not repeat for ever. Retracting and redeclaring the
+# sensor takes it to unavailable for a moment, and every card conditioned on that
+# machine goes with it, so on 1.33.15 all four machines' session cards blinked off the
+# dashboard every five minutes. Measured on DSWETT-DEV-VM1: 99 rebuilds in eight hours,
+# 57 unavailable episodes in a window that had none before the update. The repair gets
+# the beat it sends itself accepted and nothing after it, so it never converges. (#202)
+$script:ReportingMessages.Clear()
+$script:Log = @()
+$script:DaemonOnlineSeen = @{ Reported = ''; At = [DateTimeOffset]::MinValue; Unanswered = 0 }
+$script:DaemonOnlineRepairs = 0
+$script:DaemonOnlineReporting = 0
+$script:DaemonOnlineRepairGivenUp = $false
+$script:DaemonOnlineReported = '2026-10-11T15:46:56.000000-07:00'
+1..24 | ForEach-Object { Invoke-TestOnlineBeat }
+Test-That 'a sensor that ignores every rebuild is rebuilt only so many times, not for ever' {
+    (Get-TestOnlineRetractionCount) -eq $script:DaemonConfig.DetachedEntityRepairLimit
+} "retractions=$(Get-TestOnlineRetractionCount) over 24 beats"
+Test-That 'and the daemon says once that it has stopped, naming the topic nothing is listening to' {
+    @($script:Log | Where-Object { $_ -clike "$($script:DaemonOnlineEntity) has ignored * rebuilds; leaving it alone*" }).Count -eq 1 -and
+        @($script:Log | Where-Object { $_ -clike "*$(Get-CopilotMqttMachineTopicRoot -Slug $script:DaemonMachineSlug)/online/state*" }).Count -eq 1
+} (($script:Log | Select-Object -Last 2) -join ' | ')
+Test-That 'while the beats themselves keep going out, since giving up repairing is not giving up reporting' {
+    (Get-TestOnlineBeatCount) -ge 24
+} "beats=$(Get-TestOnlineBeatCount)"
+
+# One move is not recovery: the rebuild's own beat always lands, so treating a single
+# advance as health reset the counter on every cycle and the cap would never be reached.
+$script:ReportingMessages.Clear()
+$script:Log = @()
+$script:DaemonOnlineReported = 'advancing'
+1..2 | ForEach-Object { Invoke-TestOnlineBeat }
+Test-That 'a sensor that starts taking its beats again earns another repair later' {
+    $script:DaemonOnlineRepairs -eq 0 -and -not $script:DaemonOnlineRepairGivenUp
+} "repairs=$($script:DaemonOnlineRepairs) givenUp=$($script:DaemonOnlineRepairGivenUp)"
+
+$script:ReportingMessages.Clear()
+$script:Log = @()
+$script:DaemonOnlineReported = '2026-10-11T16:00:00.000000-07:00'
+1..24 | ForEach-Object { Invoke-TestOnlineBeat }
+Test-That 'and having recovered, it is repaired afresh rather than staying given up on' {
+    (Get-TestOnlineRetractionCount) -eq $script:DaemonConfig.DetachedEntityRepairLimit
+} "retractions=$(Get-TestOnlineRetractionCount)"
+
+$script:DaemonOnlineReported = 'advancing'
+$script:DaemonOnlineSeen = @{ Reported = ''; At = [DateTimeOffset]::MinValue; Unanswered = 0 }
+$script:DaemonOnlineRepairs = 0
+$script:DaemonOnlineReporting = 0
+$script:DaemonOnlineRepairGivenUp = $false
+$script:Log = @()
+
 Write-Host ''
 Write-Host '--- a live session whose entities were torn down ---'
 # On 2026-10-07 session 69e33875 was alive, working and correctly discovered; its Home
