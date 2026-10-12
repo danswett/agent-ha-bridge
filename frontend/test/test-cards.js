@@ -2428,7 +2428,7 @@ async function checkOtherRow() {
   const FIELD = 'select.agent_bridge_abc_f1';
 
   let seq = 0;
-  function armed({ typed = '', takesTyped = true, tapAnswers = false, chosen = 'Choose...', onField = true } = {}) {
+  function armed({ typed = '', takesTyped = true, tapAnswers = false, chosen = 'Choose...', onField = true, rejectSelect = false } = {}) {
     const replyTopic = `${TOPIC}/${++seq}`;
     const calls = [];
     const attributes = { decision_id: 'd1' };
@@ -2448,6 +2448,7 @@ async function checkOtherRow() {
       states,
       callService: (domain, service, data) => {
         calls.push({ domain, service, data });
+        if (domain === 'select' && rejectSelect) { return Promise.reject(new Error('refused')); }
         if (domain === 'select') { states[data.entity_id].state = data.option; }
         return Promise.resolve();
       },
@@ -2516,6 +2517,28 @@ async function checkOtherRow() {
   check('so the daemon reads no chosen option and takes the words instead',
     !row(m.choices, 'SQLite').classList.contains('chosen'));
   check('and Other is what is ticked', row(m.choices, OTHER).classList.contains('chosen'));
+
+  // The write that clears the slot can be refused. Leaving Other ticked beside the
+  // option it failed to clear read as two answers at once, with Send live and the
+  // form reading as complete - and sending then published the words while
+  // Read-DaemonFormAnswer, seeing a chosen slot, would not take them as the answer.
+  m = armed({ chosen: 'SQLite', typed: 'DuckDB, actually', rejectSelect: true });
+  row(m.choices, OTHER).click();
+  await flush();
+  m.update();
+  check('a refused clear takes Other back off, rather than showing two answers at once',
+    !row(m.choices, OTHER).classList.contains('chosen'));
+  check('leaving the option that is really there, which is what the daemon would read',
+    row(m.choices, 'SQLite').classList.contains('chosen') && m.states[FIELD].state === 'SQLite',
+    m.states[FIELD].state);
+  check('and saying Home Assistant would not take it',
+    rows(m.choices).some((r) => r.classList.contains('err') && /would not take/i.test(r.textContent)),
+    rows(m.choices).map((r) => r.textContent).join('|'));
+  m.calls.length = 0;
+  row(m.choices, 'Send answer').click();
+  await flush();
+  check('so Send is the ordinary press for the option on screen, not a typed answer',
+    m.calls.map((c) => c.domain).join(',') === 'button', m.calls.map((c) => c.domain).join(','));
 
   // The way back. Leaving Other ticked beside a picked option would send the box's
   // words over the option just tapped.

@@ -1748,6 +1748,21 @@ class AgentBridgeChoicesCard extends HTMLElement {
       if (!seen || this._pending[g.entityId] || this._inflight[g.entityId]) { return false; }
       return seen.value !== g.state;
     });
+
+    // "Other" means no option is chosen, so a settled slot that is holding one says
+    // this card is no longer describing the question: the pick cannot survive that.
+    //
+    // The write that clears the slot can be refused. _failPending drops it and says
+    // so, which left Other ticked beside the option it had failed to clear, Send live
+    // and the form reading as complete - and sending then published the words while
+    // Read-DaemonFormAnswer, seeing a chosen slot, would not take them as the answer.
+    // Settled is what is tested, not merely non-empty: a slot being cleared for Other
+    // carries the placeholder as its pending value, which is not '' either.
+    if (this._other && typedGroup && !this._pending[typedGroup.entityId] &&
+        !this._inflight[typedGroup.entityId] && typedGroup.chosen !== '') {
+      this._other = false;
+      this._otherAt = '';
+    }
     const waiting = Object.keys(this._pending).length > 0 || Object.keys(this._inflight).length > 0;
     if (!waiting && this._note === CHOICE_SAVING_NOTE) { this._note = ''; }
     if (waiting && !this._note) { this._note = CHOICE_SAVING_NOTE; }
