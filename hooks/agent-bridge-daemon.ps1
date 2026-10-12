@@ -132,6 +132,15 @@ $script:DaemonConfig = @{
     # long ago and exactly one read since, taken before its first beat could finish its
     # trip through the broker - which rebuilt a perfectly healthy sensor.
     DetachedEntityBeats = 3
+    # How many times in a row a sensor will be rebuilt before the daemon stops trying.
+    # The repair restores reception for exactly the beat it sends itself and nothing
+    # after it, so on 1.33.15 every machine's liveness sensor was retracted and
+    # declared again every five minutes without end - flashing unavailable each time,
+    # and taking its machine's session cards off the dashboard with it (#202). A repair
+    # that has not held after three attempts is not repairing anything, and repeating
+    # it for ever is worse than the stall it is answering: a stalled sensor reads `on`
+    # and is merely wrong, while this one is wrong *and* flickers.
+    DetachedEntityRepairLimit = 3
     # MCP-client presence changes slowly and only affects rendering (the MCP server
     # owns its own decision entities), so its full /api/states discovery scan is cached
     # for this long rather than repeated on every reconcile.
@@ -265,6 +274,14 @@ $script:DaemonOnlineLastPublish = [DateTimeOffset]::MinValue
 # At means nothing has been observed yet, which is distinct from having observed an
 # entity that is not there.
 $script:DaemonOnlineSeen = @{ Reported = ''; At = [DateTimeOffset]::MinValue; Unanswered = 0 }
+# How many rebuilds in a row the online sensor has ignored, how many passes running it
+# has been seen to report, and whether the daemon has given up rebuilding it and said
+# so. Separate from DaemonOnlineSeen because that hashtable is rebuilt wholesale on
+# every pass, and a counter that resets with it counts nothing. Initialised for
+# StrictMode.
+$script:DaemonOnlineRepairs = 0
+$script:DaemonOnlineReporting = 0
+$script:DaemonOnlineRepairGivenUp = $false
 
 # Short-lived cache of the MCP-client discovery scan (a full /api/states read) and
 # a consecutive-failure counter for the WebSocket watch backoff. Initialised for
