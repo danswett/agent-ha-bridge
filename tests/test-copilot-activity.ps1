@@ -818,11 +818,13 @@ Write-Host '--- how many times the conversation has been compacted ---'
 # changing: the summary replaces the history, the session carries straight on, and
 # nothing it says afterwards is evidence of what was lost.
 #
-# Copilot writes a start for every attempt and a completion carrying `success`. In one
-# real 216 MB transcript 225 starts produced 6 compactions that happened and 219
-# failures ("automatic compaction summarizer did not settle within 300s"), so a reader
-# that counted starts - or completions without reading success - would have claimed
-# that session had lost its history thirty-seven times over.
+# Counted from the transcript's bytes rather than from the batch the reader hands
+# back, because the reader takes a capped tail and a total cannot afford a skipped
+# record. Copilot writes a start for every attempt and a completion carrying
+# `success`. In one real 216 MB transcript 225 starts produced 6 compactions that
+# happened and 219 failures ("automatic compaction summarizer did not settle within
+# 300s"), so a reader that counted starts - or completions without reading success -
+# would have claimed that session had lost its history thirty-seven times over.
 function New-CompactionStart { (@{ type = 'session.compaction_start'; data = @{ currentTokens = 841305; tokenLimit = 1050000; trigger = 'threshold' } } | ConvertTo-Json -Depth 5 -Compress) }
 function New-CompactionDone {
     param([bool]$Success, [string]$Summary = '')
@@ -831,75 +833,133 @@ function New-CompactionDone {
     (@{ type = 'session.compaction_complete'; data = $data } | ConvertTo-Json -Depth 5 -Compress)
 }
 
-$activity = Get-ActivityFromEvents -Lines @((New-CompactionStart), (New-CompactionDone -Success $true)) -VerboseMode $true
-Test-That 'a compaction that finished is counted' { $activity.Compactions -eq 1 }
-$activity = Get-ActivityFromEvents -Lines @((New-CompactionStart), (New-CompactionDone -Success $false)) -VerboseMode $true
-Test-That 'one that gave up is not, because nothing happened to the conversation' { $activity.Compactions -eq 0 }
-$activity = Get-ActivityFromEvents -Lines @((New-CompactionStart)) -VerboseMode $true
-Test-That 'and an attempt still running counts for nothing yet' { $activity.Compactions -eq 0 }
-$activity = Get-ActivityFromEvents -Lines @(
-    (New-CompactionDone -Success $true), (New-Reply 'carrying on'), (New-CompactionDone -Success $true)) -VerboseMode $true
-Test-That 'two in one batch are two' { $activity.Compactions -eq 2 }
-Test-That 'and the rest of the batch is read exactly as it was' { $activity.Response -eq 'carrying on' }
-$activity = Get-ActivityFromEvents -Lines @((New-Reply 'nothing to do with compaction')) -VerboseMode $true
-Test-That 'a batch with none reports none, not nothing' { $activity.Compactions -eq 0 }
-
-# The summary a compaction writes is the model's own prose about the session, and a
-# session about this bridge quotes the event's own shape back. Matching on the text
-# '"success":true' would then count a failure as a compaction.
-$quoting = New-CompactionDone -Success $false
-$quoting = $quoting -replace 'pending summary discarded', 'pending summary discarded while reading {\"success\":true}'
-$activity = Get-ActivityFromEvents -Lines @($quoting) -VerboseMode $true
-Test-That 'a failure whose text quotes a success is still a failure' { $activity.Compactions -eq 0 }
-
-Write-Host ''
-Write-Host '--- what a session had been through before the bridge saw it ---'
-# A session the daemon merely found is read from the end of its transcript, because
-# what was said before is not news. A total is the exception: start it at adoption and
-# every long-running session - the ones most likely to have been compacted, and most
-# likely to be met part-way through - claims it has never been compacted at all.
 $script:CompactionScratch = Join-Path ([IO.Path]::GetTempPath()) "compactions-$([guid]::NewGuid().ToString('N').Substring(0, 8))"
 New-Item -ItemType Directory -Path $script:CompactionScratch -Force | Out-Null
+function New-CompactionFile {
+    param([string[]]$Lines, [string]$Name = "events-$([guid]::NewGuid().ToString('N').Substring(0, 8)).jsonl")
+    $path = Join-Path $script:CompactionScratch $Name
+    [IO.File]::WriteAllText($path, (($Lines -join "`n") + "`n"))
+    $path
+}
 try {
-    $history = Join-Path $script:CompactionScratch 'events.jsonl'
-    [IO.File]::WriteAllLines($history, @(
-        (New-Reply 'first'), (New-CompactionStart), (New-CompactionDone -Success $true -Summary 'what happened so far'),
-        (New-Reply 'second'), (New-CompactionStart), (New-CompactionDone -Success $false),
-        (New-CompactionStart), (New-CompactionDone -Success $true), (New-Reply 'third')))
-
-    Test-That 'the whole transcript is counted, not its tail' {
-        (Measure-CopilotTranscriptCompaction -Path $history) -eq 2
-    } "count=$(Measure-CopilotTranscriptCompaction -Path $history)"
-    Test-That 'through the dispatcher, for whichever agent the session belongs to' {
-        (Get-BridgeTranscriptCompactionCount -Path $history -Kind 'copilot') -eq 2
+    $one = New-CompactionFile @((New-CompactionStart), (New-CompactionDone -Success $true -Summary 'what happened so far'))
+    Test-That 'a compaction that finished is counted' {
+        (Measure-CopilotTranscriptCompaction -Path $one).Count -eq 1
     }
+    $failed = New-CompactionFile @((New-CompactionStart), (New-CompactionDone -Success $false))
+    Test-That 'one that gave up is not, because nothing happened to the conversation' {
+        (Measure-CopilotTranscriptCompaction -Path $failed).Count -eq 0
+    }
+    $running = New-CompactionFile @((New-CompactionStart))
+    Test-That 'and an attempt still running counts for nothing yet' {
+        (Measure-CopilotTranscriptCompaction -Path $running).Count -eq 0
+    }
+    $mixed = New-CompactionFile @(
+        (New-Reply 'first'), (New-CompactionStart), (New-CompactionDone -Success $true -Summary 'the story so far'),
+        (New-Reply 'second'), (New-CompactionStart), (New-CompactionDone -Success $false),
+        (New-CompactionStart), (New-CompactionDone -Success $true), (New-Reply 'third'))
+    Test-That 'a transcript with both kinds counts only the ones that happened' {
+        (Measure-CopilotTranscriptCompaction -Path $mixed).Count -eq 2
+    } "count=$((Measure-CopilotTranscriptCompaction -Path $mixed).Count)"
+    Test-That 'and reports reading through the whole of it' {
+        (Measure-CopilotTranscriptCompaction -Path $mixed).Through -eq (Get-Item $mixed).Length
+    }
+    $ordinary = New-CompactionFile @((New-Reply 'nothing to do with compaction'))
+    Test-That 'a transcript with none reports none, and says it read it' {
+        $r = Measure-CopilotTranscriptCompaction -Path $ordinary
+        $r.Count -eq 0 -and $r.Known
+    }
+
+    # The summary a compaction writes is the model's own prose about the session, and
+    # a session about this bridge quotes the event's own shape back. Matching on the
+    # text '"success":true' would then count a failure as a compaction.
+    $quoting = (New-CompactionDone -Success $false) -replace 'pending summary discarded',
+        'pending summary discarded while reading {\"success\":true}'
+    Test-That 'a failure whose text quotes a success is still a failure' {
+        (Measure-CopilotTranscriptCompaction -Path (New-CompactionFile @($quoting))).Count -eq 0
+    }
+
+    Write-Host ''
+    Write-Host '--- counted by byte range, so nothing is counted twice or missed ---'
+    # The reader takes a capped tail from wherever the last pass stopped, so the count
+    # is taken from the bytes between what it has already accounted for and where the
+    # reader has now got to. A range is scanned exactly once, whatever the reader did
+    # with it.
+    $half = (Get-Item $mixed).Length
+    $prefix = @((New-Reply 'first'), (New-CompactionStart), (New-CompactionDone -Success $true -Summary 'the story so far'))
+    $prefixBytes = [Text.Encoding]::UTF8.GetByteCount((($prefix -join "`n") + "`n"))
+    Test-That 'a range stopping after the first compaction counts only that one' {
+        (Measure-CopilotTranscriptCompaction -Path $mixed -Through $prefixBytes).Count -eq 1
+    } "count=$((Measure-CopilotTranscriptCompaction -Path $mixed -Through $prefixBytes).Count)"
+    Test-That 'and the rest of the file counts the other one, so the two do not overlap' {
+        (Measure-CopilotTranscriptCompaction -Path $mixed -From $prefixBytes).Count -eq 1
+    } "count=$((Measure-CopilotTranscriptCompaction -Path $mixed -From $prefixBytes).Count)"
+    Test-That 'a range already behind the cursor is no work and no count' {
+        $r = Measure-CopilotTranscriptCompaction -Path $mixed -From $half -Through $half
+        $r.Count -eq 0 -and $r.Known -and $r.Through -eq $half
+    }
+
+    # A record still being written is left whole for the next pass rather than parsed
+    # in half: Through stops at the last complete line, so the scan resumes there.
+    $partial = New-CompactionFile @((New-Reply 'first'), (New-CompactionDone -Success $true))
+    $complete = (Get-Item $partial).Length
+    [IO.File]::AppendAllText($partial, '{"type":"session.compaction_comp')
+    $torn = Measure-CopilotTranscriptCompaction -Path $partial
+    Test-That 'a half-written record stops the scan at the last whole line' {
+        $torn.Through -eq $complete -and $torn.Count -eq 1
+    } "through=$($torn.Through) of $complete count=$($torn.Count)"
+    [IO.File]::AppendAllText($partial, ('lete","data":{"success":true}}' + "`n"))
+    $finished = Measure-CopilotTranscriptCompaction -Path $partial -From $torn.Through
+    Test-That 'and it is counted once it is whole, from where the last scan stopped' {
+        $finished.Count -eq 1
+    } "count=$($finished.Count)"
+
+    # One record longer than the window the walk reads in. A tool result that returned
+    # a file does this, and a walk that could not get past it would stall for ever.
+    $long = New-CompactionFile @(
+        (New-Reply ('x' * 300000)), (New-CompactionDone -Success $true), (New-Reply 'after'))
+    $walked = Measure-CopilotTranscriptCompaction -Path $long -ChunkBytes 65536
+    Test-That 'a record longer than the walk''s window does not stall it' {
+        $walked.Known -and $walked.Count -eq 1 -and $walked.Through -eq (Get-Item $long).Length
+    } "known=$($walked.Known) count=$($walked.Count) through=$($walked.Through) of $((Get-Item $long).Length)"
+
+    Write-Host ''
+    Write-Host '--- a transcript that cannot be read is not a transcript with nothing in it ---'
+    # Accepting zero would be worse than saying nothing: the caller would move its
+    # cursor past a history it never read, and the count would stay wrong for the rest
+    # of the session.
+    $absent = Measure-CopilotTranscriptCompaction -Path (Join-Path $script:CompactionScratch 'absent.jsonl')
     Test-That 'a session whose transcript is not written yet has been through nothing' {
-        (Measure-CopilotTranscriptCompaction -Path (Join-Path $script:CompactionScratch 'absent.jsonl')) -eq 0
+        $absent.Count -eq 0 -and $absent.Known
     }
     Test-That 'and neither has one with no transcript at all' {
-        (Measure-CopilotTranscriptCompaction -Path '') -eq 0
+        (Measure-CopilotTranscriptCompaction -Path '').Known
+    }
+    Test-That 'through the dispatcher, for whichever agent the session belongs to' {
+        (Get-BridgeTranscriptCompactionCount -Path $mixed -Kind 'copilot').Count -eq 2
     }
     # Codex auto-compacts too, but what its rollout writes has not been read from a
     # running Codex - so it says nothing rather than scanning a rollout for a Copilot
-    # marker it cannot contain.
+    # marker it cannot contain. Known, because that is its settled answer: a caller
+    # that treated it as a failed read would retry it on every pass for ever.
+    $codex = Get-BridgeTranscriptCompactionCount -Path $mixed -Kind 'codex' -From 0 -Through $half
     Test-That 'Codex reports none rather than guessing at a marker nobody has verified' {
-        (Get-BridgeTranscriptCompactionCount -Path $history -Kind 'codex') -eq 0
+        $codex.Count -eq 0 -and $codex.Known -and $codex.Through -eq $half
     }
-}
-finally {
-    Remove-Item -LiteralPath $script:CompactionScratch -Recurse -Force -ErrorAction SilentlyContinue
-}
 
-Write-Host ''
-Write-Host '--- the count on the card ---'
-$script:StatusPublishes = @()
-function Set-CopilotMqttActivity { param($SessionId, $Summary, $Detail, $Headers) $script:Published = $Detail }
-function Set-CopilotMqttStatus { param($SessionId, $Status, $Headers, $Attributes) $script:StatusPublishes += [pscustomobject]@{ Status = $Status; Attributes = $Attributes } }
-function Write-DaemonLog { param([string]$Message) }
+    Write-Host ''
+    Write-Host '--- the count on the card ---'
+    $script:StatusPublishes = @()
+    function Set-CopilotMqttActivity { param($SessionId, $Summary, $Detail, $Headers) $script:Published = $Detail }
+    function Set-CopilotMqttStatus { param($SessionId, $Status, $Headers, $Attributes) $script:StatusPublishes += [pscustomobject]@{ Status = $Status; Attributes = $Attributes } }
+    function Write-DaemonLog { param([string]$Message) }
 
-$compactLog = Join-Path ([IO.Path]::GetTempPath()) "compaction-card-$([guid]::NewGuid().ToString('N')).jsonl"
-try {
-    $entry = [pscustomobject]@{ Offset = 0; Name = 'Copilot: long one'; Machine = 'DESK'; Status = 'working'; Kind = 'copilot'; Compactions = 3 }
+    $compactLog = Join-Path $script:CompactionScratch 'card.jsonl'
+    [IO.File]::WriteAllText($compactLog, '')
+    $entry = [pscustomobject]@{
+        Offset = 0; Name = 'Copilot: long one'; Machine = 'DESK'; Status = 'working'; Kind = 'copilot'
+        Compactions = 3; CompactionsThrough = [long]0
+    }
     $session = [pscustomobject]@{ SessionId = 's'; Transcript = $compactLog; ProcessId = 1 }
     function StepCompaction { param([string[]]$Lines)
         Add-Content -LiteralPath $compactLog -Value $Lines -Encoding utf8
@@ -916,6 +976,9 @@ try {
     $script:StatusPublishes = @()
     StepCompaction -Lines @((New-CompactionStart), (New-CompactionDone -Success $true), (New-Reply 'back to work'))
     Test-That 'a compaction adds to the running total rather than replacing it' { $entry.Compactions -eq 4 }
+    Test-That 'and the offset it covers moves with it' {
+        $entry.CompactionsThrough -eq $entry.Offset
+    } "through=$($entry.CompactionsThrough) offset=$($entry.Offset)"
     # A compaction changes no status - the session carries straight on - so without a
     # publish of its own the card would keep the old number until the session next
     # happened to go idle.
@@ -935,9 +998,45 @@ try {
     Test-That 'a failed attempt leaves it alone too' {
         $entry.Compactions -eq 4 -and @($script:StatusPublishes).Count -eq 0
     } "total=$($entry.Compactions)"
+
+    # The case the byte range exists for. More than MaxTailBytes arrives between
+    # passes, the framer skips the beginning of the append and moves the cursor past
+    # it - and the compaction in the skipped part is in no batch anybody will see.
+    $script:StatusPublishes = @()
+    $previousCap = $script:DaemonConfig.MaxTailBytes
+    try {
+        $script:DaemonConfig.MaxTailBytes = 4096
+        StepCompaction -Lines @((New-CompactionDone -Success $true), (New-Reply ('y' * 20000)), (New-Reply 'and on'))
+        Test-That 'a compaction the capped read skipped is still counted' {
+            $entry.Compactions -eq 5
+        } "total=$($entry.Compactions)"
+        Test-That 'and reaches the card, which is the whole point of counting it' {
+            @($script:StatusPublishes | Where-Object { $_.Attributes['compactions'] -eq 5 }).Count -ge 1
+        } (($script:StatusPublishes | ForEach-Object { [string]$_.Attributes['compactions'] }) -join ',')
+    }
+    finally { $script:DaemonConfig.MaxTailBytes = $previousCap }
+
+    # A pass that brings back no lines at all still has to be able to catch up: the
+    # seed may have failed, or a boundary may have been half-written when it ran. Two
+    # compactions are in this file; the entry above started at three because it was
+    # seeded with history from before it, which this one has no claim to.
+    $script:StatusPublishes = @()
+    $behind = [pscustomobject]@{
+        Offset = (Get-Item $compactLog).Length; Name = 'Copilot: behind'; Machine = 'DESK'
+        Status = 'idle'; Kind = 'copilot'; Compactions = 0; CompactionsThrough = [long]0
+    }
+    Update-DaemonSessionActivity -Id 'eeeeeeee-1111-2222-3333-444444444444' -Entry $behind `
+        -Session ([pscustomobject]@{ SessionId = 'b'; Transcript = $compactLog; ProcessId = 1 }) -Headers @{} -VerboseOn $false
+    Test-That 'a count left behind catches up on a pass that reads no new lines' {
+        $behind.Compactions -eq 2 -and $behind.CompactionsThrough -eq $behind.Offset
+    } "total=$($behind.Compactions) through=$($behind.CompactionsThrough) offset=$($behind.Offset)"
+    Test-That 'and is published, since nothing else on that pass would say it' {
+        @($script:StatusPublishes | Where-Object { $_.Attributes['compactions'] -eq 2 }).Count -ge 1
+    } (($script:StatusPublishes | ForEach-Object { [string]$_.Attributes['compactions'] }) -join ',')
 }
 finally {
-    Remove-Item -LiteralPath $compactLog -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $script:CompactionScratch -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath $script:DaemonConfig.LogFile -Force -ErrorAction SilentlyContinue
 }
 
 Write-Host ''

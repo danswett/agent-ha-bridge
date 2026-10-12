@@ -49,19 +49,22 @@ function Get-BridgeActivity {
 
 function Get-BridgeTranscriptCompactionCount {
     <#
-        How many compactions a session's transcript records, from its start.
+        How many compactions a byte range of a session's transcript records, and how
+        far the scan got, as { Count; Through; Known }.
 
-        For the one moment a running total has nothing to build on: adoption of a
-        session the daemon did not launch, which is read from the end of its
-        transcript because what was said before is not news. The compaction count is
-        the exception - it is a total, not news - so it is taken from the whole file.
+        The range is what makes this right rather than a convenience: the tail reader
+        skips bytes when a burst exceeds its cap, and starts at the end for a session
+        the daemon merely found, so a total has to be taken from the bytes themselves
+        rather than from what the reader happened to hand back.
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$Path,
-        [string]$Kind = 'copilot'
+        [string]$Kind = 'copilot',
+        [long]$From = 0,
+        [long]$Through = -1
     )
 
-    [int](& (Get-DaemonAgent -Kind $Kind).CountCompactions $Path)
+    & (Get-DaemonAgent -Kind $Kind).CountCompactions $Path $From $Through
 }
 
 function Test-BridgeSessionWorking {
@@ -202,10 +205,18 @@ function Get-DaemonStartupStatus {
 }
 
 function Measure-CopilotTranscriptCompaction {
-    <# How many times a Copilot session's conversation has been compacted, from the whole transcript. #>
-    param([Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$Path)
+    <#
+        How many times a Copilot session's conversation was compacted within a byte
+        range of its transcript, and how far the scan got.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$Path,
+        [long]$From = 0,
+        [long]$Through = -1,
+        [int]$ChunkBytes = 4194304
+    )
 
-    Measure-BridgeTranscriptLine -Path $Path -Match {
+    Measure-BridgeTranscriptLine -Path $Path -From $From -Through $Through -ChunkBytes $ChunkBytes -Match {
         param($Line)
         # The cheap test first: these events are a handful of lines in a file that is
         # mostly assistant messages and tool results.
@@ -214,9 +225,15 @@ function Measure-CopilotTranscriptCompaction {
             $parsed = $Line | ConvertFrom-Json
             if ([string]$parsed.type -ne 'session.compaction_complete') { return $false }
             $data = $parsed.data
-            # Success, for the reason Get-ActivityFromEvents reads it: a long session
-            # fails far more compactions than it completes, and a failed one changed
-            # nothing.
+            # Only a compaction that finished. Copilot writes a start for every
+            # attempt and most attempts in a long session fail: one real transcript
+            # held 225 starts against 6 compactions that happened, so counting starts
+            # - or completions without reading `success` - would have said that
+            # session had lost its history thirty-seven times over.
+            #
+            # Parsed rather than matched on '"success":true', because a successful
+            # completion also carries the summary the model just wrote, and that prose
+            # is free to quote anything at all, including this event's own shape.
             ($null -ne $data) -and (@($data.PSObject.Properties.Name) -contains 'success') -and [bool]$data.success
         }
         catch { $false }
@@ -349,7 +366,6 @@ function Get-ActivityFromEvents {
     # that already knows the attaching process is a different one.
     $shellsSinceAttach = New-Object System.Collections.Generic.List[string]
     $attached = $false
-    $compactions = 0
 
     foreach ($line in $Lines) {
         if ($line -notmatch '"type":"([^"]+)"') { continue }
@@ -366,29 +382,6 @@ function Get-ActivityFromEvents {
         if ($type -eq 'session.resume' -or $type -eq 'session.start') {
             $attached = $true
             $shellsSinceAttach.Clear()
-            continue
-        }
-
-        # A compaction that actually replaced the conversation with a summary. Only
-        # the completion counts, and only a successful one: Copilot writes a start for
-        # every attempt, and most attempts in a long session fail. One real transcript
-        # held 225 starts against 6 compactions that happened - counting starts, or
-        # counting completions without reading `success`, would have said the session
-        # had lost its history thirty-seven times over.
-        #
-        # Parsed rather than matched on '"success":true', because a successful
-        # completion also carries the summary the model just wrote, and that text is
-        # free to quote anything at all - including this event's own shape.
-        if ($type -eq 'session.compaction_complete') {
-            try {
-                $parsed = $line | ConvertFrom-Json
-                $data = $parsed.data
-                if ($null -ne $data -and @($data.PSObject.Properties.Name) -contains 'success' -and
-                    [bool]$data.success) {
-                    $compactions++
-                }
-            }
-            catch { }
             continue
         }
 
@@ -646,11 +639,6 @@ function Get-ActivityFromEvents {
         # for a process known to be new means the whole tail is the dead one's.
         ShellsSinceAttach = @($shellsSinceAttach)
         ShellAttachSeen = $attached
-        # How many times the conversation was compacted in this batch, to be added to
-        # the session's running total. A count rather than ids: nothing repeats a
-        # compaction the way a shutdown repeats a subagent.completed, and the number
-        # only ever goes up.
-        Compactions = $compactions
     }
 }
 
@@ -749,32 +737,71 @@ function Get-DaemonCompactionCount {
     try { [int]$value } catch { 0 }
 }
 
+function Get-DaemonCompactionThrough {
+    <#
+        The byte offset a session's compaction count is known to cover.
+
+        Kept beside the count because the two only mean anything together: the count
+        is "how many compactions are in [0, this offset)". Absent - an older state
+        file, a session adopted before this existed - reads as zero, and the next pass
+        then scans the whole transcript and heals it.
+    #>
+    param([Parameter(Mandatory)]$Entry)
+
+    if (-not $Entry.PSObject.Properties['CompactionsThrough']) { return [long]0 }
+    $value = $Entry.CompactionsThrough
+    if ($null -eq $value) { return [long]0 }
+    try { [long]$value } catch { [long]0 }
+}
+
 function Update-DaemonCompactionCount {
     <#
-        Adds a batch's compactions to the session's running total and returns it.
+        Brings a session's compaction total up to where its transcript has been read
+        to, and returns it.
 
-        A total kept on the entry, not recomputed: the transcript is read as a capped
-        tail from wherever the last pass stopped, so the only place the whole history
-        is ever available is the one scan at adoption that seeds this.
+        Counted by scanning the bytes between the offset the total already covers and
+        the reader's new cursor - not by counting records in the batch the reader
+        handed back. The batch is a capped tail: when more than MaxTailBytes arrives
+        between passes the framer skips the beginning of the append and moves the
+        cursor past it, so a compaction in the skipped part is gone for good and the
+        card undercounts for the rest of the session. A range is every byte, capped or
+        not, and is scanned exactly once.
 
         It only ever goes up. A compaction is a thing that happened to the
-        conversation, not a state that can clear, so nothing here subtracts - and a
-        batch carrying none leaves the total exactly where it was.
+        conversation, not a state that can clear, so nothing here subtracts.
+
+        A scan that could not read the file leaves both the total and the offset
+        alone. The unread range simply stays unaccounted for and the next pass asks
+        for it again, which is the whole reason the offset is kept: accepting a zero
+        here would put the session's history permanently behind the cursor.
     #>
     param(
         [Parameter(Mandatory)]$Entry,
-        [Parameter(Mandatory)]$Activity
+        [Parameter(Mandatory)][AllowEmptyString()][AllowNull()][string]$Path,
+        [Parameter(Mandatory)][long]$Through,
+        [string]$Kind = 'copilot'
     )
 
     $total = Get-DaemonCompactionCount -Entry $Entry
-    $batch = 0
-    if ($Activity.PSObject.Properties['Compactions'] -and $null -ne $Activity.Compactions) {
-        try { $batch = [int]$Activity.Compactions } catch { $batch = 0 }
-    }
-    if ($batch -le 0) { return $total }
+    $from = Get-DaemonCompactionThrough -Entry $Entry
+    # A transcript that shrank is a session that was reset; the reader rewinds its own
+    # cursor, and a total covering bytes that are no longer there has to rewind with
+    # it or the two never line up again.
+    if ($Through -lt $from) { $from = $Through }
+    if ($Through -le $from) { return $total }
 
-    $total += $batch
-    Set-DaemonSessionProperty -Entry $Entry -Name 'Compactions' -Value $total
+    $scan = Get-BridgeTranscriptCompactionCount -Path $Path -Kind $Kind -From $from -Through $Through
+    if (-not $scan.Known) { return $total }
+
+    if ($scan.Count -gt 0) {
+        $total += [int]$scan.Count
+        Set-DaemonSessionProperty -Entry $Entry -Name 'Compactions' -Value $total
+    }
+    # Advanced even when nothing was found, which is most passes: the point of the
+    # offset is that the range behind it has been looked at, not that it held
+    # anything. Only as far as the scan actually got, so a record still being written
+    # is read whole on the next pass instead of being parsed in half and skipped.
+    Set-DaemonSessionProperty -Entry $Entry -Name 'CompactionsThrough' -Value ([long]$scan.Through)
     $total
 }
 
@@ -972,6 +999,15 @@ function Update-DaemonSessionActivity {
 
     $append = Read-BridgeTranscriptAppend -Path $session.Transcript -Offset ([long]$entry.Offset) -Kind $entryKind
     $entry.Offset = $append.Offset
+
+    # Before the early return below, and from the cursor rather than from the batch.
+    # The session this matters most for is again one writing nothing: a count seeded
+    # by a read that failed, or left short by a record half-written when the last pass
+    # looked, has to be able to catch up on a pass that brings back no lines at all.
+    $compactionsBefore = Get-DaemonCompactionCount -Entry $entry
+    $compactions = Update-DaemonCompactionCount -Entry $entry -Path ([string]$session.Transcript) `
+        -Through ([long]$append.Offset) -Kind $entryKind
+    $compactionsChanged = ($compactions -ne $compactionsBefore)
     if ($append.Lines.Count -eq 0) {
         if ($shellsDropped -and [string]$entry.Status -eq 'shell') {
             $entry.Status = 'idle'
@@ -986,6 +1022,27 @@ function Update-DaemonSessionActivity {
             }
             catch {
                 Write-DaemonLog -Message "status publish failed for $id : $($_.Exception.Message)"
+            }
+        }
+        elseif ($compactionsChanged) {
+            # A compaction caught up on a pass that read no lines - a count the first
+            # scan could not take, or a boundary that was still being written then.
+            # Nothing else here would publish it, and the card would keep the old
+            # number for as long as the session had nothing else to say.
+            $current = [string]$entry.Status
+            if ($current -in @('working', 'idle', 'waiting', 'agents', 'shell', 'offline')) {
+                try {
+                    Set-CopilotMqttStatus -SessionId $id -Status $current -Headers $Headers -Attributes (
+                        Add-DaemonTuningAttributes -Attributes @{
+                            session = $entry.Name
+                            machine = $entry.Machine
+                            process_id = $session.ProcessId
+                            updated = [DateTimeOffset]::Now.ToString('o')
+                        } -Tuning $entry)
+                }
+                catch {
+                    Write-DaemonLog -Message "compaction publish failed for $id : $($_.Exception.Message)"
+                }
             }
         }
         # Pinned here too, because this return skips the fold that normally does it.
@@ -1060,12 +1117,6 @@ function Update-DaemonSessionActivity {
     # change the status string - so without this the card went on saying one while two
     # were running, until the session next moved for some other reason.
     $shellCountChanged = ($runningShells -ne $shellsBefore)
-
-    # A compaction never changes the status - the session carries straight on - so the
-    # count rides on the same republish the model and the shell count do, or the card
-    # would keep the old number until the session happened to go idle.
-    $compactionsBefore = Get-DaemonCompactionCount -Entry $entry
-    $compactionsChanged = (Update-DaemonCompactionCount -Entry $entry -Activity $activity) -ne $compactionsBefore
 
     # The model the transcript just named. Recorded before the status publish below,
     # so a batch that changes both spends one publish on the pair.

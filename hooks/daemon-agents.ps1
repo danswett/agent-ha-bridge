@@ -51,7 +51,7 @@ $script:DaemonAgents = [ordered]@{
         Display = { param($SessionId, $WorkingDirectory) Get-CopilotSessionDisplay -SessionId $SessionId -WorkingDirectory $WorkingDirectory }
         ReadAppend = { param($Path, $Offset) Read-TranscriptAppend -Path $Path -Offset $Offset }
         Activity = { param($Lines, $VerboseMode) Get-ActivityFromEvents -Lines $Lines -VerboseMode $VerboseMode }
-        CountCompactions = { param($Path) Measure-CopilotTranscriptCompaction -Path $Path }
+        CountCompactions = { param($Path, $From, $Through) Measure-CopilotTranscriptCompaction -Path $Path -From $From -Through $Through }
         IsWorking = { param($SessionId, $Transcript, $Status) Test-CopilotSessionWorking -SessionId $SessionId }
         AskUserState = { param($Session, $Marker) Get-CopilotAskUserState -TranscriptPath ([string]$Session.Transcript) }
         AdapterInstalled = { Test-Path -LiteralPath (Join-Path (Get-BridgeInstallContext).CopilotHome 'hooks\decision-notifier.json') }
@@ -95,9 +95,9 @@ $script:DaemonAgents = [ordered]@{
             Get-ClaudeActivityFromTranscript -Lines $Lines -VerboseMode $VerboseMode
         }
         CountCompactions = {
-            param($Path)
-            if (-not $script:ClaudeAdapterLoaded) { return 0 }
-            Measure-ClaudeTranscriptCompaction -Path $Path
+            param($Path, $From, $Through)
+            if (-not $script:ClaudeAdapterLoaded) { return [pscustomobject]@{ Count = 0; Through = [long]$From; Known = $false } }
+            Measure-ClaudeTranscriptCompaction -Path $Path -From $From -Through $Through
         }
         IsWorking = {
             param($SessionId, $Transcript, $Status)
@@ -186,11 +186,13 @@ $script:DaemonAgents = [ordered]@{
         # Codex auto-compacts, but nothing here has been able to verify what its
         # rollout writes when it does - there is no Codex install to read and no
         # rollout to measure. Rather than inherit Copilot's reader, which would scan a
-        # whole rollout for a marker it cannot contain, a Codex session simply reports
-        # no compactions and its card carries no such line. Replace this with a real
-        # counter once the rollout's marker has been read from a running Codex, the
-        # way Copilot's and Claude's were.
-        CountCompactions = { param($Path) 0 }
+        # whole rollout for a marker it cannot contain, a Codex session reports no
+        # compactions and its card carries no such line. Known is true, because "none"
+        # is this agent's settled answer rather than a read that failed; a caller that
+        # retried it would retry it for ever. Replace this with a real counter once
+        # the rollout's marker has been read from a running Codex, the way Copilot's
+        # and Claude's were.
+        CountCompactions = { param($Path, $From, $Through) [pscustomobject]@{ Count = 0; Through = [long]$Through; Known = $true } }
         # Codex reports its own status: a turn begins at UserPromptSubmit and ends at
         # Stop, both of which the hook records, so there is nothing to infer.
         IsWorking = { param($SessionId, $Transcript, $Status) $Status -eq 'working' }

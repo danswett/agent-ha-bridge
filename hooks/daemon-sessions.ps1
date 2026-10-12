@@ -790,14 +790,29 @@ function Add-DaemonSession {
     # rather than news, so starting at the end would have every adopted session claim
     # it had never been compacted - and the sessions worth looking at are exactly the
     # long ones the daemon is most likely to meet part-way through. So when reading
-    # starts at the end, the whole transcript is scanned once for them.
+    # starts at the end, the history behind the cursor is scanned once for them.
     #
-    # Tied to the offset rather than to $startedFresh, because the two have to agree:
-    # a fresh launch starts at zero and the reader counts the same events itself, and
-    # seeding from the file as well would count every one of them twice.
-    $priorCompactions = if ($startOffset -gt 0) {
-        Get-BridgeTranscriptCompactionCount -Path ([string]$session.Transcript) -Kind $kind
-    } else { 0 }
+    # Bounded by that same cursor, not by the file's length now. The scan takes
+    # seconds on a large transcript, the session goes on writing throughout, and a
+    # compaction appended while it ran would otherwise be counted here *and* read
+    # again from the cursor - double-counted for good.
+    #
+    # Nothing is seeded when reading starts at zero: a fresh launch meets the same
+    # records itself, and seeding as well would count every one of them twice.
+    $priorCompactions = 0
+    $compactionsThrough = [long]0
+    if ($startOffset -gt 0) {
+        $seed = Get-BridgeTranscriptCompactionCount -Path ([string]$session.Transcript) -Kind $kind `
+            -From 0 -Through $startOffset
+        if ($seed.Known) {
+            $priorCompactions = [int]$seed.Count
+            $compactionsThrough = [long]$seed.Through
+        }
+        # A scan that could not read the transcript leaves the offset at zero rather
+        # than at the cursor, so the first pass that can read it scans the history
+        # instead of writing it off. Accepting the zero here would put everything the
+        # session had been through permanently behind the cursor.
+    }
     # So the very first publish below carries it, rather than the card showing nothing
     # until the session next does something worth saying.
     $tuning | Add-Member -NotePropertyName Compactions -NotePropertyValue $priorCompactions -Force
@@ -863,10 +878,12 @@ function Add-DaemonSession {
         Model = [string]$tuning.Model
         Effort = [string]$tuning.Effort
         Context = [string]$tuning.Context
-        # Seeded from the transcript above and added to from then on. Re-adoption
-        # re-reads the file, so a count lost with a state file heals rather than
-        # restarting from zero.
+        # Seeded from the transcript above and brought forward on every pass. The
+        # offset is what the count covers; keeping the two together is what lets a
+        # later pass scan exactly the bytes nothing has accounted for yet, whether
+        # they were skipped by a capped read or by a seed that could not be taken.
         Compactions = $priorCompactions
+        CompactionsThrough = $compactionsThrough
     }
 
     # A session an agent launched is agent-driven from the moment it appears. The
