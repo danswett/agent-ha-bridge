@@ -20,7 +20,8 @@
       * Publish-CopilotMqttNewSession - the discovery payloads.
       * Sync-DaemonNewSession - press-timestamp semantics and refusal cases.
 
-    Nothing here contacts Home Assistant or starts a real process.
+    Nothing here contacts Home Assistant or starts a real agent CLI: where the
+    bridge talks to one over stdin and stdout, a small pwsh child stands in for it.
 #>
 
 Set-StrictMode -Version Latest
@@ -145,6 +146,15 @@ function Get-BridgeDiscoveredWorkspaces { @($script:FakeDiscovered) }
 $script:RealAgencyProfileList = ${function:Get-BridgeAgencyProfileList}
 $script:FakeProfiles = [pscustomobject]@{ Ok = $true; Profiles = @('work', 'home', 'local') }
 function Get-BridgeAgencyProfileList { $script:FakeProfiles }
+
+# Claude's and Codex's model discovery each start that CLI to ask it, so they are
+# shadowed for the same reasons, finding nothing - which leaves both on their built-in
+# lists. The real one is kept for the section on that discovery below.
+$script:RealLauncherModelDiscovery = ${function:Get-BridgeLauncherModelDiscovery}
+function Get-BridgeLauncherModelDiscovery {
+    param([string]$Launcher, [string]$Path)
+    [pscustomobject]@{ Models = @(); Efforts = @(); EffortsKnown = $false; ModelEfforts = @{} }
+}
 
 Write-Host ''
 Write-Host '--- the workspace list ---'
@@ -962,6 +972,929 @@ finally {
     $script:BridgeModelCache = $null
 }
 
+Write-Host ''
+Write-Host '--- Claude and Codex model discovery ---'
+
+# Claude's list comes from the initialize request its SDK opens every session with,
+# Codex's from model/list on its app-server, and both talk one JSON object a line. A
+# pwsh child stands in for each CLI: first one that tests that transport itself, then
+# scripted CLIs, so what is asserted is what each probe asks and what it keeps, and
+# last the cache in front of both.
+$savedLauncherDiscovery = ${function:Get-BridgeLauncherModelDiscovery}
+$savedDiscoveryClaudePath = ${function:Get-BridgeClaudePath}
+$savedDiscoveryCodexPath = ${function:Get-BridgeCodexPath}
+$savedLineStart = ${function:Start-BridgeJsonLineProcess}
+$savedClaudeRoster = ${function:Get-BridgeClaudeModelRoster}
+$savedCodexRoster = ${function:Get-BridgeCodexModelRoster}
+$linePwsh = Get-BridgePwshPath
+$lineRoot = [IO.Path]::Combine([IO.Path]::GetTempPath(), "jsonl-fake-$([guid]::NewGuid().ToString('N').Substring(0, 8))")
+$lineChild = $null
+$env:BRIDGE_TEST_PARENT = 'inherited'
+try {
+    ${function:Get-BridgeLauncherModelDiscovery} = $script:RealLauncherModelDiscovery
+    [void][IO.Directory]::CreateDirectory($lineRoot)
+
+    # What every stand-in shares: a line in, decoded once it is whole and logged where
+    # FAKE_LOG says, and a line out, written in pieces when asked to be.
+    $lineHelpers = @'
+$ErrorActionPreference = 'Stop'
+$stdin = [Console]::OpenStandardInput()
+$stdout = [Console]::OpenStandardOutput()
+$buffer = [Collections.Generic.List[byte]]::new()
+$chunk = [byte[]]::new(4096)
+function Read-Line {
+    while ($true) {
+        $end = $buffer.IndexOf([byte]10)
+        if ($end -ge 0) {
+            $line = [Text.Encoding]::UTF8.GetString($buffer.GetRange(0, $end).ToArray())
+            $buffer.RemoveRange(0, $end + 1)
+            if ($env:FAKE_LOG) { [IO.File]::AppendAllText($env:FAKE_LOG, "$line`n") }
+            return $line
+        }
+        $count = $stdin.Read($chunk, 0, $chunk.Length)
+        if ($count -le 0) { exit 0 }
+        $buffer.AddRange([ArraySegment[byte]]::new($chunk, 0, $count))
+    }
+}
+function Read-Request { ConvertFrom-Json -InputObject (Read-Line) -AsHashtable }
+function Get-LineBytes($Message) {
+    , [Text.Encoding]::UTF8.GetBytes((ConvertTo-Json -InputObject $Message -Depth 10 -Compress) + "`n")
+}
+function Write-Raw([byte[]]$Bytes, [int[]]$SplitAt = @()) {
+    $from = 0
+    foreach ($to in @($SplitAt) + $Bytes.Length) {
+        if ($from -gt 0) { Start-Sleep -Milliseconds 150 }
+        $stdout.Write($Bytes, $from, $to - $from)
+        $stdout.Flush()
+        $from = $to
+    }
+}
+function Write-Line($Message) { Write-Raw (Get-LineBytes $Message) }
+function Wait-End { while ($true) { [void](Read-Line) } }
+'@
+    function New-FakeLineScript {
+        param([string]$Name, [string]$Body)
+        $path = [IO.Path]::Combine($script:lineRoot, $Name)
+        [IO.File]::WriteAllText($path, $script:lineHelpers + "`n" + $Body)
+        $path
+    }
+    # The answer to one request of the child in $lineChild, or the exception it threw.
+    function Invoke-FakeLineRequest {
+        param([string]$Method, $Params = @{}, [DateTimeOffset]$Deadline = [DateTimeOffset]::Now.AddSeconds(60))
+        try { Invoke-BridgeJsonLineRequest -Connection $script:lineChild -Method $Method -Params $Params -Deadline $Deadline }
+        catch { $_.Exception }
+    }
+    function Format-FakeLineAnswer {
+        param($Answer)
+        if ($Answer -is [Exception]) { return "$($Answer.GetType().Name): $($Answer.Message)" }
+        ConvertTo-Json -InputObject $Answer -Compress -Depth 5
+    }
+
+    # The transport, against a child that answers each method in its own way.
+    $lineServer = New-FakeLineScript -Name 'server.ps1' -Body @'
+while ($true) {
+    $request = Read-Request
+    $id = $request['id']
+    switch ($request['method']) {
+        'echo' {
+            $bytes = Get-LineBytes ([ordered]@{
+                    id = $id; result = [ordered]@{ params = $request['params']; keys = (@($request.Keys | Sort-Object) -join ',') }
+                })
+            # Three writes, the second ending between the two bytes of a character.
+            Write-Raw $bytes -SplitAt @(10, ([Array]::IndexOf($bytes, [byte]0xC3) + 1))
+        }
+        'env' {
+            Write-Line ([ordered]@{ id = $id; result = [ordered]@{
+                        value = $env:BRIDGE_TEST_LINE; parent = $env:BRIDGE_TEST_PARENT; directory = [IO.Directory]::GetCurrentDirectory()
+                    } })
+        }
+        'interleave' {
+            # Stray output, a notification and a request of its own, then a reply to
+            # some other request and the answer, written together.
+            Write-Raw ([Text.Encoding]::UTF8.GetBytes("Warning: printed to stdout`n`n"))
+            Write-Line ([ordered]@{ method = 'thread/started'; params = @{} })
+            Write-Line ([ordered]@{ id = 'srv-1'; method = 'item/tool/requestUserInput'; params = @{} })
+            $answer = Read-Request
+            $refusal = $answer['error']
+            $other = Get-LineBytes ([ordered]@{ id = 999; result = @{} })
+            $mine = Get-LineBytes ([ordered]@{
+                    id = $id; result = [ordered]@{ answered = $answer['id']; code = $refusal['code']; message = $refusal['message'] }
+                })
+            Write-Raw ([byte[]]($other + $mine))
+        }
+        'garbled' { Write-Raw ([Text.Encoding]::UTF8.GetBytes("{not json`n")) }
+        'fail' { Write-Line ([ordered]@{ id = $id; error = [ordered]@{ code = -32001; message = 'simulated refusal' } }) }
+        'hang' { Start-Sleep -Seconds 120 }
+    }
+}
+'@
+    $lineDead = [IO.Path]::Combine($lineRoot, 'dead.ps1')
+    [IO.File]::WriteAllText($lineDead, "[Console]::Error.WriteLine('fatal: simulated bad flag')`nexit 7`n")
+
+    $lineStart = @{
+        Executable       = $linePwsh
+        Arguments        = @('-NoProfile', '-NonInteractive', '-File', $lineServer)
+        WorkingDirectory = $lineRoot
+        Environment      = @{ BRIDGE_TEST_LINE = 'from-bridge' }
+    }
+    $lineChild = Start-BridgeJsonLineProcess @lineStart
+
+    $lineEchoed = Invoke-FakeLineRequest -Method 'echo' -Params ([ordered]@{ text = 'Café ☕'; n = 3 })
+    Test-That 'a line that arrives in pieces, one of them ending inside a character, is read whole' {
+        $lineEchoed -is [Collections.IDictionary] -and $lineEchoed['params']['text'] -ceq 'Café ☕' -and
+            $lineEchoed['params']['n'] -eq 3
+    } (Format-FakeLineAnswer -Answer $lineEchoed)
+    Test-That 'a request is its id, method and params, with no "jsonrpc" member' {
+        $lineEchoed -is [Collections.IDictionary] -and $lineEchoed['keys'] -ceq 'id,method,params'
+    } (Format-FakeLineAnswer -Answer $lineEchoed)
+
+    $lineEnvironment = Invoke-FakeLineRequest -Method 'env'
+    Test-That 'the child gets its own variables on top of the bridge''s, and starts in the folder it is given' {
+        $lineEnvironment -is [Collections.IDictionary] -and $lineEnvironment['value'] -ceq 'from-bridge' -and
+            $lineEnvironment['parent'] -ceq 'inherited' -and
+            [IO.Path]::GetFileName($lineEnvironment['directory']) -ceq [IO.Path]::GetFileName($lineRoot)
+    } (Format-FakeLineAnswer -Answer $lineEnvironment)
+
+    $lineInterleaved = Invoke-FakeLineRequest -Method 'interleave'
+    Test-That 'stray output, notifications and replies to other requests are passed over' {
+        $lineInterleaved -is [Collections.IDictionary] -and $lineInterleaved['answered'] -ceq 'srv-1'
+    } (Format-FakeLineAnswer -Answer $lineInterleaved)
+    Test-That 'and a request from the child is refused rather than left waiting' {
+        $lineInterleaved -is [Collections.IDictionary] -and $lineInterleaved['code'] -eq -32601 -and
+            $lineInterleaved['message'] -ceq "agent-ha-bridge does not handle 'item/tool/requestUserInput'"
+    } (Format-FakeLineAnswer -Answer $lineInterleaved)
+
+    $lineGarbled = Invoke-FakeLineRequest -Method 'garbled'
+    Test-That 'a line that starts like JSON but is not fails the request, saying what arrived' {
+        $lineGarbled -is [Exception] -and $lineGarbled.Message -match 'not a JSON object' -and
+            $lineGarbled.Message -match '\{not json'
+    } (Format-FakeLineAnswer -Answer $lineGarbled)
+
+    $lineRefusal = Invoke-FakeLineRequest -Method 'fail'
+    Test-That 'an error reply throws its message and code, on a connection that outlived the bad line' {
+        $lineRefusal -is [Exception] -and $lineRefusal.Message -ceq "'fail' failed: simulated refusal (code -32001)" -and
+            $lineRefusal.Data['JsonRpcCode'] -eq -32001
+    } (Format-FakeLineAnswer -Answer $lineRefusal)
+
+    $lineClock = [Diagnostics.Stopwatch]::StartNew()
+    $lineHung = Invoke-FakeLineRequest -Method 'hang' -Deadline ([DateTimeOffset]::Now.AddMilliseconds(1500))
+    $lineClock.Stop()
+    Test-That 'a child that never answers times out at the deadline' {
+        $lineHung -is [Exception] -and $lineHung.GetBaseException() -is [TimeoutException] -and
+            $lineHung.Message -match "the answer to 'hang'" -and $lineClock.Elapsed.TotalSeconds -lt 15
+    } "$(Format-FakeLineAnswer -Answer $lineHung) after $([int]$lineClock.Elapsed.TotalSeconds)s"
+    $lineClock.Restart()
+    $lineStop = Stop-BridgeJsonRpcProcess -Connection $lineChild -GraceMs 500
+    $lineClock.Stop()
+    $lineChild = $null
+    Test-That 'and is killed when it does not exit once its input closes' {
+        $lineStop.Exited -and $lineStop.Killed -and $lineClock.Elapsed.TotalSeconds -lt 15
+    } "$(ConvertTo-Json -InputObject $lineStop -Compress) after $([int]$lineClock.Elapsed.TotalSeconds)s"
+
+    $lineChild = Start-BridgeJsonLineProcess -Executable $linePwsh -Arguments @('-NoProfile', '-NonInteractive', '-File', $lineDead)
+    $lineDied = Invoke-FakeLineRequest -Method 'initialize'
+    Test-That 'a child that exits at once fails the request with its exit code and what it printed' {
+        $lineDied -is [Exception] -and $lineDied.Message -match 'code 7' -and $lineDied.Message -match 'simulated bad flag'
+    } (Format-FakeLineAnswer -Answer $lineDied)
+    $lineStop = Stop-BridgeJsonRpcProcess -Connection $lineChild
+    $lineChild = $null
+    Test-That 'and stopping it afterwards finds it already gone' {
+        $lineStop.Exited -and -not $lineStop.Killed
+    } (ConvertTo-Json -InputObject $lineStop -Compress)
+
+    # The probes themselves, the real Get-BridgeClaudeModelRoster and
+    # Get-BridgeCodexModelRoster, with only the process they start swapped: a scripted
+    # CLI answering as that one does, in the mode FAKE_MODE names, and logging every
+    # line it is sent.
+    $script:LineStarts = [Collections.Generic.List[object]]::new()
+    $script:FakeCliMode = ''
+    $script:FakeCliLog = [IO.Path]::Combine($lineRoot, 'requests.log')
+    $script:FakeCodexHome = [IO.Path]::Combine($lineRoot, 'codex-home')
+    $script:FakeCliScript = ''
+    $script:FakeCliScripts = @{}
+    $script:FakeCliScripts['claude'] = New-FakeLineScript -Name 'claude.ps1' -Body @'
+if ($env:FAKE_MODE -eq 'claude-old') {
+    [Console]::Error.WriteLine("error: unknown option '--safe-mode'")
+    exit 1
+}
+function Get-Model([string]$Value, [string[]]$Effort) {
+    [ordered]@{ value = $Value; displayName = $Value; description = "$Value model"; supportsEffort = $true; supportedEffortLevels = @($Effort) }
+}
+$request = Read-Request
+$requestId = $request['request_id']
+if ($env:FAKE_MODE -eq 'claude-error') {
+    Write-Line ([ordered]@{
+            type = 'control_response'
+            response = [ordered]@{ subtype = 'error'; request_id = $requestId; error = 'simulated initialize failure' }
+        })
+    Wait-End
+}
+# Other traffic first, as the real CLI sends: a status line, and the answer to some
+# other request.
+Write-Line ([ordered]@{ type = 'system'; subtype = 'status' })
+Write-Line ([ordered]@{ type = 'control_response'; response = [ordered]@{ subtype = 'success'; request_id = 'req_0_other'; response = @{} } })
+$models = @(
+    (Get-Model 'default' @('low', 'medium', 'high', 'xhigh', 'max'))
+    (Get-Model 'opus' @('low', 'medium', 'high', 'xhigh', 'max'))
+    (Get-Model 'sonnet' @('low', 'medium', 'high'))
+    (Get-Model 'haiku' @('low', 'medium', 'high'))
+)
+Write-Line ([ordered]@{
+        type = 'control_response'
+        response = [ordered]@{ subtype = 'success'; request_id = $requestId; response = [ordered]@{ commands = @(); models = $models } }
+    })
+if ($env:FAKE_MODE -eq 'claude-slow-exit') {
+    # Still saving its settings when its input ends, as Claude is on a cold start, for
+    # longer than the two seconds another probe gets to exit.
+    while ($stdin.Read($chunk, 0, $chunk.Length) -gt 0) { }
+    Start-Sleep -Milliseconds 3000
+    [IO.File]::AppendAllText($env:FAKE_LOG, "{`"saved`":true}`n")
+    exit 0
+}
+Wait-End
+'@
+    $script:FakeCliScripts['codex'] = New-FakeLineScript -Name 'codex.ps1' -Body @'
+function Get-Effort([string[]]$Name) { @($Name | ForEach-Object { [ordered]@{ reasoningEffort = $_; description = "$_ effort" } }) }
+function Get-Entry([string]$Name, [string[]]$Effort, [bool]$Hidden = $false) {
+    [ordered]@{ id = $Name; model = $Name; displayName = $Name; hidden = $Hidden; supportedReasoningEfforts = @(Get-Effort $Effort) }
+}
+# What Codex leaves in its home once it has fetched the account's list: when, for which
+# sign-in, and the models in it, hidden ones too. The modes leave it out, age it, drop
+# the sign-in, or list other models, as a failed or an older fetch would, or another
+# Codex sharing the home.
+function Write-ModelCache {
+    if ($env:FAKE_MODE -eq 'codex-no-cache') { return }
+    $fetched = [DateTimeOffset]::UtcNow
+    if ($env:FAKE_MODE -eq 'codex-stale') { $fetched = $fetched.AddSeconds(-301) }
+    # Codex writes as many fractional digits as it has, up to nine.
+    $format = if ($env:FAKE_MODE -eq 'codex-nanos') { "yyyy-MM-dd'T'HH:mm:ss.fffffff'00Z'" } else { "yyyy-MM-dd'T'HH:mm:ss.fff'Z'" }
+    $cache = [ordered]@{ fetched_at = $fetched.ToString($format, [Globalization.CultureInfo]::InvariantCulture) }
+    if ($env:FAKE_MODE -ne 'codex-no-identity') { $cache['identity'] = 'chatgpt:fake-account' }
+    $cache['client_version'] = '0.0.0'
+    $slugs = @('gpt-6.1-sol', 'gpt-6-astra', 'gpt-5.5')
+    if ($env:FAKE_MODE -eq 'codex-other-list') { $slugs = @('gpt-6.1-sol', 'gpt-6-astra') }
+    $cache['models'] = @($slugs | ForEach-Object { [ordered]@{ slug = $_; display_name = $_ } })
+    [IO.File]::WriteAllText([IO.Path]::Combine($env:FAKE_CODEX_HOME, 'models_cache.json'), (ConvertTo-Json -InputObject $cache -Depth 4))
+}
+$request = Read-Request
+$introduced = [ordered]@{ userAgent = 'codex/0' }
+if ($env:FAKE_MODE -ne 'codex-no-home') { $introduced['codexHome'] = $env:FAKE_CODEX_HOME }
+Write-Line ([ordered]@{ id = $request['id']; result = $introduced })
+[void](Read-Request)
+while ($true) {
+    $request = Read-Request
+    $id = $request['id']
+    if ($request['method'] -ceq 'account/read') {
+        $account = switch ($env:FAKE_MODE) {
+            'codex-signed-out' { $null }
+            'codex-apikey' { [ordered]@{ type = 'apiKey' } }
+            default { [ordered]@{ type = 'chatgpt'; email = 'someone@example.com'; planType = 'pro' } }
+        }
+        Write-Line ([ordered]@{ id = $id; result = [ordered]@{ account = $account; requiresOpenaiAuth = $true } })
+        continue
+    }
+    $params = $request['params']
+    $cursor = if ($params -is [Collections.IDictionary] -and $params.Contains('cursor')) { $params['cursor'] } else { $null }
+    if ($env:FAKE_MODE -eq 'codex-error') {
+        Write-Line ([ordered]@{ id = $id; error = [ordered]@{ code = -32600; message = 'simulated refusal' } })
+        continue
+    }
+    Write-ModelCache
+    if ($env:FAKE_MODE -eq 'codex-loop') {
+        # Handing back a cursor for ever.
+        Write-Line ([ordered]@{ id = $id; result = [ordered]@{ data = @(Get-Entry 'gpt-6.1-sol' 'low'); nextCursor = 'again' } })
+        continue
+    }
+    if ($cursor -eq 'page-2') {
+        $page = @(Get-Entry 'gpt-5.5' 'low', 'medium', 'high', 'xhigh')
+        Write-Line ([ordered]@{ id = $id; result = [ordered]@{ data = $page; nextCursor = $null } })
+        continue
+    }
+    $page = @(
+        (Get-Entry 'gpt-6.1-sol' 'low', 'medium', 'high', 'xhigh', 'max', 'ultra')
+        (Get-Entry 'gpt-6-astra' 'mega' $true)
+    )
+    Write-Line ([ordered]@{ id = $id; result = [ordered]@{ data = $page; nextCursor = 'page-2' } })
+}
+'@
+    function Start-BridgeJsonLineProcess {
+        param(
+            [string]$Executable,
+            [string[]]$Arguments = @(),
+            [AllowEmptyString()][AllowNull()][string]$WorkingDirectory = '',
+            [AllowNull()][Collections.IDictionary]$Environment = $null
+        )
+        $script:LineStarts.Add([pscustomobject]@{
+                Executable = $Executable; Arguments = @($Arguments); WorkingDirectory = $WorkingDirectory; Environment = $Environment
+                Entries = if ([IO.Directory]::Exists($WorkingDirectory)) {
+                    @([IO.Directory]::EnumerateFileSystemEntries($WorkingDirectory)).Count
+                }
+                else { -1 }
+            })
+        $childVariables = @{ FAKE_MODE = $script:FakeCliMode; FAKE_LOG = $script:FakeCliLog; FAKE_CODEX_HOME = $script:FakeCodexHome }
+        if ($null -ne $Environment) { foreach ($name in @($Environment.Keys)) { $childVariables[$name] = $Environment[$name] } }
+        $fake = @{
+            Executable       = $script:linePwsh
+            Arguments        = @('-NoProfile', '-NonInteractive', '-File', $script:FakeCliScript)
+            WorkingDirectory = $WorkingDirectory
+            Environment      = $childVariables
+        }
+        & $script:savedLineStart @fake
+    }
+    function Invoke-FakeLauncherProbe {
+        param([string]$Launcher, [string]$Mode)
+        $script:LineStarts.Clear()
+        $script:FakeCliMode = $Mode
+        $script:FakeCliScript = $script:FakeCliScripts[$Launcher]
+        [IO.File]::WriteAllText($script:FakeCliLog, '')
+        # An empty Codex home each time, so no probe reads a cache another one left.
+        if ([IO.Directory]::Exists($script:FakeCodexHome)) { [IO.Directory]::Delete($script:FakeCodexHome, $true) }
+        [void][IO.Directory]::CreateDirectory($script:FakeCodexHome)
+        $script:LauncherProbeResult = $null
+        $script:LauncherProbeError = ''
+        try {
+            $script:LauncherProbeResult = if ($Launcher -eq 'claude') {
+                Get-BridgeClaudeModelRoster -Path 'C:\fake-claude.exe' -TimeoutMs 60000
+            }
+            else { Get-BridgeCodexModelRoster -Path 'C:\fake-codex.exe' -TimeoutMs 60000 }
+        }
+        catch { $script:LauncherProbeError = $_.Exception.Message }
+        $script:LauncherProbeLines = @([IO.File]::ReadAllLines($script:FakeCliLog) | Where-Object { $_.Trim() } |
+                ForEach-Object { ConvertFrom-Json -InputObject $_ -AsHashtable })
+    }
+    # The probe started one process, and its scratch folder is gone.
+    function Test-FakeProbeCleanedUp {
+        $script:LineStarts.Count -eq 1 -and
+            -not [IO.Directory]::Exists([IO.Path]::GetDirectoryName($script:LineStarts[0].WorkingDirectory))
+    }
+    # Details for a failure, which are worked out before the test runs: nothing here
+    # may throw on a probe that went wrong.
+    function Format-FakeProbeResult {
+        if ($script:LauncherProbeError) { return "error: $($script:LauncherProbeError)" }
+        ConvertTo-Json -InputObject $script:LauncherProbeResult -Compress -Depth 4
+    }
+    function Format-FakeProbeStart { ConvertTo-Json -InputObject @($script:LineStarts) -Compress -Depth 4 }
+    function Format-FakeProbeLines { ConvertTo-Json -InputObject @($script:LauncherProbeLines) -Compress -Depth 6 }
+    # Which model takes which efforts, by model, as 'model=effort+effort'.
+    function Format-ModelEfforts {
+        param([AllowNull()]$Map)
+        if ($Map -isnot [Collections.IDictionary]) { return "not a map: $Map" }
+        (@($Map.Keys | Sort-Object -CaseSensitive) | ForEach-Object { "$_=$(@($Map[$_]) -join '+')" }) -join ' '
+    }
+
+    Invoke-FakeLauncherProbe -Launcher 'claude' -Mode 'claude'
+    Test-That 'Claude''s probe offers the models its picker lists, less default, and every effort one of them takes' {
+        $null -ne $script:LauncherProbeResult -and
+            (@($script:LauncherProbeResult.Models) -join ',') -ceq 'opus,sonnet,haiku' -and
+            (@($script:LauncherProbeResult.Efforts) -join ',') -ceq 'low,medium,high,xhigh,max'
+    } (Format-FakeProbeResult)
+    Test-That 'and keeps which of those efforts each model takes' {
+        $null -ne $script:LauncherProbeResult -and $script:LauncherProbeResult.EffortsKnown -eq $true -and
+            (Format-ModelEfforts $script:LauncherProbeResult.ModelEfforts) -ceq
+            'haiku=low+medium+high opus=low+medium+high+xhigh+max sonnet=low+medium+high'
+    } (Format-FakeProbeResult)
+    Test-That 'it starts Claude as the SDK does but inert, leaving updates to Claude''s own sessions' {
+        $launched = $script:LineStarts[0]
+        $script:LineStarts.Count -eq 1 -and $launched.Executable -ceq 'C:\fake-claude.exe' -and
+            ($launched.Arguments -join ' ') -ceq ('-p --input-format stream-json --output-format stream-json --verbose ' +
+                '--safe-mode --no-session-persistence --strict-mcp-config') -and
+            $launched.Environment['DISABLE_AUTOUPDATER'] -ceq '1'
+    } (Format-FakeProbeStart)
+    Test-That 'in an empty scratch folder of its own, which is gone afterwards' {
+        $launched = $script:LineStarts[0]
+        $launched.Entries -eq 0 -and [IO.Path]::GetFileName($launched.WorkingDirectory) -ceq 'wd' -and
+            [IO.Path]::GetFileName([IO.Path]::GetDirectoryName($launched.WorkingDirectory)) -like 'agent-bridge-models-*' -and
+            (Test-FakeProbeCleanedUp)
+    } (Format-FakeProbeStart)
+    Test-That 'and sends nothing but the initialize request, in the SDK''s form and with no hooks' {
+        $sent = $script:LauncherProbeLines
+        $sent.Count -eq 1 -and $sent[0]['type'] -ceq 'control_request' -and
+            $sent[0]['request_id'] -cmatch '^req_1_[0-9a-f]{8}\z' -and
+            $sent[0]['request']['subtype'] -ceq 'initialize' -and
+            $sent[0]['request'].Contains('hooks') -and $null -eq $sent[0]['request']['hooks']
+    } (Format-FakeProbeLines)
+
+    Invoke-FakeLauncherProbe -Launcher 'claude' -Mode 'claude-error'
+    Test-That 'a Claude that refuses initialize fails the probe with its reason, and the folder still goes' {
+        $script:LauncherProbeError -ceq "'initialize' failed: simulated initialize failure" -and (Test-FakeProbeCleanedUp)
+    } (Format-FakeProbeResult)
+    Invoke-FakeLauncherProbe -Launcher 'claude' -Mode 'claude-slow-exit'
+    Test-That 'a Claude still saving its settings once it has answered is left to finish rather than killed' {
+        $null -ne $script:LauncherProbeResult -and
+            @($script:LauncherProbeLines | Where-Object { $_['saved'] -eq $true }).Count -eq 1 -and (Test-FakeProbeCleanedUp)
+    } "$(Format-FakeProbeResult) $(Format-FakeProbeLines)"
+    Invoke-FakeLauncherProbe -Launcher 'claude' -Mode 'claude-old'
+    Test-That 'a Claude too old for --safe-mode fails it with its exit code and what it printed' {
+        $script:LauncherProbeError -match 'code 1\b' -and $script:LauncherProbeError -match "unknown option '--safe-mode'" -and
+            (Test-FakeProbeCleanedUp)
+    } (Format-FakeProbeResult)
+
+    Invoke-FakeLauncherProbe -Launcher 'codex' -Mode 'codex'
+    Test-That 'Codex''s probe pages through model/list, offering each visible model and every effort one takes' {
+        $null -ne $script:LauncherProbeResult -and
+            (@($script:LauncherProbeResult.Models) -join ',') -ceq 'gpt-6.1-sol,gpt-5.5' -and
+            (@($script:LauncherProbeResult.Efforts) -join ',') -ceq 'low,medium,high,xhigh,max,ultra'
+    } (Format-FakeProbeResult)
+    Test-That 'and keeps which of those efforts each model takes' {
+        $null -ne $script:LauncherProbeResult -and $script:LauncherProbeResult.EffortsKnown -eq $true -and
+            (Format-ModelEfforts $script:LauncherProbeResult.ModelEfforts) -ceq
+            'gpt-5.5=low+medium+high+xhigh gpt-6.1-sol=low+medium+high+xhigh+max+ultra'
+    } (Format-FakeProbeResult)
+    Test-That 'it starts the app-server with plugins off and nothing more, in an empty scratch folder that is gone afterwards' {
+        $launched = $script:LineStarts[0]
+        $launched.Executable -ceq 'C:\fake-codex.exe' -and ($launched.Arguments -join ' ') -ceq '-c features.plugins=false app-server' -and
+            $null -eq $launched.Environment -and $launched.Entries -eq 0 -and (Test-FakeProbeCleanedUp)
+    } (Format-FakeProbeStart)
+    Test-That 'introduces the bridge, asks how Codex is signed in without renewing it, then asks for each page by the cursor the one before gave' {
+        $sent = $script:LauncherProbeLines
+        (@($sent | ForEach-Object { $_['method'] }) -join ',') -ceq 'initialize,initialized,account/read,model/list,model/list' -and
+            $sent[0]['params']['clientInfo']['name'] -ceq 'agent-ha-bridge' -and -not $sent[1].Contains('id') -and
+            $sent[2]['params'] -is [Collections.IDictionary] -and $sent[2]['params'].Count -eq 0 -and
+            $sent[3]['params'] -is [Collections.IDictionary] -and $sent[3]['params'].Count -eq 0 -and
+            $sent[4]['params']['cursor'] -ceq 'page-2'
+    } (Format-FakeProbeLines)
+
+    # model/list does not say whose list it is: signed out, or with its fetch failing,
+    # Codex answers with the models built into it. Only a ChatGPT sign-in, with a
+    # cache fetched for it in the last five minutes, is taken.
+    $codexRefusals = [ordered]@{}
+    foreach ($mode in 'codex-signed-out', 'codex-apikey') {
+        Invoke-FakeLauncherProbe -Launcher 'codex' -Mode $mode
+        $codexRefusals[$mode] = [pscustomobject]@{
+            Error = $script:LauncherProbeError; Listed = @($script:LauncherProbeLines | Where-Object { $_['method'] -ceq 'model/list' }).Count
+            CleanedUp = [bool](Test-FakeProbeCleanedUp)
+        }
+    }
+    Test-That 'a Codex signed out, or signed in with an API key, is not asked for its list, and the folder still goes' {
+        $codexRefusals['codex-signed-out'].Error -ceq ('Codex is signed out rather than with ChatGPT, so its model list may be ' +
+            "the one built into it rather than the account's") -and
+            $codexRefusals['codex-apikey'].Error -ceq ("Codex is signed in with 'apiKey' rather than with ChatGPT, so its model " +
+                "list may be the one built into it rather than the account's") -and
+            @($codexRefusals.Values | Where-Object { $_.Listed -ne 0 -or -not $_.CleanedUp }).Count -eq 0
+    } (ConvertTo-Json -InputObject $codexRefusals -Compress)
+
+    $codexUnconfirmed = [ordered]@{}
+    foreach ($mode in 'codex-no-cache', 'codex-stale', 'codex-no-identity', 'codex-other-list') {
+        Invoke-FakeLauncherProbe -Launcher 'codex' -Mode $mode
+        $codexUnconfirmed[$mode] = $script:LauncherProbeError.Replace(
+            [IO.Path]::Combine($script:FakeCodexHome, 'models_cache.json'), '<cache>')
+    }
+    $unconfirmedPrefix = "^could not confirm that Codex fetched this account's models: '<cache>' "
+    $unconfirmedSuffix = '\. Offline, Codex lists the models built into it instead\z'
+    Test-That 'a list Codex''s cache does not show it fetched - none written, written over five minutes before, for no sign-in, or without a model it offers - is not taken' {
+        $codexUnconfirmed['codex-no-cache'] -cmatch "${unconfirmedPrefix}does not exist$unconfirmedSuffix" -and
+            $codexUnconfirmed['codex-stale'] -cmatch "${unconfirmedPrefix}was fetched 3\d\ds before the list, and Codex keeps it 300s$unconfirmedSuffix" -and
+            $codexUnconfirmed['codex-no-identity'] -cmatch "${unconfirmedPrefix}names no sign-in$unconfirmedSuffix" -and
+            $codexUnconfirmed['codex-other-list'] -cmatch "${unconfirmedPrefix}does not list gpt-5\.5, which Codex answered with$unconfirmedSuffix"
+    } ($codexUnconfirmed.Values -join ' | ')
+    Invoke-FakeLauncherProbe -Launcher 'codex' -Mode 'codex-nanos'
+    Test-That 'a cache dated to the nanosecond, as Codex can write it, is read' {
+        $null -ne $script:LauncherProbeResult -and (@($script:LauncherProbeResult.Models) -join ',') -ceq 'gpt-6.1-sol,gpt-5.5'
+    } (Format-FakeProbeResult)
+    $savedCodexHome = $env:CODEX_HOME
+    $env:CODEX_HOME = $script:FakeCodexHome
+    try { Invoke-FakeLauncherProbe -Launcher 'codex' -Mode 'codex-no-home' }
+    finally {
+        if ($null -eq $savedCodexHome) { Remove-Item -LiteralPath 'Env:CODEX_HOME' -ErrorAction SilentlyContinue }
+        else { $env:CODEX_HOME = $savedCodexHome }
+    }
+    Test-That 'a Codex that does not say where its home is has its cache looked for under CODEX_HOME' {
+        $null -ne $script:LauncherProbeResult -and (@($script:LauncherProbeResult.Models) -join ',') -ceq 'gpt-6.1-sol,gpt-5.5'
+    } (Format-FakeProbeResult)
+
+    # The freshness check on its own: a cache written as each case needs, against a
+    # list answered at 12:05:00 UTC.
+    $cacheCheckPath = [IO.Path]::Combine($lineRoot, 'cache-check', 'models_cache.json')
+    [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($cacheCheckPath))
+    function Test-FakeCodexCache {
+        param([AllowNull()]$Content, [AllowEmptyCollection()][string[]]$Model = @())
+        if ($null -eq $Content) { [IO.File]::Delete($cacheCheckPath) } else { [IO.File]::WriteAllText($cacheCheckPath, $Content) }
+        try {
+            $emitted = @(Assert-BridgeCodexModelCacheFresh -Path $cacheCheckPath -ListedAt ([DateTimeOffset]::new(2026, 10, 8, 12, 5, 0, [TimeSpan]::Zero)) -Model $Model)
+            if ($emitted.Count -eq 0) { 'fresh' } else { "emitted $($emitted -join ',')" }
+        }
+        catch {
+            $match = [regex]::Match($_.Exception.Message, ("^could not confirm that Codex fetched this account's models: (.*)\. " +
+                    'Offline, Codex lists the models built into it instead\z'))
+            if ($match.Success) { $match.Groups[1].Value.Replace($cacheCheckPath, '<cache>') } else { "unexpected: $($_.Exception.Message)" }
+        }
+    }
+    $cacheChecks = [ordered]@{
+        'ten seconds before'      = '{"fetched_at":"2026-10-08T12:04:50.123Z","identity":"chatgpt:a"}'
+        'to the nanosecond'       = '{"fetched_at":"2026-10-08T12:04:50.123456789Z","identity":"chatgpt:a"}'
+        'just under five minutes' = '{"fetched_at":"2026-10-08T12:00:00.001Z","identity":"chatgpt:a"}'
+        'five minutes'            = '{"fetched_at":"2026-10-08T12:00:00Z","identity":"chatgpt:a"}'
+        'a second more'           = '{"fetched_at":"2026-10-08T11:59:59Z","identity":"chatgpt:a"}'
+        'the same instant'        = '{"fetched_at":"2026-10-08T12:05:00Z","identity":"chatgpt:a"}'
+        'a millisecond after'     = '{"fetched_at":"2026-10-08T12:05:00.001Z","identity":"chatgpt:a"}'
+        'dated after'             = '{"fetched_at":"2026-10-08T12:11:40Z","identity":"chatgpt:a"}'
+        'missing'                 = $null
+        'not JSON'                = 'not json'
+        'not an object'           = '[1,2]'
+        'no sign-in'              = '{"fetched_at":"2026-10-08T12:04:50Z"}'
+        'an empty sign-in'        = '{"fetched_at":"2026-10-08T12:04:50Z","identity":""}'
+        'a numeric sign-in'       = '{"fetched_at":"2026-10-08T12:04:50Z","identity":42}'
+        'no time'                 = '{"identity":"chatgpt:a"}'
+        'not a time'              = '{"fetched_at":"soon","identity":"chatgpt:a"}'
+        'a numeric time'          = '{"fetched_at":1760000000,"identity":"chatgpt:a"}'
+    }
+    $cacheVerdicts = [ordered]@{}
+    foreach ($case in @($cacheChecks.Keys)) { $cacheVerdicts[$case] = Test-FakeCodexCache -Content $cacheChecks[$case] }
+    $cacheVerdictText = (@($cacheVerdicts.Keys) | ForEach-Object { "${_}: $($cacheVerdicts[$_])" }) -join ' | '
+    Test-That 'Codex''s cache confirms a list when it names a sign-in and was fetched under five minutes before it, to any precision, and never after it' {
+        $cacheVerdicts['ten seconds before'] -ceq 'fresh' -and $cacheVerdicts['to the nanosecond'] -ceq 'fresh' -and
+            $cacheVerdicts['just under five minutes'] -ceq 'fresh' -and
+            $cacheVerdicts['five minutes'] -ceq "'<cache>' was fetched 300s before the list, and Codex keeps it 300s" -and
+            $cacheVerdicts['a second more'] -ceq "'<cache>' was fetched 301s before the list, and Codex keeps it 300s" -and
+            $cacheVerdicts['the same instant'] -ceq 'fresh' -and
+            $cacheVerdicts['a millisecond after'] -ceq "'<cache>' is dated 0.001s after the list" -and
+            $cacheVerdicts['dated after'] -ceq "'<cache>' is dated 400s after the list"
+    } $cacheVerdictText
+    Test-That 'and says what is wrong with one that is missing, unreadable, or lacks either' {
+        $cacheVerdicts['missing'] -ceq "'<cache>' does not exist" -and
+            $cacheVerdicts['not JSON'] -clike "'<cache>' could not be read (?*)" -and
+            $cacheVerdicts['not JSON'] -cnotlike '*Exception calling*' -and
+            $cacheVerdicts['not an object'] -clike "'<cache>' could not be read (?*)" -and
+            @('no sign-in', 'an empty sign-in', 'a numeric sign-in' |
+                    Where-Object { $cacheVerdicts[$_] -cne "'<cache>' names no sign-in" }).Count -eq 0 -and
+            @('no time', 'not a time', 'a numeric time' |
+                    Where-Object { $cacheVerdicts[$_] -cne "'<cache>' does not say when it was fetched" }).Count -eq 0
+    } $cacheVerdictText
+
+    # And its models, against a list answered with gpt-a and gpt-b: the time alone
+    # cannot tell a file written for the answer from one another Codex sharing the
+    # home wrote just after it.
+    $cacheModelHead = '{"fetched_at":"2026-10-08T12:04:50Z","identity":"chatgpt:a"'
+    $cacheModelChecks = [ordered]@{
+        'every model'       = $cacheModelHead + ',"models":[{"slug":"gpt-b"},{"slug":"gpt-c","visibility":"hide"},{"slug":"gpt-a"}]}'
+        'one missing'       = $cacheModelHead + ',"models":[{"slug":"gpt-a"},{"slug":"GPT-B"}]}'
+        'no models'         = $cacheModelHead + '}'
+        'models not a list' = $cacheModelHead + ',"models":{"slug":"gpt-a"}}'
+        'no slugs'          = $cacheModelHead + ',"models":["gpt-a",{"slug":1},{"id":"gpt-b"},{"model":{"slug":"gpt-b"}}]}'
+    }
+    $cacheModelVerdicts = [ordered]@{}
+    foreach ($case in @($cacheModelChecks.Keys)) {
+        $cacheModelVerdicts[$case] = Test-FakeCodexCache -Content $cacheModelChecks[$case] -Model 'gpt-a', 'gpt-b'
+    }
+    Test-That 'and only once it lists, by its exact name, every model the bridge keeps from the answer, saying which it lacks' {
+        $cacheModelVerdicts['every model'] -ceq 'fresh' -and
+            $cacheModelVerdicts['one missing'] -ceq "'<cache>' does not list gpt-b, which Codex answered with" -and
+            @('no models', 'models not a list', 'no slugs' | Where-Object {
+                    $cacheModelVerdicts[$_] -cne "'<cache>' does not list gpt-a, gpt-b, which Codex answered with" }).Count -eq 0
+    } ((@($cacheModelVerdicts.Keys) | ForEach-Object { "${_}: $($cacheModelVerdicts[$_])" }) -join ' | ')
+
+    Invoke-FakeLauncherProbe -Launcher 'codex' -Mode 'codex-loop'
+    Test-That 'a server handing back a cursor for ever is asked ten pages at most, and what came is kept' {
+        @($script:LauncherProbeLines | Where-Object { $_['method'] -ceq 'model/list' }).Count -eq 10 -and
+            $null -ne $script:LauncherProbeResult -and (@($script:LauncherProbeResult.Models) -join ',') -ceq 'gpt-6.1-sol'
+    } (Format-FakeProbeResult)
+    Invoke-FakeLauncherProbe -Launcher 'codex' -Mode 'codex-error'
+    Test-That 'a refused model/list fails the probe with the refusal and its code, and the folder still goes' {
+        $script:LauncherProbeError -ceq "'model/list' failed: simulated refusal (code -32600)" -and (Test-FakeProbeCleanedUp)
+    } (Format-FakeProbeResult)
+
+    # What each keeps of an answer, against shapes neither CLI should send but nothing
+    # stops one sending: a value reaches a command line, so only a plain name is kept.
+    $claudeConverted = $(try {
+            ConvertFrom-BridgeClaudeModelRoster -Roster @{ models = @(
+                    @{ value = 'default'; supportsEffort = $true; supportedEffortLevels = @('low', 'medium', 'high', 'xhigh', 'max', 'turbo') }
+                    @{ value = 'opus'; supportsEffort = $true; supportedEffortLevels = @('low', 'medium', 'high', 'xhigh', 'max') }
+                    @{ value = 'sonnet[1m]'; supportedEffortLevels = @('high') }
+                    @{ value = 'us.anthropic.claude-opus-5:0'; supportedEffortLevels = @('high') }
+                    @{ value = 'haiku'; supportsEffort = $false; supportedEffortLevels = @('ultra') }
+                    @{ value = 'sonnet'; supportedEffortLevels = @('true', 'HIGH', 'x y', 'minimal', 42, 'low') }
+                    @{ value = 'opus' }
+                    @{ value = '-p' }
+                    @{ value = 42 }
+                    'not-an-object'
+                ) }
+        }
+        catch { $_.Exception.Message })
+    Test-That 'Claude''s list keeps plain names once each, and the efforts of every entry that takes one' {
+        $claudeConverted -isnot [string] -and (@($claudeConverted.Models) -join ',') -ceq 'opus,haiku,sonnet' -and
+            (@($claudeConverted.Efforts) -join ',') -ceq 'minimal,low,medium,high,xhigh,max,turbo'
+    } (ConvertTo-Json -InputObject $claudeConverted -Compress -Depth 4)
+    Test-That 'and each offered model''s own, none for one that takes none, and default''s with no model of its own' {
+        $claudeConverted -isnot [string] -and $claudeConverted.EffortsKnown -eq $true -and
+            (Format-ModelEfforts $claudeConverted.ModelEfforts) -ceq 'haiku= opus=low+medium+high+xhigh+max sonnet=minimal+low'
+    } (ConvertTo-Json -InputObject $claudeConverted -Compress -Depth 4)
+    $claudeEffortCases = foreach ($models in @(
+            , @(@{ value = 'opus' }, @{ value = 'sonnet'; supportsEffort = $true })
+            , @(@{ value = 'opus'; supportsEffort = $false }, @{ value = 'haiku'; supportsEffort = $false; supportedEffortLevels = @('high') })
+        )) {
+        $converted = ConvertFrom-BridgeClaudeModelRoster -Roster @{ models = $models }
+        "$($converted.EffortsKnown):$(@($converted.Efforts) -join '+'):$(Format-ModelEfforts $converted.ModelEfforts)"
+    }
+    Test-That 'a list that never says what effort a model takes leaves efforts unknown, and one where none takes any knows that' {
+        ($claudeEffortCases -join ' | ') -ceq 'False:: | True::haiku= opus='
+    } ($claudeEffortCases -join ' | ')
+    $claudeShapeErrors = @(@{ models = 'opus' }, @{ models = @{ value = 'opus' } }, @{} | ForEach-Object {
+            $roster = $_
+            try { [void](ConvertFrom-BridgeClaudeModelRoster -Roster $roster); 'no error' } catch { $_.Exception.Message }
+        })
+    Test-That 'an answer without a model list, or with one of the wrong shape, is an error rather than an empty list' {
+        $claudeShapeErrors.Count -eq 3 -and
+            @($claudeShapeErrors | Where-Object { $_ -cne 'Claude answered without a model list' }).Count -eq 0
+    } ($claudeShapeErrors -join ' | ')
+    $claudeNothingUsable = $(try {
+            ConvertFrom-BridgeClaudeModelRoster -Roster @{ models = @(@{ value = 'default' }, @{ value = 'sonnet[1m]' }) }
+        }
+        catch { $_.Exception.Message })
+    Test-That 'and so is a list with nothing worth offering, saying how many entries it had' {
+        $claudeNothingUsable -ceq 'Claude listed no usable models (2 entries)'
+    } "$claudeNothingUsable"
+
+    $codexConverted = $(try {
+            ConvertFrom-BridgeCodexModelRoster -Entry @(
+                @{ id = 'gpt-6.1-sol'; model = 'gpt-6.1-sol'; hidden = $false
+                    supportedReasoningEfforts = @(@{ reasoningEffort = 'low' }, @{ reasoningEffort = 'ultra' })
+                }
+                @{ id = 'gpt-6-astra'; model = 'gpt-6-astra'; hidden = $true; supportedReasoningEfforts = @(@{ reasoningEffort = 'mega' }) }
+                @{ id = 'gpt-5.5'; supportedReasoningEfforts = @('medium', 'xhigh', 'inf') }
+                @{ id = 'x'; model = 'gpt-6.1-sol' }
+                @{ model = 'bad name' }
+                @{ model = 'ollama/llama3' }
+            )
+        }
+        catch { $_.Exception.Message })
+    Test-That 'Codex''s list leaves hidden models out, names one by its id when it has no model, and keeps plain names once each' {
+        $codexConverted -isnot [string] -and (@($codexConverted.Models) -join ',') -ceq 'gpt-6.1-sol,gpt-5.5' -and
+            (@($codexConverted.Efforts) -join ',') -ceq 'low,medium,xhigh,ultra'
+    } (ConvertTo-Json -InputObject $codexConverted -Compress -Depth 4)
+    Test-That 'and each listed model''s own efforts, the first entry for a name being the one kept' {
+        $codexConverted -isnot [string] -and $codexConverted.EffortsKnown -eq $true -and
+            (Format-ModelEfforts $codexConverted.ModelEfforts) -ceq 'gpt-5.5=medium+xhigh gpt-6.1-sol=low+ultra'
+    } (ConvertTo-Json -InputObject $codexConverted -Compress -Depth 4)
+    $codexEffortCases = foreach ($entries in @(
+            , @(@{ model = 'gpt-6.1-sol' }, @{ model = 'gpt-5.5'; supportedReasoningEfforts = 'high' })
+            , @(@{ model = 'gpt-6.1-sol'; supportedReasoningEfforts = @() }, @{ model = 'gpt-5.5' })
+        )) {
+        $converted = ConvertFrom-BridgeCodexModelRoster -Entry $entries
+        "$($converted.EffortsKnown):$(@($converted.Efforts) -join '+'):$(Format-ModelEfforts $converted.ModelEfforts)"
+    }
+    Test-That 'models listed without their efforts leave efforts unknown, and one listed as taking none knows that' {
+        ($codexEffortCases -join ' | ') -ceq 'False:: | True::gpt-6.1-sol='
+    } ($codexEffortCases -join ' | ')
+    $codexEmpty = $(try { ConvertFrom-BridgeCodexModelRoster -Entry @() } catch { $_.Exception.Message })
+    $codexAllHidden = $(try {
+            ConvertFrom-BridgeCodexModelRoster -Entry @(@{ model = 'gpt-6-astra'; hidden = $true })
+        }
+        catch { $_.Exception.Message })
+    Test-That 'an empty list, or one of hidden models only, is an error saying how many entries it had' {
+        $codexEmpty -ceq 'Codex listed no usable models (0 entries)' -and
+            $codexAllHidden -ceq 'Codex listed no usable models (1 entries)'
+    } "$codexEmpty | $codexAllHidden"
+
+    # The cache in front of both, read through the selectors. One answer fills a
+    # launcher's model and effort lists, and is kept and retried as Copilot's is.
+    $script:LauncherRosterCalls = @{ claude = 0; codex = 0 }
+    $script:LauncherRosterPath = @{ claude = ''; codex = '' }
+    $script:LauncherRosterFailure = @{ claude = $null; codex = $null }
+    $script:LauncherRoster = @{
+        claude = [pscustomobject]@{
+            Models = @('opus', 'sonnet'); Efforts = @('low', 'high')
+            EffortsKnown = $true; ModelEfforts = @{ opus = @('low', 'high'); sonnet = @('low') }
+        }
+        codex  = [pscustomobject]@{
+            Models = @('gpt-6.1-sol'); Efforts = @('medium', 'ultra')
+            EffortsKnown = $true; ModelEfforts = @{ 'gpt-6.1-sol' = @('medium', 'ultra') }
+        }
+    }
+    function Get-FakeLauncherRoster {
+        param([string]$Launcher, [string]$Path)
+        $script:LauncherRosterCalls[$Launcher]++
+        $script:LauncherRosterPath[$Launcher] = $Path
+        if ($script:LauncherRosterFailure[$Launcher]) { throw $script:LauncherRosterFailure[$Launcher] }
+        $script:LauncherRoster[$Launcher]
+    }
+    function Get-BridgeClaudeModelRoster {
+        param([string]$Path, [int]$TimeoutMs = 20000)
+        Get-FakeLauncherRoster -Launcher 'claude' -Path $Path
+    }
+    function Get-BridgeCodexModelRoster {
+        param([string]$Path, [int]$TimeoutMs = 20000)
+        Get-FakeLauncherRoster -Launcher 'codex' -Path $Path
+    }
+    $script:FakeClaudeExe = 'C:\fake-claude.exe'
+    function Get-BridgeClaudePath { $script:FakeClaudeExe }
+    function Get-BridgeCodexPath { 'C:\fake-codex.exe' }
+    function Get-LastLauncherModelLog {
+        param([string]$Label)
+        if (-not (Test-Path -LiteralPath $script:testLogFile)) { return '' }
+        [string](@(Get-Content -LiteralPath $script:testLogFile | Where-Object { $_ -match "$Label model discovery" }) |
+                Select-Object -Last 1)
+    }
+    function Get-LastLauncherModelRetry {
+        param([string]$Label)
+        [int][regex]::Match((Get-LastLauncherModelLog -Label $Label), 'retrying in (\d+)s').Groups[1].Value
+    }
+
+    $script:FakeSettings = @{}
+    $script:BridgeLauncherModelCache = @{}
+    $claudeModelChoices = @(Get-BridgeTuningOptions -Launcher 'claude' -Axis 'model')
+    $claudeCallsAfterModels = $script:LauncherRosterCalls['claude']
+    $claudeEffortChoices = @(Get-BridgeTuningOptions -Launcher 'claude' -Axis 'effort')
+    Test-That 'a cold start asks Claude once, and offers the models it lists instead of the built-in ones' {
+        ($claudeModelChoices -join ',') -ceq 'Agent default,opus,sonnet' -and $claudeCallsAfterModels -eq 1 -and
+            $script:LauncherRosterPath['claude'] -ceq 'C:\fake-claude.exe'
+    } ($claudeModelChoices -join ',')
+    Test-That 'and the efforts from the same answer, without asking again' {
+        ($claudeEffortChoices -join ',') -ceq 'Agent default,low,high' -and $script:LauncherRosterCalls['claude'] -eq 1
+    } "$($claudeEffortChoices -join ',') after $($script:LauncherRosterCalls['claude']) call(s)"
+    Test-That 'a listed model is accepted from Home Assistant, and a built-in one Claude did not list is not' {
+        (Resolve-BridgeTuningValue -Launcher 'claude' -Axis 'model' -Value 'sonnet') -ceq 'sonnet' -and
+            (Resolve-BridgeTuningValue -Launcher 'claude' -Axis 'model' -Value 'fable') -ceq ''
+    }
+    $codexModelChoices = @(Get-BridgeTuningOptions -Launcher 'codex' -Axis 'model')
+    $codexEffortChoices = @(Get-BridgeTuningOptions -Launcher 'codex' -Axis 'effort')
+    Test-That 'Codex is asked on its own, and its answer fills both of its lists' {
+        ($codexModelChoices -join ',') -ceq 'Agent default,gpt-6.1-sol' -and
+            ($codexEffortChoices -join ',') -ceq 'Agent default,medium,ultra' -and
+            $script:LauncherRosterCalls['codex'] -eq 1 -and $script:LauncherRosterPath['codex'] -ceq 'C:\fake-codex.exe'
+    } "$($codexModelChoices -join ',') / $($codexEffortChoices -join ',')"
+
+    $script:BridgeLauncherModelCache['claude'].At = [DateTimeOffset]::Now.AddHours(-5)
+    [void](Get-BridgeTuningOptions -Launcher 'claude' -Axis 'model')
+    Test-That 'the answer is reused for hours' { $script:LauncherRosterCalls['claude'] -eq 1 }
+    $script:BridgeLauncherModelCache['claude'].At = [DateTimeOffset]::Now.AddHours(-6).AddSeconds(-1)
+    [void](Get-BridgeTuningOptions -Launcher 'claude' -Axis 'model')
+    Test-That 'and asked for again after six' { $script:LauncherRosterCalls['claude'] -eq 2 }
+
+    $script:LauncherRosterFailure['claude'] = 'simulated Claude failure'
+    $script:BridgeLauncherModelCache['claude'].At = [DateTimeOffset]::Now.AddHours(-7)
+    $keptClaudeModels = @(Get-BridgeTuningOptions -Launcher 'claude' -Axis 'model')
+    $keptClaudeEfforts = @(Get-BridgeTuningOptions -Launcher 'claude' -Axis 'effort')
+    $keptClaudeTakes = Format-ModelEfforts (Get-BridgeLauncherModelDiscovery -Launcher 'claude').ModelEfforts
+    Test-That 'a failed refresh keeps both of the last good lists and logs why' {
+        ($keptClaudeModels -join ',') -ceq 'Agent default,opus,sonnet' -and
+            ($keptClaudeEfforts -join ',') -ceq 'Agent default,low,high' -and
+            $keptClaudeTakes -ceq 'opus=low+high sonnet=low' -and
+            (Get-LastLauncherModelLog -Label 'Claude') -match ("failed for 'C:\\fake-claude\.exe': simulated Claude failure\. " +
+                'Keeping 2 cached model\(s\); retrying in 60s')
+    } "$(Get-LastLauncherModelLog -Label 'Claude') / $keptClaudeTakes"
+    $launcherRetryWaits = foreach ($attempt in 1..6) {
+        $script:BridgeLauncherModelCache['claude'].At = [DateTimeOffset]::Now.AddSeconds(-(Get-LastLauncherModelRetry -Label 'Claude') - 1)
+        [void](Get-BridgeLauncherModelDiscovery -Launcher 'claude')
+        Get-LastLauncherModelRetry -Label 'Claude'
+    }
+    Test-That 'repeated failures back off as Copilot''s do, and keep the lists throughout' {
+        ($launcherRetryWaits -join ',') -ceq '120,240,480,960,1800,1800' -and
+            ((Get-BridgeTuningOptions -Launcher 'claude' -Axis 'model') -join ',') -ceq 'Agent default,opus,sonnet'
+    } "waits $($launcherRetryWaits -join ',')"
+    $script:LauncherRosterFailure['claude'] = $null
+    $script:BridgeLauncherModelCache['claude'].At = [DateTimeOffset]::Now.AddSeconds(-1801)
+    [void](Get-BridgeLauncherModelDiscovery -Launcher 'claude')
+    Test-That 'recovery is logged' {
+        (Get-LastLauncherModelLog -Label 'Claude') -match "recovered: found 2 model\(s\) from 'C:\\fake-claude\.exe'"
+    } (Get-LastLauncherModelLog -Label 'Claude')
+    Test-That 'and none of it touched Codex''s answer' {
+        $script:LauncherRosterCalls['codex'] -eq 1 -and -not $script:BridgeLauncherModelCache['codex'].Failed
+    }
+
+    $script:LauncherRosterFailure['claude'] = 'simulated Claude failure'
+    $script:LauncherRosterFailure['codex'] = 'simulated Codex failure'
+    $script:BridgeLauncherModelCache = @{}
+    $fallbackChoices = @(
+        (@(Get-BridgeTuningOptions -Launcher 'claude' -Axis 'model') -join ',')
+        (@(Get-BridgeTuningOptions -Launcher 'claude' -Axis 'effort') -join ',')
+        (@(Get-BridgeTuningOptions -Launcher 'codex' -Axis 'model') -join ',')
+        (@(Get-BridgeTuningOptions -Launcher 'codex' -Axis 'effort') -join ',')
+    ) -join ' / '
+    Test-That 'a failure with nothing cached offers each built-in list instead, and says so' {
+        $fallbackChoices -ceq ('Agent default,opus,sonnet,haiku,fable / Agent default,low,medium,high,xhigh,max / ' +
+            'Agent default,gpt-6.1-sol,gpt-6-sol,gpt-6-luna / Agent default,low,medium,high,xhigh,max,ultra') -and
+            (Get-LastLauncherModelLog -Label 'Claude') -match 'Keeping 0 cached model\(s\); retrying in 60s' -and
+            (Get-LastLauncherModelLog -Label 'Codex') -match 'Keeping 0 cached model\(s\); retrying in 60s'
+    } $fallbackChoices
+
+    $script:LauncherRosterFailure['claude'] = $null
+    $script:BridgeLauncherModelCache = @{}
+    $claudeCallsBefore = $script:LauncherRosterCalls['claude']
+    $script:FakeSettings = @{ 'newSession.models.claude' = @('opus') }
+    $configuredClaudeChoices = @(Get-BridgeTuningOptions -Launcher 'claude' -Axis 'model')
+    $script:FakeSettings = @{}
+    Test-That 'a configured list is offered as it is, without asking Claude' {
+        ($configuredClaudeChoices -join ',') -ceq 'Agent default,opus' -and $script:LauncherRosterCalls['claude'] -eq $claudeCallsBefore
+    } ($configuredClaudeChoices -join ',')
+
+    $script:FakeClaudeExe = $null
+    $missingClaudeChoices = @(Get-BridgeTuningOptions -Launcher 'claude' -Axis 'model')
+    Test-That 'with no Claude installed the built-in list stands, nothing is started, and the log says why' {
+        ($missingClaudeChoices -join ',') -ceq 'Agent default,opus,sonnet,haiku,fable' -and
+            $script:LauncherRosterCalls['claude'] -eq $claudeCallsBefore -and
+            (Get-LastLauncherModelLog -Label 'Claude') -match 'Claude executable was not found'
+    } (Get-LastLauncherModelLog -Label 'Claude')
+
+    # The Effort list offers every effort some model takes, so it can offer one the
+    # chosen model does not. A launch moves that to the nearest the model does take.
+    $script:FakeClaudeExe = 'C:\fake-claude.exe'
+    $script:LauncherRosterFailure = @{ claude = $null; codex = $null }
+    $script:LauncherRoster['codex'] = [pscustomobject]@{
+        Models       = @('gpt-6.1-sol', 'gpt-5.5', 'gpt-oss', 'gpt-lab')
+        Efforts      = @('low', 'medium', 'high', 'xhigh', 'max', 'ultra', 'alpha', 'beta', 'gamma')
+        EffortsKnown = $true
+        ModelEfforts = @{
+            'gpt-6.1-sol' = @('low', 'medium', 'high', 'xhigh', 'max', 'ultra')
+            'gpt-5.5'     = @('medium', 'xhigh')
+            'gpt-oss'     = @()
+            'gpt-lab'     = @('alpha', 'beta', 'gamma')
+        }
+    }
+    $script:BridgeLauncherModelCache = @{}
+    $effortHolds = foreach ($case in @(
+            , @('codex', 'gpt-6.1-sol', 'minimal', 'low')
+            , @('codex', 'gpt-6.1-sol', 'none', 'low')
+            , @('codex', 'gpt-6.1-sol', 'turbo', 'high')
+            , @('codex', 'gpt-5.5', 'high', 'medium')
+            , @('codex', 'gpt-5.5', 'ultra', 'xhigh')
+            , @('codex', 'gpt-5.5', 'low', 'medium')
+            , @('codex', 'gpt-oss', 'high', '')
+            , @('codex', 'gpt-lab', 'high', 'beta')
+            , @('codex', 'gpt-lab', 'beta', 'beta')
+            , @('codex', 'gpt-9', 'minimal', 'minimal')
+            , @('codex', '', 'minimal', 'minimal')
+            , @('codex', 'gpt-6.1-sol', '', '')
+            , @('copilot', 'gpt-6.1-sol', 'minimal', 'minimal')
+            , @('claude', 'sonnet', 'high', 'low')
+        )) {
+        $held = $(try { Resolve-BridgeModelEffort -Launcher $case[0] -Model $case[1] -Effort $case[2] } catch { "threw: $($_.Exception.Message)" })
+        [pscustomobject]@{ Case = "$($case[0]) '$($case[1])' '$($case[2])'"; Held = $held; Expected = $case[3] }
+    }
+    $wrongHolds = @($effortHolds | Where-Object { $_.Held -isnot [string] -or $_.Held -cne $_.Expected })
+    Test-That 'an effort the model does not take moves to the nearest it does, the weaker of two, its middle if they cannot be compared, or none' {
+        @($effortHolds).Count -eq 14 -and $wrongHolds.Count -eq 0
+    } (($wrongHolds | ForEach-Object { "$($_.Case) held '$($_.Held)', not '$($_.Expected)'" }) -join ' | ')
+
+    function Get-EffortHoldLog {
+        if (-not (Test-Path -LiteralPath $script:testLogFile)) { return @() }
+        @(Get-Content -LiteralPath $script:testLogFile | Where-Object { $_ -match 'does not take effort' })
+    }
+    $holdLogsBefore = @(Get-EffortHoldLog).Count
+    $launchHeld = Resolve-BridgeLaunchTuning -Launcher 'codex' -Model 'gpt-5.5' -Effort 'high' -Context ''
+    $holdLogsAfter = @(Get-EffortHoldLog)
+    Test-That 'a launch passes the effort the model takes, and logs what it moved' {
+        $launchHeld['model'] -ceq 'gpt-5.5' -and $launchHeld['effort'] -ceq 'medium' -and $launchHeld['context'] -ceq '' -and
+            $holdLogsAfter.Count -eq $holdLogsBefore + 1 -and
+            [string]($holdLogsAfter | Select-Object -Last 1) -cmatch "Codex model 'gpt-5\.5' does not take effort 'high'; starting it with 'medium'\.$"
+    } "$(ConvertTo-Json -InputObject $launchHeld -Compress) / $($holdLogsAfter | Select-Object -Last 1)"
+    $launchKept = Resolve-BridgeLaunchTuning -Launcher 'codex' -Model 'gpt-6.1-sol' -Effort 'high' -Context ''
+    $launchUnmodelled = Resolve-BridgeLaunchTuning -Launcher 'codex' -Model '' -Effort 'max' -Context ''
+    Test-That 'and an effort the model takes, or one chosen with no model, as it is, logging nothing' {
+        $launchKept['model'] -ceq 'gpt-6.1-sol' -and $launchKept['effort'] -ceq 'high' -and
+            $launchUnmodelled['model'] -ceq '' -and $launchUnmodelled['effort'] -ceq 'max' -and
+            @(Get-EffortHoldLog).Count -eq $holdLogsAfter.Count
+    } "$(ConvertTo-Json -InputObject $launchKept -Compress) / $(ConvertTo-Json -InputObject $launchUnmodelled -Compress)"
+    $script:FakeSettings = @{ 'newSession.efforts.codex' = @('minimal', 'xhigh') }
+    $launchUnlisted = Resolve-BridgeLaunchTuning -Launcher 'codex' -Model 'gpt-6.1-sol' -Effort 'minimal' -Context ''
+    $script:FakeSettings = @{}
+    Test-That 'a nearest effort the configured list leaves out is not passed, and the log says no effort' {
+        $launchUnlisted['effort'] -ceq '' -and
+            [string](Get-EffortHoldLog | Select-Object -Last 1) -cmatch "Codex model 'gpt-6\.1-sol' does not take effort 'minimal'; starting it with no effort\.$"
+    } "$(ConvertTo-Json -InputObject $launchUnlisted -Compress) / $(Get-EffortHoldLog | Select-Object -Last 1)"
+
+    # The same through a roster made from Codex's own answer, whose map is not a hashtable.
+    $script:LauncherRoster['codex'] = ConvertFrom-BridgeCodexModelRoster -Entry @(
+        @{ model = 'gpt-5.5'; supportedReasoningEfforts = @('medium', 'xhigh') }
+        @{ model = 'gpt-oss'; supportedReasoningEfforts = @() }
+    )
+    $script:BridgeLauncherModelCache = @{}
+    $convertedHolds = $(try {
+            @(foreach ($model in 'gpt-5.5', 'gpt-oss') { "$model=$(Resolve-BridgeModelEffort -Launcher 'codex' -Model $model -Effort 'high')" }) -join ' '
+        }
+        catch { "threw: $($_.Exception.Message)" })
+    Test-That 'and the same for the models Codex''s own list describes' {
+        $convertedHolds -ceq 'gpt-5.5=medium gpt-oss='
+    } $convertedHolds
+
+    # An answer that no model takes an effort is an answer: only Agent default is
+    # offered. One that does not say leaves the built-in list standing.
+    $script:LauncherRoster['codex'] = [pscustomobject]@{
+        Models = @('gpt-oss'); Efforts = @(); EffortsKnown = $true; ModelEfforts = @{ 'gpt-oss' = @() }
+    }
+    $script:BridgeLauncherModelCache = @{}
+    $noEffortChoices = @(Get-BridgeTuningOptions -Launcher 'codex' -Axis 'effort')
+    $script:LauncherRoster['codex'] = [pscustomobject]@{ Models = @('gpt-oss'); Efforts = @(); EffortsKnown = $false; ModelEfforts = @{} }
+    $script:BridgeLauncherModelCache = @{}
+    $unsaidEffortChoices = @(Get-BridgeTuningOptions -Launcher 'codex' -Axis 'effort')
+    Test-That 'models that take no effort leave only Agent default to offer, and models that do not say leave the built-in list' {
+        ($noEffortChoices -join ',') -ceq 'Agent default' -and
+            ($unsaidEffortChoices -join ',') -ceq 'Agent default,low,medium,high,xhigh,max,ultra'
+    } "$($noEffortChoices -join ',') / $($unsaidEffortChoices -join ',')"
+}
+finally {
+    if ($null -ne $lineChild) { [void](Stop-BridgeJsonRpcProcess -Connection $lineChild -GraceMs 0) }
+    Remove-Item -LiteralPath $lineRoot -Recurse -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath 'Env:BRIDGE_TEST_PARENT' -ErrorAction SilentlyContinue
+    ${function:Get-BridgeLauncherModelDiscovery} = $savedLauncherDiscovery
+    ${function:Get-BridgeClaudePath} = $savedDiscoveryClaudePath
+    ${function:Get-BridgeCodexPath} = $savedDiscoveryCodexPath
+    ${function:Start-BridgeJsonLineProcess} = $savedLineStart
+    ${function:Get-BridgeClaudeModelRoster} = $savedClaudeRoster
+    ${function:Get-BridgeCodexModelRoster} = $savedCodexRoster
+    $script:BridgeLauncherModelCache = @{}
+    $script:FakeSettings = @{}
+}
+
 # Three per-launch settings, spelled differently by every agent: Copilot has
 # --reasoning-effort and --context, Claude has --effort and (having no real context
 # switch) --autocompact, Codex has neither and takes both as `-c` overrides. Each was
@@ -969,7 +1902,9 @@ finally {
 # lists here are what those parsers actually accept.
 #
 # Discovery is shadowed throughout: the real one holds a throwaway session with the
-# Copilot CLI, which is neither offline nor stable enough to assert on.
+# Copilot CLI, which is neither offline nor stable enough to assert on. Claude's and
+# Codex's have been shadowed since the top, finding nothing, so those two offer their
+# built-in lists here.
 function Get-BridgeCopilotModelList { @('gpt-5.4', 'claude-opus-5') }
 
 $script:FakeSettings = @{}
@@ -992,7 +1927,7 @@ Test-That 'Agency offers Copilot\''s lists, because it builds a Copilot command 
 Test-That 'each agent offers its own efforts' {
     (Get-BridgeTuningOptions -Launcher 'claude' -Axis 'effort') -contains 'max' -and
     (Get-BridgeTuningOptions -Launcher 'claude' -Axis 'effort') -notcontains 'none' -and
-    (Get-BridgeTuningOptions -Launcher 'codex' -Axis 'effort') -contains 'minimal' -and
+    (Get-BridgeTuningOptions -Launcher 'codex' -Axis 'effort') -contains 'ultra' -and
     (Get-BridgeTuningOptions -Launcher 'copilot' -Axis 'effort') -contains 'none'
 }
 Test-That 'Claude\''s context options are autocompact sizes, which is all it has' {
@@ -1074,7 +2009,7 @@ Test-That 'and a configured default opens the selector there' {
     (Get-BridgeDefaultTuning -Launcher 'claude' -Axis 'effort') -eq 'high'
 }
 Test-That 'a launcher with nothing configured is unaffected' {
-    (Get-BridgeTuningOptions -Launcher 'codex' -Axis 'model') -contains 'gpt-5.3-codex'
+    (Get-BridgeTuningOptions -Launcher 'codex' -Axis 'model') -contains 'gpt-6.1-sol'
 }
 
 $script:FakeSettings = @{}

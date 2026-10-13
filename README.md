@@ -417,7 +417,7 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `newSession.resumeCount` | How many recent sessions the Resume dropdown offers (default `12`) |
 | `newSession.model` | Model preselected on the card (default: **Agent default** — the CLI's own choice). Applies to Copilot and Agency; `newSession.model.claude` / `.codex` do the same per agent |
 | `newSession.effort.<agent>` / `.context.<agent>` | Reasoning effort and context window preselected on the card, per agent (`copilot`, `claude`, `codex`; Agency reads Copilot's) |
-| `newSession.models.<agent>` | Replace the model list the card offers, e.g. `"models": { "copilot": ["auto", "claude-opus-5"] }`. Copilot's is otherwise asked of the CLI: the models this account can use; `efforts.<agent>` and `contexts.<agent>` do the same for the other two axes |
+| `newSession.models.<agent>` | Replace the model list the card offers, e.g. `"models": { "copilot": ["auto", "claude-opus-5"] }`. Otherwise each agent's list is asked of its CLI: the models this account can use; `efforts.<agent>` and `contexts.<agent>` do the same for the other two axes |
 | `newSession.allowAllTools` | What the card's **Permissions** row opens on (default `false`). **Allow all** launches without permission prompts: `--allow-all` for Copilot, `--dangerously-skip-permissions` for Claude, `--ask-for-approval never` for Codex, and it answers Claude's folder-trust dialog rather than waiting for a second press. The card decides each launch, so a session started on another machine no longer silently takes that machine's setting |
 | `newSession.extraArgs` | Extra CLI arguments for launched sessions, e.g. `["--plan"]` |
 | `newSession.copilotPath` | Full path to `copilot.exe` if it is not on the daemon's PATH |
@@ -826,9 +826,49 @@ and retries after a minute, the wait doubling up to half an hour. On a cold star
 no previous successful discovery, *Agent default* and `auto` remain available until a
 retry succeeds. Failures and recovery are recorded in the daemon log
 (`agent-ha-bridge logs`), or the bridge log outside the daemon.
-The other two ship with a short built-in list,
-which `newSession.models.<agent>` replaces — worth doing for Copilot too, since
-nearly thirty options on a phone is a scroll rather than a choice.
+
+Claude's and Codex's lists are asked of their CLIs too, with the same time limit, cache
+and retries. For Claude the daemon starts `claude -p` the way Claude's own SDK does and
+sends only the SDK's opening `initialize` request, whose answer lists the models Claude's
+`/model` picker shows this account; its `default` entry is left out, since *Agent
+default* already means it. It runs in `--safe-mode`, which keeps the sign-in but loads no
+hooks, plugins, skills, MCP servers or `CLAUDE.md`, and with `--no-session-persistence`.
+Once it has answered, Claude gets ten seconds to exit by itself before it is stopped, since
+it may still be saving its settings to `~/.claude.json`.
+For Codex the daemon starts `codex app-server`, as Codex's IDE extensions do, and pages
+through `model/list`, leaving out the models Codex hides from its own picker. Plugins are
+turned off for that one process: an app-server otherwise starts refreshing Codex's plugin
+marketplace as it comes up, and a probe gone a second later would leave that refresh's
+temporary folders in `~/.codex/.tmp` every time. Neither
+probe sends a prompt or keeps a session, so neither spends anything or counts as use, and
+each takes a second or two.
+
+Codex answers `model/list` even when it cannot reach OpenAI, with the models packaged
+with it, and its answer does not say which it gave. So the daemon takes it only when it
+can tell it was this account's: Codex must be signed in with ChatGPT - an API key or
+another provider is refused, since Codex then has no plan to ask about - and the
+`models_cache.json` in Codex's home, which Codex rewrites only after fetching the
+account's list, must name the sign-in, be dated within the five minutes before the
+answer, and list every model in it. Anything else counts as a failed discovery, which
+keeps the last good list, and the daemon log says which check failed. One case still gets
+through: switching Codex to another sign-in or updating it, and losing the network, all
+within the same five minutes, when that earlier list has every model packaged with
+Codex; the next discovery that reaches OpenAI puts that right.
+
+The Effort row offers every effort some listed model takes. Claude and Codex also say
+which efforts each model takes, so a launch that pairs a model with one it does not take
+starts it with the nearest one it does - the weaker of two equally near, or the middle of
+its list when they cannot be compared, which is how Codex itself chooses - or with no
+effort when the model takes none, or when `newSession.efforts.<agent>` leaves the nearest
+one out. That needs a model to have been chosen, on the card or in
+`newSession.model.<agent>`, since otherwise the CLI picks it. The move is written to the
+daemon log, and the session's card shows the effort the session really got. When
+discovery finds that no listed model takes an effort, the row offers only *Agent
+default*.
+
+Claude and Codex keep a short built-in list, offered only until their discovery first
+succeeds. `newSession.models.<agent>` replaces any agent's list — worth doing for
+Copilot, since nearly thirty options on a phone is a scroll rather than a choice.
 
 A value arriving from Home Assistant is validated against that agent's list before it
 reaches a command line, exactly as a workspace label is. An unrecognised one quietly
