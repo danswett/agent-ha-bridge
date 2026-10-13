@@ -834,7 +834,10 @@ sends only the SDK's opening `initialize` request, whose answer lists the models
 default* already means it. It runs in `--safe-mode`, which keeps the sign-in but loads no
 hooks, plugins, skills, MCP servers or `CLAUDE.md`, and with `--no-session-persistence`.
 For Codex the daemon starts `codex app-server`, as Codex's IDE extensions do, and pages
-through `model/list`, leaving out the models Codex hides from its own picker. Neither
+through `model/list`, leaving out the models Codex hides from its own picker. Plugins are
+turned off for that one process: an app-server otherwise starts refreshing Codex's plugin
+marketplace as it comes up, and a probe gone a second later would leave that refresh's
+temporary folders in `~/.codex/.tmp` every time. Neither
 probe sends a prompt or keeps a session, so neither spends anything or counts as use, and
 each takes a second or two. The Effort row for each offers every effort some listed model
 accepts.

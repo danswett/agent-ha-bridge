@@ -1337,9 +1337,9 @@ while ($true) {
             (@($script:LauncherProbeResult.Models) -join ',') -ceq 'gpt-6.1-sol,gpt-5.5' -and
             (@($script:LauncherProbeResult.Efforts) -join ',') -ceq 'low,medium,high,xhigh,max,ultra'
     } (Format-FakeProbeResult)
-    Test-That 'it starts the app-server and nothing more, in an empty scratch folder that is gone afterwards' {
+    Test-That 'it starts the app-server with plugins off and nothing more, in an empty scratch folder that is gone afterwards' {
         $launched = $script:LineStarts[0]
-        $launched.Executable -ceq 'C:\fake-codex.exe' -and ($launched.Arguments -join ' ') -ceq 'app-server' -and
+        $launched.Executable -ceq 'C:\fake-codex.exe' -and ($launched.Arguments -join ' ') -ceq '-c features.plugins=false app-server' -and
             $null -eq $launched.Environment -and $launched.Entries -eq 0 -and (Test-FakeProbeCleanedUp)
     } (Format-FakeProbeStart)
     Test-That 'introduces the bridge, then asks for each page by the cursor the one before gave' {

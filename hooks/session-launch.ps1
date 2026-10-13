@@ -2442,6 +2442,13 @@ function Get-BridgeCodexModelRoster {
         server is a separate `app-server daemon` - and starts in an empty scratch
         folder.
 
+        Plugins are turned off for this one process. An app-server otherwise starts
+        refreshing Codex's curated plugin marketplace as it comes up - a git
+        ls-remote and, when that has moved, a clone of openai/plugins, both under
+        CODEX_HOME\.tmp - and a probe this short cuts that off partway every time,
+        leaving its temporary folders behind. The model list does not depend on
+        plugins, and Codex's own sessions keep whatever their config says.
+
         While it runs, the probe is a codex process outside app-server-daemon, which
         is how the bridge tells that background server from a window
         (Test-BridgeCodexAppServer), so for that second it looks like a window. A
@@ -2472,7 +2479,7 @@ function Get-BridgeCodexModelRoster {
     $connection = $null
     try {
         [void][IO.Directory]::CreateDirectory($workingDirectory)
-        $connection = Start-BridgeJsonLineProcess -Executable $Path -WorkingDirectory $workingDirectory -Arguments @('app-server')
+        $connection = Start-BridgeJsonLineProcess -Executable $Path -WorkingDirectory $workingDirectory -Arguments @('-c', 'features.plugins=false', 'app-server')
         [void](Invoke-BridgeJsonLineRequest -Connection $connection -Method 'initialize' -Deadline $deadline -Params ([ordered]@{
                     clientInfo = [ordered]@{ name = 'agent-ha-bridge'; title = 'agent-ha-bridge'; version = $version }
                 }))
