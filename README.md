@@ -848,11 +848,12 @@ with it, and its answer does not say which it gave. So the daemon takes it only 
 can tell it was this account's: Codex must be signed in with ChatGPT - an API key or
 another provider is refused, since Codex then has no plan to ask about - and the
 `models_cache.json` in Codex's home, which Codex rewrites only after fetching the
-account's list, must name the sign-in and be dated within the five minutes before the
-answer. Anything else counts as a failed discovery, which keeps the last good list, and
-the daemon log says which check failed. One case still gets through: switching Codex to
-another sign-in or updating it, and losing the network, all within the same five
-minutes; the next discovery that reaches OpenAI puts that right.
+account's list, must name the sign-in, be dated within the five minutes before the
+answer, and list every model in it. Anything else counts as a failed discovery, which
+keeps the last good list, and the daemon log says which check failed. One case still gets
+through: switching Codex to another sign-in or updating it, and losing the network, all
+within the same five minutes, when that earlier list has every model packaged with
+Codex; the next discovery that reaches OpenAI puts that right.
 
 The Effort row offers every effort some listed model takes. Claude and Codex also say
 which efforts each model takes, so a launch that pairs a model with one it does not take

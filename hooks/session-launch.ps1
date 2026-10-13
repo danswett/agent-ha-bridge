@@ -2469,7 +2469,7 @@ function ConvertFrom-BridgeCodexModelRoster {
 function Assert-BridgeCodexModelCacheFresh {
     <#
         Throws, saying why, unless Codex's model cache shows that the model/list
-        answered at -ListedAt was the list Codex fetched for its sign-in.
+        answered at -ListedAt with -Model was the list Codex fetched for its sign-in.
 
         model/list does not say where its list came from. Codex answers it from the
         cache in its home, models_cache.json, while that is under five minutes old
@@ -2478,22 +2478,27 @@ function Assert-BridgeCodexModelCacheFresh {
         it was fetched for, and only then answers from it. When the fetch fails -
         offline, or turned away - it leaves the file as it was and answers from the
         list built into it. So a file written for a sign-in in the five minutes up to
-        the answer means the answer was that sign-in's list, and anything else means
-        it may have been the built-in one.
+        the answer, listing every model in it, means the answer was that sign-in's
+        list, and anything else means it may have been the built-in one. The models
+        tie the file to this answer, which its time alone cannot: another Codex
+        sharing the home can rewrite the file after the answer but before -ListedAt
+        was taken.
 
         One case passes that should not: a list written in those five minutes for
-        another sign-in, or by another version of Codex, and the fetch for this one
-        failing - a sign-in switched or Codex updated, and the network lost, all
-        within the same five minutes. The next discovery that reaches OpenAI puts it
-        right.
+        another sign-in, or by another version of Codex, that happens to have every
+        model built into this one, and the fetch for this one failing - a sign-in
+        switched or Codex updated, and the network lost, all within the same five
+        minutes. The next discovery that reaches OpenAI puts it right.
     #>
     param(
         [Parameter(Mandatory)][string]$Path,
-        [Parameter(Mandatory)][DateTimeOffset]$ListedAt
+        [Parameter(Mandatory)][DateTimeOffset]$ListedAt,
+        [AllowEmptyCollection()][string[]]$Model = @()
     )
 
     $fetchedText = $null
     $identity = $null
+    $listed = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $reason = ''
     if (-not [IO.File]::Exists($Path)) { $reason = "'$Path' does not exist" }
     else {
@@ -2501,6 +2506,17 @@ function Assert-BridgeCodexModelCacheFresh {
             $document = [Text.Json.JsonDocument]::Parse([IO.File]::ReadAllText($Path))
             try {
                 foreach ($property in $document.RootElement.EnumerateObject()) {
+                    if ($property.Name -ceq 'models' -and $property.Value.ValueKind -eq [Text.Json.JsonValueKind]::Array) {
+                        foreach ($entry in $property.Value.EnumerateArray()) {
+                            if ($entry.ValueKind -ne [Text.Json.JsonValueKind]::Object) { continue }
+                            foreach ($field in $entry.EnumerateObject()) {
+                                if ($field.Name -ceq 'slug' -and $field.Value.ValueKind -eq [Text.Json.JsonValueKind]::String) {
+                                    [void]$listed.Add($field.Value.GetString())
+                                }
+                            }
+                        }
+                        continue
+                    }
                     if ($property.Value.ValueKind -ne [Text.Json.JsonValueKind]::String) { continue }
                     if ($property.Name -ceq 'fetched_at') { $fetchedText = $property.Value.GetString() }
                     elseif ($property.Name -ceq 'identity') { $identity = $property.Value.GetString() }
@@ -2532,6 +2548,10 @@ function Assert-BridgeCodexModelCacheFresh {
             elseif ($age -lt 0) {
                 $after = (-$age).ToString('0.#######', [Globalization.CultureInfo]::InvariantCulture)
                 $reason = "'$Path' is dated ${after}s after the list"
+            }
+            else {
+                $missing = @($Model | Where-Object { -not $listed.Contains($_) })
+                if ($missing.Count -gt 0) { $reason = "'$Path' does not list $($missing -join ', '), which Codex answered with" }
             }
         }
     }
@@ -2637,8 +2657,9 @@ function Get-BridgeCodexModelRoster {
         if ($codexHome -isnot [string] -or [string]::IsNullOrWhiteSpace($codexHome)) {
             $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
         }
-        Assert-BridgeCodexModelCacheFresh -Path (Join-Path $codexHome 'models_cache.json') -ListedAt $listedAt
-        return ConvertFrom-BridgeCodexModelRoster -Entry $entries.ToArray()
+        $roster = ConvertFrom-BridgeCodexModelRoster -Entry $entries.ToArray()
+        Assert-BridgeCodexModelCacheFresh -Path (Join-Path $codexHome 'models_cache.json') -ListedAt $listedAt -Model $roster.Models
+        return $roster
     }
     finally {
         if ($null -ne $connection) { [void](Stop-BridgeJsonRpcProcess -Connection $connection) }

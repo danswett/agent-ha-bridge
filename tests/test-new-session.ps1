@@ -1218,9 +1218,10 @@ function Get-Effort([string[]]$Name) { @($Name | ForEach-Object { [ordered]@{ re
 function Get-Entry([string]$Name, [string[]]$Effort, [bool]$Hidden = $false) {
     [ordered]@{ id = $Name; model = $Name; displayName = $Name; hidden = $Hidden; supportedReasoningEfforts = @(Get-Effort $Effort) }
 }
-# What Codex leaves in its home once it has fetched the account's list: when, and for
-# which sign-in. The modes leave it out, age it, or drop the sign-in, as a failed or
-# an older fetch would.
+# What Codex leaves in its home once it has fetched the account's list: when, for which
+# sign-in, and the models in it, hidden ones too. The modes leave it out, age it, drop
+# the sign-in, or list other models, as a failed or an older fetch would, or another
+# Codex sharing the home.
 function Write-ModelCache {
     if ($env:FAKE_MODE -eq 'codex-no-cache') { return }
     $fetched = [DateTimeOffset]::UtcNow
@@ -1230,7 +1231,9 @@ function Write-ModelCache {
     $cache = [ordered]@{ fetched_at = $fetched.ToString($format, [Globalization.CultureInfo]::InvariantCulture) }
     if ($env:FAKE_MODE -ne 'codex-no-identity') { $cache['identity'] = 'chatgpt:fake-account' }
     $cache['client_version'] = '0.0.0'
-    $cache['models'] = @()
+    $slugs = @('gpt-6.1-sol', 'gpt-6-astra', 'gpt-5.5')
+    if ($env:FAKE_MODE -eq 'codex-other-list') { $slugs = @('gpt-6.1-sol', 'gpt-6-astra') }
+    $cache['models'] = @($slugs | ForEach-Object { [ordered]@{ slug = $_; display_name = $_ } })
     [IO.File]::WriteAllText([IO.Path]::Combine($env:FAKE_CODEX_HOME, 'models_cache.json'), (ConvertTo-Json -InputObject $cache -Depth 4))
 }
 $request = Read-Request
@@ -1431,17 +1434,18 @@ while ($true) {
     } (ConvertTo-Json -InputObject $codexRefusals -Compress)
 
     $codexUnconfirmed = [ordered]@{}
-    foreach ($mode in 'codex-no-cache', 'codex-stale', 'codex-no-identity') {
+    foreach ($mode in 'codex-no-cache', 'codex-stale', 'codex-no-identity', 'codex-other-list') {
         Invoke-FakeLauncherProbe -Launcher 'codex' -Mode $mode
         $codexUnconfirmed[$mode] = $script:LauncherProbeError.Replace(
             [IO.Path]::Combine($script:FakeCodexHome, 'models_cache.json'), '<cache>')
     }
     $unconfirmedPrefix = "^could not confirm that Codex fetched this account's models: '<cache>' "
     $unconfirmedSuffix = '\. Offline, Codex lists the models built into it instead\z'
-    Test-That 'a list Codex''s cache does not show it fetched - none written, written over five minutes before, or for no sign-in - is not taken' {
+    Test-That 'a list Codex''s cache does not show it fetched - none written, written over five minutes before, for no sign-in, or without a model it offers - is not taken' {
         $codexUnconfirmed['codex-no-cache'] -cmatch "${unconfirmedPrefix}does not exist$unconfirmedSuffix" -and
             $codexUnconfirmed['codex-stale'] -cmatch "${unconfirmedPrefix}was fetched 3\d\ds before the list, and Codex keeps it 300s$unconfirmedSuffix" -and
-            $codexUnconfirmed['codex-no-identity'] -cmatch "${unconfirmedPrefix}names no sign-in$unconfirmedSuffix"
+            $codexUnconfirmed['codex-no-identity'] -cmatch "${unconfirmedPrefix}names no sign-in$unconfirmedSuffix" -and
+            $codexUnconfirmed['codex-other-list'] -cmatch "${unconfirmedPrefix}does not list gpt-5\.5, which Codex answered with$unconfirmedSuffix"
     } ($codexUnconfirmed.Values -join ' | ')
     Invoke-FakeLauncherProbe -Launcher 'codex' -Mode 'codex-nanos'
     Test-That 'a cache dated to the nanosecond, as Codex can write it, is read' {
@@ -1463,10 +1467,10 @@ while ($true) {
     $cacheCheckPath = [IO.Path]::Combine($lineRoot, 'cache-check', 'models_cache.json')
     [void][IO.Directory]::CreateDirectory([IO.Path]::GetDirectoryName($cacheCheckPath))
     function Test-FakeCodexCache {
-        param([AllowNull()]$Content)
+        param([AllowNull()]$Content, [AllowEmptyCollection()][string[]]$Model = @())
         if ($null -eq $Content) { [IO.File]::Delete($cacheCheckPath) } else { [IO.File]::WriteAllText($cacheCheckPath, $Content) }
         try {
-            $emitted = @(Assert-BridgeCodexModelCacheFresh -Path $cacheCheckPath -ListedAt ([DateTimeOffset]::new(2026, 10, 8, 12, 5, 0, [TimeSpan]::Zero)))
+            $emitted = @(Assert-BridgeCodexModelCacheFresh -Path $cacheCheckPath -ListedAt ([DateTimeOffset]::new(2026, 10, 8, 12, 5, 0, [TimeSpan]::Zero)) -Model $Model)
             if ($emitted.Count -eq 0) { 'fresh' } else { "emitted $($emitted -join ',')" }
         }
         catch {
@@ -1516,6 +1520,28 @@ while ($true) {
             @('no time', 'not a time', 'a numeric time' |
                     Where-Object { $cacheVerdicts[$_] -cne "'<cache>' does not say when it was fetched" }).Count -eq 0
     } $cacheVerdictText
+
+    # And its models, against a list answered with gpt-a and gpt-b: the time alone
+    # cannot tell a file written for the answer from one another Codex sharing the
+    # home wrote just after it.
+    $cacheModelHead = '{"fetched_at":"2026-10-08T12:04:50Z","identity":"chatgpt:a"'
+    $cacheModelChecks = [ordered]@{
+        'every model'       = $cacheModelHead + ',"models":[{"slug":"gpt-b"},{"slug":"gpt-c","visibility":"hide"},{"slug":"gpt-a"}]}'
+        'one missing'       = $cacheModelHead + ',"models":[{"slug":"gpt-a"},{"slug":"GPT-B"}]}'
+        'no models'         = $cacheModelHead + '}'
+        'models not a list' = $cacheModelHead + ',"models":{"slug":"gpt-a"}}'
+        'no slugs'          = $cacheModelHead + ',"models":["gpt-a",{"slug":1},{"id":"gpt-b"},{"model":{"slug":"gpt-b"}}]}'
+    }
+    $cacheModelVerdicts = [ordered]@{}
+    foreach ($case in @($cacheModelChecks.Keys)) {
+        $cacheModelVerdicts[$case] = Test-FakeCodexCache -Content $cacheModelChecks[$case] -Model 'gpt-a', 'gpt-b'
+    }
+    Test-That 'and only once it lists, by its exact name, every model the bridge keeps from the answer, saying which it lacks' {
+        $cacheModelVerdicts['every model'] -ceq 'fresh' -and
+            $cacheModelVerdicts['one missing'] -ceq "'<cache>' does not list gpt-b, which Codex answered with" -and
+            @('no models', 'models not a list', 'no slugs' | Where-Object {
+                    $cacheModelVerdicts[$_] -cne "'<cache>' does not list gpt-a, gpt-b, which Codex answered with" }).Count -eq 0
+    } ((@($cacheModelVerdicts.Keys) | ForEach-Object { "${_}: $($cacheModelVerdicts[$_])" }) -join ' | ')
 
     Invoke-FakeLauncherProbe -Launcher 'codex' -Mode 'codex-loop'
     Test-That 'a server handing back a cursor for ever is asked ten pages at most, and what came is kept' {
