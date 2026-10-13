@@ -841,8 +841,29 @@ turned off for that one process: an app-server otherwise starts refreshing Codex
 marketplace as it comes up, and a probe gone a second later would leave that refresh's
 temporary folders in `~/.codex/.tmp` every time. Neither
 probe sends a prompt or keeps a session, so neither spends anything or counts as use, and
-each takes a second or two. The Effort row for each offers every effort some listed model
-accepts.
+each takes a second or two.
+
+Codex answers `model/list` even when it cannot reach OpenAI, with the models packaged
+with it, and its answer does not say which it gave. So the daemon takes it only when it
+can tell it was this account's: Codex must be signed in with ChatGPT - an API key or
+another provider is refused, since Codex then has no plan to ask about - and the
+`models_cache.json` in Codex's home, which Codex rewrites only after fetching the
+account's list, must name the sign-in and be dated within the five minutes before the
+answer. Anything else counts as a failed discovery, which keeps the last good list, and
+the daemon log says which check failed. One case still gets through: switching Codex to
+another sign-in and losing the network within the same five minutes; the next discovery
+puts that right.
+
+The Effort row offers every effort some listed model takes. Claude and Codex also say
+which efforts each model takes, so a launch that pairs a model with one it does not take
+starts it with the nearest one it does - the weaker of two equally near, or the middle of
+its list when they cannot be compared, which is how Codex itself chooses - or with no
+effort when the model takes none, or when `newSession.efforts.<agent>` leaves the nearest
+one out. That needs a model to have been chosen, on the card or in
+`newSession.model.<agent>`, since otherwise the CLI picks it. The move is written to the
+daemon log, and the session's card shows the effort the session really got. When
+discovery finds that no listed model takes an effort, the row offers only *Agent
+default*.
 
 Claude and Codex keep a short built-in list, offered only until their discovery first
 succeeds. `newSession.models.<agent>` replaces any agent's list — worth doing for

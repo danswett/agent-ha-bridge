@@ -2275,8 +2275,8 @@ function Get-BridgeOrderedEffort {
 function ConvertFrom-BridgeClaudeModelRoster {
     <#
         The models and efforts worth offering from Claude's answer to the SDK's
-        initialize request, as [pscustomobject]@{ Models; Efforts }, models in Claude's
-        order and once each.
+        initialize request, as [pscustomobject]@{ Models; Efforts; EffortsKnown;
+        ModelEfforts }, models in Claude's order and once each.
 
         Its `models` are what Claude's own /model picker lists. 'default' is left out,
         since the selector's 'Agent default' already means it, and so is any value that
@@ -2287,7 +2287,10 @@ function ConvertFrom-BridgeClaudeModelRoster {
 
         The efforts are every one some model accepts, 'default' included, since that
         is what a launch without a model runs. A model saying it takes no effort adds
-        none.
+        none. ModelEfforts holds each offered model's own efforts, weakest first, for
+        Resolve-BridgeModelEffort; a model that says nothing about effort has no entry.
+        EffortsKnown says whether any model said, so that no efforts at all is told
+        apart from an answer that did not mention them.
     #>
     param([AllowNull()]$Roster)
 
@@ -2300,22 +2303,35 @@ function ConvertFrom-BridgeClaudeModelRoster {
     $models = [Collections.Generic.List[string]]::new()
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $efforts = [Collections.Generic.List[string]]::new()
+    $modelEfforts = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $known = $false
     $entries = 0
     foreach ($entry in $list) {
         $entries++
         $value = Get-BridgeJsonField -Object $entry -Name 'value'
-        if ($value -is [string] -and $value -cne 'default' -and $value -cmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\z' -and
-            $seen.Add($value)) {
-            $models.Add($value)
-        }
+        $offered = $value -is [string] -and $value -cne 'default' -and
+            $value -cmatch '^[A-Za-z0-9][A-Za-z0-9._-]{0,127}\z' -and $seen.Add($value)
+        if ($offered) { $models.Add($value) }
+
+        $takes = [Collections.Generic.List[string]]::new()
         $supported = Get-BridgeJsonField -Object $entry -Name 'supportsEffort'
-        if ($supported -is [bool] -and -not $supported) { continue }
-        $levels = Get-BridgeJsonField -Object $entry -Name 'supportedEffortLevels'
-        if ($levels -is [string] -or $levels -isnot [Collections.IEnumerable] -or $levels -is [Collections.IDictionary]) { continue }
-        foreach ($level in $levels) { if (Test-BridgeEffortName -Value $level) { $efforts.Add($level) } }
+        if ($supported -isnot [bool] -or $supported) {
+            # Taking effort, or not saying, and with no list of levels: unknown.
+            $levels = Get-BridgeJsonField -Object $entry -Name 'supportedEffortLevels'
+            if ($levels -is [string] -or $levels -isnot [Collections.IEnumerable] -or $levels -is [Collections.IDictionary]) { continue }
+            foreach ($level in $levels) { if (Test-BridgeEffortName -Value $level) { $takes.Add($level) } }
+        }
+        $known = $true
+        $efforts.AddRange($takes)
+        if ($offered) { $modelEfforts[$value] = @(Get-BridgeOrderedEffort -Effort $takes.ToArray()) }
     }
     if ($models.Count -eq 0) { throw "Claude listed no usable models ($entries entries)" }
-    [pscustomobject]@{ Models = $models.ToArray(); Efforts = @(Get-BridgeOrderedEffort -Effort $efforts.ToArray()) }
+    [pscustomobject]@{
+        Models       = $models.ToArray()
+        Efforts      = @(Get-BridgeOrderedEffort -Effort $efforts.ToArray())
+        EffortsKnown = $known
+        ModelEfforts = $modelEfforts
+    }
 }
 
 function Get-BridgeClaudeModelRoster {
@@ -2404,19 +2420,24 @@ function Get-BridgeClaudeModelRoster {
 function ConvertFrom-BridgeCodexModelRoster {
     <#
         The models and efforts worth offering from Codex's model/list entries, as
-        [pscustomobject]@{ Models; Efforts }, models in Codex's order and once each.
+        [pscustomobject]@{ Models; Efforts; EffortsKnown; ModelEfforts }, models in
+        Codex's order and once each.
 
         That is what Codex's own /model picker lists: a hidden model is left out, and
         one with an upgrade on offer is kept, as the picker keeps it. An entry is named
         by its `model`, or failing that its `id`, and only if that is plainly a name -
         the boundary ConvertFrom-BridgeCopilotModelRoster explains. The efforts are
-        every one some listed model accepts.
+        every one some listed model accepts. ModelEfforts and EffortsKnown are what
+        ConvertFrom-BridgeClaudeModelRoster describes: each listed model's own
+        efforts, and whether any model listed its efforts at all.
     #>
     param([AllowEmptyCollection()][object[]]$Entry = @())
 
     $models = [Collections.Generic.List[string]]::new()
     $seen = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
     $efforts = [Collections.Generic.List[string]]::new()
+    $modelEfforts = [Collections.Generic.Dictionary[string, object]]::new([StringComparer]::Ordinal)
+    $known = $false
     foreach ($item in $Entry) {
         if ((Get-BridgeJsonField -Object $item -Name 'hidden') -eq $true) { continue }
         $name = Get-BridgeJsonField -Object $item -Name 'model'
@@ -2426,14 +2447,90 @@ function ConvertFrom-BridgeCodexModelRoster {
 
         $levels = Get-BridgeJsonField -Object $item -Name 'supportedReasoningEfforts'
         if ($levels -is [string] -or $levels -isnot [Collections.IEnumerable] -or $levels -is [Collections.IDictionary]) { continue }
+        $takes = [Collections.Generic.List[string]]::new()
         foreach ($level in $levels) {
             # Each is {reasoningEffort, description}; a bare name is taken as well.
             $effort = if ($level -is [string]) { $level } else { Get-BridgeJsonField -Object $level -Name 'reasoningEffort' }
-            if (Test-BridgeEffortName -Value $effort) { $efforts.Add($effort) }
+            if (Test-BridgeEffortName -Value $effort) { $takes.Add($effort) }
         }
+        $known = $true
+        $efforts.AddRange($takes)
+        $modelEfforts[$name] = @(Get-BridgeOrderedEffort -Effort $takes.ToArray())
     }
     if ($models.Count -eq 0) { throw "Codex listed no usable models ($(@($Entry).Count) entries)" }
-    [pscustomobject]@{ Models = $models.ToArray(); Efforts = @(Get-BridgeOrderedEffort -Effort $efforts.ToArray()) }
+    [pscustomobject]@{
+        Models       = $models.ToArray()
+        Efforts      = @(Get-BridgeOrderedEffort -Effort $efforts.ToArray())
+        EffortsKnown = $known
+        ModelEfforts = $modelEfforts
+    }
+}
+
+function Assert-BridgeCodexModelCacheFresh {
+    <#
+        Throws, saying why, unless Codex's model cache shows that the model/list
+        answered at -ListedAt was the list Codex fetched for its sign-in.
+
+        model/list does not say where its list came from. Codex answers it from the
+        cache in its home, models_cache.json, while that is under five minutes old.
+        Otherwise it fetches the account's list, writes it there with the time and
+        the sign-in it was fetched for, and answers from that. When the fetch fails -
+        offline, or turned away - it leaves the file as it was and answers from the
+        list built into it. So a file written for a sign-in in the five minutes up to
+        the answer means the answer was that sign-in's list, and anything else means
+        it may have been the built-in one.
+
+        One case passes that should not: another sign-in's list written in those five
+        minutes, and the fetch for this one failing - a sign-in switched and the
+        network lost within the same five minutes. The next discovery puts it right.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][DateTimeOffset]$ListedAt
+    )
+
+    $fetchedText = $null
+    $identity = $null
+    $reason = ''
+    if (-not [IO.File]::Exists($Path)) { $reason = "'$Path' does not exist" }
+    else {
+        try {
+            $document = [Text.Json.JsonDocument]::Parse([IO.File]::ReadAllText($Path))
+            try {
+                foreach ($property in $document.RootElement.EnumerateObject()) {
+                    if ($property.Value.ValueKind -ne [Text.Json.JsonValueKind]::String) { continue }
+                    if ($property.Name -ceq 'fetched_at') { $fetchedText = $property.Value.GetString() }
+                    elseif ($property.Name -ceq 'identity') { $identity = $property.Value.GetString() }
+                }
+            }
+            finally { $document.Dispose() }
+        }
+        catch {
+            # The innermost message: the outer one is PowerShell's "Exception calling
+            # 'Parse'" wrapped around it.
+            $why = ($_.Exception.GetBaseException().Message -replace '\s+', ' ').Trim().TrimEnd('.')
+            $reason = "'$Path' could not be read ($why)"
+        }
+    }
+
+    $fetchedAt = [DateTimeOffset]::MinValue
+    if (-not $reason) {
+        if ([string]::IsNullOrWhiteSpace($identity)) { $reason = "'$Path' names no sign-in" }
+        elseif (-not [DateTimeOffset]::TryParse([string]$fetchedText, [Globalization.CultureInfo]::InvariantCulture,
+                [Globalization.DateTimeStyles]::AssumeUniversal, [ref]$fetchedAt)) {
+            $reason = "'$Path' does not say when it was fetched"
+        }
+        else {
+            $age = ($ListedAt - $fetchedAt).TotalSeconds
+            # Codex keeps it 300s. Later than the answer is the clock having moved, so
+            # how old the list really is cannot be told.
+            if ($age -ge 300) { $reason = "'$Path' was fetched $([long]$age)s before the list, and Codex keeps it 300s" }
+            elseif ($age -lt -300) { $reason = "'$Path' is dated $([long]-$age)s after the list" }
+        }
+    }
+    if ($reason) {
+        throw "could not confirm that Codex fetched this account's models: $reason. Offline, Codex lists the models built into it instead"
+    }
 }
 
 function Get-BridgeCodexModelRoster {
@@ -2442,6 +2539,13 @@ function Get-BridgeCodexModelRoster {
         its IDE extensions ask: start `codex app-server`, introduce the bridge, and
         page through model/list. That is the list Codex's /model picker shows, and it
         follows the sign-in - a ChatGPT plan and an API key do not see the same models.
+
+        model/list alone does not say whose list it is: signed out, or with its
+        fetch failing, Codex answers with the models built into it. So the probe asks
+        how Codex is signed in (account/read) and takes the list only from a ChatGPT
+        sign-in, the one that lists exactly what its plan can use, and only once
+        Codex's cache shows the list was fetched for it (Assert-BridgeCodexModelCacheFresh).
+        Otherwise it throws, and the last list found, or the built-in one, stands in.
 
         No thread is started, so nothing is spent and nothing reaches Codex's history
         or sessions, which the launcher's 'auto' reads to tell when Codex was last
@@ -2487,10 +2591,21 @@ function Get-BridgeCodexModelRoster {
     try {
         [void][IO.Directory]::CreateDirectory($workingDirectory)
         $connection = Start-BridgeJsonLineProcess -Executable $Path -WorkingDirectory $workingDirectory -Arguments @('-c', 'features.plugins=false', 'app-server')
-        [void](Invoke-BridgeJsonLineRequest -Connection $connection -Method 'initialize' -Deadline $deadline -Params ([ordered]@{
-                    clientInfo = [ordered]@{ name = 'agent-ha-bridge'; title = 'agent-ha-bridge'; version = $version }
-                }))
+        $introduced = Invoke-BridgeJsonLineRequest -Connection $connection -Method 'initialize' -Deadline $deadline -Params ([ordered]@{
+                clientInfo = [ordered]@{ name = 'agent-ha-bridge'; title = 'agent-ha-bridge'; version = $version }
+            })
         Send-BridgeJsonLine -Connection $connection -Message ([ordered]@{ method = 'initialized' })
+
+        # Without refreshToken, so the bridge never has Codex renew its sign-in.
+        $read = Invoke-BridgeJsonLineRequest -Connection $connection -Method 'account/read' -Params ([ordered]@{}) -Deadline $deadline
+        $account = Get-BridgeJsonField -Object $read -Name 'account'
+        $type = Get-BridgeJsonField -Object $account -Name 'type'
+        if ($type -isnot [string] -or $type -cne 'chatgpt') {
+            $how = if ($null -eq $account) { 'is signed out' }
+            elseif ($type -is [string] -and $type -cmatch '^[A-Za-z0-9_-]{1,40}\z') { "is signed in with '$type'" }
+            else { 'is signed in some other way' }
+            throw "Codex $how rather than with ChatGPT, so its model list may be the one built into it rather than the account's"
+        }
 
         $entries = [Collections.Generic.List[object]]::new()
         $cursor = $null
@@ -2509,6 +2624,13 @@ function Get-BridgeCodexModelRoster {
             $cursor = Get-BridgeJsonField -Object $answer -Name 'nextCursor'
             if ($cursor -isnot [string] -or [string]::IsNullOrEmpty($cursor)) { break }
         }
+        $listedAt = [DateTimeOffset]::UtcNow
+
+        $codexHome = Get-BridgeJsonField -Object $introduced -Name 'codexHome'
+        if ($codexHome -isnot [string] -or [string]::IsNullOrWhiteSpace($codexHome)) {
+            $codexHome = if ($env:CODEX_HOME) { $env:CODEX_HOME } else { Join-Path $HOME '.codex' }
+        }
+        Assert-BridgeCodexModelCacheFresh -Path (Join-Path $codexHome 'models_cache.json') -ListedAt $listedAt
         return ConvertFrom-BridgeCodexModelRoster -Entry $entries.ToArray()
     }
     finally {
@@ -2518,20 +2640,22 @@ function Get-BridgeCodexModelRoster {
 }
 
 # Claude's and Codex's discoveries, by launcher, kept and retried exactly as Copilot's
-# is (see $script:BridgeModelCacheHours). Each holds { At; Models; Efforts; Failed;
-# RetrySeconds }: one answer fills both the model and the effort list.
+# is (see $script:BridgeModelCacheHours). Each holds { At; Models; Efforts;
+# EffortsKnown; ModelEfforts; Failed; RetrySeconds }: one answer fills both the model
+# and the effort list.
 $script:BridgeLauncherModelCache = @{}
 
 function Get-BridgeLauncherModelDiscovery {
     <#
         The models and efforts Claude or Codex offers this account (see
         Get-BridgeClaudeModelRoster and Get-BridgeCodexModelRoster), as
-        [pscustomobject]@{ Models; Efforts }. Never throws.
+        [pscustomobject]@{ Models; Efforts; EffortsKnown; ModelEfforts }, the last two
+        as ConvertFrom-BridgeClaudeModelRoster describes them. Never throws.
 
         Cached, retried and logged as Get-BridgeCopilotModelList is, one launcher
         apart from the other. A failed refresh keeps the last successful lists, and
-        without one both are @(), so the caller offers its defaults until discovery
-        succeeds.
+        without one both are @(), with no efforts known, so the caller offers its
+        defaults until discovery succeeds.
     #>
     param(
         [Parameter(Mandatory)][ValidateSet('claude', 'codex')][string]$Launcher,
@@ -2543,13 +2667,18 @@ function Get-BridgeLauncherModelDiscovery {
     if ($null -ne $cached) {
         $cacheSeconds = if ($cached.Failed) { [int]$cached.RetrySeconds } else { $script:BridgeModelCacheHours * 3600 }
         if (([DateTimeOffset]::Now - $cached.At).TotalSeconds -lt $cacheSeconds) {
-            return [pscustomobject]@{ Models = @($cached.Models); Efforts = @($cached.Efforts) }
+            return [pscustomobject]@{
+                Models = @($cached.Models); Efforts = @($cached.Efforts)
+                EffortsKnown = $cached.EffortsKnown; ModelEfforts = $cached.ModelEfforts
+            }
         }
     }
 
     $label = if ($Launcher -eq 'claude') { 'Claude' } else { 'Codex' }
     $models = @()
     $efforts = @()
+    $effortsKnown = $false
+    $modelEfforts = @{}
     $failed = $false
     $retrySeconds = 0
     $diagnostic = ''
@@ -2559,6 +2688,8 @@ function Get-BridgeLauncherModelDiscovery {
         $roster = if ($Launcher -eq 'claude') { Get-BridgeClaudeModelRoster -Path $Path } else { Get-BridgeCodexModelRoster -Path $Path }
         $models = @($roster.Models)
         $efforts = @($roster.Efforts)
+        $effortsKnown = [bool]$roster.EffortsKnown
+        $modelEfforts = $roster.ModelEfforts
         if ($models.Count -eq 0) { throw 'the CLI listed no models' }
         if ($null -ne $cached -and $cached.Failed) {
             $diagnostic = "$label model discovery recovered: found $($models.Count) model(s) from '$Path'."
@@ -2568,9 +2699,13 @@ function Get-BridgeLauncherModelDiscovery {
         $failed = $true
         $models = @()
         $efforts = @()
+        $effortsKnown = $false
+        $modelEfforts = @{}
         if ($null -ne $cached) {
             $models = @($cached.Models)
             $efforts = @($cached.Efforts)
+            $effortsKnown = $cached.EffortsKnown
+            $modelEfforts = $cached.ModelEfforts
         }
         $retrySeconds = $script:BridgeModelRetrySeconds
         if ($null -ne $cached -and $cached.Failed) {
@@ -2582,14 +2717,15 @@ function Get-BridgeLauncherModelDiscovery {
     }
 
     $script:BridgeLauncherModelCache[$Launcher] = [pscustomobject]@{
-        At = [DateTimeOffset]::Now; Models = @($models); Efforts = @($efforts); Failed = $failed; RetrySeconds = $retrySeconds
+        At = [DateTimeOffset]::Now; Models = @($models); Efforts = @($efforts)
+        EffortsKnown = $effortsKnown; ModelEfforts = $modelEfforts; Failed = $failed; RetrySeconds = $retrySeconds
     }
     if ($diagnostic) {
         $daemonLog = Get-Command Write-DaemonLog -ErrorAction SilentlyContinue
         if ($daemonLog) { & $daemonLog -Message $diagnostic }
         else { Write-DecisionBridgeLog -Message $diagnostic }
     }
-    [pscustomobject]@{ Models = @($models); Efforts = @($efforts) }
+    [pscustomobject]@{ Models = @($models); Efforts = @($efforts); EffortsKnown = $effortsKnown; ModelEfforts = $modelEfforts }
 }
 
 # What each agent accepts on each axis, and how it is spelled on the command line.
@@ -2600,6 +2736,9 @@ function Get-BridgeLauncherModelDiscovery {
 #   Discover    an optional source of the values the CLI itself offers this account,
 #               added after Options - or, with Replace, offered instead of them, so
 #               that Options only stand in while discovery has found nothing
+#   Known       with Replace, an optional test of whether discovery answered even
+#               though it found nothing - the CLI said no model takes an effort - so
+#               that nothing is offered beyond 'Agent default' rather than Options
 #   Arguments   the flag form of a chosen value
 #
 # Verified against the installed CLIs rather than guessed: `copilot --reasoning-effort
@@ -2633,6 +2772,7 @@ $script:BridgeLauncherTuning = @{
         effort = @{
             Options   = @('low', 'medium', 'high', 'xhigh', 'max')
             Discover  = { @((Get-BridgeLauncherModelDiscovery -Launcher 'claude').Efforts) }
+            Known     = { [bool](Get-BridgeLauncherModelDiscovery -Launcher 'claude').EffortsKnown }
             Replace   = $true
             Arguments = { param($Value) @('--effort', $Value) }
         }
@@ -2651,6 +2791,7 @@ $script:BridgeLauncherTuning = @{
         effort = @{
             Options   = @('low', 'medium', 'high', 'xhigh', 'max', 'ultra')
             Discover  = { @((Get-BridgeLauncherModelDiscovery -Launcher 'codex').Efforts) }
+            Known     = { [bool](Get-BridgeLauncherModelDiscovery -Launcher 'codex').EffortsKnown }
             Replace   = $true
             Arguments = { param($Value) @('-c', "model_reasoning_effort=$Value") }
         }
@@ -2731,11 +2872,13 @@ function Get-BridgeTuningOptions {
         # Copilot's discovery adds to its built-in list, so 'auto' is still offered
         # while discovery is failing; the roster lists it too, and the de-duplication
         # below keeps one. Claude's and Codex's built-in lists only stand in until
-        # discovery finds something (Replace), since offering a model the CLI did not
-        # list is offering a launch that may fail.
+        # discovery answers (Replace), since offering a model the CLI did not list is
+        # offering a launch that may fail - and an answer that no model takes an
+        # effort (Known) leaves nothing to offer.
         if ($entry[$Axis].ContainsKey('Discover')) {
             $found = @(& $entry[$Axis].Discover)
-            if ($found.Count -gt 0) {
+            $answered = $found.Count -gt 0 -or ($entry[$Axis].ContainsKey('Known') -and [bool](& $entry[$Axis].Known))
+            if ($answered) {
                 $replace = $entry[$Axis].ContainsKey('Replace') -and [bool]$entry[$Axis]['Replace']
                 if ($replace) { $built = @($found) } else { $built = @($built) + @($found) }
             }
@@ -2831,6 +2974,100 @@ function Get-BridgeTuningArguments {
     $entry = $script:BridgeLauncherTuning[$key]
     if ($null -eq $entry -or -not $entry.ContainsKey($Axis)) { return @() }
     @(& $entry[$Axis].Arguments $resolved)
+}
+
+function Resolve-BridgeModelEffort {
+    <#
+        The effort to start -Model with, given -Effort was chosen: -Effort itself when
+        the model takes it, else the nearest effort it does take - the weaker of two
+        equally near, or its middle one when the two cannot be compared, which is how
+        Codex itself picks - or '' when it takes none.
+
+        The Effort list offers every effort some model takes, so it can offer one the
+        chosen model does not: GPT-6.1 Sol takes no 'minimal'. Only Claude's and
+        Codex's discoveries say which model takes which, so -Effort comes back as it
+        is for any other launcher, for a model discovery did not describe, and when
+        no model was chosen, since the agent's own config picks the model then.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Launcher,
+        [AllowEmptyString()][AllowNull()][string]$Model,
+        [AllowEmptyString()][AllowNull()][string]$Effort
+    )
+
+    if ([string]::IsNullOrWhiteSpace($Effort) -or [string]::IsNullOrWhiteSpace($Model) -or $Launcher -notin @('claude', 'codex')) {
+        return [string]$Effort
+    }
+    $map = (Get-BridgeLauncherModelDiscovery -Launcher $Launcher).ModelEfforts
+    if ($map -isnot [Collections.IDictionary] -or -not ([Collections.IDictionary]$map).Contains($Model)) { return $Effort }
+
+    $takes = @($map[$Model])
+    if ($takes -ccontains $Effort) { return $Effort }
+    if ($takes.Count -eq 0) { return '' }
+
+    $wanted = [Array]::IndexOf($script:BridgeEffortOrder, $Effort)
+    $held = ''
+    $best = -1
+    foreach ($candidate in $takes) {
+        $at = [Array]::IndexOf($script:BridgeEffortOrder, [string]$candidate)
+        if ($wanted -lt 0 -or $at -lt 0) { continue }
+        $distance = [Math]::Abs($at - $wanted)
+        # Only a strictly nearer one replaces it: they come weakest first, so a tie
+        # keeps the weaker.
+        if ($best -lt 0 -or $distance -lt $best) {
+            $best = $distance
+            $held = [string]$candidate
+        }
+    }
+    if (-not $held) { $held = [string]$takes[[int][Math]::Floor(($takes.Count - 1) / 2)] }
+    $held
+}
+
+function Resolve-BridgeLaunchTuning {
+    <#
+        What a launch passes on each tuning axis, as a hashtable by axis with ''
+        meaning nothing: what the card chose, or - when it chose nothing - what the
+        config asks for, each through Resolve-BridgeTuningValue.
+
+        An effort the chosen model does not take is then moved to one it does
+        (Resolve-BridgeModelEffort), and the move is logged. Passed on as chosen, the
+        agent would be asked for an effort its model does not offer, and the card
+        would name an effort the session never had.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Launcher,
+        [AllowEmptyString()][AllowNull()][string]$Model,
+        [AllowEmptyString()][AllowNull()][string]$Effort,
+        [AllowEmptyString()][AllowNull()][string]$Context
+    )
+
+    $chosen = @{}
+    foreach ($axis in @(Get-BridgeTuningAxes)) {
+        $asked = switch ($axis) { 'model' { $Model } 'effort' { $Effort } 'context' { $Context } }
+        $value = Resolve-BridgeTuningValue -Launcher $Launcher -Axis $axis -Value $asked
+        if ([string]::IsNullOrWhiteSpace($value)) {
+            $value = Resolve-BridgeTuningValue -Launcher $Launcher -Axis $axis `
+                -Value (Get-BridgeDefaultTuning -Launcher $Launcher -Axis $axis)
+        }
+        $chosen[$axis] = $value
+    }
+
+    $asked = [string]$chosen['effort']
+    $held = Resolve-BridgeModelEffort -Launcher $Launcher -Model $chosen['model'] -Effort $asked
+    if ($held -cne $asked) {
+        # Validated again because the argument builder validates again: an effort a
+        # configured list leaves out is dropped there, and the log and the card would
+        # then name an effort the session never got.
+        $held = Resolve-BridgeTuningValue -Launcher $Launcher -Axis 'effort' -Value $held
+        $label = if ($Launcher -eq 'claude') { 'Claude' } else { 'Codex' }
+        $outcome = if ($held) { "'$held'" } else { 'no effort' }
+        $message = "$label model '$($chosen['model'])' does not take effort '$asked'; starting it with $outcome."
+        $daemonLog = Get-Command Write-DaemonLog -ErrorAction SilentlyContinue
+        if ($daemonLog) { & $daemonLog -Message $message }
+        else { Write-DecisionBridgeLog -Message $message }
+        $chosen['effort'] = $held
+    }
+    $chosen
 }
 
 function Get-BridgeAgencyProfileNames {
@@ -4579,19 +4816,10 @@ function Start-BridgeCopilotSession {
     }
 
     # Each axis: what the card chose, or - when it chose nothing - what the config
-    # asks for. Resolved here rather than in the argument builder so the result can
-    # report what the session was actually started with, which is what the session
-    # card then shows.
-    $chosen = @{}
-    foreach ($axis in @(Get-BridgeTuningAxes)) {
-        $asked = switch ($axis) { 'model' { $Model } 'effort' { $Effort } 'context' { $Context } }
-        $value = Resolve-BridgeTuningValue -Launcher $launcher -Axis $axis -Value $asked
-        if ([string]::IsNullOrWhiteSpace($value)) {
-            $value = Resolve-BridgeTuningValue -Launcher $launcher -Axis $axis `
-                -Value (Get-BridgeDefaultTuning -Launcher $launcher -Axis $axis)
-        }
-        $chosen[$axis] = $value
-    }
+    # asks for, with an effort the model does not take moved to one it does. Resolved
+    # here rather than in the argument builder so the result can report what the
+    # session was actually started with, which is what the session card then shows.
+    $chosen = Resolve-BridgeLaunchTuning -Launcher $launcher -Model $Model -Effort $Effort -Context $Context
     $result.Model = $chosen['model']
     $result.Effort = $chosen['effort']
     $result.Context = $chosen['context']
