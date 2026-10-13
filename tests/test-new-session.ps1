@@ -1481,6 +1481,8 @@ while ($true) {
         'just under five minutes' = '{"fetched_at":"2026-10-08T12:00:00.001Z","identity":"chatgpt:a"}'
         'five minutes'            = '{"fetched_at":"2026-10-08T12:00:00Z","identity":"chatgpt:a"}'
         'a second more'           = '{"fetched_at":"2026-10-08T11:59:59Z","identity":"chatgpt:a"}'
+        'the same instant'        = '{"fetched_at":"2026-10-08T12:05:00Z","identity":"chatgpt:a"}'
+        'a millisecond after'     = '{"fetched_at":"2026-10-08T12:05:00.001Z","identity":"chatgpt:a"}'
         'dated after'             = '{"fetched_at":"2026-10-08T12:11:40Z","identity":"chatgpt:a"}'
         'missing'                 = $null
         'not JSON'                = 'not json'
@@ -1495,11 +1497,13 @@ while ($true) {
     $cacheVerdicts = [ordered]@{}
     foreach ($case in @($cacheChecks.Keys)) { $cacheVerdicts[$case] = Test-FakeCodexCache -Content $cacheChecks[$case] }
     $cacheVerdictText = (@($cacheVerdicts.Keys) | ForEach-Object { "${_}: $($cacheVerdicts[$_])" }) -join ' | '
-    Test-That 'Codex''s cache confirms a list when it names a sign-in and was fetched under five minutes before it, to any precision' {
+    Test-That 'Codex''s cache confirms a list when it names a sign-in and was fetched under five minutes before it, to any precision, and never after it' {
         $cacheVerdicts['ten seconds before'] -ceq 'fresh' -and $cacheVerdicts['to the nanosecond'] -ceq 'fresh' -and
             $cacheVerdicts['just under five minutes'] -ceq 'fresh' -and
             $cacheVerdicts['five minutes'] -ceq "'<cache>' was fetched 300s before the list, and Codex keeps it 300s" -and
             $cacheVerdicts['a second more'] -ceq "'<cache>' was fetched 301s before the list, and Codex keeps it 300s" -and
+            $cacheVerdicts['the same instant'] -ceq 'fresh' -and
+            $cacheVerdicts['a millisecond after'] -ceq "'<cache>' is dated 0.001s after the list" -and
             $cacheVerdicts['dated after'] -ceq "'<cache>' is dated 400s after the list"
     } $cacheVerdictText
     Test-That 'and says what is wrong with one that is missing, unreadable, or lacks either' {

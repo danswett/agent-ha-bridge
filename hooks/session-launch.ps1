@@ -2525,10 +2525,14 @@ function Assert-BridgeCodexModelCacheFresh {
         }
         else {
             $age = ($ListedAt - $fetchedAt).TotalSeconds
-            # Codex keeps it 300s. Later than the answer is the clock having moved, so
-            # how old the list really is cannot be told.
+            # Codex keeps it 300s, and writes it before it answers. Dated after the
+            # answer, it was written after it - by another Codex sharing the file, or
+            # with the clock put back - so it cannot show where the answer came from.
             if ($age -ge 300) { $reason = "'$Path' was fetched $([long]$age)s before the list, and Codex keeps it 300s" }
-            elseif ($age -lt -300) { $reason = "'$Path' is dated $([long]-$age)s after the list" }
+            elseif ($age -lt 0) {
+                $after = (-$age).ToString('0.#######', [Globalization.CultureInfo]::InvariantCulture)
+                $reason = "'$Path' is dated ${after}s after the list"
+            }
         }
     }
     if ($reason) {
