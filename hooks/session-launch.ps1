@@ -2472,17 +2472,20 @@ function Assert-BridgeCodexModelCacheFresh {
         answered at -ListedAt was the list Codex fetched for its sign-in.
 
         model/list does not say where its list came from. Codex answers it from the
-        cache in its home, models_cache.json, while that is under five minutes old.
-        Otherwise it fetches the account's list, writes it there with the time and
-        the sign-in it was fetched for, and answers from that. When the fetch fails -
+        cache in its home, models_cache.json, while that is under five minutes old
+        and was written for the same sign-in by the same version of Codex. Otherwise
+        it fetches the account's list, writes it there with the time and the sign-in
+        it was fetched for, and only then answers from it. When the fetch fails -
         offline, or turned away - it leaves the file as it was and answers from the
         list built into it. So a file written for a sign-in in the five minutes up to
         the answer means the answer was that sign-in's list, and anything else means
         it may have been the built-in one.
 
-        One case passes that should not: another sign-in's list written in those five
-        minutes, and the fetch for this one failing - a sign-in switched and the
-        network lost within the same five minutes. The next discovery puts it right.
+        One case passes that should not: a list written in those five minutes for
+        another sign-in, or by another version of Codex, and the fetch for this one
+        failing - a sign-in switched or Codex updated, and the network lost, all
+        within the same five minutes. The next discovery that reaches OpenAI puts it
+        right.
     #>
     param(
         [Parameter(Mandatory)][string]$Path,

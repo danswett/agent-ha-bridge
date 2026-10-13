@@ -851,8 +851,8 @@ another provider is refused, since Codex then has no plan to ask about - and the
 account's list, must name the sign-in and be dated within the five minutes before the
 answer. Anything else counts as a failed discovery, which keeps the last good list, and
 the daemon log says which check failed. One case still gets through: switching Codex to
-another sign-in and losing the network within the same five minutes; the next discovery
-puts that right.
+another sign-in or updating it, and losing the network, all within the same five
+minutes; the next discovery that reaches OpenAI puts that right.
 
 The Effort row offers every effort some listed model takes. Claude and Codex also say
 which efforts each model takes, so a launch that pairs a model with one it does not take
