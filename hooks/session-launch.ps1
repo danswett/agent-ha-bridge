@@ -2339,8 +2339,8 @@ function Get-BridgeClaudeModelRoster {
         A Claude too old to know --safe-mode refuses to start, and the selector keeps
         its built-in list until Claude is updated.
 
-        Throws, saying why, on any failure; gives up after -TimeoutMs, plus a few
-        seconds to clean up.
+        Throws, saying why, on any failure; gives up after -TimeoutMs, plus up to ten
+        seconds for Claude to exit (see the finally block) and a few more to clean up.
     #>
     param(
         [Parameter(Mandatory)][string]$Path,
@@ -2389,7 +2389,14 @@ function Get-BridgeClaudeModelRoster {
         }
     }
     finally {
-        if ($null -ne $connection) { [void](Stop-BridgeJsonRpcProcess -Connection $connection) }
+        # Ten seconds to exit, not the two another probe gets. Claude is often still
+        # saving its settings when its input ends - the feature flags it fetched,
+        # written into ~/.claude.json - and on a cold start that took over two seconds,
+        # so killing it then could leave that file, or a refreshed sign-in, half
+        # written. Claude's own SDK waits five seconds and then asks it to stop for
+        # five more; the kill here does not ask, so Claude gets both. A Claude that
+        # exits promptly, as it does once warm, is not held up at all.
+        if ($null -ne $connection) { [void](Stop-BridgeJsonRpcProcess -Connection $connection -GraceMs 10000) }
         try { if ([IO.Directory]::Exists($root)) { [IO.Directory]::Delete($root, $true) } } catch { }
     }
 }

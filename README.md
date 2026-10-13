@@ -833,6 +833,8 @@ sends only the SDK's opening `initialize` request, whose answer lists the models
 `/model` picker shows this account; its `default` entry is left out, since *Agent
 default* already means it. It runs in `--safe-mode`, which keeps the sign-in but loads no
 hooks, plugins, skills, MCP servers or `CLAUDE.md`, and with `--no-session-persistence`.
+Once it has answered, Claude gets ten seconds to exit by itself before it is stopped, since
+it may still be saving its settings to `~/.claude.json`.
 For Codex the daemon starts `codex app-server`, as Codex's IDE extensions do, and pages
 through `model/list`, leaving out the models Codex hides from its own picker. Plugins are
 turned off for that one process: an app-server otherwise starts refreshing Codex's plugin

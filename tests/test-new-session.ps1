@@ -1202,6 +1202,14 @@ Write-Line ([ordered]@{
         type = 'control_response'
         response = [ordered]@{ subtype = 'success'; request_id = $requestId; response = [ordered]@{ commands = @(); models = $models } }
     })
+if ($env:FAKE_MODE -eq 'claude-slow-exit') {
+    # Still saving its settings when its input ends, as Claude is on a cold start, for
+    # longer than the two seconds another probe gets to exit.
+    while ($stdin.Read($chunk, 0, $chunk.Length) -gt 0) { }
+    Start-Sleep -Milliseconds 3000
+    [IO.File]::AppendAllText($env:FAKE_LOG, "{`"saved`":true}`n")
+    exit 0
+}
 Wait-End
 '@
     $script:FakeCliScripts['codex'] = New-FakeLineScript -Name 'codex.ps1' -Body @'
@@ -1325,6 +1333,11 @@ while ($true) {
     Test-That 'a Claude that refuses initialize fails the probe with its reason, and the folder still goes' {
         $script:LauncherProbeError -ceq "'initialize' failed: simulated initialize failure" -and (Test-FakeProbeCleanedUp)
     } (Format-FakeProbeResult)
+    Invoke-FakeLauncherProbe -Launcher 'claude' -Mode 'claude-slow-exit'
+    Test-That 'a Claude still saving its settings once it has answered is left to finish rather than killed' {
+        $null -ne $script:LauncherProbeResult -and
+            @($script:LauncherProbeLines | Where-Object { $_['saved'] -eq $true }).Count -eq 1 -and (Test-FakeProbeCleanedUp)
+    } "$(Format-FakeProbeResult) $(Format-FakeProbeLines)"
     Invoke-FakeLauncherProbe -Launcher 'claude' -Mode 'claude-old'
     Test-That 'a Claude too old for --safe-mode fails it with its exit code and what it printed' {
         $script:LauncherProbeError -match 'code 1\b' -and $script:LauncherProbeError -match "unknown option '--safe-mode'" -and
