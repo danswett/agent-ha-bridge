@@ -148,6 +148,41 @@ Update-DaemonPendingLaunch -Headers @{}
 Test-That 'but not forever' { $null -eq $script:DaemonPendingLaunch -and $script:Notes[-1] -match 'still waiting on a question in its window' }
 
 Write-Host ''
+Write-Host '--- allow-all answers both of Claude''s startup questions, in turn ---'
+# 2026-10-15: an allow-all launch answered "do you trust the files in this folder?" at
+# 01:52 and then sat on the warning that --dangerously-skip-permissions itself raises,
+# which the screen reader did not know, until it was clicked by hand three minutes
+# later. Both are two options with the refusing one focused, so both take the same
+# keys - but only once both are recognised.
+$trustScreen = "Do you trust the files in this folder?`n  C:\repo`n`n> No, exit`n  Yes, I trust this folder`n"
+$bypassScreen = "WARNING: Claude Code running in Bypass Permissions mode`n`n> No, exit`n  Yes, I accept`n"
+$script:Sent = @()
+function Send-BridgeTrustAnswer { param([int]$ProcessId, [string]$Selection) $script:Sent += $Selection; 'ok' }
+$script:Screen = $trustScreen
+$script:DaemonPendingLaunch = [pscustomobject]@{
+    SessionId = ''; Launcher = 'claude'; ProcessId = $otherPid; Label = 'repo'; Verb = 'Started'
+    Since = [DateTimeOffset]::Now.AddSeconds(-5)
+    LastCheck = [DateTimeOffset]::MinValue; TrustAskedAt = $null; TrustConfirmed = $true; TrustAnswers = 0
+    AwaitingFirstMessage = $false; FirstMessageAsked = $false
+}
+Update-DaemonPendingLaunch -Headers @{}
+$script:Screen = $bypassScreen
+$script:DaemonPendingLaunch.LastCheck = [DateTimeOffset]::MinValue
+Update-DaemonPendingLaunch -Headers @{}
+Test-That 'the folder question and the bypass warning are both answered' {
+    ($script:Sent -join ',') -eq 'no,no'
+} ($script:Sent -join ',')
+Test-That 'and the launch is still held while they are worked through' {
+    $null -ne $script:DaemonPendingLaunch -and $script:DaemonPendingLaunch.TrustAnswers -eq 2
+}
+
+$script:Sent = @()
+$script:Screen = "Claude Code`n`n> Try 'fix the failing test'`n"
+$script:DaemonPendingLaunch.LastCheck = [DateTimeOffset]::MinValue
+Update-DaemonPendingLaunch -Headers @{}
+Test-That 'a window that is asking nothing is left alone' { $script:Sent.Count -eq 0 } ($script:Sent -join ',')
+
+Write-Host ''
 Write-Host '--- a slow launch is still watched, so a late trust prompt is caught ---'
 # What happened on the Mac: Claude was launched, put up its "do you trust the files in
 # this folder?" question, and the launch was dropped at 90 seconds - which stopped the
