@@ -2768,6 +2768,58 @@ Test-That 'an empty fetch with nothing cached is simply empty' {
     @(Get-DaemonResumableSessions -LiveSessionIds @()).Count -eq 0
 }
 
+# Only sessions in an approved workspace can be offered, and that test used to run
+# after the list had already been cut to resumeCount. Recent work in unapproved
+# folders therefore filled the window and was thrown away, leaving a dropdown far
+# shorter than the machine could offer - 402 resumable sessions, 47 of them in
+# approved workspaces, and four on the card. The cut has to come last.
+#
+# Only the one key is changed: this hashtable also carries the approved workspaces
+# and the profiles, and replacing it wholesale emptied both.
+Reset-ResumeCache
+$script:FakeSettings['newSession.resumeCount'] = 3
+Set-AgencySessions -Sessions @(
+    @{ session_id = 'e0000000-0000-0000-0000-000000000001'; summary = 'Newest, unapproved'; folder = $root;  can_resume = $true; updated_at = '2026-09-30T10:00:00Z' }
+    @{ session_id = 'e0000000-0000-0000-0000-000000000002'; summary = 'Also unapproved';    folder = $root;  can_resume = $true; updated_at = '2026-09-29T10:00:00Z' }
+    @{ session_id = 'e0000000-0000-0000-0000-000000000003'; summary = 'Unapproved again';   folder = $root;  can_resume = $true; updated_at = '2026-09-28T10:00:00Z' }
+    @{ session_id = 'e0000000-0000-0000-0000-000000000004'; summary = 'Older, approved';    folder = $alpha; can_resume = $true; updated_at = '2026-09-27T10:00:00Z' }
+    @{ session_id = 'e0000000-0000-0000-0000-000000000005'; summary = 'Older still';        folder = $beta;  can_resume = $true; updated_at = '2026-09-26T10:00:00Z' }
+)
+$past = @(Get-DaemonResumableSessions -LiveSessionIds @())
+Test-That 'sessions in approved workspaces are offered even when newer ones are not' {
+    $past.Count -eq 2 -and
+    $past.SessionId -contains 'e0000000-0000-0000-0000-000000000004' -and
+    $past.SessionId -contains 'e0000000-0000-0000-0000-000000000005'
+}
+Test-That 'and an unapproved folder is still never offered' {
+    @($past).SessionId -notcontains 'e0000000-0000-0000-0000-000000000001'
+}
+
+# resumeCount must bound what is shown, not what is scanned.
+Reset-ResumeCache
+$script:FakeSettings['newSession.resumeCount'] = 2
+$many = foreach ($n in 1..6) {
+    @{ session_id = ('f0000000-0000-0000-0000-00000000000{0}' -f $n); summary = "Approved $n"
+       folder = $alpha; can_resume = $true; updated_at = ('2026-09-{0:00}T10:00:00Z' -f (20 + $n)) }
+}
+Set-AgencySessions -Sessions @($many)
+$capped = @(Get-DaemonResumableSessions -LiveSessionIds @())
+Test-That 'the dropdown is capped at resumeCount' { $capped.Count -eq 2 }
+Test-That 'and keeps the newest of the offerable ones' {
+    $capped[0].SessionId -eq 'f0000000-0000-0000-0000-000000000006' -and
+    $capped[1].SessionId -eq 'f0000000-0000-0000-0000-000000000005'
+}
+
+# A live session is removed after the cache is built, so the cache has to hold more
+# than resumeCount or the list shrinks every time something is running.
+Reset-ResumeCache
+$null = Get-DaemonResumableSessions -LiveSessionIds @()
+$withLive = @(Get-DaemonResumableSessions -LiveSessionIds @('f0000000-0000-0000-0000-000000000006'))
+Test-That 'a live session is replaced rather than leaving a gap' {
+    $withLive.Count -eq 2 -and $withLive.SessionId -notcontains 'f0000000-0000-0000-0000-000000000006'
+}
+$script:FakeSettings.Remove('newSession.resumeCount')
+
 Write-Host ''
 Write-Host '--- press handling, continued ---'
 $script:AgencyJson = ''

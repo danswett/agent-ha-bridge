@@ -523,6 +523,23 @@ function Invoke-PendingStops {
     }
 }
 
+function Get-DaemonResumeDisplayCount {
+    <#
+        How many resumable sessions the dropdown offers, and so how many this machine
+        publishes to its peers.
+
+        In one place because three callers need the same number and the fetch now
+        depends on it: a fetch that kept fewer than the dropdown wanted would silently
+        shorten the list, which is the failure this whole path was just fixed for.
+        Settings come from a file that can hold anything, so a non-numeric or negative
+        value falls back rather than throwing inside a reconcile.
+    #>
+    $count = 0
+    if (-not [int]::TryParse([string](Get-BridgeSetting 'newSession.resumeCount' 12), [ref]$count)) { $count = 12 }
+    if ($count -lt 0) { $count = 0 }
+    $count
+}
+
 function Get-DaemonResumableSessions {
     <#
         The cached list of sessions offered in the resume dropdown.
@@ -546,7 +563,17 @@ function Get-DaemonResumableSessions {
     $age = ([DateTimeOffset]::Now - $script:DaemonResumeCacheAt).TotalSeconds
     if ($Force.IsPresent -or $age -ge $script:DaemonConfig.ResumeCacheSeconds) {
         try {
-            $fetched = @(Get-BridgeResumableSessions)
+            # The approved-workspace test goes into the fetch, so the newest $display
+            # *offerable* sessions are kept rather than whatever survives the newest
+            # $display overall - see the $Include note in Get-BridgeResumableSessions.
+            # The margin covers the live sessions removed below: those change between
+            # reconciles, so they cannot be part of a cache that is reused across them,
+            # and without it a machine running several sessions showed a short list.
+            $display = Get-DaemonResumeDisplayCount
+            $fetched = @(Get-BridgeResumableSessions -Limit ($display + 25) -Include {
+                $_.PSObject.Properties['Folder'] -and
+                (Test-BridgeWorkspacePathApproved -Path ([string]$_.Folder))
+            })
 
             # An empty result is treated as a failed fetch, not as truth, whenever a
             # previous fetch found something. Launching a session spawns Agency, and a
@@ -576,11 +603,11 @@ function Get-DaemonResumableSessions {
         if (-not [string]::IsNullOrWhiteSpace($id)) { $live[[string]$id] = $true }
     }
 
-    $offered = @(@($script:DaemonResumeCache) | Where-Object {
-        -not $live.ContainsKey([string]$_.SessionId) -and
-        $_.PSObject.Properties['Folder'] -and
-        (Test-BridgeWorkspacePathApproved -Path ([string]$_.Folder))
-    })
+    # The folder test already ran in the fetch above. Only liveness is re-tested here,
+    # because it is the one thing that changes while the cache is still warm.
+    $offered = @(@($script:DaemonResumeCache) |
+        Where-Object { -not $live.ContainsKey([string]$_.SessionId) } |
+        Select-Object -First (Get-DaemonResumeDisplayCount))
     # Remembered so the global status publishes exactly what this dropdown offers,
     # rather than recomputing and risking the two drifting apart.
     $script:DaemonResumeOffered = $offered

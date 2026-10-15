@@ -3756,7 +3756,17 @@ function Get-BridgeResumableSessions {
 
         # Session ids to leave out - the live ones.
         [AllowEmptyCollection()]
-        [string[]]$Exclude = @()
+        [string[]]$Exclude = @(),
+
+        # Applied before the list is cut to $Limit, which is the only place it can go.
+        # The daemon offers a session only when its folder is an approved workspace,
+        # and testing that *after* the cut meant the dropdown showed whatever survived
+        # of the newest $Limit rather than $Limit sessions it could actually offer. On
+        # a machine with 402 resumable sessions, 47 of them in approved workspaces,
+        # the newest 12 were fetched and 6 survived - so most of the offerable list was
+        # unreachable however long it got, because recent work in unapproved folders
+        # filled the window and was then discarded.
+        [scriptblock]$Include = $null
     )
 
     if ($Limit -le 0) { $Limit = [int](Get-BridgeSetting 'newSession.resumeCount' 12) }
@@ -3784,7 +3794,8 @@ function Get-BridgeResumableSessions {
         $entry
     }
 
-    $recent = @(@($unique) | Sort-Object Updated -Descending | Select-Object -First $Limit)
+    $eligible = if ($null -ne $Include) { @(@($unique) | Where-Object $Include) } else { @($unique) }
+    $recent = @(@($eligible) | Sort-Object Updated -Descending | Select-Object -First $Limit)
 
     # The agent is named in each label once the list holds more than one kind, so a
     # Claude and a Copilot session on the same task can be told apart.
