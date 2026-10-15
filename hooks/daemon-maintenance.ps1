@@ -8,7 +8,9 @@
     declaring the shared $script: state; see docs/daemon-split.md.
     Shared state it changes: DaemonClientSetup, DaemonRestartRequested,
     DaemonUpdateAvailable, DaemonUpdateLastPress, DaemonUpdatePublished,
-    DaemonMemoryTrimmedAt, DaemonUpdateVerdict.
+    DaemonMemoryTrimmedAt, DaemonUpdateVerdict, DaemonUpdateCheckLastPress,
+    DaemonPeerLatestVersion, DaemonPeerLatestChecked, DaemonUpdateEntityIdsPinned,
+    DaemonUpdateEntityIdsPinnedAt.
 #>
 
 $script:DaemonMemoryTrimmedAt = [DateTimeOffset]::MinValue
@@ -277,6 +279,148 @@ function Invoke-DaemonUpdateOutcome {
     }
 }
 
+function Confirm-DaemonUpdateEntityIds {
+    <#
+        Keeps asking Home Assistant to put this machine's update entities on their
+        deterministic ids until the check button is actually seen on one.
+
+        Set-CopilotMqttUpdateEntityIds runs inside the publish, and the publish only
+        happens when the status signature changes. A Home Assistant that had not yet
+        processed the discovery message when the registry was listed has nothing to
+        rename, the setter skips it silently, and on a stable install - no new release,
+        no stage, nothing moving - the signature never changes again. The button then
+        keeps the id Home Assistant built from the device and entity names, while the
+        daemon reads and the card presses the one the bridge chose. Both ends correct,
+        pointing at different entities, with nothing anywhere saying so. Raised by
+        Codex on #224.
+
+        Observation comes from the reconcile snapshot, which already holds every
+        agent_bridge_* entity, so confirming costs nothing. Only a confirmed absence
+        asks for the rename again, and no more than once a minute, so an entity that
+        never appears cannot turn this into a registry walk every fifteen seconds.
+    #>
+    param([DateTimeOffset]$Now = [DateTimeOffset]::Now)
+
+    if ($script:DaemonUpdateEntityIdsPinned) { return $true }
+    # No snapshot is no evidence either way - the startup pass has none - and acting
+    # on that would re-pin on every daemon start regardless of whether it was needed.
+    if ($null -eq $script:DaemonReconcileStates) { return $false }
+    if ($script:DaemonReconcileStates.ContainsKey($script:DaemonEntity.CheckUpdates)) {
+        $script:DaemonUpdateEntityIdsPinned = $true
+        return $true
+    }
+    if (($Now - $script:DaemonUpdateEntityIdsPinnedAt).TotalSeconds -lt 60) { return $false }
+    $script:DaemonUpdateEntityIdsPinnedAt = $Now
+    try { [void](Set-CopilotMqttUpdateEntityIds) }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        Write-DaemonLog -Message "update entity ids could not be pinned: $($_.Exception.Message)"
+    }
+    $false
+}
+
+function Test-DaemonUpdateCheckPress {
+    <#
+        Whether the Check button has been pressed since this daemon last looked.
+
+        The same press-timestamp mechanism as Install and Submit, and kept separate
+        from Install's for the same reason the buttons are separate: Install acts on
+        what the last check found, so a press of Check that Install's handler had
+        already consumed would be a press that did nothing visible at all.
+
+        A press from before this daemon started is a retained value from an earlier
+        run, not an instruction - compared against the start time rather than simply
+        ignoring the first value seen, so a press made moments after a restart still
+        counts.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Headers)
+
+    try {
+        $button = Get-DaemonEntityState -EntityId $script:DaemonEntity.CheckUpdates -Headers $Headers
+        $press = [string]$button.state
+        if ($press -in @('unknown', 'unavailable', '')) { return $false }
+        if ($press -eq $script:DaemonUpdateCheckLastPress) { return $false }
+        $script:DaemonUpdateCheckLastPress = $press
+
+        $pressedAt = [DateTimeOffset]::MinValue
+        if (-not [DateTimeOffset]::TryParse($press, [ref]$pressedAt)) { return $false }
+        if ($pressedAt -le $script:DaemonStartedAt) { return $false }
+
+        Write-DaemonLog -Message 'update check requested from Home Assistant'
+        return $true
+    }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        # The button may not exist yet on a first run. Never a reason to skip the
+        # ordinary check that follows.
+        Write-DaemonLog -Message "update check button not read: $($_.Exception.Message)"
+        return $false
+    }
+}
+
+function Get-DaemonPeerLatestVersion {
+    <#
+        The highest release any other machine's update entity is currently reporting,
+        or '' when the snapshot holds none.
+
+        Machines publish what they find to retained entities, so one that has already
+        seen a new release is saying so where every other machine can read it - the
+        same trick Sync-DaemonUsage uses to tell whether another machine is already
+        reading the same account (#142). No writer, no authority, no election: it is a
+        hint that something has changed, and the only thing this machine does with it
+        is go and look for itself.
+
+        Deliberately not adopted as this machine's answer. A peer's version decides
+        nothing about what gets installed here - Invoke-BridgeSelfUpdate re-checks
+        under -Force before it downloads anything - and a machine reporting a version
+        this one cannot verify is a machine to be curious about, not to obey.
+    #>
+
+    if ($null -eq $script:DaemonReconcileStates) { return '' }
+    $mine = $script:DaemonEntity.Update
+    $highest = ''
+    foreach ($id in $script:DaemonReconcileStates.Keys) {
+        if ($id -eq $mine -or $id -notlike 'update.agent_bridge_*') { continue }
+        $entry = $script:DaemonReconcileStates[$id]
+        if ($null -eq $entry -or -not $entry.PSObject.Properties['attributes'] -or $null -eq $entry.attributes) { continue }
+        if (-not $entry.attributes.PSObject.Properties['latest_version']) { continue }
+        $version = [string]$entry.attributes.latest_version
+        if ([string]::IsNullOrWhiteSpace($version)) { continue }
+        if ([string]::IsNullOrWhiteSpace($highest) -or
+            (ConvertTo-BridgeVersion $version) -gt (ConvertTo-BridgeVersion $highest)) {
+            $highest = $version
+        }
+    }
+    $highest
+}
+
+function Test-DaemonPeerUpdateNotice {
+    <#
+        Whether a peer is reporting a release this machine has not established yet,
+        and this machine has not already looked because of it.
+
+        Looking is cheap - the routine check is a redirect that spends no API
+        allowance - but it is not free, and the daemon reconciles every fifteen
+        seconds. Remembering which peer version prompted the last look is what keeps
+        a peer that is permanently ahead (or simply wrong) from turning that into a
+        four-per-minute poll.
+    #>
+
+    $peer = Get-DaemonPeerLatestVersion
+    if ([string]::IsNullOrWhiteSpace($peer)) { return $false }
+    $script:DaemonPeerLatestVersion = $peer
+    if ($peer -eq $script:DaemonPeerLatestChecked) { return $false }
+
+    $installed = Get-BridgeInstalledVersion
+    $known = Get-BridgeKnownReleaseTag
+    if ([string]::IsNullOrWhiteSpace($known)) { $known = $installed }
+    if ((ConvertTo-BridgeVersion $peer) -le (ConvertTo-BridgeVersion $known)) { return $false }
+
+    $script:DaemonPeerLatestChecked = $peer
+    Write-DaemonLog -Message "another machine reports $peer; checking for a release rather than waiting for the interval"
+    $true
+}
+
 function Sync-DaemonUpdateStatus {
     <#
         Publishes the bridge's own update status, and acts on a press of the install
@@ -297,6 +441,22 @@ function Sync-DaemonUpdateStatus {
     # checked before anything else happens.
     if (-not (Get-BridgeSetting 'updates.checkForUpdates' $true)) { return }
 
+    # Independent of the publish below, which only runs when something changed: a
+    # freshly discovered entity that Home Assistant had not registered yet would
+    # otherwise keep the id Home Assistant chose for it, for good.
+    [void](Confirm-DaemonUpdateEntityIds)
+
+    # Two things mean "look now" rather than "look at the usual time": somebody
+    # pressed Check - on this machine's card or, fanned out, on every machine's at
+    # once - and another machine reporting a release this one has not established.
+    #
+    # Both are read before the lookup so that a single press produces a single forced
+    # check, and both are evaluated unconditionally: || would skip the peer read on a
+    # press and leave the notice to fire again on the following pass.
+    $pressed = Test-DaemonUpdateCheckPress -Headers $Headers
+    $peerNotice = Test-DaemonPeerUpdateNotice
+    $force = $pressed -or $peerNotice
+
     # What the check found, or what is still true without it. A failed check used to
     # `return` here, which had two consequences that cost an extended debugging
     # session each: the update entity was never published, so it went unavailable with
@@ -309,7 +469,7 @@ function Sync-DaemonUpdateStatus {
     # always something honest to publish.
     $status = $null
     $checkFailure = ''
-    try { $status = Get-BridgeUpdateStatus }
+    try { $status = Get-BridgeUpdateStatus -Force:$force }
     catch {
         if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
         $checkFailure = [string]$_.Exception.Message
@@ -328,6 +488,25 @@ function Sync-DaemonUpdateStatus {
             Notes = ''
             Zip = ''
         }
+    }
+
+    # A press has to answer for itself. Where the check changed something, the publish
+    # below says so on its own - but "you are already current" is a result with no
+    # state change behind it, and republishing an identical retained payload is not a
+    # change Home Assistant shows. Without this, pressing Check on a machine that is
+    # up to date is indistinguishable from a button wired to nothing.
+    #
+    # The verdict mechanism the install button already uses carries it, and clears the
+    # signature so the answer is republished either way. Deliberately not 'failed'
+    # when the check could not reach GitHub: a refused check is not a failed update,
+    # which is the conflation #92 and #124 were both about. That case republishes with
+    # the explanation already carried in the notes.
+    if ($pressed -and -not $script:DaemonUpdatePendingAttempt) {
+        if ($status.State -eq 'Current') {
+            Set-DaemonUpdateVerdict -Stage 'current' `
+                -Detail "Checked just now; $($status.Installed) is the latest release."
+        }
+        else { $script:DaemonUpdateSignature = '' }
     }
 
     # Computed once, before anything can throw, because the press handler below

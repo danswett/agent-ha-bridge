@@ -31,10 +31,15 @@ $script:BridgeUpdateStages = @('checking', 'downloading', 'installing', 'restart
 $script:BridgeUpdateConfig = @{
     CacheFile     = Get-BridgeRuntimePath 'agent-bridge-update.json'
     ProgressFile  = Get-BridgeRuntimePath 'agent-bridge-update-progress.json'
-    # How often to check GitHub for a new release. Four times a day catches a release
-    # within a few hours and still barely touches the unauthenticated GitHub rate
-    # limit (60/hour/IP). Tunable with updates.checkHours in the config.
-    CheckHours    = [double](Get-BridgeSetting 'updates.checkHours' 6)
+    # How often to check GitHub for a new release. Half-hourly, because a routine
+    # check no longer spends the API allowance: Get-BridgeLatestRelease asks the
+    # releases/latest redirect first, and only reaches for api.github.com when that
+    # redirect names a tag the cache has not already seen - roughly once per release
+    # rather than once per check. Tunable with updates.checkHours in the config.
+    #
+    # It used to be six hours for exactly the reason that no longer applies: four
+    # checks a day was as often as the 60-an-hour-per-IP pool could be asked safely.
+    CheckHours    = [double](Get-BridgeSetting 'updates.checkHours' 0.5)
     # How long a check that could not reach GitHub is believed for. A rate-limited or
     # briefly unreachable API used to be cached like an answer, so one bad moment hid
     # a release for the full six hours - which is exactly what happened on the day
@@ -487,6 +492,151 @@ function Remove-BridgeUpdateProgress {
     }
 }
 
+function Get-BridgeResponseETag {
+    <#
+        The ETag from a captured response header collection, or ''.
+
+        Both shapes are read for the same reason Get-BridgeLatestReleaseWithoutApi
+        reads two: -ResponseHeadersVariable yields a dictionary of string arrays on
+        PowerShell 7, and anything older hands back a flat string. Under StrictMode
+        guessing wrong throws rather than yielding null.
+    #>
+    param([AllowNull()]$Headers)
+
+    if ($null -eq $Headers) { return '' }
+    $raw = $null
+    try { $raw = $Headers['ETag'] } catch { $raw = $null }
+    if (-not $raw) { try { $raw = $Headers['etag'] } catch { $raw = $null } }
+    $value = [string](@($raw) | Where-Object { $_ } | Select-Object -First 1)
+    # A weak validator is still a validator and GitHub sends them; it is echoed back
+    # exactly as received, because that is what If-None-Match compares against.
+    $value.Trim()
+}
+
+function Invoke-BridgeReleaseApiLookup {
+    <#
+        The latest-release lookup against api.github.com, which is the only part of a
+        check that spends the 60-an-hour-per-IP allowance.
+
+        Separated from Get-BridgeLatestRelease when the redirect probe took over the
+        routine check, so that what costs allowance is one named thing rather than a
+        branch halfway down a long function.
+
+        -ETag makes it a conditional request. GitHub answers 304 when the release has
+        not changed, and a 304 does not count against the primary rate limit for an
+        authenticated caller - so the machine that cannot use the redirect at all, and
+        therefore asks the API every half hour, spends almost nothing for it. The
+        caller keeps the release it already had on NotModified; this function will not
+        invent one, because a 304 carries no body.
+
+        Throws on failure. Every classification - 404, rate limiting, the backoff -
+        belongs to the caller's catch, which is where it already was.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Uri,
+        [AllowEmptyString()][string]$ETag = '',
+        [Parameter(Mandatory)][psobject]$Lookup
+    )
+
+    # Resolved once and handed to the header builder, so what is reported about this
+    # check and what was actually sent on it cannot disagree.
+    $resolvedToken = Get-BridgeUpdateToken
+    $Lookup.TokenSource = $resolvedToken.Source
+    $Lookup.TokenNote = $resolvedToken.Note
+    $headers = Get-BridgeReleaseRequestHeaders -ResolvedToken $resolvedToken
+    $sentToken = $headers.ContainsKey('Authorization')
+    if (-not [string]::IsNullOrWhiteSpace($ETag)) { $headers['If-None-Match'] = $ETag }
+
+    # Named rather than inlined because the same call is made twice - once as
+    # configured, once anonymously - and the two must not drift apart. It returns the
+    # headers alongside the body because -ResponseHeadersVariable writes into the
+    # scope that ran the call, and that is this scriptblock's, not its caller's.
+    $invoke = {
+        param([hashtable]$RequestHeaders)
+        $restArgs = @{
+            Uri        = $Uri
+            Headers    = $RequestHeaders
+            TimeoutSec = $script:BridgeUpdateConfig.RequestTimeout
+        }
+        $captured = $null
+        # Absent before PowerShell 6.1. Missing it costs only the conditional request
+        # on the next check, so it is skipped rather than made a requirement.
+        if ((Get-Command Invoke-RestMethod).Parameters.ContainsKey('ResponseHeadersVariable')) {
+            $restArgs['ResponseHeadersVariable'] = 'captured'
+        }
+        $body = Invoke-RestMethod @restArgs
+        [pscustomobject]@{ Body = $body; Headers = $captured }
+    }
+
+    $answer = $null
+    try {
+        $answer = & $invoke $headers
+    }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        $failureStatus = 0
+        if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
+            $failureStatus = [int]$_.Exception.Response.StatusCode
+        }
+        # Not an error. PowerShell raises any non-2xx, and 304 is the success case of
+        # a conditional request - the one answer that costs an authenticated caller
+        # nothing. Treating it as a failure would have made the cheapest possible
+        # check look like an outage.
+        if ($failureStatus -eq 304) {
+            return [pscustomobject]@{ Release = $null; ETag = $ETag; NotModified = $true }
+        }
+        # A token picked up from the environment is not necessarily a good one.
+        # GITHUB_TOKEN expires when its workflow job ends, and a revoked or
+        # SSO-blocked token answers 401 - so sending one turns a check that would
+        # have worked unauthenticated into a failure, on every retry, for a public
+        # release anyone can read. Asking again without it costs one request and
+        # only happens when credentials were actually the problem.
+        #
+        # A rate-limited 403 is deliberately not retried here: the allowance, not
+        # the credential, is what was refused, and the caller's redirect answers that.
+        $failureDetail = Get-BridgeHttpErrorDetail -ErrorRecord $_
+        $badCredential = $failureStatus -eq 401 -or
+            ($failureStatus -eq 403 -and -not (Get-BridgeRateLimitWait -Response $_.Exception.Response `
+                -Status $failureStatus -Detail $failureDetail).Limited)
+        if (-not $sentToken -or -not $badCredential) { throw }
+        # Said out loud, because the retry hides it otherwise. A rejected token that
+        # silently falls back leaves the machine on the 60-an-hour shared pool while
+        # its configuration claims otherwise, and nothing anywhere says which of the
+        # two it is on - which is the quiet half of #153.
+        $Lookup.TokenNote = "$($Lookup.TokenSource) was rejected by GitHub (bad credentials); " +
+            'the check ran unauthenticated instead.'
+        $Lookup.TokenSource = ''
+        $anonymous = Get-BridgeReleaseRequestHeaders -Anonymous
+        if (-not [string]::IsNullOrWhiteSpace($ETag)) { $anonymous['If-None-Match'] = $ETag }
+        try { $answer = & $invoke $anonymous }
+        catch {
+            if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+            $retryStatus = 0
+            if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
+                $retryStatus = [int]$_.Exception.Response.StatusCode
+            }
+            if ($retryStatus -eq 304) {
+                return [pscustomobject]@{ Release = $null; ETag = $ETag; NotModified = $true }
+            }
+            throw
+        }
+    }
+
+    $response = $answer.Body
+    [pscustomobject]@{
+        Release = [pscustomobject]@{
+            Tag       = [string]$response.tag_name
+            Name      = [string]$response.name
+            Url       = [string]$response.html_url
+            Zip       = [string]$response.zipball_url
+            Notes     = [string]$response.body
+            Published = [string]$response.published_at
+        }
+        ETag        = (Get-BridgeResponseETag -Headers $answer.Headers)
+        NotModified = $false
+    }
+}
+
 function Get-BridgeLatestRelease {
     <#
         The newest published release, cached so a restart loop cannot hammer GitHub.
@@ -517,6 +667,14 @@ function Get-BridgeLatestRelease {
         # A name, never a value. '' means the check went out unauthenticated, which is
         # the 60-requests-an-hour-per-IP pool everything behind this address shares.
         TokenSource = ''; TokenNote = ''
+        # Which route answered: 'redirect' (the free releases/latest 302), 'api', or
+        # 'api-304'. A cache-served answer carries the route of the check that wrote
+        # it, not a route of its own: the time reported beside it is that check's time
+        # too, and "answered from the cache" says nothing about what the half-hourly
+        # cadence is actually costing. Reported by `agent-ha-bridge status` so a
+        # machine quietly reduced to the API on every check is visible before the
+        # redirect it no longer has is the one that would have saved it.
+        Route = ''
     }
     # Carried across checks so a limit that names no time of its own backs off instead
     # of being asked again at the same fixed interval for as long as it lasts.
@@ -532,7 +690,7 @@ function Get-BridgeLatestRelease {
         if ($null -ne $checkedAt) {
             # Describes the check that produced this entry, so it is served with it
             # rather than being recomputed from whatever the environment holds now.
-            foreach ($field in @('TokenSource', 'TokenNote')) {
+            foreach ($field in @('TokenSource', 'TokenNote', 'Route')) {
                 if ($cache.PSObject.Properties[$field]) { $lookup.$field = [string]$cache.$field }
             }
             $rateLimitExpired = $false
@@ -606,76 +764,146 @@ function Get-BridgeLatestRelease {
         }
     }
 
+    # What the cache already established, kept across the reset below so the probe can
+    # recognise "still the same release" and answer from it. The redirect carries no
+    # release notes, so recognising an unchanged tag is what lets a free check keep
+    # publishing the notes a paid one fetched.
+    $knownRelease = $null
+    $knownETag = ''
+    # Whether the held release carries what only the API can give - the notes. Kept
+    # apart from Route, which says how *this* check was answered: once an unchanged
+    # tag starts being confirmed by the redirect, Route is 'redirect' on every pass,
+    # and reading that as "the notes were never fetched" would spend an API request
+    # every half hour forever.
+    #
+    # Absent means a cache from before this field, which is read as incomplete rather
+    # than assumed good. That costs one API request on the first check after an
+    # upgrade - exactly what every check used to cost - and is then settled for as
+    # long as the release stands.
+    $knownMetadataFrom = 'redirect'
+    if ($null -ne $cache) {
+        $candidate = if ($cache.PSObject.Properties['Release']) { $cache.Release } else { $null }
+        $reachedKnown = (-not $cache.PSObject.Properties['Reached']) -or
+            ($cache.Reached -is [bool] -and $cache.Reached)
+        if ($reachedKnown -and (Test-BridgeUpdateRelease $candidate)) { $knownRelease = $candidate }
+        if ($cache.PSObject.Properties['ETag']) { $knownETag = [string]$cache.ETag }
+        if ($cache.PSObject.Properties['MetadataFrom'] -and [string]$cache.MetadataFrom -eq 'api') {
+            $knownMetadataFrom = 'api'
+        }
+    }
+
     $lookup.State = 'Unavailable'
     $lookup.Release = $null
     $lookup.Detail = 'The latest release could not be established.'
     $lookup.TokenSource = ''
     $lookup.TokenNote = ''
+    $lookup.Route = ''
+    # Only ever describes an API response, so it is carried forward from the cache and
+    # cleared the moment anything else answers. A tag learned from the redirect has no
+    # ETag of its own, and reusing the previous one would make the next conditional
+    # request claim to hold a body it never saw.
+    $etag = $knownETag
+    # Travels with the release rather than with the check, and is cleared the moment a
+    # different release takes its place.
+    $metadataFrom = 'redirect'
+    # The redirect's answer, held outside the try so a failure further down can still
+    # fall back to it rather than reporting that nothing could be established.
+    $probe = $null
     try {
         $repository = Get-BridgeUpdateRepository
         if ($repository -notmatch '^[\w.-]+/[\w.-]+$') { throw 'The update repository must be owner/name.' }
-        $uri = "https://api.github.com/repos/$repository/releases/latest"
-        Assert-BridgeHttpAllowed -Uri $uri -Transport Rest
-        # Resolved once and handed to the header builder, so what is reported about
-        # this check and what was actually sent on it cannot disagree.
-        $resolvedToken = Get-BridgeUpdateToken
-        $lookup.TokenSource = $resolvedToken.Source
-        $lookup.TokenNote = $resolvedToken.Note
-        $headers = Get-BridgeReleaseRequestHeaders -ResolvedToken $resolvedToken
-        $sentToken = $headers.ContainsKey('Authorization')
-        try {
-            $response = Invoke-RestMethod -Uri $uri -Headers $headers `
-                -TimeoutSec $script:BridgeUpdateConfig.RequestTimeout
-        }
+
+        # The free question first: has the current tag changed?
+        #
+        # github.com/<r>/releases/latest answers with a 302 naming it and is not part
+        # of the 60-an-hour-per-IP API allowance, so asking costs nothing that can run
+        # out. Only a tag the cache has not already seen is worth an API request, and
+        # then it is spent on what the redirect cannot carry - the release notes. That
+        # turns the API cost from one request per check into roughly one per release,
+        # which is what makes a half-hourly cadence safe.
+        #
+        # The ordering matters more than the saving. On shared corporate egress the
+        # API pool is drained by everything else behind the same address: measured
+        # from a Dev Box, the remaining count read 0, then 26, then 36 within twenty
+        # seconds, under three different reset windows, while this machine made no
+        # requests at all. A check that opens with the API is therefore refused at any
+        # cadence, which is what #92 and #109 were; one that opens here is refused
+        # only when GitHub itself cannot be reached.
+        try { $probe = Get-BridgeLatestReleaseWithoutApi -Repository $repository }
         catch {
             if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
-            # A token picked up from the environment is not necessarily a good one.
-            # GITHUB_TOKEN expires when its workflow job ends, and a revoked or
-            # SSO-blocked token answers 401 - so sending one turns a check that would
-            # have worked unauthenticated into a failure, on every retry, for a public
-            # release anyone can read. Asking again without it costs one request and
-            # only happens when credentials were actually the problem.
-            #
-            # A rate-limited 403 is deliberately not retried here: the allowance, not
-            # the credential, is what was refused, and the non-API fallback below is
-            # what answers that.
-            $failureStatus = 0
-            if ($_.Exception.PSObject.Properties['Response'] -and $_.Exception.Response) {
-                $failureStatus = [int]$_.Exception.Response.StatusCode
-            }
-            $failureDetail = Get-BridgeHttpErrorDetail -ErrorRecord $_
-            $badCredential = $failureStatus -eq 401 -or
-                ($failureStatus -eq 403 -and -not (Get-BridgeRateLimitWait -Response $_.Exception.Response `
-                    -Status $failureStatus -Detail $failureDetail).Limited)
-            if (-not $sentToken -or -not $badCredential) { throw }
-            # Said out loud, because the retry hides it otherwise. A rejected token
-            # that silently falls back leaves the machine on the 60-an-hour shared
-            # pool while its configuration claims otherwise, and nothing anywhere
-            # says which of the two it is on - which is the quiet half of #153.
-            $lookup.TokenNote = "$($lookup.TokenSource) was rejected by GitHub (bad credentials); " +
-                'the check ran unauthenticated instead.'
-            $lookup.TokenSource = ''
-            $response = Invoke-RestMethod -Uri $uri -Headers (Get-BridgeReleaseRequestHeaders -Anonymous) `
-                -TimeoutSec $script:BridgeUpdateConfig.RequestTimeout
+            # Nothing learned, so the API is still asked below exactly as it used to
+            # be. The redirect being unavailable must not be a new way to fail.
+            $probe = $null
+        }
+        if (-not (Test-BridgeUpdateRelease $probe)) { $probe = $null }
+
+        # Compared as versions so that v1.2.3 and 1.2.3 are not mistaken for a new
+        # release every check, and as text as well because ConvertTo-BridgeVersion
+        # drops a pre-release suffix - 1.2.3-rc.1 and 1.2.3 are the same [version] and
+        # emphatically not the same release.
+        $unchanged = $false
+        if ($null -ne $probe -and $null -ne $knownRelease) {
+            $probeTag = ([string]$probe.Tag).TrimStart('v', 'V')
+            $knownTag = ([string]$knownRelease.Tag).TrimStart('v', 'V')
+            $unchanged = $probeTag -eq $knownTag -and
+                (ConvertTo-BridgeVersion $probe.Tag) -eq (ConvertTo-BridgeVersion $knownRelease.Tag)
         }
 
-        $release = [pscustomobject]@{
-            Tag       = [string]$response.tag_name
-            Name      = [string]$response.name
-            Url       = [string]$response.html_url
-            Zip       = [string]$response.zipball_url
-            Notes     = [string]$response.body
-            Published = [string]$response.published_at
+        if ($unchanged) {
+            $lookup.Release = $knownRelease
         }
-        # Prefer the archive that is not an API request, so that pressing Update does
-        # not spend - or get refused by - the same allowance the check competes for.
-        $archive = Get-BridgeReleaseArchiveUri -Repository $repository -Tag $release.Tag
-        if ($archive) { $release.Zip = $archive }
-        if (-not (Test-BridgeUpdateRelease $release)) { throw 'The latest-release response has invalid version or download metadata.' }
-        $lookup.State = 'Found'
-        $lookup.Release = $release
-        $lookup.Detail = ''
-        $strikes = 0
+
+        # An unchanged tag is only the whole answer once the notes have actually been
+        # fetched for it. A release first learned from the redirect while the API was
+        # timing out, refusing or returning 500 is complete apart from exactly what
+        # the redirect cannot carry - and treating it as settled meant that release
+        # kept its empty notes for as long as it stood, with even a forced check
+        # skipping the API path. Raised by Codex on #224.
+        if ($unchanged -and $knownMetadataFrom -eq 'api') {
+            # Still the release already established, and the record is complete, so no
+            # API request is made at all. This is the path almost every check takes.
+            $lookup.State = 'Found'
+            $lookup.Detail = ''
+            $lookup.Route = 'redirect'
+            $metadataFrom = 'api'
+            $strikes = 0
+        }
+        else {
+            $uri = "https://api.github.com/repos/$repository/releases/latest"
+            Assert-BridgeHttpAllowed -Uri $uri -Transport Rest
+            # Conditional only when there is a release to keep. A 304 carries no body,
+            # so asking "has it changed?" without holding the previous answer would
+            # buy an unanswerable success.
+            $conditional = if ($null -ne $knownRelease) { $knownETag } else { '' }
+            $api = Invoke-BridgeReleaseApiLookup -Uri $uri -ETag $conditional -Lookup $lookup
+
+            if ($api.NotModified) {
+                # GitHub confirmed the body it already answered with is still current,
+                # and charged nothing for saying so. The cached release keeps its notes.
+                $lookup.State = 'Found'
+                $lookup.Release = $knownRelease
+                $lookup.Detail = ''
+                $lookup.Route = 'api-304'
+                $metadataFrom = 'api'
+                $strikes = 0
+            }
+            else {
+                $release = $api.Release
+                # Prefer the archive that is not an API request, so that pressing Update
+                # does not spend - or get refused by - the allowance the check competes for.
+                $archive = Get-BridgeReleaseArchiveUri -Repository $repository -Tag $release.Tag
+                if ($archive) { $release.Zip = $archive }
+                if (-not (Test-BridgeUpdateRelease $release)) { throw 'The latest-release response has invalid version or download metadata.' }
+                $lookup.State = 'Found'
+                $lookup.Release = $release
+                $lookup.Detail = ''
+                $lookup.Route = 'api'
+                $etag = [string]$api.ETag
+                $metadataFrom = 'api'
+                $strikes = 0
+            }
+        }
     }
     catch {
         if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
@@ -690,7 +918,7 @@ function Get-BridgeLatestRelease {
         # A refusal GitHub gave no time for is the one that has to back off; when it
         # named a reset, that time is the answer and waiting for it ends the loop.
         $strikes = if ($rateLimit.Limited -and -not $rateLimit.Explicit) { $strikes + 1 } else { 0 }
-        if ($httpStatus -eq 404) {
+        if ($httpStatus -eq 404 -and $null -eq $probe) {
             $lookup.State = 'NotFound'
             $lookup.Detail = 'GitHub returned 404 for the latest-release endpoint; repository existence and access are not confirmed.'
         }
@@ -701,11 +929,9 @@ function Get-BridgeLatestRelease {
             # all - and the bare 403 that used to be reported read as the release being
             # broken rather than as a queue to wait in (#109, #92).
             #
-            # Being refused is not the same as not knowing, though. The Atom feed is
-            # outside that allowance, so it is asked before the refusal is accepted as
-            # an answer. Without this the machine kept publishing whatever version it
-            # last managed to read, with the update entity sitting at "off" - a machine
-            # days behind looked exactly like one that was current.
+            # Being refused is not the same as not knowing, though - which is what the
+            # redirect already asked, before this request was made. It is reinstated
+            # below rather than fetched again here.
             $lookup.State = 'RateLimited'
             $lookup.RetryAt = if ($rateLimit.RetryAt) { $rateLimit.RetryAt.ToString('o') } else { $null }
             # The last sentence is advice, so it has to be true of this machine. Told
@@ -727,22 +953,49 @@ function Get-BridgeLatestRelease {
                     'a personal access token in updates.token raises this machine to 5,000 of its own.'
                 })
             try {
-                $fallback = Get-BridgeLatestReleaseWithoutApi -Repository $repository
-                if (Test-BridgeUpdateRelease $fallback) {
-                    $lookup.State = 'Found'
-                    $lookup.Release = $fallback
-                    $lookup.RetryAt = $null
-                    $lookup.Detail = ''
-                    $strikes = 0
+                # Only when the probe found nothing: a tag already in hand is why this
+                # request was made at all, and asking the same redirect twice in one
+                # check learns nothing. A probe that failed transiently gets its second
+                # chance here, at no cost to the allowance that just refused us.
+                if ($null -eq $probe) {
+                    $fallback = Get-BridgeLatestReleaseWithoutApi -Repository $repository
+                    if (Test-BridgeUpdateRelease $fallback) { $probe = $fallback }
                 }
             }
             catch {
                 if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
-                # Keep the rate-limit verdict; the feed is a second chance, not a
+                # Keep the rate-limit verdict; the redirect is a second chance, not a
                 # second thing to report as broken.
             }
         }
         else { $lookup.Detail = "The latest release could not be established: $($_.Exception.Message)" }
+
+        # Whatever refused the request, the redirect above may already have named the
+        # current release - and a correct version with no notes beats a stale one
+        # presented as current, which is the whole reason the probe runs first.
+        #
+        # This used to apply only to a rate-limited check, so a 500 or a timeout from
+        # api.github.com reported "could not be established" while the answer was
+        # already in hand. The one verdict it must not overturn is an authoritative
+        # 404 that the redirect also could not contradict, which is why that arm above
+        # only claims NotFound when the probe found nothing either.
+        if ($lookup.State -ne 'NotFound' -and (Test-BridgeUpdateRelease $probe)) {
+            $lookup.State = 'Found'
+            $lookup.Release = $probe
+            $lookup.RetryAt = $null
+            $lookup.Detail = ''
+            $lookup.Route = 'redirect'
+            # The notes could not be fetched, so no ETag describes what is held now.
+            # Carrying the previous one forward would make the next conditional
+            # request claim a body this check never saw, and a 304 would then restore
+            # the release this one replaced.
+            $etag = ''
+            # And the record is incomplete, which the next check has to know: the tag
+            # will look unchanged then, and without this it would be taken as settled
+            # and the notes never fetched at all.
+            $metadataFrom = 'redirect'
+            $strikes = 0
+        }
     }
 
     # A 404 is authoritative - GitHub answered - so it is allowed to clear what was
@@ -768,11 +1021,54 @@ function Get-BridgeLatestRelease {
         # a note here rather than vanishing into a silent anonymous retry.
         TokenSource = $lookup.TokenSource
         TokenNote   = $lookup.TokenNote
+        # Which route actually answered, so `agent-ha-bridge status` can say whether
+        # this machine is living on the free redirect or still spending the API
+        # allowance on every check. A machine quietly reduced to one of them is worth
+        # seeing before the other stops working too.
+        Route     = $lookup.Route
+        # The validator for the body held in Release, and only ever that. Cleared by
+        # any answer that did not come from the API, so a conditional request can
+        # never claim a body this machine never received.
+        ETag      = $etag
+        # Whether the release above carries the API-only metadata - the notes - rather
+        # than only what the redirect could name. Separate from Route, which describes
+        # the check: an unchanged tag is confirmed by the redirect on every pass, so
+        # Route alone would either re-fetch the notes forever or never again.
+        MetadataFrom = $metadataFrom
         Release   = $lookup.Release
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
 
     if ($IncludeStatus) { return $lookup }
     $lookup.Release
+}
+
+function Get-BridgeKnownReleaseTag {
+    <#
+        The release tag the last reached check established, or '' - read from the
+        cache without making any request.
+
+        Exists so a caller can ask "is this version news?" without the question itself
+        becoming a lookup. Reading it through Get-BridgeLatestRelease with a very wide
+        interval almost works and is a trap: a missing or unreadable cache falls
+        straight through to the network, which is the one thing the caller was trying
+        to avoid.
+    #>
+
+    $cachePath = $script:BridgeUpdateConfig.CacheFile
+    if (Test-BridgeTestExecution) { Assert-BridgeTestPath -Path $cachePath }
+    if (-not (Test-Path -LiteralPath $cachePath -PathType Leaf)) { return '' }
+    $cache = $null
+    try { $cache = Get-Content -LiteralPath $cachePath -Raw -Encoding UTF8 | ConvertFrom-Json }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        return ''
+    }
+    if ($null -eq $cache -or -not $cache.PSObject.Properties['Release']) { return '' }
+    # Only a check that reached GitHub established anything. A release retained beside
+    # Reached=false is the last thing that was known, not the current answer.
+    if ($cache.PSObject.Properties['Reached'] -and $cache.Reached -is [bool] -and -not $cache.Reached) { return '' }
+    if (-not (Test-BridgeUpdateRelease $cache.Release)) { return '' }
+    [string]$cache.Release.Tag
 }
 
 function Get-BridgeUpdateStatus {

@@ -54,7 +54,7 @@
     "repository": "danswett/agent-ha-bridge",
     "installedVersion": "",
     "checkForUpdates": true,
-    "checkHours": 6,
+    "checkHours": 0.5,
     "token": ""
   }
 }

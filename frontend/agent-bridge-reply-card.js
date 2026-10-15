@@ -82,7 +82,7 @@
  * was away never appeared, and a hard reload was the only way to see it. The cards
  * now hold a subscription of their own; see CONFIG_WATCH.
  */
-const CARD_VERSION = '1.39.0';
+const CARD_VERSION = '1.40.0';
 
 /*
  * How large a non-image attachment may be.
@@ -2972,6 +2972,20 @@ class AgentBridgeStatusCard extends HTMLElement {
            spinner this replaced. It is drawn beside the word, not instead of it. */
         .update .bar { flex: none; width: 48px; height: 4px; border-radius: 2px; background: var(--divider-color); overflow: hidden; }
         .update .bar span { display: block; height: 100%; width: 0; background: var(--primary-color, #03a9f4); transition: width 0.3s ease; }
+        /* One control for the whole fleet, in the header rather than on a row,
+           because the question it answers - is any of these behind? - is not about
+           any one machine. */
+        .check { flex: none; display: flex; align-items: center; }
+        .check button {
+          display: inline-flex; align-items: center; cursor: pointer;
+          font: inherit; padding: 3px 8px; border-radius: 14px;
+          background: none; border: 1px solid transparent; color: var(--secondary-text-color);
+        }
+        .check button:hover { color: var(--primary-color, #03a9f4); }
+        .check button[disabled] { cursor: default; color: var(--disabled-text-color, #9e9e9e); }
+        .check ha-icon { --mdc-icon-size: 20px; }
+        .check button.busy ha-icon { animation: spin 1s linear infinite; }
+        @keyframes spin { to { transform: rotate(360deg); } }
         [hidden] { display: none !important; }
       </style>
       <ha-card>
@@ -2980,6 +2994,11 @@ class AgentBridgeStatusCard extends HTMLElement {
             <div class="title"><ha-icon class="chev" icon="mdi:chevron-right"></ha-icon><span class="name"></span></div>
             <div class="summary"></div>
           </div>
+          <div class="check" hidden>
+            <button type="button" title="Check every machine for a bridge update" aria-label="Check every machine for a bridge update">
+              <ha-icon icon="mdi:cloud-refresh"></ha-icon>
+            </button>
+          </div>
         </div>
         <div class="machines" hidden></div>
       </ha-card>`;
@@ -2987,8 +3006,20 @@ class AgentBridgeStatusCard extends HTMLElement {
     this._els = {
       card: $('ha-card'), toggle: $('.toggle'), name: $('.name'),
       summary: $('.summary'), machines: $('.machines'),
+      check: $('.check'), checkButton: $('.check button'),
     };
     this._els.name.textContent = this._config.title;
+
+    // Drawn only when the dashboard that generated this config actually named check
+    // buttons. A bridge from before they existed sends none, and a control pointing
+    // at nothing is worse than no control - which is the rule the Detail switch, the
+    // X and the update button all follow.
+    this._checkEntities = this._config.machines
+      .map((m) => m.check)
+      .filter((id) => typeof id === 'string' && id.length > 0);
+    this._els.check.hidden = this._checkEntities.length === 0;
+    this._els.checkButton.addEventListener('click', () => this._checkAll());
+    this._checking = false;
 
     const flip = () => {
       this._open = !this._open;
@@ -3131,6 +3162,55 @@ class AgentBridgeStatusCard extends HTMLElement {
     entry.pendingAt = Date.now();
     entry.pendingFrom = this._state(entityId);
     this._hass.callService(entityId.split('.')[0], 'toggle', { entity_id: entityId });
+  }
+
+  /*
+   * Asks every machine to check for a release, now, instead of waiting out its own
+   * interval.
+   *
+   * One service call per machine, each naming exactly one entity. Home Assistant
+   * expands area_id, device_id, label_id and floor_id to every matching entity, and
+   * a list of ids is pressed in full: on 2026-10-02 a selection that collapsed to
+   * thousands of ids pressed 166 buttons across the house, rebooting the network
+   * mid-request. Assert-BridgeHomeAssistantServiceTarget enforces the scalar rule on
+   * the PowerShell side; nothing enforces it here, so the shape is built explicitly
+   * and each id is checked before it is sent.
+   *
+   * The presses are sequential rather than concurrent for the sake of what they
+   * cause: each one wakes a daemon that will go and ask GitHub. That is a redirect
+   * that spends no API allowance, but three machines answering at the same instant
+   * is still three requests from the same egress address, and nothing is waiting on
+   * the result quickly enough for the difference to matter.
+   *
+   * Returned so the tests can await it; the click handler ignores it.
+   */
+  _checkAll() {
+    if (!this._hass || this._checking || !this._checkEntities.length) { return undefined; }
+    this._checking = true;
+    this._renderCheck();
+    const press = (ids) => {
+      if (!ids.length) { return Promise.resolve(); }
+      const entityId = ids[0];
+      const rest = ids.slice(1);
+      // Never a value this card did not build itself, and never more than one.
+      if (typeof entityId !== 'string' || !entityId.includes('.')) { return press(rest); }
+      return Promise.resolve(this._hass.callService('button', 'press', { entity_id: entityId }))
+        .catch(() => { /* one machine refusing is not the others' problem */ })
+        .then(() => press(rest));
+    };
+    return press(this._checkEntities.slice()).then(() => {
+      // Nothing here waits for an answer: each machine reports on its own row when
+      // its daemon gets to the press, which is a reconcile away.
+      this._checking = false;
+      this._renderCheck();
+    });
+  }
+
+  _renderCheck() {
+    if (!this._els || !this._els.checkButton) { return; }
+    const button = this._els.checkButton;
+    button.disabled = this._checking;
+    button.classList.toggle('busy', this._checking);
   }
 
   /*
@@ -3351,6 +3431,7 @@ class AgentBridgeStatusCard extends HTMLElement {
     this._els.card.classList.toggle('open', this._open);
     this._els.toggle.setAttribute('aria-expanded', this._open ? 'true' : 'false');
     this._els.machines.hidden = !this._open;
+    this._renderCheck();
 
     let live = 0;
     let soloVersion = '';

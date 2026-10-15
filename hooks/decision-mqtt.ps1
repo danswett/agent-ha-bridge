@@ -745,6 +745,29 @@ function Publish-CopilotMqttUpdate {
     Publish-CopilotMqttMessage `
         -Topic "$($script:CopilotMqttConfig.DiscoveryPrefix)/button/$node/install_update/config" `
         -Payload ($button | ConvertTo-Json -Depth 8 -Compress) -Headers $Headers -Retain
+
+    # Checking and installing are deliberately two buttons. The install button acts on
+    # whatever the last check found, and the answer to "is this machine actually
+    # current?" was previously only available by waiting out the check interval - so
+    # the honest answer to a stale card was to press Install and see what happened,
+    # which is the one control that should never be a question.
+    #
+    # Pressing this forces a fresh lookup. That is affordable now only because a
+    # routine check no longer spends the API allowance: it asks the releases/latest
+    # redirect first and reaches api.github.com only when the tag has changed. Before
+    # that, a per-machine button a card could fan out across the fleet was a way to
+    # exhaust 60 requests an hour by holding down one control.
+    $checkButton = @{
+        name          = 'Check for Bridge Update'
+        unique_id     = "agent_bridge_${Slug}_check_updates"
+        object_id     = "agent_bridge_${Slug}_check_updates"
+        command_topic = "$(Get-CopilotMqttMachineTopicRoot -Slug $Slug)/update/check"
+        icon          = 'mdi:cloud-refresh'
+        device        = $device
+    }
+    Publish-CopilotMqttMessage `
+        -Topic "$($script:CopilotMqttConfig.DiscoveryPrefix)/button/$node/check_updates/config" `
+        -Payload ($checkButton | ConvertTo-Json -Depth 8 -Compress) -Headers $Headers -Retain
 }
 
 function Publish-CopilotMqttNewSession {
@@ -1594,6 +1617,10 @@ function Get-CopilotMqttMachineTopic {
     @(
         "$prefix/update/$node/update/config"
         "$prefix/button/$node/install_update/config"
+        # Added with the forced check (the fleet "check for updates" fan-out). Listed
+        # here for the reason the comment below records: a topic missing from this
+        # list leaves an entity in Home Assistant that nothing is left to remove.
+        "$prefix/button/$node/check_updates/config"
         "$prefix/text/$node/new_prompt/config"
         "$prefix/sensor/$node/new_prompt_payload/config"
         "$prefix/sensor/$node/transfer_request/config"

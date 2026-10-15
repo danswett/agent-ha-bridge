@@ -109,9 +109,12 @@ function seedLaunchParts(slots) {
 
 // The status card's parts, seeded for the same reason as the launch card's.
 function seedStatusParts(slots) {
-  for (const sel of ['.toggle', '.name', '.summary', '.machines']) {
+  for (const sel of ['.toggle', '.name', '.summary', '.machines', '.check']) {
     if (!slots[sel]) { slots[sel] = new FakeElement('div'); }
   }
+  // The fleet check control, from card 1.40.0. A button rather than a div, because
+  // the card disables it while the presses are in flight.
+  if (!slots['.check button']) { slots['.check button'] = new FakeElement('button'); }
 }
 
 // The usage card shares the status card's folding head and adds its own body.

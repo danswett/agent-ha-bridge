@@ -427,7 +427,7 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `devBox.intervalMinutes` | How often the keep-awake task runs (default `15`, capped at `30`). It has to be shorter than the pool's stop-on-disconnect grace period, since the pending stop only exists inside that window |
 | `updates.repository` | Repository to check for releases (default `danswett/agent-ha-bridge`) |
 | `updates.checkForUpdates` | Set to `false` to disable the update check |
-| `updates.checkHours` | How often to check GitHub for a release (default `6`, i.e. 4×/day) |
+| `updates.checkHours` | How often to check GitHub for a release (default `0.5`, i.e. every 30 minutes). A routine check asks the `releases/latest` redirect, which is outside the API allowance, so the cadence costs nothing that can be exhausted |
 | `updates.token` | Optional GitHub token for release checks only, sent to `api.github.com` and never logged. Unauthenticated callers share **60 requests an hour per IP**, so a Dev Box or anything else behind shared egress can be refused without the bridge having made a request of its own. `agent-ha-bridge configure` offers a masked prompt for one when the machine has nothing to use, and again when a configured one has been refused; `-UpdateToken <token>` sets it in one go, at the usual command-line risk. `AGENT_HA_BRIDGE_UPDATE_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN` in the environment are used when this setting is empty - a machine that already has one needs no configuration - and this setting wins over all three, because it is the one chosen for this machine. If a token is rejected as bad credentials, the check is retried without one rather than failing, and says which credential was refused instead of going quietly back to the shared pool - an ambient `GITHUB_TOKEN` expires when its workflow job ends, and these are public releases. A value that cannot be sent as a request header at all - a paste carrying a newline or a smart quote - is skipped with a reason rather than breaking the check. A read-only token with no scopes is enough |
 | `usage.publish` | Set to `false` to stop collecting and publishing each agent's remaining allowance (default `true`). This stops the vendor calls, not just the card |
 | `usage.intervalSeconds` | How often to re-read an agent's allowance while a session of that agent is open on this machine (default `120`). Copilot's figure moves continuously while a session runs, so this is a poll rather than a cache read |
@@ -1611,10 +1611,32 @@ bootstrap policy. Later compatible participating updates continue the establishe
 authority and fences; a card/render change that conflicts with a pin stays refused
 until an explicit policy operation authorizes it.
 
-The daemon asks GitHub for the newest release a few times a day (every 6 hours by
-default, tunable via `updates.checkHours`) and publishes the result as
+The daemon asks GitHub for the newest release every half hour (tunable via
+`updates.checkHours`) and publishes the result as
 a Home Assistant **update entity**, so a new version shows up on the dashboard and in
 Home Assistant's own Updates list — with the release notes and a one-press install.
+
+A routine check costs nothing that can run out, which is what makes that cadence
+affordable. It asks `github.com/<r>/releases/latest` first — a redirect naming the
+current tag, outside the API allowance — and only reaches for `api.github.com` when
+that tag is one it has not already seen, to fetch the release notes the redirect
+cannot carry. The API is therefore spent about once per **release** rather than once
+per check. It used to be the other way round, and six hours was as often as the
+60-an-hour-per-IP pool could safely be asked.
+
+**Checking every machine at once.** The **Agent sessions** card has a refresh control
+in its header that presses each machine's own *Check for Bridge Update* button in
+turn; each machine then looks immediately instead of waiting out its interval. There
+is also a per-machine `button.agent_bridge_<slug>_check_updates` for pressing one on
+its own, from an automation or a script. The buttons are per-machine and fanned out by
+the card rather than one shared button every daemon watches — an unscoped entity is
+exactly what once let a second machine overwrite the first's, and a single press
+timestamp cannot tell two daemons apart.
+
+A machine also looks of its own accord when another machine publishes a release it has
+not established yet. That is a hint to go and check, never an answer to adopt: the
+peer's version decides nothing about what gets installed, and an install re-checks
+under its own authority before downloading anything.
 
 On the dashboard that press is on the machine's own row in **Agent sessions**, where
 it takes the place of that row's **Detail** switch, and it is only there when there is
@@ -1676,21 +1698,32 @@ action, because this software types into terminals and registers scheduled tasks
 
 **If the check is refused.** GitHub allows unauthenticated callers 60 requests an hour
 per IP, so a machine behind shared egress can be rate limited without having made a
-request of its own - measured here going from 39 remaining to none in ninety seconds.
-Four things keep that from becoming a failed update:
+request of its own - measured here going from 39 remaining to none in ninety seconds,
+and on a Dev Box reading 0, then 26, then 36 remaining within twenty seconds, under
+three different reset windows, while the bridge made no requests at all: corporate
+egress is NAT'd across several addresses, each with its own partly-spent bucket.
+Five things keep that from becoming a failed update:
 
 - The release archive is fetched from `codeload.github.com`, which is not part of the
   API allowance. The `zipball_url` the API offers is itself an API request, so pressing
   **Install update** used to spend the same allowance the check competes for - and be
   refused once it was gone, for a reason that had nothing to do with this machine.
 - When the check itself is refused, `github.com/<r>/releases/latest` is asked instead;
-  that redirect is outside the allowance too. It is used rather than the `releases.atom`
+  that redirect is outside the allowance too — and since this version it is asked
+  *first*, so a refusal usually costs nothing at all. It is used rather than the `releases.atom`
   feed because it makes the same selection the API does - the newest **published,
   non-prerelease** release. The feed is ordered by date and includes prereleases, so on
   a repository that ships them its newest entry is the wrong answer, and this project
   pushes a release tag while the release is still a draft. Release notes are not
   available this way, but which release is current is, and a correct version with no
-  notes beats a stale one presented as current.
+  notes beats a stale one presented as current. A release first learned this way is
+  recorded as still owing its notes, so a later check fetches them once the API is
+  reachable again rather than treating the unchanged tag as settled.
+- When the API *is* asked, the request is conditional on the `ETag` of the body
+  already held. GitHub answers `304 Not Modified` when nothing has changed, and a 304
+  does not count against the primary rate limit for an authenticated caller — so a
+  machine that cannot use the redirect at all, and therefore asks the API every half
+  hour, still spends almost nothing.
 - A secondary limit names no reset time of its own, so the wait doubles each time it
   keeps answering - 1, 2, 4, 8 minutes and so on to an hour - rather than asking again
   at a fixed interval, which GitHub warns can earn a ban.
@@ -1723,6 +1756,15 @@ an entity:
     updates    : checked Oct 10 19:42, refused - GitHub is rate limiting this machine
                  checks are unauthenticated, 60 requests an hour shared with everything behind this address
                  set a personal access token in updates.token for 5,000 of this machine's own: agent-ha-bridge configure
+```
+
+A healthy check says which route answered it, because that is what makes the
+half-hourly cadence affordable — a machine answering every check through the API is
+working, and is also one busy hour on its egress address away from the refusal above:
+
+```
+    updates    : checked Oct 15 14:12, found v1.33.20
+                 via the releases redirect, which spends no API allowance
 ```
 
 A record written before this version said nothing about how its check authenticated,

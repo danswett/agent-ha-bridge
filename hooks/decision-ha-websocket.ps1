@@ -61,7 +61,7 @@
 # beside it for the same reason the slot ceiling is - makes every gate answer false
 # when the served bytes are a different build of the version they claim. That changes
 # what Save-CopilotSessionDashboard emits, so the fence needs a version to move to.
-$script:BridgeDashboardRenderVersion = '1.10.0'
+$script:BridgeDashboardRenderVersion = '1.11.0'
 $script:BridgeDashboardObservation = $null
 
 function Invoke-CopilotHaWebSocket {
@@ -725,7 +725,7 @@ function Set-CopilotMqttOnlineEntityId {
 
 function Set-CopilotMqttUpdateEntityIds {
     <#
-        Forces the update entity and its install button onto deterministic ids.
+        Forces the update entity and its two buttons onto deterministic ids.
 
         Home Assistant builds an MQTT entity id from the device name plus the entity
         name, so these first appear as update.agent_bridge_desktop_bridge_update and
@@ -742,6 +742,12 @@ function Set-CopilotMqttUpdateEntityIds {
     $wanted = @{
         "agent_bridge_${Slug}_update"         = Get-BridgeMachineEntityId -Domain 'update' -Key 'update' -Slug $Slug
         "agent_bridge_${Slug}_install_update" = Get-BridgeMachineEntityId -Domain 'button' -Key 'install_update' -Slug $Slug
+        # The check button is read by id on every reconcile and pressed by id from the
+        # card, so it needs pinning for exactly the reason the install button does:
+        # left to Home Assistant it arrives as
+        # button.agent_bridge_<machine>_check_for_bridge_update, and both ends would be
+        # correct while pointing at nothing.
+        "agent_bridge_${Slug}_check_updates"  = Get-BridgeMachineEntityId -Domain 'button' -Key 'check_updates' -Slug $Slug
     }
     Set-CopilotMqttMachineEntityId -Wanted $wanted
 }
@@ -1927,6 +1933,17 @@ function Save-CopilotSessionDashboard {
         # (#129). Updating a machine meant finding its own card lower down the view and
         # then watching a spinner that said only that something was happening.
         $canUpdate = Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.31.0'
+        # From card 1.40.0 the card's header carries one "check for updates" control
+        # that presses every machine's own check button in turn. A fleet-wide answer
+        # to "is anything behind?" previously meant waiting out updates.checkHours on
+        # each machine separately, so the practical way to ask was to press Install
+        # and watch - using the one control that should never be a question.
+        #
+        # Deliberately per-machine entities fanned out by the card, rather than one
+        # shared button every daemon watches. An unscoped entity is what let a second
+        # machine overwrite the first's (Get-CopilotMqttLegacyMachineTopic), and the
+        # press-timestamp mechanism cannot tell two daemons apart on one button.
+        $canCheck = Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.40.0'
         $statusCard = [ordered]@{
             type      = 'custom:agent-bridge-status-card'
             title     = 'Agent sessions'
@@ -1951,6 +1968,13 @@ function Save-CopilotSessionDashboard {
                 # own daemon is mid-restart is one that may well have an update running.
                 if ($canUpdate) {
                     $entry.install = Get-BridgeMachineEntityId -Domain 'button' -Key 'install_update' -Slug $_.Slug
+                }
+                # Given for every machine for the same reason install is: the card
+                # decides from the entity whether there is anything to press, and a
+                # machine whose row reads offline is often exactly the one worth
+                # asking about.
+                if ($canCheck) {
+                    $entry.check = Get-BridgeMachineEntityId -Domain 'button' -Key 'check_updates' -Slug $_.Slug
                 }
                 if ($_.PSObject.Properties['IsDev'] -and $_.IsDev) { $entry.dev = $true }
                 if ($canForget) {

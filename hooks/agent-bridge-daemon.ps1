@@ -68,6 +68,7 @@ $script:DaemonEntity = @{
     Sessions      = Get-BridgeMachineEntityId -Domain 'sensor' -Key 'sessions'          -Slug $script:DaemonMachineSlug
     Update        = Get-BridgeMachineEntityId -Domain 'update' -Key 'update'            -Slug $script:DaemonMachineSlug
     InstallUpdate = Get-BridgeMachineEntityId -Domain 'button' -Key 'install_update'    -Slug $script:DaemonMachineSlug
+    CheckUpdates  = Get-BridgeMachineEntityId -Domain 'button' -Key 'check_updates'     -Slug $script:DaemonMachineSlug
     NewPrompt     = Get-BridgeMachineEntityId -Domain 'text'   -Key 'new_prompt'        -Slug $script:DaemonMachineSlug
     NewPromptPayload = Get-BridgeMachineEntityId -Domain 'sensor' -Key 'new_prompt_payload' -Slug $script:DaemonMachineSlug
     NewWorkspace  = Get-BridgeMachineEntityId -Domain 'select' -Key 'new_workspace'     -Slug $script:DaemonMachineSlug
@@ -308,6 +309,21 @@ $script:DaemonWatchFailures = 0
 $script:DaemonUpdateAvailable = $false
 $script:DaemonUpdatePublished = $false
 $script:DaemonUpdateLastPress = ''
+# The Check button's own press timestamp, kept apart from Install's so that one
+# control cannot swallow the other's press. Pressing Check forces a lookup now
+# instead of waiting out updates.checkHours.
+$script:DaemonUpdateCheckLastPress = ''
+# The highest release any *other* machine has published, and whether this machine has
+# already gone and looked because of it. Without the second half, a peer sitting on a
+# version this one cannot reach would force a fresh lookup every fifteen seconds.
+$script:DaemonPeerLatestVersion = ''
+$script:DaemonPeerLatestChecked = ''
+# Whether this machine's update entity ids have been seen to take. The pin runs
+# inside the publish, which only happens when something changed, so a Home Assistant
+# that had not yet registered a freshly discovered entity at that moment would never
+# be asked again on a stable install.
+$script:DaemonUpdateEntityIdsPinned = $false
+$script:DaemonUpdateEntityIdsPinnedAt = [DateTimeOffset]::MinValue
 
 # New-session control state. The workspace signature is tracked so the discovery
 # payload is only re-published when the configured list actually changes, rather

@@ -237,6 +237,7 @@ function Invoke-StatusCard {
         [string]$RetryAfterRefusal = '',
         [bool]$Open = $true,
         [hashtable]$States = $null,
+        [switch]$CheckAll,
         [switch]$Refuse
     )
     $job = @{
@@ -248,6 +249,7 @@ function Invoke-StatusCard {
         installs          = @($Installs)
         slowInstall       = $SlowInstall
         retryAfterRefusal = $RetryAfterRefusal
+        checkAll          = [bool]$CheckAll
         refuse            = [bool]$Refuse
     } | ConvertTo-Json -Depth 20 -Compress
     $out = $job | & $nodeExe.Source $driver
@@ -486,6 +488,42 @@ Test-That 'a retry after a refusal arms its own re-check rather than inheriting 
 Test-That 'and leaves exactly one of them live, for the claim that is actually held' {
     @($retried.timers).Count -eq 1
 } "timers=[$(@($retried.timers) -join ',')]"
+
+Write-Host ''
+Write-Host '--- one control asks every machine to check, each by its own entity ---'
+Test-That 'the dashboard hands every row a check button of its own' {
+    @($cardConfig.machines | Where-Object { $_.PSObject.Properties['check'] }).Count -eq @($cardConfig.machines).Count
+}
+Test-That 'each naming the button that machine publishes, and no other' {
+    @($cardConfig.machines | Where-Object {
+        $slug = if ($_.machine -eq $live.Machine) { $live.Slug } else { $dark.Slug }
+        [string]$_.check -ne (Get-BridgeMachineEntityId -Domain 'button' -Key 'check_updates' -Slug $slug)
+    }).Count -eq 0
+}
+
+$checked = Invoke-StatusCard -CheckAll
+Test-That 'the control was there to press' { @($checked.missing).Count -eq 0 } "missing=[$(@($checked.missing) -join ',')]"
+Test-That 'one press per machine, and no more' {
+    @($checked.calls).Count -eq @($cardConfig.machines).Count
+} "calls=$(@($checked.calls).Count) machines=$(@($cardConfig.machines).Count)"
+# The rule the 2026-10-02 incident is about: Home Assistant presses every entity a
+# call names, and expands area_id, device_id, label_id and floor_id to all of them.
+# One call carrying a list is one call that presses the lot.
+Test-That 'each call names exactly one entity, as a string and never a list' {
+    @($checked.calls | Where-Object {
+        $_.domain -ne 'button' -or $_.service -ne 'press' -or
+        @($_.data.PSObject.Properties).Count -ne 1 -or
+        $_.data.entity_id -isnot [string] -or [string]::IsNullOrWhiteSpace($_.data.entity_id)
+    }).Count -eq 0
+} ((@($checked.calls | ForEach-Object { "$($_.domain).$($_.service)=$($_.data.entity_id)" })) -join ' | ')
+Test-That 'and between them they are exactly the machines on the card' {
+    $asked = @($checked.calls | ForEach-Object { [string]$_.data.entity_id } | Sort-Object)
+    $expected = @($cardConfig.machines | ForEach-Object { [string]$_.check } | Sort-Object)
+    ($asked -join ',') -eq ($expected -join ',')
+} ((@($checked.calls | ForEach-Object { $_.data.entity_id })) -join ',')
+Test-That 'the control refuses a second press while the first round is still going out' {
+    $checked.check.control.duringDisabled -and -not $checked.check.control.afterDisabled
+} "during=$($checked.check.control.duringDisabled) after=$($checked.check.control.afterDisabled)"
 
 Write-Host ''
 Write-Host '--- while it runs it says which stage, not that something is happening ---'
