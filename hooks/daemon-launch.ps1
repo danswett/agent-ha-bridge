@@ -785,11 +785,23 @@ function Invoke-DaemonTransferRequest {
     # Retained, so a request already served would be served again every pass.
     if ($correlation -eq $script:DaemonTransferServed) { return }
 
+    # Read once and reused for both the freshness window and the signature, so the two
+    # cannot disagree - and so the signature below is not a second unguarded property
+    # access, which under StrictMode throws before the try/finally that clears the
+    # retained request.
+    $rawAt = if ($request.PSObject.Properties['at']) { $request.at } else { $null }
+
     # A retained request outlives the daemon that served it: the served-correlation is
     # process-local, so without a freshness window every restart re-sends whatever was
     # last asked for - and an update restarts the daemon.
+    #
+    # Parsed through the same helper the signature uses, so the window and the HMAC
+    # agree on what the timestamp says. [string] on the value ConvertFrom-Json returns
+    # is a culture rendering, which only parses back on a machine whose culture happens
+    # to match the one that formatted it.
     $at = [DateTimeOffset]::MinValue
-    if ($request.PSObject.Properties['at']) { [void][DateTimeOffset]::TryParse([string]$request.at, [ref]$at) }
+    [void][DateTimeOffset]::TryParse((Get-BridgeTransferStamp -Value $rawAt),
+        [cultureinfo]::InvariantCulture, [Globalization.DateTimeStyles]::RoundtripKind, [ref]$at)
     if (([DateTimeOffset]::Now - $at).TotalMinutes -gt 10) {
         $script:DaemonTransferServed = $correlation
         try { Clear-CopilotMqttTransferRequest -Slug $script:DaemonMachineSlug -Headers $Headers } catch { }
@@ -822,7 +834,7 @@ function Invoke-DaemonTransferRequest {
     $presented = if ($request.PSObject.Properties['sig']) { [string]$request.sig } else { '' }
     $expected = Get-BridgeTransferSignature -Secret $transferSecret -Fields (
         Get-BridgeTransferRequestFields -SessionId $session -Launcher $launcher `
-            -Requester $requester -Correlation $correlation -At ([string]$request.at))
+            -Requester $requester -Correlation $correlation -At $rawAt)
     if (-not (Test-BridgeTransferSignature -Presented $presented -Expected $expected)) {
         Write-DaemonLog -Message "transfer refused: the request for $session was not signed by this fleet"
         $script:DaemonTransferServed = $correlation

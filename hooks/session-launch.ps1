@@ -4469,6 +4469,43 @@ function Test-BridgeTransferSignature {
     $difference -eq 0
 }
 
+function Get-BridgeTransferStamp {
+    <#
+        One canonical spelling of a request's timestamp, which is what both ends sign.
+
+        Signing the value as it arrives does not work, and this is why no transfer
+        between two machines had ever succeeded. The requester sends
+        `[DateTimeOffset]::Now.ToString('o')`, but `ConvertFrom-Json` does not hand the
+        source a string: it recognises ISO-8601 and returns a [datetime]. `[string]` on
+        that renders the machine's own culture - '10/15/2026 14:43:46' - so the source
+        hashed something the requester had never signed. The HMAC could not match for
+        any input, every request was refused as "not signed by this fleet", and because
+        a refusal clears the topic without replying, the requester then sat out its full
+        two-minute wait and blamed the source: "did not send that session. It may be
+        busy or offline."
+
+        So the derived form is signed rather than the wire form, for the same reason
+        Get-BridgeTransferSignature joins named fields instead of hashing serialised
+        JSON: a signature must not depend on what a deserialiser decided to do.
+
+        UTC, because the fleet spans timezones - the parsed value keeps the instant and
+        the ticks but not the original offset, so only an absolute form is common to
+        both. Ticks are kept, so this stays as specific as what the requester sent.
+    #>
+    param([AllowNull()][object]$Value)
+
+    $parsed = [DateTimeOffset]::MinValue
+    if ($Value -is [DateTimeOffset]) { $parsed = $Value }
+    elseif ($Value -is [datetime]) { $parsed = [DateTimeOffset]::new($Value) }
+    elseif (-not [DateTimeOffset]::TryParse([string]$Value, [cultureinfo]::InvariantCulture,
+            [Globalization.DateTimeStyles]::RoundtripKind, [ref]$parsed)) {
+        # Unparseable signs as empty rather than throwing, so a malformed request fails
+        # the signature check like any other forgery instead of wedging the reconcile.
+        return ''
+    }
+    $parsed.ToUniversalTime().ToString("yyyy-MM-dd'T'HH:mm:ss.fffffff'Z'", [cultureinfo]::InvariantCulture)
+}
+
 function Get-BridgeTransferRequestFields {
     <# Exactly what a request signature covers, in one place so both sides agree. #>
     param(
@@ -4476,12 +4513,15 @@ function Get-BridgeTransferRequestFields {
         [Parameter(Mandatory)][string]$Launcher,
         [Parameter(Mandatory)][string]$Requester,
         [Parameter(Mandatory)][string]$Correlation,
-        [Parameter(Mandatory)][string]$At
+        # Deliberately not [string]: the source receives this as a [datetime] from
+        # ConvertFrom-Json, and a [string] parameter would culture-format it on the way
+        # in - before Get-BridgeTransferStamp ever saw it.
+        [Parameter(Mandatory)][AllowNull()][object]$At
     )
     # The requester and the correlation are in here deliberately: they name the topic the
     # transcript is published to, so an unsigned one would let a valid request be
     # replayed with the destination changed.
-    @('transfer-request-v1', $SessionId, $Launcher, $Requester, $Correlation, $At)
+    @('transfer-request-v1', $SessionId, $Launcher, $Requester, $Correlation, (Get-BridgeTransferStamp -Value $At))
 }
 
 function Get-BridgeTransferManifestFields {
