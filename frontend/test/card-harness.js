@@ -158,7 +158,10 @@ function loadCards(sourceFile) {
   let intervalId = 0;
   const sandbox = {
     console: { info() {}, log() {} },
-    window: { customCards: [] },
+    // A path, because the cards match a lovelace_updated against the dashboard the
+    // page is actually showing rather than refetching for every dashboard saved;
+    // and a query, because the panel says it is being edited by putting edit=1 there.
+    window: { customCards: [], location: { pathname: '/agent-decisions/decision', search: '' } },
     // The elapsed-time spinner is a real timer against a real visibility state. Both
     // are controllable here, because the bug they guard against - a hidden tab whose
     // interval keeps firing and doing nothing - is invisible to a source-text check.
@@ -180,7 +183,11 @@ function loadCards(sourceFile) {
     HTMLElement: class {
       constructor() { this.hidden = false; }
       attachShadow() { this.shadowRoot = makeShadow(); return this.shadowRoot; }
-      dispatchEvent() { return true; }
+      // Recorded rather than delivered. A card asking the panel to refetch the
+      // dashboard config fires an event that only Home Assistant's own hui-root
+      // listens for, so what a test can check is that it was fired at all - and
+      // that it was fired in a shape able to leave the card's shadow root.
+      dispatchEvent(event) { (this._dispatched = this._dispatched || []).push(event); return true; }
     },
     CustomEvent: class { constructor(type, init) { this.type = type; Object.assign(this, init); } },
     localStorage: { getItem: () => null, setItem: () => {} },

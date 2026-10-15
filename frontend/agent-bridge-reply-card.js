@@ -74,8 +74,15 @@
  * session carries on, and nothing it says afterwards is evidence of what was lost.
  * The bridge publishes it as a `compactions` attribute of the status entity and the
  * card draws it when there is one to draw.
+ *
+ * 1.39.0 keeps a page that has been left open showing every live session. Home
+ * Assistant parks the whole panel after the tab has been hidden for five minutes and
+ * re-attaches the same element afterwards, which silently and permanently costs this
+ * dashboard its lovelace_updated subscription - so a session that started while it
+ * was away never appeared, and a hard reload was the only way to see it. The cards
+ * now hold a subscription of their own; see CONFIG_WATCH.
  */
-const CARD_VERSION = '1.38.0';
+const CARD_VERSION = '1.39.0';
 
 /*
  * How large a non-image attachment may be.
@@ -203,6 +210,138 @@ const REPLY_CARDS = new Map();
  * a hold its successor now owns - the same reason REPLY_CARDS checks identity.
  */
 const FORM_SENDS = new Map();
+
+/*
+ * A subscription to lovelace_updated of the cards' own, because Home Assistant
+ * throws the panel's away and never replaces it.
+ *
+ * This dashboard is generated whole, so a session that starts gets a card only when
+ * the writer republishes the Lovelace config - and the page learns that happened
+ * from the `lovelace_updated` event. ha-panel-lovelace subscribes to it once, in
+ * firstUpdated, and drops the subscription in disconnectedCallback for every
+ * dashboard except the cached default one. partial-panel-resolver detaches the panel
+ * element once the tab has been hidden for five minutes and re-attaches that same
+ * element when it comes back, so firstUpdated never runs again: from then on the page
+ * never hears that the config changed, no session that starts afterwards ever
+ * appears, and reloading is the only cure.
+ *
+ * Measured against 2026.10.1, driving the real dashboard: with the subscription
+ * intact a session card taken out of the page's config came back 0.5 s after
+ * lovelace_updated; after a single detach and re-attach the same event changed
+ * nothing at all, while a `config-refresh` from a card restored it immediately.
+ *
+ * So the cards keep their own subscription and ask the panel to refetch through
+ * `config-refresh`, which ha-panel-lovelace already listens for on hui-root. It is
+ * deliberately never unsubscribed: being detached is the very condition this exists
+ * to survive, so tearing it down on disconnect would reproduce the bug exactly.
+ */
+const CONFIG_WATCH = {
+  connection: null,
+  card: null,
+  // Counted, not clocked. Two of these can land in the same millisecond, and then a
+  // config applied before a change reads as having answered it - which is exactly
+  // the case this exists for, a change arriving while the page is parked. A counter
+  // also owes nothing to a clock that can be set backwards under a page left open
+  // for days.
+  changes: 0,
+  applied: 0,
+  requested: 0,
+  timer: null,
+};
+
+/*
+ * How long to let the panel's own subscription answer first.
+ *
+ * A refetch hands every card on the view its config again, including the cards whose
+ * config did not change, so a config arriving inside this window is proof the panel
+ * is still listening - and the request stands down rather than fetching the same
+ * config twice and rebuilding every card for nothing.
+ */
+const CONFIG_REFRESH_GRACE_MS = 3000;
+
+/*
+ * The dashboard this page is showing, under the name lovelace_updated gives it.
+ *
+ * The event carries a dashboard's url_path, and the default dashboard's is null while
+ * it is served under /lovelace - so the two are reconciled here. Without the match
+ * this dashboard would refetch itself every time an unrelated one was saved.
+ */
+function dashboardUrlPath() {
+  try { return String(window.location.pathname).split('/')[1] || 'lovelace'; }
+  catch (e) { return ''; }
+}
+
+/*
+ * Whether the dashboard is being edited.
+ *
+ * Refusing to refetch while it is, is Home Assistant's own rule, and the reason for
+ * it is that a refetch replaces whatever is in the editor - the panel shows a toast
+ * instead and leaves the choice to the person typing. It puts edit=1 in the address
+ * bar for exactly as long as that is true, which is the one sign of it a card can
+ * read without reaching into the panel. The request is only stood down, not spent,
+ * so closing the editor picks it up on the next state update.
+ */
+function dashboardIsEditing() {
+  try { return /(^|[?&])edit=1(&|$)/.test(String(window.location.search || '')); }
+  catch (e) { return false; }
+}
+
+function armConfigRefresh() {
+  if (CONFIG_WATCH.timer) { return; }
+  if (CONFIG_WATCH.applied >= CONFIG_WATCH.changes) { return; }
+  // One request per change. A refetch that answers nothing must not become a card
+  // asking for the same config again every time it is handed a state update.
+  if (CONFIG_WATCH.requested >= CONFIG_WATCH.changes) { return; }
+  CONFIG_WATCH.timer = setTimeout(runConfigRefresh, CONFIG_REFRESH_GRACE_MS);
+}
+
+function runConfigRefresh() {
+  CONFIG_WATCH.timer = null;
+  if (CONFIG_WATCH.applied >= CONFIG_WATCH.changes) { return; }
+  if (dashboardIsEditing()) { return; }
+  const card = CONFIG_WATCH.card;
+  // Detached is not failed: the tab is hidden, or Home Assistant has parked the whole
+  // panel. The next hass the card is handed re-arms this, which is the first moment
+  // the page could have acted on it anyway.
+  if (!card || card.isConnected === false) { return; }
+  CONFIG_WATCH.requested = CONFIG_WATCH.changes;
+  card.dispatchEvent(new CustomEvent('config-refresh', { bubbles: true, composed: true }));
+}
+
+function onLovelaceUpdated(event) {
+  const path = dashboardUrlPath();
+  if (!path) { return; }
+  const data = (event && event.data) || {};
+  if (String(data.url_path || 'lovelace') !== path) { return; }
+  CONFIG_WATCH.changes += 1;
+  armConfigRefresh();
+}
+
+/*
+ * Called by a bridge card whenever it is handed a hass. Takes out the subscription
+ * the first time, and is also where a change that arrived while the card was parked
+ * is picked up, because a parked card is handed nothing until it is back.
+ */
+function watchDashboardConfig(card, hass) {
+  CONFIG_WATCH.card = card;
+  const connection = hass && hass.connection;
+  if (connection && typeof connection.subscribeEvents === 'function' &&
+      CONFIG_WATCH.connection !== connection) {
+    CONFIG_WATCH.connection = connection;
+    try {
+      Promise.resolve(connection.subscribeEvents(onLovelaceUpdated, 'lovelace_updated'))
+        .catch(() => { CONFIG_WATCH.connection = null; });
+    }
+    catch (e) { CONFIG_WATCH.connection = null; }
+  }
+  armConfigRefresh();
+}
+
+// The panel handing a card its config is the one signal that says the page is still
+// being kept current by Home Assistant itself.
+function noteDashboardConfig() {
+  CONFIG_WATCH.applied = CONFIG_WATCH.changes;
+}
 
 class AgentBridgeReplyCard extends HTMLElement {
   constructor() {
@@ -2158,6 +2297,7 @@ class AgentBridgeSessionCard extends HTMLElement {
     if (!config || !Array.isArray(config.cards)) {
       throw new Error('agent-bridge-session-card: "cards" is required');
     }
+    noteDashboardConfig();
     this._config = Object.assign({ status: '', decision: '' }, config);
     this._storeKey = `agent-bridge-collapsed:${this._config.status || ''}`;
     try { this._collapsed = localStorage.getItem(this._storeKey) === '1'; } catch (e) { this._collapsed = false; }
@@ -2183,6 +2323,7 @@ class AgentBridgeSessionCard extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
+    watchDashboardConfig(this, hass);
     for (const child of this._children) { if (child) { child.hass = hass; } }
     this._renderState();
   }
@@ -2733,6 +2874,7 @@ class AgentBridgeStatusCard extends HTMLElement {
     if (!config || !Array.isArray(config.machines) || config.machines.length === 0) {
       throw new Error('agent-bridge-status-card: "machines" is required');
     }
+    noteDashboardConfig();
     this._config = Object.assign({ title: 'Agent sessions', decisions: [] }, config);
     this._built = false;
     if (this._hass) { this._build(); this._render(); }
@@ -2740,6 +2882,9 @@ class AgentBridgeStatusCard extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
+    // This card is on the dashboard whether or not anything is running, which is
+    // exactly when a session appearing has to be noticed.
+    watchDashboardConfig(this, hass);
     if (!this._built) { this._build(); }
     this._render();
   }
