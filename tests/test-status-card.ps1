@@ -119,29 +119,6 @@ function Get-PublishedHaStates {
             $raw = Get-LastPublishedPayload -Topic ([string]$config.state_topic)
         }
         $state = if ($null -eq $raw) { 'unavailable' } else { [string]$raw }
-        # Home Assistant resolves value_template before it compares payload_on and
-        # payload_off, so this has to as well: without it a sensor whose state rides in
-        # a JSON field reads as the entire payload and matches neither. Only the one
-        # form the bridge publishes is understood - a different template is a change to
-        # the contract, and should fail here rather than quietly pass.
-        if ($config.PSObject.Properties['value_template'] -and $null -ne $raw) {
-            $template = [string]$config.value_template
-            if ($template -notmatch '^\{\{\s*value_json\.([A-Za-z_][A-Za-z0-9_]*)\s*\}\}$') {
-                throw "Unsupported value_template in a discovery payload: $template"
-            }
-            $field = $Matches[1]
-            # An emptied or unparseable payload resolves to nothing, the same as a
-            # topic that never carried one: a retraction must not crash the fixture,
-            # and under StrictMode reading through a $null body does exactly that.
-            $body = $null
-            if (-not [string]::IsNullOrWhiteSpace([string]$raw)) {
-                $body = try { [string]$raw | ConvertFrom-Json -ErrorAction Stop } catch { $null }
-            }
-            $state = 'unavailable'
-            if ($null -ne $body -and $null -ne $body.PSObject.Properties[$field]) {
-                $state = [string]$body.$field
-            }
-        }
         $attributes = @{}
 
         if ($domain -eq 'update' -and -not [string]::IsNullOrWhiteSpace($raw)) {

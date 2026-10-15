@@ -106,11 +106,11 @@ function Invoke-RestMethod {
             throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('Synthetic online sensor read', $response)
         }
         # last_reported is the only field that can tell a beat that landed from one that
-        # went nowhere - but only because the beat carries the time it was sent. A
-        # message repeating the state an entity already holds is not written at all and
-        # moves nothing, measured on 2026.10.1, which is what rebuilt healthy sensors on
-        # a loop until the beat was made to vary (#202). 'none' models a Home Assistant
-        # too old to publish the field at all.
+        # went nowhere - but only because each beat now sends a changing attributes
+        # message beside its unchanged state. A message repeating the state an entity
+        # already holds is not written at all and moves nothing, measured on 2026.10.1,
+        # which is what rebuilt healthy sensors on a loop (#202). 'none' models a Home
+        # Assistant too old to publish the field at all.
         if ($script:DaemonOnlineReported -ceq 'none') {
             return [pscustomobject]@{
                 entity_id = $script:DaemonOnlineEntity; state = 'on'
@@ -769,6 +769,7 @@ $script:ReportingMessages.Clear()
 # rename both sides follow quietly.
 $onlineConfigTopic = "$($script:CopilotMqttConfig.DiscoveryPrefix)/binary_sensor/$(Get-CopilotMqttMachineNode -Slug $script:DaemonMachineSlug)/online/config"
 $onlineStateTopic = "$(Get-CopilotMqttMachineTopicRoot -Slug $script:DaemonMachineSlug)/online/state"
+$onlineAttrTopic = "$(Get-CopilotMqttMachineTopicRoot -Slug $script:DaemonMachineSlug)/online/attr"
 function Invoke-TestOnlineBeat {
     <#
         One beat, with the clock wound back a heartbeat interval, so a run of them
@@ -791,14 +792,14 @@ function Get-TestOnlineRetractionCount {
     @($script:ReportingMessages | Where-Object { $_.Topic -ceq $onlineConfigTopic -and [string]$_.Payload -eq '' }).Count
 }
 function Get-TestOnlineBeatCount {
-    # Matched by parsing rather than by string equality: the beat carries the moment it
-    # was sent, so it is never twice the same payload, and an exact match would quietly
-    # count nothing at all (#202).
-    @($script:ReportingMessages | Where-Object {
-        $_.Topic -ceq $onlineStateTopic -and [string]$_.Payload -and
-        ([string]$_.Payload).StartsWith('{') -and
-        (([string]$_.Payload | ConvertFrom-Json).state) -ceq 'online'
-    }).Count
+    @($script:ReportingMessages | Where-Object { $_.Topic -ceq $onlineStateTopic -and [string]$_.Payload -ceq 'online' }).Count
+}
+function Get-TestOnlineAttrPayload {
+    # The varying half of each beat. Counted and compared separately from the state,
+    # because the state is deliberately identical every time and the attributes are
+    # the only thing that makes a beat something Home Assistant writes down (#202).
+    @($script:ReportingMessages | Where-Object { $_.Topic -ceq $onlineAttrTopic } |
+        ForEach-Object { [string]$_.Payload })
 }
 
 1..5 | ForEach-Object { Invoke-TestOnlineBeat }
@@ -825,7 +826,11 @@ Test-That 'one that has taken no beat for the whole window is retracted and decl
         [string]$onlineConfigMessages[1].Payload -match "\`"state_topic\`":\`"$([regex]::Escape($onlineStateTopic))\`""
 } (($script:ReportingMessages | ForEach-Object { "$($_.Topic)=$([string]$_.Payload.Length)" }) -join ' | ')
 Test-That 'and a beat follows it, so the sensor is not left unavailable for a whole interval' {
-    (Get-TestOnlineBeatCount) -eq 5 -and $script:ReportingMessages[-1].Topic -ceq $onlineStateTopic
+    # A beat is two messages now - the unchanged state, then the attributes that make
+    # it observable - so the rebuild is followed by both, in that order.
+    (Get-TestOnlineBeatCount) -eq 5 -and
+        $script:ReportingMessages[-2].Topic -ceq $onlineStateTopic -and
+        $script:ReportingMessages[-1].Topic -ceq $onlineAttrTopic
 }
 Test-That 'with the operator told which entity it was and how long it had been silent' {
     @($script:Log | Where-Object { $_ -clike "$($script:DaemonOnlineEntity) has taken no beat for *s; rebuilding it" }).Count -eq 1
@@ -929,12 +934,12 @@ Test-That 'while the beats themselves keep going out, since giving up repairing 
     (Get-TestOnlineBeatCount) -ge 24
 } "beats=$(Get-TestOnlineBeatCount)"
 Test-That 'and no two beats are alike, so none of them can be discarded as a repeat' {
-    # The fault this fixes was a beat Home Assistant had no reason to write: identical
-    # payloads leave last_reported standing still, which reads exactly like silence and
-    # is what drove the rebuild loop.
-    $beats = @($script:ReportingMessages |
-        Where-Object { $_.Topic -ceq $onlineStateTopic } | ForEach-Object { [string]$_.Payload })
-    $beats.Count -ge 2 -and @($beats | Sort-Object -Unique).Count -eq $beats.Count
+    # The fault this fixes was a beat Home Assistant had no reason to write: an
+    # unchanged state leaves last_reported standing still, which reads exactly like
+    # silence and is what drove the rebuild loop. The state stays identical on
+    # purpose - it is the attributes that have to move.
+    $attrs = @(Get-TestOnlineAttrPayload)
+    $attrs.Count -ge 2 -and @($attrs | Sort-Object -Unique).Count -eq $attrs.Count
 }
 
 # One move is not recovery: the rebuild's own beat always lands, so treating a single

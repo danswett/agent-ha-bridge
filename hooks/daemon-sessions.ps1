@@ -1493,11 +1493,11 @@ function Get-DaemonStateReportedAt {
         written to avoid (#202).
 
         So the freshness has to come from the message rather than from the choice of
-        field: `Publish-CopilotMqttMachineHeartbeat` puts the time of each beat in the
-        payload, which makes every beat a genuine write and `last_reported` a true
-        record of when one last arrived. Read that function before changing the beat's
-        payload - a beat whose content does not vary is invisible here, and the
-        failure is silent in both directions.
+        field: `Publish-CopilotMqttMachineHeartbeat` sends the time of each beat on
+        the sensor's attributes topic, which makes every beat a genuine write and
+        `last_reported` a true record of when one last arrived. Read that function
+        before changing what a beat sends - a beat with nothing varying in it is
+        invisible here, and the failure is silent in both directions.
 
         Home Assistant has published the field since 2024.4. No field, no detection;
         the README sets no minimum version.
