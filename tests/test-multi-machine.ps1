@@ -557,6 +557,16 @@ Test-That 'it expires, so a machine that stops reporting goes offline on its own
     $onlineConfig.Payload -match '"expire_after":180'
 }
 Test-That 'it is a connectivity sensor' { $onlineConfig.Payload -match '"device_class":"connectivity"' }
+Test-That 'it reads its state out of the beat rather than from the raw payload' {
+    (($onlineConfig.Payload | ConvertFrom-Json).value_template) -ceq '{{ value_json.state }}'
+}
+Test-That 'and takes its attributes from that same message, so every beat is a write' {
+    # The beat's timestamp arrives as an attribute. Without it a beat repeating the
+    # state the entity already holds is not written at all, last_reported stands still
+    # on a healthy sensor, and the stall detector rebuilds it for ever (#202).
+    $declared = $onlineConfig.Payload | ConvertFrom-Json
+    $declared.json_attributes_topic -ceq $declared.state_topic
+}
 Test-That 'the discovery config is retained, so the entity survives a restart' {
     $onlineConfig.Retained
 }
@@ -572,7 +582,26 @@ Test-That 'the beat is not retained' {
     # Retaining it would resurrect a stale "online" for a machine that has since been
     # switched off, every time Home Assistant restarts.
     $state = @($script:Published | Where-Object { $_.Topic -match '/online/state$' })[0]
-    $state.Payload -eq 'online' -and -not $state.Retained
+    -not $state.Retained
+}
+Test-That 'the beat says the machine is online' {
+    $beat = @($script:Published | Where-Object { $_.Topic -match '/online/state$' })[0].Payload | ConvertFrom-Json
+    $beat.state -ceq 'online'
+}
+Test-That 'the beat carries the moment it was sent' {
+    $beat = @($script:Published | Where-Object { $_.Topic -match '/online/state$' })[0].Payload | ConvertFrom-Json
+    $parsed = [DateTimeOffset]::MinValue
+    [DateTimeOffset]::TryParse([string]$beat.at, [ref]$parsed) -and $parsed -gt [DateTimeOffset]::MinValue
+}
+Test-That 'two beats in a row differ, so neither is discarded as a repeat' {
+    # A liveness sensor only ever says it is online, so without something that changes
+    # there is nothing for Home Assistant to write and nothing to read back. That is
+    # what made a perfectly healthy machine look silent every few minutes (#202).
+    $script:Published = @()
+    Publish-CopilotMqttMachineHeartbeat -Slug 'laptop' -Headers @{}
+    Publish-CopilotMqttMachineHeartbeat -Slug 'laptop' -Headers @{}
+    $beats = @($script:Published | Where-Object { $_.Topic -match '/online/state$' })
+    $beats.Count -eq 2 -and [string]$beats[0].Payload -cne [string]$beats[1].Payload
 }
 Test-That 'uninstalling a machine withdraws its liveness sensor too' {
     @(Get-CopilotMqttMachineTopic -Slug 'laptop') -contains 'homeassistant/binary_sensor/agent_bridge_laptop/online/config'

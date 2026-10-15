@@ -1406,11 +1406,18 @@ function Publish-CopilotMqttMachineOnlineConfig {
     if (-not $Slug) { $Slug = Get-BridgeMachineSlug }
     if (-not $MachineName) { $MachineName = [Environment]::MachineName }
 
+    $stateTopic = "$(Get-CopilotMqttMachineTopicRoot -Slug $Slug)/online/state"
     $config = @{
         name = 'Online'
         unique_id = "agent_bridge_${Slug}_online"
         object_id = "agent_bridge_${Slug}_online"
-        state_topic = "$(Get-CopilotMqttMachineTopicRoot -Slug $Slug)/online/state"
+        state_topic = $stateTopic
+        value_template = '{{ value_json.state }}'
+        # The same topic, so the timestamp each beat carries lands as an attribute and
+        # every beat becomes a state write. Without that, a beat repeating the state
+        # the entity already holds is discarded and `last_reported` stands still on a
+        # healthy sensor - see Publish-CopilotMqttMachineHeartbeat.
+        json_attributes_topic = $stateTopic
         device_class = 'connectivity'
         payload_on = 'online'
         payload_off = 'offline'
@@ -1434,14 +1441,26 @@ function Publish-CopilotMqttMachineHeartbeat {
         signal, and it is the one thing deliberately not retained: `expire_after` turns
         it unavailable when the beats stop, and a Home Assistant restart cannot
         resurrect a stale "online" for a machine that has since been switched off.
+
+        The beat carries the moment it was sent, and that timestamp is load-bearing
+        rather than decoration. A sensor like this one only ever says `online`, so
+        every beat after the first repeats a state Home Assistant already holds - and
+        a repeat is not written, which leaves `last_reported` standing still on a
+        sensor that is taking its beats perfectly well. The stall detector read that
+        as silence and rebuilt the sensor every few minutes for ever (#202); the
+        rebuild appeared to help only because recreating the entity makes the next
+        beat a change. Measured on Home Assistant 2026.10.1: three identical `online`
+        payloads left `last_reported` untouched, and the first differing one moved it.
+        Varying the payload is what makes the beat observable at all.
     #>
     param(
         [string]$Slug,
         [Parameter(Mandatory)][hashtable]$Headers
     )
 
+    $beat = @{ state = 'online'; at = [DateTimeOffset]::Now.ToString('o') }
     Publish-CopilotMqttMessage -Topic "$(Get-CopilotMqttMachineTopicRoot -Slug $Slug)/online/state" `
-        -Payload 'online' -Headers $Headers
+        -Payload ($beat | ConvertTo-Json -Compress) -Headers $Headers
 }
 
 function Get-CopilotMqttGlobalEntityId {

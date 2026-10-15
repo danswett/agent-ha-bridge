@@ -105,11 +105,12 @@ function Invoke-RestMethod {
             $response = [Net.Http.HttpResponseMessage]::new([Net.HttpStatusCode]$script:DaemonOnlineReadStatus)
             throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('Synthetic online sensor read', $response)
         }
-        # Only last_reported moves for a message that repeats the state an entity
-        # already holds, and this sensor only ever says 'online' - so it is the one
-        # field that can tell a beat that landed from one that went nowhere. 'none'
-        # models a Home Assistant too old to publish it, which discarded a repeated
-        # write outright, so the other two stand still for a perfectly healthy sensor.
+        # last_reported is the only field that can tell a beat that landed from one that
+        # went nowhere - but only because the beat carries the time it was sent. A
+        # message repeating the state an entity already holds is not written at all and
+        # moves nothing, measured on 2026.10.1, which is what rebuilt healthy sensors on
+        # a loop until the beat was made to vary (#202). 'none' models a Home Assistant
+        # too old to publish the field at all.
         if ($script:DaemonOnlineReported -ceq 'none') {
             return [pscustomobject]@{
                 entity_id = $script:DaemonOnlineEntity; state = 'on'
@@ -790,7 +791,14 @@ function Get-TestOnlineRetractionCount {
     @($script:ReportingMessages | Where-Object { $_.Topic -ceq $onlineConfigTopic -and [string]$_.Payload -eq '' }).Count
 }
 function Get-TestOnlineBeatCount {
-    @($script:ReportingMessages | Where-Object { $_.Topic -ceq $onlineStateTopic -and [string]$_.Payload -ceq 'online' }).Count
+    # Matched by parsing rather than by string equality: the beat carries the moment it
+    # was sent, so it is never twice the same payload, and an exact match would quietly
+    # count nothing at all (#202).
+    @($script:ReportingMessages | Where-Object {
+        $_.Topic -ceq $onlineStateTopic -and [string]$_.Payload -and
+        ([string]$_.Payload).StartsWith('{') -and
+        (([string]$_.Payload | ConvertFrom-Json).state) -ceq 'online'
+    }).Count
 }
 
 1..5 | ForEach-Object { Invoke-TestOnlineBeat }
@@ -880,10 +888,9 @@ Test-That 'but it does once enough beats have gone unanswered as well' {
 } "unanswered=$($script:DaemonOnlineSeen.Unanswered)"
 
 # Home Assistant has only published last_reported since 2024.4, and the README sets no
-# minimum version. Before it, a write repeating the state an entity already held was
-# discarded, so last_changed and last_updated stand still for a sensor that is taking
-# every beat - and falling back to them would rebuild a healthy sensor every few
-# minutes for ever, which is worse than the fault being fixed.
+# minimum version. Without that field there is nothing that distinguishes a beat which
+# landed from one that went nowhere, so detection switches itself off rather than
+# rebuilding a healthy sensor every few minutes.
 $script:ReportingMessages.Clear()
 $script:Log = @()
 $script:DaemonOnlineSeen = @{ Reported = ''; At = [DateTimeOffset]::MinValue; Unanswered = 0 }
@@ -914,13 +921,21 @@ $script:DaemonOnlineReported = '2026-10-11T15:46:56.000000-07:00'
 Test-That 'a sensor that ignores every rebuild is rebuilt only so many times, not for ever' {
     (Get-TestOnlineRetractionCount) -eq $script:DaemonConfig.DetachedEntityRepairLimit
 } "retractions=$(Get-TestOnlineRetractionCount) over 24 beats"
-Test-That 'and the daemon says once that it has stopped, naming the topic nothing is listening to' {
+Test-That 'and the daemon says once that it has stopped, naming the topic the beats go to' {
     @($script:Log | Where-Object { $_ -clike "$($script:DaemonOnlineEntity) has ignored * rebuilds; leaving it alone*" }).Count -eq 1 -and
         @($script:Log | Where-Object { $_ -clike "*$(Get-CopilotMqttMachineTopicRoot -Slug $script:DaemonMachineSlug)/online/state*" }).Count -eq 1
 } (($script:Log | Select-Object -Last 2) -join ' | ')
 Test-That 'while the beats themselves keep going out, since giving up repairing is not giving up reporting' {
     (Get-TestOnlineBeatCount) -ge 24
 } "beats=$(Get-TestOnlineBeatCount)"
+Test-That 'and no two beats are alike, so none of them can be discarded as a repeat' {
+    # The fault this fixes was a beat Home Assistant had no reason to write: identical
+    # payloads leave last_reported standing still, which reads exactly like silence and
+    # is what drove the rebuild loop.
+    $beats = @($script:ReportingMessages |
+        Where-Object { $_.Topic -ceq $onlineStateTopic } | ForEach-Object { [string]$_.Payload })
+    $beats.Count -ge 2 -and @($beats | Sort-Object -Unique).Count -eq $beats.Count
+}
 
 # One move is not recovery: the rebuild's own beat always lands, so treating a single
 # advance as health reset the counter on every cycle and the cap would never be reached.
