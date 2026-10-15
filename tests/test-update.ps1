@@ -248,7 +248,7 @@ try {
     # Two hours old against the default interval, so it is stale and a check really
     # does happen - the assertion is about what that check asks, not about skipping it.
     $staleButReached = {
-        param($Release, $ETag = '')
+        param($Release, $ETag = '', $MetadataFrom = 'api')
         $record = [ordered]@{
             CheckedAt = [DateTimeOffset]::Now.AddHours(-2).ToString('o')
             Reached   = $true
@@ -256,6 +256,10 @@ try {
             Release   = $Release
         }
         if ($ETag) { $record['ETag'] = $ETag }
+        # 'api' unless a case says otherwise: that is a record whose notes have been
+        # fetched, which is what almost every cache holds. A record that never got
+        # them has to be told apart, or an unchanged tag looks settled forever.
+        if ($MetadataFrom) { $record['MetadataFrom'] = $MetadataFrom }
         [pscustomobject]$record | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
     }
     $olderCachedRelease = [pscustomobject]@{
@@ -281,6 +285,17 @@ try {
         $unchanged.Route -eq 'redirect' -and
             (Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json).Route -eq 'redirect'
     } $unchanged.Route
+
+    # A cache written before the notes were tracked cannot say whether it holds them,
+    # and is read as owing them rather than assumed complete. That costs one API
+    # request on the first check after an upgrade - which is what every check used to
+    # cost - and nothing after it.
+    $script:ApiCalls = 0
+    & $staleButReached $richCachedRelease '' $null
+    $upgraded = Get-BridgeLatestRelease -IncludeStatus
+    Test-That 'a cache from before this field is read as owing its notes, not as complete' {
+        $script:ApiCalls -eq 1 -and $upgraded.Release.Tag -eq 'v9.9.9'
+    } "api calls=$($script:ApiCalls)"
 
     # A tag the cache has not seen is the one thing worth an API request, and it is
     # spent on what the redirect cannot give: the notes.
@@ -318,6 +333,45 @@ try {
     Test-That 'and the stale notes are not carried onto the new version' {
         (Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json).Release.Notes -eq ''
     }
+
+    # ...and the notes are still owed. The tag now looks unchanged on every later
+    # check, so without a record of what the cache is actually missing, a release
+    # first learned from the redirect during an API outage would keep its empty notes
+    # for as long as it stood - and a forced check would skip the API path too.
+    # Raised by Codex on #224.
+    Test-That 'a release the API never answered for is recorded as still owing its notes' {
+        (Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json).MetadataFrom -eq 'redirect'
+    }
+    $script:ApiCalls = 0
+    function Invoke-RestMethod {
+        param($Uri, $Headers, $TimeoutSec)
+        $script:ApiCalls++
+        [pscustomobject]@{
+            tag_name = 'v9.9.9'; name = '9.9.9'; body = 'what changed in 9.9.9'
+            html_url = 'https://github.com/danswett/agent-ha-bridge/releases/tag/v9.9.9'
+            zipball_url = 'https://api.github.com/repos/danswett/agent-ha-bridge/zipball/v9.9.9'
+            published_at = '2026-10-15T00:00:00Z'
+        }
+    }
+    # Deliberately not forced: the ordinary next check is what has to recover, because
+    # a release nobody is watching is exactly the one this would be lost on. The cache
+    # written above is aged back so that check is due.
+    $owed = Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json
+    $owed.CheckedAt = [DateTimeOffset]::Now.AddHours(-2).ToString('o')
+    $owed | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
+    $recovered = Get-BridgeLatestRelease -IncludeStatus
+    Test-That 'so the next ordinary check fetches them once the API is back' {
+        $script:ApiCalls -eq 1 -and $recovered.Release.Notes -eq 'what changed in 9.9.9'
+    } "api calls=$($script:ApiCalls), notes=[$($recovered.Release.Notes)]"
+    Test-That 'and stops asking once it holds them' {
+        $settled = Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json
+        $settled.CheckedAt = [DateTimeOffset]::Now.AddHours(-2).ToString('o')
+        $settled | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
+        $script:ApiCalls = 0
+        $again = Get-BridgeLatestRelease -IncludeStatus
+        $script:ApiCalls -eq 0 -and $again.Route -eq 'redirect' -and
+            $again.Release.Notes -eq 'what changed in 9.9.9'
+    } "api calls=$($script:ApiCalls)"
 
     # An ETag makes the API request conditional. GitHub answers 304 when nothing has
     # changed, and a 304 does not count against the primary rate limit for an

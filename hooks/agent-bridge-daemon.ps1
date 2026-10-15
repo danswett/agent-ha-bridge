@@ -318,6 +318,12 @@ $script:DaemonUpdateCheckLastPress = ''
 # version this one cannot reach would force a fresh lookup every fifteen seconds.
 $script:DaemonPeerLatestVersion = ''
 $script:DaemonPeerLatestChecked = ''
+# Whether this machine's update entity ids have been seen to take. The pin runs
+# inside the publish, which only happens when something changed, so a Home Assistant
+# that had not yet registered a freshly discovered entity at that moment would never
+# be asked again on a stable install.
+$script:DaemonUpdateEntityIdsPinned = $false
+$script:DaemonUpdateEntityIdsPinnedAt = [DateTimeOffset]::MinValue
 
 # New-session control state. The workspace signature is tracked so the discovery
 # payload is only re-published when the configured list actually changes, rather

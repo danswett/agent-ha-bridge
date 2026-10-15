@@ -40,6 +40,9 @@ $script:ButtonState = 'unavailable'
 # And the check button, which is a separate control with a press of its own: one
 # acts on what the last check found, the other goes and looks.
 $script:CheckButtonState = 'unavailable'
+# How many times the entity registry was walked, so a pin that keeps retrying - or
+# one that gives up before the entity exists - is visible rather than inferred.
+$script:RegistryWalks = 0
 # How many times the routine check actually went out, so a forced lookup can be told
 # from one answered out of the cache.
 $script:RedirectCalls = 0
@@ -100,6 +103,7 @@ function Invoke-WebRequest {
 function Invoke-CopilotHaWebSocket {
     param($Commands)
     if (@($Commands).Count -ne 1 -or $Commands[0].type -ne 'config/entity_registry/list') { throw 'Unexpected WebSocket fixture command.' }
+    $script:RegistryWalks++
     $replies = [Collections.Generic.List[object]]::new()
     $replies.Add([object[]]@([pscustomobject]@{ unique_id = 'unrelated-fixture'; entity_id = 'sensor.fixture' }))
     return ,$replies.ToArray()
@@ -686,6 +690,56 @@ try {
 finally {
     $script:DaemonReconcileStates = $null
     $script:DaemonPeerLatestChecked = ''
+}
+
+Write-Host '--- the entity-id pin keeps asking until the button is actually there ---'
+# The pin used to run only inside the signature-gated publish, so a Home Assistant
+# that had not registered the freshly discovered button when the registry was listed
+# had nothing to rename - and on a stable install the signature never changed again.
+# The button kept the id Home Assistant built from the device and entity names while
+# the daemon read, and the card pressed, the one the bridge chose. Raised by Codex
+# on #224.
+$script:DaemonUpdateEntityIdsPinned = $false
+$script:DaemonUpdateEntityIdsPinnedAt = [DateTimeOffset]::MinValue
+try {
+    $script:DaemonReconcileStates = $null
+    $script:RegistryWalks = 0
+    Assert-UpdateOutcome 'with no snapshot there is no evidence either way, so nothing is asked' (
+        -not (Confirm-DaemonUpdateEntityIds) -and $script:RegistryWalks -eq 0)
+
+    # The button under the id Home Assistant would have chosen for it: present on the
+    # machine, and not the one anything here addresses.
+    $script:DaemonReconcileStates = @{
+        'button.agent_bridge_fixture_check_for_bridge_update' = [pscustomobject]@{
+            entity_id = 'button.agent_bridge_fixture_check_for_bridge_update'; state = 'unknown'
+        }
+    }
+    $script:RegistryWalks = 0
+    $now = [DateTimeOffset]::Now
+    Assert-UpdateOutcome 'a button that is not on its chosen id has the rename asked for again' (
+        -not (Confirm-DaemonUpdateEntityIds -Now $now) -and $script:RegistryWalks -eq 1)
+    # Four reconciles a minute, forever, is what this must not become on a machine
+    # where the entity never appears at all.
+    Assert-UpdateOutcome 'but not again on the very next reconcile' (
+        -not (Confirm-DaemonUpdateEntityIds -Now $now.AddSeconds(15)) -and $script:RegistryWalks -eq 1)
+    Assert-UpdateOutcome 'and once a minute at most while it stays missing' (
+        -not (Confirm-DaemonUpdateEntityIds -Now $now.AddSeconds(75)) -and $script:RegistryWalks -eq 2)
+
+    $script:DaemonReconcileStates = @{
+        $script:DaemonEntity.CheckUpdates = [pscustomobject]@{
+            entity_id = $script:DaemonEntity.CheckUpdates; state = 'unknown'
+        }
+    }
+    $script:RegistryWalks = 0
+    Assert-UpdateOutcome 'seeing it on the id the card presses settles it' (
+        (Confirm-DaemonUpdateEntityIds) -and $script:RegistryWalks -eq 0)
+    $script:DaemonReconcileStates = $null
+    Assert-UpdateOutcome 'and it is not asked again, snapshot or no snapshot' (
+        (Confirm-DaemonUpdateEntityIds) -and $script:RegistryWalks -eq 0)
+}
+finally {
+    $script:DaemonReconcileStates = $null
+    $script:DaemonUpdateEntityIdsPinned = $true
 }
 
 Reset-UpdateCapture

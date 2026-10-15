@@ -9,7 +9,8 @@
     Shared state it changes: DaemonClientSetup, DaemonRestartRequested,
     DaemonUpdateAvailable, DaemonUpdateLastPress, DaemonUpdatePublished,
     DaemonMemoryTrimmedAt, DaemonUpdateVerdict, DaemonUpdateCheckLastPress,
-    DaemonPeerLatestVersion, DaemonPeerLatestChecked.
+    DaemonPeerLatestVersion, DaemonPeerLatestChecked, DaemonUpdateEntityIdsPinned,
+    DaemonUpdateEntityIdsPinnedAt.
 #>
 
 $script:DaemonMemoryTrimmedAt = [DateTimeOffset]::MinValue
@@ -278,6 +279,46 @@ function Invoke-DaemonUpdateOutcome {
     }
 }
 
+function Confirm-DaemonUpdateEntityIds {
+    <#
+        Keeps asking Home Assistant to put this machine's update entities on their
+        deterministic ids until the check button is actually seen on one.
+
+        Set-CopilotMqttUpdateEntityIds runs inside the publish, and the publish only
+        happens when the status signature changes. A Home Assistant that had not yet
+        processed the discovery message when the registry was listed has nothing to
+        rename, the setter skips it silently, and on a stable install - no new release,
+        no stage, nothing moving - the signature never changes again. The button then
+        keeps the id Home Assistant built from the device and entity names, while the
+        daemon reads and the card presses the one the bridge chose. Both ends correct,
+        pointing at different entities, with nothing anywhere saying so. Raised by
+        Codex on #224.
+
+        Observation comes from the reconcile snapshot, which already holds every
+        agent_bridge_* entity, so confirming costs nothing. Only a confirmed absence
+        asks for the rename again, and no more than once a minute, so an entity that
+        never appears cannot turn this into a registry walk every fifteen seconds.
+    #>
+    param([DateTimeOffset]$Now = [DateTimeOffset]::Now)
+
+    if ($script:DaemonUpdateEntityIdsPinned) { return $true }
+    # No snapshot is no evidence either way - the startup pass has none - and acting
+    # on that would re-pin on every daemon start regardless of whether it was needed.
+    if ($null -eq $script:DaemonReconcileStates) { return $false }
+    if ($script:DaemonReconcileStates.ContainsKey($script:DaemonEntity.CheckUpdates)) {
+        $script:DaemonUpdateEntityIdsPinned = $true
+        return $true
+    }
+    if (($Now - $script:DaemonUpdateEntityIdsPinnedAt).TotalSeconds -lt 60) { return $false }
+    $script:DaemonUpdateEntityIdsPinnedAt = $Now
+    try { [void](Set-CopilotMqttUpdateEntityIds) }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        Write-DaemonLog -Message "update entity ids could not be pinned: $($_.Exception.Message)"
+    }
+    $false
+}
+
 function Test-DaemonUpdateCheckPress {
     <#
         Whether the Check button has been pressed since this daemon last looked.
@@ -399,6 +440,11 @@ function Sync-DaemonUpdateStatus {
     # Opting out has to stop the network call, not just hide the result, so this is
     # checked before anything else happens.
     if (-not (Get-BridgeSetting 'updates.checkForUpdates' $true)) { return }
+
+    # Independent of the publish below, which only runs when something changed: a
+    # freshly discovered entity that Home Assistant had not registered yet would
+    # otherwise keep the id Home Assistant chose for it, for good.
+    [void](Confirm-DaemonUpdateEntityIds)
 
     # Two things mean "look now" rather than "look at the usual time": somebody
     # pressed Check - on this machine's card or, fanned out, on every machine's at

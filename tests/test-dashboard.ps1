@@ -584,6 +584,36 @@ Test-That 'so the press it does know is still there' {
     ($script:SavedConfig | ConvertTo-Json -Depth 40 -Compress) -match 'Bridge update available'
 }
 
+# The header control that asks every machine to check presses each machine's own
+# button, so the dashboard has to name them - and an older card drops config keys it
+# has no code for, silently, which is why both sides of the gate are pinned here.
+Write-Host '--- from card 1.40.0 each machine row carries its own check button ---'
+Set-TestPublicationCardUrl -Url '/local/agent-bridge-reply-card.js?v=1.40.0'
+Save-CopilotSessionDashboard -Sessions $sessions -Machines $twoMachines -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.40.0'
+$checkStatus = @($script:SavedConfig.views[0].cards | Where-Object { $_['type'] -eq 'custom:agent-bridge-status-card' })[0]
+Test-That 'every machine row is given the button that checks on that machine' {
+    @($checkStatus['machines'] | Where-Object { [string]$_['check'] -match '^button\.agent_bridge_.+_check_updates$' }).Count -eq
+        @($checkStatus['machines']).Count
+}
+Test-That 'each row its own, never one shared button' {
+    @(@($checkStatus['machines'] | ForEach-Object { [string]$_['check'] }) | Sort-Object -Unique).Count -eq
+        @($checkStatus['machines']).Count
+}
+
+# The last version before the control exists, so the boundary is tested where it is
+# rather than somewhere safely below it.
+Write-Host '--- and a card served below it is handed no key it would drop ---'
+Set-TestPublicationCardUrl -Url '/local/agent-bridge-reply-card.js?v=1.39.0'
+Save-CopilotSessionDashboard -Sessions $sessions -Machines $twoMachines -ReplyCardUrl '/local/agent-bridge-reply-card.js?v=1.39.0'
+$preCheckStatus = @($script:SavedConfig.views[0].cards | Where-Object { $_['type'] -eq 'custom:agent-bridge-status-card' })[0]
+Test-That 'a 1.39.0 card is handed no check button it has no code to press' {
+    @($preCheckStatus['machines'] | Where-Object { $_.Contains('check') }).Count -eq 0
+}
+Test-That 'while the install button it does know is still on every row' {
+    @($preCheckStatus['machines'] | Where-Object { [string]$_['install'] -match '^button\.agent_bridge_.+_install_update$' }).Count -eq
+        @($preCheckStatus['machines']).Count
+}
+
 # The custom activity and session cards draw the status from their own code, so a card
 # served before 1.35.0 has no branch for 'shell' and renders the bare word under an
 # idle-grey frame - exactly the reading this status exists to replace. Handing those

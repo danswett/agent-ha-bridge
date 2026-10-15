@@ -1716,7 +1716,9 @@ Five things keep that from becoming a failed update:
   a repository that ships them its newest entry is the wrong answer, and this project
   pushes a release tag while the release is still a draft. Release notes are not
   available this way, but which release is current is, and a correct version with no
-  notes beats a stale one presented as current.
+  notes beats a stale one presented as current. A release first learned this way is
+  recorded as still owing its notes, so a later check fetches them once the API is
+  reachable again rather than treating the unchanged tag as settled.
 - When the API *is* asked, the request is conditional on the `ETag` of the body
   already held. GitHub answers `304 Not Modified` when nothing has changed, and a 304
   does not count against the primary rate limit for an authenticated caller — so a

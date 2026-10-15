@@ -770,12 +770,26 @@ function Get-BridgeLatestRelease {
     # publishing the notes a paid one fetched.
     $knownRelease = $null
     $knownETag = ''
+    # Whether the held release carries what only the API can give - the notes. Kept
+    # apart from Route, which says how *this* check was answered: once an unchanged
+    # tag starts being confirmed by the redirect, Route is 'redirect' on every pass,
+    # and reading that as "the notes were never fetched" would spend an API request
+    # every half hour forever.
+    #
+    # Absent means a cache from before this field, which is read as incomplete rather
+    # than assumed good. That costs one API request on the first check after an
+    # upgrade - exactly what every check used to cost - and is then settled for as
+    # long as the release stands.
+    $knownMetadataFrom = 'redirect'
     if ($null -ne $cache) {
         $candidate = if ($cache.PSObject.Properties['Release']) { $cache.Release } else { $null }
         $reachedKnown = (-not $cache.PSObject.Properties['Reached']) -or
             ($cache.Reached -is [bool] -and $cache.Reached)
         if ($reachedKnown -and (Test-BridgeUpdateRelease $candidate)) { $knownRelease = $candidate }
         if ($cache.PSObject.Properties['ETag']) { $knownETag = [string]$cache.ETag }
+        if ($cache.PSObject.Properties['MetadataFrom'] -and [string]$cache.MetadataFrom -eq 'api') {
+            $knownMetadataFrom = 'api'
+        }
     }
 
     $lookup.State = 'Unavailable'
@@ -789,6 +803,9 @@ function Get-BridgeLatestRelease {
     # ETag of its own, and reusing the previous one would make the next conditional
     # request claim to hold a body it never saw.
     $etag = $knownETag
+    # Travels with the release rather than with the check, and is cleared the moment a
+    # different release takes its place.
+    $metadataFrom = 'redirect'
     # The redirect's answer, held outside the try so a failure further down can still
     # fall back to it rather than reporting that nothing could be established.
     $probe = $null
@@ -834,13 +851,22 @@ function Get-BridgeLatestRelease {
         }
 
         if ($unchanged) {
-            # Still the release already established, so the richer cached record - with
-            # the notes the redirect cannot carry - remains the answer, and no API
-            # request is made at all. This is the path almost every check now takes.
-            $lookup.State = 'Found'
             $lookup.Release = $knownRelease
+        }
+
+        # An unchanged tag is only the whole answer once the notes have actually been
+        # fetched for it. A release first learned from the redirect while the API was
+        # timing out, refusing or returning 500 is complete apart from exactly what
+        # the redirect cannot carry - and treating it as settled meant that release
+        # kept its empty notes for as long as it stood, with even a forced check
+        # skipping the API path. Raised by Codex on #224.
+        if ($unchanged -and $knownMetadataFrom -eq 'api') {
+            # Still the release already established, and the record is complete, so no
+            # API request is made at all. This is the path almost every check takes.
+            $lookup.State = 'Found'
             $lookup.Detail = ''
             $lookup.Route = 'redirect'
+            $metadataFrom = 'api'
             $strikes = 0
         }
         else {
@@ -859,6 +885,7 @@ function Get-BridgeLatestRelease {
                 $lookup.Release = $knownRelease
                 $lookup.Detail = ''
                 $lookup.Route = 'api-304'
+                $metadataFrom = 'api'
                 $strikes = 0
             }
             else {
@@ -873,6 +900,7 @@ function Get-BridgeLatestRelease {
                 $lookup.Detail = ''
                 $lookup.Route = 'api'
                 $etag = [string]$api.ETag
+                $metadataFrom = 'api'
                 $strikes = 0
             }
         }
@@ -962,6 +990,10 @@ function Get-BridgeLatestRelease {
             # request claim a body this check never saw, and a 304 would then restore
             # the release this one replaced.
             $etag = ''
+            # And the record is incomplete, which the next check has to know: the tag
+            # will look unchanged then, and without this it would be taken as settled
+            # and the notes never fetched at all.
+            $metadataFrom = 'redirect'
             $strikes = 0
         }
     }
@@ -998,6 +1030,11 @@ function Get-BridgeLatestRelease {
         # any answer that did not come from the API, so a conditional request can
         # never claim a body this machine never received.
         ETag      = $etag
+        # Whether the release above carries the API-only metadata - the notes - rather
+        # than only what the redirect could name. Separate from Route, which describes
+        # the check: an unchanged tag is confirmed by the redirect on every pass, so
+        # Route alone would either re-fetch the notes forever or never again.
+        MetadataFrom = $metadataFrom
         Release   = $lookup.Release
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
 
