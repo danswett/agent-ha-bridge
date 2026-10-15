@@ -278,6 +278,12 @@ function Set-Request {
         at = $stamp; session = $Session; launcher = 'copilot'
         requester = $Requester; correlation = $Correlation; sig = $Sig
     }
+    # Round-tripped through JSON because that is what the daemon actually receives:
+    # the request reaches it as Home Assistant attributes parsed by Invoke-RestMethod,
+    # and that parser turns an ISO-8601 'at' into a [datetime] rather than leaving the
+    # string alone. A fixture built straight from a hashtable kept 'at' a string, so
+    # every signature here matched while no real transfer ever did.
+    $script:RequestAttrs = $script:RequestAttrs | ConvertTo-Json -Compress | ConvertFrom-Json
 }
 function Get-HomeAssistantState { param($EntityId, $Headers)
     if ($EntityId -like '*transfer_request*') { return [pscustomobject]@{ state = 'x'; attributes = $script:RequestAttrs } }
@@ -367,6 +373,36 @@ $liftedSig = Get-BridgeTransferSignature -Secret $script:TransferSecret -Fields 
 Set-Request -Session $offeredId -Correlation 'ab000003' -Requester 'attacker' -Sig $liftedSig
 Invoke-DaemonTransferRequest -LiveSessionIds @() -Headers $headers
 Test-That 'a valid signature cannot be replayed with the delivery topic changed' { $script:Served.Count -eq 0 }
+
+# The timestamp is the one signed field a parser rewrites on the way in. A request
+# reaches the daemon as Home Assistant attributes read by Invoke-RestMethod, which turns
+# an ISO-8601 string into a [datetime]; the source then signed that value's culture
+# rendering - '10/15/2026 14:43:46' - which the requester had never sent. The HMAC could
+# not match for any input, so every cross-machine transfer refused as "not signed by
+# this fleet", and because a refusal clears the topic without replying the requester sat
+# out its full two-minute wait and reported the source as busy or offline instead.
+$script:Served = @(); $script:DaemonTransferServed = ''
+Set-Request -Session $offeredId -Correlation 'ab000005'
+Test-That 'the request the daemon reads carries a timestamp the parser has already rewritten' {
+    $script:RequestAttrs.at -is [datetime]
+}
+Invoke-DaemonTransferRequest -LiveSessionIds @() -Headers $headers
+Test-That 'a request signed over the timestamp as sent still verifies once it arrives as a date' {
+    $script:Served -contains $offeredId
+}
+
+# Both ends must derive the same signing form from the same instant, or transfers would
+# work only between machines that happen to share an offset. This fleet spans several.
+Test-That 'the signing form of an instant is the same whatever offset it is read in' {
+    $utc = [DateTimeOffset]::Parse('2026-10-15T09:13:46.1234567Z')
+    $canonical = Get-BridgeTransferStamp -Value $utc
+    $canonical -ceq (Get-BridgeTransferStamp -Value $utc.ToOffset([TimeSpan]::FromHours(5.5))) -and
+    $canonical -ceq (Get-BridgeTransferStamp -Value $utc.ToOffset([TimeSpan]::FromHours(-7))) -and
+    $canonical -ceq (Get-BridgeTransferStamp -Value $utc.UtcDateTime)
+}
+Test-That 'a timestamp that cannot be read signs as nothing rather than throwing' {
+    (Get-BridgeTransferStamp -Value 'not a date') -eq '' -and (Get-BridgeTransferStamp -Value $null) -eq ''
+}
 
 # Fail closed rather than silently unauthenticated.
 $script:FakeSettings = @{ 'newSession.shareResumable' = $true }
