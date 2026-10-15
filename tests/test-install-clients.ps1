@@ -1962,21 +1962,25 @@ function Invoke-AdapterEntityCleanupFixture {
                     @($without | Where-Object { -not $_.retain }).Count -eq 0 -and
                     @($without | Select-Object -Skip 1 | Where-Object { $_.payload -cne '' }).Count -eq 0
             }
-            # 25 rather than 24 since the update entity's attributes topic joined the
-            # machine list (#129): the stage is retained like everything else, so a
-            # machine recreated under the same slug would come back wearing it. The
-            # number is deliberately spelled out: it is the tripwire that caught the
-            # permissions selector being added to the dashboard and not to the
-            # cleanup, which left a dead entity behind in Home Assistant.
-            Test-That "$fixtureClient-only machine cleanup remains a separate 25-topic control" {
-                $script:CleanupPublications.Count - $without.Count -eq 25
+            # 26 rather than 25 since the liveness sensor's attributes topic joined the
+            # machine list (#202): the time of each beat goes there so that a beat is
+            # something Home Assistant writes down, and a machine being removed should
+            # leave nothing of its own behind. 25 rather than 24 before that since the
+            # update entity's attributes topic joined it (#129): the stage is retained
+            # like everything else, so a machine recreated under the same slug would
+            # come back wearing it. The number is deliberately spelled out: it is the
+            # tripwire that caught the permissions selector being added to the
+            # dashboard and not to the cleanup, which left a dead entity behind in
+            # Home Assistant.
+            Test-That "$fixtureClient-only machine cleanup remains a separate 26-topic control" {
+                $script:CleanupPublications.Count - $without.Count -eq 26
             }
             [void][IO.Directory]::CreateDirectory($unusedState)
             $script:CleanupPublications.Clear()
             . ([scriptblock]::Create($cleanup.Extent.Text))
             $with = @($script:CleanupPublications | Where-Object { $_.topic -like "*/$node/*" }).Count
             Test-That "adding an empty Copilot directory does not change $fixtureClient cleanup" {
-                $with -eq $expectedSessionCleanup -and $without.Count -eq $with -and $script:CleanupPublications.Count - $with -eq 25
+                $with -eq $expectedSessionCleanup -and $without.Count -eq $with -and $script:CleanupPublications.Count - $with -eq 26
             }
         }
         finally {

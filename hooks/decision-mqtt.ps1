@@ -1406,11 +1406,19 @@ function Publish-CopilotMqttMachineOnlineConfig {
     if (-not $Slug) { $Slug = Get-BridgeMachineSlug }
     if (-not $MachineName) { $MachineName = [Environment]::MachineName }
 
+    $root = Get-CopilotMqttMachineTopicRoot -Slug $Slug
     $config = @{
         name = 'Online'
         unique_id = "agent_bridge_${Slug}_online"
         object_id = "agent_bridge_${Slug}_online"
-        state_topic = "$(Get-CopilotMqttMachineTopicRoot -Slug $Slug)/online/state"
+        state_topic = "$root/online/state"
+        # The time of each beat rides on a topic of its own rather than in the state,
+        # which goes on being exactly `online`. That is what keeps an upgraded machine
+        # safe: this config is published at startup inside a try/catch that logs and
+        # carries on, so a transient failure here leaves the *previous* config in
+        # place, and a beat it cannot match against payload_on would take a running
+        # machine offline. See Publish-CopilotMqttMachineHeartbeat.
+        json_attributes_topic = "$root/online/attr"
         device_class = 'connectivity'
         payload_on = 'online'
         payload_off = 'offline'
@@ -1434,14 +1442,33 @@ function Publish-CopilotMqttMachineHeartbeat {
         signal, and it is the one thing deliberately not retained: `expire_after` turns
         it unavailable when the beats stop, and a Home Assistant restart cannot
         resurrect a stale "online" for a machine that has since been switched off.
+
+        The beat is two messages, and the second one is why this works. The state
+        topic keeps saying exactly `online`, but a message repeating the state an
+        entity already holds is not written at all, so `last_reported` stands still on
+        a sensor that is taking its beats perfectly well. The stall detector read that
+        as silence and rebuilt the sensor every few minutes for ever (#202); the
+        rebuild appeared to help only because recreating the entity makes the next
+        beat a change. Measured on Home Assistant 2026.10.1: three identical `online`
+        payloads left `last_reported` untouched, and the first differing one moved it.
+        The expiry timer is reset either way, which is why the sensor stayed `on`
+        rather than expiring while it looked silent.
+
+        So the varying part goes on its own attributes topic. Both halves are
+        unretained; the state half is unchanged, so a machine still running an older
+        discovery config - or one whose config republish failed at startup - matches
+        payload_on exactly as before and simply ignores the attributes topic nothing
+        has subscribed it to.
     #>
     param(
         [string]$Slug,
         [Parameter(Mandatory)][hashtable]$Headers
     )
 
-    Publish-CopilotMqttMessage -Topic "$(Get-CopilotMqttMachineTopicRoot -Slug $Slug)/online/state" `
-        -Payload 'online' -Headers $Headers
+    $root = Get-CopilotMqttMachineTopicRoot -Slug $Slug
+    Publish-CopilotMqttMessage -Topic "$root/online/state" -Payload 'online' -Headers $Headers
+    Publish-CopilotMqttMessage -Topic "$root/online/attr" `
+        -Payload (@{ at = [DateTimeOffset]::Now.ToString('o') } | ConvertTo-Json -Compress) -Headers $Headers
 }
 
 function Get-CopilotMqttGlobalEntityId {
@@ -1594,6 +1621,9 @@ function Get-CopilotMqttMachineTopic {
         "$root/newsession/promptpayload"
         "$root/transfer/request"
         "$root/online/state"
+        # Unretained like the state beside it, and listed for the same reason: the
+        # withdrawal list is checked against everything a machine actually publishes.
+        "$root/online/attr"
         "$root/global/state"
         "$root/global/attr"
     )

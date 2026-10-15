@@ -1478,16 +1478,29 @@ function Get-DaemonStateReportedAt {
         When Home Assistant last took a state message for an entity, or $null when it
         does not say.
 
-        `last_reported` only, with no fallback to `last_updated` or `last_changed`. It
-        is the only one that moves for a message repeating the state an entity already
-        holds, which is every message this is used for: the liveness sensor only ever
-        says `online`. Home Assistant has published it since 2024.4; before that a
-        repeated write was discarded outright, so on an older installation the other
-        two stand still for a sensor that is perfectly healthy. Falling back to them
-        would class every beat there as a stall and rebuild the sensor on a loop,
-        flapping it to unavailable every few minutes for ever - a far worse failure
-        than the one being fixed, and inflicted on installations that never had it.
-        No field, no detection; the README sets no minimum version.
+        `last_reported` only, with no fallback to `last_updated` or `last_changed`.
+        Those two move only when the state or its attributes change, so on a sensor
+        that only ever says `online` they stand still however healthy it is; falling
+        back to them would class every beat as a stall and rebuild the sensor on a
+        loop, flapping it to unavailable every few minutes for ever.
+
+        `last_reported` was chosen because it was believed to move for a message
+        repeating the state an entity already holds. It does not. Measured on Home
+        Assistant 2026.10.1: three identical `online` payloads to a freshly declared
+        sensor left `last_reported` untouched, and only a differing payload moved it -
+        a repeat is not written at all, and no field records it. That is what made the
+        detector rebuild healthy sensors on exactly the loop the paragraph above was
+        written to avoid (#202).
+
+        So the freshness has to come from the message rather than from the choice of
+        field: `Publish-CopilotMqttMachineHeartbeat` sends the time of each beat on
+        the sensor's attributes topic, which makes every beat a genuine write and
+        `last_reported` a true record of when one last arrived. Read that function
+        before changing what a beat sends - a beat with nothing varying in it is
+        invisible here, and the failure is silent in both directions.
+
+        Home Assistant has published the field since 2024.4. No field, no detection;
+        the README sets no minimum version.
 
         The string is returned as Home Assistant wrote it rather than parsed. Nothing
         here does arithmetic on it - only "is this the same answer as last time" - and
@@ -1635,16 +1648,19 @@ function Confirm-DaemonOnlineHeartbeat {
     $script:DaemonOnlineSeen = @{ Reported = $reported; At = $now; Unanswered = 0 }
     if ([int]$script:DaemonOnlineRepairs -ge $script:DaemonConfig.DetachedEntityRepairLimit) {
         # Said once, not every window: the condition persists and the point of stopping
-        # was to stop making noise about it. Naming the topic matters because that is
-        # what Home Assistant is no longer subscribed to, and restarting its MQTT
-        # integration is what resubscribes it - the daemon cannot do it from here.
+        # was to stop making noise about it. The topic is named because that is what
+        # the beats are going to, but the cause is deliberately not asserted here - an
+        # earlier version of this line told the reader Home Assistant had stopped
+        # listening and to reload its MQTT integration, which was wrong and sent
+        # people to restart a working integration (#202).
         if (-not $script:DaemonOnlineRepairGivenUp) {
             $script:DaemonOnlineRepairGivenUp = $true
             Write-DaemonLog -Message ("$entityId has ignored " +
                 "$($script:DaemonConfig.DetachedEntityRepairLimit) rebuilds; leaving it alone rather " +
-                "than flapping it. Home Assistant is not listening to " +
+                'than flapping it. Nothing is reaching it from ' +
                 "$(Get-CopilotMqttMachineTopicRoot -Slug $script:DaemonMachineSlug)/online/state - " +
-                'reload its MQTT integration to resubscribe it.')
+                'check that the beat still carries a changing payload, then the broker and ' +
+                "Home Assistant's MQTT integration.")
         }
         return
     }
