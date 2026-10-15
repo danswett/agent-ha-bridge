@@ -2935,25 +2935,29 @@ async function checkOtherRow() {
     connection.subscriptions.length === 1, String(connection.subscriptions.length));
 
   const publish = (urlPath) => connection.subscriptions[0].handler({ data: { url_path: urlPath } });
+  const panelAnswers = () => watcher.setConfig({ title: 'Agent sessions', machines: MACHINES, decisions: [] });
 
+  // A page Home Assistant is still keeping current: the panel refetches on its own
+  // and every card is handed its config again, well inside the grace window.
   let mark = watchLoad.sandbox.timers.length;
   publish('agent-decisions');
   let armed = armedSince(mark);
   check('a dashboard change waits before acting, so the panel can answer first',
     armed.length === 1 && armed[0].ms === 3000, JSON.stringify(armed.map((t) => t.ms)));
-  armed[0].fn();
-  check('and with no answer the card asks the panel for the new config itself',
+  panelAnswers();
+  armed.forEach((timer) => timer.fn());
+  check('and a page whose own subscription still works is not made to fetch it twice',
+    sent(watcher).length === 0, String(sent(watcher).length));
+
+  mark = watchLoad.sandbox.timers.length;
+  publish('agent-decisions');
+  armedSince(mark).forEach((timer) => timer.fn());
+  check('with no answer the card asks the panel for the new config itself',
     sent(watcher).length === 1 && sent(watcher)[0].type === 'config-refresh',
     JSON.stringify(sent(watcher).map((e) => e.type)));
   check('as an event shaped to leave the card and reach hui-root',
     sent(watcher)[0].bubbles === true && sent(watcher)[0].composed === true);
-
-  mark = watchLoad.sandbox.timers.length;
-  publish('agent-decisions');
-  watcher.setConfig({ title: 'Agent sessions', machines: MACHINES, decisions: [] });
-  armedSince(mark).forEach((timer) => timer.fn());
-  check('a page whose own subscription still works is not made to fetch it twice',
-    sent(watcher).length === 1, String(sent(watcher).length));
+  panelAnswers();
 
   mark = watchLoad.sandbox.timers.length;
   publish('energy');
@@ -2976,6 +2980,7 @@ async function checkOtherRow() {
   armed.forEach((timer) => timer.fn());
   check('so the sessions that started while it was away appear',
     sent(watcher).length === 2, String(sent(watcher).length));
+  panelAnswers();
 
   mark = watchLoad.sandbox.timers.length;
   watchLoad.sandbox.window.location.search = '?edit=1';
@@ -2990,11 +2995,40 @@ async function checkOtherRow() {
   armedSince(mark).forEach((timer) => timer.fn());
   check('and the change is taken up once the editor is closed',
     sent(watcher).length === 3, String(sent(watcher).length));
+  panelAnswers();
 
   mark = watchLoad.sandbox.timers.length;
   watcher.hass = hassOn();
   check('one request per change, however many state updates follow it',
     armedSince(mark).length === 0, String(armedSince(mark).length));
+
+  /*
+   * A fetch can only carry what had already happened when it started. Crediting a
+   * config this card asked for with every change seen since would mark a session
+   * that started during that round trip as already drawn - and with the panel's own
+   * subscription gone, nothing would ever ask again.
+   */
+  mark = watchLoad.sandbox.timers.length;
+  publish('agent-decisions');
+  armedSince(mark).forEach((timer) => timer.fn());
+  check('a change with no answer is asked about', sent(watcher).length === 4,
+    String(sent(watcher).length));
+  mark = watchLoad.sandbox.timers.length;
+  publish('agent-decisions');
+  panelAnswers();
+  armedSince(mark).forEach((timer) => timer.fn());
+  check('and a session that started while that config was in flight is asked for too',
+    sent(watcher).length === 5, String(sent(watcher).length));
+  panelAnswers();
+
+  // The other half of that rule: a config that arrived unasked is the panel still
+  // answering, and the panel fetches once per change.
+  mark = watchLoad.sandbox.timers.length;
+  publish('agent-decisions');
+  panelAnswers();
+  armedSince(mark).forEach((timer) => timer.fn());
+  check('while a page the panel is still fetching for is left to get on with it',
+    sent(watcher).length === 5, String(sent(watcher).length));
 
   check('and a card that has been parked and come back holds no second subscription',
     connection.subscriptions.length === 1, String(connection.subscriptions.length));

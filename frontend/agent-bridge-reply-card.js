@@ -234,6 +234,12 @@ const FORM_SENDS = new Map();
  * `config-refresh`, which ha-panel-lovelace already listens for on hui-root. It is
  * deliberately never unsubscribed: being detached is the very condition this exists
  * to survive, so tearing it down on disconnect would reproduce the bug exactly.
+ *
+ * The status card alone keeps it, because it is on the generated dashboard exactly
+ * once however many sessions are running - including none, which is precisely when
+ * a session appearing has to be noticed. That is also what makes one config arriving
+ * mean one fetch: every card on the view is handed its config again on a refetch, so
+ * a count kept by all of them could not tell one fetch from seven.
  */
 const CONFIG_WATCH = {
   connection: null,
@@ -246,6 +252,11 @@ const CONFIG_WATCH = {
   changes: 0,
   applied: 0,
   requested: 0,
+  // Whether the config about to arrive is one this card asked for. A fetch can only
+  // carry the changes that had already happened when it started, so a config this
+  // card requested is credited with the change it asked about and nothing later -
+  // see noteDashboardConfig.
+  ours: false,
   timer: null,
 };
 
@@ -305,6 +316,7 @@ function runConfigRefresh() {
   // the page could have acted on it anyway.
   if (!card || card.isConnected === false) { return; }
   CONFIG_WATCH.requested = CONFIG_WATCH.changes;
+  CONFIG_WATCH.ours = true;
   card.dispatchEvent(new CustomEvent('config-refresh', { bubbles: true, composed: true }));
 }
 
@@ -337,9 +349,27 @@ function watchDashboardConfig(card, hass) {
   armConfigRefresh();
 }
 
-// The panel handing a card its config is the one signal that says the page is still
-// being kept current by Home Assistant itself.
+/*
+ * The panel handing the card its config again. There are two reasons that happens
+ * and they are credited differently.
+ *
+ * A config that arrived on its own is the panel's own subscription answering, and
+ * the panel fetches once per change, so everything seen so far is covered.
+ *
+ * A config this card asked for is not. It can only carry the changes that had
+ * already happened when its fetch started, and a change landing during that round
+ * trip would otherwise be marked as answered by a config that predates it - with
+ * the panel's subscription gone, nothing would ever ask again and that session
+ * would simply never appear. So a requested config is credited with the change it
+ * asked about and nothing later, which leaves the newer change outstanding and asks
+ * for it next.
+ */
 function noteDashboardConfig() {
+  if (CONFIG_WATCH.ours) {
+    CONFIG_WATCH.ours = false;
+    if (CONFIG_WATCH.requested > CONFIG_WATCH.applied) { CONFIG_WATCH.applied = CONFIG_WATCH.requested; }
+    return;
+  }
   CONFIG_WATCH.applied = CONFIG_WATCH.changes;
 }
 
@@ -2297,7 +2327,6 @@ class AgentBridgeSessionCard extends HTMLElement {
     if (!config || !Array.isArray(config.cards)) {
       throw new Error('agent-bridge-session-card: "cards" is required');
     }
-    noteDashboardConfig();
     this._config = Object.assign({ status: '', decision: '' }, config);
     this._storeKey = `agent-bridge-collapsed:${this._config.status || ''}`;
     try { this._collapsed = localStorage.getItem(this._storeKey) === '1'; } catch (e) { this._collapsed = false; }
@@ -2323,7 +2352,6 @@ class AgentBridgeSessionCard extends HTMLElement {
 
   set hass(hass) {
     this._hass = hass;
-    watchDashboardConfig(this, hass);
     for (const child of this._children) { if (child) { child.hass = hass; } }
     this._renderState();
   }
