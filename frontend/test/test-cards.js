@@ -2885,6 +2885,155 @@ async function checkOtherRow() {
   await checkDeferredChoices();
 
   console.log('');
+  console.log('--- a page Home Assistant stopped telling about new sessions asks for itself ---');
+  /*
+   * partial-panel-resolver parks the whole panel element once the tab has been hidden
+   * for five minutes and re-attaches that same element afterwards. ha-panel-lovelace
+   * unsubscribes from lovelace_updated on its way out and only ever subscribes from
+   * firstUpdated, which has already run - so for every dashboard but the cached
+   * default one the page stops hearing that the config changed, for good. This
+   * dashboard is generated whole, so that means a session that starts afterwards
+   * never gets a card, and reloading the page is the only way to see it.
+   */
+  const MACHINES = [{ machine: 'desk', slug: 'desk' }];
+  // Its own sandbox: the subscription and the pending request are one per page, so a
+  // block that means to test them has to start from a page nothing else has touched.
+  const watchLoad = require('./card-harness').loadCards();
+  const WatchedStatusCard = watchLoad.AgentBridgeStatusCard;
+
+  function watcherCard() {
+    const card = Object.create(WatchedStatusCard.prototype);
+    card._config = { title: 'Agent sessions', machines: MACHINES, decisions: [] };
+    card._built = true;
+    card._build = function () { this._built = true; };
+    card._render = () => {};
+    return card;
+  }
+
+  const connection = {
+    subscriptions: [],
+    subscribeEvents(handler, type) {
+      this.subscriptions.push({ handler, type });
+      return Promise.resolve(() => {});
+    },
+  };
+  const hassOn = () => ({ states: {}, connection });
+  // Timers are recorded rather than run, so a block only ever looks at the ones
+  // armed after it started.
+  const armedSince = (mark) => watchLoad.sandbox.timers.slice(mark).filter(Boolean);
+  const sent = (card) => card._dispatched || [];
+
+  const firstCard = watcherCard();
+  firstCard.hass = hassOn();
+  check('a card on the dashboard subscribes to the config changing',
+    connection.subscriptions.length === 1 && connection.subscriptions[0].type === 'lovelace_updated',
+    JSON.stringify(connection.subscriptions.map((s) => s.type)));
+
+  const watcher = watcherCard();
+  watcher.hass = hassOn();
+  check('and a second card on the same page shares that one subscription',
+    connection.subscriptions.length === 1, String(connection.subscriptions.length));
+
+  const publish = (urlPath) => connection.subscriptions[0].handler({ data: { url_path: urlPath } });
+  const panelAnswers = () => watcher.setConfig({ title: 'Agent sessions', machines: MACHINES, decisions: [] });
+
+  // A page Home Assistant is still keeping current: the panel refetches on its own
+  // and every card is handed its config again, well inside the grace window.
+  let mark = watchLoad.sandbox.timers.length;
+  publish('agent-decisions');
+  let armed = armedSince(mark);
+  check('a dashboard change waits before acting, so the panel can answer first',
+    armed.length === 1 && armed[0].ms === 3000, JSON.stringify(armed.map((t) => t.ms)));
+  panelAnswers();
+  armed.forEach((timer) => timer.fn());
+  check('and a page whose own subscription still works is not made to fetch it twice',
+    sent(watcher).length === 0, String(sent(watcher).length));
+
+  mark = watchLoad.sandbox.timers.length;
+  publish('agent-decisions');
+  armedSince(mark).forEach((timer) => timer.fn());
+  check('with no answer the card asks the panel for the new config itself',
+    sent(watcher).length === 1 && sent(watcher)[0].type === 'config-refresh',
+    JSON.stringify(sent(watcher).map((e) => e.type)));
+  check('as an event shaped to leave the card and reach hui-root',
+    sent(watcher)[0].bubbles === true && sent(watcher)[0].composed === true);
+  panelAnswers();
+
+  mark = watchLoad.sandbox.timers.length;
+  publish('energy');
+  check('and another dashboard being saved is not this one',
+    armedSince(mark).length === 0, String(armedSince(mark).length));
+
+  mark = watchLoad.sandbox.timers.length;
+  watcher.isConnected = false;
+  publish('agent-decisions');
+  armedSince(mark).forEach((timer) => timer.fn());
+  check('a card Home Assistant has parked fires nothing into a detached tree',
+    sent(watcher).length === 1, String(sent(watcher).length));
+
+  mark = watchLoad.sandbox.timers.length;
+  watcher.isConnected = true;
+  watcher.hass = hassOn();
+  armed = armedSince(mark);
+  check('and the change it slept through is acted on the moment it is back',
+    armed.length === 1, String(armed.length));
+  armed.forEach((timer) => timer.fn());
+  check('so the sessions that started while it was away appear',
+    sent(watcher).length === 2, String(sent(watcher).length));
+  panelAnswers();
+
+  mark = watchLoad.sandbox.timers.length;
+  watchLoad.sandbox.window.location.search = '?edit=1';
+  publish('agent-decisions');
+  armedSince(mark).forEach((timer) => timer.fn());
+  check('a dashboard being edited is left alone, as Home Assistant leaves it alone',
+    sent(watcher).length === 2, String(sent(watcher).length));
+
+  mark = watchLoad.sandbox.timers.length;
+  watchLoad.sandbox.window.location.search = '';
+  watcher.hass = hassOn();
+  armedSince(mark).forEach((timer) => timer.fn());
+  check('and the change is taken up once the editor is closed',
+    sent(watcher).length === 3, String(sent(watcher).length));
+  panelAnswers();
+
+  mark = watchLoad.sandbox.timers.length;
+  watcher.hass = hassOn();
+  check('one request per change, however many state updates follow it',
+    armedSince(mark).length === 0, String(armedSince(mark).length));
+
+  /*
+   * A fetch can only carry what had already happened when it started. Crediting a
+   * config this card asked for with every change seen since would mark a session
+   * that started during that round trip as already drawn - and with the panel's own
+   * subscription gone, nothing would ever ask again.
+   */
+  mark = watchLoad.sandbox.timers.length;
+  publish('agent-decisions');
+  armedSince(mark).forEach((timer) => timer.fn());
+  check('a change with no answer is asked about', sent(watcher).length === 4,
+    String(sent(watcher).length));
+  mark = watchLoad.sandbox.timers.length;
+  publish('agent-decisions');
+  panelAnswers();
+  armedSince(mark).forEach((timer) => timer.fn());
+  check('and a session that started while that config was in flight is asked for too',
+    sent(watcher).length === 5, String(sent(watcher).length));
+  panelAnswers();
+
+  // The other half of that rule: a config that arrived unasked is the panel still
+  // answering, and the panel fetches once per change.
+  mark = watchLoad.sandbox.timers.length;
+  publish('agent-decisions');
+  panelAnswers();
+  armedSince(mark).forEach((timer) => timer.fn());
+  check('while a page the panel is still fetching for is left to get on with it',
+    sent(watcher).length === 5, String(sent(watcher).length));
+
+  check('and a card that has been parked and come back holds no second subscription',
+    connection.subscriptions.length === 1, String(connection.subscriptions.length));
+
+  console.log('');
   if (failures) {
     console.log(`${failures} check(s) failed`);
     process.exit(1);

@@ -1834,6 +1834,7 @@ inside a disposable machine, not permission to exercise installation on a real o
 | `reply card publication paused` or `bootstrap` / `migration required` | Choose/configure the publisher and follow the explicit [publication procedure](#publication-authority-and-migration); reporting or a registered card alone is not authority. |
 | `not current`, `Pinned card ... repair required`, or `unconfirmed` publication | Inspect actual policy/card/view state. Apply the exact pin or resolve the failed operation; do not weaken the pin or infer success from a cached signature. |
 | `Publication policy was lost after establishment` | Preserve receipts and restore the operator-verified policy resource; do not erase local evidence or bootstrap again. |
+| Sessions stop appearing on a page left open, until it is reloaded | Home Assistant parks the whole dashboard panel after the tab has been hidden for five minutes and drops its config subscription for good. From card 1.39.0 the cards hold a subscription of their own and ask the panel to refetch, so the page catches up within a few seconds. Below that, reload it. |
 | A Dev Box goes offline mid-session every evening | Its pool hibernates on disconnect. See [Running on a Microsoft Dev Box](#running-on-a-microsoft-dev-box). |
 
 On Windows the daemon runs under an installation-scoped hidden task. For the default
