@@ -2029,6 +2029,19 @@ function Get-BridgeUpdateCheckSummary {
     $tag = ''
     if ($record.PSObject.Properties['Release'] -and $record.Release -and
         $record.Release.PSObject.Properties['Tag']) { $tag = [string]$record.Release.Tag }
+    # Which route answered. Checks run half-hourly only because 'redirect' costs no
+    # API allowance, so a machine that has quietly been reduced to 'api' on every
+    # check is one busy hour on its egress address away from the refusals #92 and #109
+    # were about - and nothing else would say so until it started failing. '' for a
+    # cache written before the field existed, which is reported as nothing rather than
+    # guessed at, exactly as the allowance above is.
+    $route = if ($record.PSObject.Properties['Route']) { [string]$record.Route } else { '' }
+    $routeNote = switch ($route) {
+        'redirect' { 'via the releases redirect, which spends no API allowance' }
+        'api'      { 'via the GitHub API, which spends this machine''s allowance' }
+        'api-304'  { 'via a conditional GitHub API request, which GitHub answered unchanged' }
+        default    { '' }
+    }
 
     [pscustomobject]@{
         When     = $when
@@ -2045,6 +2058,8 @@ function Get-BridgeUpdateCheckSummary {
         # unauthenticated. Never a credential: the cache has never held one.
         TokenSource = if ($record.PSObject.Properties['TokenSource']) { [string]$record.TokenSource } else { '' }
         TokenNote   = if ($record.PSObject.Properties['TokenNote']) { [string]$record.TokenNote } else { '' }
+        Route     = $route
+        RouteNote = $routeNote
     }
 }
 

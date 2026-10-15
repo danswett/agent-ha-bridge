@@ -185,8 +185,12 @@ try {
         Reached   = $true
         Release   = $validCachedRelease
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
+    # The interval is named rather than defaulted, because these two assert what a
+    # reached answer is worth inside its window - not what the window happens to be.
+    # They were written when the default was six hours and quietly began exercising a
+    # stale cache when it became half an hour.
     Test-That 'a real answer is still believed for the full interval' {
-        (Get-BridgeLatestRelease).Tag -eq 'v9.9.9'
+        (Get-BridgeLatestRelease -CheckHours 6).Tag -eq 'v9.9.9'
     }
 
     # An older cache with a validated release still has affirmative metadata. A null
@@ -196,7 +200,7 @@ try {
         Release   = $validCachedRelease
     } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
     Test-That 'a cache from an older version is read as before' {
-        (Get-BridgeLatestRelease).Tag -eq 'v9.9.9'
+        (Get-BridgeLatestRelease -CheckHours 6).Tag -eq 'v9.9.9'
     }
 
     Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
@@ -223,6 +227,172 @@ try {
             $notFound.Detail -match 'existence and access are not confirmed'
     }
     function Invoke-RestMethod { throw 'network disabled in test' }
+
+    # The whole point of the half-hourly cadence: a routine check asks a redirect that
+    # is outside the API allowance, and reaches for api.github.com only when that
+    # redirect names a tag the cache has not already seen. Before this, every check
+    # was an API request, and on shared egress - where the 60-an-hour pool is drained
+    # by other tenants - that meant being refused at any cadence at all (#92, #109).
+    Write-Host '--- a routine check costs no API allowance ---'
+    function New-TagRedirect {
+        param([string]$Tag)
+        $collection = [System.Net.WebHeaderCollection]::new()
+        $collection.Add('Location', "https://github.com/danswett/agent-ha-bridge/releases/tag/$Tag")
+        [pscustomobject]@{ StatusCode = 302; Headers = $collection }
+    }
+    $richCachedRelease = [pscustomobject]@{
+        Tag = 'v9.9.9'; Url = 'https://example.test/releases/v9.9.9'
+        Zip = 'https://codeload.github.com/danswett/agent-ha-bridge/zip/refs/tags/v9.9.9'
+        Notes = 'what changed in 9.9.9'; Name = '9.9.9'; Published = '2026-10-15T00:00:00Z'
+    }
+    # Two hours old against the default interval, so it is stale and a check really
+    # does happen - the assertion is about what that check asks, not about skipping it.
+    $staleButReached = {
+        param($Release, $ETag = '')
+        $record = [ordered]@{
+            CheckedAt = [DateTimeOffset]::Now.AddHours(-2).ToString('o')
+            Reached   = $true
+            State     = 'Found'
+            Release   = $Release
+        }
+        if ($ETag) { $record['ETag'] = $ETag }
+        [pscustomobject]$record | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
+    }
+    $olderCachedRelease = [pscustomobject]@{
+        Tag = 'v9.9.8'; Url = 'https://example.test/releases/v9.9.8'
+        Zip = 'https://example.test/archive/v9.9.8.zip'; Notes = 'old'; Name = ''; Published = ''
+    }
+
+    $script:ApiCalls = 0
+    function Invoke-RestMethod { param($Uri, $Headers, $TimeoutSec) $script:ApiCalls++; throw 'the API must not be asked' }
+    function Invoke-WebRequest {
+        param($Uri, $Headers, $TimeoutSec, $MaximumRedirection)
+        New-TagRedirect -Tag 'v9.9.9'
+    }
+    & $staleButReached $richCachedRelease
+    $unchanged = Get-BridgeLatestRelease -IncludeStatus
+    Test-That 'an unchanged release is established without asking the API at all' {
+        $script:ApiCalls -eq 0 -and $unchanged.State -eq 'Found' -and $unchanged.Release.Tag -eq 'v9.9.9'
+    } "api calls=$($script:ApiCalls), state=$($unchanged.State)"
+    Test-That 'and it keeps the release notes the redirect cannot carry' {
+        $unchanged.Release.Notes -eq 'what changed in 9.9.9'
+    } "[$($unchanged.Release.Notes)]"
+    Test-That 'the route that answered is recorded, so a machine still paying for every check is visible' {
+        $unchanged.Route -eq 'redirect' -and
+            (Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json).Route -eq 'redirect'
+    } $unchanged.Route
+
+    # A tag the cache has not seen is the one thing worth an API request, and it is
+    # spent on what the redirect cannot give: the notes.
+    $script:ApiCalls = 0
+    function Invoke-RestMethod {
+        param($Uri, $Headers, $TimeoutSec)
+        $script:ApiCalls++
+        [pscustomobject]@{
+            tag_name = 'v9.9.9'; name = '9.9.9'; body = 'what changed in 9.9.9'
+            html_url = 'https://github.com/danswett/agent-ha-bridge/releases/tag/v9.9.9'
+            zipball_url = 'https://api.github.com/repos/danswett/agent-ha-bridge/zipball/v9.9.9'
+            published_at = '2026-10-15T00:00:00Z'
+        }
+    }
+    & $staleButReached $olderCachedRelease
+    $changed = Get-BridgeLatestRelease -IncludeStatus
+    Test-That 'a tag the cache has not seen is worth exactly one API request' {
+        $script:ApiCalls -eq 1 -and $changed.Release.Tag -eq 'v9.9.9' -and $changed.Route -eq 'api'
+    } "api calls=$($script:ApiCalls), route=$($changed.Route)"
+    Test-That 'and that request is what fetches the notes' {
+        $changed.Release.Notes -eq 'what changed in 9.9.9'
+    } "[$($changed.Release.Notes)]"
+
+    # The API failing is no longer a reason to report nothing. The redirect has
+    # already named the release, and a correct version with no notes beats a stale one
+    # presented as current. This used to apply only to a rate-limited refusal, so a
+    # 500 or a timeout reported "could not be established" with the answer in hand.
+    $script:ApiCalls = 0
+    function Invoke-RestMethod { param($Uri, $Headers, $TimeoutSec) $script:ApiCalls++; throw 'api.github.com is having a bad day' }
+    & $staleButReached $olderCachedRelease
+    $degraded = Get-BridgeUpdateStatus
+    Test-That 'an API outage still yields the current release, from the redirect' {
+        $degraded.State -eq 'Available' -and $degraded.Latest -eq '9.9.9' -and $degraded.Notes -eq ''
+    } "$($degraded.State): latest=$($degraded.Latest) notes=[$($degraded.Notes)]"
+    Test-That 'and the stale notes are not carried onto the new version' {
+        (Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json).Release.Notes -eq ''
+    }
+
+    # An ETag makes the API request conditional. GitHub answers 304 when nothing has
+    # changed, and a 304 does not count against the primary rate limit for an
+    # authenticated caller - which is what keeps a machine that cannot use the
+    # redirect from spending its allowance forty-eight times a day.
+    Write-Host '--- the API request is conditional on what is already held ---'
+    $script:SentConditional = ''
+    # No redirect answer at all here, so the API is the only route left - which is the
+    # machine this case exists for.
+    function Invoke-WebRequest {
+        param($Uri, $Headers, $TimeoutSec, $MaximumRedirection)
+        throw 'the redirect is unreachable here'
+    }
+    function Invoke-RestMethod {
+        param($Uri, $Headers, $TimeoutSec)
+        $script:SentConditional = if ($Headers.ContainsKey('If-None-Match')) { [string]$Headers['If-None-Match'] } else { '' }
+        $response = [System.Net.Http.HttpResponseMessage]::new([System.Net.HttpStatusCode]::NotModified)
+        throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('Not Modified', $response)
+    }
+    & $staleButReached $richCachedRelease '"etag-9-9-9"'
+    $notModified = Get-BridgeLatestRelease -IncludeStatus
+    Test-That 'the validator already held is sent with the request' {
+        $script:SentConditional -eq '"etag-9-9-9"'
+    } "[$($script:SentConditional)]"
+    Test-That 'a 304 is the answer, not an outage - the held release stands, notes and all' {
+        $notModified.State -eq 'Found' -and $notModified.Release.Tag -eq 'v9.9.9' -and
+            $notModified.Release.Notes -eq 'what changed in 9.9.9' -and $notModified.Route -eq 'api-304'
+    } "$($notModified.State) via $($notModified.Route)"
+    Test-That 'and the validator survives for the next check' {
+        (Get-Content -LiteralPath $cachePath -Raw | ConvertFrom-Json).ETag -eq '"etag-9-9-9"'
+    }
+
+    # A 304 carries no body, so asking "has it changed?" while holding nothing would
+    # buy a success that cannot be answered.
+    $script:SentConditional = 'not asked'
+    [pscustomobject]@{
+        CheckedAt = [DateTimeOffset]::Now.AddHours(-2).ToString('o')
+        Reached   = $false
+        State     = 'Unavailable'
+        ETag      = '"etag-from-a-body-no-longer-held"'
+        Release   = $null
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
+    $null = Get-BridgeLatestRelease
+    Test-That 'with no release held, nothing is claimed to be held' {
+        $script:SentConditional -eq ''
+    } "[$($script:SentConditional)]"
+
+    Write-Host '--- what the cache can be asked without making a request ---'
+    & $staleButReached $richCachedRelease
+    # Both transports throw here, so a lookup that reached for either would fail this
+    # outright rather than quietly passing. That is the property under test: reading
+    # the established tag through Get-BridgeLatestRelease with a very wide interval
+    # almost works, and falls straight through to the network when the cache is
+    # missing or unreadable - which is the one thing the caller wanted to avoid.
+    Test-That 'the established tag is readable without any network call at all' {
+        (Get-BridgeKnownReleaseTag) -eq 'v9.9.9'
+    } (Get-BridgeKnownReleaseTag)
+    [pscustomobject]@{
+        CheckedAt = [DateTimeOffset]::Now.ToString('o')
+        Reached   = $false
+        Release   = $richCachedRelease
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $cachePath -Encoding UTF8
+    Test-That 'a release retained beside a check that never reached GitHub establishes nothing' {
+        (Get-BridgeKnownReleaseTag) -eq ''
+    } "[$(Get-BridgeKnownReleaseTag)]"
+    Remove-Item -LiteralPath $cachePath -Force -ErrorAction SilentlyContinue
+    Test-That 'and neither does no cache at all' { (Get-BridgeKnownReleaseTag) -eq '' }
+
+    Test-That 'checks are configured half-hourly, which only the free route affords' {
+        $example = Get-Content -LiteralPath (Join-Path $PSScriptRoot '..\config.example.json') -Raw | ConvertFrom-Json
+        $example.updates.checkHours -eq 0.5
+    }
+
+    function Invoke-RestMethod { throw 'network disabled in test' }
+    function Invoke-WebRequest { throw 'network disabled in test' }
 
     # A refused request is not a broken install. 403 alone is ambiguous - a private
     # repository answers the same way - so the rate-limit headers are what decide,

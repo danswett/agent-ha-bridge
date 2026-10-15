@@ -37,6 +37,12 @@ $script:Notified = @()
 $script:Lookup = 'current'
 # What the install button reports. Unpressed unless a case says otherwise.
 $script:ButtonState = 'unavailable'
+# And the check button, which is a separate control with a press of its own: one
+# acts on what the last check found, the other goes and looks.
+$script:CheckButtonState = 'unavailable'
+# How many times the routine check actually went out, so a forced lookup can be told
+# from one answered out of the cache.
+$script:RedirectCalls = 0
 function Invoke-RestMethod {
     param($Uri, $Method, $Headers, $Body, $ContentType, $TimeoutSec, $WebSession)
     if ($Uri -like 'https://api.github.com/repos/*/releases/latest') {
@@ -51,7 +57,10 @@ function Invoke-RestMethod {
             html_url = "https://example.test/releases/$tag"; zipball_url = "https://example.test/archive/$tag.zip"
         }
     }
-    if ($Uri -like 'http://127.0.0.1:1/api/states/button.*') { return [pscustomobject]@{ state = $script:ButtonState } }
+    if ($Uri -like 'http://127.0.0.1:1/api/states/button.*') {
+        $state = if ($Uri -like '*_check_updates') { $script:CheckButtonState } else { $script:ButtonState }
+        return [pscustomobject]@{ state = $state }
+    }
     $data = if ($Body -is [byte[]]) { [Text.Encoding]::UTF8.GetString($Body) | ConvertFrom-Json } else { $Body | ConvertFrom-Json }
     if ($Uri -eq 'http://127.0.0.1:1/api/services/mqtt/publish') {
         $script:MqttMsgs += [pscustomobject]@{ Topic = $data.topic; Payload = $data.payload }
@@ -62,6 +71,31 @@ function Invoke-RestMethod {
         return @()
     }
     throw "Unexpected REST fixture endpoint: $Uri"
+}
+# The routine check asks the releases/latest redirect before it asks the API, so this
+# transport is part of the fixture now rather than something the suite can leave
+# unstubbed. A REST stub deliberately does not stand in for it - the boundary guard
+# refuses an unmocked transport rather than letting it reach the network - and the
+# two answers are kept consistent with each other, because a redirect that disagreed
+# with the API would be testing a situation that cannot arise.
+function Invoke-WebRequest {
+    param($Uri, $Headers, $TimeoutSec, $MaximumRedirection)
+    if ($Uri -notlike 'https://github.com/*/releases/latest') { throw "Unexpected WebRequest fixture endpoint: $Uri" }
+    $script:RedirectCalls++
+    # An outage is an outage on both routes; otherwise the redirect would answer and
+    # the lookup would never be unavailable at all.
+    if ($script:Lookup -eq 'unavailable') { throw [IO.IOException]::new('synthetic lookup outage') }
+    # A repository with no published release redirects to the releases index, which
+    # names no tag - so the API's 404 stays the authoritative answer.
+    $location = if ($script:Lookup -eq 'not-found') {
+        'https://github.com/danswett/agent-ha-bridge/releases'
+    } else {
+        $tag = if ($script:Lookup -eq 'available') { 'v1.2.0' } else { 'v1.1.0' }
+        "https://github.com/danswett/agent-ha-bridge/releases/tag/$tag"
+    }
+    $response = [Net.Http.HttpResponseMessage]::new([Net.HttpStatusCode]::Found)
+    $response.Headers.Location = [Uri]$location
+    throw [Microsoft.PowerShell.Commands.HttpResponseException]::new('redirect', $response)
 }
 function Invoke-CopilotHaWebSocket {
     param($Commands)
@@ -534,6 +568,125 @@ try { Sync-DaemonUpdateStatus -Headers $headers }
 catch { $blocked = [bool]$_.Exception.Data['BridgeTestWriteBlocked'] }
 finally { $script:DaemonConfig.UpdateOutcomeFile = $outcomeFile }
 Assert-UpdateOutcome 'real write guard refusal is not swallowed by the daemon consumer' $blocked
+
+Write-Host '--- the Check button goes and looks, instead of waiting out the interval ---'
+Reset-UpdateCapture
+$script:Lookup = 'current'
+$script:ButtonState = 'unavailable'
+$script:DaemonUpdateVerdict = $null
+$script:DaemonUpdateSignature = ''
+$script:DaemonUpdateCheckLastPress = ''
+$script:DaemonPeerLatestChecked = ''
+# A cache so fresh that an ordinary pass answers from it without asking anything.
+# That is the whole point of the control: the answer is already settled, and the
+# press is how somebody says "settle it again, now".
+function Write-FreshCache {
+    param([string]$Tag = 'v1.1.0')
+    [pscustomobject]@{
+        CheckedAt = [DateTimeOffset]::Now.ToString('o')
+        Reached   = $true
+        State     = 'Found'
+        Route     = 'redirect'
+        Release   = [pscustomobject]@{
+            Tag = $Tag; Name = $Tag; Notes = ''; Published = ''
+            Url = "https://example.test/releases/$Tag"; Zip = "https://example.test/archive/$Tag.zip"
+        }
+    } | ConvertTo-Json -Depth 6 | Set-Content -LiteralPath $script:BridgeUpdateConfig.CacheFile -Encoding UTF8
+}
+
+Write-FreshCache
+$script:RedirectCalls = 0
+Sync-DaemonUpdateStatus -Headers $headers
+Assert-UpdateOutcome 'an ordinary pass with a fresh answer asks GitHub nothing at all' ($script:RedirectCalls -eq 0)
+
+Write-FreshCache
+$script:RedirectCalls = 0
+$script:CheckButtonState = [DateTimeOffset]::Now.AddMinutes(1).ToString('o')
+Sync-DaemonUpdateStatus -Headers $headers
+Assert-UpdateOutcome 'a press makes it look anyway' ($script:RedirectCalls -ge 1)
+# The press that answers for itself: nothing changed, so nothing about the entity
+# changes either, and an identical retained payload is not something Home Assistant
+# shows. Without a verdict the control would be indistinguishable from one wired to
+# nothing - which is exactly what sends people to the Install button to find out.
+Assert-UpdateOutcome 'and says so, rather than leaving the press looking like it did nothing' (
+    $script:DaemonUpdateVerdict -and $script:DaemonUpdateVerdict.Stage -ceq 'current' -and
+    $script:DaemonUpdateVerdict.Detail -match 'Checked just now')
+
+# A press is honoured once. The daemon reconciles every fifteen seconds and the
+# button keeps reporting the same timestamp until the next press, so re-honouring it
+# would turn one tap into a permanent four-a-minute poll.
+Write-FreshCache
+$script:RedirectCalls = 0
+Sync-DaemonUpdateStatus -Headers $headers
+Assert-UpdateOutcome 'the same press is not honoured again on the next pass' ($script:RedirectCalls -eq 0)
+$script:CheckButtonState = 'unavailable'
+$script:DaemonUpdateVerdict = $null
+
+Write-Host '--- another machine finding a release is a reason to look, not an answer ---'
+Reset-UpdateCapture
+$script:DaemonUpdateSignature = ''
+$peerUpdateEntity = Get-BridgeMachineEntityId -Domain 'update' -Key 'update' -Slug 'some_other_machine'
+function Set-PeerReport {
+    param([AllowNull()][string]$Version)
+    $script:DaemonReconcileStates = @{
+        # This machine's own entity is in the snapshot too, and must never be mistaken
+        # for news from somewhere else.
+        $script:DaemonEntity.Update = [pscustomobject]@{
+            entity_id = $script:DaemonEntity.Update
+            state = 'off'; attributes = [pscustomobject]@{ latest_version = '1.1.0' }
+        }
+    }
+    if ($null -ne $Version) {
+        $script:DaemonReconcileStates[$peerUpdateEntity] = [pscustomobject]@{
+            entity_id = $peerUpdateEntity
+            state = 'on'; attributes = [pscustomobject]@{ latest_version = $Version }
+        }
+    }
+}
+
+try {
+    Set-PeerReport -Version '1.2.0'
+    Assert-UpdateOutcome 'a peer ahead of this machine is read off the snapshot it already took' (
+        (Get-DaemonPeerLatestVersion) -eq '1.2.0')
+
+    $script:DaemonPeerLatestChecked = ''
+    Write-FreshCache
+    $script:RedirectCalls = 0
+    Sync-DaemonUpdateStatus -Headers $headers
+    Assert-UpdateOutcome 'and is enough to make this machine look for itself' ($script:RedirectCalls -ge 1)
+
+    # Looking is cheap, not free, and a peer that is permanently ahead - or simply
+    # wrong - would otherwise be a standing instruction to check every fifteen seconds.
+    Write-FreshCache
+    $script:RedirectCalls = 0
+    Sync-DaemonUpdateStatus -Headers $headers
+    Assert-UpdateOutcome 'but only once, not on every pass for as long as it says so' ($script:RedirectCalls -eq 0)
+
+    # Nothing is adopted from a peer. What this machine publishes is what this machine
+    # established, which is why a peer claiming 9.9.9 cannot put 9.9.9 on this card.
+    $script:DaemonPeerLatestChecked = ''
+    Set-PeerReport -Version '9.9.9'
+    Write-FreshCache
+    Sync-DaemonUpdateStatus -Headers $headers
+    $peerWire = Get-StatePayload | ConvertFrom-Json -AsHashtable
+    Assert-UpdateOutcome 'a version only a peer has seen is not published as this machine''s own finding' (
+        $peerWire.latest_version -eq '1.1.0')
+
+    $script:DaemonPeerLatestChecked = ''
+    Set-PeerReport -Version '1.0.0'
+    Write-FreshCache
+    $script:RedirectCalls = 0
+    Sync-DaemonUpdateStatus -Headers $headers
+    Assert-UpdateOutcome 'a peer behind this machine is no reason to go and look' ($script:RedirectCalls -eq 0)
+
+    Set-PeerReport -Version $null
+    Assert-UpdateOutcome 'and this machine''s own entity is never read as news from elsewhere' (
+        (Get-DaemonPeerLatestVersion) -eq '')
+}
+finally {
+    $script:DaemonReconcileStates = $null
+    $script:DaemonPeerLatestChecked = ''
+}
 
 Reset-UpdateCapture
 Write-Host 'All update outcome checks passed'

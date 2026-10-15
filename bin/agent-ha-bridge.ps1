@@ -305,6 +305,13 @@ function Show-Status {
                 else { 'unauthenticated, 60 requests an hour shared with everything behind this address' }
             if ($check.Answered) {
                 Write-Host "    updates    : checked $($check.When), $($check.Verdict)$(if ($allowance) { " ($allowance)" })" -ForegroundColor Green
+                # How the answer was obtained, on its own line because it is the thing
+                # that makes a half-hourly cadence affordable. A machine answering
+                # every check through the API is still working, and is also one busy
+                # hour on its egress address away from the refusals #92 and #109 were.
+                if ($check.RouteNote) {
+                    Write-Host "                 $($check.RouteNote)" -ForegroundColor DarkGray
+                }
             }
             else {
                 Write-Host "    updates    : checked $($check.When), $($check.Verdict)" -ForegroundColor Yellow

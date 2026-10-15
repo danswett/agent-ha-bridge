@@ -1867,8 +1867,8 @@ Test-That 'and a blank entry never matches a blank user' { -not (Test-BridgeAgen
 # Test-BridgeServedCardContent is fingerprinted for the same reason: Test-BridgeActivityCardServed
 # now asks it whether the served bytes are this build at all, so what it decides is
 # part of what the renderer emits even though its own text sits in another function.
-$script:ExpectedRenderVersion = '1.10.0'
-$script:ExpectedRenderHash = '02510878cd04c3cf7831a663d1e7697218de5d945d5a467fb1b7a2d28bc13e2a'
+$script:ExpectedRenderVersion = '1.11.0'
+$script:ExpectedRenderHash = 'ed1a66c59bc1f104831a0368b198273e81aa3bb57fb7133f1b13843e10b4df25'
 $artifact = Get-BridgeRenderArtifact
 
 Test-That 'the renderer is still the one this version was pinned to' {

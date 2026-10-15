@@ -128,6 +128,21 @@ process.stdin.on('end', async () => {
     }
   }
 
+  // The header control: one press, every machine asked. Done after the per-row
+  // actions so it is the only thing in `calls` when it is the only thing asked for.
+  let checkControl = null;
+  if (job.checkAll) {
+    if (!card._els.check || card._els.check.hidden) { missing.push('check'); }
+    else {
+      const inFlight = card._checkAll();
+      // What the control looks like while the presses are still going out, which is
+      // the window a second click would land in.
+      checkControl = { duringDisabled: !!card._els.checkButton.disabled };
+      await inFlight;
+      checkControl.afterDisabled = !!card._els.checkButton.disabled;
+    }
+  }
+
   const rows = card._rows.map((entry) => ({
     machine: entry.machine.machine,
     meta: entry.meta.textContent,
@@ -160,6 +175,11 @@ process.stdin.on('end', async () => {
     waiting: card._els.summary.classList.contains('waiting'),
     hidden: !!card._els.machines.hidden,
     size: card.getCardSize(),
+    check: {
+      hidden: !!card._els.check.hidden,
+      entities: (card._checkEntities || []).slice(),
+      control: checkControl,
+    },
     rows,
     calls,
     missing,
