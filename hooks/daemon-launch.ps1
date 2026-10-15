@@ -563,17 +563,17 @@ function Get-DaemonResumableSessions {
     $age = ([DateTimeOffset]::Now - $script:DaemonResumeCacheAt).TotalSeconds
     if ($Force.IsPresent -or $age -ge $script:DaemonConfig.ResumeCacheSeconds) {
         try {
-            # The approved-workspace test goes into the fetch, so the newest $display
-            # *offerable* sessions are kept rather than whatever survives the newest
-            # $display overall - see the $Include note in Get-BridgeResumableSessions.
-            # The margin covers the live sessions removed below: those change between
-            # reconciles, so they cannot be part of a cache that is reused across them,
-            # and without it a machine running several sessions showed a short list.
-            $display = Get-DaemonResumeDisplayCount
-            $fetched = @(Get-BridgeResumableSessions -Limit ($display + 25) -Include {
-                $_.PSObject.Properties['Folder'] -and
-                (Test-BridgeWorkspacePathApproved -Path ([string]$_.Folder))
-            })
+            # Every eligible session is cached, not a margin above the display count.
+            # The live set changes between reconciles, so it cannot be part of a cache
+            # reused across them - and a fixed margin only postponed the problem: with
+            # more live sessions than the margin, the cut still ran out of candidates
+            # and the dropdown came up short. Eligibility is what bounds this instead,
+            # and the display cut happens below, after the live filter.
+            $fetched = @(Get-BridgeResumableSessions -Limit $script:BridgeResumeCacheLimit `
+                -ScanLimit $script:BridgeResumeScanLimit -Include {
+                    $_.PSObject.Properties['Folder'] -and
+                    (Test-BridgeWorkspacePathApproved -Path ([string]$_.Folder))
+                })
 
             # An empty result is treated as a failed fetch, not as truth, whenever a
             # previous fetch found something. Launching a session spawns Agency, and a

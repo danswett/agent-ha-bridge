@@ -2262,9 +2262,10 @@ finally {
 # From here the file readers are shadowed, so this machine's own sessions never
 # leak into the assertions below.
 $script:FileEntries = @{ claude = @(); copilot = @(); codex = @() }
-function Get-BridgeClaudeSessionEntries { param([int]$Limit) @($script:FileEntries.claude) }
-function Get-BridgeCopilotSessionEntries { param([int]$Limit) @($script:FileEntries.copilot) }
-function Get-BridgeCodexSessionEntries { param([int]$Limit) @($script:FileEntries.codex) }
+$script:ReaderLimits = @{}
+function Get-BridgeClaudeSessionEntries { param([int]$Limit) $script:ReaderLimits['claude'] = $Limit; @($script:FileEntries.claude) }
+function Get-BridgeCopilotSessionEntries { param([int]$Limit) $script:ReaderLimits['copilot'] = $Limit; @($script:FileEntries.copilot) }
+function Get-BridgeCodexSessionEntries { param([int]$Limit) $script:ReaderLimits['codex'] = $Limit; @($script:FileEntries.codex) }
 function New-FileEntry {
     param([string]$Id, [string]$Launcher, [string]$Summary, [string]$Folder, [string]$Updated)
     [pscustomobject]@{ SessionId = $Id; Launcher = $Launcher; Summary = $Summary; Folder = $Folder; Updated = [DateTimeOffset]::Parse($Updated) }
@@ -2367,6 +2368,21 @@ Test-That 'an agent that is not installed contributes nothing' { @(Get-BridgeRes
 
 $script:CopilotPresent = $false; $script:ClaudePresent = $true
 Test-That 'with one agent the labels stay plain' { (@(Get-BridgeResumableSessions)[0]).Label -eq 'Claude work - alpha' }
+
+# Each agent's reader truncates by whatever limit it is handed - Claude and Codex scan
+# the newest Limit * 3 transcripts - so the scan budget, not the display count, has to
+# reach them. Deriving it from the display count starved the eligibility filter: with a
+# small count, enough newer sessions in unapproved folders hid every older approved one
+# and the dropdown stayed short for the very reason the filter was moved earlier.
+$script:ReaderLimits = @{}
+$null = Get-BridgeResumableSessions -Limit 3 -ScanLimit 120
+Test-That 'a reader is given the scan budget, not the display count' { $script:ReaderLimits['claude'] -eq 120 }
+$script:ReaderLimits = @{}
+$null = Get-BridgeResumableSessions -Limit 7
+Test-That 'and the display count when no scan budget is asked for' { $script:ReaderLimits['claude'] -eq 7 }
+$script:ReaderLimits = @{}
+$null = Get-BridgeResumableSessions -Limit 9 -ScanLimit 4
+Test-That 'a scan budget below the display count never shrinks the scan' { $script:ReaderLimits['claude'] -eq 9 }
 
 # With Agency installed it speaks for Copilot; a session it also knows is listed once,
 # under the agent whose files hold it.
@@ -2817,6 +2833,31 @@ $null = Get-DaemonResumableSessions -LiveSessionIds @()
 $withLive = @(Get-DaemonResumableSessions -LiveSessionIds @('f0000000-0000-0000-0000-000000000006'))
 Test-That 'a live session is replaced rather than leaving a gap' {
     $withLive.Count -eq 2 -and $withLive.SessionId -notcontains 'f0000000-0000-0000-0000-000000000006'
+}
+
+# ...and a fixed margin above the display count was not enough, because the number of
+# live sessions is not bounded by it. The cache therefore holds every eligible session
+# and the cut happens after the live filter, so the list refills from older entries
+# however many of the newest are running.
+Reset-ResumeCache
+$script:FakeSettings['newSession.resumeCount'] = 2
+# Strictly increasing dates, so "the newest thirty" is exactly sessions 11-40 and the
+# assertion does not depend on how a cycling date happened to sort.
+$crowdBase = [datetime]::SpecifyKind([datetime]::Parse('2026-06-01T10:00:00'), 'Utc')
+$crowd = foreach ($n in 1..40) {
+    @{ session_id = ('aa000000-0000-0000-0000-{0:000000000000}' -f $n); summary = "Approved $n"
+       folder = $alpha; can_resume = $true
+       updated_at = $crowdBase.AddDays($n).ToString('yyyy-MM-ddTHH:mm:ssZ') }
+}
+Set-AgencySessions -Sessions @($crowd)
+$manyLive = @(11..40 | ForEach-Object { 'aa000000-0000-0000-0000-{0:000000000000}' -f $_ })
+$stillFull = @(Get-DaemonResumableSessions -LiveSessionIds $manyLive)
+Test-That 'far more live sessions than any fixed margin still leaves a full list' {
+    $stillFull.Count -eq 2
+}
+Test-That 'and it falls back to the newest sessions that are not running' {
+    $stillFull[0].SessionId -eq 'aa000000-0000-0000-0000-000000000010' -and
+    $stillFull[1].SessionId -eq 'aa000000-0000-0000-0000-000000000009'
 }
 $script:FakeSettings.Remove('newSession.resumeCount')
 
