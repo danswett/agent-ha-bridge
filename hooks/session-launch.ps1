@@ -3736,6 +3736,18 @@ function Get-BridgeCodexSessionEntries {
     @($entries)
 }
 
+# Bounds for the daemon's resume cache, kept apart from newSession.resumeCount because
+# that setting is a display count. Deriving either of these from it starved the
+# eligibility filter: the readers truncate by what they are given, so a small display
+# count meant older approved sessions were never scanned at all.
+#
+# The cache holds every eligible session rather than a margin above what is shown, so
+# removing the live ones cannot run the list short. The scan bound stays, because a
+# Claude or Codex session records its folder inside the transcript and judging
+# eligibility means opening each file.
+$script:BridgeResumeCacheLimit = 200
+$script:BridgeResumeScanLimit = 200
+
 function Get-BridgeResumableSessions {
     <#
         Recent sessions that can be resumed, newest first, from every installed agent:
@@ -3756,11 +3768,36 @@ function Get-BridgeResumableSessions {
 
         # Session ids to leave out - the live ones.
         [AllowEmptyCollection()]
-        [string[]]$Exclude = @()
+        [string[]]$Exclude = @(),
+
+        # Applied before the list is cut to $Limit, which is the only place it can go.
+        # The daemon offers a session only when its folder is an approved workspace,
+        # and testing that *after* the cut meant the dropdown showed whatever survived
+        # of the newest $Limit rather than $Limit sessions it could actually offer. On
+        # a machine with 402 resumable sessions, 47 of them in approved workspaces,
+        # the newest 12 were fetched and 6 survived - so most of the offerable list was
+        # unreachable however long it got, because recent work in unapproved folders
+        # filled the window and was then discarded.
+        [scriptblock]$Include = $null,
+
+        # How many candidates each agent's reader may scan, when that is more than
+        # $Limit. The readers truncate by what they are given - Claude and Codex scan
+        # the newest $Limit * 3 transcripts - so deriving their budget from the display
+        # count starved the $Include filter below: with a display count of 12, enough
+        # newer sessions in unapproved folders hid every older approved one, and the
+        # dropdown stayed short for exactly the reason this change set out to fix.
+        #
+        # It is still a bound, deliberately. A Claude or Codex session records its
+        # folder *inside* the transcript, so eligibility cannot be judged without
+        # opening each file, and an unbounded scan would read every session on the
+        # machine on every cache refresh. Agency is unaffected either way: it reports
+        # its whole list and ignores this.
+        [int]$ScanLimit = 0
     )
 
     if ($Limit -le 0) { $Limit = [int](Get-BridgeSetting 'newSession.resumeCount' 12) }
     if ($Limit -le 0) { return @() }
+    $scan = if ($ScanLimit -gt $Limit) { $ScanLimit } else { $Limit }
 
     $installed = @(Get-BridgeAvailableLaunchers)
     $candidates = @()
@@ -3770,7 +3807,7 @@ function Get-BridgeResumableSessions {
         if ($installed -notcontains $launcher) { continue }
         $read = (Get-BridgeLauncher -Launcher $launcher).Resumable
         if (-not $read) { continue }
-        $found[$launcher] = @(& $read $Limit $found)
+        $found[$launcher] = @(& $read $scan $found)
         $candidates += $found[$launcher]
     }
 
@@ -3784,7 +3821,8 @@ function Get-BridgeResumableSessions {
         $entry
     }
 
-    $recent = @(@($unique) | Sort-Object Updated -Descending | Select-Object -First $Limit)
+    $eligible = if ($null -ne $Include) { @(@($unique) | Where-Object $Include) } else { @($unique) }
+    $recent = @(@($eligible) | Sort-Object Updated -Descending | Select-Object -First $Limit)
 
     # The agent is named in each label once the list holds more than one kind, so a
     # Claude and a Copilot session on the same task can be told apart.

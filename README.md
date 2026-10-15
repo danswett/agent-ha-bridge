@@ -414,7 +414,7 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `newSession.worktreeIdleHours` | How old a finished worktree must be before it is removed (default `12`) |
 | `newSession.discoverWorkspaces` | Controls the explicitly invoked `Get-BridgeDiscoveredWorkspaces` helper (default `true`), not the launch card. Use the [read-only suggestion command](docs/installation-isolation.md#listing-workspace-suggestions), then explicitly configure any chosen folder. System folders such as `C:\Windows\System32` are excluded |
 | `newSession.discoverCount` | Maximum suggestions returned by that helper (default `8`). It does not populate the launch card or limit cleanup's liveness checks |
-| `newSession.resumeCount` | How many recent sessions the Resume dropdown offers (default `12`) |
+| `newSession.resumeCount` | How many recent sessions the Resume dropdown offers (default `12`). It bounds what is offered, not what is searched: the approved-workspace and live filters are applied first |
 | `newSession.model` | Model preselected on the card (default: **Agent default** — the CLI's own choice). Applies to Copilot and Agency; `newSession.model.claude` / `.codex` do the same per agent |
 | `newSession.effort.<agent>` / `.context.<agent>` | Reasoning effort and context window preselected on the card, per agent (`copilot`, `claude`, `codex`; Agency reads Copilot's) |
 | `newSession.models.<agent>` | Replace the model list the card offers, e.g. `"models": { "copilot": ["auto", "claude-opus-5"] }`. Otherwise each agent's list is asked of its CLI: the models this account can use; `efforts.<agent>` and `contexts.<agent>` do the same for the other two axes |
@@ -792,6 +792,13 @@ offered) and refreshes it on a timer rather than on every reconcile.
 Sessions that are currently live are never offered, because two CLIs writing one
 transcript would corrupt it. A resume reopens in the folder the session originally ran
 in; the Workspace row only applies to a new session.
+
+Only sessions whose folder is an approved workspace are offered, and that test — along
+with the live one — is applied *before* the list is cut to `newSession.resumeCount`. So
+the setting bounds what you can pick, not what is searched: a machine with hundreds of
+sessions still offers the newest `resumeCount` it can actually open, rather than
+whichever of the newest `resumeCount` happen to survive the filters. Recent work in a
+folder you have not approved no longer crowds the list out.
 
 ### Model, effort and context
 
