@@ -2016,14 +2016,17 @@ function Start-DaemonLaunch {
             Since          = $launchedAt
             LastCheck      = [DateTimeOffset]::MinValue
             TrustAskedAt   = $null
-            # Allow all means "launch without permission prompts", and Claude's folder
-            # trust dialog is one - the one flag that cannot waive it, because Claude only
-            # skips that dialog in non-interactive mode and a bridge window is deliberately
-            # interactive. Left needing a second press, an unattended launch simply stops
+            # Allow all means "launch without permission prompts", and Claude asks two
+            # questions the flag does not answer. The folder trust dialog is the one it
+            # cannot waive, because Claude only skips that in non-interactive mode and a
+            # bridge window is deliberately interactive. The Bypass Permissions warning
+            # is the one it *causes*, and Claude records no acceptance of it, so it comes
+            # back every launch. Left needing a press, an unattended launch simply stops
             # there with nobody at the keyboard, which is the deadlock the setting exists
             # to avoid. The folder is one of the configured workspaces and the choice was
             # made on the press, so the confirmation this stands in for has already
-            # happened; an ordinary launch still asks for its second press.
+            # happened; an ordinary launch still asks for its second press, and never
+            # meets the warning at all, since nothing passed the flag that raises it.
             TrustConfirmed = $allowAllTools
             TrustAnswers   = 0
             # Who pressed Launch, carried from the press to whichever session it produces:
@@ -2161,12 +2164,13 @@ function Update-DaemonPendingLaunch {
         Follows a session launched from the dashboard until it registers, a pass at a
         time, so the daemon never stalls waiting on it.
 
-        Claude may stop at "Do you trust this folder?" before it registers - and before
-        its SessionStart hook runs - where nobody at the dashboard can see it. Whether
-        it will ask cannot be predicted reliably from its config, so the session's
-        screen is read instead. When the question shows, the launch note asks for a
-        second press of Launch within two minutes; that press sets TrustConfirmed, and
-        the answer is sent from whatever the screen shows then (see
+        Claude may stop at one of its startup questions - "Do you trust this folder?",
+        or the Bypass Permissions warning that 'Allow all' itself provokes - before it
+        registers and before its SessionStart hook runs, where nobody at the dashboard
+        can see it. Whether it will ask cannot be predicted reliably from its config, so
+        the session's screen is read instead. When a question shows, the launch note
+        asks for a second press of Launch within two minutes; that press sets
+        TrustConfirmed, and the answer is sent from whatever the screen shows then (see
         Send-BridgeTrustAnswer). Checked at most every 700 ms.
     #>
     param([Parameter(Mandatory)][hashtable]$Headers)
@@ -2235,10 +2239,14 @@ function Update-DaemonPendingLaunch {
         $selection = Read-BridgeTrustPrompt -ProcessId $p.ProcessId
         if ($selection) {
             if ($p.TrustConfirmed) {
-                if ($p.TrustAnswers -lt 3) {
+                # Two in a row, not one: an allow-all launch answers the folder question
+                # and then meets the Bypass Permissions warning behind it. The budget is
+                # per launch rather than per question, so it has to cover both and leave
+                # each the retries one alone used to have.
+                if ($p.TrustAnswers -lt 6) {
                     $p.TrustAnswers++
                     $sent = Send-BridgeTrustAnswer -ProcessId $p.ProcessId -Selection $selection
-                    Write-DaemonLog -Message "answered $agent's trust question for $($p.Label) (highlight was '$selection'): $sent"
+                    Write-DaemonLog -Message "answered $agent's startup question for $($p.Label) (highlight was '$selection'): $sent"
                 }
             }
             elseif ($null -eq $p.TrustAskedAt) {

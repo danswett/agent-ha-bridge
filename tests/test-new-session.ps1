@@ -362,6 +362,20 @@ Test-That 'a moved highlight reads Yes' { (Get-BridgeTrustPromptSelection -Scree
 Test-That 'no question on screen reads as nothing' { (Get-BridgeTrustPromptSelection -Screen "Welcome to Claude Code`n> ") -eq '' }
 Test-That 'an unreadable screen reads as nothing' { (Get-BridgeTrustPromptSelection -Screen $null) -eq '' }
 
+# The second question, which only 'Allow all' can produce: Claude shows it *because*
+# --dangerously-skip-permissions was passed, and 2.1.285 records no acceptance of it
+# anywhere, so it comes back every launch. Same two options, same refusing label - and
+# reading only the first left an unattended launch sitting here (2026-10-15).
+$bypassNo = "WARNING: Claude Code running in Bypass Permissions mode`n`n > No, exit`n   Yes, I accept`n"
+$bypassYes = "WARNING: Claude Code running in Bypass Permissions mode`n   No, exit`n > Yes, I accept`n"
+Test-That 'the bypass-permissions warning is read as a question too' { (Get-BridgeTrustPromptSelection -Screen $bypassNo) -eq 'no' }
+Test-That 'and reads Yes once its accepting option is highlighted' { (Get-BridgeTrustPromptSelection -Screen $bypassYes) -eq 'yes' }
+# "No, exit" is shared, so it alone must never be enough to start sending keys into a
+# window: it is the accepting label that says which question is on screen.
+Test-That 'a highlighted No with no question behind it reads as nothing' {
+    (Get-BridgeTrustPromptSelection -Screen "Choose one`n > No, exit`n   Something else`n") -eq ''
+}
+
 Write-Host ''
 Write-Host '--- the profiles this machine actually has ---'
 

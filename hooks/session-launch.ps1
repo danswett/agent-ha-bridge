@@ -4714,29 +4714,56 @@ namespace CopilotCli {
 '@
 }
 
+# The questions Claude can stop on at startup, before it registers, labelled exactly
+# as its own code does. Both render the same way - two options, the refusing one first
+# and focused - so the keys that answer either are the same.
+#
+# The second one is caused by 'Allow all' rather than waived by it:
+# --dangerously-skip-permissions is what makes Claude show it. Reading only the first
+# left an unattended allow-all launch sitting on it for ever - the folder question was
+# answered at 01:52, this one never was, and the dashboard only said the session had
+# not registered (2026-10-15, Claude 2.1.285).
+$script:BridgeClaudeStartupPrompts = @(
+    @{ Confirm = 'Yes, I trust this folder'; Cancel = 'No, exit' }  # trust this folder?
+    @{ Confirm = 'Yes, I accept'; Cancel = 'No, exit' }             # Bypass Permissions mode
+)
+
 function Get-BridgeTrustPromptSelection {
     <#
-        Reads Claude's "Do you trust this folder?" question off a console screen.
-        Returns 'yes' or 'no' for the highlighted option, or '' when the question is not
-        on screen. Pure, so it can be tested against captured screens.
+        Reads whichever of Claude's startup questions is on a console screen - "Do you
+        trust this folder?" or the Bypass Permissions warning. Returns 'yes' or 'no' for
+        the highlighted option, or '' when neither is showing. Pure, so it can be tested
+        against captured screens.
+
+        'yes' and 'no' name the option, not the question: Send-BridgeTrustAnswer needs
+        only to know whether the accepting option is already highlighted, which is the
+        same for both.
     #>
     param([AllowEmptyString()][AllowNull()][string]$Screen)
 
-    if ([string]::IsNullOrWhiteSpace($Screen) -or $Screen -notmatch 'Yes, I trust this folder') { return '' }
+    if ([string]::IsNullOrWhiteSpace($Screen)) { return '' }
+    # The accepting label is what identifies the question; the refusing one is shared,
+    # so a screen is only answered when something confirms which question it is.
+    $asking = $script:BridgeClaudeStartupPrompts |
+        Where-Object { $Screen -match [regex]::Escape($_.Confirm) } | Select-Object -First 1
+    if ($null -eq $asking) { return '' }
+
     foreach ($line in ($Screen -split "`n")) {
-        if ($line -match '^\s*[>❯›]\s*Yes, I trust this folder') { return 'yes' }
-        if ($line -match '^\s*[>❯›]\s*No, exit') { return 'no' }
+        if ($line -match ('^\s*[>❯›]\s*' + [regex]::Escape($asking.Confirm))) { return 'yes' }
+        if ($line -match ('^\s*[>❯›]\s*' + [regex]::Escape($asking.Cancel))) { return 'no' }
     }
     ''
 }
 
 function Read-BridgeTrustPrompt {
     <#
-        Looks at a Claude session's screen for its "Do you trust this folder?" question.
-        Returns 'yes' or 'no' for the highlighted option, or '' when the question is not
-        showing. Whether Claude will ask cannot be predicted reliably from its config -
-        it has honoured entries its own code path would not suggest - so the bridge
-        reads what is actually on screen.
+        Looks at a Claude session's screen for whichever startup question it is holding
+        on - "Do you trust this folder?" or the Bypass Permissions warning. Returns
+        'yes' or 'no' for the highlighted option, or '' when neither is showing. Whether
+        Claude will ask cannot be predicted reliably from its config - it has honoured
+        entries its own code path would not suggest, and 2.1.285 records no acceptance
+        of the Bypass Permissions warning anywhere, so it asks again every launch - so
+        the bridge reads what is actually on screen.
     #>
     param([Parameter(Mandatory)][int]$ProcessId)
 
@@ -4748,8 +4775,9 @@ function Read-BridgeTrustPrompt {
 
 function Send-BridgeTrustAnswer {
     <#
-        Answers Claude's trust question with "Yes, I trust this folder", given which
-        option is highlighted now. Only called after the user explicitly confirmed.
+        Accepts whichever startup question is on screen - "Yes, I trust this folder" or
+        "Yes, I accept" - given which option is highlighted now. Only called after the
+        user explicitly confirmed.
 
         Never blind: the option list wraps, so one Down too many lands back on
         "No, exit" and closes the session (verified). From "No" it is Down then Enter;
