@@ -88,6 +88,21 @@ if ($status.PSObject.Properties['TokenNote'] -and $status.TokenNote) {
     Write-Host '                 replace it with: agent-ha-bridge configure' -ForegroundColor Yellow
 }
 
+# Asked here as well as by the updater, and before any answer from the lookup, because
+# every one of those returns before the updater is reached. An update that is
+# restarting or verifying has already recorded the release it installed, so the lookup
+# reads Current while the installation is still being changed, and "no newer release
+# found" would vouch for it; a lookup that fails meanwhile would be reported instead of
+# the update in the way (#196, raised by Codex on #230). -Check installs nothing, so it
+# is not turned away. Installed helpers older than the lock have nothing to ask.
+if (-not $Check -and (Get-Command -Name Get-BridgeUpdateRunning -CommandType Function -ErrorAction SilentlyContinue)) {
+    $running = Get-BridgeUpdateRunning -Context $updateContext
+    if ($running.State -eq 'Running') {
+        Write-Host "    $($running.Detail)"
+        Write-Host '    Nothing was installed; run this again once that update has finished.' -ForegroundColor Yellow
+        exit 1
+    }
+}
 if (-not $status.PSObject.Properties['State']) {
     Write-Host '    this older update helper cannot establish lookup status; nothing will be installed' -ForegroundColor Red
     exit 1
@@ -99,19 +114,6 @@ if ($status.State -in @('Unavailable', 'NotFound')) {
 if ($Check) {
     Write-Host "    $($status.State); check only, nothing installed."
     return
-}
-# Asked here as well as by the updater, because the answer below returns before the
-# updater is reached: an update that is restarting or verifying has already recorded
-# the release it installed, so the lookup reads Current while the installation is
-# still being changed, and "no newer release found" would vouch for it (#196, raised
-# by Codex on #230). Installed helpers older than the lock have nothing to ask.
-if (Get-Command -Name Get-BridgeUpdateRunning -CommandType Function -ErrorAction SilentlyContinue) {
-    $running = Get-BridgeUpdateRunning -Context $updateContext
-    if ($running.State -eq 'Running') {
-        Write-Host "    $($running.Detail)"
-        Write-Host '    Nothing was installed; run this again once that update has finished.' -ForegroundColor Yellow
-        exit 1
-    }
 }
 if ($status.State -eq 'Current' -and -not $Force) {
     Write-Host '    no newer release found; nothing installed' -ForegroundColor Green

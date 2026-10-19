@@ -55,12 +55,14 @@ foreach ($intent in @(
 # verifies, and the lookup already reads Current: the terminal answered "no newer
 # release found" and exited 0 about an installation still being changed. Raised by
 # Codex on #230. A newer release is not asked about either, so nobody is asked to
-# confirm an install that would only be refused.
+# confirm an install that would only be refused - and a lookup failing meanwhile is
+# not what gets reported.
 foreach ($intent in @(
-    @{ Case = 'cli-busy-current'; Target = '1.1.0' },
-    @{ Case = 'cli-busy-available'; Target = '1.2.0' }
+    @{ Case = 'cli-busy-current'; Target = '1.1.0'; Lookup = 'found' },
+    @{ Case = 'cli-busy-available'; Target = '1.2.0'; Lookup = 'found' },
+    @{ Case = 'cli-busy-unavailable'; Target = '1.2.0'; Lookup = 'unavailable' }
 )) {
-    New-UpdateFixture -Case $intent.Case -Target $intent.Target
+    New-UpdateFixture -Case $intent.Case -Target $intent.Target -Lookup $intent.Lookup
     $busyContext = Resolve-BridgeInstallContext -TargetHome $env:HOME -BridgeHome $fixtureState.Fixture.InstallRoot
     $heldByAnother = Enter-BridgeFileLock -Path (Get-BridgeUpdateLockPath -Context $busyContext) -Create
     try {
@@ -75,6 +77,7 @@ foreach ($intent in @(
         -not $child.TimedOut -and $child.ExitCode -eq 1 -and
         $child.Output -match 'another update is already running on this installation' -and
         $child.Output -match 'Nothing was installed' -and $child.Output -notmatch 'no newer release found' -and
+        $child.Output -notmatch 'synthetic lookup outage' -and
         $observation.launches -eq 0 -and -not (Test-Path -LiteralPath (Join-Path $fixtureState.FixtureRoot 'cli-prompts.txt')))
 }
 

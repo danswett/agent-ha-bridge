@@ -545,7 +545,8 @@ function Invoke-DaemonUpdateRefusal {
         and only while that update is still running - the notice promises its result
         will follow. Once it has finished it has reported, and a notice saying it is
         still running must not replace that. -ResultAnnounced covers the moment between
-        the holder writing its result and letting go of the lock.
+        the holder writing its result and letting go of the lock. One that stopped
+        without a result - its lock free, its record part-way - is said to have done so.
     #>
     param([Parameter(Mandatory)][hashtable]$Headers, [switch]$ResultAnnounced)
 
@@ -570,8 +571,41 @@ function Invoke-DaemonUpdateRefusal {
         $script:DaemonUpdateSignature = ''
         if (([DateTimeOffset]::Now - $refusal.At).TotalHours -gt 6) { return $true }
         $running = if ($ResultAnnounced) { $null } else { Get-BridgeUpdateRunning }
-        if ($null -ne $running -and $running.State -eq 'Running') { Send-DaemonUpdateBusyNotice -Detail $running.Detail -Headers $Headers }
-        else { Write-DaemonLog -Message "a pressed update did not start, and the one in its way has since finished: $($refusal.Error)" }
+        if ($null -ne $running -and $running.State -eq 'Running') {
+            Send-DaemonUpdateBusyNotice -Detail $running.Detail -Headers $Headers
+            return $true
+        }
+        # The lock is free and no result came with it, yet the record of the update
+        # in the way stops part-way. Its lock went with its process, so it ended
+        # without saying how - and without this the press would hear nothing at all,
+        # neither the answer it was promised nor a result. Raised by Codex on #230.
+        $stranded = $null
+        if ($null -ne $running -and $running.State -eq 'Idle') {
+            try {
+                $stranded = Read-BridgeUpdateStage -Path $script:BridgeUpdateConfig.ProgressFile `
+                    -NotBefore ([DateTimeOffset]::Now.AddHours(-1))
+            }
+            catch {
+                if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+                $stranded = $null
+            }
+        }
+        if ($null -eq $stranded -or $stranded.Done) {
+            Write-DaemonLog -Message "a pressed update did not start, and the one in its way has since finished: $($refusal.Error)"
+            return $true
+        }
+        Write-DaemonLog -Message "a pressed update did not start, and the one in its way stopped at '$($stranded.Stage)' without a result"
+        try {
+            Invoke-HomeAssistantService -Domain 'persistent_notification' -Service 'create' -Data @{
+                title           = "Bridge update ended without a result on $($script:DaemonMachineName)"
+                message         = "This press did not start an update, because another was already running - and that update has since stopped at '$($stranded.Stage)' without reporting how it ended. Currently recorded version: $(Get-BridgeInstalledVersion -Refresh). Check the installation with ``agent-ha-bridge status``, then press Install again if it still needs updating."
+                notification_id = "agent_bridge_update_$($script:DaemonMachineSlug)"
+            } -Headers $Headers
+        }
+        catch {
+            if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+            Write-DaemonLog -Message "could not say the update in the way ended without a result: $($_.Exception.Message)"
+        }
         return $true
     }
     catch {

@@ -712,6 +712,19 @@ try {
     Assert-UpdateOutcome 'a refusal read after the update in its way has finished announces nothing' (
         $script:Notified.Count -eq 0 -and -not $script:DaemonUpdatePendingAttempt -and
         -not (Test-Path -LiteralPath $refusalFile))
+
+    # But one that died part-way leaves no result to report, only its lock gone and its
+    # record stopped mid-update - and the press would otherwise hear nothing at all.
+    # Raised by Codex on #230.
+    Reset-UpdateCapture
+    Set-Content -LiteralPath $progressFile -Value $runningRecord -Encoding UTF8 -NoNewline
+    Write-Refusal
+    Sync-DaemonUpdateStatus -Headers $headers
+    $ended = @($script:Notified | Where-Object { [string]$_.title -match '^Bridge update ended without a result on ' })
+    Assert-UpdateOutcome 'a refusal whose update in the way died part-way says that update ended without a result' (
+        $ended.Count -eq 1 -and [string]$ended[0].message -match "stopped at 'installing'" -and
+        [string]$ended[0].notification_id -ceq "agent_bridge_update_$($script:DaemonMachineSlug)" -and
+        @(Get-AlreadyRunningNotice).Count -eq 0 -and -not (Test-Path -LiteralPath $refusalFile))
 }
 finally {
     Set-Item Function:\Invoke-BridgeSelfUpdate -Value $realSelfUpdate
