@@ -906,6 +906,17 @@ try {
     Test-That 'and warns that a stale response is kept while the next turn starts' {
         $script:InstrText -match 'previous'
     }
+    # The prompt box advertises max: 255, which an agent took for the bridge's own
+    # limit and nearly cut a handover brief down to; the longer route was written only
+    # in a docstring no agent opens (#192).
+    Test-That 'and says a launch prompt longer than the box goes whole by another route' {
+        $script:InstrText -match '`max: 255`' -and $script:InstrText -match 'newsession/promptpayload' -and
+            $script:InstrText -match '"at"' -and $script:InstrText -match '"text"' -and
+            $script:InstrText -match 'launch_agent_session'
+    }
+    Test-That 'and that publishing it needs the administrator token the agent does not have' {
+        $script:InstrText -match '`mqtt\.publish` is administrator-only, so that publish takes `homeAssistant\.token`'
+    }
     Test-That 'and says the bridge owns the file, so nobody hand-edits it' {
         $script:InstrText -match 'uninstall' -and $script:InstrText -match 'overwritten'
     }

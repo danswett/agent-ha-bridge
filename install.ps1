@@ -1941,6 +1941,12 @@ function Get-BridgeAgentInstructions {
         cost: nothing errors, nothing is logged, and the symptom shows up somewhere the
         agent is not looking. Both were learned the hard way on 2026-09-29.
 
+        So does the launch-prompt rule. The prompt box advertises Home Assistant's
+        255-character cap as though it were the bridge's, and a handover brief was
+        nearly cut down to fit it before the route for a longer one turned up in a
+        docstring an agent has no reason to open - a truncation neither end could have
+        seen afterwards (#192).
+
         The worktree rule is different: it does not fail silently, it destroys
         uncommitted work belonging to other sessions. It lives here rather than only in
         the repository's own AGENTS.md for the reason below - the session that swept the
@@ -1993,7 +1999,7 @@ Installed and maintained by agent-ha-bridge. Removed when the bridge is uninstal
 local edits are overwritten on the next install.
 
 This machine runs a bridge that puts agent sessions on a Home Assistant dashboard. You
-can drive a session - yours, or one on another machine - through its entities. Two
+can drive a session - yours, or one on another machine - through its entities. Three
 things about that fail silently, so they are worth knowing before you try. The last
 section is about the worktrees the bridge creates, and is here because getting it
 wrong has already destroyed other sessions' work.
@@ -2019,6 +2025,21 @@ Do not ask a session to answer with a persistent notification. Home Assistant do
 expose those through `GET /api/states`, so polling for a `persistent_notification.*`
 entity finds nothing however long you wait, and that silence looks exactly like the
 session having died.
+
+## Send a long launch prompt whole, never cut down
+
+`text.agent_bridge_<machine>_new_prompt` says `max: 255`. That is Home Assistant's
+limit on a text entity, not the bridge's. A prompt of any length goes whole as a
+retained message on `copilot/cli/machine/<machine>/newsession/promptpayload`, shaped
+`{"at": "<ISO 8601 time>", "text": "<prompt>"}`, which the bridge prefers to the box
+whenever it holds anything; then press `button.agent_bridge_<machine>_new_session`.
+`<machine>` is the slug in `binary_sensor.agent_bridge_<machine>_online`. The bridge
+clears the message once used, so publish it just before the press.
+
+`mqtt.publish` is administrator-only, so that publish takes `homeAssistant.token`; the
+press is an ordinary write, made as above. The bridge MCP server's
+`launch_agent_session` tool does both. A prompt trimmed to fit the box is invisible
+from either end.
 
 ## Remove only the worktrees you made yourself
 
