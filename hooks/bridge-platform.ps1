@@ -1263,7 +1263,8 @@ function Test-BridgeAgentEmbeddedProcess {
             very bug would otherwise have excused itself.
           - A session carries its id on the command line, new or resumed alike (see
             Get-BridgeAgentProcessSessionIds), while an embedded CLI is driven over
-            stdio and never given one. So --session-id settles it outright.
+            stdio and never given one - nor a prompt. So --session-id, -i/--interactive
+            or -p/--prompt settles it outright.
     #>
     param([string]$CommandLine = '')
     if ([string]::IsNullOrWhiteSpace($CommandLine)) { return $false }
@@ -1272,13 +1273,19 @@ function Test-BridgeAgentEmbeddedProcess {
         # cannot leave --headless outside them. Raised by Codex on #226.
         $parsed = ConvertFrom-BridgeWindowsCommandLine -CommandLine $CommandLine
         if ($parsed.Ambiguous) { return $false }
-        $arguments = @($parsed.Arguments | Select-Object -Skip 1)
-        if (-not @($arguments | Where-Object { $_ -eq '--headless' -or $_ -like '--headless=*' }).Count) { return $false }
-        return (-not @($arguments | Where-Object { $_ -eq '--session-id' -or $_ -like '--session-id=*' }).Count)
+        $names = @($parsed.Arguments | Select-Object -Skip 1 | ForEach-Object { ([string]$_ -split '=', 2)[0] })
+        if ($names -notcontains '--headless') { return $false }
+        # Nor can a prompt that is itself the word --headless, which splitting leaves
+        # as an argument of its own: a CLI driven over stdio is never handed a prompt,
+        # so one that has been is a session, whatever the prompt says. Also Codex on
+        # #226.
+        return (-not @($names | Where-Object {
+                    $_ -in @('--session-id', '--interactive', '--prompt') -or $_ -cmatch '^-[ip]'
+                }).Count)
     }
     $options = [regex]::Replace($CommandLine, '"[^"]*"', ' ')
     if ($options -notmatch '(^|\s)--headless(\s|=|$)') { return $false }
-    -not ($options -match '(^|\s)--session-id(\s|=)')
+    -not ($options -match '(^|\s)(--session-id|--interactive|--prompt)(\s|=)' -or $options -cmatch '(^|\s)-[ip](\s|$)')
 }
 
 function Get-BridgeAgencyInvocation {

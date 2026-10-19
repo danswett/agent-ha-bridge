@@ -1067,6 +1067,18 @@ setTimeout(() => process.exit(3), 5 * 60 * 1000);
             Test-P4 'the note is left on the launch card when the session registers, not cleared' `
                 ($null -eq $script:DaemonPendingLaunch -and $script:P4Messages.Count -gt 0 -and
                     $script:P4Messages[$script:P4Messages.Count - 1].Contains($named)) @($script:P4Messages)
+            # The reconcile that adds the session then clears launch notes made obsolete
+            # by a registration - which this one is not, being written because of it.
+            # Raised by Codex on #226: it used to show for a fraction of a reconcile.
+            $script:P4States[$script:DaemonEntity.NewResult] = $script:P4Messages[$script:P4Messages.Count - 1]
+            $published = $script:P4Messages.Count
+            Clear-DaemonLaunchNoteOnRegistration -Headers $headers
+            Test-P4 'nor by the reconcile that then adds the session' ($script:P4Messages.Count -eq $published) @($script:P4Messages)
+            $script:P4States[$script:DaemonEntity.NewResult] = 'Copilot in Approved started, but has not registered - check its window.'
+            Clear-DaemonLaunchNoteOnRegistration -Headers $headers
+            Test-P4 'while any other launch note still goes once a session registers' (
+                $script:P4Messages.Count -eq $published + 1 -and $script:P4Messages[$script:P4Messages.Count - 1] -eq '') @($script:P4Messages)
+            [void]$script:P4States.Remove($script:DaemonEntity.NewResult)
             Stop-P4Child $session
             $session = $null
             Remove-P4SessionFiles $files

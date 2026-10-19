@@ -384,6 +384,10 @@ try {
         Test-That 'while a CLI really started --headless still is' {
             Test-BridgeAgentEmbeddedProcess -CommandLine '"C:\Apps\Scout\copilot.exe" --headless --no-auto-update --stdio'
         }
+        Test-That 'and a prompt that is the word --headless itself is a prompt, not the flag' {
+            -not (Test-BridgeAgentEmbeddedProcess -CommandLine '"C:\x\copilot.exe" -i "--headless"') -and
+                -not (Test-BridgeAgentEmbeddedProcess -CommandLine '"C:\x\copilot.exe" --prompt=--headless --headless')
+        }
         Test-That 'and an escaped quote cannot carry a session id out of an Agency prompt' {
             $line = 'agency copilot ' + (ConvertTo-BridgeArgumentString -Arguments @('-i', "use `" --session-id $agencySession `" here"))
             (Get-BridgeAgencyInvocation -CommandLine $line).SessionId -eq ''

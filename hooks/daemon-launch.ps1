@@ -2191,7 +2191,10 @@ function Clear-DaemonLaunchNoteOnRegistration {
 
         A session registering is the proof that note is obsolete, whichever launch it
         came from. A launch still being followed keeps its own note: that one is
-        current, and Update-DaemonPendingLaunch clears it itself.
+        current, and Update-DaemonPendingLaunch clears it itself. So does the note a
+        launch leaves on registering, which is written because of that registration:
+        cleared here, a reconcile later, worktree cleanup being blocked showed for a
+        fraction of a second (raised by Codex on #226). The expiry clears that one.
     #>
     param([Parameter(Mandatory)][hashtable]$Headers)
 
@@ -2200,6 +2203,7 @@ function Clear-DaemonLaunchNoteOnRegistration {
         $state = Get-HomeAssistantState -EntityId $script:DaemonEntity.NewResult -Headers $Headers
         $text = [string]$state.state
         if ([string]::IsNullOrWhiteSpace($text) -or $text -in @('unknown', 'unavailable')) { return }
+        if ($script:DaemonLaunchKeptNote -and $text -ceq $script:DaemonLaunchKeptNote) { return }
         Set-CopilotMqttNewSessionResult -Headers $Headers -Text ''
         Write-DaemonLog -Message "cleared the launch note now a session has registered: $text"
     }
@@ -2275,6 +2279,7 @@ function Update-DaemonPendingLaunch {
         # Cleared unless the launch has something to say that the card cannot.
         $script:DaemonReconcileNow = $true
         $note = if ($p.PSObject.Properties['Note']) { [string]$p.Note } else { '' }
+        $script:DaemonLaunchKeptNote = $note
         & $finish $note ("$($p.Verb) $agent in $($p.Label); registered after {0:N1} s" -f ($now - $p.Since).TotalSeconds)
         return
     }
