@@ -599,7 +599,7 @@ function Get-BridgeWorktreeUsage {
                 if (-not $cwd) { throw 'A live Copilot/Agency session has no readable working directory.' }
                 $directories.Add((Resolve-BridgeWorkspaceDirectory -Path $cwd))
                 foreach ($owner in $owners.Keys) { $accounted[$owner] = $true }
-                $liveSessions[$session.Name] = $true
+                $liveSessions[$session.Name] = @($owners.Keys)
             }
         }
         foreach ($processId in $agents.copilot.Keys) {
@@ -615,7 +615,10 @@ function Get-BridgeWorktreeUsage {
         # Agency starts copilot.exe as its direct child, so a launcher that is the
         # parent of an accounted Copilot process has finished starting, and its
         # session's directory is already in the set. The session id on its command
-        # line is the same fact for a platform where the parent cannot be read.
+        # line is the same fact for a platform where the parent cannot be read - but
+        # only from an owner no older than the launcher. A second launcher for a
+        # session that was already running, a duplicate resume, has not started
+        # anything yet, and naming a live session does not make it settled.
         foreach ($processId in @($accounted.Keys)) {
             $child = $agents.copilot[$processId]
             $parent = $null
@@ -633,7 +636,12 @@ function Get-BridgeWorktreeUsage {
             if ($command.State -eq 'Readable') {
                 $invocation = Get-BridgeAgencyInvocation -CommandLine $command.Text
                 if ($invocation.Command -eq 'mcp') { continue }
-                if ($invocation.SessionId -and $liveSessions.ContainsKey($invocation.SessionId)) { continue }
+                if ($invocation.SessionId -and $liveSessions.ContainsKey($invocation.SessionId)) {
+                    $started = $launchers[$processId].StartTime
+                    $ownGeneration = @($liveSessions[$invocation.SessionId] | Where-Object {
+                            $agents.copilot[[int]$_].StartTime -ge $started })
+                    if ($ownGeneration.Count -gt 0) { continue }
+                }
             }
             throw "Agency pid $processId has not registered a session yet, so one may still be starting."
         }

@@ -192,10 +192,12 @@ state independently of suggestion settings and caches. Descendant working direct
 and path aliases protect their containing tree. Unreadable, incomplete or unmapped
 live state blocks cleanup; age alone never proves a session ended. An Agency launcher
 is accounted for once the session it started has registered - it is the parent of an
-accounted Copilot process, or names that session's id - and the `agency mcp` servers
-each Agency session keeps are not launches. Any other Agency launcher is
-conservatively treated as a potentially starting session. A Copilot CLI embedded
-`--headless` with no session id, as Microsoft Scout runs one, is not a session.
+accounted Copilot process, or names the id of a session whose live owner started no
+earlier than it did - and the `agency mcp` servers each Agency session keeps are not
+launches. Any other Agency launcher, including a second one for a session already
+running, is conservatively treated as a potentially starting session. A Copilot CLI
+embedded `--headless` with no session id, as Microsoft Scout runs one, is not a
+session.
 Relative working directories and registrations predating the current process
 generation are uncertain, not evidence that another worktree is unused.
 

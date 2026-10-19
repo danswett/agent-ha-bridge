@@ -964,9 +964,11 @@ setTimeout(() => process.exit(3), 5 * 60 * 1000);
                         $files = @(New-P4SessionFiles copilot $elsewhere $id $launcher.Spawned.Process.Id)
                     }
                     'session-id' {
+                        # Launcher first, as Agency does: the session it names is one it
+                        # could have started, not one already running before it.
+                        $started.Add((Start-P4Child launcher $elsewhere '' -Arguments @('copilot', '--session-id', $id, '--banner')))
                         $session = Start-P4Child copilot $elsewhere $id
                         $started.Add($session)
-                        $started.Add((Start-P4Child launcher $elsewhere '' -Arguments @('copilot', '--session-id', $id, '--banner')))
                         $files = @(New-P4SessionFiles copilot $elsewhere $id $session.Process.Id)
                     }
                     'mcp' { $started.Add((Start-P4Child launcher $elsewhere '' -Arguments @('mcp', 'native', 'kusto'))) }
@@ -988,29 +990,41 @@ setTimeout(() => process.exit(3), 5 * 60 * 1000);
         }
     }
 
-    foreach ($mode in @('unregistered-launcher', 'embedded-with-session')) {
+    foreach ($mode in @('unregistered-launcher', 'duplicate-launcher', 'embedded-with-session')) {
         Invoke-P4Scenario "an unsettled $mode process still holds cleanup" {
             $fixture = New-P4Fixture
             $worktree = New-P4Worktree $fixture
             Set-P4OldWorktree $worktree
             $id = [guid]::NewGuid().ToString()
+            $owner = $null
+            $files = @()
             # A launcher that has not started its session yet, in the candidate itself,
-            # is exactly the startup the Agency guard exists for. A headless process that
-            # names a session is a session, whatever else it says.
-            $child = if ($mode -eq 'unregistered-launcher') {
-                Start-P4Child launcher $worktree '' -Arguments @('copilot', '--session-id', $id)
+            # is exactly the startup the Agency guard exists for - and so is a second
+            # launcher for a session that is already running elsewhere, a duplicate
+            # resume, which names a live session without having started anything. A
+            # headless process that names a session is a session, whatever else it says.
+            if ($mode -eq 'duplicate-launcher') {
+                $elsewhere = Join-Path $fixture.Root 'elsewhere'
+                [void][IO.Directory]::CreateDirectory($elsewhere)
+                $owner = Start-P4Child copilot $elsewhere $id
+                $files = @(New-P4SessionFiles copilot $elsewhere $id $owner.Process.Id)
             }
-            else { Start-P4Child copilot $worktree $id -Arguments @('--headless') }
+            $child = if ($mode -eq 'embedded-with-session') { Start-P4Child copilot $worktree $id -Arguments @('--headless') }
+            else { Start-P4Child launcher $worktree '' -Arguments @('copilot', '--session-id', $id) }
             try {
                 $usage = Get-BridgeWorktreeUsage
-                $named = if ($mode -eq 'unregistered-launcher') { "Agency pid $($child.Process.Id)" } else { "Copilot pid $($child.Process.Id)" }
+                $named = if ($mode -eq 'embedded-with-session') { "Copilot pid $($child.Process.Id)" } else { "Agency pid $($child.Process.Id)" }
                 Test-P4 "${mode}: usage is unknown and names the process responsible" `
                     (-not $usage.Known -and $usage.Detail.Contains($named)) $usage
                 $outcome = Invoke-P4Cleanup $fixture $worktree
                 Test-P4 "${mode}: the candidate is preserved complete" `
                     ($outcome.Removed -eq 0 -and $outcome.TrackedContentPreserved) $outcome
             }
-            finally { Stop-P4Child $child }
+            finally {
+                Stop-P4Child $child
+                if ($null -ne $owner) { Stop-P4Child $owner }
+                Remove-P4SessionFiles $files
+            }
         }
     }
 
