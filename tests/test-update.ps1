@@ -1556,6 +1556,25 @@ try {
             $null -eq $script:LaunchedWith -and $refusedRun.Detail -match 'already running' -and
             ($stagingAfter -join '|') -ceq ($stagingBefore -join '|')
     } "$($refusedRun.State): $($refusedRun.Detail)"
+
+    # An updater that has recorded the release it is installing still restarts and
+    # verifies, and all that while the lookup reads Current. A press then was told
+    # "no newer release found" about an installation still being changed. Raised by
+    # Codex on #230.
+    $currentRun = & {
+        function Get-BridgeUpdateStatus {
+            param([switch]$Force)
+            [pscustomobject]@{
+                Installed = '9.9.9'; Latest = '9.9.9'; Available = $false; State = 'Current'
+                Url = 'https://github.com/x/y/releases/tag/v9.9.9'
+                Notes = ''; Zip = 'https://api.github.com/repos/x/y/zipball/v9.9.9'
+            }
+        }
+        Invoke-BridgeSelfUpdate -Detached
+    }
+    Test-That 'and once it has recorded its release, a press is still turned away rather than told nothing is newer' {
+        $currentRun.State -eq 'Busy' -and -not $currentRun.Started -and $currentRun.Detail -match 'already running'
+    } "$($currentRun.State): $($currentRun.Detail)"
 }
 finally {
     if ($held.Stream) { $held.Stream.Dispose() }

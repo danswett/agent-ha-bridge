@@ -1690,11 +1690,12 @@ Or, from anywhere, `agent-ha-bridge update`.
 
 It distinguishes three outcomes, where it used to report two. Exit **0** means the
 release installed or nothing newer was found; **1** means the update did not happen —
-including when another update is already running on the installation, which it names;
-**2** means the release installed but a step after it failed, and names that step
-rather than calling the update a failure. A stale Codex marketplace once made every
-`codex plugin` command exit 1 *after* the installer had printed "All good", so a
-successful update reported itself as broken and looked like the thing to retry.
+including when another update is still running on the installation, which it names,
+even one that has already recorded the newest release as installed; **2** means the
+release installed but a step after it failed, and names that step rather than calling
+the update a failure. A stale Codex marketplace once made every `codex plugin` command
+exit 1 *after* the installer had printed "All good", so a successful update reported
+itself as broken and looked like the thing to retry.
 
 Either way your configuration is preserved: the installer reads the existing config,
 backs it up, and keeps your URL, token and settings.

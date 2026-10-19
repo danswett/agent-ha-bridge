@@ -50,6 +50,34 @@ foreach ($intent in @(
         -not (Test-Path -LiteralPath (Join-Path $fixtureState.FixtureRoot 'cli-prompts.txt')))
 }
 
+# While another update runs - here, another process holding the lock, as it would.
+# Once that update has recorded the release it is installing it still restarts and
+# verifies, and the lookup already reads Current: the terminal answered "no newer
+# release found" and exited 0 about an installation still being changed. Raised by
+# Codex on #230. A newer release is not asked about either, so nobody is asked to
+# confirm an install that would only be refused.
+foreach ($intent in @(
+    @{ Case = 'cli-busy-current'; Target = '1.1.0' },
+    @{ Case = 'cli-busy-available'; Target = '1.2.0' }
+)) {
+    New-UpdateFixture -Case $intent.Case -Target $intent.Target
+    $busyContext = Resolve-BridgeInstallContext -TargetHome $env:HOME -BridgeHome $fixtureState.Fixture.InstallRoot
+    $heldByAnother = Enter-BridgeFileLock -Path (Get-BridgeUpdateLockPath -Context $busyContext) -Create
+    try {
+        Assert-UpdateIntake "$($intent.Case) holds the lock the way a running update does" ($heldByAnother.State -eq 'Acquired')
+        $start = New-BridgeTestProcessStartInfo -ScriptPath $fixtureState.TestEntry -Sandbox $env:AGENT_HA_BRIDGE_TEST_ROOT -ScriptArguments @('Cli')
+        $child = Invoke-BridgeTestProcess -StartInfo $start
+    }
+    finally { if ($heldByAnother.Stream) { $heldByAnother.Stream.Dispose() } }
+    Write-UpdateCliDiagnostic -Case $intent.Case -Child $child -ExpectedExit 1
+    $observation = Get-Content -LiteralPath (Join-Path $fixtureState.FixtureRoot 'cli-observation.json') -Raw | ConvertFrom-Json
+    Assert-UpdateIntake "$($intent.Case) says an update is already running and exits 1, without prompting or launching" (
+        -not $child.TimedOut -and $child.ExitCode -eq 1 -and
+        $child.Output -match 'another update is already running on this installation' -and
+        $child.Output -match 'Nothing was installed' -and $child.Output -notmatch 'no newer release found' -and
+        $observation.launches -eq 0 -and -not (Test-Path -LiteralPath (Join-Path $fixtureState.FixtureRoot 'cli-prompts.txt')))
+}
+
 if ($IsWindows) {
     foreach ($target in @('1.1.0', '1.0.0')) {
         New-UpdateFixture -Case "cli-force-$target" -Target $target -Force -Yes

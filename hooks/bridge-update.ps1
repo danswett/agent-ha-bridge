@@ -1309,11 +1309,42 @@ function Invoke-BridgeSelfUpdate {
         [switch]$ScriptOnly
     )
 
-    $status = Get-BridgeUpdateStatus -Force
     $result = [pscustomobject]@{
         Started = $false; Success = $false; State = 'Refused'; AttemptId = ''
-        AttemptedVersion = $status.Latest; InstalledVersion = $status.Installed; Detail = ''
+        AttemptedVersion = $null; InstalledVersion = $null; Detail = ''
     }
+    $resolvedTarget = $TargetHome
+    if ($TargetHome) {
+        $resolvedTarget = if (Test-Path -LiteralPath $TargetHome -PathType Container) {
+            (Resolve-Path -LiteralPath $TargetHome -ErrorAction Stop).Path
+        } else { $null }
+        if (-not $resolvedTarget -or -not (Test-Path -LiteralPath $resolvedTarget -PathType Container)) {
+            $result.Detail = "TargetHome '$TargetHome' is not an existing directory"
+            return $result
+        }
+    }
+    $updateContext = if ($TargetHome -or $InstallRoot) { Resolve-BridgeInstallContext -TargetHome $resolvedTarget -BridgeHome $InstallRoot }
+        else { Get-BridgeInstallContext }
+    # Turned away before anything is staged, and before the release is even looked up
+    # (#196). An updater that is restarting or verifying has already recorded the
+    # release it installed, so the lookup answers Current while the installation is
+    # still being changed - and "nothing newer found" would vouch for an installation
+    # nobody has finished with. Raised by Codex on #230. The child still takes the lock
+    # itself: only the process that runs the installer can hold it for as long as the
+    # installer runs, and two presses can both pass this check before either child has
+    # started.
+    if (-not $ScriptOnly) {
+        $running = Get-BridgeUpdateRunning -Context $updateContext
+        if ($running.State -eq 'Running') {
+            $result.State = 'Busy'
+            $result.Detail = $running.Detail
+            return $result
+        }
+    }
+
+    $status = Get-BridgeUpdateStatus -Force
+    $result.AttemptedVersion = $status.Latest
+    $result.InstalledVersion = $status.Installed
     if ($status.PSObject.Properties['LookupState'] -and $status.LookupState -ne 'Found') {
         $result.State = $status.LookupState
         $result.Detail = $status.Detail
@@ -1334,30 +1365,6 @@ function Invoke-BridgeSelfUpdate {
         return $result
     }
 
-    $resolvedTarget = $TargetHome
-    if ($TargetHome) {
-        $resolvedTarget = if (Test-Path -LiteralPath $TargetHome -PathType Container) {
-            (Resolve-Path -LiteralPath $TargetHome -ErrorAction Stop).Path
-        } else { $null }
-        if (-not $resolvedTarget -or -not (Test-Path -LiteralPath $resolvedTarget -PathType Container)) {
-            $result.Detail = "TargetHome '$TargetHome' is not an existing directory"
-            return $result
-        }
-    }
-    $updateContext = if ($TargetHome -or $InstallRoot) { Resolve-BridgeInstallContext -TargetHome $resolvedTarget -BridgeHome $InstallRoot }
-        else { Get-BridgeInstallContext }
-    # Turned away before anything is staged when the answer is already known (#196).
-    # The child still takes the lock itself: only the process that runs the installer
-    # can hold it for as long as the installer runs, and two presses can both pass
-    # this check before either child has started.
-    if (-not $ScriptOnly) {
-        $running = Get-BridgeUpdateRunning -Context $updateContext
-        if ($running.State -eq 'Running') {
-            $result.State = 'Busy'
-            $result.Detail = $running.Detail
-            return $result
-        }
-    }
     $result.AttemptId = [guid]::NewGuid().ToString('N')
     $attemptStartedAt = [DateTimeOffset]::Now
     $staging = Get-BridgeRuntimePath -Name "agent-ha-bridge-update-$($result.AttemptId)" -Context $updateContext
