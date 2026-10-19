@@ -1235,6 +1235,72 @@ function ConvertFrom-BridgeWindowsCommandLine {
     [pscustomobject]@{ Arguments = [string[]]$arguments.ToArray(); Ambiguous = $ambiguous }
 }
 
+function Get-BridgeCommandLineOptions {
+    <#
+        The arguments of a Copilot or Agency command line that can be read as its
+        options: the program and everything up to its prompt, never the prompt itself.
+
+        A prompt is text, and can say anything - `--session-id <uuid>` included. What
+        is read off these lines is which session a process is working in, and a
+        process credited with a session it only mentions is wrong in every way that
+        matters: a launcher counts as settled while its own session is still starting,
+        so cleanup can take the worktree it is starting in, and a reply meant for the
+        session it mentions can be typed into its console instead. Raised by Codex on
+        #226.
+
+        On Windows the line is split as the program splits it, so the value of
+        -i/--interactive or -p/--prompt is one argument and only that is skipped; a
+        line the two Windows splitters read differently gives nothing. Elsewhere it is
+        ps's flattened argv, where nothing after a prompt option can be told apart from
+        the prompt, so nothing from there on is returned. Every launch the bridge makes
+        puts --session-id ahead of the prompt, so its own sessions read in full either
+        way. `--` ends the options everywhere.
+    #>
+    param([string]$CommandLine = '')
+    $tokens = @()
+    if ($script:BridgeIsWindows) {
+        $parsed = ConvertFrom-BridgeWindowsCommandLine -CommandLine $CommandLine
+        if ($parsed.Ambiguous) { return }
+        $tokens = @($parsed.Arguments)
+    }
+    else { $tokens = @([regex]::Matches([string]$CommandLine, '"[^"]*"|[^\s"]+') | ForEach-Object { $_.Value.Trim('"') }) }
+    for ($index = 0; $index -lt $tokens.Count; $index++) {
+        $token = [string]$tokens[$index]
+        if ($token -ceq '--') { return }
+        $separate = $token -cmatch '^(?:-[ip]|--interactive|--prompt)$'
+        if ($separate -or $token -cmatch '^(?:-[ip].|--interactive=|--prompt=)') {
+            if (-not $script:BridgeIsWindows) { return }
+            if ($separate) { $index++ }
+            continue
+        }
+        $token
+    }
+}
+
+function Get-BridgeCommandLineSessionId {
+    <#
+        The session id among a command line's options (Get-BridgeCommandLineOptions),
+        or '' if they name none. Spelled `--session-id <id>` or `--session-id=<id>`,
+        and matched as a UUID so that a name or a prefix cannot be taken for one.
+        Options naming two different sessions name neither: which one the program
+        used is not something to guess at when the answer decides what cleanup may
+        remove and where a reply is typed.
+    #>
+    param([AllowEmptyCollection()][string[]]$Options = @())
+    $found = @{}
+    for ($index = 0; $index -lt $Options.Count; $index++) {
+        if ([string]$Options[$index] -notmatch '^--session-id(?:=(.*))?$') { continue }
+        $value = ''
+        if ($Matches[1]) { $value = [string]$Matches[1] }
+        elseif ($index + 1 -lt $Options.Count) { $index++; $value = [string]$Options[$index] }
+        if ($value -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+            $found[$value.ToLowerInvariant()] = $value
+        }
+    }
+    if ($found.Count -ne 1) { return '' }
+    [string]@($found.Values)[0]
+}
+
 function Test-BridgeAgentEmbeddedProcess {
     <#
         Whether an agent CLI process is an embedded, headless instance rather than an
@@ -1302,45 +1368,31 @@ function Get-BridgeAgencyInvocation {
         option nor the program again, which is what an interpreter running Agency as a
         script puts there. The two global options that take a value are skipped with
         it, so `--verbosity debug copilot` is a copilot launch. Anything this cannot
-        parse reads as no subcommand, which callers treat as a possible launcher.
+        parse reads as no subcommand, which callers treat as a possible launcher. Both
+        answers come from the options alone (Get-BridgeCommandLineOptions), so neither
+        can be read out of a prompt.
     #>
     param([string]$CommandLine = '')
     $invocation = [pscustomobject]@{ Command = ''; SessionId = '' }
-    # On Windows, split as the program splits it, so an escaped quote in a prompt
-    # cannot end the prompt early (Codex on #226); a line the two Windows splitters
-    # read differently is no subcommand at all. Elsewhere ps has removed the quotes
-    # already, and this is the best reading there is.
-    $tokens = @()
-    if ($script:BridgeIsWindows) {
-        $parsed = ConvertFrom-BridgeWindowsCommandLine -CommandLine $CommandLine
-        if ($parsed.Ambiguous) { return $invocation }
-        $tokens = @($parsed.Arguments)
-    }
-    else { $tokens = @([regex]::Matches([string]$CommandLine, '"[^"]*"|[^\s"]+') | ForEach-Object { $_.Value.Trim('"') }) }
-    $program = $false
+    $tokens = @(Get-BridgeCommandLineOptions -CommandLine $CommandLine)
+    $program = -1
     for ($index = 0; $index -lt $tokens.Count; $index++) {
         $token = [string]$tokens[$index]
         # Split on either separator, so a command line parses the same on every host:
         # [IO.Path] on macOS and Linux splits on '/' alone and reads a Windows path as
         # one long file name. Raised by Codex on #226.
         $leaf = try { [System.IO.Path]::GetFileNameWithoutExtension(($token -split '[\\/]')[-1]) } catch { '' }
-        if ($leaf -eq 'agency' -and -not $invocation.Command) { $program = $true; continue }
-        if (-not $program) { continue }
-        # Quoted values are whole tokens here, so a prompt that mentions --session-id
-        # is text and cannot be read as the flag.
-        if ($token -match '^--session-id(?:=(.*))?$') {
-            $value = ''
-            if ($Matches[1]) { $value = [string]$Matches[1] }
-            elseif ($index + 1 -lt $tokens.Count) { $index++; $value = [string]$tokens[$index] }
-            if ($value -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
-                $invocation.SessionId = $value
-            }
-            continue
-        }
+        if ($leaf -eq 'agency' -and -not $invocation.Command) { $program = $index; continue }
+        if ($program -lt 0) { continue }
+        # Its value is a session, never the subcommand.
+        if ($token -eq '--session-id') { $index++; continue }
         if ($invocation.Command) { continue }
         if ($token -in @('--verbosity', '--log-dir')) { $index++; continue }
         if ($token.StartsWith('-')) { continue }
         $invocation.Command = $token.ToLowerInvariant()
+    }
+    if ($program -ge 0) {
+        $invocation.SessionId = Get-BridgeCommandLineSessionId -Options @($tokens | Select-Object -Skip ($program + 1))
     }
     $invocation
 }
@@ -1393,13 +1445,11 @@ function Get-BridgeAgentProcessSessionIds {
             if ([string]::IsNullOrWhiteSpace($commandLine)) {
                 $commandLine = Get-BridgeCommandLine -ProcessId $processId
             }
-            # `--session-id <id>` and `--session-id=<id>` are both spelled by the CLI,
-            # and the value is matched as a UUID so a prefix or a name cannot be taken
-            # for one.
-            $found = ''
-            if ($commandLine -match '--session-id[=\s]+"?([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
-                $found = $Matches[1]
-            }
+            # `--session-id <id>` and `--session-id=<id>` are both spelled by the CLI.
+            # Read from the options alone: the regex this replaced found one inside a
+            # prompt too, on every platform, and credited the process with a session it
+            # only mentioned. Raised by Codex on #226.
+            $found = Get-BridgeCommandLineSessionId -Options @(Get-BridgeCommandLineOptions -CommandLine $commandLine)
             $script:BridgeAgentSessionIdCache[$key] = $found
         }
 

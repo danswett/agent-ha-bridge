@@ -360,6 +360,45 @@ try {
     }
 
     Write-Host ''
+    Write-Host '--- a launcher''s session is read from its options, never from its prompt ---'
+    # A launcher credited with a live session its prompt only mentions counted as
+    # settled while its own was still starting, so cleanup could take the worktree it
+    # was starting in. Both readings are checked on every host: Windows keeps a prompt
+    # one argument, while ps flattens it into the options around it. Raised by Codex
+    # on #226.
+    $otherSession = '22222222-2222-4222-8222-222222222222'
+    $platform = $script:BridgeIsWindows
+    try {
+        foreach ($windows in @($true, $false)) {
+            $script:BridgeIsWindows = $windows
+            $as = if ($windows) { 'split as Windows splits it' } else { 'flattened by ps' }
+            Test-That "the bridge's own launch, prompt last, names its session, $as" {
+                $line = "agency copilot --profile-only local --session-id $agencySession --banner -i `"compare --session-id $otherSession`""
+                (Get-BridgeAgencyInvocation -CommandLine $line).SessionId -eq $agencySession
+            }
+            Test-That "a prompt that is the word --session-id is a prompt, not the flag, $as" {
+                (Get-BridgeAgencyInvocation -CommandLine "agency copilot -i --session-id $agencySession").SessionId -eq '' -and
+                    (Get-BridgeAgencyInvocation -CommandLine "agency copilot --prompt=--session-id $agencySession").SessionId -eq ''
+            }
+            Test-That "nothing after -- is an option, $as" {
+                (Get-BridgeAgencyInvocation -CommandLine "agency copilot -- --session-id $agencySession").SessionId -eq ''
+            }
+            Test-That "a launcher naming two sessions names neither, $as" {
+                (Get-BridgeAgencyInvocation -CommandLine "agency copilot --session-id $agencySession --session-id $otherSession").SessionId -eq ''
+            }
+        }
+        $script:BridgeIsWindows = $false
+        Test-That 'flattened by ps, an id after a prompt option could be the prompt, so it is not read' {
+            (Get-BridgeAgencyInvocation -CommandLine "agency copilot -i continue --session-id $agencySession").SessionId -eq ''
+        }
+        $script:BridgeIsWindows = $true
+        Test-That 'while split as Windows splits it, the same id after a one-word prompt is an option' {
+            (Get-BridgeAgencyInvocation -CommandLine "agency copilot -i continue --session-id $agencySession").SessionId -eq $agencySession
+        }
+    }
+    finally { $script:BridgeIsWindows = $platform }
+
+    Write-Host ''
     Write-Host '--- a Windows command line is split the way the program it starts splits it ---'
     # The bridge quotes a prompt typed on a phone with ConvertTo-BridgeArgumentString, so a
     # quote inside one arrives escaped as \" - and a regex stripping "..." then read the

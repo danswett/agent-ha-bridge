@@ -999,7 +999,7 @@ setTimeout(() => process.exit(3), 5 * 60 * 1000);
     # flattened argv, where the quotes that say so are gone - so there a CLI that really
     # is embedded holds as well, since the two cannot be told apart. Raised by Codex on
     # #226.
-    $unsettledModes = @('unregistered-launcher', 'duplicate-launcher', 'embedded-with-session', 'prompt-mentions-headless')
+    $unsettledModes = @('unregistered-launcher', 'duplicate-launcher', 'prompt-names-session', 'embedded-with-session', 'prompt-mentions-headless')
     if (-not $IsWindows) { $unsettledModes += 'embedded' }
     foreach ($mode in $unsettledModes) {
         Invoke-P4Scenario "an unsettled $mode process still holds cleanup" {
@@ -1024,9 +1024,19 @@ setTimeout(() => process.exit(3), 5 * 60 * 1000);
                 'embedded-with-session' { Start-P4Child copilot $worktree $id -Arguments @('--headless') }
                 'prompt-mentions-headless' { Start-P4Child copilot $worktree '' -Arguments @('-i', 'explain "quoted --headless text"') }
                 'embedded' { Start-P4Child copilot $worktree '' -Arguments @('--headless', '--no-auto-update', '--stdio') }
+                # Its prompt names a session that started after it, which is what its
+                # own would look like - so the id has to be read as text. Off Windows
+                # ps has flattened the prompt into the options. Raised by Codex on #226.
+                'prompt-names-session' { Start-P4Child launcher $worktree '' -Arguments @('copilot', '-i', "continue --session-id $id") }
                 default { Start-P4Child launcher $worktree '' -Arguments @('copilot', '--session-id', $id) }
             }
             try {
+                if ($mode -eq 'prompt-names-session') {
+                    $elsewhere = Join-Path $fixture.Root 'elsewhere'
+                    [void][IO.Directory]::CreateDirectory($elsewhere)
+                    $owner = Start-P4Child copilot $elsewhere $id
+                    $files = @(New-P4SessionFiles copilot $elsewhere $id $owner.Process.Id)
+                }
                 $usage = Get-BridgeWorktreeUsage
                 $named = if ($mode -in @('embedded-with-session', 'prompt-mentions-headless', 'embedded')) { "Copilot pid $($child.Process.Id)" } else { "Agency pid $($child.Process.Id)" }
                 Test-P4 "${mode}: usage is unknown and names the process responsible" `

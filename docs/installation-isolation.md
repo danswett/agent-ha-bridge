@@ -194,7 +194,11 @@ live state blocks cleanup; age alone never proves a session ended. An Agency lau
 is accounted for once the session it started has registered - it is the parent of an
 accounted Copilot process, or names the id of a session whose live owner started no
 earlier than it did - and the `agency mcp` servers each Agency session keeps are not
-launches. Any other Agency launcher, including a second one for a session already
+launches. A session id is read only from a command line's options, never from its
+prompt; elsewhere than Windows, where `ps` has flattened the prompt into the options
+around it, nothing after a prompt option is read at all. The bridge puts
+`--session-id` ahead of the prompt in every launch, so its own launchers still read in
+full. Any other Agency launcher, including a second one for a session already
 running, is conservatively treated as a potentially starting session. On Windows, a
 Copilot CLI embedded `--headless` with no session id, as Microsoft Scout runs one, is
 not a session. Elsewhere the command line can only be read as `ps` prints it, with the

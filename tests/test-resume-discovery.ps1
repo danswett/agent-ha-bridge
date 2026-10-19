@@ -159,6 +159,27 @@ try {
     $ids = Get-BridgeAgentProcessSessionIds -Processes $script:FakeProcesses
     Test-That 'a platform with no CommandLine property falls back to asking the OS' { $ids[104] -eq $resumedId }
 
+    # A process credited with a session it only mentions is where a reply to that
+    # session gets typed (Get-CopilotSessionProcessId), and whose directory cleanup
+    # protects instead of its own. Both readings are checked on every host: Windows
+    # keeps a prompt one argument, while ps flattens it into the options around it.
+    # Raised by Codex on #226.
+    $platform = $script:BridgeIsWindows
+    try {
+        foreach ($windows in @($true, $false)) {
+            $script:BridgeIsWindows = $windows
+            $as = if ($windows) { 'split as Windows splits it' } else { 'flattened by ps' }
+            Set-FixtureProcesses @((New-FixtureProcess -Id 108 -CommandLine "C:\copilot.exe --banner -i `"why is --session-id $otherId stuck`""))
+            $ids = Get-BridgeAgentProcessSessionIds -Processes $script:FakeProcesses
+            Test-That "a session a prompt only mentions is not the process's own, $as" { -not $ids.ContainsKey(108) } "$($ids[108])"
+
+            Set-FixtureProcesses @((New-FixtureProcess -Id 109 -CommandLine ((New-CopilotCommandLine -SessionId $resumedId) + " -i `"compare --session-id $otherId`"")))
+            $ids = Get-BridgeAgentProcessSessionIds -Processes $script:FakeProcesses
+            Test-That "while the bridge's own launch, prompt last, still names its session, $as" { $ids[109] -eq $resumedId } "$($ids[109])"
+        }
+    }
+    finally { $script:BridgeIsWindows = $platform }
+
     Write-Host "`n--- the command line is read once, not every pass ---"
 
     Set-FixtureProcesses @((New-FixtureProcess -Id 105 -CommandLine (New-CopilotCommandLine -SessionId $resumedId)))
