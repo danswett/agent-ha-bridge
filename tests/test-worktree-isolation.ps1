@@ -335,9 +335,7 @@ try {
     Write-Host '--- what an Agency process is doing, read from its command line ---'
     $agencySession = '11111111-1111-4111-8111-111111111111'
     $launch = Get-BridgeAgencyInvocation -CommandLine "`"C:\Users\x\AppData\Roaming\agency\CurrentVersion\agency.exe`" copilot --profile-only local --session-id $agencySession --banner --model m"
-    Test-That 'a launcher the bridge started is a copilot launch for its session' {
-        $launch.Command -eq 'copilot' -and $launch.SessionId -eq $agencySession
-    } "command: $($launch.Command); session: $($launch.SessionId)"
+    Test-That 'a launcher the bridge started is a copilot launch' { $launch.Command -eq 'copilot' } "command: $($launch.Command)"
     Test-That 'the MCP servers every Agency session keeps are not launches' {
         (Get-BridgeAgencyInvocation -CommandLine '"C:\.Tools\agency\CurrentVersion\agency.exe" mcp native kusto').Command -eq 'mcp'
     }
@@ -348,52 +346,52 @@ try {
         (Get-BridgeAgencyInvocation -CommandLine '/usr/local/bin/node /opt/agency/agency.js mcp native kusto').Command -eq 'mcp'
     }
     Test-That 'the value of --session-id is never taken for the subcommand' {
-        $parsed = Get-BridgeAgencyInvocation -CommandLine "agency --session-id $agencySession copilot"
-        $parsed.Command -eq 'copilot' -and $parsed.SessionId -eq $agencySession
-    }
-    Test-That 'a session id in a quoted prompt is text, not the option' {
-        (Get-BridgeAgencyInvocation -CommandLine "agency copilot -i `"resume --session-id $agencySession please`"").SessionId -eq ''
+        (Get-BridgeAgencyInvocation -CommandLine "agency --session-id $agencySession copilot").Command -eq 'copilot'
     }
     Test-That 'a command line that is not Agency names nothing' {
-        $parsed = Get-BridgeAgencyInvocation -CommandLine 'copilot.exe mcp --session-id 11111111-1111-4111-8111-111111111111'
-        $parsed.Command -eq '' -and $parsed.SessionId -eq ''
+        (Get-BridgeAgencyInvocation -CommandLine "copilot.exe mcp --session-id $agencySession").Command -eq ''
     }
 
     Write-Host ''
-    Write-Host '--- a launcher''s session is read from its options, never from its prompt ---'
-    # A launcher credited with a live session its prompt only mentions counted as
-    # settled while its own was still starting, so cleanup could take the worktree it
-    # was starting in. Both readings are checked on every host: Windows keeps a prompt
+    Write-Host '--- a command line is read from its options, never from its prompt ---'
+    # A process credited with a session its prompt only mentions protects that
+    # session's directory from cleanup instead of its own, and is where a reply to that
+    # session gets typed; a launcher whose prompt reads as `mcp` is excused from holding
+    # cleanup at all. Both readings are checked on every host: Windows keeps a prompt
     # one argument, while ps flattens it into the options around it. Raised by Codex
     # on #226.
     $otherSession = '22222222-2222-4222-8222-222222222222'
+    $sessionOf = { param([string]$Line) Get-BridgeCommandLineSessionId -Options @(Get-BridgeCommandLineOptions -CommandLine $Line) }
     $platform = $script:BridgeIsWindows
     try {
         foreach ($windows in @($true, $false)) {
             $script:BridgeIsWindows = $windows
             $as = if ($windows) { 'split as Windows splits it' } else { 'flattened by ps' }
             Test-That "the bridge's own launch, prompt last, names its session, $as" {
-                $line = "agency copilot --profile-only local --session-id $agencySession --banner -i `"compare --session-id $otherSession`""
-                (Get-BridgeAgencyInvocation -CommandLine $line).SessionId -eq $agencySession
+                (& $sessionOf "copilot --session-id $agencySession --banner -i `"compare --session-id $otherSession`"") -eq $agencySession
             }
             Test-That "a prompt that is the word --session-id is a prompt, not the flag, $as" {
-                (Get-BridgeAgencyInvocation -CommandLine "agency copilot -i --session-id $agencySession").SessionId -eq '' -and
-                    (Get-BridgeAgencyInvocation -CommandLine "agency copilot --prompt=--session-id $agencySession").SessionId -eq ''
+                (& $sessionOf "copilot -i --session-id $agencySession") -eq '' -and
+                    (& $sessionOf "copilot --prompt=--session-id $agencySession") -eq ''
             }
-            Test-That "nothing after -- is an option, $as" {
-                (Get-BridgeAgencyInvocation -CommandLine "agency copilot -- --session-id $agencySession").SessionId -eq ''
+            Test-That "nothing after -- is an option, $as" { (& $sessionOf "copilot -- --session-id $agencySession") -eq '' }
+            Test-That "a line naming two sessions names neither, $as" {
+                (& $sessionOf "copilot --session-id $agencySession --session-id $otherSession") -eq ''
             }
-            Test-That "a launcher naming two sessions names neither, $as" {
-                (Get-BridgeAgencyInvocation -CommandLine "agency copilot --session-id $agencySession --session-id $otherSession").SessionId -eq ''
+            Test-That "a prompt cannot make a launcher an MCP server, $as" {
+                (Get-BridgeAgencyInvocation -CommandLine 'agency -i mcp copilot').Command -ne 'mcp'
             }
         }
         $script:BridgeIsWindows = $false
         Test-That 'flattened by ps, an id after a prompt option could be the prompt, so it is not read' {
-            (Get-BridgeAgencyInvocation -CommandLine "agency copilot -i continue --session-id $agencySession").SessionId -eq ''
+            (& $sessionOf "copilot -i continue --session-id $agencySession") -eq ''
         }
         $script:BridgeIsWindows = $true
         Test-That 'while split as Windows splits it, the same id after a one-word prompt is an option' {
-            (Get-BridgeAgencyInvocation -CommandLine "agency copilot -i continue --session-id $agencySession").SessionId -eq $agencySession
+            (& $sessionOf "copilot -i continue --session-id $agencySession") -eq $agencySession
+        }
+        Test-That 'and an escaped quote cannot carry a session id out of a prompt' {
+            (& $sessionOf ('copilot ' + (ConvertTo-BridgeArgumentString -Arguments @('-i', "use `" --session-id $agencySession `" here")))) -eq ''
         }
     }
     finally { $script:BridgeIsWindows = $platform }
@@ -426,10 +424,6 @@ try {
         Test-That 'and a prompt that is the word --headless itself is a prompt, not the flag' {
             -not (Test-BridgeAgentEmbeddedProcess -CommandLine '"C:\x\copilot.exe" -i "--headless"') -and
                 -not (Test-BridgeAgentEmbeddedProcess -CommandLine '"C:\x\copilot.exe" --prompt=--headless --headless')
-        }
-        Test-That 'and an escaped quote cannot carry a session id out of an Agency prompt' {
-            $line = 'agency copilot ' + (ConvertTo-BridgeArgumentString -Arguments @('-i', "use `" --session-id $agencySession `" here"))
-            (Get-BridgeAgencyInvocation -CommandLine $line).SessionId -eq ''
         }
     }
 

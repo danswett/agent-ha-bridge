@@ -531,10 +531,10 @@ function Get-BridgeWorktreeUsage {
        of every Agency session already running, and the `agency mcp` servers each one
        keeps - vetoed cleanup outright, and so did Microsoft Scout's
        embedded copilot.exe, which no registration can ever name (#215). The
-       exceptions are positive identifications: a launcher whose session is already
-       registered and accounted for below, an Agency MCP server, and - on Windows,
-       where a command line keeps its quoting - a CLI embedded --headless without a
-       session. Anything else still holds. #>
+       exceptions are positive identifications: a launcher that is the parent of a
+       session registered and accounted for below, an Agency MCP server, and - on
+       Windows, where a command line keeps its quoting - a CLI embedded --headless
+       without a session. Anything else still holds. #>
     $directories = [System.Collections.Generic.List[string]]::new()
     try {
         $processes = @(Get-Process -ErrorAction Stop)
@@ -572,7 +572,6 @@ function Get-BridgeWorktreeUsage {
         $copilotProcesses = @($agents.copilot.Values)
         $named = Get-BridgeAgentProcessSessionIds -Processes $copilotProcesses
         $accounted = @{}
-        $liveSessions = @{}
         if (Test-Path -LiteralPath $stateRoot -ErrorAction Stop) {
             foreach ($session in Get-ChildItem -LiteralPath $stateRoot -Directory -Force -ErrorAction Stop) {
                 if ($session.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
@@ -600,7 +599,6 @@ function Get-BridgeWorktreeUsage {
                 if (-not $cwd) { throw 'A live Copilot/Agency session has no readable working directory.' }
                 $directories.Add((Resolve-BridgeWorkspaceDirectory -Path $cwd))
                 foreach ($owner in $owners.Keys) { $accounted[$owner] = $true }
-                $liveSessions[$session.Name] = @($owners.Keys)
             }
         }
         foreach ($processId in $agents.copilot.Keys) {
@@ -619,22 +617,18 @@ function Get-BridgeWorktreeUsage {
             throw "Copilot pid $processId has no registered session."
         }
 
-        # Agency starts copilot.exe as its direct child, so a launcher that is the
-        # parent of an accounted Copilot process has finished starting, and its
-        # session's directory is already in the set. The session id on its command
-        # line is the same fact for a platform where the parent cannot be read - but
-        # only from an owner no older than the launcher. A second launcher for a
-        # session that was already running, a duplicate resume, has not started
-        # anything yet, and naming a live session does not make it settled.
-        #
-        # Nor can one owner settle two launchers. An owner whose parent is a launcher
-        # belongs to that launcher alone, and a session that more than one waiting
-        # launcher names does not say which of them started it. Two overlapping
-        # launches for one session otherwise both counted as settled on the strength of
-        # one child, while the other had started nothing in the worktree beneath it.
-        # Raised by Codex on #226.
-        $parented = @{}
-        $settled = @{}
+        # Agency starts copilot.exe as its direct child - a bridge launch on Windows
+        # shows exactly that - so a launcher that is the parent of an accounted Copilot
+        # process has finished starting, and its session's directory is already in the
+        # set. Nothing short of that settles one. A --session-id on its command line
+        # once stood in for parentage, and every reading of it vouched for a launcher
+        # that had started nothing: a duplicate resume naming a session already running,
+        # a prompt mentioning one, two overlapping launches sharing one child, and a
+        # launcher whose session was started directly beside it. In each, cleanup could
+        # take the worktree that launcher was still starting in. Parentage is readable
+        # wherever cleanup runs - the daemon and the CLI need PowerShell 7, whose
+        # Process.Parent works on every platform - and a launcher it does not settle
+        # holds cleanup and is named for it. Raised by Codex on #226.
         foreach ($processId in @($accounted.Keys)) {
             $child = $agents.copilot[$processId]
             $parent = $null
@@ -643,34 +637,14 @@ function Get-BridgeWorktreeUsage {
             $parentId = 0
             try { $parentId = [int]$parent.Id } catch { continue }
             if ($launchers.ContainsKey($parentId) -and $launchers[$parentId].StartTime -le $child.StartTime) {
-                $settled[$parentId] = $true
-                $parented[[int]$processId] = $true
+                [void]$launchers.Remove($parentId)
             }
         }
-        foreach ($parentId in @($settled.Keys)) { [void]$launchers.Remove($parentId) }
-        $waiting = @{}
-        $namedBy = @{}
         foreach ($processId in @($launchers.Keys)) {
             $command = Get-BridgeCommandLine -ProcessId $processId -AsObservation
             if ($command.State -eq 'Absent') { continue }
-            $sessionId = ''
-            if ($command.State -eq 'Readable') {
-                $invocation = Get-BridgeAgencyInvocation -CommandLine $command.Text
-                if ($invocation.Command -eq 'mcp') { continue }
-                $sessionId = [string]$invocation.SessionId
-            }
-            if (-not $sessionId -or -not $liveSessions.ContainsKey($sessionId)) {
-                throw "Agency pid $processId has not registered a session yet, so one may still be starting."
-            }
-            $waiting[$processId] = $sessionId
-            $namedBy[$sessionId] = 1 + [int]$namedBy[$sessionId]
-        }
-        foreach ($processId in @($waiting.Keys)) {
-            $sessionId = $waiting[$processId]
-            $started = $launchers[$processId].StartTime
-            $ownGeneration = @($liveSessions[$sessionId] | Where-Object {
-                    -not $parented.ContainsKey([int]$_) -and $agents.copilot[[int]$_].StartTime -ge $started })
-            if ($namedBy[$sessionId] -eq 1 -and $ownGeneration.Count -gt 0) { continue }
+            if ($command.State -eq 'Readable' -and
+                (Get-BridgeAgencyInvocation -CommandLine $command.Text).Command -eq 'mcp') { continue }
             throw "Agency pid $processId has not registered a session yet, so one may still be starting."
         }
 

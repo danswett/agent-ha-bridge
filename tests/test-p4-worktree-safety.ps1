@@ -944,7 +944,7 @@ setTimeout(() => process.exit(3), 5 * 60 * 1000);
     # did an embedded copilot.exe no registration can name. These are the processes
     # that must now be accounted for, beside the ones that must still hold. An
     # embedded CLI is only told apart on Windows: see the unsettled cases below.
-    $settledModes = @('parent', 'session-id', 'mcp')
+    $settledModes = @('parent', 'mcp')
     if ($IsWindows) { $settledModes += 'embedded' }
     foreach ($mode in $settledModes) {
         Invoke-P4Scenario "a settled $mode process lets cleanup reclaim a finished worktree" {
@@ -959,20 +959,12 @@ setTimeout(() => process.exit(3), 5 * 60 * 1000);
             try {
                 switch ($mode) {
                     'parent' {
-                        # No session id on the launcher, so only the process tree can
-                        # tie it to the session it started.
-                        $launcher = Start-P4Child launcher $elsewhere '' -Arguments @('copilot', '--banner') `
+                        # Launched as the bridge launches one, session id and all - but
+                        # it is the process tree that ties it to the session it started.
+                        $launcher = Start-P4Child launcher $elsewhere '' -Arguments @('copilot', '--session-id', $id, '--banner') `
                             -Spawn @{ Agent = 'copilot'; Directory = $elsewhere; SessionId = $id }
                         $started.Add($launcher.Spawned); $started.Add($launcher)
                         $files = @(New-P4SessionFiles copilot $elsewhere $id $launcher.Spawned.Process.Id)
-                    }
-                    'session-id' {
-                        # Launcher first, as Agency does: the session it names is one it
-                        # could have started, not one already running before it.
-                        $started.Add((Start-P4Child launcher $elsewhere '' -Arguments @('copilot', '--session-id', $id, '--banner')))
-                        $session = Start-P4Child copilot $elsewhere $id
-                        $started.Add($session)
-                        $files = @(New-P4SessionFiles copilot $elsewhere $id $session.Process.Id)
                     }
                     'mcp' { $started.Add((Start-P4Child launcher $elsewhere '' -Arguments @('mcp', 'native', 'kusto'))) }
                     'embedded' {
@@ -999,8 +991,8 @@ setTimeout(() => process.exit(3), 5 * 60 * 1000);
     # flattened argv, where the quotes that say so are gone - so there a CLI that really
     # is embedded holds as well, since the two cannot be told apart. Raised by Codex on
     # #226.
-    $unsettledModes = @('unregistered-launcher', 'duplicate-launcher', 'prompt-names-session', 'twin-launcher', 'twin-launchers',
-        'embedded-with-session', 'prompt-mentions-headless')
+    $unsettledModes = @('unregistered-launcher', 'duplicate-launcher', 'unrelated-owner', 'prompt-names-session', 'twin-launcher',
+        'twin-launchers', 'embedded-with-session', 'prompt-mentions-headless')
     if (-not $IsWindows) { $unsettledModes += 'embedded' }
     foreach ($mode in $unsettledModes) {
         Invoke-P4Scenario "an unsettled $mode process still holds cleanup" {
@@ -1026,22 +1018,19 @@ setTimeout(() => process.exit(3), 5 * 60 * 1000);
                 'embedded-with-session' { Start-P4Child copilot $worktree $id -Arguments @('--headless') }
                 'prompt-mentions-headless' { Start-P4Child copilot $worktree '' -Arguments @('-i', 'explain "quoted --headless text"') }
                 'embedded' { Start-P4Child copilot $worktree '' -Arguments @('--headless', '--no-auto-update', '--stdio') }
-                # Its prompt names a session that started after it, which is what its
-                # own would look like - so the id has to be read as text. Off Windows
-                # ps has flattened the prompt into the options. Raised by Codex on #226.
                 'prompt-names-session' { Start-P4Child launcher $worktree '' -Arguments @('copilot', '-i', "continue --session-id $id") }
                 default { Start-P4Child launcher $worktree '' -Arguments @('copilot', '--session-id', $id) }
             }
             $names = @(if ($mode -in @('embedded-with-session', 'prompt-mentions-headless', 'embedded')) { "Copilot pid $($child.Process.Id)" }
                 else { "Agency pid $($child.Process.Id)" })
             try {
-                # Each of these starts an owner after the launcher in the candidate, so
-                # by age alone that owner could be its session. Two overlapping launches
-                # for one session settle only the one whose child it is: by parentage
-                # where the owner is a launcher's child, and not at all where it is
-                # neither's - either launcher can be the one that holds then. Raised by
-                # Codex on #226.
-                if ($mode -in @('prompt-names-session', 'twin-launcher', 'twin-launchers')) {
+                # Each of these starts the owner of the session the launcher names, or
+                # its prompt mentions, after the launcher - so by session and age alone
+                # that owner could be the launcher's own. It is not its child, though:
+                # it was started directly, or by another launcher for the same session,
+                # or neither launcher of two started it. Only parentage settles a
+                # launcher, so each still holds. Raised by Codex on #226.
+                if ($mode -in @('unrelated-owner', 'prompt-names-session', 'twin-launcher', 'twin-launchers')) {
                     $elsewhere = Join-Path $fixture.Root 'elsewhere'
                     [void][IO.Directory]::CreateDirectory($elsewhere)
                     if ($mode -eq 'twin-launcher') {

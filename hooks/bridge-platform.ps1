@@ -1243,10 +1243,9 @@ function Get-BridgeCommandLineOptions {
         A prompt is text, and can say anything - `--session-id <uuid>` included. What
         is read off these lines is which session a process is working in, and a
         process credited with a session it only mentions is wrong in every way that
-        matters: a launcher counts as settled while its own session is still starting,
-        so cleanup can take the worktree it is starting in, and a reply meant for the
-        session it mentions can be typed into its console instead. Raised by Codex on
-        #226.
+        matters: cleanup protects that session's directory instead of the one it is
+        running in, and a reply meant for that session can be typed into its console.
+        Raised by Codex on #226.
 
         On Windows the line is split as the program splits it, so the value of
         -i/--interactive or -p/--prompt is one argument and only that is skipped; a
@@ -1357,7 +1356,7 @@ function Test-BridgeAgentEmbeddedProcess {
 function Get-BridgeAgencyInvocation {
     <#
         What an Agency process was asked to do, from its command line: the subcommand
-        (`copilot`, `mcp`, ...) and the session id it was given, if any.
+        (`copilot`, `mcp`, ...).
 
         Agency is not only a session launcher. Every session started through it also
         keeps `agency mcp ...` servers running for as long as it lives, and those are
@@ -1366,33 +1365,27 @@ function Get-BridgeAgencyInvocation {
 
         The subcommand is the first argument after the program that is neither an
         option nor the program again, which is what an interpreter running Agency as a
-        script puts there. The two global options that take a value are skipped with
-        it, so `--verbosity debug copilot` is a copilot launch. Anything this cannot
-        parse reads as no subcommand, which callers treat as a possible launcher. Both
-        answers come from the options alone (Get-BridgeCommandLineOptions), so neither
-        can be read out of a prompt.
+        script puts there. The global options that take a value are skipped with it,
+        so `--verbosity debug copilot` is a copilot launch. Anything this cannot parse
+        reads as no subcommand, which callers treat as a possible launcher. It comes
+        from the options alone (Get-BridgeCommandLineOptions), so it cannot be read out
+        of a prompt.
     #>
     param([string]$CommandLine = '')
-    $invocation = [pscustomobject]@{ Command = ''; SessionId = '' }
+    $invocation = [pscustomobject]@{ Command = '' }
     $tokens = @(Get-BridgeCommandLineOptions -CommandLine $CommandLine)
-    $program = -1
+    $program = $false
     for ($index = 0; $index -lt $tokens.Count; $index++) {
         $token = [string]$tokens[$index]
         # Split on either separator, so a command line parses the same on every host:
         # [IO.Path] on macOS and Linux splits on '/' alone and reads a Windows path as
         # one long file name. Raised by Codex on #226.
         $leaf = try { [System.IO.Path]::GetFileNameWithoutExtension(($token -split '[\\/]')[-1]) } catch { '' }
-        if ($leaf -eq 'agency' -and -not $invocation.Command) { $program = $index; continue }
-        if ($program -lt 0) { continue }
-        # Its value is a session, never the subcommand.
-        if ($token -eq '--session-id') { $index++; continue }
-        if ($invocation.Command) { continue }
-        if ($token -in @('--verbosity', '--log-dir')) { $index++; continue }
+        if ($leaf -eq 'agency' -and -not $invocation.Command) { $program = $true; continue }
+        if (-not $program -or $invocation.Command) { continue }
+        if ($token -in @('--session-id', '--verbosity', '--log-dir')) { $index++; continue }
         if ($token.StartsWith('-')) { continue }
         $invocation.Command = $token.ToLowerInvariant()
-    }
-    if ($program -ge 0) {
-        $invocation.SessionId = Get-BridgeCommandLineSessionId -Options @($tokens | Select-Object -Skip ($program + 1))
     }
     $invocation
 }
