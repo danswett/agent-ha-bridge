@@ -1672,9 +1672,10 @@ One update runs at a time on an installation. A press while one is already runni
 from another browser, from Home Assistant's own button, or while `agent-ha-bridge
 update` runs in a terminal — does not start a second installer over the same files:
 the row goes on showing the update that is running, and a notification says the press
-was not acted on until that update's own result replaces it. The updater holds a lock
-for as long as it runs, and the operating system releases it however the updater ends,
-so one that crashes cannot leave the machine unable to update.
+was not acted on until that update's own result replaces it — or, if it stops without
+reporting one, a notice that it did. The updater holds a lock for as long as it runs,
+and the operating system releases it however the updater ends, so one that crashes
+cannot leave the machine unable to update.
 
 A browser served a card older than 1.31.0 gets the previous separate **Bridge update
 available** card instead; the two are never drawn at once.
