@@ -227,6 +227,9 @@ $script:DaemonRegistrationStamps = @{}
 # end of the interval, so a newly registered session's card appears straight away.
 $script:DaemonPendingLaunch = $null
 $script:DaemonReconcileNow = $false
+# The note a launch left when its session registered - worktree cleanup being blocked -
+# which that same registration must not then clear (Clear-DaemonLaunchNoteOnRegistration).
+$script:DaemonLaunchKeptNote = ''
 
 # Who pressed Launch, and the driver waiting for the session that press produced. The
 # press carries the account behind it and the session does not exist yet, so the

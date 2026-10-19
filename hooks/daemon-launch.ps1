@@ -1906,6 +1906,10 @@ function Start-DaemonLaunch {
     $worktreeOperation = $null
     $worktreeReservation = $null
     $reservationPath = ''
+    # Left on the launch note once the session registers, instead of clearing it: an
+    # isolated launch is the only place worktree cleanup runs, so it is the only
+    # place that can say cleanup has stopped working before the limit says it (#215).
+    $cleanupNote = ''
     try {
         $candidate = if ($null -ne $resumeSession) { [string]$resumeSession.Folder } else { $directory }
         if (-not [string]::IsNullOrWhiteSpace($candidate) -and [System.IO.Directory]::Exists($candidate)) {
@@ -1967,6 +1971,9 @@ function Start-DaemonLaunch {
                 }
                 $launchDirectory = $worktree.Path
                 $reservationPath = Get-BridgeWorkspaceManagedWorktree -Path $worktree.Path
+                if ($worktree.PSObject.Properties['CleanupBlocked'] -and $worktree.CleanupBlocked) {
+                    $cleanupNote = "Worktree cleanup is blocked: $($worktree.CleanupBlocked)"
+                }
                 if ($worktree.Detail) {
                     Write-DaemonLog -Message "$(if ($worktree.Isolated) { 'worktree' } else { 'no worktree' }): $($worktree.Detail)"
                 }
@@ -2077,6 +2084,7 @@ function Start-DaemonLaunch {
             AwaitingFirstMessage = ((Get-BridgeLauncher -Launcher $chosenLauncher).NeedsFirstMessage -and -not $prompt)
             FirstMessageAsked    = $false
             WorktreeReservation  = $worktreeReservation
+            Note                 = $cleanupNote
         }
 
         # A launch changes what is resumable - the session just started is now live, and
@@ -2183,7 +2191,10 @@ function Clear-DaemonLaunchNoteOnRegistration {
 
         A session registering is the proof that note is obsolete, whichever launch it
         came from. A launch still being followed keeps its own note: that one is
-        current, and Update-DaemonPendingLaunch clears it itself.
+        current, and Update-DaemonPendingLaunch clears it itself. So does the note a
+        launch leaves on registering, which is written because of that registration:
+        cleared here, a reconcile later, worktree cleanup being blocked showed for a
+        fraction of a second (raised by Codex on #226). The expiry clears that one.
     #>
     param([Parameter(Mandatory)][hashtable]$Headers)
 
@@ -2192,6 +2203,7 @@ function Clear-DaemonLaunchNoteOnRegistration {
         $state = Get-HomeAssistantState -EntityId $script:DaemonEntity.NewResult -Headers $Headers
         $text = [string]$state.state
         if ([string]::IsNullOrWhiteSpace($text) -or $text -in @('unknown', 'unavailable')) { return }
+        if ($script:DaemonLaunchKeptNote -and $text -ceq $script:DaemonLaunchKeptNote) { return }
         Set-CopilotMqttNewSessionResult -Headers $Headers -Text ''
         Write-DaemonLog -Message "cleared the launch note now a session has registered: $text"
     }
@@ -2264,8 +2276,11 @@ function Update-DaemonPendingLaunch {
         Clear-DaemonStaleLaunchTuning
         # The session's own card is the confirmation, so the note is cleared, and a
         # reconcile is asked for now so the card appears without waiting the interval.
+        # Cleared unless the launch has something to say that the card cannot.
         $script:DaemonReconcileNow = $true
-        & $finish '' ("$($p.Verb) $agent in $($p.Label); registered after {0:N1} s" -f ($now - $p.Since).TotalSeconds)
+        $note = if ($p.PSObject.Properties['Note']) { [string]$p.Note } else { '' }
+        $script:DaemonLaunchKeptNote = $note
+        & $finish $note ("$($p.Verb) $agent in $($p.Label); registered after {0:N1} s" -f ($now - $p.Since).TotalSeconds)
         return
     }
 

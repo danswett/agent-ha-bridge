@@ -522,7 +522,19 @@ function Read-BridgeCopilotWorkspace {
 function Get-BridgeWorktreeUsage {
     <# A read-only safety snapshot, not session discovery: no caps, cached answers,
        enrollment filtering, age-based retirement or deletion of registrations.
-       An incomplete snapshot cannot authorize cleanup. #>
+       An incomplete snapshot cannot authorize cleanup.
+
+       Every exception here has to be one that clears. A guard that can never be
+       satisfied does not make cleanup careful, it switches it off: on 2026-10-15 a
+       machine refused a launch at the worktree limit with eight finished trees that
+       had not been reclaimed for a week, because any live agency.exe - the launcher
+       of every Agency session already running, and the `agency mcp` servers each one
+       keeps - vetoed cleanup outright, and so did Microsoft Scout's
+       embedded copilot.exe, which no registration can ever name (#215). The
+       exceptions are positive identifications: a launcher that is the parent of a
+       session registered and accounted for below, an Agency MCP server, and - on
+       Windows, where a command line keeps its quoting - a CLI embedded --headless
+       without a session. Anything else still holds. #>
     $directories = [System.Collections.Generic.List[string]]::new()
     try {
         $processes = @(Get-Process -ErrorAction Stop)
@@ -544,9 +556,15 @@ function Get-BridgeWorktreeUsage {
                     [void]$process.StartTime
                     $agents[$kind][[int]$process.Id] = $process
                 }
-                if (@($processes | Where-Object { Test-BridgeAgentProcess -Process $_ -Agent 'agency' }).Count) {
-                    throw 'An Agency launcher is active; cleanup cannot rule out a session still starting.'
-                }
+            }
+        }
+        # Collected once and judged after Copilot is accounted for, because whether a
+        # launcher is still starting depends on whether its session has registered.
+        $launchers = @{}
+        foreach ($process in $processes) {
+            if (Test-BridgeAgentProcess -Process $process -Agent 'agency') {
+                [void]$process.StartTime
+                $launchers[[int]$process.Id] = $process
             }
         }
 
@@ -584,9 +602,50 @@ function Get-BridgeWorktreeUsage {
             }
         }
         foreach ($processId in $agents.copilot.Keys) {
-            if (-not $accounted.ContainsKey($processId)) {
-                throw 'A live Copilot/Agency process has no authoritative session working directory.'
+            if ($accounted.ContainsKey($processId)) { continue }
+            # Positive identification only, as in session discovery (#106): an
+            # unreadable command line is not evidence that a process is embedded.
+            $command = Get-BridgeCommandLine -ProcessId $processId -AsObservation
+            if ($command.State -eq 'Absent') { continue }
+            # Windows only, whose command line is the string the process was given,
+            # quotes and all. Elsewhere it is ps's flattened argv, in which a prompt
+            # passed as -i "...--headless..." reads exactly like the flag, and excusing
+            # a session that has not registered yet would let cleanup take the worktree
+            # it is starting in. Raised by Codex on #226.
+            if ($script:BridgeIsWindows -and $command.State -eq 'Readable' -and
+                (Test-BridgeAgentEmbeddedProcess -CommandLine $command.Text)) { continue }
+            throw "Copilot pid $processId has no registered session."
+        }
+
+        # Agency starts copilot.exe as its direct child - a bridge launch on Windows
+        # shows exactly that - so a launcher that is the parent of an accounted Copilot
+        # process has finished starting, and its session's directory is already in the
+        # set. Nothing short of that settles one. A --session-id on its command line
+        # once stood in for parentage, and every reading of it vouched for a launcher
+        # that had started nothing: a duplicate resume naming a session already running,
+        # a prompt mentioning one, two overlapping launches sharing one child, and a
+        # launcher whose session was started directly beside it. In each, cleanup could
+        # take the worktree that launcher was still starting in. Parentage is readable
+        # wherever cleanup runs - the daemon and the CLI need PowerShell 7, whose
+        # Process.Parent works on every platform - and a launcher it does not settle
+        # holds cleanup and is named for it. Raised by Codex on #226.
+        foreach ($processId in @($accounted.Keys)) {
+            $child = $agents.copilot[$processId]
+            $parent = $null
+            try { $parent = $child.Parent } catch { $parent = $null }
+            if ($null -eq $parent) { continue }
+            $parentId = 0
+            try { $parentId = [int]$parent.Id } catch { continue }
+            if ($launchers.ContainsKey($parentId) -and $launchers[$parentId].StartTime -le $child.StartTime) {
+                [void]$launchers.Remove($parentId)
             }
+        }
+        foreach ($processId in @($launchers.Keys)) {
+            $command = Get-BridgeCommandLine -ProcessId $processId -AsObservation
+            if ($command.State -eq 'Absent') { continue }
+            if ($command.State -eq 'Readable' -and
+                (Get-BridgeAgencyInvocation -CommandLine $command.Text).Command -eq 'mcp') { continue }
+            throw "Agency pid $processId has not registered a session yet, so one may still be starting."
         }
 
         foreach ($kind in @('claude', 'codex')) {
@@ -631,7 +690,7 @@ function Get-BridgeWorktreeUsage {
             }
             foreach ($processId in $agents[$kind].Keys) {
                 if (-not $accounted.ContainsKey($processId)) {
-                    throw "A live $kind process has no authoritative registration."
+                    throw "A live $kind process (pid $processId) has no authoritative registration."
                 }
             }
         }
@@ -979,15 +1038,29 @@ function Remove-BridgeWorktreeFiles {
 }
 
 function Remove-BridgeFinishedWorktree {
-    param([Parameter(Mandatory)][string]$RepositoryPath, [double]$IdleHours = 12)
+    <#
+        Removes the repository's finished managed worktrees and returns how many.
+
+        -AsObservation returns { Removed; Blocked } instead, Blocked being why cleanup
+        could not run at all, or ''. Retaining a tree that is not finished is the
+        normal answer and is not Blocked; being unable to judge any of them is, and a
+        launch has to be able to say so. Left as a warning only, a guard that never
+        cleared disabled cleanup for a week before the worktree limit refused a
+        launch, which was the first anyone heard of it (#215).
+    #>
+    param([Parameter(Mandatory)][string]$RepositoryPath, [double]$IdleHours = 12, [switch]$AsObservation)
 
     $removed = 0
+    $blocked = ''
     $operation = $null
     try {
         $operation = Enter-BridgeWorktreeOperation -RepositoryPath $RepositoryPath
         $baseRef = Get-BridgeRepositoryBaseRef -RepositoryPath $RepositoryPath
         $usage = Get-BridgeWorktreeUsage
-        if (-not $usage.Known) { throw "Workspace usage is unknown: $($usage.Detail)" }
+        if (-not $usage.Known) {
+            $blocked = [string]$usage.Detail
+            throw "Workspace usage is unknown: $($usage.Detail)"
+        }
         foreach ($worktree in @(Get-BridgeManagedWorktree -RepositoryPath $RepositoryPath)) {
             if (Test-BridgeWorktreeInUse -WorktreePath $worktree -Usage $usage) { continue }
             $common = Invoke-BridgeGit -Directory $worktree -Arguments @('rev-parse', '--path-format=absolute', '--git-common-dir')
@@ -999,10 +1072,14 @@ function Remove-BridgeFinishedWorktree {
             if (Remove-BridgeWorktreeFiles -WorktreePath $worktree -BaseRef $baseRef -IdleHours $IdleHours) { $removed++ }
         }
     }
-    catch { Write-BridgeLaunchWarning "Managed worktrees were retained because cleanup could not be authorized: $($_.Exception.Message)" }
+    catch {
+        if (-not $blocked) { $blocked = [string]$_.Exception.Message }
+        Write-BridgeLaunchWarning "Managed worktrees were retained because cleanup could not be authorized: $($_.Exception.Message)"
+    }
     finally {
         if ($null -ne $operation) { $operation.Mutex.ReleaseMutex(); $operation.Mutex.Dispose() }
     }
+    if ($AsObservation) { return [pscustomobject]@{ Removed = $removed; Blocked = $blocked } }
     $removed
 }
 
@@ -1046,15 +1123,25 @@ function New-BridgeSessionWorktree {
         $operation = Enter-BridgeWorktreeOperation -RepositoryPath $RepositoryPath
         # Finished worktrees are cleared before the cap is judged, so a long-lived
         # install does not end up refusing isolation because of sessions that ended days
-        # ago. Best effort: a prune that fails must not stop a launch.
+        # ago. Best effort: a prune that fails must not stop a launch - but it must be
+        # said, on every launch, rather than discovered when the cap is reached (#215).
         $removed = 0
-        try { $removed = Remove-BridgeFinishedWorktree -RepositoryPath $RepositoryPath -IdleHours $IdleHours }
-        catch { Write-BridgeLaunchWarning "Worktree cleanup was refused; existing trees were retained: $($_.Exception.Message)" }
+        $blocked = ''
+        try {
+            $cleanup = Remove-BridgeFinishedWorktree -RepositoryPath $RepositoryPath -IdleHours $IdleHours -AsObservation
+            $removed = [int]$cleanup.Removed
+            $blocked = [string]$cleanup.Blocked
+        }
+        catch {
+            $blocked = [string]$_.Exception.Message
+            Write-BridgeLaunchWarning "Worktree cleanup was refused; existing trees were retained: $blocked"
+        }
 
         $existing = @(Get-BridgeManagedWorktree -RepositoryPath $RepositoryPath)
         $registered = @(Get-BridgeRepositoryWorktree -RepositoryPath $RepositoryPath)
         if ($Limit -gt 0 -and $existing.Count -ge $Limit) {
             $refused.Detail = "$($existing.Count) managed worktrees already exist (limit $Limit); finish or explicitly remove some before launching."
+            if ($blocked) { $refused.Detail += " Cleanup is blocked: $blocked" }
             return $refused
         }
 
@@ -1115,7 +1202,8 @@ function New-BridgeSessionWorktree {
         $detail = "$launchPath from $baseRef"
         if ($removed -gt 0) { $detail += " (removed $removed finished)" }
         if (-not $fetch.Ok) { $detail += '; origin fetch failed, so the existing local base was used' }
-        [pscustomobject]@{ Path = $launchPath; Isolated = $true; Detail = $detail }
+        if ($blocked) { $detail += "; cleanup is blocked: $blocked" }
+        [pscustomobject]@{ Path = $launchPath; Isolated = $true; Detail = $detail; CleanupBlocked = $blocked }
     }
     catch {
         # Named rather than passed through raw. The console-handle failure described in

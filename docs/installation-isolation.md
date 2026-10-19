@@ -190,10 +190,26 @@ This is a host-local safety change, not a shared dashboard or client-state migra
 Cleanup reads uncapped current Copilot/Agency, Claude and Codex process/registration
 state independently of suggestion settings and caches. Descendant working directories
 and path aliases protect their containing tree. Unreadable, incomplete or unmapped
-live state blocks cleanup; age alone never proves a session ended. A standalone
-Agency launcher is conservatively treated as a potentially starting session.
+live state blocks cleanup; age alone never proves a session ended. An Agency launcher
+is accounted for once the session it started has registered - it is the parent of an
+accounted Copilot process - and the `agency mcp` servers each Agency session keeps are
+not launches. Any other Agency launcher is conservatively treated as a potentially
+starting session, whatever session id it carries: a session it names, or its prompt
+mentions, may be one it did not start. A Copilot process's own session id is read only
+from its command line's options, never from its prompt; elsewhere than Windows, where
+`ps` has flattened the prompt into the options around it, nothing after a prompt
+option is read at all. The bridge puts `--session-id` ahead of the prompt in every
+launch, so its own sessions still read in full. On Windows, a
+Copilot CLI embedded `--headless` with no session id, as Microsoft Scout runs one, is
+not a session. Elsewhere the command line can only be read as `ps` prints it, with the
+quoting gone, so a prompt that mentions `--headless` would look the same; there an
+embedded CLI blocks cleanup like any other unregistered Copilot process.
 Relative working directories and registrations predating the current process
 generation are uncertain, not evidence that another worktree is unused.
+
+When cleanup cannot run, each isolated launch says why, naming the process
+responsible: in the daemon log, on the launch card once the session registers, and in
+the refusal at `newSession.worktreeLimit`.
 
 Only marked, unlocked, sufficiently old, clean and detached trees with no commits
 ahead of their readable base qualify. Dirty, untracked, ignored, unmerged,

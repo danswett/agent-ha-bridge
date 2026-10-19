@@ -982,7 +982,10 @@ A few deliberate choices:
   modifications keep the tree. Without the exception, following the project's own test
   instructions made a worktree unreclaimable for ever and the launch cap filled.
   Pending launches hold a Git lock until registration. If isolation cannot be provided,
-  the launch stops with a useful error instead of using the original checkout.
+  the launch stops with a useful error instead of using the original checkout. If
+  cleanup itself cannot run - a live agent process nothing accounts for, say - each
+  isolated launch says so on its card, naming the process, rather than the first sign
+  being a launch refused at the cap.
 - **Tools are not auto-approved.** Launched sessions get no `--allow-all` unless
   you set `newSession.allowAllTools`. Permission prompts already route to Home
   Assistant, so an unattended session still asks before it acts.

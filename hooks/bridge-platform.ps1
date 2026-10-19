@@ -1173,6 +1173,133 @@ function Get-BridgeAgentProcesses {
     }
 }
 
+function ConvertFrom-BridgeWindowsCommandLine {
+    <#
+        The arguments a Windows program is given by its command line, split the way the
+        C runtime and CommandLineToArgvW split them: whitespace separates arguments
+        outside quotes, 2n backslashes before a quote are n backslashes and the quote
+        opens or closes quoting, 2n+1 are n backslashes and a literal quote, and a
+        backslash anywhere else is itself. The inverse of ConvertTo-BridgeArgumentString,
+        which is how the bridge quotes a prompt typed on a phone - so a quote inside one
+        arrives as \", and a regex that strips "..." reads the text after it as options.
+        Raised by Codex on #226.
+
+        Ambiguous marks "" inside quotes, the one place the two splitters disagree: the
+        C runtime reads a literal quote and stays quoted, CommandLineToArgvW reads one
+        that also ends the quoting. A caller deciding something about safety treats that
+        as unreadable rather than picking one.
+    #>
+    param([AllowEmptyString()][string]$CommandLine = '')
+    $arguments = [Collections.Generic.List[string]]::new()
+    $current = [Text.StringBuilder]::new()
+    $quoted = $false
+    $started = $false
+    $ambiguous = $false
+    $index = 0
+    while ($index -lt $CommandLine.Length) {
+        $character = $CommandLine[$index]
+        if ($character -eq [char]'\') {
+            $run = 0
+            while ($index -lt $CommandLine.Length -and $CommandLine[$index] -eq [char]'\') { $run++; $index++ }
+            $started = $true
+            if ($index -lt $CommandLine.Length -and $CommandLine[$index] -eq [char]'"') {
+                [void]$current.Append([string]::new([char]'\', [int][Math]::Floor($run / 2)))
+                # An odd run escapes the quote; an even one leaves it to open or close.
+                if ($run % 2 -eq 1) { [void]$current.Append([char]'"'); $index++ }
+            }
+            else { [void]$current.Append([string]::new([char]'\', $run)) }
+            continue
+        }
+        if ($character -eq [char]'"') {
+            $started = $true
+            if ($quoted -and $index + 1 -lt $CommandLine.Length -and $CommandLine[$index + 1] -eq [char]'"') {
+                $ambiguous = $true
+                [void]$current.Append([char]'"')
+                $index += 2
+                continue
+            }
+            $quoted = -not $quoted
+            $index++
+            continue
+        }
+        if (-not $quoted -and ($character -eq [char]' ' -or $character -eq [char]"`t")) {
+            if ($started) { $arguments.Add($current.ToString()); [void]$current.Clear(); $started = $false }
+            $index++
+            continue
+        }
+        [void]$current.Append($character)
+        $started = $true
+        $index++
+    }
+    if ($started) { $arguments.Add($current.ToString()) }
+    [pscustomobject]@{ Arguments = [string[]]$arguments.ToArray(); Ambiguous = $ambiguous }
+}
+
+function Get-BridgeCommandLineOptions {
+    <#
+        The arguments of a Copilot or Agency command line that can be read as its
+        options: the program and everything up to its prompt, never the prompt itself.
+
+        A prompt is text, and can say anything - `--session-id <uuid>` included. What
+        is read off these lines is which session a process is working in, and a
+        process credited with a session it only mentions is wrong in every way that
+        matters: cleanup protects that session's directory instead of the one it is
+        running in, and a reply meant for that session can be typed into its console.
+        Raised by Codex on #226.
+
+        On Windows the line is split as the program splits it, so the value of
+        -i/--interactive or -p/--prompt is one argument and only that is skipped; a
+        line the two Windows splitters read differently gives nothing. Elsewhere it is
+        ps's flattened argv, where nothing after a prompt option can be told apart from
+        the prompt, so nothing from there on is returned. Every launch the bridge makes
+        puts --session-id ahead of the prompt, so its own sessions read in full either
+        way. `--` ends the options everywhere.
+    #>
+    param([string]$CommandLine = '')
+    $tokens = @()
+    if ($script:BridgeIsWindows) {
+        $parsed = ConvertFrom-BridgeWindowsCommandLine -CommandLine $CommandLine
+        if ($parsed.Ambiguous) { return }
+        $tokens = @($parsed.Arguments)
+    }
+    else { $tokens = @([regex]::Matches([string]$CommandLine, '"[^"]*"|[^\s"]+') | ForEach-Object { $_.Value.Trim('"') }) }
+    for ($index = 0; $index -lt $tokens.Count; $index++) {
+        $token = [string]$tokens[$index]
+        if ($token -ceq '--') { return }
+        $separate = $token -cmatch '^(?:-[ip]|--interactive|--prompt)$'
+        if ($separate -or $token -cmatch '^(?:-[ip].|--interactive=|--prompt=)') {
+            if (-not $script:BridgeIsWindows) { return }
+            if ($separate) { $index++ }
+            continue
+        }
+        $token
+    }
+}
+
+function Get-BridgeCommandLineSessionId {
+    <#
+        The session id among a command line's options (Get-BridgeCommandLineOptions),
+        or '' if they name none. Spelled `--session-id <id>` or `--session-id=<id>`,
+        and matched as a UUID so that a name or a prefix cannot be taken for one.
+        Options naming two different sessions name neither: which one the program
+        used is not something to guess at when the answer decides what cleanup may
+        remove and where a reply is typed.
+    #>
+    param([AllowEmptyCollection()][string[]]$Options = @())
+    $found = @{}
+    for ($index = 0; $index -lt $Options.Count; $index++) {
+        if ([string]$Options[$index] -notmatch '^--session-id(?:=(.*))?$') { continue }
+        $value = ''
+        if ($Matches[1]) { $value = [string]$Matches[1] }
+        elseif ($index + 1 -lt $Options.Count) { $index++; $value = [string]$Options[$index] }
+        if ($value -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+            $found[$value.ToLowerInvariant()] = $value
+        }
+    }
+    if ($found.Count -ne 1) { return '' }
+    [string]@($found.Values)[0]
+}
+
 function Test-BridgeAgentEmbeddedProcess {
     <#
         Whether an agent CLI process is an embedded, headless instance rather than an
@@ -1194,18 +1321,73 @@ function Test-BridgeAgentEmbeddedProcess {
         Two guards against excusing a process that is really a session, because the
         cost of that is a live session being retired while it is still working:
 
-          - Quoted values are removed before anything is read as an option. A prompt
-            passed as -i "...--headless..." is text, not a flag, and a session asked
-            about this very bug would otherwise have excused itself.
+          - A prompt is text, not a flag. On Windows the command line is split into
+            the arguments the program receives, so -i "...--headless..." is one
+            argument however its own quotes were escaped; elsewhere quoted values are
+            removed before anything is read as an option. A session asked about this
+            very bug would otherwise have excused itself.
           - A session carries its id on the command line, new or resumed alike (see
             Get-BridgeAgentProcessSessionIds), while an embedded CLI is driven over
-            stdio and never given one. So --session-id settles it outright.
+            stdio and never given one - nor a prompt. So --session-id, -i/--interactive
+            or -p/--prompt settles it outright.
     #>
     param([string]$CommandLine = '')
     if ([string]::IsNullOrWhiteSpace($CommandLine)) { return $false }
+    if ($script:BridgeIsWindows) {
+        # Split as the program splits it, so a prompt whose own quotes arrived as \"
+        # cannot leave --headless outside them. Raised by Codex on #226.
+        $parsed = ConvertFrom-BridgeWindowsCommandLine -CommandLine $CommandLine
+        if ($parsed.Ambiguous) { return $false }
+        $names = @($parsed.Arguments | Select-Object -Skip 1 | ForEach-Object { ([string]$_ -split '=', 2)[0] })
+        if ($names -notcontains '--headless') { return $false }
+        # Nor can a prompt that is itself the word --headless, which splitting leaves
+        # as an argument of its own: a CLI driven over stdio is never handed a prompt,
+        # so one that has been is a session, whatever the prompt says. Also Codex on
+        # #226.
+        return (-not @($names | Where-Object {
+                    $_ -in @('--session-id', '--interactive', '--prompt') -or $_ -cmatch '^-[ip]'
+                }).Count)
+    }
     $options = [regex]::Replace($CommandLine, '"[^"]*"', ' ')
     if ($options -notmatch '(^|\s)--headless(\s|=|$)') { return $false }
-    -not ($options -match '(^|\s)--session-id(\s|=)')
+    -not ($options -match '(^|\s)(--session-id|--interactive|--prompt)(\s|=)' -or $options -cmatch '(^|\s)-[ip](\s|$)')
+}
+
+function Get-BridgeAgencyInvocation {
+    <#
+        What an Agency process was asked to do, from its command line: the subcommand
+        (`copilot`, `mcp`, ...).
+
+        Agency is not only a session launcher. Every session started through it also
+        keeps `agency mcp ...` servers running for as long as it lives, and those are
+        processes named agency too - so "an Agency process exists" says nothing about
+        whether a session is starting (#215).
+
+        The subcommand is the first argument after the program that is neither an
+        option nor the program again, which is what an interpreter running Agency as a
+        script puts there. The global options that take a value are skipped with it,
+        so `--verbosity debug copilot` is a copilot launch. Anything this cannot parse
+        reads as no subcommand, which callers treat as a possible launcher. It comes
+        from the options alone (Get-BridgeCommandLineOptions), so it cannot be read out
+        of a prompt.
+    #>
+    param([string]$CommandLine = '')
+    $invocation = [pscustomobject]@{ Command = '' }
+    $tokens = @(Get-BridgeCommandLineOptions -CommandLine $CommandLine)
+    $program = $false
+    for ($index = 0; $index -lt $tokens.Count; $index++) {
+        $token = [string]$tokens[$index]
+        # Split on either separator, so a command line parses the same on every host:
+        # [IO.Path] on macOS and Linux splits on '/' alone and reads a Windows path as
+        # one long file name. Raised by Codex on #226.
+        $leaf = try { [System.IO.Path]::GetFileNameWithoutExtension(($token -split '[\\/]')[-1]) } catch { '' }
+        if ($leaf -eq 'agency' -and -not $invocation.Command) { $program = $true; continue }
+        if (-not $program -or $invocation.Command) { continue }
+        if ($token -in @('--session-id', '--verbosity', '--log-dir')) { $index++; continue }
+        if ($token.StartsWith('-')) { continue }
+        $invocation.Command = $token.ToLowerInvariant()
+    }
+    $invocation
 }
 
 function Get-BridgeAgentProcessSessionIds {
@@ -1256,13 +1438,11 @@ function Get-BridgeAgentProcessSessionIds {
             if ([string]::IsNullOrWhiteSpace($commandLine)) {
                 $commandLine = Get-BridgeCommandLine -ProcessId $processId
             }
-            # `--session-id <id>` and `--session-id=<id>` are both spelled by the CLI,
-            # and the value is matched as a UUID so a prefix or a name cannot be taken
-            # for one.
-            $found = ''
-            if ($commandLine -match '--session-id[=\s]+"?([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})') {
-                $found = $Matches[1]
-            }
+            # `--session-id <id>` and `--session-id=<id>` are both spelled by the CLI.
+            # Read from the options alone: the regex this replaced found one inside a
+            # prompt too, on every platform, and credited the process with a session it
+            # only mentioned. Raised by Codex on #226.
+            $found = Get-BridgeCommandLineSessionId -Options @(Get-BridgeCommandLineOptions -CommandLine $commandLine)
             $script:BridgeAgentSessionIdCache[$key] = $found
         }
 

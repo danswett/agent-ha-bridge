@@ -299,6 +299,135 @@ try {
         finally { ${function:Get-BridgeWorktreeUsage} = $realUsage }
 
     Write-Host ''
+    Write-Host '--- cleanup that cannot run says so on every launch, not only at the limit ---'
+    # #215: the only trace of a cleanup guard that never cleared was a warning nobody
+    # reads, for a week, until the limit refused a launch.
+    $realUsage = ${function:Get-BridgeWorktreeUsage}
+    try {
+        function Get-BridgeWorktreeUsage {
+            [pscustomobject]@{ Known = $false; Directories = @(); Detail = 'Agency pid 4242 has not registered a session yet, so one may still be starting.' }
+        }
+        $observed = Remove-BridgeFinishedWorktree -RepositoryPath $repo -IdleHours 12 -AsObservation -WarningAction SilentlyContinue
+        Test-That 'cleanup that could not run reports why, not only that it removed nothing' {
+            $observed.Removed -eq 0 -and $observed.Blocked -ceq 'Agency pid 4242 has not registered a session yet, so one may still be starting.'
+        } "blocked: $($observed.Blocked)"
+        $launchedWhileBlocked = New-BridgeSessionWorktree -RepositoryPath $repo -Limit 0 -IdleHours 12 -WarningAction SilentlyContinue
+        Test-That 'a launch under the limit still goes ahead' {
+            $launchedWhileBlocked.Isolated -and [System.IO.Directory]::Exists($launchedWhileBlocked.Path)
+        }
+        Test-That 'and carries the reason, so a broken cleanup shows before the limit is reached' {
+            $launchedWhileBlocked.CleanupBlocked -match 'Agency pid 4242' -and
+                $launchedWhileBlocked.Detail -match 'cleanup is blocked: Agency pid 4242'
+        } "detail: $($launchedWhileBlocked.Detail)"
+        $count = @(Get-BridgeManagedWorktree -RepositoryPath $repo).Count
+        $refusedAtLimit = New-BridgeSessionWorktree -RepositoryPath $repo -Limit $count -IdleHours 12 -WarningAction SilentlyContinue
+        Test-That 'and a launch refused at the limit names the cleanup that could not run' {
+            -not $refusedAtLimit.Isolated -and $refusedAtLimit.Detail -match 'limit' -and
+                $refusedAtLimit.Detail -match 'Cleanup is blocked: Agency pid 4242'
+        } "detail: $($refusedAtLimit.Detail)"
+    }
+    finally { ${function:Get-BridgeWorktreeUsage} = $realUsage }
+    Test-That 'cleanup that runs reports nothing blocked' {
+        (Remove-BridgeFinishedWorktree -RepositoryPath $repo -IdleHours 12 -AsObservation).Blocked -eq ''
+    }
+
+    Write-Host ''
+    Write-Host '--- what an Agency process is doing, read from its command line ---'
+    $agencySession = '11111111-1111-4111-8111-111111111111'
+    $launch = Get-BridgeAgencyInvocation -CommandLine "`"C:\Users\x\AppData\Roaming\agency\CurrentVersion\agency.exe`" copilot --profile-only local --session-id $agencySession --banner --model m"
+    Test-That 'a launcher the bridge started is a copilot launch' { $launch.Command -eq 'copilot' } "command: $($launch.Command)"
+    Test-That 'the MCP servers every Agency session keeps are not launches' {
+        (Get-BridgeAgencyInvocation -CommandLine '"C:\.Tools\agency\CurrentVersion\agency.exe" mcp native kusto').Command -eq 'mcp'
+    }
+    Test-That 'a global option and its value are read past to the subcommand' {
+        (Get-BridgeAgencyInvocation -CommandLine 'agency --verbosity debug --no-aec mcp native kusto').Command -eq 'mcp'
+    }
+    Test-That 'Agency run as a script is read past its interpreter' {
+        (Get-BridgeAgencyInvocation -CommandLine '/usr/local/bin/node /opt/agency/agency.js mcp native kusto').Command -eq 'mcp'
+    }
+    Test-That 'the value of --session-id is never taken for the subcommand' {
+        (Get-BridgeAgencyInvocation -CommandLine "agency --session-id $agencySession copilot").Command -eq 'copilot'
+    }
+    Test-That 'a command line that is not Agency names nothing' {
+        (Get-BridgeAgencyInvocation -CommandLine "copilot.exe mcp --session-id $agencySession").Command -eq ''
+    }
+
+    Write-Host ''
+    Write-Host '--- a command line is read from its options, never from its prompt ---'
+    # A process credited with a session its prompt only mentions protects that
+    # session's directory from cleanup instead of its own, and is where a reply to that
+    # session gets typed; a launcher whose prompt reads as `mcp` is excused from holding
+    # cleanup at all. Both readings are checked on every host: Windows keeps a prompt
+    # one argument, while ps flattens it into the options around it. Raised by Codex
+    # on #226.
+    $otherSession = '22222222-2222-4222-8222-222222222222'
+    $sessionOf = { param([string]$Line) Get-BridgeCommandLineSessionId -Options @(Get-BridgeCommandLineOptions -CommandLine $Line) }
+    $platform = $script:BridgeIsWindows
+    try {
+        foreach ($windows in @($true, $false)) {
+            $script:BridgeIsWindows = $windows
+            $as = if ($windows) { 'split as Windows splits it' } else { 'flattened by ps' }
+            Test-That "the bridge's own launch, prompt last, names its session, $as" {
+                (& $sessionOf "copilot --session-id $agencySession --banner -i `"compare --session-id $otherSession`"") -eq $agencySession
+            }
+            Test-That "a prompt that is the word --session-id is a prompt, not the flag, $as" {
+                (& $sessionOf "copilot -i --session-id $agencySession") -eq '' -and
+                    (& $sessionOf "copilot --prompt=--session-id $agencySession") -eq ''
+            }
+            Test-That "nothing after -- is an option, $as" { (& $sessionOf "copilot -- --session-id $agencySession") -eq '' }
+            Test-That "a line naming two sessions names neither, $as" {
+                (& $sessionOf "copilot --session-id $agencySession --session-id $otherSession") -eq ''
+            }
+            Test-That "a prompt cannot make a launcher an MCP server, $as" {
+                (Get-BridgeAgencyInvocation -CommandLine 'agency -i mcp copilot').Command -ne 'mcp'
+            }
+        }
+        $script:BridgeIsWindows = $false
+        Test-That 'flattened by ps, an id after a prompt option could be the prompt, so it is not read' {
+            (& $sessionOf "copilot -i continue --session-id $agencySession") -eq ''
+        }
+        $script:BridgeIsWindows = $true
+        Test-That 'while split as Windows splits it, the same id after a one-word prompt is an option' {
+            (& $sessionOf "copilot -i continue --session-id $agencySession") -eq $agencySession
+        }
+        Test-That 'and an escaped quote cannot carry a session id out of a prompt' {
+            (& $sessionOf ('copilot ' + (ConvertTo-BridgeArgumentString -Arguments @('-i', "use `" --session-id $agencySession `" here")))) -eq ''
+        }
+    }
+    finally { $script:BridgeIsWindows = $platform }
+
+    Write-Host ''
+    Write-Host '--- a Windows command line is split the way the program it starts splits it ---'
+    # The bridge quotes a prompt typed on a phone with ConvertTo-BridgeArgumentString, so a
+    # quote inside one arrives escaped as \" - and a regex stripping "..." then read the
+    # rest of the prompt as options. Raised by Codex on #226.
+    $awkward = @('C:\Program Files\x\copilot.exe', '-i', 'explain "quoted --headless text"',
+        'trailing\', 'a\\"b', '', "tab`there", '\\server\share\', 'plain')
+    $roundTrip = ConvertFrom-BridgeWindowsCommandLine -CommandLine (ConvertTo-BridgeArgumentString -Arguments $awkward)
+    $mismatched = @(for ($i = 0; $i -lt $awkward.Count; $i++) {
+            if ($i -ge $roundTrip.Arguments.Count -or $roundTrip.Arguments[$i] -cne $awkward[$i]) { $i }
+        })
+    Test-That 'every argument the bridge quotes comes back exactly, quotes and backslashes included' {
+        -not $roundTrip.Ambiguous -and $roundTrip.Arguments.Count -eq $awkward.Count -and $mismatched.Count -eq 0
+    } ($roundTrip.Arguments -join ' | ')
+    Test-That 'a doubled quote inside quotes, which the two Windows splitters read differently, is ambiguous' {
+        (ConvertFrom-BridgeWindowsCommandLine -CommandLine 'copilot.exe -i "say ""hi"" --headless"').Ambiguous
+    }
+    if ($IsWindows) {
+        $quotedPrompt = '"C:\x\copilot.exe" ' + (ConvertTo-BridgeArgumentString -Arguments @('-i', 'explain "quoted --headless text"'))
+        Test-That 'a prompt whose own quotes arrived escaped is not an embedded CLI' {
+            -not (Test-BridgeAgentEmbeddedProcess -CommandLine $quotedPrompt)
+        } $quotedPrompt
+        Test-That 'while a CLI really started --headless still is' {
+            Test-BridgeAgentEmbeddedProcess -CommandLine '"C:\Apps\Scout\copilot.exe" --headless --no-auto-update --stdio'
+        }
+        Test-That 'and a prompt that is the word --headless itself is a prompt, not the flag' {
+            -not (Test-BridgeAgentEmbeddedProcess -CommandLine '"C:\x\copilot.exe" -i "--headless"') -and
+                -not (Test-BridgeAgentEmbeddedProcess -CommandLine '"C:\x\copilot.exe" --prompt=--headless --headless')
+        }
+    }
+
+    Write-Host ''
     Write-Host '--- requested isolation never falls back to the repository ---'
     $notRepo = Join-Path $sandbox 'plain'
     [void][System.IO.Directory]::CreateDirectory($notRepo)
