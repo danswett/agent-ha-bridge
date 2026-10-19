@@ -190,10 +190,18 @@ This is a host-local safety change, not a shared dashboard or client-state migra
 Cleanup reads uncapped current Copilot/Agency, Claude and Codex process/registration
 state independently of suggestion settings and caches. Descendant working directories
 and path aliases protect their containing tree. Unreadable, incomplete or unmapped
-live state blocks cleanup; age alone never proves a session ended. A standalone
-Agency launcher is conservatively treated as a potentially starting session.
+live state blocks cleanup; age alone never proves a session ended. An Agency launcher
+is accounted for once the session it started has registered - it is the parent of an
+accounted Copilot process, or names that session's id - and the `agency mcp` servers
+each Agency session keeps are not launches. Any other Agency launcher is
+conservatively treated as a potentially starting session. A Copilot CLI embedded
+`--headless` with no session id, as Microsoft Scout runs one, is not a session.
 Relative working directories and registrations predating the current process
 generation are uncertain, not evidence that another worktree is unused.
+
+When cleanup cannot run, each isolated launch says why, naming the process
+responsible: in the daemon log, on the launch card once the session registers, and in
+the refusal at `newSession.worktreeLimit`.
 
 Only marked, unlocked, sufficiently old, clean and detached trees with no commits
 ahead of their readable base qualify. Dirty, untracked, ignored, unmerged,

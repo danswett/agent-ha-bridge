@@ -299,6 +299,67 @@ try {
         finally { ${function:Get-BridgeWorktreeUsage} = $realUsage }
 
     Write-Host ''
+    Write-Host '--- cleanup that cannot run says so on every launch, not only at the limit ---'
+    # #215: the only trace of a cleanup guard that never cleared was a warning nobody
+    # reads, for a week, until the limit refused a launch.
+    $realUsage = ${function:Get-BridgeWorktreeUsage}
+    try {
+        function Get-BridgeWorktreeUsage {
+            [pscustomobject]@{ Known = $false; Directories = @(); Detail = 'Agency pid 4242 has not registered a session yet, so one may still be starting.' }
+        }
+        $observed = Remove-BridgeFinishedWorktree -RepositoryPath $repo -IdleHours 12 -AsObservation -WarningAction SilentlyContinue
+        Test-That 'cleanup that could not run reports why, not only that it removed nothing' {
+            $observed.Removed -eq 0 -and $observed.Blocked -ceq 'Agency pid 4242 has not registered a session yet, so one may still be starting.'
+        } "blocked: $($observed.Blocked)"
+        $launchedWhileBlocked = New-BridgeSessionWorktree -RepositoryPath $repo -Limit 0 -IdleHours 12 -WarningAction SilentlyContinue
+        Test-That 'a launch under the limit still goes ahead' {
+            $launchedWhileBlocked.Isolated -and [System.IO.Directory]::Exists($launchedWhileBlocked.Path)
+        }
+        Test-That 'and carries the reason, so a broken cleanup shows before the limit is reached' {
+            $launchedWhileBlocked.CleanupBlocked -match 'Agency pid 4242' -and
+                $launchedWhileBlocked.Detail -match 'cleanup is blocked: Agency pid 4242'
+        } "detail: $($launchedWhileBlocked.Detail)"
+        $count = @(Get-BridgeManagedWorktree -RepositoryPath $repo).Count
+        $refusedAtLimit = New-BridgeSessionWorktree -RepositoryPath $repo -Limit $count -IdleHours 12 -WarningAction SilentlyContinue
+        Test-That 'and a launch refused at the limit names the cleanup that could not run' {
+            -not $refusedAtLimit.Isolated -and $refusedAtLimit.Detail -match 'limit' -and
+                $refusedAtLimit.Detail -match 'Cleanup is blocked: Agency pid 4242'
+        } "detail: $($refusedAtLimit.Detail)"
+    }
+    finally { ${function:Get-BridgeWorktreeUsage} = $realUsage }
+    Test-That 'cleanup that runs reports nothing blocked' {
+        (Remove-BridgeFinishedWorktree -RepositoryPath $repo -IdleHours 12 -AsObservation).Blocked -eq ''
+    }
+
+    Write-Host ''
+    Write-Host '--- what an Agency process is doing, read from its command line ---'
+    $agencySession = '11111111-1111-4111-8111-111111111111'
+    $launch = Get-BridgeAgencyInvocation -CommandLine "`"C:\Users\x\AppData\Roaming\agency\CurrentVersion\agency.exe`" copilot --profile-only local --session-id $agencySession --banner --model m"
+    Test-That 'a launcher the bridge started is a copilot launch for its session' {
+        $launch.Command -eq 'copilot' -and $launch.SessionId -eq $agencySession
+    } "command: $($launch.Command); session: $($launch.SessionId)"
+    Test-That 'the MCP servers every Agency session keeps are not launches' {
+        (Get-BridgeAgencyInvocation -CommandLine '"C:\.Tools\agency\CurrentVersion\agency.exe" mcp native kusto').Command -eq 'mcp'
+    }
+    Test-That 'a global option and its value are read past to the subcommand' {
+        (Get-BridgeAgencyInvocation -CommandLine 'agency --verbosity debug --no-aec mcp native kusto').Command -eq 'mcp'
+    }
+    Test-That 'Agency run as a script is read past its interpreter' {
+        (Get-BridgeAgencyInvocation -CommandLine '/usr/local/bin/node /opt/agency/agency.js mcp native kusto').Command -eq 'mcp'
+    }
+    Test-That 'the value of --session-id is never taken for the subcommand' {
+        $parsed = Get-BridgeAgencyInvocation -CommandLine "agency --session-id $agencySession copilot"
+        $parsed.Command -eq 'copilot' -and $parsed.SessionId -eq $agencySession
+    }
+    Test-That 'a session id in a quoted prompt is text, not the option' {
+        (Get-BridgeAgencyInvocation -CommandLine "agency copilot -i `"resume --session-id $agencySession please`"").SessionId -eq ''
+    }
+    Test-That 'a command line that is not Agency names nothing' {
+        $parsed = Get-BridgeAgencyInvocation -CommandLine 'copilot.exe mcp --session-id 11111111-1111-4111-8111-111111111111'
+        $parsed.Command -eq '' -and $parsed.SessionId -eq ''
+    }
+
+    Write-Host ''
     Write-Host '--- requested isolation never falls back to the repository ---'
     $notRepo = Join-Path $sandbox 'plain'
     [void][System.IO.Directory]::CreateDirectory($notRepo)

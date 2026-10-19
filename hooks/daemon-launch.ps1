@@ -1906,6 +1906,10 @@ function Start-DaemonLaunch {
     $worktreeOperation = $null
     $worktreeReservation = $null
     $reservationPath = ''
+    # Left on the launch note once the session registers, instead of clearing it: an
+    # isolated launch is the only place worktree cleanup runs, so it is the only
+    # place that can say cleanup has stopped working before the limit says it (#215).
+    $cleanupNote = ''
     try {
         $candidate = if ($null -ne $resumeSession) { [string]$resumeSession.Folder } else { $directory }
         if (-not [string]::IsNullOrWhiteSpace($candidate) -and [System.IO.Directory]::Exists($candidate)) {
@@ -1967,6 +1971,9 @@ function Start-DaemonLaunch {
                 }
                 $launchDirectory = $worktree.Path
                 $reservationPath = Get-BridgeWorkspaceManagedWorktree -Path $worktree.Path
+                if ($worktree.PSObject.Properties['CleanupBlocked'] -and $worktree.CleanupBlocked) {
+                    $cleanupNote = "Worktree cleanup is blocked: $($worktree.CleanupBlocked)"
+                }
                 if ($worktree.Detail) {
                     Write-DaemonLog -Message "$(if ($worktree.Isolated) { 'worktree' } else { 'no worktree' }): $($worktree.Detail)"
                 }
@@ -2077,6 +2084,7 @@ function Start-DaemonLaunch {
             AwaitingFirstMessage = ((Get-BridgeLauncher -Launcher $chosenLauncher).NeedsFirstMessage -and -not $prompt)
             FirstMessageAsked    = $false
             WorktreeReservation  = $worktreeReservation
+            Note                 = $cleanupNote
         }
 
         # A launch changes what is resumable - the session just started is now live, and
@@ -2264,8 +2272,10 @@ function Update-DaemonPendingLaunch {
         Clear-DaemonStaleLaunchTuning
         # The session's own card is the confirmation, so the note is cleared, and a
         # reconcile is asked for now so the card appears without waiting the interval.
+        # Cleared unless the launch has something to say that the card cannot.
         $script:DaemonReconcileNow = $true
-        & $finish '' ("$($p.Verb) $agent in $($p.Label); registered after {0:N1} s" -f ($now - $p.Since).TotalSeconds)
+        $note = if ($p.PSObject.Properties['Note']) { [string]$p.Note } else { '' }
+        & $finish $note ("$($p.Verb) $agent in $($p.Label); registered after {0:N1} s" -f ($now - $p.Since).TotalSeconds)
         return
     }
 

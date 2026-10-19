@@ -227,31 +227,63 @@ function Invoke-P4Cleanup {
     }
 }
 
-function Start-P4Child {
-    param([string]$Kind, [string]$Directory, [string]$SessionId,
-        [string]$WatchTrace = '', [string]$WritePath = '', [string]$WriteTrigger = 'remove')
-    Assert-P4Path $Directory
-    $key = [guid]::NewGuid().ToString('N')
-    $ready = Join-Path $script:P4Root "$key.ready"
-    $stop = Join-Path $script:P4Root "$key.stop"
-    $agent = if ($Kind -eq 'agency') { 'copilot' } elseif ($Kind -in @('writer', 'holder')) { 'fixture' } else { $Kind }
-    $start = [Diagnostics.ProcessStartInfo]::new($script:P4Executables[$agent])
-    $start.WorkingDirectory = $Directory
-    $start.UseShellExecute = $false
-    $start.CreateNoWindow = $true
-    $start.ArgumentList.Add((Join-Path $script:P4Root "$agent.js"))
+function Get-P4ChildCommand {
+    param([string]$Agent, [string]$Ready, [string]$Stop, [string]$SessionId = '', [string[]]$Arguments = @())
+    $list = [Collections.Generic.List[string]]::new()
+    $list.Add((Join-Path $script:P4Root "$Agent.js"))
     if (-not $IsWindows) {
-        $package = switch ($agent) {
+        $package = switch ($Agent) {
             'copilot' { '@github/copilot' }
             'claude' { '@anthropic-ai/claude-code' }
             'codex' { '@openai/codex' }
             default { 'p4-fixture' }
         }
-        $start.ArgumentList.Add("--fixture-package=$package")
+        $list.Add("--fixture-package=$package")
     }
-    foreach ($argument in @("-ready=$ready", "-stop=$stop", "--session-id=$SessionId")) {
-        $start.ArgumentList.Add($argument)
+    $list.Add("-ready=$Ready")
+    $list.Add("-stop=$Stop")
+    if ($SessionId) { $list.Add("--session-id=$SessionId") }
+    foreach ($argument in $Arguments) { $list.Add($argument) }
+    [pscustomobject]@{ File = $script:P4Executables[$Agent]; Arguments = @($list.ToArray()) }
+}
+
+function Wait-P4Ready {
+    param([string]$Ready, [AllowNull()]$Process = $null)
+    $reported = $null
+    $deadline = [DateTimeOffset]::Now.AddSeconds(10)
+    while ($null -eq $reported -and ($null -eq $Process -or -not $Process.HasExited) -and [DateTimeOffset]::Now -lt $deadline) {
+        if ([IO.File]::Exists($Ready)) {
+            try { $reported = [IO.File]::ReadAllText($Ready) | ConvertFrom-Json }
+            catch [IO.IOException] { Start-Sleep -Milliseconds 20 }
+        }
+        else { Start-Sleep -Milliseconds 20 }
     }
+    if ($null -eq $reported -or ($null -ne $Process -and $Process.HasExited)) {
+        throw 'Fixture child did not report readable readiness within the deadline.'
+    }
+    $reported
+}
+
+function Start-P4Child {
+    <# Kind 'agency' is a Copilot session started through Agency, which is a copilot
+       process; 'launcher' is the agency process itself. -Spawn has the fixture start
+       a child of its own, so the operating system records it as the parent, which is
+       how Agency starts copilot.exe. #>
+    param([string]$Kind, [string]$Directory, [string]$SessionId,
+        [string]$WatchTrace = '', [string]$WritePath = '', [string]$WriteTrigger = 'remove',
+        [string[]]$Arguments = @(), [hashtable]$Spawn = $null)
+    Assert-P4Path $Directory
+    $key = [guid]::NewGuid().ToString('N')
+    $ready = Join-Path $script:P4Root "$key.ready"
+    $stop = Join-Path $script:P4Root "$key.stop"
+    $agent = if ($Kind -eq 'agency') { 'copilot' } elseif ($Kind -eq 'launcher') { 'agency' }
+    elseif ($Kind -in @('writer', 'holder')) { 'fixture' } else { $Kind }
+    $command = Get-P4ChildCommand -Agent $agent -Ready $ready -Stop $stop -SessionId $SessionId -Arguments $Arguments
+    $start = [Diagnostics.ProcessStartInfo]::new($command.File)
+    $start.WorkingDirectory = $Directory
+    $start.UseShellExecute = $false
+    $start.CreateNoWindow = $true
+    foreach ($argument in $command.Arguments) { $start.ArgumentList.Add($argument) }
     if ($WatchTrace) {
         Assert-P4Path $WatchTrace
         Assert-P4Path $WritePath
@@ -259,32 +291,57 @@ function Start-P4Child {
         $start.ArgumentList.Add("-write=$WritePath")
         $start.ArgumentList.Add("-trigger=$WriteTrigger")
     }
+    $spawned = $null
+    if ($null -ne $Spawn) {
+        Assert-P4Path $Spawn.Directory
+        $childKey = [guid]::NewGuid().ToString('N')
+        $spawned = [pscustomobject]@{
+            Agent = [string]$Spawn.Agent; Directory = [string]$Spawn.Directory
+            Ready = Join-Path $script:P4Root "$childKey.ready"; Stop = Join-Path $script:P4Root "$childKey.stop"
+        }
+        $childCommand = Get-P4ChildCommand -Agent $spawned.Agent -Ready $spawned.Ready -Stop $spawned.Stop `
+            -SessionId ([string]$Spawn.SessionId)
+        $spec = Join-Path $script:P4Root "$childKey.spawn.json"
+        [IO.File]::WriteAllText($spec, (@{
+            file = $childCommand.File; args = @($childCommand.Arguments); cwd = $spawned.Directory
+        } | ConvertTo-Json -Compress))
+        $start.ArgumentList.Add("-spawn=$spec")
+    }
     $process = [Diagnostics.Process]::new()
     $process.StartInfo = $start
     if (-not $process.Start()) { throw 'Fixture child did not start.' }
-    $child = [pscustomobject]@{ Process = $process; Ready = $ready; Stop = $stop; Agent = $agent; Written = "$ready.wrote" }
+    $child = [pscustomobject]@{
+        Process = $process; Ready = $ready; Stop = $stop; Agent = $agent; Written = "$ready.wrote"; Spawned = $null
+    }
     $script:P4Children.Add($child)
     try {
-        $reported = $null
-        $deadline = [DateTimeOffset]::Now.AddSeconds(10)
-        while ($null -eq $reported -and -not $process.HasExited -and [DateTimeOffset]::Now -lt $deadline) {
-            if ([IO.File]::Exists($ready)) {
-                try { $reported = [IO.File]::ReadAllText($ready) | ConvertFrom-Json }
-                catch [IO.IOException] { Start-Sleep -Milliseconds 20 }
-            }
-            else { Start-Sleep -Milliseconds 20 }
-        }
-        if ($null -eq $reported -or $process.HasExited) { throw 'Fixture child did not report readable readiness within the deadline.' }
+        $reported = Wait-P4Ready -Ready $ready -Process $process
         if ($reported.pid -ne $process.Id -or -not (Test-BridgeInstallPath $reported.cwd (Resolve-BridgeWorkspaceDirectory $Directory))) {
             throw 'Fixture child identity or actual working directory did not match.'
         }
         if (@(Get-BridgeAgentProcesses -Agent $agent | Where-Object Id -eq $process.Id).Count -ne 1) {
             throw 'The actual process reader did not recognize the test-owned native fixture.'
         }
+        if ($null -ne $spawned) {
+            $grandchild = Wait-P4Ready -Ready $spawned.Ready
+            $native = Microsoft.PowerShell.Management\Get-Process -Id ([int]$grandchild.pid) -ErrorAction Stop
+            $child.Spawned = [pscustomobject]@{
+                Process = $native; Ready = $spawned.Ready; Stop = $spawned.Stop; Agent = $spawned.Agent
+                Written = "$($spawned.Ready).wrote"; Spawned = $null
+            }
+            $script:P4Children.Add($child.Spawned)
+            if ($null -eq $native.Parent -or [int]$native.Parent.Id -ne $process.Id) {
+                throw 'The operating system does not record the spawned fixture as the launcher''s child.'
+            }
+            if (-not (Test-BridgeInstallPath $grandchild.cwd (Resolve-BridgeWorkspaceDirectory $spawned.Directory))) {
+                throw 'The spawned fixture is not in its requested working directory.'
+            }
+        }
         $child
     }
     catch {
         $failure = $_
+        if ($null -ne $child.Spawned) { Stop-P4Child $child.Spawned }
         Stop-P4Child $child
         throw $failure
     }
@@ -512,6 +569,7 @@ try {
     $program = @'
 const fs = require('node:fs');
 const path = require('node:path');
+const childProcess = require('node:child_process');
 const args = {};
 for (const arg of process.argv.slice(2)) {
   const match = /^--?([^=]+)=(.*)$/s.exec(arg);
@@ -520,6 +578,10 @@ for (const arg of process.argv.slice(2)) {
 function publish(file, value) {
   fs.writeFileSync(file + '.pending', value, { mode: 0o600 });
   fs.renameSync(file + '.pending', file);
+}
+if (args.spawn) {
+  const spec = JSON.parse(fs.readFileSync(args.spawn, 'utf8'));
+  childProcess.spawn(spec.file, spec.args, { cwd: spec.cwd, stdio: 'ignore', windowsHide: true }).unref();
 }
 publish(args.ready, JSON.stringify({ pid: process.pid, cwd: process.cwd() }));
 let written = false;
@@ -538,7 +600,7 @@ setInterval(() => {
 }, 1);
 setTimeout(() => process.exit(3), 5 * 60 * 1000);
 '@
-    foreach ($agent in @('copilot', 'claude', 'codex', 'fixture')) {
+    foreach ($agent in @('copilot', 'claude', 'codex', 'agency', 'fixture')) {
         [IO.File]::WriteAllText((Join-Path $script:P4Root "$agent.js"), $program)
         $script:P4Executables[$agent] = $node.Source
         if ($IsWindows) {
@@ -875,6 +937,125 @@ setTimeout(() => process.exit(3), 5 * 60 * 1000);
                 ($outcome.Removed -eq 0 -and $outcome.TrackedContentPreserved) $outcome
         }
         finally { Stop-P4Child $child }
+    }
+
+    # #215: any agency.exe at all - a launcher whose session was long since running,
+    # or one of the MCP servers every Agency session keeps - vetoed cleanup, and so
+    # did an embedded copilot.exe no registration can name. These are the processes
+    # that must now be accounted for, beside the ones that must still hold.
+    foreach ($mode in @('parent', 'session-id', 'mcp', 'embedded')) {
+        Invoke-P4Scenario "a settled $mode process lets cleanup reclaim a finished worktree" {
+            $fixture = New-P4Fixture
+            $worktree = New-P4Worktree $fixture
+            Set-P4OldWorktree $worktree
+            $elsewhere = Join-Path $fixture.Root 'elsewhere'
+            [void][IO.Directory]::CreateDirectory($elsewhere)
+            $id = [guid]::NewGuid().ToString()
+            $started = [Collections.Generic.List[object]]::new()
+            $files = @()
+            try {
+                switch ($mode) {
+                    'parent' {
+                        # No session id on the launcher, so only the process tree can
+                        # tie it to the session it started.
+                        $launcher = Start-P4Child launcher $elsewhere '' -Arguments @('copilot', '--banner') `
+                            -Spawn @{ Agent = 'copilot'; Directory = $elsewhere; SessionId = $id }
+                        $started.Add($launcher.Spawned); $started.Add($launcher)
+                        $files = @(New-P4SessionFiles copilot $elsewhere $id $launcher.Spawned.Process.Id)
+                    }
+                    'session-id' {
+                        $session = Start-P4Child copilot $elsewhere $id
+                        $started.Add($session)
+                        $started.Add((Start-P4Child launcher $elsewhere '' -Arguments @('copilot', '--session-id', $id, '--banner')))
+                        $files = @(New-P4SessionFiles copilot $elsewhere $id $session.Process.Id)
+                    }
+                    'mcp' { $started.Add((Start-P4Child launcher $elsewhere '' -Arguments @('mcp', 'native', 'kusto'))) }
+                    'embedded' {
+                        $started.Add((Start-P4Child copilot $elsewhere '' -Arguments @('--headless', '--no-auto-update', '--stdio')))
+                    }
+                }
+                $usage = Get-BridgeWorktreeUsage
+                Test-P4 "${mode}: the process is accounted for, so usage is known" $usage.Known $usage
+                $outcome = Invoke-P4Cleanup $fixture $worktree
+                Test-P4 "${mode}: the finished worktree is reclaimed while the process runs" `
+                    ($outcome.Removed -eq 1 -and -not $outcome.DirectoryPresent -and
+                        @($started | Where-Object { $_.Process.HasExited }).Count -eq 0) $outcome
+            }
+            finally {
+                foreach ($child in $started) { Stop-P4Child $child }
+                Remove-P4SessionFiles $files
+            }
+        }
+    }
+
+    foreach ($mode in @('unregistered-launcher', 'embedded-with-session')) {
+        Invoke-P4Scenario "an unsettled $mode process still holds cleanup" {
+            $fixture = New-P4Fixture
+            $worktree = New-P4Worktree $fixture
+            Set-P4OldWorktree $worktree
+            $id = [guid]::NewGuid().ToString()
+            # A launcher that has not started its session yet, in the candidate itself,
+            # is exactly the startup the Agency guard exists for. A headless process that
+            # names a session is a session, whatever else it says.
+            $child = if ($mode -eq 'unregistered-launcher') {
+                Start-P4Child launcher $worktree '' -Arguments @('copilot', '--session-id', $id)
+            }
+            else { Start-P4Child copilot $worktree $id -Arguments @('--headless') }
+            try {
+                $usage = Get-BridgeWorktreeUsage
+                $named = if ($mode -eq 'unregistered-launcher') { "Agency pid $($child.Process.Id)" } else { "Copilot pid $($child.Process.Id)" }
+                Test-P4 "${mode}: usage is unknown and names the process responsible" `
+                    (-not $usage.Known -and $usage.Detail.Contains($named)) $usage
+                $outcome = Invoke-P4Cleanup $fixture $worktree
+                Test-P4 "${mode}: the candidate is preserved complete" `
+                    ($outcome.Removed -eq 0 -and $outcome.TrackedContentPreserved) $outcome
+            }
+            finally { Stop-P4Child $child }
+        }
+    }
+
+    Invoke-P4Scenario 'blocked cleanup is visible on a launch before the limit refuses one' {
+        $fixture = New-P4Fixture
+        Set-P4Config $fixture @{ workspaces = @(@{ label = 'Approved'; path = $fixture.Repository; isolate = $true }) }
+        $finished = New-P4Worktree $fixture
+        Set-P4OldWorktree $finished
+        $elsewhere = Join-Path $fixture.Root 'elsewhere'
+        [void][IO.Directory]::CreateDirectory($elsewhere)
+        $holder = Start-P4Child launcher $elsewhere '' -Arguments @('copilot')
+        $session = $null
+        $files = @()
+        try {
+            $named = "Agency pid $($holder.Process.Id)"
+            $outcome = Invoke-P4Launch
+            $pending = $script:DaemonPendingLaunch
+            Test-P4 'a launch under the limit still goes ahead while cleanup is blocked' `
+                ($outcome.Calls.Count -eq 1 -and $null -ne $pending -and [IO.Directory]::Exists($finished)) $outcome
+            Test-P4 'and the launch carries why finished worktrees were kept' `
+                ($null -ne $pending -and $pending.Note.Contains('Worktree cleanup is blocked') -and $pending.Note.Contains($named))
+            $session = Start-P4Child copilot $outcome.Calls[0].Directory $pending.SessionId
+            $files = @(New-P4SessionFiles copilot $outcome.Calls[0].Directory $pending.SessionId $session.Process.Id)
+            Update-DaemonPendingLaunch -Headers $headers
+            Test-P4 'the note is left on the launch card when the session registers, not cleared' `
+                ($null -eq $script:DaemonPendingLaunch -and $script:P4Messages.Count -gt 0 -and
+                    $script:P4Messages[$script:P4Messages.Count - 1].Contains($named)) @($script:P4Messages)
+            Stop-P4Child $session
+            $session = $null
+            Remove-P4SessionFiles $files
+            $files = @()
+
+            $count = @(Get-BridgeManagedWorktree -RepositoryPath $fixture.Repository).Count
+            Set-P4Config $fixture @{
+                workspaces = @(@{ label = 'Approved'; path = $fixture.Repository; isolate = $true }); worktreeLimit = $count
+            }
+            $outcome = Invoke-P4Launch
+            Test-P4 'a launch refused at the limit names the cleanup that could not run' `
+                ($outcome.Calls.Count -eq 0 -and ($outcome.Messages -join ' ').Contains("Cleanup is blocked: $named")) $outcome
+        }
+        finally {
+            if ($null -ne $session) { Stop-P4Child $session }
+            Stop-P4Child $holder
+            Remove-P4SessionFiles $files
+        }
     }
 
     foreach ($mode in @('stale-process-identity', 'relative-working-directory')) {

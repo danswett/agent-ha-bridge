@@ -1208,6 +1208,50 @@ function Test-BridgeAgentEmbeddedProcess {
     -not ($options -match '(^|\s)--session-id(\s|=)')
 }
 
+function Get-BridgeAgencyInvocation {
+    <#
+        What an Agency process was asked to do, from its command line: the subcommand
+        (`copilot`, `mcp`, ...) and the session id it was given, if any.
+
+        Agency is not only a session launcher. Every session started through it also
+        keeps `agency mcp ...` servers running for as long as it lives, and those are
+        processes named agency too - so "an Agency process exists" says nothing about
+        whether a session is starting (#215).
+
+        The subcommand is the first argument after the program that is neither an
+        option nor the program again, which is what an interpreter running Agency as a
+        script puts there. The two global options that take a value are skipped with
+        it, so `--verbosity debug copilot` is a copilot launch. Anything this cannot
+        parse reads as no subcommand, which callers treat as a possible launcher.
+    #>
+    param([string]$CommandLine = '')
+    $invocation = [pscustomobject]@{ Command = ''; SessionId = '' }
+    $tokens = @([regex]::Matches([string]$CommandLine, '"[^"]*"|[^\s"]+') | ForEach-Object { $_.Value.Trim('"') })
+    $program = $false
+    for ($index = 0; $index -lt $tokens.Count; $index++) {
+        $token = [string]$tokens[$index]
+        $leaf = try { [System.IO.Path]::GetFileNameWithoutExtension($token) } catch { '' }
+        if ($leaf -eq 'agency' -and -not $invocation.Command) { $program = $true; continue }
+        if (-not $program) { continue }
+        # Quoted values are whole tokens here, so a prompt that mentions --session-id
+        # is text and cannot be read as the flag.
+        if ($token -match '^--session-id(?:=(.*))?$') {
+            $value = ''
+            if ($Matches[1]) { $value = [string]$Matches[1] }
+            elseif ($index + 1 -lt $tokens.Count) { $index++; $value = [string]$tokens[$index] }
+            if ($value -match '^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$') {
+                $invocation.SessionId = $value
+            }
+            continue
+        }
+        if ($invocation.Command) { continue }
+        if ($token -in @('--verbosity', '--log-dir')) { $index++; continue }
+        if ($token.StartsWith('-')) { continue }
+        $invocation.Command = $token.ToLowerInvariant()
+    }
+    $invocation
+}
+
 function Get-BridgeAgentProcessSessionIds {
     <#
         Which session each of $Processes is working in, as a pid -> session id map,
