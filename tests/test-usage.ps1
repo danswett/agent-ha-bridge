@@ -1110,6 +1110,22 @@ Test-That 'each client is told apart by its own sessions' {
     $asked -ceq 'copilot,codex'
 }
 
+# A gh held off after a keyring timeout used to stay held for the daemon's life (#201).
+# A Copilot session opening means somebody is at the machine to answer a prompt, so it
+# ends the hold - and another client's session, which says nothing about gh, does not.
+Reset-UsagePacing
+[void](Invoke-UsageAt 0 $none)
+$script:BridgeGhUnavailable = $true
+$script:BridgeGhUnavailableAt = $paceStart.AddHours(-1)
+[void](Invoke-UsageAt 60 $claudeOpen)
+$heldAfterClaude = $script:BridgeGhUnavailable
+[void](Invoke-UsageAt 120 (New-LiveSessions 'copilot'))
+Test-That 'a Copilot session opening here ends a gh hold early, where another client''s does not' {
+    $heldAfterClaude -and -not $script:BridgeGhUnavailable -and
+        @($script:Logged | Where-Object { $_ -match 'asking gh for the allowance again' }).Count -eq 1
+} "held after Claude=$heldAfterClaude, held now=$($script:BridgeGhUnavailable)"
+$script:BridgeGhUnavailable = $false
+
 Reset-UsagePacing
 $script:Settings['usage.idleIntervalSeconds'] = 1800
 [void](Invoke-UsageAt 0 $none)
@@ -1465,12 +1481,22 @@ Test-That 'the machine doing the asking republishes an unchanged reading, so bei
     $quiet -ceq '' -and (@($script:Published) -join ',') -ceq 'copilot'
 }
 Reset-UsagePacing
-Test-That 'while an installation where nobody defers keeps an unchanged reading off the bus, as before' {
+Test-That 'while an installation where nobody defers keeps an unchanged reading off the bus between polls' {
     [void](Invoke-UsageAt 0 $copilotOpen @())
     [void](Invoke-UsageAt 240 $copilotOpen @())
     $first = @($script:Published) -join ','
     [void](Invoke-UsageAt 480 $copilotOpen @())
     $first -ceq '' -and (@($script:Published) -join ',') -ceq ''
+}
+# But not for ever. Never republishing it made a daemon still asking and finding
+# nothing new look exactly like one that had stopped asking: a Mac's sensors sat at the
+# same reading for four days while its daemon was demonstrably alive (#201).
+Test-That 'and republishes it every half hour, so a reading nobody is checking any more ages on the card' {
+    [void](Invoke-UsageAt ($script:BridgeUsageConfig.RepublishSeconds - 120) $copilotOpen @())
+    $before = @($script:Published) -join ','
+    [void](Invoke-UsageAt $script:BridgeUsageConfig.RepublishSeconds $copilotOpen @())
+    $before -ceq '' -and (@($script:Published) -join ',') -ceq 'copilot' -and
+        $script:BridgeUsageConfig.RepublishSeconds -lt 3600
 }
 
 Reset-UsagePacing
@@ -1754,6 +1780,7 @@ function Reset-GhRung {
     $script:BridgeGhAccount = ''
     $script:BridgeGhReason = ''
     $script:BridgeGhUnavailable = $false
+    $script:BridgeGhUnavailableAt = [DateTimeOffset]::MinValue
     foreach ($name in @('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')) {
         Set-Item -LiteralPath "env:$name" -Value '' -ErrorAction SilentlyContinue
     }
@@ -1840,6 +1867,33 @@ Test-That 'but another account is asked afresh' {
     $script:GhAnswer = New-ProbeAnswer -Stdout "gho_forhubot`n"
     (Get-BridgeCopilotToken -Login 'hubot') -ceq 'gho_forhubot'
 }
+
+# Held off, but not for as long as the daemon lives. "Final for the run" was final for
+# weeks on a daemon that never restarted, and a Mac's Copilot reading never moved
+# again (#201).
+Reset-GhRung
+$script:GhAnswer = New-ProbeAnswer -TimedOut $true -ExitCode -1
+$null = Get-BridgeCopilotToken -Login 'octocat'
+$script:GhAnswer = New-ProbeAnswer -Stdout "gho_fromgh`n"
+$script:BridgeGhUnavailableAt = [DateTimeOffset]::Now.AddHours(-$script:BridgeUsageConfig.GhHoldHours).AddMinutes(-1)
+Test-That 'a gh that did not answer is asked again once its hold has run out' {
+    (Get-BridgeCopilotToken -Login 'octocat') -ceq 'gho_fromgh' -and @($script:GhRuns).Count -eq 2
+} "runs: $(@($script:GhRuns).Count)"
+
+Reset-GhRung
+$script:GhAnswer = New-ProbeAnswer -TimedOut $true -ExitCode -1
+$null = Get-BridgeCopilotToken -Login 'octocat'
+$failedAt = $script:BridgeGhUnavailableAt
+Test-That 'a Copilot session opening straight after the timeout does not ask again, which would be the prompt storm' {
+    -not (Reset-BridgeGitHubCliHold -Now $failedAt.AddMinutes(5)) -and $script:BridgeGhUnavailable -and
+        (Get-BridgeCopilotToken -Login 'octocat') -ceq '' -and @($script:GhRuns).Count -eq 1
+}
+Test-That 'but one opening a while later does, somebody being at the machine to answer it' {
+    $script:GhAnswer = New-ProbeAnswer -Stdout "gho_fromgh`n"
+    (Reset-BridgeGitHubCliHold -Now $failedAt.AddMinutes($script:BridgeUsageConfig.GhPresentMinutes + 1)) -and
+        (Get-BridgeCopilotToken -Login 'octocat') -ceq 'gho_fromgh' -and @($script:GhRuns).Count -eq 2
+}
+Test-That 'and with no hold in place there is nothing to end' { -not (Reset-BridgeGitHubCliHold) }
 
 # What goes into an Authorization header, and what lands in a log, are not for gh to
 # decide: a success prints the token itself.

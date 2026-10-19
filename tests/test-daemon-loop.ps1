@@ -191,6 +191,23 @@ Test-That 'while a pass whose snapshot failed hands over nothing, not an empty l
     $null -ne $script:UsageCall -and $null -eq $script:UsageCall.States
 }
 
+# An update that did not manage to stop this daemon must not leave it running the old
+# release for as long as it lives (#201). The pass notices the record moving under it
+# and asks for the restart the loop already ends on.
+$script:InstalledVersion = '1.1.0'
+function Get-BridgeInstalledVersion { param([switch]$Refresh) $script:InstalledVersion }
+$script:DaemonRunningVersion = ''
+$script:DaemonRestartRequested = ''
+Invoke-DaemonReconcile -Headers $headers -State $state
+Invoke-DaemonReconcile -Headers $headers -State $state
+Test-That 'a pass with the same release still installed asks for no restart' { -not $script:DaemonRestartRequested }
+$script:InstalledVersion = '1.2.0'
+Invoke-DaemonReconcile -Headers $headers -State $state
+Test-That 'a pass after another release was installed under it asks to restart into that one' {
+    $script:DaemonRestartRequested -match '^run 1\.2\.0\b'
+} $script:DaemonRestartRequested
+$script:DaemonRestartRequested = ''
+
 function Sync-DaemonSessions { throw 'ha down' }
 $script:Calls.Clear()
 Invoke-DaemonReconcile -Headers $headers -State $state
