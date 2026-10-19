@@ -634,6 +634,94 @@ function Stop-BridgeOwnedRuntime {
     }
 }
 
+function Test-BridgeFileLockContention {
+    <#
+        Whether a failure to open a file means another handle holds its lock, as
+        opposed to anything else that can stop a file opening.
+
+        Only that answer may turn an updater away (#196). A denied open, a missing
+        folder or an unreadable path says nothing about whether an update is running,
+        and a lock that refused on those would be the leaked lock that issue warns
+        about under another name: a machine that can never update again.
+    #>
+    param([Parameter(Mandatory)][Exception]$Exception)
+
+    $failure = $Exception
+    while ($failure -is [Management.Automation.MethodInvocationException] -and $failure.InnerException) {
+        $failure = $failure.InnerException
+    }
+    # Exactly IOException: its subclasses are a missing file or folder, a path too
+    # long, and the rest of what is not contention.
+    if ($failure.GetType() -ne [IO.IOException]) { return $false }
+    # Windows reports a held handle as a sharing or lock violation. .NET elsewhere
+    # takes the lock with flock(LOCK_NB) and passes EWOULDBLOCK through as the
+    # HResult: 35 on macOS, 11 on Linux.
+    if ($script:BridgeIsWindows) { return ($failure.HResult -band 0xFFFF) -in @(32, 33) }
+    $failure.HResult -in @(11, 35)
+}
+
+function Enter-BridgeFileLock {
+    <#
+        Takes the exclusive lock a file stands for, held for as long as the returned
+        Stream stays open.
+
+        The operating system releases it when the holder's process ends, however it
+        ends, so a crash cannot leave it held - which a marker file or a timestamp
+        could. The handle is not inherited, so nothing the holder starts keeps it
+        either. Never deleted on release: a lock file unlinked by one holder while
+        another opens it lets two processes each hold a lock on a different file.
+
+        State is one of:
+          Acquired - this caller holds it; Stream is the handle, or null with -Probe.
+          Free     - there is no such file, so nothing can hold it. Only without -Create.
+          Held     - another handle held it for the whole of -WaitMilliseconds.
+          Unknown  - it could not be opened for any other reason; Detail says why.
+
+        No test-boundary checks here, because adapters load their own copy of this
+        file without the installation context; callers assert the path first.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [switch]$Create,
+        # How long to keep trying while another handle holds it. A probe holds it for
+        # an instant, and that must not turn away an updater starting at that moment.
+        [ValidateRange(0, 60000)][int]$WaitMilliseconds = 0,
+        # Release it again at once: asking whether it is held, rather than taking it.
+        [switch]$Probe
+    )
+
+    $deadline = [DateTimeOffset]::UtcNow.AddMilliseconds($WaitMilliseconds)
+    $mode = if ($Create) { [IO.FileMode]::OpenOrCreate } else { [IO.FileMode]::Open }
+    while ($true) {
+        try {
+            # Read access is enough for either platform's lock, and still opens a lock
+            # file another account created - which write access would refuse for good.
+            $stream = [IO.File]::Open($Path, $mode, [IO.FileAccess]::Read, [IO.FileShare]::None)
+            if ($Probe) {
+                $stream.Dispose()
+                $stream = $null
+            }
+            return [pscustomobject]@{ State = 'Acquired'; Stream = $stream; Detail = '' }
+        }
+        catch {
+            $failure = $_.Exception
+            while ($failure -is [Management.Automation.MethodInvocationException] -and $failure.InnerException) {
+                $failure = $failure.InnerException
+            }
+            if (-not $Create -and ($failure -is [IO.FileNotFoundException] -or $failure -is [IO.DirectoryNotFoundException])) {
+                return [pscustomobject]@{ State = 'Free'; Stream = $null; Detail = '' }
+            }
+            if (-not (Test-BridgeFileLockContention -Exception $failure)) {
+                return [pscustomobject]@{ State = 'Unknown'; Stream = $null; Detail = $failure.Message }
+            }
+            if ([DateTimeOffset]::UtcNow -ge $deadline) {
+                return [pscustomobject]@{ State = 'Held'; Stream = $null; Detail = $failure.Message }
+            }
+            Start-Sleep -Milliseconds 100
+        }
+    }
+}
+
 function Test-BridgeTaskOwnership {
     param([Parameter(Mandatory)]$Task, [Parameter(Mandatory)]$Context,
         [ValidateSet('daemon', 'devbox-keepawake')][string]$Role = 'daemon')

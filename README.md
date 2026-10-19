@@ -1668,6 +1668,15 @@ running. A daemon it could not stop restarts itself once it sees a different ver
 recorded as installed, rather than running the release it started with until the
 machine next reboots (#201).
 
+One update runs at a time on an installation. A press while one is already running —
+from another browser, from Home Assistant's own button, or while `agent-ha-bridge
+update` runs in a terminal — does not start a second installer over the same files:
+the row goes on showing the update that is running, and a notification says the press
+was not acted on until that update's own result replaces it — or, if it stops without
+reporting one, a notice that it did. The updater holds a lock for as long as it runs,
+and the operating system releases it however the updater ends, so one that crashes
+cannot leave the machine unable to update.
+
 A browser served a card older than 1.31.0 gets the previous separate **Bridge update
 available** card instead; the two are never drawn at once.
 
@@ -1681,11 +1690,13 @@ From a terminal:
 Or, from anywhere, `agent-ha-bridge update`.
 
 It distinguishes three outcomes, where it used to report two. Exit **0** means the
-release installed or nothing newer was found; **1** means the update did not happen;
-**2** means the release installed but a step after it failed, and names that step
-rather than calling the update a failure. A stale Codex marketplace once made every
-`codex plugin` command exit 1 *after* the installer had printed "All good", so a
-successful update reported itself as broken and looked like the thing to retry.
+release installed or nothing newer was found; **1** means the update did not happen —
+including when another update is still running on the installation, which it names,
+even one that has already recorded the newest release as installed; **2** means the
+release installed but a step after it failed, and names that step rather than calling
+the update a failure. A stale Codex marketplace once made every `codex plugin` command
+exit 1 *after* the installer had printed "All good", so a successful update reported
+itself as broken and looked like the thing to retry.
 
 Either way your configuration is preserved: the installer reads the existing config,
 backs it up, and keeps your URL, token and settings.
