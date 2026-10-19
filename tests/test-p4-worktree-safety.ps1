@@ -942,8 +942,11 @@ setTimeout(() => process.exit(3), 5 * 60 * 1000);
     # #215: any agency.exe at all - a launcher whose session was long since running,
     # or one of the MCP servers every Agency session keeps - vetoed cleanup, and so
     # did an embedded copilot.exe no registration can name. These are the processes
-    # that must now be accounted for, beside the ones that must still hold.
-    foreach ($mode in @('parent', 'session-id', 'mcp', 'embedded')) {
+    # that must now be accounted for, beside the ones that must still hold. An
+    # embedded CLI is only told apart on Windows: see the unsettled cases below.
+    $settledModes = @('parent', 'session-id', 'mcp')
+    if ($IsWindows) { $settledModes += 'embedded' }
+    foreach ($mode in $settledModes) {
         Invoke-P4Scenario "a settled $mode process lets cleanup reclaim a finished worktree" {
             $fixture = New-P4Fixture
             $worktree = New-P4Worktree $fixture
@@ -990,7 +993,13 @@ setTimeout(() => process.exit(3), 5 * 60 * 1000);
         }
     }
 
-    foreach ($mode in @('unregistered-launcher', 'duplicate-launcher', 'embedded-with-session')) {
+    # An interactive session whose prompt mentions --headless is not embedded, on any
+    # platform. Off Windows the command line is ps's flattened argv, where the quotes
+    # that say so are gone - so there a CLI that really is embedded holds as well,
+    # since the two cannot be told apart. Raised by Codex on #226.
+    $unsettledModes = @('unregistered-launcher', 'duplicate-launcher', 'embedded-with-session', 'prompt-mentions-headless')
+    if (-not $IsWindows) { $unsettledModes += 'embedded' }
+    foreach ($mode in $unsettledModes) {
         Invoke-P4Scenario "an unsettled $mode process still holds cleanup" {
             $fixture = New-P4Fixture
             $worktree = New-P4Worktree $fixture
@@ -1009,11 +1018,15 @@ setTimeout(() => process.exit(3), 5 * 60 * 1000);
                 $owner = Start-P4Child copilot $elsewhere $id
                 $files = @(New-P4SessionFiles copilot $elsewhere $id $owner.Process.Id)
             }
-            $child = if ($mode -eq 'embedded-with-session') { Start-P4Child copilot $worktree $id -Arguments @('--headless') }
-            else { Start-P4Child launcher $worktree '' -Arguments @('copilot', '--session-id', $id) }
+            $child = switch ($mode) {
+                'embedded-with-session' { Start-P4Child copilot $worktree $id -Arguments @('--headless') }
+                'prompt-mentions-headless' { Start-P4Child copilot $worktree '' -Arguments @('-i', 'explain the --headless flag') }
+                'embedded' { Start-P4Child copilot $worktree '' -Arguments @('--headless', '--no-auto-update', '--stdio') }
+                default { Start-P4Child launcher $worktree '' -Arguments @('copilot', '--session-id', $id) }
+            }
             try {
                 $usage = Get-BridgeWorktreeUsage
-                $named = if ($mode -eq 'embedded-with-session') { "Copilot pid $($child.Process.Id)" } else { "Agency pid $($child.Process.Id)" }
+                $named = if ($mode -in @('embedded-with-session', 'prompt-mentions-headless', 'embedded')) { "Copilot pid $($child.Process.Id)" } else { "Agency pid $($child.Process.Id)" }
                 Test-P4 "${mode}: usage is unknown and names the process responsible" `
                     (-not $usage.Known -and $usage.Detail.Contains($named)) $usage
                 $outcome = Invoke-P4Cleanup $fixture $worktree

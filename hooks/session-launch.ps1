@@ -532,8 +532,9 @@ function Get-BridgeWorktreeUsage {
        keeps - vetoed cleanup outright, and so did Microsoft Scout's
        embedded copilot.exe, which no registration can ever name (#215). The
        exceptions are positive identifications: a launcher whose session is already
-       registered and accounted for below, an Agency MCP server, and a CLI embedded
-       --headless without a session. Anything else still holds. #>
+       registered and accounted for below, an Agency MCP server, and - on Windows,
+       where a command line keeps its quoting - a CLI embedded --headless without a
+       session. Anything else still holds. #>
     $directories = [System.Collections.Generic.List[string]]::new()
     try {
         $processes = @(Get-Process -ErrorAction Stop)
@@ -608,7 +609,13 @@ function Get-BridgeWorktreeUsage {
             # unreadable command line is not evidence that a process is embedded.
             $command = Get-BridgeCommandLine -ProcessId $processId -AsObservation
             if ($command.State -eq 'Absent') { continue }
-            if ($command.State -eq 'Readable' -and (Test-BridgeAgentEmbeddedProcess -CommandLine $command.Text)) { continue }
+            # Windows only, whose command line is the string the process was given,
+            # quotes and all. Elsewhere it is ps's flattened argv, in which a prompt
+            # passed as -i "...--headless..." reads exactly like the flag, and excusing
+            # a session that has not registered yet would let cleanup take the worktree
+            # it is starting in. Raised by Codex on #226.
+            if ($script:BridgeIsWindows -and $command.State -eq 'Readable' -and
+                (Test-BridgeAgentEmbeddedProcess -CommandLine $command.Text)) { continue }
             throw "Copilot pid $processId has no registered session."
         }
 

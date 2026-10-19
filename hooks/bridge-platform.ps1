@@ -1230,7 +1230,10 @@ function Get-BridgeAgencyInvocation {
     $program = $false
     for ($index = 0; $index -lt $tokens.Count; $index++) {
         $token = [string]$tokens[$index]
-        $leaf = try { [System.IO.Path]::GetFileNameWithoutExtension($token) } catch { '' }
+        # Split on either separator, so a command line parses the same on every host:
+        # [IO.Path] on macOS and Linux splits on '/' alone and reads a Windows path as
+        # one long file name. Raised by Codex on #226.
+        $leaf = try { [System.IO.Path]::GetFileNameWithoutExtension(($token -split '[\\/]')[-1]) } catch { '' }
         if ($leaf -eq 'agency' -and -not $invocation.Command) { $program = $true; continue }
         if (-not $program) { continue }
         # Quoted values are whole tokens here, so a prompt that mentions --session-id

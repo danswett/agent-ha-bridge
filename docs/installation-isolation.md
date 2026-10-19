@@ -195,9 +195,11 @@ is accounted for once the session it started has registered - it is the parent o
 accounted Copilot process, or names the id of a session whose live owner started no
 earlier than it did - and the `agency mcp` servers each Agency session keeps are not
 launches. Any other Agency launcher, including a second one for a session already
-running, is conservatively treated as a potentially starting session. A Copilot CLI
-embedded `--headless` with no session id, as Microsoft Scout runs one, is not a
-session.
+running, is conservatively treated as a potentially starting session. On Windows, a
+Copilot CLI embedded `--headless` with no session id, as Microsoft Scout runs one, is
+not a session. Elsewhere the command line can only be read as `ps` prints it, with the
+quoting gone, so a prompt that mentions `--headless` would look the same; there an
+embedded CLI blocks cleanup like any other unregistered Copilot process.
 Relative working directories and registrations predating the current process
 generation are uncertain, not evidence that another worktree is unused.
 
