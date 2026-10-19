@@ -360,6 +360,37 @@ try {
     }
 
     Write-Host ''
+    Write-Host '--- a Windows command line is split the way the program it starts splits it ---'
+    # The bridge quotes a prompt typed on a phone with ConvertTo-BridgeArgumentString, so a
+    # quote inside one arrives escaped as \" - and a regex stripping "..." then read the
+    # rest of the prompt as options. Raised by Codex on #226.
+    $awkward = @('C:\Program Files\x\copilot.exe', '-i', 'explain "quoted --headless text"',
+        'trailing\', 'a\\"b', '', "tab`there", '\\server\share\', 'plain')
+    $roundTrip = ConvertFrom-BridgeWindowsCommandLine -CommandLine (ConvertTo-BridgeArgumentString -Arguments $awkward)
+    $mismatched = @(for ($i = 0; $i -lt $awkward.Count; $i++) {
+            if ($i -ge $roundTrip.Arguments.Count -or $roundTrip.Arguments[$i] -cne $awkward[$i]) { $i }
+        })
+    Test-That 'every argument the bridge quotes comes back exactly, quotes and backslashes included' {
+        -not $roundTrip.Ambiguous -and $roundTrip.Arguments.Count -eq $awkward.Count -and $mismatched.Count -eq 0
+    } ($roundTrip.Arguments -join ' | ')
+    Test-That 'a doubled quote inside quotes, which the two Windows splitters read differently, is ambiguous' {
+        (ConvertFrom-BridgeWindowsCommandLine -CommandLine 'copilot.exe -i "say ""hi"" --headless"').Ambiguous
+    }
+    if ($IsWindows) {
+        $quotedPrompt = '"C:\x\copilot.exe" ' + (ConvertTo-BridgeArgumentString -Arguments @('-i', 'explain "quoted --headless text"'))
+        Test-That 'a prompt whose own quotes arrived escaped is not an embedded CLI' {
+            -not (Test-BridgeAgentEmbeddedProcess -CommandLine $quotedPrompt)
+        } $quotedPrompt
+        Test-That 'while a CLI really started --headless still is' {
+            Test-BridgeAgentEmbeddedProcess -CommandLine '"C:\Apps\Scout\copilot.exe" --headless --no-auto-update --stdio'
+        }
+        Test-That 'and an escaped quote cannot carry a session id out of an Agency prompt' {
+            $line = 'agency copilot ' + (ConvertTo-BridgeArgumentString -Arguments @('-i', "use `" --session-id $agencySession `" here"))
+            (Get-BridgeAgencyInvocation -CommandLine $line).SessionId -eq ''
+        }
+    }
+
+    Write-Host ''
     Write-Host '--- requested isolation never falls back to the repository ---'
     $notRepo = Join-Path $sandbox 'plain'
     [void][System.IO.Directory]::CreateDirectory($notRepo)

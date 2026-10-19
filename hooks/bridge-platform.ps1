@@ -1173,6 +1173,68 @@ function Get-BridgeAgentProcesses {
     }
 }
 
+function ConvertFrom-BridgeWindowsCommandLine {
+    <#
+        The arguments a Windows program is given by its command line, split the way the
+        C runtime and CommandLineToArgvW split them: whitespace separates arguments
+        outside quotes, 2n backslashes before a quote are n backslashes and the quote
+        opens or closes quoting, 2n+1 are n backslashes and a literal quote, and a
+        backslash anywhere else is itself. The inverse of ConvertTo-BridgeArgumentString,
+        which is how the bridge quotes a prompt typed on a phone - so a quote inside one
+        arrives as \", and a regex that strips "..." reads the text after it as options.
+        Raised by Codex on #226.
+
+        Ambiguous marks "" inside quotes, the one place the two splitters disagree: the
+        C runtime reads a literal quote and stays quoted, CommandLineToArgvW reads one
+        that also ends the quoting. A caller deciding something about safety treats that
+        as unreadable rather than picking one.
+    #>
+    param([AllowEmptyString()][string]$CommandLine = '')
+    $arguments = [Collections.Generic.List[string]]::new()
+    $current = [Text.StringBuilder]::new()
+    $quoted = $false
+    $started = $false
+    $ambiguous = $false
+    $index = 0
+    while ($index -lt $CommandLine.Length) {
+        $character = $CommandLine[$index]
+        if ($character -eq [char]'\') {
+            $run = 0
+            while ($index -lt $CommandLine.Length -and $CommandLine[$index] -eq [char]'\') { $run++; $index++ }
+            $started = $true
+            if ($index -lt $CommandLine.Length -and $CommandLine[$index] -eq [char]'"') {
+                [void]$current.Append([string]::new([char]'\', [int][Math]::Floor($run / 2)))
+                # An odd run escapes the quote; an even one leaves it to open or close.
+                if ($run % 2 -eq 1) { [void]$current.Append([char]'"'); $index++ }
+            }
+            else { [void]$current.Append([string]::new([char]'\', $run)) }
+            continue
+        }
+        if ($character -eq [char]'"') {
+            $started = $true
+            if ($quoted -and $index + 1 -lt $CommandLine.Length -and $CommandLine[$index + 1] -eq [char]'"') {
+                $ambiguous = $true
+                [void]$current.Append([char]'"')
+                $index += 2
+                continue
+            }
+            $quoted = -not $quoted
+            $index++
+            continue
+        }
+        if (-not $quoted -and ($character -eq [char]' ' -or $character -eq [char]"`t")) {
+            if ($started) { $arguments.Add($current.ToString()); [void]$current.Clear(); $started = $false }
+            $index++
+            continue
+        }
+        [void]$current.Append($character)
+        $started = $true
+        $index++
+    }
+    if ($started) { $arguments.Add($current.ToString()) }
+    [pscustomobject]@{ Arguments = [string[]]$arguments.ToArray(); Ambiguous = $ambiguous }
+}
+
 function Test-BridgeAgentEmbeddedProcess {
     <#
         Whether an agent CLI process is an embedded, headless instance rather than an
@@ -1194,15 +1256,26 @@ function Test-BridgeAgentEmbeddedProcess {
         Two guards against excusing a process that is really a session, because the
         cost of that is a live session being retired while it is still working:
 
-          - Quoted values are removed before anything is read as an option. A prompt
-            passed as -i "...--headless..." is text, not a flag, and a session asked
-            about this very bug would otherwise have excused itself.
+          - A prompt is text, not a flag. On Windows the command line is split into
+            the arguments the program receives, so -i "...--headless..." is one
+            argument however its own quotes were escaped; elsewhere quoted values are
+            removed before anything is read as an option. A session asked about this
+            very bug would otherwise have excused itself.
           - A session carries its id on the command line, new or resumed alike (see
             Get-BridgeAgentProcessSessionIds), while an embedded CLI is driven over
             stdio and never given one. So --session-id settles it outright.
     #>
     param([string]$CommandLine = '')
     if ([string]::IsNullOrWhiteSpace($CommandLine)) { return $false }
+    if ($script:BridgeIsWindows) {
+        # Split as the program splits it, so a prompt whose own quotes arrived as \"
+        # cannot leave --headless outside them. Raised by Codex on #226.
+        $parsed = ConvertFrom-BridgeWindowsCommandLine -CommandLine $CommandLine
+        if ($parsed.Ambiguous) { return $false }
+        $arguments = @($parsed.Arguments | Select-Object -Skip 1)
+        if (-not @($arguments | Where-Object { $_ -eq '--headless' -or $_ -like '--headless=*' }).Count) { return $false }
+        return (-not @($arguments | Where-Object { $_ -eq '--session-id' -or $_ -like '--session-id=*' }).Count)
+    }
     $options = [regex]::Replace($CommandLine, '"[^"]*"', ' ')
     if ($options -notmatch '(^|\s)--headless(\s|=|$)') { return $false }
     -not ($options -match '(^|\s)--session-id(\s|=)')
@@ -1226,7 +1299,17 @@ function Get-BridgeAgencyInvocation {
     #>
     param([string]$CommandLine = '')
     $invocation = [pscustomobject]@{ Command = ''; SessionId = '' }
-    $tokens = @([regex]::Matches([string]$CommandLine, '"[^"]*"|[^\s"]+') | ForEach-Object { $_.Value.Trim('"') })
+    # On Windows, split as the program splits it, so an escaped quote in a prompt
+    # cannot end the prompt early (Codex on #226); a line the two Windows splitters
+    # read differently is no subcommand at all. Elsewhere ps has removed the quotes
+    # already, and this is the best reading there is.
+    $tokens = @()
+    if ($script:BridgeIsWindows) {
+        $parsed = ConvertFrom-BridgeWindowsCommandLine -CommandLine $CommandLine
+        if ($parsed.Ambiguous) { return $invocation }
+        $tokens = @($parsed.Arguments)
+    }
+    else { $tokens = @([regex]::Matches([string]$CommandLine, '"[^"]*"|[^\s"]+') | ForEach-Object { $_.Value.Trim('"') }) }
     $program = $false
     for ($index = 0; $index -lt $tokens.Count; $index++) {
         $token = [string]$tokens[$index]

@@ -994,9 +994,11 @@ setTimeout(() => process.exit(3), 5 * 60 * 1000);
     }
 
     # An interactive session whose prompt mentions --headless is not embedded, on any
-    # platform. Off Windows the command line is ps's flattened argv, where the quotes
-    # that say so are gone - so there a CLI that really is embedded holds as well,
-    # since the two cannot be told apart. Raised by Codex on #226.
+    # platform - including when the prompt's own quotes arrive escaped as \", which is
+    # how the bridge quotes one typed on a phone. Off Windows the command line is ps's
+    # flattened argv, where the quotes that say so are gone - so there a CLI that really
+    # is embedded holds as well, since the two cannot be told apart. Raised by Codex on
+    # #226.
     $unsettledModes = @('unregistered-launcher', 'duplicate-launcher', 'embedded-with-session', 'prompt-mentions-headless')
     if (-not $IsWindows) { $unsettledModes += 'embedded' }
     foreach ($mode in $unsettledModes) {
@@ -1020,7 +1022,7 @@ setTimeout(() => process.exit(3), 5 * 60 * 1000);
             }
             $child = switch ($mode) {
                 'embedded-with-session' { Start-P4Child copilot $worktree $id -Arguments @('--headless') }
-                'prompt-mentions-headless' { Start-P4Child copilot $worktree '' -Arguments @('-i', 'explain the --headless flag') }
+                'prompt-mentions-headless' { Start-P4Child copilot $worktree '' -Arguments @('-i', 'explain "quoted --headless text"') }
                 'embedded' { Start-P4Child copilot $worktree '' -Arguments @('--headless', '--no-auto-update', '--stdio') }
                 default { Start-P4Child launcher $worktree '' -Arguments @('copilot', '--session-id', $id) }
             }
