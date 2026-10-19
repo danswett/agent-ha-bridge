@@ -999,7 +999,8 @@ setTimeout(() => process.exit(3), 5 * 60 * 1000);
     # flattened argv, where the quotes that say so are gone - so there a CLI that really
     # is embedded holds as well, since the two cannot be told apart. Raised by Codex on
     # #226.
-    $unsettledModes = @('unregistered-launcher', 'duplicate-launcher', 'prompt-names-session', 'embedded-with-session', 'prompt-mentions-headless')
+    $unsettledModes = @('unregistered-launcher', 'duplicate-launcher', 'prompt-names-session', 'twin-launcher', 'twin-launchers',
+        'embedded-with-session', 'prompt-mentions-headless')
     if (-not $IsWindows) { $unsettledModes += 'embedded' }
     foreach ($mode in $unsettledModes) {
         Invoke-P4Scenario "an unsettled $mode process still holds cleanup" {
@@ -1008,6 +1009,7 @@ setTimeout(() => process.exit(3), 5 * 60 * 1000);
             Set-P4OldWorktree $worktree
             $id = [guid]::NewGuid().ToString()
             $owner = $null
+            $others = [Collections.Generic.List[object]]::new()
             $files = @()
             # A launcher that has not started its session yet, in the candidate itself,
             # is exactly the startup the Agency guard exists for - and so is a second
@@ -1030,17 +1032,37 @@ setTimeout(() => process.exit(3), 5 * 60 * 1000);
                 'prompt-names-session' { Start-P4Child launcher $worktree '' -Arguments @('copilot', '-i', "continue --session-id $id") }
                 default { Start-P4Child launcher $worktree '' -Arguments @('copilot', '--session-id', $id) }
             }
+            $names = @(if ($mode -in @('embedded-with-session', 'prompt-mentions-headless', 'embedded')) { "Copilot pid $($child.Process.Id)" }
+                else { "Agency pid $($child.Process.Id)" })
             try {
-                if ($mode -eq 'prompt-names-session') {
+                # Each of these starts an owner after the launcher in the candidate, so
+                # by age alone that owner could be its session. Two overlapping launches
+                # for one session settle only the one whose child it is: by parentage
+                # where the owner is a launcher's child, and not at all where it is
+                # neither's - either launcher can be the one that holds then. Raised by
+                # Codex on #226.
+                if ($mode -in @('prompt-names-session', 'twin-launcher', 'twin-launchers')) {
                     $elsewhere = Join-Path $fixture.Root 'elsewhere'
                     [void][IO.Directory]::CreateDirectory($elsewhere)
-                    $owner = Start-P4Child copilot $elsewhere $id
-                    $files = @(New-P4SessionFiles copilot $elsewhere $id $owner.Process.Id)
+                    if ($mode -eq 'twin-launcher') {
+                        $other = Start-P4Child launcher $elsewhere '' -Arguments @('copilot', '--session-id', $id) `
+                            -Spawn @{ Agent = 'copilot'; Directory = $elsewhere; SessionId = $id }
+                        $others.Add($other.Spawned); $others.Add($other)
+                        $files = @(New-P4SessionFiles copilot $elsewhere $id $other.Spawned.Process.Id)
+                    }
+                    else {
+                        if ($mode -eq 'twin-launchers') {
+                            $other = Start-P4Child launcher $elsewhere '' -Arguments @('copilot', '--session-id', $id)
+                            $others.Add($other)
+                            $names += "Agency pid $($other.Process.Id)"
+                        }
+                        $owner = Start-P4Child copilot $elsewhere $id
+                        $files = @(New-P4SessionFiles copilot $elsewhere $id $owner.Process.Id)
+                    }
                 }
                 $usage = Get-BridgeWorktreeUsage
-                $named = if ($mode -in @('embedded-with-session', 'prompt-mentions-headless', 'embedded')) { "Copilot pid $($child.Process.Id)" } else { "Agency pid $($child.Process.Id)" }
                 Test-P4 "${mode}: usage is unknown and names the process responsible" `
-                    (-not $usage.Known -and $usage.Detail.Contains($named)) $usage
+                    (-not $usage.Known -and @($names | Where-Object { $usage.Detail.Contains($_) }).Count -gt 0) $usage
                 $outcome = Invoke-P4Cleanup $fixture $worktree
                 Test-P4 "${mode}: the candidate is preserved complete" `
                     ($outcome.Removed -eq 0 -and $outcome.TrackedContentPreserved) $outcome
@@ -1048,6 +1070,7 @@ setTimeout(() => process.exit(3), 5 * 60 * 1000);
             finally {
                 Stop-P4Child $child
                 if ($null -ne $owner) { Stop-P4Child $owner }
+                foreach ($extra in $others) { Stop-P4Child $extra }
                 Remove-P4SessionFiles $files
             }
         }

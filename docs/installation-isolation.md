@@ -193,7 +193,8 @@ and path aliases protect their containing tree. Unreadable, incomplete or unmapp
 live state blocks cleanup; age alone never proves a session ended. An Agency launcher
 is accounted for once the session it started has registered - it is the parent of an
 accounted Copilot process, or names the id of a session whose live owner started no
-earlier than it did - and the `agency mcp` servers each Agency session keeps are not
+earlier than it did and is no launcher's child, when no other waiting launcher names
+that session - and the `agency mcp` servers each Agency session keeps are not
 launches. A session id is read only from a command line's options, never from its
 prompt; elsewhere than Windows, where `ps` has flattened the prompt into the options
 around it, nothing after a prompt option is read at all. The bridge puts

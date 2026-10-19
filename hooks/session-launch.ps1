@@ -626,6 +626,15 @@ function Get-BridgeWorktreeUsage {
         # only from an owner no older than the launcher. A second launcher for a
         # session that was already running, a duplicate resume, has not started
         # anything yet, and naming a live session does not make it settled.
+        #
+        # Nor can one owner settle two launchers. An owner whose parent is a launcher
+        # belongs to that launcher alone, and a session that more than one waiting
+        # launcher names does not say which of them started it. Two overlapping
+        # launches for one session otherwise both counted as settled on the strength of
+        # one child, while the other had started nothing in the worktree beneath it.
+        # Raised by Codex on #226.
+        $parented = @{}
+        $settled = @{}
         foreach ($processId in @($accounted.Keys)) {
             $child = $agents.copilot[$processId]
             $parent = $null
@@ -634,22 +643,34 @@ function Get-BridgeWorktreeUsage {
             $parentId = 0
             try { $parentId = [int]$parent.Id } catch { continue }
             if ($launchers.ContainsKey($parentId) -and $launchers[$parentId].StartTime -le $child.StartTime) {
-                [void]$launchers.Remove($parentId)
+                $settled[$parentId] = $true
+                $parented[[int]$processId] = $true
             }
         }
+        foreach ($parentId in @($settled.Keys)) { [void]$launchers.Remove($parentId) }
+        $waiting = @{}
+        $namedBy = @{}
         foreach ($processId in @($launchers.Keys)) {
             $command = Get-BridgeCommandLine -ProcessId $processId -AsObservation
             if ($command.State -eq 'Absent') { continue }
+            $sessionId = ''
             if ($command.State -eq 'Readable') {
                 $invocation = Get-BridgeAgencyInvocation -CommandLine $command.Text
                 if ($invocation.Command -eq 'mcp') { continue }
-                if ($invocation.SessionId -and $liveSessions.ContainsKey($invocation.SessionId)) {
-                    $started = $launchers[$processId].StartTime
-                    $ownGeneration = @($liveSessions[$invocation.SessionId] | Where-Object {
-                            $agents.copilot[[int]$_].StartTime -ge $started })
-                    if ($ownGeneration.Count -gt 0) { continue }
-                }
+                $sessionId = [string]$invocation.SessionId
             }
+            if (-not $sessionId -or -not $liveSessions.ContainsKey($sessionId)) {
+                throw "Agency pid $processId has not registered a session yet, so one may still be starting."
+            }
+            $waiting[$processId] = $sessionId
+            $namedBy[$sessionId] = 1 + [int]$namedBy[$sessionId]
+        }
+        foreach ($processId in @($waiting.Keys)) {
+            $sessionId = $waiting[$processId]
+            $started = $launchers[$processId].StartTime
+            $ownGeneration = @($liveSessions[$sessionId] | Where-Object {
+                    -not $parented.ContainsKey([int]$_) -and $agents.copilot[[int]$_].StartTime -ge $started })
+            if ($namedBy[$sessionId] -eq 1 -and $ownGeneration.Count -gt 0) { continue }
             throw "Agency pid $processId has not registered a session yet, so one may still be starting."
         }
 
