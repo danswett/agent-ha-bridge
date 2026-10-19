@@ -212,12 +212,20 @@ function Start-Process {
     }, $true)
     $literal = $assignment.Right.Find({ param($node) $node -is [Management.Automation.Language.StringConstantExpressionAst] }, $true)
     $proof = $literal.Value
-    $drainDetached = -not $Wait -and $fixtureState.Fixture.Case -in @('detached-success', 'detached-failure')
+    $drainDetached = -not $Wait -and $fixtureState.Fixture.Case -in @('detached-success', 'detached-failure', 'busy-detached')
     if (-not $Wait -and -not $drainDetached) { return }
     if ($Wait) { Assert-BridgeTestPath -Path @($proof, $RedirectStandardOutput, $RedirectStandardError) }
     $start = New-BridgeTestProcessStartInfo -ScriptPath $fixtureState.TestEntry -Sandbox $env:AGENT_HA_BRIDGE_TEST_ROOT `
         -ScriptArguments @('Updater', $generated)
-    $child = Invoke-BridgeTestProcess -StartInfo $start
+    # Another updater takes the lock after the parent looked and before this child
+    # does: the race that only the child's own lock can close (#196).
+    $heldByAnother = $null
+    if ($fixtureState.Fixture.Case -in @('busy-child', 'busy-detached')) {
+        $heldByAnother = Enter-BridgeFileLock -Path (Get-BridgeUpdateLockPath) -Create
+        if ($heldByAnother.State -ne 'Acquired') { throw "The fixture could not hold the update lock: $($heldByAnother.State)" }
+    }
+    try { $child = Invoke-BridgeTestProcess -StartInfo $start }
+    finally { if ($heldByAnother -and $heldByAnother.Stream) { $heldByAnother.Stream.Dispose() } }
     Write-UpdateIntakeDiagnostic -Kind UPDATE -Data ([ordered]@{
         stage = 'child-result'; case = $fixtureState.Fixture.Case; fixtureInput = $fixtureState.Fixture
         generated = $generated; wait = [bool]$Wait; drainDetached = $drainDetached

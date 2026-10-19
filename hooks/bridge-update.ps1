@@ -492,6 +492,49 @@ function Remove-BridgeUpdateProgress {
     }
 }
 
+function Get-BridgeUpdateLockPath {
+    <#
+        The lock an updater holds for as long as it runs, one per installation: two
+        updaters installing over the same files at once is what it prevents (#196).
+    #>
+    param($Context = (Get-BridgeInstallContext))
+    Get-BridgeRuntimePath -Name 'agent-bridge-update.lock' -Context $Context
+}
+
+function Get-BridgeUpdateRunning {
+    <#
+        Whether an updater is running on an installation right now.
+
+        Asked of the lock the updater holds rather than of its progress record,
+        because the operating system releases the lock when that process ends: a
+        record says what an updater last wrote, and outlives one that died.
+
+        State is Idle, Running, or Unknown - the lock could not be opened for a
+        reason that says nothing either way. Unknown is not Idle, but it is not a
+        reason to refuse either: refusing on it would let one unreadable file stop a
+        machine updating for good, which is the failure #196 was most wary of.
+    #>
+    param($Context = (Get-BridgeInstallContext))
+
+    $lock = Enter-BridgeFileLock -Path (Get-BridgeUpdateLockPath -Context $Context) -Probe
+    if ($lock.State -in @('Acquired', 'Free')) { return [pscustomobject]@{ State = 'Idle'; Detail = '' } }
+    if ($lock.State -ne 'Held') {
+        return [pscustomobject]@{ State = 'Unknown'; Detail = "whether an update is running could not be read: $($lock.Detail)" }
+    }
+    # Where it has got to, when its record says - a description only. The lock has
+    # already answered whether it is running.
+    $stage = $null
+    try {
+        $stage = Read-BridgeUpdateStage -Path (Get-BridgeRuntimePath -Name 'agent-bridge-update-progress.json' -Context $Context) `
+            -NotBefore ([DateTimeOffset]::Now.AddHours(-1))
+    }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+    }
+    $where = if ($stage -and -not $stage.Done) { " ($("$($stage.Stage) $($stage.Version)".Trim()))" } else { '' }
+    [pscustomobject]@{ State = 'Running'; Detail = "another update is already running on this installation$where" }
+}
+
 function Get-BridgeResponseETag {
     <#
         The ETag from a captured response header collection, or ''.
@@ -1303,6 +1346,18 @@ function Invoke-BridgeSelfUpdate {
     }
     $updateContext = if ($TargetHome -or $InstallRoot) { Resolve-BridgeInstallContext -TargetHome $resolvedTarget -BridgeHome $InstallRoot }
         else { Get-BridgeInstallContext }
+    # Turned away before anything is staged when the answer is already known (#196).
+    # The child still takes the lock itself: only the process that runs the installer
+    # can hold it for as long as the installer runs, and two presses can both pass
+    # this check before either child has started.
+    if (-not $ScriptOnly) {
+        $running = Get-BridgeUpdateRunning -Context $updateContext
+        if ($running.State -eq 'Running') {
+            $result.State = 'Busy'
+            $result.Detail = $running.Detail
+            return $result
+        }
+    }
     $result.AttemptId = [guid]::NewGuid().ToString('N')
     $attemptStartedAt = [DateTimeOffset]::Now
     $staging = Get-BridgeRuntimePath -Name "agent-ha-bridge-update-$($result.AttemptId)" -Context $updateContext
@@ -1334,6 +1389,7 @@ function Invoke-BridgeSelfUpdate {
     # child outlives the daemon, so a daemon that comes back mid-update reads where the
     # update actually is instead of losing it (#129).
     $progressPath = Get-BridgeRuntimePath -Name 'agent-bridge-update-progress.json' -Context $updateContext
+    $lockPath = Get-BridgeUpdateLockPath -Context $updateContext
     $scriptText = @"
 `$ErrorActionPreference = 'Stop'
 `$staging = '$($staging.Replace("'", "''"))'
@@ -1341,8 +1397,12 @@ function Invoke-BridgeSelfUpdate {
 `$outcomeFile = '$($outcomePath.Replace("'", "''"))'
 `$progressFile = '$($progressPath.Replace("'", "''"))'
 `$resultFile = '$($resultPath.Replace("'", "''"))'
+`$lockFile = '$($lockPath.Replace("'", "''"))'
 `$env:AGENT_HA_BRIDGE_CONFIG = '$($updateContext.ConfigPath.Replace("'", "''"))'
 `$pathsVerified = `$false
+# Set when another updater holds the lock, so this one speaks only for itself.
+`$refused = `$false
+`$updateLock = `$null
 trap {
     if (`$_.Exception.Data['BridgeTestWriteBlocked']) { Write-Error -ErrorAction Continue 'BridgeTestWriteBlocked'; exit 78 }
     if (`$_.Exception.Data['BridgeTestNetworkBlocked']) { Write-Error -ErrorAction Continue 'BridgeTestNetworkBlocked'; exit 77 }
@@ -1403,7 +1463,7 @@ try {
     Assert-BridgeTestEnvironment
     `$ownedContext = Resolve-BridgeInstallContext -BridgeHome '$($updateContext.BridgeHome.Replace("'", "''"))'$contextArgument
     if (Test-BridgeTestExecution) {
-        `$paths = @(`$staging, `$log, `$outcomeFile, `$env:AGENT_HA_BRIDGE_CONFIG)
+        `$paths = @(`$staging, `$log, `$outcomeFile, `$lockFile, `$env:AGENT_HA_BRIDGE_CONFIG)
         if (`$resultFile) { `$paths += `$resultFile }
         Assert-BridgeTestPath -Path `$paths
     }
@@ -1412,6 +1472,22 @@ try {
     . '$((Join-Path $updateContext.HooksDir 'bridge-test-guard.ps1').Replace("'", "''"))'
     . '$((Join-Path $updateContext.HooksDir 'bridge-download.ps1').Replace("'", "''"))'
     `$pathsVerified = `$true
+    # One updater per installation (#196): two would install over the same files at
+    # once. Held from here until this process exits and released by the operating
+    # system however it exits, so a child that dies cannot leave it held. Taken
+    # before the first progress write, because a refused child must not touch the
+    # record of the update that is running. The wait covers a daemon probing it at
+    # this very moment; a real holder holds it for minutes.
+    Assert-BridgeInstallPayload -Root `$lockFile -CheckAncestors
+    `$lock = Enter-BridgeFileLock -Path `$lockFile -Create -WaitMilliseconds 5000
+    if (`$lock.State -eq 'Acquired') { `$updateLock = `$lock.Stream }
+    elseif (`$lock.State -eq 'Held') {
+        `$refused = `$true
+        throw 'Another update is already running on this installation; this one did not start.'
+    }
+    # Anything else says nothing about another updater, and refusing on it would
+    # stop this machine updating for as long as the file stays unreadable.
+    else { Write-UpdateLog "the update lock could not be taken, so nothing stops a second update running alongside this one: `$(`$lock.Detail)" }
     Write-UpdateStage -Stage 'downloading'
     Write-UpdateLog 'downloading $($status.Latest)'
     `$zip = Join-Path `$staging 'release.zip'
@@ -1501,9 +1577,15 @@ if (-not `$resultFile) {
     }
 }
 `$outcome.at = [DateTimeOffset]::Now.ToString('o')
-Write-UpdateStage -Stage `$(if (`$outcome.success) { 'completed' } else { 'failed' }) -Detail `$outcome.error
+# A refused child speaks only for itself. The progress record belongs to the update
+# that is running, and so does the shared outcome - unless this child was detached,
+# when the shared outcome is the only way anyone hears that it did not run.
+if (-not `$refused) { Write-UpdateStage -Stage `$(if (`$outcome.success) { 'completed' } else { 'failed' }) -Detail `$outcome.error }
 if (`$resultFile) { Write-UpdateOutcome -Path `$resultFile -Outcome `$outcome }
-Write-UpdateOutcome -Path `$outcomeFile -Outcome `$outcome
+if (-not (`$refused -and `$resultFile)) { Write-UpdateOutcome -Path `$outcomeFile -Outcome `$outcome }
+# Only now: released any earlier, a second updater could start and have its record
+# overwritten by this one's last writes.
+if (`$updateLock) { `$updateLock.Dispose() }
 exit `$outcome.exitCode
 "@
 

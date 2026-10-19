@@ -159,6 +159,46 @@ if ($IsWindows) {
         })
         Assert-UpdateIntake "$case cleans its reserved private result" (-not (Test-Path -LiteralPath $proof))
     }
+    # Another updater took the lock between the parent's check and this child's - the
+    # race the child's own lock exists to close (#196). The child is turned away
+    # before it installs anything, and the running update's progress record, which is
+    # what the dashboard is showing, is left exactly as it was.
+    $refusal = 'Another update is already running on this installation; this one did not start.'
+    foreach ($case in @('busy-child', 'busy-detached')) {
+        New-UpdateFixture -Case $case
+        $progressPath = $script:BridgeUpdateConfig.ProgressFile
+        Assert-BridgeTestPath -Path $progressPath
+        $runningRecord = @{
+            schemaVersion = 1; attemptId = ('f' * 32); stage = 'installing'; version = '1.2.0'
+            at = [DateTimeOffset]::Now.ToString('o')
+        } | ConvertTo-Json -Compress
+        Set-Content -LiteralPath $progressPath -Value $runningRecord -Encoding UTF8 -NoNewline
+        $detached = $case -eq 'busy-detached'
+        $result = if ($detached) { Invoke-BridgeSelfUpdate -Detached } else { Invoke-BridgeSelfUpdate }
+        Write-UpdateResultDiagnostic -Result $result -Expected @{ Success = $false; Refusal = $refusal }
+        Assert-UpdateIntake "$case does not hide a fixture timeout" (-not $fixtureState.ChildTimedOut -and $fixtureState.Launches -eq 1)
+        Assert-UpdateIntake "$case never reaches the installer" (
+            -not (Test-Path -LiteralPath (Join-Path $fixtureState.DefaultInstallRoot 'inert-installer-called.txt')))
+        Assert-UpdateIntake "$case leaves the running update's progress record exactly as it was" (
+            (Get-Content -LiteralPath $progressPath -Raw) -ceq $runningRecord)
+        if ($detached) {
+            $notice = Read-BridgeUpdateOutcome -Path $script:DaemonConfig.UpdateOutcomeFile
+            Assert-UpdateIntake 'a turned-away detached child says so in the shared outcome, having nobody else to tell' (
+                $result.Started -and -not $notice.Success -and $notice.AttemptId -ceq $result.AttemptId -and
+                $notice.Error -ceq $refusal -and $notice.RanInstaller -eq $false -and $fixtureState.DetachedChildExit -eq 1)
+            Assert-UpdateIntake 'and removes its own stage' (-not (Test-Path -LiteralPath $fixtureState.LastStage))
+        }
+        else {
+            Assert-UpdateIntake 'a turned-away foreground child reports the refusal to its own caller' (
+                $result.State -eq 'Failed' -and -not $result.Success -and $result.Detail.Contains($refusal))
+            Assert-UpdateIntake 'and leaves the shared outcome to the update that is running' (
+                -not (Test-Path -LiteralPath $script:DaemonConfig.UpdateOutcomeFile))
+            Assert-UpdateIntake 'and cleans its own stage and private result' (
+                -not (Test-Path -LiteralPath $fixtureState.LastStage) -and
+                -not (Test-Path -LiteralPath (Get-BridgeRuntimePath -Name "agent-bridge-update-result-$($result.AttemptId).json")))
+        }
+        Remove-Item -LiteralPath $progressPath -Force
+    }
     foreach ($case in @('guard-child-network', 'guard-child-write')) {
         New-UpdateFixture -Case $case
         $marker = if ($case -eq 'guard-child-network') { 'BridgeTestNetworkBlocked' } else { 'BridgeTestWriteBlocked' }

@@ -128,6 +128,11 @@ Write-Host '==> Installing' -ForegroundColor Cyan
 $result = Invoke-BridgeSelfUpdate -Force:$Force -InstallRoot $updateContext.BridgeHome -TargetHome $(if ($updateContext.Isolated) { $updateContext.Home } else { '' })
 Write-Host "    $($result.Detail)"
 if ($result.State -eq 'Current') { return }
+# Refused before anything was staged: there is no log of this attempt to point at.
+if ($result.State -eq 'Busy') {
+    Write-Host '    Nothing was installed; run this again once that update has finished.' -ForegroundColor Yellow
+    exit 1
+}
 Write-Host ''
 Write-Host "Log: $(Get-BridgeRuntimePath -Name 'agent-bridge-update.log' -Context $updateContext)"
 # Three outcomes, three exit codes. A post-install step failing used to exit 1 exactly

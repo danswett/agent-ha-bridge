@@ -12,6 +12,12 @@
     and staging writer run, but the external launch/download boundary never does.
     Generated scripts and every embedded destination must remain in the fixture.
 #>
+[CmdletBinding()]
+param(
+    # Set only when this suite starts itself as a separate process to hold the update
+    # lock, so it can be killed the way a crashed updater dies (#196).
+    [Parameter(Position = 0)][string]$HoldUpdateLock = ''
+)
 
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
@@ -23,6 +29,16 @@ Assert-BridgeTestEnvironment -Required
 # The streaming download the generated updater uses, so its progress reporting can be
 # driven here against an ordinary Stream rather than a socket (#155).
 . (Join-Path $PSScriptRoot '..\hooks\bridge-download.ps1')
+
+if ($HoldUpdateLock) {
+    Assert-BridgeTestPath -Path $HoldUpdateLock
+    $held = Enter-BridgeFileLock -Path $HoldUpdateLock -Create -WaitMilliseconds 5000
+    [Console]::Out.WriteLine("HOLDER $($held.State)")
+    [Console]::Out.Flush()
+    if ($held.State -ne 'Acquired') { exit 3 }
+    Start-Sleep -Seconds 120
+    exit 0
+}
 
 $script:Failures = 0
 function Test-That {
@@ -1309,6 +1325,14 @@ Test-That 'the installing stage carries no proportion, so the bar ends with the 
 Test-That 'and the downloader library is verified before it is loaded' {
     $generated -match "RelativePaths @\('bridge-platform\.ps1', 'bridge-test-guard\.ps1', 'bridge-download\.ps1'\)"
 }
+# One updater per installation (#196). Taken before the first progress write, because
+# a child turned away after writing one would overwrite the record of the update that
+# is running - the very thing the dashboard is showing.
+Test-That 'the updater takes its installation''s update lock before it reports any progress' {
+    $take = $generated.IndexOf('Enter-BridgeFileLock -Path $lockFile -Create')
+    $take -ge 0 -and $take -lt $generated.IndexOf("Write-UpdateStage -Stage 'downloading'") -and
+        $generated.Contains("`$lockFile = '$((Get-BridgeUpdateLockPath).Replace("'", "''"))'")
+}
 
 $genValid = Invoke-BridgeSelfUpdate -ScriptOnly -TargetHome $env:TEMP
 Test-That 'a valid TargetHome is passed through to the installer' {
@@ -1487,6 +1511,115 @@ foreach ($expectedPath in @(
     }
 }
 Remove-BridgeTestSandbox -Sandbox $env:AGENT_HA_BRIDGE_TEST_ROOT -Directory (Split-Path $stagedScript -Parent)
+
+Write-Host '--- one updater per installation ---'
+# Two presses used to start two updaters, each running the release's installer over
+# the same installation at the same time (#196). Nothing serialised them, and the
+# obvious fix - a flag a crashed updater could leave set - would have left a machine
+# unable to update ever again.
+function Get-UpdateStagingFolders {
+    @(Get-ChildItem -LiteralPath (Get-BridgeRuntimeRoot) -Directory -Filter 'agent-ha-bridge-update-*' -ErrorAction Stop |
+        Sort-Object FullName | ForEach-Object { $_.FullName })
+}
+function Remove-LaunchedUpdateStaging {
+    if (-not $script:LaunchedWith) { return }
+    Remove-BridgeTestSandbox -Sandbox $env:AGENT_HA_BRIDGE_TEST_ROOT `
+        -Directory (Split-Path ([string]$script:LaunchedWith.ArgumentList[-1]).Trim('"') -Parent)
+}
+$lockPath = Get-BridgeUpdateLockPath
+$progressPath = $script:BridgeUpdateConfig.ProgressFile
+Assert-BridgeTestPath -Path @($lockPath, $progressPath)
+[void][IO.Directory]::CreateDirectory((Split-Path $lockPath -Parent))
+Remove-Item -LiteralPath $lockPath -Force -ErrorAction SilentlyContinue
+Test-That 'with no lock file yet, no update is running' { (Get-BridgeUpdateRunning).State -eq 'Idle' }
+
+$held = Enter-BridgeFileLock -Path $lockPath -Create
+try {
+    Test-That 'an updater can take the lock' { $held.State -eq 'Acquired' -and $null -ne $held.Stream } $held.Detail
+    @{ schemaVersion = 1; attemptId = ('f' * 32); stage = 'installing'; version = '9.9.9'
+       at = [DateTimeOffset]::Now.ToString('o') } | ConvertTo-Json -Compress |
+        Set-Content -LiteralPath $progressPath -Encoding UTF8
+    $running = Get-BridgeUpdateRunning
+    Test-That 'while it holds it an update is running, and where it has got to is named' {
+        $running.State -eq 'Running' -and $running.Detail -match 'already running.*\(installing 9\.9\.9\)'
+    } $running.Detail
+    $second = Enter-BridgeFileLock -Path $lockPath -Create -WaitMilliseconds 300
+    Test-That 'a second updater cannot take it, however long it waits' { $second.State -eq 'Held' } $second.State
+    Test-That 'and asking whether it is held does not take it from the holder' { (Get-BridgeUpdateRunning).State -eq 'Running' }
+
+    $script:LaunchedWith = $null
+    $stagingBefore = Get-UpdateStagingFolders
+    $refusedRun = Invoke-BridgeSelfUpdate -Detached
+    $stagingAfter = Get-UpdateStagingFolders
+    Test-That 'a press while it runs starts nothing, stages nothing, and says why' {
+        $refusedRun.State -eq 'Busy' -and -not $refusedRun.Started -and $refusedRun.AttemptId -eq '' -and
+            $null -eq $script:LaunchedWith -and $refusedRun.Detail -match 'already running' -and
+            ($stagingAfter -join '|') -ceq ($stagingBefore -join '|')
+    } "$($refusedRun.State): $($refusedRun.Detail)"
+}
+finally {
+    if ($held.Stream) { $held.Stream.Dispose() }
+    Remove-Item -LiteralPath $progressPath -Force -ErrorAction SilentlyContinue
+}
+Test-That 'released, the lock is free for the next update' { (Get-BridgeUpdateRunning).State -eq 'Idle' }
+$script:LaunchedWith = $null
+$afterRelease = Invoke-BridgeSelfUpdate -Detached
+Test-That 'which then starts' { $afterRelease.Started -and $null -ne $script:LaunchedWith } $afterRelease.Detail
+Remove-LaunchedUpdateStaging
+
+# A lock that cannot be opened at all - a folder where the file should be - says
+# nothing about whether an update is running. Refusing on it would turn one bad file
+# into a machine that can never update, which is worse than what the lock prevents.
+Remove-Item -LiteralPath $lockPath -Force
+[void][IO.Directory]::CreateDirectory($lockPath)
+try {
+    $unreadable = Get-BridgeUpdateRunning
+    Test-That 'a lock that cannot be read is unknown, never a running update' {
+        $unreadable.State -eq 'Unknown' -and $unreadable.Detail -match 'could not be read'
+    } "$($unreadable.State): $($unreadable.Detail)"
+    $script:LaunchedWith = $null
+    $unknownRun = Invoke-BridgeSelfUpdate -Detached
+    Test-That 'and it does not stop an update starting' { $unknownRun.Started } $unknownRun.Detail
+    Remove-LaunchedUpdateStaging
+}
+finally { [IO.Directory]::Delete($lockPath) }
+
+# What a crash leaves behind: nothing. The holder is a real process, killed outright
+# with no chance to release anything - how an updater dies when its process tree is
+# ended or the machine loses power - and the lock is free the moment it has gone.
+$holder = [Diagnostics.Process]::new()
+$holderStarted = $false
+try {
+    $holder.StartInfo = New-BridgeTestProcessStartInfo -ScriptPath $PSCommandPath `
+        -Sandbox $env:AGENT_HA_BRIDGE_TEST_ROOT -ScriptArguments @($lockPath)
+    $holderStarted = $holder.Start()
+    $holder.StandardInput.Close()
+    $holderErrors = $holder.StandardError.ReadToEndAsync()
+    $announced = ''
+    $deadline = [DateTimeOffset]::UtcNow.AddSeconds(60)
+    while (-not $announced.StartsWith('HOLDER') -and [DateTimeOffset]::UtcNow -lt $deadline) {
+        $next = $holder.StandardOutput.ReadLineAsync()
+        $remaining = [int][Math]::Max(1, ($deadline - [DateTimeOffset]::UtcNow).TotalMilliseconds)
+        if (-not $next.Wait($remaining) -or $null -eq $next.Result) { break }
+        $announced = [string]$next.Result
+    }
+    Test-That 'a separate process holding the lock is an update running' {
+        $announced -eq 'HOLDER Acquired' -and (Get-BridgeUpdateRunning).State -eq 'Running'
+    } "holder said '$announced'$(if ($holder.HasExited -and $holderErrors.Wait(1000)) { ": $($holderErrors.Result)" })"
+    $holder.Kill($true)
+    [void]$holder.WaitForExit(30000)
+    $afterCrash = Get-BridgeUpdateRunning
+    Test-That 'and once that process is killed the lock is free at once, with nothing to expire' {
+        $holder.HasExited -and $afterCrash.State -eq 'Idle'
+    } "$($afterCrash.State): $($afterCrash.Detail)"
+}
+finally {
+    if ($holderStarted -and -not $holder.HasExited) {
+        $holder.Kill($true)
+        [void]$holder.WaitForExit(30000)
+    }
+    $holder.Dispose()
+}
 
 Write-Host '--- an updater that cannot be launched fails cleanly and leaves nothing behind ---'
 Test-That 'pwsh is resolvable here' { [bool](Get-BridgePwshPath) } "$(Get-BridgePwshPath)"
