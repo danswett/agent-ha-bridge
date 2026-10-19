@@ -98,6 +98,13 @@ Test-That 'and the account reported is the one last signed in, not the first lis
 # The shape GitHub really returns, trimmed to the parts that are read. The snapshot is
 # stamped now rather than on a fixed date: the card calls a reading over an hour old a
 # memory, so a literal timestamp here passes in the morning and fails after lunch.
+#
+# The reset date moves with the clock for the same reason. The window is the month
+# ending there, and the card's pace verdict compares the spend with how much of that
+# month has gone - so a fixed 2026-11-01 read as "ahead of pace" early in October and
+# "on pace" from the 18th, failing every build from then on. Twenty days out keeps the
+# window between 28% and 39% gone, whatever today is, which 67.2% is well ahead of.
+$copilotResetDay = [DateTimeOffset]::new([DateTime]::UtcNow.Date.AddDays(20), [TimeSpan]::Zero)
 function New-CopilotBody {
     param(
         [double]$Remaining = 492078,
@@ -109,7 +116,7 @@ function New-CopilotBody {
 {
   "login": "$Login",
   "copilot_plan": "enterprise",
-  "quota_reset_date_utc": "2026-11-01T00:00:00.000Z",
+  "quota_reset_date_utc": "$($copilotResetDay.ToString('yyyy-MM-dd'))T00:00:00.000Z",
   "quota_snapshots": {
     "chat": { "entitlement": 0, "remaining": 0, "unlimited": true, "percent_remaining": 100 },
     "premium_interactions": {
@@ -135,7 +142,7 @@ Test-That 'the window keeps the raw figures the card prints under the bar' {
     $copilot.windows[0].used -eq 1007922 -and $copilot.windows[0].limit -eq 1500000 -and $copilot.windows[0].unit -ceq 'AIC'
 }
 Test-That 'the reset date is carried as sortable UTC, not a local short date' {
-    $copilot.windows[0].resets_at -match '^2026-11-01T00:00:00'
+    $copilot.windows[0].resets_at -match "^$($copilotResetDay.ToString('yyyy-MM-dd'))T00:00:00"
 } "resets_at=$($copilot.windows[0].resets_at)"
 Test-That 'and the window it belongs to is the month ending there, so pace can be read' {
     $copilot.windows[0].Contains('elapsed') -and $copilot.windows[0].elapsed -gt 0
