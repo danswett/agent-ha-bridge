@@ -501,6 +501,19 @@ function Get-BridgeUpdateLockPath {
     Get-BridgeRuntimePath -Name 'agent-bridge-update.lock' -Context $Context
 }
 
+function Get-BridgeUpdateRefusalPath {
+    <#
+        Where a detached updater that found the lock held says it did not run (#196).
+
+        Not the shared outcome, which belongs to the update holding the lock. Written
+        there, a refusal landing after that update's result and before the daemon read
+        it replaced the result, and was then announced as a failed update that might
+        have left the installation half-changed. Raised by Codex on #230.
+    #>
+    param($Context = (Get-BridgeInstallContext))
+    Get-BridgeRuntimePath -Name 'agent-bridge-update-refused.json' -Context $Context
+}
+
 function Get-BridgeUpdateRunning {
     <#
         Whether an updater is running on an installation right now.
@@ -1397,6 +1410,7 @@ function Invoke-BridgeSelfUpdate {
     # update actually is instead of losing it (#129).
     $progressPath = Get-BridgeRuntimePath -Name 'agent-bridge-update-progress.json' -Context $updateContext
     $lockPath = Get-BridgeUpdateLockPath -Context $updateContext
+    $refusalPath = Get-BridgeUpdateRefusalPath -Context $updateContext
     $scriptText = @"
 `$ErrorActionPreference = 'Stop'
 `$staging = '$($staging.Replace("'", "''"))'
@@ -1405,6 +1419,7 @@ function Invoke-BridgeSelfUpdate {
 `$progressFile = '$($progressPath.Replace("'", "''"))'
 `$resultFile = '$($resultPath.Replace("'", "''"))'
 `$lockFile = '$($lockPath.Replace("'", "''"))'
+`$refusalFile = '$($refusalPath.Replace("'", "''"))'
 `$env:AGENT_HA_BRIDGE_CONFIG = '$($updateContext.ConfigPath.Replace("'", "''"))'
 `$pathsVerified = `$false
 # Set when another updater holds the lock, so this one speaks only for itself.
@@ -1470,7 +1485,7 @@ try {
     Assert-BridgeTestEnvironment
     `$ownedContext = Resolve-BridgeInstallContext -BridgeHome '$($updateContext.BridgeHome.Replace("'", "''"))'$contextArgument
     if (Test-BridgeTestExecution) {
-        `$paths = @(`$staging, `$log, `$outcomeFile, `$lockFile, `$env:AGENT_HA_BRIDGE_CONFIG)
+        `$paths = @(`$staging, `$log, `$outcomeFile, `$lockFile, `$refusalFile, `$env:AGENT_HA_BRIDGE_CONFIG)
         if (`$resultFile) { `$paths += `$resultFile }
         Assert-BridgeTestPath -Path `$paths
     }
@@ -1584,12 +1599,14 @@ if (-not `$resultFile) {
     }
 }
 `$outcome.at = [DateTimeOffset]::Now.ToString('o')
-# A refused child speaks only for itself. The progress record belongs to the update
-# that is running, and so does the shared outcome - unless this child was detached,
-# when the shared outcome is the only way anyone hears that it did not run.
+# A refused child speaks only for itself. The progress record and the shared outcome
+# both belong to the update holding the lock: a refusal written over that outcome
+# could replace its result before the daemon read it (Codex on #230). A detached
+# child, with nobody else to tell, leaves its refusal beside them instead.
 if (-not `$refused) { Write-UpdateStage -Stage `$(if (`$outcome.success) { 'completed' } else { 'failed' }) -Detail `$outcome.error }
 if (`$resultFile) { Write-UpdateOutcome -Path `$resultFile -Outcome `$outcome }
-if (-not (`$refused -and `$resultFile)) { Write-UpdateOutcome -Path `$outcomeFile -Outcome `$outcome }
+if (-not `$refused) { Write-UpdateOutcome -Path `$outcomeFile -Outcome `$outcome }
+elseif (-not `$resultFile) { Write-UpdateOutcome -Path `$refusalFile -Outcome `$outcome }
 # Only now: released any earlier, a second updater could start and have its record
 # overwritten by this one's last writes.
 if (`$updateLock) { `$updateLock.Dispose() }

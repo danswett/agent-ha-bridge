@@ -647,7 +647,7 @@ try {
     }
     Submit-UpdatePress -Minutes 8
     Assert-UpdateOutcome 'a launch turned away because one started in between is answered as already running' (
-        $script:SelfUpdateCalls -eq 1 -and (Get-AlreadyRunningNotice).Count -eq 1 -and
+        $script:SelfUpdateCalls -eq 1 -and @(Get-AlreadyRunningNotice).Count -eq 1 -and
         @($script:Notified | Where-Object { [string]$_.title -match 'failed' }).Count -eq 0)
     Assert-UpdateOutcome 'and leaves that update''s progress record in place, with no failure recorded against it' (
         (Get-Content -LiteralPath $progressFile -Raw) -ceq $runningRecord -and $null -eq $script:DaemonUpdateVerdict)
@@ -656,10 +656,67 @@ try {
     $republished = Get-UpdateAttributesPayload | ConvertFrom-Json -AsHashtable
     Assert-UpdateOutcome 'and the next pass shows that update again, not the spinner this press put up' (
         $null -ne $republished -and $republished['stage'] -ceq 'installing')
+
+    Write-Host '--- an updater turned away by the lock never speaks over the update in its way ---'
+    # A launched child that loses the race for the lock writes a file of its own, never
+    # the shared outcome: written there, a refusal landing after the holder's result
+    # and before this daemon read it replaced that result, and was announced as a
+    # failure that might have half-changed the installation. Raised by Codex on #230.
+    $refusalFile = Get-BridgeUpdateRefusalPath
+    Assert-BridgeTestPath -Path $refusalFile
+    function Write-Refusal {
+        @{ schemaVersion = 1; attemptId = ('7' * 32); success = $false; exitCode = 1; version = '1.2.0'
+           beforeVersion = '1.1.0'; ranInstaller = $false
+           error = 'Another update is already running on this installation; this one did not start.'
+           at = [DateTimeOffset]::Now.ToString('o') } | ConvertTo-Json -Compress |
+            Set-Content -LiteralPath $refusalFile -Encoding UTF8
+    }
+    function Get-FailedNotice { @($script:Notified | Where-Object { [string]$_.title -match 'failed' }) }
+
+    Reset-UpdateCapture
+    $script:DaemonUpdateVerdict = $null
+    $script:DaemonUpdatePendingAttempt = ('7' * 32)
+    $script:DaemonUpdateLaunchedAt = [DateTimeOffset]::Now
+    Write-Refusal
+    $held = Enter-BridgeFileLock -Path $lockPath -Create
+    try { Sync-DaemonUpdateStatus -Headers $headers }
+    finally { if ($held.Stream) { $held.Stream.Dispose() } }
+    Assert-UpdateOutcome 'while the update in its way runs, the press is answered as already running' (
+        @(Get-AlreadyRunningNotice).Count -eq 1 -and @(Get-FailedNotice).Count -eq 0 -and $null -eq $script:DaemonUpdateVerdict)
+    Assert-UpdateOutcome 'and is no longer waited on, with its file consumed and the shared outcome never written' (
+        -not $script:DaemonUpdatePendingAttempt -and -not (Test-Path -LiteralPath $refusalFile) -and
+        -not (Test-Path -LiteralPath $outcomeFile))
+
+    # The race itself: the holder has written its result, and the refusal is read in the
+    # same pass - before the holder has even let go of the lock.
+    Reset-UpdateCapture
+    Remove-Item -LiteralPath $progressFile -Force
+    Write-Marker @{ schemaVersion = 1; attemptId = ('f' * 32); success = $true; exitCode = 0; version = '1.2.0'
+        beforeVersion = '1.1.0'; ranInstaller = $true; error = ''; at = [DateTimeOffset]::Now.ToString('o') }
+    $script:DaemonUpdatePendingAttempt = ('7' * 32)
+    Write-Refusal
+    $held = Enter-BridgeFileLock -Path $lockPath -Create
+    try { Sync-DaemonUpdateStatus -Headers $headers }
+    finally { if ($held.Stream) { $held.Stream.Dispose() } }
+    Assert-UpdateOutcome 'a refusal read with the holder''s success leaves that success as the only answer' (
+        @($script:Notified | Where-Object { [string]$_.title -match '^Bridge installer completed' }).Count -eq 1 -and
+        @(Get-AlreadyRunningNotice).Count -eq 0 -and @(Get-FailedNotice).Count -eq 0)
+    Assert-UpdateOutcome 'with both files consumed' (
+        -not (Test-Path -LiteralPath $outcomeFile) -and -not (Test-Path -LiteralPath $refusalFile))
+
+    # Once the update in its way has finished and reported, a late refusal adds nothing.
+    Reset-UpdateCapture
+    $script:DaemonUpdatePendingAttempt = ('7' * 32)
+    Write-Refusal
+    Sync-DaemonUpdateStatus -Headers $headers
+    Assert-UpdateOutcome 'a refusal read after the update in its way has finished announces nothing' (
+        $script:Notified.Count -eq 0 -and -not $script:DaemonUpdatePendingAttempt -and
+        -not (Test-Path -LiteralPath $refusalFile))
 }
 finally {
     Set-Item Function:\Invoke-BridgeSelfUpdate -Value $realSelfUpdate
     Remove-Item -LiteralPath $progressFile -Force -ErrorAction SilentlyContinue
+    Remove-Item -LiteralPath (Get-BridgeUpdateRefusalPath) -Force -ErrorAction SilentlyContinue
     $script:ButtonState = 'unavailable'
     $script:DaemonUpdateVerdict = $null
     $script:DaemonUpdateSignature = ''

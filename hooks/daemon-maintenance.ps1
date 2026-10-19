@@ -532,6 +532,61 @@ function Send-DaemonUpdateBusyNotice {
     }
 }
 
+function Invoke-DaemonUpdateRefusal {
+    <#
+        Answers a press whose detached updater found another holding the lock (#196).
+
+        Such an updater says so in its own file, never in the shared outcome: written
+        there, a refusal that landed after the holder's result and before this daemon
+        read it replaced that result, and was announced as a failed update that might
+        have left the installation half-changed. Raised by Codex on #230.
+
+        The answer is the notice a press gets when the lock is seen before launching,
+        and only while that update is still running - the notice promises its result
+        will follow. Once it has finished it has reported, and a notice saying it is
+        still running must not replace that. -ResultAnnounced covers the moment between
+        the holder writing its result and letting go of the lock.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Headers, [switch]$ResultAnnounced)
+
+    $path = Get-BridgeUpdateRefusalPath
+    $claimed = "$path.$([guid]::NewGuid().ToString('N')).reading"
+    if (Test-BridgeTestExecution) { Assert-BridgeTestPath -Path @($path, $claimed) }
+    if (-not (Test-Path -LiteralPath $path)) { return $false }
+    Assert-BridgeInstallPayload -Root $path -CheckAncestors
+    $ownsClaim = $false
+    try {
+        try {
+            [IO.File]::Move($path, $claimed)
+            $ownsClaim = $true
+        }
+        catch [IO.FileNotFoundException] { return $false }
+        $refusal = Read-BridgeUpdateOutcome -Path $claimed
+        if ($script:DaemonUpdatePendingAttempt -and $script:DaemonUpdatePendingAttempt -eq $refusal.AttemptId) {
+            $script:DaemonUpdatePendingAttempt = ''
+            $script:DaemonUpdateLaunchedAt = [DateTimeOffset]::MinValue
+        }
+        # Whatever this press put up is replaced by what is actually true next pass.
+        $script:DaemonUpdateSignature = ''
+        if (([DateTimeOffset]::Now - $refusal.At).TotalHours -gt 6) { return $true }
+        $running = if ($ResultAnnounced) { $null } else { Get-BridgeUpdateRunning }
+        if ($null -ne $running -and $running.State -eq 'Running') { Send-DaemonUpdateBusyNotice -Detail $running.Detail -Headers $Headers }
+        else { Write-DaemonLog -Message "a pressed update did not start, and the one in its way has since finished: $($refusal.Error)" }
+        return $true
+    }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        Write-DaemonLog -Message "a refused update could not be read: $($_.Exception.Message)"
+        return $true
+    }
+    finally {
+        if ($ownsClaim) {
+            if (Test-BridgeTestExecution) { Assert-BridgeTestPath -Path $claimed }
+            if (Test-Path -LiteralPath $claimed) { Remove-Item -LiteralPath $claimed -Force -ErrorAction Stop }
+        }
+    }
+}
+
 function Sync-DaemonUpdateStatus {
     <#
         Publishes the bridge's own update status, and acts on a press of the install
@@ -547,6 +602,9 @@ function Sync-DaemonUpdateStatus {
     # A pending self-update result is announced regardless of the update-check opt-out:
     # it is the response to the user pressing install, not a background poll.
     $outcomeHandled = Invoke-DaemonUpdateOutcome -Headers $Headers
+    # After the outcome, and told about it: a refusal that arrives with the result of
+    # the update that turned it away must not answer over that result.
+    [void](Invoke-DaemonUpdateRefusal -Headers $Headers -ResultAnnounced:([bool]$outcomeHandled))
 
     # Opting out has to stop the network call, not just hide the result, so this is
     # checked before anything else happens.

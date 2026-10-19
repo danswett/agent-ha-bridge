@@ -182,11 +182,18 @@ if ($IsWindows) {
         Assert-UpdateIntake "$case leaves the running update's progress record exactly as it was" (
             (Get-Content -LiteralPath $progressPath -Raw) -ceq $runningRecord)
         if ($detached) {
-            $notice = Read-BridgeUpdateOutcome -Path $script:DaemonConfig.UpdateOutcomeFile
-            Assert-UpdateIntake 'a turned-away detached child says so in the shared outcome, having nobody else to tell' (
+            $refusalPath = Get-BridgeUpdateRefusalPath
+            Assert-BridgeTestPath -Path $refusalPath
+            $notice = Read-BridgeUpdateOutcome -Path $refusalPath
+            Assert-UpdateIntake 'a turned-away detached child says so in a file of its own, having nobody else to tell' (
                 $result.Started -and -not $notice.Success -and $notice.AttemptId -ceq $result.AttemptId -and
                 $notice.Error -ceq $refusal -and $notice.RanInstaller -eq $false -and $fixtureState.DetachedChildExit -eq 1)
+            # Written there, it could replace the running update's result before the
+            # daemon read it. Raised by Codex on #230.
+            Assert-UpdateIntake 'and never in the shared outcome, which belongs to the update holding the lock' (
+                -not (Test-Path -LiteralPath $script:DaemonConfig.UpdateOutcomeFile))
             Assert-UpdateIntake 'and removes its own stage' (-not (Test-Path -LiteralPath $fixtureState.LastStage))
+            Remove-Item -LiteralPath $refusalPath -Force
         }
         else {
             Assert-UpdateIntake 'a turned-away foreground child reports the refusal to its own caller' (
