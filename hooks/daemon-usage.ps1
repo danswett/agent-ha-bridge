@@ -42,6 +42,9 @@ $script:BridgeKeychainUnavailable = $false
 $script:BridgeGhAccount = ''
 $script:BridgeGhReason = ''
 $script:BridgeGhUnavailable = $false
+# When gh last failed to answer, so the hold that follows can end - see
+# Get-BridgeGitHubCliToken and Reset-BridgeGitHubCliHold.
+$script:BridgeGhUnavailableAt = [DateTimeOffset]::MinValue
 
 function Get-BridgeKeychainRefusal {
     <#
@@ -86,6 +89,22 @@ $script:BridgeUsageConfig = @{
     # the takeover whatever pace is configured; see Test-BridgeUsageCovered.
     CoveredIntervals = 3
     ReassertIntervals = 2
+    # How long a machine that defers to nobody leaves an unchanged reading before
+    # publishing it again. It used to be never, so a daemon still asking and finding
+    # nothing new looked exactly like one that had stopped asking: a Mac's sensors sat
+    # at the same reading for four days while its daemon was demonstrably alive, and
+    # nothing on them could say which it was (#201). Half an hour keeps a reading this
+    # machine is still confirming inside the card's hour, so one that ages past it has
+    # stopped being checked - while costing one retained publish per client per half
+    # hour, not one per poll.
+    RepublishSeconds = 1800
+    # How long a gh that did not answer is left alone before it is asked again, and how
+    # long after that a Copilot session opening here may ask it sooner. A keyring waiting
+    # to be unlocked holds gh at a prompt, so asking on every poll raises a prompt on
+    # every poll; but "not again this run" meant never again for a daemon that runs for
+    # weeks (#201).
+    GhHoldHours = 6
+    GhPresentMinutes = 15
     RequestTimeout  = 15
     # One attempt is not a reading, it is a coin toss on any path that is less than
     # perfect. Measured on DSWETT-HOME on 2026-10-07: api.github.com completed 6 of 14
@@ -458,8 +477,11 @@ function Get-BridgeGitHubCliToken {
         milliseconds, so signing in to it heals the card on the next poll instead of
         at the next restart. A `gh` that never answers is a different matter. A keyring
         waiting to be unlocked holds it at a prompt, and asking again in two minutes
-        raises that prompt again - so a timeout is final for the run, as the keychain's
-        refusal is.
+        raises that prompt again - so a timeout holds it off, as the keychain's
+        refusal does. For GhHoldHours rather than for the run, though: a daemon can run
+        for weeks, and a hold that outlived the locked keyring by that long froze a
+        Mac's Copilot reading for days (#201). Reset-BridgeGitHubCliHold ends it sooner
+        once somebody is evidently at the machine.
     #>
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Login, [string]$HostUrl = 'https://github.com')
 
@@ -475,7 +497,10 @@ function Get-BridgeGitHubCliToken {
         $script:BridgeGhReason = ''
         $script:BridgeGhUnavailable = $false
     }
-    if ($script:BridgeGhUnavailable) { return '' }
+    if ($script:BridgeGhUnavailable) {
+        if (([DateTimeOffset]::Now - $script:BridgeGhUnavailableAt).TotalHours -lt $script:BridgeUsageConfig.GhHoldHours) { return '' }
+        $script:BridgeGhUnavailable = $false
+    }
 
     $reason = ''
     $gh = Get-BridgeGitHubCliPath
@@ -485,6 +510,7 @@ function Get-BridgeGitHubCliToken {
             -Arguments @('auth', 'token', '--hostname', $hostName, '--user', $Login)
         if ($probe.TimedOut) {
             $script:BridgeGhUnavailable = $true
+            $script:BridgeGhUnavailableAt = [DateTimeOffset]::Now
             $reason = 'gh did not answer in time'
         }
         elseif (-not $probe.Ran) { $reason = 'gh could not be run' }
@@ -523,6 +549,26 @@ function Get-BridgeGitHubCliRefusal {
 
     if ($script:BridgeGhAccount -ne "${HostUrl}:$Login") { return '' }
     [string]$script:BridgeGhReason
+}
+
+function Reset-BridgeGitHubCliHold {
+    <#
+        Lets a gh that did not answer be asked again before its hold runs out, because
+        somebody has just opened a Copilot session on this machine. Returns whether a
+        hold was ended.
+
+        A session opening is the moment the person is at the keyboard, which is when a
+        keyring prompt can be answered rather than pile up - and when the CLI itself
+        has just reached for its credential, so a locked keyring may well be open now.
+        Never within GhPresentMinutes of the timeout: sessions opening in quick
+        succession must not become the prompt storm the hold exists to prevent.
+    #>
+    param([DateTimeOffset]$Now = [DateTimeOffset]::Now)
+
+    if (-not $script:BridgeGhUnavailable) { return $false }
+    if (($Now - $script:BridgeGhUnavailableAt).TotalMinutes -lt $script:BridgeUsageConfig.GhPresentMinutes) { return $false }
+    $script:BridgeGhUnavailable = $false
+    $true
 }
 
 function Get-BridgeCopilotToken {
@@ -1374,11 +1420,13 @@ function Sync-DaemonUsage {
         not have an allowance on a screen. The signature check keeps an unchanged
         reading off the MQTT bus between polls, which matters because every publish is
         retained; it is kept per client, so one that moved does not republish the rest.
-        The one exception is the machine actually doing the asking, which republishes an
-        unchanged reading every ReassertIntervals so that the machines standing down for
-        it can tell it apart from one that has stopped reading - an unchanged figure
-        that is never republished looks exactly like a machine that went away, and every
-        one of them would take over. Nothing is re-asserted where nobody defers.
+        An unchanged reading is still republished now and then, so that `updated` - and
+        `measured_at`, for a reading taken from a vendor rather than a transcript - says
+        when this machine last confirmed it: every RepublishSeconds where nobody defers
+        (#201), and every ReassertIntervals for the machine actually doing the asking,
+        so that the machines standing down for it can tell it apart from one that has
+        stopped reading - an unchanged figure that is never republished looks exactly
+        like a machine that went away, and every one of them would take over.
     #>
     param(
         [Parameter(Mandatory)][hashtable]$Headers,
@@ -1416,6 +1464,12 @@ function Sync-DaemonUsage {
         # its turn too: the account key behind the decision is a file read, and on a
         # reconcile loop rather than a poll clock it would be paid for every few seconds.
         $state.CheckedAt = $Now
+        # Somebody has just opened a Copilot session here, so a gh that a locked keyring
+        # held up is worth asking now rather than at the end of its hold (#201).
+        if ($client -ceq 'copilot' -and $known -and $busy -and -not [bool]$state.Busy -and
+            (Reset-BridgeGitHubCliHold -Now $Now)) {
+            Write-DaemonLog -Message 'a Copilot session opened here; asking gh for the allowance again'
+        }
         # What discovery could not see is not remembered as the state of the sessions,
         # or the pass after it would be compared against a state that never existed.
         if ($known) { $state.Busy = $busy }
@@ -1458,9 +1512,10 @@ function Sync-DaemonUsage {
     }
     if ($records.Count -eq 0) { return $false }
 
-    # Infinite where no machine defers to any other, so an installation without a
-    # configured publication keeps an unchanged reading off the bus exactly as before.
-    $reassert = if ($role -ceq 'none') { [double]::PositiveInfinity }
+    # Where no machine defers to any other, an unchanged reading still stays off the bus
+    # between polls, but only for RepublishSeconds: never republishing it made a daemon
+    # that was still asking indistinguishable from one that had stopped (#201).
+    $reassert = if ($role -ceq 'none') { [double]$script:BridgeUsageConfig.RepublishSeconds }
         else { $interval * $script:BridgeUsageConfig.ReassertIntervals }
 
     $changed = @()

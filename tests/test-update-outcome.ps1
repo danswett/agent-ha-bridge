@@ -742,6 +742,39 @@ finally {
     $script:DaemonUpdateEntityIdsPinned = $true
 }
 
+Write-Host '--- a daemon a new release was installed under restarts into it ---'
+# The updater stops only a daemon it can identify, and one it missed kept running the
+# release it started with: a Mac's usage poll stayed frozen for days across an update,
+# still on code from before the fix it had just installed (#201).
+$script:DaemonRunningVersion = ''
+$script:DaemonRestartRequested = ''
+try {
+    Set-RecordedVersion '1.1.0'
+    Assert-UpdateOutcome 'the first look only notes which release this daemon is running' (
+        -not (Request-DaemonVersionRestart) -and $script:DaemonRunningVersion -ceq '1.1.0' -and -not $script:DaemonRestartRequested)
+    Assert-UpdateOutcome 'and the same release still installed asks for nothing' (
+        -not (Request-DaemonVersionRestart) -and -not $script:DaemonRestartRequested)
+    $saved = Get-Content -LiteralPath $configPath -Raw
+    try {
+        # An installer rewriting the record is no reason to restart in the middle of it.
+        Set-Content -LiteralPath $configPath -Value '{ "updates": ' -Encoding UTF8
+        Assert-UpdateOutcome 'a record that cannot be read is not a new release' (
+            -not (Request-DaemonVersionRestart) -and -not $script:DaemonRestartRequested)
+    }
+    finally { Set-Content -LiteralPath $configPath -Value $saved -Encoding UTF8 -NoNewline }
+    Set-RecordedVersion '1.2.0'
+    Assert-UpdateOutcome 'another release recorded under it asks the loop to restart into that release' (
+        (Request-DaemonVersionRestart) -and $script:DaemonRestartRequested -match '^run 1\.2\.0\b.*running 1\.1\.0$')
+    $script:DaemonRestartRequested = 'load the Claude Code adapter'
+    Assert-UpdateOutcome 'without replacing a restart something else already asked for' (
+        (Request-DaemonVersionRestart) -and $script:DaemonRestartRequested -ceq 'load the Claude Code adapter')
+}
+finally {
+    $script:DaemonRunningVersion = ''
+    $script:DaemonRestartRequested = ''
+    Set-RecordedVersion '1.1.0'
+}
+
 Reset-UpdateCapture
 Write-Host 'All update outcome checks passed'
 exit 0

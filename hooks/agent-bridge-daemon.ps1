@@ -1039,6 +1039,7 @@ function Invoke-DaemonReconcile {
         Sync-DaemonUpdateStatus -Headers $headers
         if ($discovery.Complete) { Sync-DaemonNewSession -Headers $headers -Live $live }
         Sync-DaemonClients -Headers $headers
+        [void](Request-DaemonVersionRestart)
         # Discovery that could not account for everything passes nothing rather than a
         # partial set, and the usage pacing then treats every client as busy: a session
         # that was missed must not be what lets a figure go stale.
@@ -1072,6 +1073,9 @@ function Invoke-DaemonReconcile {
 function Start-BridgeDaemon {
     $headers = Get-HomeAssistantHeaders
     $state = Read-DaemonState
+    # Which release this daemon is running, so a reconcile can tell when another has
+    # been installed under it (Request-DaemonVersionRestart).
+    [void](Request-DaemonVersionRestart)
 
     # Questions recorded by a previous daemon. Cleared here rather than where the
     # shared state is declared, so that loading this file for its functions cannot

@@ -150,7 +150,7 @@ foreach ($name in @(
     'Set-DaemonReconcileSnapshot', 'Sync-DaemonSessions', 'Repair-CopilotSessionEntities',
     'Invoke-DaemonFastActivity', 'Invoke-PendingDecisions', 'Invoke-PendingReplies',
     'Invoke-PendingCodexApprovals', 'Invoke-PendingStops', 'Sync-DaemonUpdateStatus',
-    'Sync-DaemonNewSession', 'Sync-DaemonClients', 'Sync-DaemonUsage', 'Clear-DaemonStaleNote',
+    'Sync-DaemonNewSession', 'Sync-DaemonClients', 'Request-DaemonVersionRestart', 'Sync-DaemonUsage', 'Clear-DaemonStaleNote',
     'Invoke-DaemonAnswerButtonQueue'
 )) {
     Set-Item -LiteralPath "function:$name" -Value { param($Headers, $State, $Live, $States) }

@@ -1106,12 +1106,15 @@ its keychain entries through `/usr/bin/security`, which therefore already trusts
 no panel is raised and `gh auth login` as that account is the whole setup. It is asked
 afresh on each poll, so signing in heals the card on the next one — within two minutes
 with a session open, a quarter of an hour without (see
-[How current it is](#how-current-it-is)); a `gh` that never answers is not asked again
-until the daemon restarts, so a keyring waiting to be unlocked cannot become the same
-storm. The same rung covers a Windows or Linux machine whose
-Copilot access comes from `gh`, with no item of the CLI's own to read. The daemon looks
-for `gh` in Homebrew's and the installers' folders as well as on `PATH`, since a
-LaunchAgent's `PATH` does not include them.
+[How current it is](#how-current-it-is)); a `gh` that never answers is left alone for
+six hours, so a keyring waiting to be unlocked cannot become the same storm. Not until
+the daemon restarts, as it once was: a daemon can run for weeks, and that froze a Mac's
+reading for days (#201). A Copilot session opening on the machine asks it again sooner,
+since somebody is then there to answer a prompt, but never within a quarter of an hour
+of it failing. The same rung covers a Windows or Linux machine whose Copilot access
+comes from `gh`, with no item of the CLI's own to read. The daemon looks for `gh` in
+Homebrew's and the installers' folders as well as on `PATH`, since a LaunchAgent's
+`PATH` does not include them.
 
 Set `usage.keychain: true` to allow the CLI's own item to be read as well. A machine that
 wants the live Copilot figure without any of that can export `COPILOT_GITHUB_TOKEN`,
@@ -1151,6 +1154,11 @@ on a machine you are working in, which is the point: its figure was measured mov
 continuously during an active session. A machine with nothing open can be up to a
 quarter of an hour behind, but the card shows whichever machine read the account most
 recently, so the machine where the work is happening is the one you are looking at.
+
+An unchanged figure is published again every half hour all the same, so that the time on
+its row says when it was last confirmed. Never republishing one made a daemon that was
+still asking look exactly like one that had stopped: a Mac's row sat on the same reading
+for four days, and nothing on it could say which (#201).
 
 That holds for work the bridge can see. Spending it cannot — Copilot in an editor, say,
 with no CLI session open on any machine — is picked up at the idle pace, so the figure
@@ -1656,7 +1664,9 @@ install.
 
 A notification is left as well — *Bridge updated to X*, or the error if it failed. The
 updater then asks the supervisor to restart the daemon so the new version is actually
-running.
+running. A daemon it could not stop restarts itself once it sees a different version
+recorded as installed, rather than running the release it started with until the
+machine next reboots (#201).
 
 A browser served a card older than 1.31.0 gets the previous separate **Bridge update
 available** card instead; the two are never drawn at once.

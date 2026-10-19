@@ -17,6 +17,11 @@ $script:DaemonMemoryTrimmedAt = [DateTimeOffset]::MinValue
 $script:DaemonUpdateSignature = ''
 $script:DaemonUpdatePendingAttempt = ''
 
+# The installed version this daemon's code came from, recorded on the first check
+# rather than when this file is loaded, so loading it for its functions reads nothing.
+# See Request-DaemonVersionRestart.
+$script:DaemonRunningVersion = ''
+
 # How an attempt ended, when no progress file says - the two outcomes where the
 # updater never started and so never wrote one: a release already installed, and a
 # launch that failed. Held in memory because neither restarts the daemon.
@@ -152,6 +157,41 @@ function Invoke-DaemonMemoryTrim {
     if (($memory.Committed - $memory.Heap) -lt $MinimumReserveBytes) { return $false }
     $script:DaemonMemoryTrimmedAt = $Now
     [GC]::Collect(2, [GCCollectionMode]::Aggressive, $true, $true)
+    $true
+}
+
+function Request-DaemonVersionRestart {
+    <#
+        Asks for this daemon to end once a different release has been recorded as
+        installed, so the supervisor starts one running it. Returns whether it asked.
+
+        The updater stops the daemon itself, but only one it can identify - and a
+        daemon it misses goes on running the release it started with for as long as
+        it lives. Every decision that daemon made "for the run" then lasts until the
+        machine next reboots: a Mac kept its usage reading frozen for four days across
+        an update, still on code from before the fix it had just installed (#201).
+        The installer writes the version record after it has copied the hooks, so a
+        daemon that ends on seeing it starts again on the new ones.
+
+        Ending is the existing restart path (DaemonRestartRequested), taken once the
+        pass is over. A record that cannot be read, or reads as nothing, is not a new
+        version - an installer rewriting it is no reason to restart mid-install.
+    #>
+    $installed = ''
+    try { $installed = [string](Get-BridgeInstalledVersion -Refresh) }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        return $false
+    }
+    if ([string]::IsNullOrWhiteSpace($installed)) { return $false }
+    if (-not $script:DaemonRunningVersion) {
+        $script:DaemonRunningVersion = $installed
+        return $false
+    }
+    if ($installed -ceq $script:DaemonRunningVersion) { return $false }
+    if (-not $script:DaemonRestartRequested) {
+        $script:DaemonRestartRequested = "run $installed, installed while this daemon was running $($script:DaemonRunningVersion)"
+    }
     $true
 }
 
