@@ -61,7 +61,13 @@
 # beside it for the same reason the slot ceiling is - makes every gate answer false
 # when the served bytes are a different build of the version they claim. That changes
 # what Save-CopilotSessionDashboard emits, so the fence needs a version to move to.
-$script:BridgeDashboardRenderVersion = '1.11.0'
+#
+# 1.12.0, not 1.11.0: the usage card now lists the numbered sensors that further
+# Copilot logins are reported on (#200), and every machine's withdrawal list - which
+# the renderer hands the card for its forget button - now names the usage sensors.
+# Both change what Save-CopilotSessionDashboard emits, and the sensor list comes from a
+# constant, so it is fingerprinted beside the field-slot ceiling for the same reason.
+$script:BridgeDashboardRenderVersion = '1.12.0'
 $script:BridgeDashboardObservation = $null
 
 function Invoke-CopilotHaWebSocket {
@@ -690,8 +696,15 @@ function Set-CopilotMqttMachineEntityId {
         Takes a unique_id -> entity_id map rather than owning a list, because four
         different groups need exactly this and each maintaining its own copy of the
         registry walk was three copies too many.
+
+        An entity not in the registry at all is skipped rather than waited for: one
+        published moments ago may not have been registered yet. -Unregistered collects
+        those, for a caller that has to try again until it is.
     #>
-    param([Parameter(Mandatory)][hashtable]$Wanted)
+    param(
+        [Parameter(Mandatory)][hashtable]$Wanted,
+        [System.Collections.Generic.List[string]]$Unregistered = $null
+    )
 
     $registry = (Invoke-CopilotHaWebSocket -Commands @(@{ type = 'config/entity_registry/list' }))[0]
     $byUniqueId = @{}
@@ -702,7 +715,10 @@ function Set-CopilotMqttMachineEntityId {
     $changed = $false
     foreach ($uniqueId in $Wanted.Keys) {
         $entry = $byUniqueId[$uniqueId]
-        if ($null -eq $entry) { continue }
+        if ($null -eq $entry) {
+            if ($null -ne $Unregistered) { $Unregistered.Add([string]$uniqueId) }
+            continue
+        }
         if ([string]$entry.entity_id -eq $Wanted[$uniqueId]) { continue }
         [void](Invoke-CopilotHaWebSocket -Commands @(@{
             type          = 'config/entity_registry/update'
@@ -761,6 +777,13 @@ function Set-CopilotMqttUsageEntityIds {
         built from the device name plus the entity name, while the generated dashboard
         hands the card sensor.agent_bridge_dswett_home_usage_copilot. Both ends were
         correct and the card drew nothing.
+
+        Returns whether every sensor was in the registry, not whether any was renamed,
+        so the daemon can tell a correction that is done from one that skipped a sensor
+        published moments before. Taken as done, that sensor would keep the id Home
+        Assistant derived until the set next changed, out of the card's sight - the
+        usual case for a further Copilot login's sensor, first published in the middle
+        of a run (#200).
     #>
     param([string]$Slug, [AllowEmptyCollection()][string[]]$Clients = @('copilot', 'claude', 'codex'))
 
@@ -770,8 +793,10 @@ function Set-CopilotMqttUsageEntityIds {
         $wanted["agent_bridge_${Slug}_usage_$client"] =
             Get-BridgeMachineEntityId -Domain 'sensor' -Key "usage_$client" -Slug $Slug
     }
-    if ($wanted.Count -eq 0) { return $false }
-    Set-CopilotMqttMachineEntityId -Wanted $wanted
+    if ($wanted.Count -eq 0) { return $true }
+    $unregistered = [System.Collections.Generic.List[string]]::new()
+    [void](Set-CopilotMqttMachineEntityId -Wanted $wanted -Unregistered $unregistered)
+    $unregistered.Count -eq 0
 }
 
 function Set-CopilotMqttNewSessionEntityIds {
@@ -996,6 +1021,9 @@ function Get-BridgeRenderArtifact {
         # the fifth unanswerable and the daemon waiting on a slot nobody could set.
         # A value the output depends on belongs in the fingerprint with the source.
         "fieldSlots=$script:CopilotMqttMaxFields"
+        # Likewise the usage sensors every machine is listed with, which the slot count
+        # for further Copilot logins decides (#200).
+        "usageSensors=$(@(Get-CopilotMqttUsageSensorKey) -join ',')"
     ) -join "`n"
     @{
         version = $script:BridgeDashboardRenderVersion
@@ -1999,12 +2027,22 @@ function Save-CopilotSessionDashboard {
             Get-BridgeMachineEntityId -Domain 'sensor' -Key "usage_$client" -Slug $slug
         }
     })
+    # The numbered sensors for further Copilot logins (#200) go to the usage card alone,
+    # which skips an entity that does not exist - so every one a machine could have is
+    # listed, and nothing has to say which it has. The fallback's entities card would
+    # draw "Entity not found" for each instead.
+    $usageCardEntities = @($machineList | ForEach-Object {
+        $slug = $_.Slug
+        foreach ($key in @(Get-CopilotMqttUsageSensorKey)) {
+            Get-BridgeMachineEntityId -Domain 'sensor' -Key "usage_$key" -Slug $slug
+        }
+    })
     if ($usageEntities.Count -gt 0) {
         if (Test-BridgeActivityCardServed -ReplyCardUrl $ReplyCardUrl -MinimumVersion '1.25.0') {
             $usageCards = @([ordered]@{
                 type     = 'custom:agent-bridge-usage-card'
                 title    = 'Agent usage'
-                entities = @($usageEntities)
+                entities = @($usageCardEntities)
             })
         }
         else {

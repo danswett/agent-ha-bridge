@@ -37,7 +37,7 @@ function Write-DaemonLog { param([string]$Message) $script:Calls.Add("log:$Messa
 foreach ($name in 'Invoke-PendingReplies', 'Invoke-PendingStops', 'Sync-DaemonNewSession',
     'Sync-DaemonSessions', 'Repair-CopilotSessionEntities', 'Invoke-DaemonFastActivity', 'Invoke-PendingDecisions',
     'Invoke-PendingCodexApprovals', 'Sync-DaemonUpdateStatus', 'Sync-DaemonClients', 'Clear-DaemonStaleNote',
-    'Write-DaemonState', 'Set-BridgeHomeAssistantReachable', 'Set-BridgeDaemonAlive') {
+    'Write-DaemonState', 'Set-BridgeHomeAssistantReachable', 'Set-BridgeDaemonAlive', 'Sync-DaemonUsage') {
     Set-Item -Path "function:script:$name" -Value ([scriptblock]::Create("`$script:Calls.Add('$name')"))
 }
 $script:DiscoveryLive = @{}

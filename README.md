@@ -433,6 +433,7 @@ never in the repo). See [`config.example.json`](config.example.json).
 | `usage.intervalSeconds` | How often to re-read an agent's allowance while a session of that agent is open on this machine (default `120`). Copilot's figure moves continuously while a session runs, so this is a poll rather than a cache read |
 | `usage.idleIntervalSeconds` | How often to re-read it while none is (default `900`, and never less than `usage.intervalSeconds`). An allowance belongs to the account, not the machine, so a machine with nothing open is not what is spending it. A session opening or closing asks at once — see [How current it is](#how-current-it-is) |
 | `usage.keychain` | Set to `true` to let the Copilot allowance read its token from the macOS login keychain (default `false`). Off because the read raises an authorization panel that **Always Allow** cannot silence — the CLI replaces the item on every token refresh, so each grant outlives its item by minutes. `COPILOT_GITHUB_TOKEN`, `GH_TOKEN` or `GITHUB_TOKEN` get the same figure without prompting, and so does a machine signed in to the GitHub CLI (`gh auth login`) as the same account — see [Agent usage](#agent-usage). No effect on Windows, which reads the credential store silently |
+| `usage.copilotAccounts` | Further GitHub logins whose Copilot allowance this machine reports beside the account Copilot is signed in as, such as `["danswett"]` — up to three, each on a numbered sensor of its own and read with the token `gh` holds for that login. Logins only, never tokens. See [More than one Copilot account](#more-than-one-copilot-account) |
 
 Prefer keeping tokens out of a file? Leave `token` / `agentToken` empty and set the
 variables named by `tokenEnvVar` / `agentTokenEnvVar` in the environment of each process
@@ -1128,6 +1129,44 @@ is no credential — for a Mac whose `gh` is not signed in as the account Copilo
 *No Copilot credential was available and nothing was cached (gh has no token for
 octocat - run gh auth login).*
 
+### More than one Copilot account
+
+A machine reports the Copilot account it is signed in as, and on purpose not every
+login Copilot's cache remembers: a token picked up from the environment leaves one
+behind, and an untouched personal allowance drawn beside the work one being spent is
+worse than nothing. When one machine really does hold two seats, name the others in
+`~/.agent-ha-bridge/config.json` and run `agent-ha-bridge restart`, since the daemon
+reads its configuration when it starts:
+
+```json
+"usage": { "copilotAccounts": ["danswett"] }
+```
+
+Each login gets a sensor of its own, numbered by its place in the list — the first on
+`sensor.agent_bridge_<slug>_usage_copilot_2`, then `_copilot_3` and `_copilot_4` —
+and the card draws it as a row of its own, under its account. Its token comes from
+`gh`, asked for exactly that login (`gh auth token --user <login>`), and from nothing
+else: the environment variables and the keychain item belong to whoever Copilot is
+signed in as, and spent for another login they would read that account's allowance
+instead. So `gh auth login` as that account is all the setup there is, a reading that
+answers for a different login than the one asked for is refused rather than shown
+under the wrong name, and a login `gh` holds no token for stays on the card saying why.
+
+The sessions on a machine spend the account Copilot is signed in as, never a further
+one, so a further login is read at the idle pace (`usage.idleIntervalSeconds`) whatever
+is open, one login a reconcile pass at most and the one that has waited longest, so
+that an endpoint that never answers cannot hold the daemon for three of them at once
+and a short pace cannot keep the later logins waiting for good — and, like any
+account, it is left to another machine that has just read it
+(see [How current it is](#how-current-it-is)), once this machine has put a reading of
+its own on its sensor since it started, so that nothing an earlier configuration left
+there outlasts it. Listing the account Copilot is already
+signed in as costs a second read and nothing else, the card drawing one row per
+account. An entry that is not a login is skipped, logged, and keeps its place, so the
+logins after it keep their sensors; one shaped like a token is refused without being
+repeated in the log. A login taken off the list has its sensor withdrawn, rather than
+its last reading left on the card with nothing to refresh it.
+
 ### How current it is
 
 An allowance belongs to the account, not the machine, so every machine signed in to it
@@ -1197,8 +1236,13 @@ The parts that keep a gauge from quietly going flat:
   whoever needs the figure most: a machine with a session open wants a reading inside
   six minutes, so it takes over from an idle machine that cannot supply one.
 - **Anything unknown means ask.** No state list from Home Assistant, no publication
-  configured, an account that cannot be identified, a reading with no timestamp — all
-  of them fall back to asking, because a redundant request is cheaper than a flat gauge.
+  configured, an account that cannot be identified, a reading with no timestamp or that
+  does not say where it came from — all of them fall back to asking, because a redundant
+  request is cheaper than a flat gauge.
+- **A failure is not a reading.** A machine that could not read an account still
+  publishes the attempt, so the card can say why, but nobody stands down for it.
+  Otherwise a machine without the credential would keep one that has it from reading
+  the account at all.
 - **A clock running ahead cannot silence anybody.** A reading stamped more than one
   interval into the future is treated as a clock rather than a figure, so a machine
   whose time is wrong makes the others ask more often, never less.
