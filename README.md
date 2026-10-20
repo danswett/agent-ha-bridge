@@ -1231,8 +1231,13 @@ The parts that keep a gauge from quietly going flat:
   whoever needs the figure most: a machine with a session open wants a reading inside
   six minutes, so it takes over from an idle machine that cannot supply one.
 - **Anything unknown means ask.** No state list from Home Assistant, no publication
-  configured, an account that cannot be identified, a reading with no timestamp — all
-  of them fall back to asking, because a redundant request is cheaper than a flat gauge.
+  configured, an account that cannot be identified, a reading with no timestamp or that
+  does not say where it came from — all of them fall back to asking, because a redundant
+  request is cheaper than a flat gauge.
+- **A failure is not a reading.** A machine that could not read an account still
+  publishes the attempt, so the card can say why, but nobody stands down for it.
+  Otherwise a machine without the credential would keep one that has it from reading
+  the account at all.
 - **A clock running ahead cannot silence anybody.** A reading stamped more than one
   interval into the future is treated as a clock rather than a figure, so a machine
   whose time is wrong makes the others ask more often, never less.
