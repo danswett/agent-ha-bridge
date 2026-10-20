@@ -54,6 +54,13 @@ $script:CopilotMqttNewSessionOption = 'New session'
 $script:CopilotEndSessionConfirmNote = 'Press End session again to end it'
 $script:CopilotEndSessionLapsedNote = 'End session NOT confirmed'
 
+# How many Copilot logins beyond the one Copilot itself is signed in as a machine can
+# report, each on a usage sensor of its own (usage.copilotAccounts, #200). Numbered
+# rather than named after the login, so the dashboard can list every sensor a machine
+# might have without being told which it has - nothing tells it, and the usage card
+# skips an entity that does not exist.
+$script:CopilotMqttUsageAccountSlots = 3
+
 function Get-CopilotMqttNodeId {
     <#
         A stable, MQTT-safe node id for a session. Discovery topics and object ids
@@ -1320,13 +1327,18 @@ function Publish-CopilotMqttUsage {
     foreach ($record in @($Records)) {
         $client = [string]$record.client
         if ([string]::IsNullOrWhiteSpace($client) -or $client -notmatch '^[a-z0-9]+$') { continue }
+        # A further login's reading goes on a numbered sensor of its own (#200); the card
+        # tells its row apart from the signed-in account's by the account it names.
+        $key = Get-CopilotMqttUsageRecordKey -Record $record
+        if ($key -cne $client -and -not ($key -cmatch '^([a-z0-9]+)_\d+$' -and $Matches[1] -ceq $client -and
+                (Get-CopilotMqttUsageSensorKey) -ccontains $key)) { continue }
 
-        $stateTopic = "$machineRoot/usage/$client/state"
-        $attrTopic = "$machineRoot/usage/$client/attr"
+        $stateTopic = "$machineRoot/usage/$key/state"
+        $attrTopic = "$machineRoot/usage/$key/attr"
         $config = @{
-            name = "$($record.label) usage"
-            unique_id = "agent_bridge_${Slug}_usage_$client"
-            object_id = "agent_bridge_${Slug}_usage_$client"
+            name = if ($key -ceq $client) { "$($record.label) usage" } else { "$($record.label) usage ($($record.account))" }
+            unique_id = "agent_bridge_${Slug}_usage_$key"
+            object_id = "agent_bridge_${Slug}_usage_$key"
             state_topic = $stateTopic
             json_attributes_topic = $attrTopic
             unit_of_measurement = '%'
@@ -1335,7 +1347,7 @@ function Publish-CopilotMqttUsage {
             device = $device
         }
         Publish-CopilotMqttMessage `
-            -Topic "$($script:CopilotMqttConfig.DiscoveryPrefix)/sensor/$node/usage_$client/config" `
+            -Topic "$($script:CopilotMqttConfig.DiscoveryPrefix)/sensor/$node/usage_$key/config" `
             -Payload ($config | ConvertTo-Json -Depth 6 -Compress) -Headers $Headers -Retain
 
         # `unknown` rather than an empty payload or a zero: a client that could not be
@@ -1363,12 +1375,41 @@ function Publish-CopilotMqttUsage {
     }
 }
 
+function Get-CopilotMqttUsageSensorKey {
+    <#
+        Every usage sensor a machine can publish, by the key in its topics and entity id:
+        one per client, and the numbered ones for the further Copilot logins that
+        usage.copilotAccounts can name (#200). One list, because the publisher, the
+        dashboard and the withdrawal on uninstall or forget all have to agree on it: a
+        sensor missing from the last is left behind with nothing to remove it.
+    #>
+    $keys = @('copilot', 'claude', 'codex')
+    if ($script:CopilotMqttUsageAccountSlots -ge 1) {
+        foreach ($slot in 2..(1 + $script:CopilotMqttUsageAccountSlots)) { $keys += "copilot_$slot" }
+    }
+    $keys
+}
+
+function Get-CopilotMqttUsageRecordKey {
+    <# The sensor a usage record goes on: the numbered one it names, for a further
+       Copilot login's reading, and otherwise its client's. #>
+    param([Parameter(Mandatory)]$Record)
+    $sensor = ''
+    if ($Record -is [System.Collections.IDictionary]) {
+        if ($Record.Contains('sensor')) { $sensor = [string]$Record['sensor'] }
+    }
+    elseif ($Record.PSObject.Properties['sensor']) { $sensor = [string]$Record.sensor }
+    if ($sensor) { return $sensor }
+    [string]$Record.client
+}
+
 function Get-CopilotMqttUsageTopics {
     <#
         The retained usage topics for one machine, for an uninstall or a forget to
-        clear. Separate from the publisher so the list of what exists is written once.
+        clear - and for the daemon, when a further Copilot login stops being reported.
+        Separate from the publisher so the list of what exists is written once.
     #>
-    param([string]$Slug, [AllowEmptyCollection()][string[]]$Clients = @('copilot', 'claude', 'codex'))
+    param([string]$Slug, [AllowEmptyCollection()][string[]]$Clients = @(Get-CopilotMqttUsageSensorKey))
 
     if (-not $Slug) { $Slug = Get-BridgeMachineSlug }
     $node = Get-CopilotMqttMachineNode -Slug $Slug
@@ -1385,6 +1426,20 @@ function Get-CopilotMqttUsageTopics {
     # `$x = Get-...`, but every caller here writes `@(Get-...)`, and that wraps the
     # single array object in another array instead of unwrapping it.
     $topics
+}
+
+function Remove-CopilotMqttUsageSensors {
+    <#
+        Withdraws usage sensors this machine no longer reports - the numbered sensor of
+        a Copilot login taken out of usage.copilotAccounts (#200) - by clearing their
+        retained topics, so the last reading does not stay on the card with nothing
+        left to refresh it. Unlike an uninstall's withdrawal a failure is thrown, so the
+        daemon tries again on its next pass rather than believing it done.
+    #>
+    param([string]$Slug, [AllowEmptyCollection()][string[]]$Keys = @(), [Parameter(Mandatory)][hashtable]$Headers)
+    $topics = @(Get-CopilotMqttUsageTopics -Slug $Slug -Clients $Keys)
+    foreach ($topic in $topics) { Publish-CopilotMqttMessage -Topic $topic -Payload '' -Headers $Headers -Retain }
+    $topics.Count
 }
 
 function Get-CopilotMqttMachineOnlineTopic {
@@ -1653,6 +1708,10 @@ function Get-CopilotMqttMachineTopic {
         "$root/online/attr"
         "$root/global/state"
         "$root/global/attr"
+        # The usage sensors, numbered ones for further Copilot logins included (#200).
+        # Missing from here until then, so an uninstalled or forgotten machine left its
+        # allowance rows behind in Home Assistant with nothing left to remove them.
+        Get-CopilotMqttUsageTopics -Slug $Slug
     )
 }
 

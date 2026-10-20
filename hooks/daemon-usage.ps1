@@ -24,7 +24,8 @@
 
     Part of agent-bridge-daemon.ps1, which dot-sources it into its own scope after
     declaring the shared $script: state; see docs/daemon-split.md.
-    Shared state it changes: DaemonUsageClients, DaemonUsageEntityIds.
+    Shared state it changes: DaemonUsageClients, DaemonUsageEntityIds,
+    DaemonUsageExtraSensors, DaemonUsageExtraNote.
 #>
 
 # Asked once per daemon, then left alone - see the macOS branch of
@@ -35,12 +36,14 @@ $script:BridgeKeychainToken = ''
 $script:BridgeKeychainAccount = ''
 $script:BridgeKeychainUnavailable = $false
 
-# What `gh` last said for the account being read, also per account. The reason is kept
-# so a failure is logged when it changes rather than every poll, and so the card can
-# say why there was no credential; the flag stops a `gh` that hung from being run
-# again - see Get-BridgeGitHubCliToken.
-$script:BridgeGhAccount = ''
-$script:BridgeGhReason = ''
+# What `gh` last said for each account it was asked about, and whether it is being held
+# off. The reason is kept per account, so a failure is logged when it changes rather
+# than every poll, and so the card can say why there was no credential. The hold is
+# not: it is for a `gh` that hung, and a keyring holding gh at a prompt holds it
+# whichever login it is asked for - so once several logins are read each poll (#200),
+# a hold kept per account was a hung gh asked again for each of them every poll. See
+# Get-BridgeGitHubCliToken.
+$script:BridgeGhReasons = @{}
 $script:BridgeGhUnavailable = $false
 # When gh last failed to answer, so the hold that follows can end - see
 # Get-BridgeGitHubCliToken and Reset-BridgeGitHubCliHold.
@@ -125,6 +128,12 @@ $script:BridgeUsageConfig = @{
 # See Get-BridgeUsageClientState.
 $script:DaemonUsageClients = @{}
 $script:DaemonUsageEntityIds = ''
+# The numbered sensors further Copilot logins were last reconciled onto, joined with
+# commas, and what was last said about usage.copilotAccounts. $null until the first
+# pass that reads anything, which withdraws every numbered sensor not in use, because
+# nothing records what an earlier run of the daemon left behind (#200).
+$script:DaemonUsageExtraSensors = $null
+$script:DaemonUsageExtraNote = ''
 
 function Get-BridgeUsageLabel {
     param([Parameter(Mandatory)][string]$Client)
@@ -426,6 +435,52 @@ function Get-BridgeCopilotAccount {
     $logins[0]
 }
 
+function Get-BridgeCopilotExtraAccounts {
+    <#
+        The further Copilot logins usage.copilotAccounts names for this machine to report
+        beside the one Copilot itself is signed in as, each with the numbered sensor it
+        goes on, and what is wrong with any entry that cannot be used.
+
+        Named, never discovered. Get-BridgeCopilotAccount's refusal to report a login the
+        cache merely remembers stands: a login is reported here only because somebody
+        listed it (#200).
+
+        The Nth entry goes on usage_copilot_<N+1> whatever becomes of the others, so a
+        sensor keeps its account when another entry is added, mended or taken out. An
+        entry that is not a login, or repeats an earlier one, leaves its sensor unused
+        rather than moving the rest up, and so does one past the last numbered sensor
+        there is. A login Copilot is itself signed in as needs no entry; listing it costs
+        a second read and nothing more, the card drawing one row per account however many
+        sensors carry it.
+
+        An entry is only ever repeated back once it is known to be a login. One shaped
+        like a token - pasted where a login belongs - would otherwise reach the daemon
+        log and, through gh's refusal to find it, the card.
+    #>
+    $result = [pscustomobject]@{ Accounts = @(); Problems = @() }
+    $configured = Get-BridgeSetting 'usage.copilotAccounts' $null
+    if ($null -eq $configured) { return $result }
+    if ($configured -is [System.Collections.IDictionary] -or $configured -is [System.Management.Automation.PSCustomObject]) {
+        $result.Problems += 'it is not a list of logins'
+        return $result
+    }
+    $sensors = @(Get-CopilotMqttUsageSensorKey | Where-Object { $_ -cmatch '^copilot_\d+$' })
+    $seen = @{}
+    $entries = @($configured)
+    for ($index = 0; $index -lt $entries.Count; $index++) {
+        $place = "entry $($index + 1)"
+        $login = if ($entries[$index] -is [string]) { $entries[$index].Trim() } else { '' }
+        if ($login -cmatch '^(?:gh[opusr]_|github_pat_)') { $result.Problems += "$place looks like a token, not a login, so it is not used"; continue }
+        if ($login -cnotmatch '^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$') { $result.Problems += "$place is not a GitHub login"; continue }
+        if ($index -ge $sensors.Count) { $result.Problems += "$login is past the $($sensors.Count) further logins there are sensors for"; continue }
+        $folded = $login.ToLowerInvariant()
+        if ($seen.ContainsKey($folded)) { $result.Problems += "$login is listed twice"; continue }
+        $seen[$folded] = $true
+        $result.Accounts += [pscustomobject]@{ Sensor = $sensors[$index]; Login = $login }
+    }
+    $result
+}
+
 function Get-BridgeGitHubCliPath {
     <#
         gh, found where its installers put it as well as on PATH: a LaunchAgent or a
@@ -477,8 +532,9 @@ function Get-BridgeGitHubCliToken {
         milliseconds, so signing in to it heals the card on the next poll instead of
         at the next restart. A `gh` that never answers is a different matter. A keyring
         waiting to be unlocked holds it at a prompt, and asking again in two minutes
-        raises that prompt again - so a timeout holds it off, as the keychain's
-        refusal does. For GhHoldHours rather than for the run, though: a daemon can run
+        raises that prompt again - so a timeout holds it off, for every login alike, as
+        the keychain's refusal does. For GhHoldHours rather than for the run, though: a
+        daemon can run
         for weeks, and a hold that outlived the locked keyring by that long froze a
         Mac's Copilot reading for days (#201). Reset-BridgeGitHubCliHold ends it sooner
         once somebody is evidently at the machine.
@@ -489,50 +545,50 @@ function Get-BridgeGitHubCliToken {
     try { $hostName = ([Uri]$HostUrl).Host } catch { $hostName = '' }
     if ($hostName -ne 'github.com' -or [string]::IsNullOrWhiteSpace($Login)) { return '' }
 
-    # Same reasoning as the keychain's: whatever was learned belongs to the account it
-    # was learned for, and Copilot's lastLoggedInUser can change under a running daemon.
+    # Whatever was learned belongs to the account it was learned for: Copilot's
+    # lastLoggedInUser can change under a running daemon, and further logins are read
+    # beside it (#200). The hold is the exception - what hung was gh, not the account
+    # it was asked about - so it holds gh off for every login alike.
     $account = "${HostUrl}:$Login"
-    if ($script:BridgeGhAccount -ne $account) {
-        $script:BridgeGhAccount = $account
-        $script:BridgeGhReason = ''
-        $script:BridgeGhUnavailable = $false
-    }
-    if ($script:BridgeGhUnavailable) {
-        if (([DateTimeOffset]::Now - $script:BridgeGhUnavailableAt).TotalHours -lt $script:BridgeUsageConfig.GhHoldHours) { return '' }
-        $script:BridgeGhUnavailable = $false
-    }
-
     $reason = ''
-    $gh = Get-BridgeGitHubCliPath
-    if (-not $gh) { $reason = 'gh is not installed' }
+    if ($script:BridgeGhUnavailable -and
+        ([DateTimeOffset]::Now - $script:BridgeGhUnavailableAt).TotalHours -lt $script:BridgeUsageConfig.GhHoldHours) {
+        $reason = 'gh did not answer in time'
+    }
     else {
-        $probe = Invoke-BridgeCommandProbe -Executable $gh -TimeoutMs 5000 `
-            -Arguments @('auth', 'token', '--hostname', $hostName, '--user', $Login)
-        if ($probe.TimedOut) {
-            $script:BridgeGhUnavailable = $true
-            $script:BridgeGhUnavailableAt = [DateTimeOffset]::Now
-            $reason = 'gh did not answer in time'
-        }
-        elseif (-not $probe.Ran) { $reason = 'gh could not be run' }
-        elseif ($probe.ExitCode -ne 0) { $reason = "gh has no token for $Login - run gh auth login" }
+        $script:BridgeGhUnavailable = $false
+        $gh = Get-BridgeGitHubCliPath
+        if (-not $gh) { $reason = 'gh is not installed' }
         else {
-            # Standard output alone, and exactly one line of printable characters: this
-            # goes into an Authorization header, and anything else that gh printed
-            # beside the token is not part of it.
-            $lines = @(([string]$probe.StandardOutput) -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-            if ($lines.Count -eq 1 -and $lines[0] -match '^[\x21-\x7E]+$') {
-                $script:BridgeGhReason = ''
-                return $lines[0]
+            $probe = Invoke-BridgeCommandProbe -Executable $gh -TimeoutMs 5000 `
+                -Arguments @('auth', 'token', '--hostname', $hostName, '--user', $Login)
+            if ($probe.TimedOut) {
+                $script:BridgeGhUnavailable = $true
+                $script:BridgeGhUnavailableAt = [DateTimeOffset]::Now
+                $reason = 'gh did not answer in time'
             }
-            $reason = 'gh answered with something that is not a token'
+            elseif (-not $probe.Ran) { $reason = 'gh could not be run' }
+            elseif ($probe.ExitCode -ne 0) { $reason = "gh has no token for $Login - run gh auth login" }
+            else {
+                # Standard output alone, and exactly one line of printable characters:
+                # this goes into an Authorization header, and anything else that gh
+                # printed beside the token is not part of it.
+                $lines = @(([string]$probe.StandardOutput) -split "`r?`n" | ForEach-Object { $_.Trim() } | Where-Object { $_ })
+                if ($lines.Count -eq 1 -and $lines[0] -match '^[\x21-\x7E]+$') {
+                    [void]$script:BridgeGhReasons.Remove($account)
+                    return $lines[0]
+                }
+                $reason = 'gh answered with something that is not a token'
+            }
         }
     }
 
-    # Said when it changes, not every poll. The reason is deliberately all there is: what
-    # gh printed is not logged, because on a success that is the token.
-    $changed = $script:BridgeGhReason -cne $reason
-    $script:BridgeGhReason = $reason
-    if ($changed) { Write-DaemonLog -Message "the Copilot allowance could not be read through gh: $reason" }
+    # Said when it changes, not every poll, and for each account apart. The reason is
+    # deliberately all there is: what gh printed is not logged, because on a success
+    # that is the token.
+    $previous = if ($script:BridgeGhReasons.ContainsKey($account)) { [string]$script:BridgeGhReasons[$account] } else { '' }
+    $script:BridgeGhReasons[$account] = $reason
+    if ($previous -cne $reason) { Write-DaemonLog -Message "the Copilot allowance of $Login could not be read through gh: $reason" }
     ''
 }
 
@@ -547,8 +603,9 @@ function Get-BridgeGitHubCliRefusal {
     #>
     param([AllowEmptyString()][string]$Login, [string]$HostUrl = 'https://github.com')
 
-    if ($script:BridgeGhAccount -ne "${HostUrl}:$Login") { return '' }
-    [string]$script:BridgeGhReason
+    $account = "${HostUrl}:$Login"
+    if (-not $script:BridgeGhReasons.ContainsKey($account)) { return '' }
+    [string]$script:BridgeGhReasons[$account]
 }
 
 function Reset-BridgeGitHubCliHold {
@@ -764,6 +821,17 @@ function ConvertFrom-BridgeCopilotQuota {
         -Windows @($window)
 }
 
+function Invoke-BridgeCopilotQuotaRequest {
+    <# One `/copilot_internal/user` read with the token given: the request both Copilot
+       readers make, written once so the two cannot drift apart. #>
+    param([Parameter(Mandatory)][string]$Token)
+    Invoke-BridgeUsageRequest -Uri 'https://api.github.com/copilot_internal/user' -Headers @{
+        Authorization = "token $Token"
+        Accept        = 'application/json'
+        'User-Agent'  = $script:BridgeUsageConfig.UserAgent
+    }
+}
+
 function Get-BridgeCopilotAllowance {
     <#
         Copilot's monthly AI-credit allowance.
@@ -784,14 +852,7 @@ function Get-BridgeCopilotAllowance {
             param($Login, $HostUrl)
             Get-BridgeCopilotToken -Login $Login -HostUrl $HostUrl
         },
-        [scriptblock]$Fetch = {
-            param($Token)
-            Invoke-BridgeUsageRequest -Uri 'https://api.github.com/copilot_internal/user' -Headers @{
-                Authorization = "token $Token"
-                Accept        = 'application/json'
-                'User-Agent'  = $script:BridgeUsageConfig.UserAgent
-            }
-        }
+        [scriptblock]$Fetch = { param($Token) Invoke-BridgeCopilotQuotaRequest -Token $Token }
     )
 
     $account = Get-BridgeCopilotAccount -ConfigPath $ConfigPath
@@ -853,6 +914,64 @@ function Get-BridgeCopilotAllowance {
         if ($why) { $failure = "No Copilot credential was available and nothing was cached ($why)." }
     }
     New-BridgeUsageRecord -Client 'copilot' -Account $account.Login -Source 'none' -Problem $failure
+}
+
+function Get-BridgeCopilotLoginAllowance {
+    <#
+        The allowance of a further Copilot login that usage.copilotAccounts names, on the
+        numbered sensor it was given (#200).
+
+        Its token comes from gh, asked for exactly that login, and from nothing else. The
+        environment variables and the keychain item Get-BridgeCopilotToken also reads
+        belong to whoever Copilot itself is signed in as, and one login's token spent for
+        another would publish the wrong account's figure under this one's name - which is
+        also why the answer is checked against the login before it is believed. Nor is
+        the CLI's cache a fallback: only the sessions Copilot runs refresh it, and those
+        spend the signed-in account. A login gh holds no token for reports the honest
+        "no credential" state with gh's reason, rather than disappearing.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Login,
+        [Parameter(Mandatory)][string]$Sensor,
+        [scriptblock]$ResolveToken = { param($Login) Get-BridgeGitHubCliToken -Login $Login },
+        [scriptblock]$Fetch = { param($Token) Invoke-BridgeCopilotQuotaRequest -Token $Token }
+    )
+
+    $failure = ''
+    $token = ''
+    try { $token = [string](& $ResolveToken $Login) }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        $failure = "The Copilot credential for $Login could not be read: $($_.Exception.Message)"
+    }
+
+    $record = $null
+    if ($token) {
+        try {
+            $response = Invoke-BridgeUsageAttempt -Operation { & $Fetch $token }
+            $record = ConvertFrom-BridgeCopilotQuota -Response $response -Source 'api'
+            if (-not $record) { $failure = "GitHub returned no premium-interaction quota for $Login." }
+            # Logins are not case-sensitive, so neither is this.
+            elseif ($record.account -and $record.account -ne $Login) {
+                $failure = "The token gh holds for $Login reads the allowance of $($record.account) instead."
+                $record = $null
+            }
+        }
+        catch {
+            if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+            $failure = "The Copilot quota for $Login could not be read: $(Get-BridgeUsageFailureText -ErrorRecord $_)"
+        }
+    }
+    elseif (-not $failure) {
+        $why = Get-BridgeGitHubCliRefusal -Login $Login
+        $failure = if ($why) { "No Copilot credential was available for $Login ($why)." }
+            else { "No Copilot credential was available for $Login." }
+    }
+
+    if (-not $record) { $record = New-BridgeUsageRecord -Client 'copilot' -Account $Login -Source 'none' -Problem $failure }
+    elseif (-not $record.account) { $record.account = $Login }
+    $record['sensor'] = $Sensor
+    $record
 }
 
 function Get-BridgeClaudeAccountId {
@@ -1308,7 +1427,11 @@ function Test-BridgeUsageCovered {
             $published = [string]$attributes.account_id
         }
         elseif ($names -contains 'account') { $published = [string]$attributes.account }
-        if ($published -cne $Key) { continue }
+        # A GitHub login is not case-sensitive, and a further Copilot login is keyed as
+        # usage.copilotAccounts spells it rather than as GitHub returns it (#200).
+        # Claude's id is opaque, and matched exactly.
+        $same = if ($Client -ceq 'copilot') { $published -eq $Key } else { $published -ceq $Key }
+        if (-not $same) { continue }
 
         $at = ConvertTo-BridgeUsageInstant $attributes.updated
         if ($null -eq $at) { continue }
@@ -1427,6 +1550,13 @@ function Sync-DaemonUsage {
         so that the machines standing down for it can tell it apart from one that has
         stopped reading - an unchanged figure that is never republished looks exactly
         like a machine that went away, and every one of them would take over.
+
+        Further Copilot logins named in usage.copilotAccounts (#200) are read on clocks
+        of their own, each like another client: at the idle pace, since the sessions here
+        spend the signed-in account and never theirs, deferring to another machine's
+        reading of the same login exactly as a client does, and published on numbered
+        sensors that are withdrawn again, with the next reading, once their login is no
+        longer listed.
     #>
     param(
         [Parameter(Mandatory)][hashtable]$Headers,
@@ -1450,11 +1580,32 @@ function Sync-DaemonUsage {
     $clients = @($clients | Where-Object { $_ -ne 'mcp' } | ForEach-Object { ([string]$_).ToLowerInvariant() } | Select-Object -Unique)
     if ($clients.Count -eq 0) { return $false }
 
+    # Further Copilot logins, each read on a clock of its own like another client
+    # (#200) - and only while Copilot is one of the clients reported here.
+    $extras = @()
+    $said = ''
+    if ($clients -ccontains 'copilot') {
+        $resolved = Get-BridgeCopilotExtraAccounts
+        $extras = @($resolved.Accounts)
+        $said = @(@($extras | ForEach-Object { "reporting $($_.Login) on usage_$($_.Sensor)" }) + @($resolved.Problems)) -join '; '
+    }
+    if ($said -cne $script:DaemonUsageExtraNote) {
+        $script:DaemonUsageExtraNote = $said
+        if ($said) { Write-DaemonLog -Message "usage.copilotAccounts: $said" }
+    }
+    $active = @($extras | ForEach-Object { [string]$_.Sensor })
+
     $known = $null -ne $Live
+    $streams = @($clients | ForEach-Object { [pscustomobject]@{ Key = $_; Client = $_; Login = '' } }) +
+        @($extras | ForEach-Object { [pscustomobject]@{ Key = [string]$_.Sensor; Client = 'copilot'; Login = [string]$_.Login } })
     $due = @()
-    foreach ($client in $clients) {
-        $state = Get-BridgeUsageClientState -Client $client
-        $busy = Test-BridgeUsageBusy -Client $client -Live $Live
+    $dueLogins = @()
+    foreach ($stream in $streams) {
+        $client = $stream.Client
+        $state = Get-BridgeUsageClientState -Client $stream.Key
+        # The sessions open here spend the account Copilot is signed in as, never a
+        # further login, so one of those is read at the idle pace whatever is open.
+        $busy = if ($stream.Login) { $false } else { Test-BridgeUsageBusy -Client $client -Live $Live }
         if (-not (Test-BridgeUsageDue -State $state -Busy $busy -Known $known -Now $Now -Interval $interval -IdleInterval $idleInterval -Gap $gap)) { continue }
         # The pace Test-BridgeUsageDue has just judged it by, which is also how current
         # somebody else's reading has to be before this machine will stand down for it.
@@ -1466,7 +1617,7 @@ function Sync-DaemonUsage {
         $state.CheckedAt = $Now
         # Somebody has just opened a Copilot session here, so a gh that a locked keyring
         # held up is worth asking now rather than at the end of its hold (#201).
-        if ($client -ceq 'copilot' -and $known -and $busy -and -not [bool]$state.Busy -and
+        if ($stream.Key -ceq 'copilot' -and $known -and $busy -and -not [bool]$state.Busy -and
             (Reset-BridgeGitHubCliHold -Now $Now)) {
             Write-DaemonLog -Message 'a Copilot session opened here; asking gh for the allowance again'
         }
@@ -1477,40 +1628,86 @@ function Sync-DaemonUsage {
 
         $covered = $false
         if ($role -ceq 'participant') {
-            $key = ''
-            try { $key = [string](Get-BridgeUsageAccountKey -Client $client) }
-            catch {
-                if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
-                # An account that cannot be identified is one that cannot be matched
-                # against anybody else's reading, so this machine reads it itself.
-                $key = ''
+            # A further login is its own key: whose allowance it is was configured, not
+            # read from anything.
+            $key = [string]$stream.Login
+            if (-not $key) {
+                try { $key = [string](Get-BridgeUsageAccountKey -Client $client) }
+                catch {
+                    if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+                    # An account that cannot be identified is one that cannot be matched
+                    # against anybody else's reading, so this machine reads it itself.
+                    $key = ''
+                }
             }
             $covered = Test-BridgeUsageCovered -Client $client -Key $key -States $States -Now $Now `
                 -Since $state.PublishedAt -Pace $pace
         }
         # Said when it changes rather than every pass: a machine that has quietly
         # stopped asking is the thing somebody debugging a flat gauge needs to be told.
+        $what = if ($stream.Login) { "$client usage for $($stream.Login)" } else { "$client usage" }
         if ($covered -ne [bool]$state.Covered) {
             Write-DaemonLog -Message $(if ($covered) {
-                    "$client usage is being read for this account by another machine; not asking from here"
+                    "$what is being read for this account by another machine; not asking from here"
                 }
-                else { "$client usage is no longer being read for this account elsewhere; asking from here" })
+                else { "$what is no longer being read for this account elsewhere; asking from here" })
         }
         $state.Covered = $covered
         if ($covered) { continue }
-        $due += $client
+        if ($stream.Login) { $dueLogins += $stream } else { $due += $client }
     }
-    if ($due.Count -eq 0) { return $false }
+    if ($due.Count -eq 0 -and $dueLogins.Count -eq 0) { return $false }
 
-    try {
-        $records = @(Get-BridgeAgentAllowance -Clients $due)
+    $records = @()
+    if ($due.Count -gt 0) {
+        try {
+            $records = @(Get-BridgeAgentAllowance -Clients $due)
+        }
+        catch {
+            if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+            Write-DaemonLog -Message "usage collection failed: $($_.Exception.Message)"
+            return $false
+        }
     }
-    catch {
-        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
-        Write-DaemonLog -Message "usage collection failed: $($_.Exception.Message)"
-        return $false
+    # Each on its own, as Get-BridgeAgentAllowance takes each client: a login that cannot
+    # be read is that login's failure, and says so on its own row.
+    foreach ($stream in $dueLogins) {
+        try { $records += Get-BridgeCopilotLoginAllowance -Login $stream.Login -Sensor $stream.Key }
+        catch {
+            if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+            $failed = New-BridgeUsageRecord -Client 'copilot' -Account $stream.Login -Source 'none' `
+                -Problem "Usage for $($stream.Login) could not be collected: $($_.Exception.Message)"
+            $failed['sensor'] = $stream.Key
+            $records += $failed
+        }
     }
     if ($records.Count -eq 0) { return $false }
+
+    # A numbered sensor no login is reported on any more is withdrawn, or its last
+    # reading would sit on the card with nothing left to refresh it. Done whenever the
+    # set changes, and on a daemon's first pass that reads anything, since nothing
+    # records what an earlier run left behind. Only on a pass that has read something:
+    # a withdrawal is an MQTT publish, and one that failed would otherwise be retried,
+    # and logged, on every fifteen-second reconcile; this way it is paced like the
+    # readings, and a machine with nothing to report writes nothing for it. A failure
+    # leaves the set as it was, so the next reading tries again.
+    if (($active -join ',') -cne $script:DaemonUsageExtraSensors) {
+        $unused = @(Get-CopilotMqttUsageSensorKey | Where-Object { $_ -cmatch '^copilot_\d+$' -and $active -cnotcontains $_ })
+        try {
+            [void](Remove-CopilotMqttUsageSensors -Keys $unused -Headers $Headers)
+            foreach ($key in $unused) { [void]$script:DaemonUsageClients.Remove($key) }
+            # A withdrawn sensor leaves Home Assistant's registry, and one listed again is
+            # registered afresh under an id of Home Assistant's choosing. The set of
+            # sensors could read the same as when its id was last forced, so what was
+            # forced then is not taken to hold now.
+            $script:DaemonUsageEntityIds = ''
+            $script:DaemonUsageExtraSensors = $active -join ','
+        }
+        catch {
+            if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+            Write-DaemonLog -Message "usage sensors no longer reported could not be withdrawn: $($_.Exception.Message)"
+        }
+    }
 
     # Where no machine defers to any other, an unchanged reading still stays off the bus
     # between polls, but only for RepublishSeconds: never republishing it made a daemon
@@ -1521,13 +1718,14 @@ function Sync-DaemonUsage {
     $changed = @()
     $signatures = @{}
     foreach ($record in $records) {
-        $client = [string]$record.client
-        $clientState = Get-BridgeUsageClientState -Client $client
+        # Its sensor's, which is its client's unless it is a further login's reading.
+        $sensor = Get-CopilotMqttUsageRecordKey -Record $record
+        $clientState = Get-BridgeUsageClientState -Client $sensor
         $signature = Get-BridgeUsageSignature -Record $record
         if ($signature -ceq $clientState.Signature -and
             ($Now - $clientState.PublishedAt).TotalSeconds -lt $reassert) { continue }
         $changed += $record
-        $signatures[$client] = $signature
+        $signatures[$sensor] = $signature
     }
 
     $published = $false
@@ -1559,6 +1757,12 @@ function Sync-DaemonUsage {
     # passed each time, not just what is new, so an earlier client the registry had
     # not caught up with yet is corrected on the way.
     #
+    # And the set counts as done only once every sensor in it was found in the registry.
+    # One published moments ago may not be there yet, and the correction skips it rather
+    # than waiting; taken as done, it would keep Home Assistant's own id until the set
+    # next changed, which for a further Copilot login's sensor - first published in the
+    # middle of a run - is out of the card's sight indefinitely (#200).
+    #
     # Checked on every ask that read anything, not only one that published, and apart
     # from the publish above: a correction that failed was otherwise never tried
     # again, because the readings were by then unchanged and the ask ended before it
@@ -1568,8 +1772,7 @@ function Sync-DaemonUsage {
     $sensorKey = $sensors -join ','
     if ($sensorKey -cne $script:DaemonUsageEntityIds) {
         try {
-            [void](Set-CopilotMqttUsageEntityIds -Clients $sensors)
-            $script:DaemonUsageEntityIds = $sensorKey
+            if (Set-CopilotMqttUsageEntityIds -Clients $sensors) { $script:DaemonUsageEntityIds = $sensorKey }
         }
         catch {
             if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }

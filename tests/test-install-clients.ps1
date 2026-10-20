@@ -1986,15 +1986,22 @@ function Invoke-AdapterEntityCleanupFixture {
             # tripwire that caught the permissions selector being added to the
             # dashboard and not to the cleanup, which left a dead entity behind in
             # Home Assistant - and it caught the check button the same way.
-            Test-That "$fixtureClient-only machine cleanup remains a separate 27-topic control" {
-                $script:CleanupPublications.Count - $without.Count -eq 27
+            #
+            # Plus the usage sensors' topics, three for each sensor a machine can have
+            # (#200). They were missing from the machine list until then, so an
+            # uninstall left a machine's allowance rows behind. Counted from the list of
+            # sensors, like the field slots above, because the number of further Copilot
+            # logins legitimately moves it; the 27 stays the tripwire.
+            $expectedMachineCleanup = 27 + 3 * @(Get-CopilotMqttUsageSensorKey).Count
+            Test-That "$fixtureClient-only machine cleanup remains a separate $expectedMachineCleanup-topic control" {
+                $script:CleanupPublications.Count - $without.Count -eq $expectedMachineCleanup
             }
             [void][IO.Directory]::CreateDirectory($unusedState)
             $script:CleanupPublications.Clear()
             . ([scriptblock]::Create($cleanup.Extent.Text))
             $with = @($script:CleanupPublications | Where-Object { $_.topic -like "*/$node/*" }).Count
             Test-That "adding an empty Copilot directory does not change $fixtureClient cleanup" {
-                $with -eq $expectedSessionCleanup -and $without.Count -eq $with -and $script:CleanupPublications.Count - $with -eq 27
+                $with -eq $expectedSessionCleanup -and $without.Count -eq $with -and $script:CleanupPublications.Count - $with -eq $expectedMachineCleanup
             }
         }
         finally {

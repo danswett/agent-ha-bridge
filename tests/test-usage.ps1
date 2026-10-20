@@ -695,6 +695,16 @@ Test-That 'and every entity it reads is one the publisher really declares' {
     $asked = @($usageCard.entities | Where-Object { $_ -like '*usage_copilot' })
     @($asked | Where-Object { $_ -notin $declared }).Count -eq 0
 } "asked=[$(@($usageCard.entities) -join ',')]"
+# Nothing tells the dashboard which further Copilot logins a machine reports (#200), and
+# the card skips an entity that does not exist, so it is handed every numbered sensor.
+Test-That 'and the numbered sensors further Copilot logins go on, for every machine alike' {
+    $missing = @(foreach ($slug in $desk.Slug, $book.Slug) {
+            foreach ($n in 2, 3, 4) {
+                if (@($usageCard.entities | Where-Object { $_ -like "*_${slug}_usage_copilot_$n" }).Count -ne 1) { "$slug/$n" }
+            }
+        })
+    $missing.Count -eq 0
+} "entities=[$(@($usageCard.entities) -join ',')]"
 
 $older = Get-GeneratedDashboard -Version '1.21.1'
 Test-That 'a browser serving the older card gets no card it would silently empty' {
@@ -711,6 +721,12 @@ Test-That 'whose rows are row objects, the shape every other generated card uses
         $_.type -eq 'conditional' -and $_.card -and $_.card.title -eq 'Agent usage'
     })[0]
     @($fallbackCard.card.entities | Where-Object { -not $_.PSObject.Properties['entity'] }).Count -eq 0
+}
+Test-That 'and which leaves the numbered sensors out, an entities card drawing each one missing as an error' {
+    $fallbackCard = @($older.views[0].cards | Where-Object {
+        $_.type -eq 'conditional' -and $_.card -and $_.card.title -eq 'Agent usage'
+    })[0]
+    @($fallbackCard.card.entities | Where-Object { $_.entity -match 'usage_copilot_\d' }).Count -eq 0
 }
 Test-That 'but it does not displace the session controls on a browser still serving the old one' {
     $older.views[0].cards[0].type -ceq 'custom:agent-bridge-status-card'
@@ -853,6 +869,8 @@ Write-Host '--- how often the daemon asks ---'
 # machine leaves behind with it, so renaming an attribute there fails a check here
 # rather than quietly stopping every machine standing down for another one.
 $script:RealUsagePublisher = (Get-Item function:Publish-CopilotMqttUsage).ScriptBlock
+$script:RealUsageWithdrawal = (Get-Item function:Remove-CopilotMqttUsageSensors).ScriptBlock
+$script:RealUsageIdForcing = (Get-Item function:Set-CopilotMqttUsageEntityIds).ScriptBlock
 $script:Settings = @{}
 function Get-BridgeSetting { param([string]$Name, $Default) if ($script:Settings.ContainsKey($Name)) { $script:Settings[$Name] } else { $Default } }
 function Get-BridgeSelectedClients { , @('copilot', 'mcp') }
@@ -871,14 +889,27 @@ function Publish-CopilotMqttUsage {
     $script:UsagePublishes++
 }
 $script:IdForcings = 0
+# True: every sensor was found in the registry, so the correction is done.
 function Set-CopilotMqttUsageEntityIds {
     param([string]$Slug, [AllowEmptyCollection()][string[]]$Clients = @())
     $script:IdForcings++
-    $false
+    $true
+}
+# What a pass withdrew, keys by pass. A daemon's first pass that reads anything
+# withdraws the numbered sensors no further login is on (#200); see section 6d.
+$script:Withdrawn = [System.Collections.Generic.List[string]]::new()
+$script:WithdrawThrows = $false
+function Remove-CopilotMqttUsageSensors {
+    param([string]$Slug, [AllowEmptyCollection()][string[]]$Keys = @(), [hashtable]$Headers)
+    if ($script:WithdrawThrows) { throw 'mqtt unreachable' }
+    $script:Withdrawn.Add(($Keys -join ','))
+    @($Keys).Count
 }
 
 $script:DaemonUsageClients = @{}
 $script:DaemonUsageEntityIds = ''
+$script:DaemonUsageExtraSensors = $null
+$script:DaemonUsageExtraNote = ''
 $clock = [DateTimeOffset]::Parse('2026-10-07T12:00:00Z')
 
 Test-That 'the first pass collects and publishes' {
@@ -950,6 +981,7 @@ $script:Logged = [System.Collections.Generic.List[string]]::new()
 $script:CollectorThrows = $false
 $script:PublishThrows = $false
 $script:ForcingThrows = $false
+$script:ForcingUnsettled = $false
 function Write-DaemonLog { param([string]$Message) $script:Logged.Add($Message) }
 function Get-BridgeAgentAllowance {
     param([AllowEmptyCollection()][string[]]$Clients = @())
@@ -966,7 +998,8 @@ function Set-CopilotMqttUsageEntityIds {
     param([string]$Slug, [AllowEmptyCollection()][string[]]$Clients = @())
     $script:ForcedWith.Add($Clients -join ',')
     if ($script:ForcingThrows) { throw 'the entity registry could not be reached' }
-    $false
+    # Whether every sensor was in the registry; one published moments ago may not be.
+    -not $script:ForcingUnsettled
 }
 
 function New-UsageReading {
@@ -976,11 +1009,16 @@ function New-UsageReading {
 function Reset-UsagePacing {
     $script:DaemonUsageClients = @{}
     $script:DaemonUsageEntityIds = ''
+    $script:DaemonUsageExtraSensors = $null
+    $script:DaemonUsageExtraNote = ''
+    $script:Withdrawn.Clear()
+    $script:WithdrawThrows = $false
     $script:Settings = @{}
     $script:Selected = @('copilot', 'claude', 'codex', 'mcp')
     $script:CollectorThrows = $false
     $script:PublishThrows = $false
     $script:ForcingThrows = $false
+    $script:ForcingUnsettled = $false
     $script:Logged.Clear()
     $script:Readings = @{
         copilot = New-UsageReading 'copilot' 10
@@ -1250,6 +1288,24 @@ Test-That 'after which it is left alone' {
     @($script:ForcedWith).Count -eq 0
 }
 
+# The correction skips a sensor Home Assistant has not registered yet rather than
+# waiting for it, and one published moments before may well not have been. Taken as
+# done, that sensor would keep the id Home Assistant derived until the set of sensors
+# next changed.
+Reset-UsagePacing
+$script:ForcingUnsettled = $true
+[void](Invoke-UsageAt 0 $none)
+$script:ForcingUnsettled = $false
+$unsettledAgain = Invoke-UsageAt 900 $none
+$unsettledForced = @($script:ForcedWith) -join '|'
+[void](Invoke-UsageAt 1800 $none)
+Test-That 'a correction that found a sensor not yet registered is made again at the next ask' {
+    $unsettledAgain -ceq 'copilot,claude,codex' -and $unsettledForced -ceq 'claude,codex,copilot'
+} "asked=$unsettledAgain forced=$unsettledForced"
+Test-That 'and left alone once every sensor was there' {
+    @($script:ForcedWith).Count -eq 0 -and $script:DaemonUsageEntityIds -ceq 'claude,codex,copilot'
+} "forced=$(@($script:ForcedWith) -join '|') settled=$($script:DaemonUsageEntityIds)"
+
 Reset-UsagePacing
 $script:Selected = @('Copilot', 'CLAUDE', 'mcp')
 Test-That 'a client selected under another capitalisation is the same client' {
@@ -1338,10 +1394,13 @@ function New-PeerUsageState {
         [AllowEmptyString()][string]$Account = '',
         [AllowEmptyString()][string]$AccountId = '',
         [string]$Slug = 'otherbox',
+        # A further Copilot login's numbered sensor, rather than the client's own (#200).
+        [string]$Sensor = '',
         [Parameter(Mandatory)][DateTimeOffset]$Updated
     )
     $record = New-BridgeUsageRecord -Client $Client -Account $Account -AccountId $AccountId -Source 'api' `
         -Windows @(Get-BridgeUsageWindow -Key 'main' -Label 'Main' -PercentUsed 42)
+    if ($Sensor) { $record['sensor'] = $Sensor }
     $script:PeerMessages.Clear()
     & $script:RealUsagePublisher -Records @($record) -Slug $Slug -MachineName 'Other box' -Headers $headers
     $states = @(ConvertTo-PeerUsageState)
@@ -1625,6 +1684,369 @@ Test-That 'and settles the role from that configuration alone, never from a host
     $asParticipant -ceq 'participant' -and $asWriter -ceq 'writer' -and (Get-BridgeUsagePollRole) -ceq 'none'
 }
 
+# --- 6d. further Copilot logins, each on a numbered sensor -------------------------
+
+Write-Host ''
+Write-Host '--- further Copilot logins, each on a numbered sensor of its own ---'
+
+# One machine can hold more than one Copilot seat - the work account Copilot is signed
+# in as, and a personal one gh also holds a token for - and only the first was ever
+# reported (#200). That was deliberate: a login Copilot's cache merely remembers is not
+# one being spent here. A further login is reported because usage.copilotAccounts names
+# it, on a numbered sensor of its own, and the card draws a row for each account.
+function Get-ExtraAccounts {
+    param($Configured)
+    $script:Settings = @{ 'usage.copilotAccounts' = $Configured }
+    Get-BridgeCopilotExtraAccounts
+}
+function Format-ExtraAccounts {
+    param($Resolved)
+    @($Resolved.Accounts | ForEach-Object { "$($_.Sensor)=$($_.Login)" }) -join ','
+}
+
+Test-That 'with none configured there are no further logins, and nothing to say about them' {
+    $resolved = Get-ExtraAccounts $null
+    @($resolved.Accounts).Count -eq 0 -and @($resolved.Problems).Count -eq 0
+}
+Test-That 'each login listed goes on a numbered sensor of its own, in the order listed' {
+    (Format-ExtraAccounts (Get-ExtraAccounts @('danswett', 'hubot'))) -ceq 'copilot_2=danswett,copilot_3=hubot'
+}
+Test-That 'a single login written without a list around it is a list of one' {
+    (Format-ExtraAccounts (Get-ExtraAccounts 'danswett')) -ceq 'copilot_2=danswett'
+}
+# By position, so mending or removing one entry never moves another login onto a
+# sensor whose history belongs to somebody else.
+$gapped = Get-ExtraAccounts @('danswett', 'not a login', 'hubot')
+Test-That 'an entry that is not a login leaves its sensor unused rather than moving the rest up' {
+    (Format-ExtraAccounts $gapped) -ceq 'copilot_2=danswett,copilot_4=hubot' -and
+        (@($gapped.Problems) -join '|') -ceq 'entry 2 is not a GitHub login'
+} "accounts=$(Format-ExtraAccounts $gapped) problems=$(@($gapped.Problems) -join '|')"
+$twice = Get-ExtraAccounts @('danswett', 'DanSwett')
+Test-That 'a login listed twice, in whatever case, is read once' {
+    (Format-ExtraAccounts $twice) -ceq 'copilot_2=danswett' -and (@($twice.Problems) -join '|') -ceq 'DanSwett is listed twice'
+} "accounts=$(Format-ExtraAccounts $twice) problems=$(@($twice.Problems) -join '|')"
+$overflow = Get-ExtraAccounts @('one', 'two', 'three', 'four')
+Test-That 'one past the last numbered sensor is said, not quietly dropped' {
+    (Format-ExtraAccounts $overflow) -ceq 'copilot_2=one,copilot_3=two,copilot_4=three' -and
+        (@($overflow.Problems) -join '|') -match '^four is past the 3 further logins'
+} "accounts=$(Format-ExtraAccounts $overflow) problems=$(@($overflow.Problems) -join '|')"
+# The likely mistake is a token pasted where the login belongs. Repeated back, it would
+# reach the daemon log, and through gh's refusal to find such a login, the card.
+$pasted = Get-ExtraAccounts @('ghp_0123456789abcdefABCDEF0123456789abcd', 'github_pat_11AAAAAAA0123456789_abcdef')
+Test-That 'a token pasted where a login belongs is refused, and never repeated back' {
+    @($pasted.Accounts).Count -eq 0 -and @($pasted.Problems | Where-Object { $_ -match 'looks like a token' }).Count -eq 2 -and
+        @($pasted.Problems | Where-Object { $_ -match 'ghp_|github_pat_|0123456789' }).Count -eq 0
+} "problems=$(@($pasted.Problems).Count)"
+Test-That 'and a setting that is not a list at all is said to be wrong, not guessed at' {
+    $map = Get-ExtraAccounts @{ danswett = 'copilot_2' }
+    $object = Get-ExtraAccounts ([pscustomobject]@{ login = 'danswett' })
+    @($map.Accounts).Count -eq 0 -and @($object.Accounts).Count -eq 0 -and
+        (@($map.Problems) -join '|') -ceq 'it is not a list of logins' -and (@($object.Problems) -join '|') -ceq 'it is not a list of logins'
+}
+
+# Read with a token for that login and nothing else: whatever the environment or the
+# keychain holds is the signed-in account's, and spent for another login it would put
+# that account's figure under this one's name.
+$script:SeenToken = ''
+$further = Get-BridgeCopilotLoginAllowance -Login 'danswett' -Sensor 'copilot_2' -ResolveToken { param($Login) "token-for-$Login" } `
+    -Fetch { param($Token) $script:SeenToken = $Token; New-CopilotBody -Login 'danswett' -Remaining 1200000 }
+Test-That 'a further login is read with the token resolved for that login' {
+    $script:SeenToken -ceq 'token-for-danswett' -and $further.source -ceq 'api' -and $further.percent -eq 20
+} "token=$($script:SeenToken) source=$($further.source) percent=$($further.percent) error=$($further.error)"
+Test-That 'and its reading goes on the numbered sensor it was given, under its own account' {
+    (Get-CopilotMqttUsageRecordKey -Record $further) -ceq 'copilot_2' -and $further.account -ceq 'danswett' -and $further.client -ceq 'copilot'
+}
+$wrongAccount = Get-BridgeCopilotLoginAllowance -Login 'danswett' -Sensor 'copilot_2' -ResolveToken { 'stub' } -Fetch { New-CopilotBody -Login 'work_account' }
+Test-That 'a token that answers for some other account is not believed, its figure being somebody else''s' {
+    $wrongAccount.source -ceq 'none' -and $null -eq $wrongAccount.percent -and $wrongAccount.account -ceq 'danswett' -and
+        $wrongAccount.error -ceq 'The token gh holds for danswett reads the allowance of work_account instead.' -and
+        (Get-CopilotMqttUsageRecordKey -Record $wrongAccount) -ceq 'copilot_2'
+} "source=$($wrongAccount.source) error=$($wrongAccount.error)"
+Test-That 'though the same login in another case is the same account' {
+    (Get-BridgeCopilotLoginAllowance -Login 'DanSwett' -Sensor 'copilot_2' -ResolveToken { 'stub' } -Fetch { New-CopilotBody -Login 'danswett' }).source -ceq 'api'
+}
+$script:BridgeGhReasons = @{ 'https://github.com:danswett' = 'gh has no token for danswett - run gh auth login' }
+$noToken = Get-BridgeCopilotLoginAllowance -Login 'danswett' -Sensor 'copilot_2' -ResolveToken { '' } -Fetch { throw 'never reached' }
+$script:BridgeGhReasons = @{}
+Test-That 'a login gh holds no token for stays on the card, saying why, rather than vanishing from it' {
+    $noToken.source -ceq 'none' -and $null -eq $noToken.percent -and (Get-CopilotMqttUsageRecordKey -Record $noToken) -ceq 'copilot_2' -and
+        $noToken.error -ceq 'No Copilot credential was available for danswett (gh has no token for danswett - run gh auth login).'
+} "error=$($noToken.error)"
+$fetchFailed = Get-BridgeCopilotLoginAllowance -Login 'danswett' -Sensor 'copilot_2' -ResolveToken { 'stub' } -Fetch { throw 'the line went dead' }
+Test-That 'and a quota that cannot be fetched says so, for that login' {
+    $fetchFailed.source -ceq 'none' -and $fetchFailed.error -ceq 'The Copilot quota for danswett could not be read: the line went dead'
+} "error=$($fetchFailed.error)"
+
+# The real publisher, as Home Assistant would see it. Every machine's dashboard lists
+# the numbered sensors by id, so the id is the contract.
+$deskNode = Get-CopilotMqttMachineNode -Slug 'deskbox'
+$deskRoot = Get-CopilotMqttMachineTopicRoot -Slug 'deskbox'
+$script:PeerMessages.Clear()
+& $script:RealUsagePublisher -Records @($further) -Slug 'deskbox' -MachineName 'Desk box' -Headers $headers
+$furtherState = @(ConvertTo-PeerUsageState)
+$furtherConfig = @($script:PeerMessages | Where-Object { $_.Topic -ceq "homeassistant/sensor/$deskNode/usage_copilot_2/config" })
+Test-That 'a further login''s reading is published as a sensor of its own, on the id the dashboard lists' {
+    $furtherState.Count -eq 1 -and $furtherState[0].entity_id -ceq 'sensor.agent_bridge_deskbox_usage_copilot_2' -and
+        $furtherState[0].state -ceq '20' -and $furtherState[0].attributes.account -ceq 'danswett' -and $furtherState[0].attributes.client -ceq 'copilot'
+} "states=$(@($furtherState | ForEach-Object { "$($_.entity_id)=$($_.state)" }) -join ',')"
+Test-That 'named for its account, so the entity list tells it apart from the signed-in one' {
+    $furtherConfig.Count -eq 1 -and ($furtherConfig[0].Payload | ConvertFrom-Json).name -ceq 'GitHub Copilot usage (danswett)' -and
+        ($furtherConfig[0].Payload | ConvertFrom-Json).unique_id -ceq 'agent_bridge_deskbox_usage_copilot_2'
+} "config=$(@($furtherConfig | ForEach-Object { $_.Payload }) -join ' ')"
+Test-That 'and every topic of it is retained, like the client sensors beside it' {
+    @($script:PeerMessages | Where-Object { -not $_.Retain }).Count -eq 0 -and
+        @($script:PeerMessages | Where-Object { $_.Topic -like "$deskRoot/usage/copilot_2/*" }).Count -eq 2
+}
+Test-That 'while a record naming a sensor that is not one of its client''s is published nowhere' {
+    $strays = foreach ($pair in @(@('copilot', 'copilot_9'), @('copilot', 'claude_2'), @('claude', 'copilot_2'), @('copilot', 'copilot_02'))) {
+        $stray = New-BridgeUsageRecord -Client $pair[0] -Account 'x' -Source 'api' -Windows @(Get-BridgeUsageWindow -Key 'main' -Label 'Main' -PercentUsed 1)
+        $stray['sensor'] = $pair[1]
+        $stray
+    }
+    $script:PeerMessages.Clear()
+    & $script:RealUsagePublisher -Records @($strays) -Slug 'deskbox' -MachineName 'Desk box' -Headers $headers
+    $script:PeerMessages.Count -eq 0
+} "published=$(@($script:PeerMessages | ForEach-Object { $_.Topic }) -join ',')"
+
+$script:PeerMessages.Clear()
+$withdrewCount = & $script:RealUsageWithdrawal -Slug 'deskbox' -Keys @('copilot_3', 'copilot_4') -Headers $headers
+Test-That 'withdrawing numbered sensors clears exactly theirs, retained, so Home Assistant drops them' {
+    $expected = @(foreach ($key in 'copilot_3', 'copilot_4') {
+            "homeassistant/sensor/$deskNode/usage_$key/config", "$deskRoot/usage/$key/state", "$deskRoot/usage/$key/attr"
+        }) | Sort-Object
+    $cleared = @($script:PeerMessages | ForEach-Object { $_.Topic }) | Sort-Object
+    $withdrewCount -eq 6 -and ($cleared -join ',') -ceq ($expected -join ',') -and
+        @($script:PeerMessages | Where-Object { $_.Payload -ne '' -or -not $_.Retain }).Count -eq 0
+} "cleared=$(@($script:PeerMessages | ForEach-Object { $_.Topic }) -join ',')"
+Test-That 'and withdrawing none clears nothing' {
+    $script:PeerMessages.Clear()
+    (& $script:RealUsageWithdrawal -Slug 'deskbox' -Keys @() -Headers $headers) -eq 0 -and $script:PeerMessages.Count -eq 0
+}
+# The topics an uninstall or a forget clears. The usage sensors were missing from them
+# before the numbered ones existed, so a removed machine left its readings behind.
+Test-That 'what an uninstall or a forget clears includes every usage sensor, numbered ones and all' {
+    $machineTopics = @(Get-CopilotMqttMachineTopic -Slug 'deskbox')
+    $missing = @(foreach ($key in Get-CopilotMqttUsageSensorKey) {
+            foreach ($topic in "homeassistant/sensor/$deskNode/usage_$key/config", "$deskRoot/usage/$key/state", "$deskRoot/usage/$key/attr") {
+                if ($machineTopics -cnotcontains $topic) { $topic }
+            }
+        })
+    $missing.Count -eq 0
+} "missing=$(@(foreach ($key in Get-CopilotMqttUsageSensorKey) { if (@(Get-CopilotMqttMachineTopic -Slug 'deskbox') -cnotcontains "$deskRoot/usage/$key/state") { $key } }) -join ',')"
+
+# The correction of entity ids, against a registry that has registered one numbered
+# sensor and not yet the other. The registry is a stub local to this block, so the
+# publication fixture the dashboard checks used stays in place for anything after.
+$script:RegistryUpdates = [System.Collections.Generic.List[string]]::new()
+$idForcing = & {
+    function Invoke-CopilotHaWebSocket {
+        param([Parameter(Mandatory)][object[]]$Commands)
+        if ($Commands[0].type -ceq 'config/entity_registry/list') {
+            $registry = @(
+                [pscustomobject]@{ unique_id = 'agent_bridge_deskbox_usage_copilot'; entity_id = 'sensor.agent_bridge_deskbox_usage_copilot' }
+                [pscustomobject]@{ unique_id = 'agent_bridge_deskbox_usage_copilot_2'; entity_id = 'sensor.ai_agent_bridge_desk_box_github_copilot_usage_danswett' }
+            )
+            return Write-Output -NoEnumerate @(, $registry)
+        }
+        $script:RegistryUpdates.Add("$($Commands[0].entity_id)>$($Commands[0].new_entity_id)")
+        Write-Output -NoEnumerate @($null)
+    }
+    $pending = & $script:RealUsageIdForcing -Slug 'deskbox' -Clients @('copilot', 'copilot_2', 'copilot_3')
+    $renamed = @($script:RegistryUpdates)
+    $settled = & $script:RealUsageIdForcing -Slug 'deskbox' -Clients @('copilot', 'copilot_2')
+    [pscustomobject]@{ Pending = $pending; Settled = $settled; Renamed = $renamed }
+}
+Test-That 'forcing the ids renames what is registered, and says the correction is not done while one is not' {
+    $idForcing.Pending -eq $false -and $idForcing.Settled -eq $true -and
+        ($idForcing.Renamed -join ',') -ceq 'sensor.ai_agent_bridge_desk_box_github_copilot_usage_danswett>sensor.agent_bridge_deskbox_usage_copilot_2'
+} "pending=$($idForcing.Pending) settled=$($idForcing.Settled) renamed=$(@($idForcing.Renamed) -join ',')"
+
+# The passes, with the reader of a further login stubbed: what was asked, in the order
+# it was asked, and which sensor each reading went out on.
+$script:RealLoginAllowance = (Get-Item function:Get-BridgeCopilotLoginAllowance).ScriptBlock
+$script:LoginThrows = $false
+function Get-BridgeCopilotLoginAllowance {
+    param([string]$Login, [string]$Sensor)
+    $script:AskLog.Add("${Sensor}:$Login")
+    if ($script:LoginThrows) { throw 'gh went away' }
+    $record = New-BridgeUsageRecord -Client 'copilot' -Account $Login -Source 'api' `
+        -Windows @(Get-BridgeUsageWindow -Key 'plan' -Label 'Plan' -PercentUsed 5)
+    $record['sensor'] = $Sensor
+    $record
+}
+$script:PublishedRecords = [System.Collections.Generic.List[object]]::new()
+function Publish-CopilotMqttUsage {
+    param([object[]]$Records, [string]$Slug, [string]$MachineName, [hashtable]$Headers)
+    if ($script:PublishThrows) { throw 'mqtt unreachable' }
+    foreach ($record in $Records) {
+        $script:Published.Add((Get-CopilotMqttUsageRecordKey -Record $record))
+        $script:PublishedRecords.Add($record)
+    }
+}
+
+Reset-UsagePacing
+$script:Settings['usage.copilotAccounts'] = @('danswett')
+$firstAsk = Invoke-UsageAt 0 $none
+Test-That 'a further login is asked about on the first pass, beside the clients, and published on its own sensor' {
+    $firstAsk -ceq 'copilot,claude,codex;copilot_2:danswett' -and (@($script:Published) -join ',') -ceq 'copilot,claude,codex,copilot_2'
+} "asked=$firstAsk published=$(@($script:Published) -join ',')"
+Test-That 'that first pass withdraws the numbered sensors no login is on, whatever an earlier run left there' {
+    (@($script:Withdrawn) -join '|') -ceq 'copilot_3,copilot_4'
+} "withdrawn=$(@($script:Withdrawn) -join '|')"
+Test-That 'and forces its sensor''s id along with the rest' {
+    (@($script:ForcedWith) -join '|') -ceq 'claude,codex,copilot,copilot_2'
+} "forced=$(@($script:ForcedWith) -join '|')"
+$busyAsks = @(foreach ($second in 30, 120, 240, 360, 480, 600, 720, 840) { Invoke-UsageAt $second $copilotOpen })
+$idleDue = Invoke-UsageAt 900 $copilotOpen
+Test-That 'it is read at the idle pace while a Copilot session is open here, those sessions spending the signed-in account' {
+    @($busyAsks | Where-Object { $_ -match 'copilot_2' }).Count -eq 0 -and @($busyAsks | Where-Object { $_ -ceq 'copilot' }).Count -ge 6 -and
+        $idleDue -match ';copilot_2:danswett$'
+} "asks=$($busyAsks -join ' / ') then=$idleDue"
+Test-That 'and nothing is withdrawn again while the logins listed stay the same' {
+    @($script:Withdrawn).Count -eq 1
+} "withdrawn=$(@($script:Withdrawn) -join '|')"
+
+Reset-UsagePacing
+$script:Settings['usage.copilotAccounts'] = @('danswett')
+[void](Invoke-UsageAt 0 $none)
+$script:Settings['usage.copilotAccounts'] = @()
+$script:Withdrawn.Clear()
+$afterRemoval = Invoke-UsageAt 900 $none
+Test-That 'a login taken off the list is asked about no more, and its sensor is withdrawn rather than left showing its last reading' {
+    $afterRemoval -ceq 'copilot,claude,codex' -and (@($script:Withdrawn) -join '|') -ceq 'copilot_2,copilot_3,copilot_4' -and
+        -not $script:DaemonUsageClients.ContainsKey('copilot_2')
+} "asked=$afterRemoval withdrawn=$(@($script:Withdrawn) -join '|')"
+
+# Taken off the list and listed again, the set of sensors can read exactly as it did
+# when their ids were last forced, if the correction in between did not go through -
+# but the entity forced then went with the withdrawal, and the one published now is
+# registered afresh.
+Reset-UsagePacing
+$script:Settings['usage.copilotAccounts'] = @('danswett')
+[void](Invoke-UsageAt 0 $none)
+$script:Settings['usage.copilotAccounts'] = @()
+$script:ForcingThrows = $true
+$removalAsk = Invoke-UsageAt 900 $none
+$script:ForcingThrows = $false
+$script:Settings['usage.copilotAccounts'] = @('danswett')
+$relisted = Invoke-UsageAt 960 $none
+Test-That 'listed again, it is read and published at once, its retained reading having been cleared' {
+    $removalAsk -ceq 'copilot,claude,codex' -and $relisted -ceq 'copilot_2:danswett' -and (@($script:Published) -join ',') -ceq 'copilot_2'
+} "removal=$removalAsk asked=$relisted published=$(@($script:Published) -join ',')"
+Test-That 'and its id forced afresh, the entity it was forced on before having gone with it' {
+    (@($script:ForcedWith) -join '|') -ceq 'claude,codex,copilot,copilot_2'
+} "forced=$(@($script:ForcedWith) -join '|')"
+
+# A withdrawal is a publish, and the reconcile runs every fifteen seconds: retried on
+# every pass, one that failed would be retried, and logged, four times a minute.
+Reset-UsagePacing
+$script:Settings['usage.copilotAccounts'] = @('danswett')
+$script:WithdrawThrows = $true
+$withdrawFailedAsk = Invoke-UsageAt 0 $none
+$script:WithdrawThrows = $false
+[void](Invoke-UsageAt 15 $none)
+$withdrawnBeforeReading = @($script:Withdrawn).Count
+[void](Invoke-UsageAt 30 $claudeOpen)
+Test-That 'a withdrawal that fails holds up no reading, is said, and is tried again with the next reading, not on every pass' {
+    $withdrawFailedAsk -ceq 'copilot,claude,codex;copilot_2:danswett' -and $withdrawnBeforeReading -eq 0 -and
+        @($script:Logged | Where-Object { $_ -match 'could not be withdrawn' }).Count -eq 1 -and
+        (@($script:Withdrawn) -join '|') -ceq 'copilot_3,copilot_4'
+} "asked=$withdrawFailedAsk early=$withdrawnBeforeReading withdrawn=$(@($script:Withdrawn) -join '|') log=$(@($script:Logged) -join ' | ')"
+
+Reset-UsagePacing
+$script:Readings = @{}
+[void](Invoke-UsageAt 0 $none)
+Test-That 'and a pass that read nothing withdraws nothing, so a machine with nothing to report writes nothing for it' {
+    @($script:Withdrawn).Count -eq 0 -and $null -eq $script:DaemonUsageExtraSensors
+} "withdrawn=$(@($script:Withdrawn) -join '|')"
+
+Reset-UsagePacing
+$script:Settings['usage.copilotAccounts'] = @('danswett')
+$script:LoginThrows = $true
+$script:PublishedRecords.Clear()
+[void](Invoke-UsageAt 0 $none)
+$failedRow = @($script:PublishedRecords | Where-Object { (Get-CopilotMqttUsageRecordKey -Record $_) -ceq 'copilot_2' } | Select-Object -Last 1)
+$signedInRow = @($script:PublishedRecords | Where-Object { (Get-CopilotMqttUsageRecordKey -Record $_) -ceq 'copilot' } | Select-Object -Last 1)
+Test-That 'a further login whose reading blew up says so on its own row, and not on the signed-in account''s' {
+    $failedRow.Count -eq 1 -and $failedRow[0].source -ceq 'none' -and $failedRow[0].account -ceq 'danswett' -and
+        $failedRow[0].error -match '^Usage for danswett could not be collected: gh went away' -and
+        $signedInRow.Count -eq 1 -and $signedInRow[0].source -ceq 'api' -and -not $signedInRow[0].error
+} "row=$(@($failedRow | ForEach-Object { "$($_.source): $($_.error)" }) -join ',')"
+$script:LoginThrows = $false
+
+Reset-UsagePacing
+$script:Settings['usage.copilotAccounts'] = @('danswett')
+$script:PublishThrows = $true
+[void](Invoke-UsageAt 0 $none)
+$script:PublishThrows = $false
+$republishEarly = Invoke-UsageAt 119 $none
+$republishDue = Invoke-UsageAt 120 $none
+Test-That 'one that could not be published is asked for again at the busy pace, like any reading' {
+    $republishEarly -ceq '' -and $republishDue -ceq 'copilot,claude,codex;copilot_2:danswett' -and
+        (@($script:Published) -join ',') -ceq 'copilot,claude,codex,copilot_2'
+} "early=$republishEarly due=$republishDue"
+
+Reset-UsagePacing
+$script:Settings['usage.copilotAccounts'] = @('danswett')
+$script:Selected = @('claude', 'mcp')
+$noCopilot = Invoke-UsageAt 0 $none
+Test-That 'a machine that does not report Copilot reads no further Copilot login either, and keeps no numbered sensor' {
+    $noCopilot -ceq 'claude' -and (@($script:Withdrawn) -join '|') -ceq 'copilot_2,copilot_3,copilot_4'
+} "asked=$noCopilot withdrawn=$(@($script:Withdrawn) -join '|')"
+
+Reset-UsagePacing
+$script:Settings['usage.copilotAccounts'] = @('danswett', 'ghp_0123456789abcdefABCDEF0123456789abcd')
+[void](Invoke-UsageAt 0 $none)
+[void](Invoke-UsageAt 30 $none)
+[void](Invoke-UsageAt 900 $none)
+$listNotes = @($script:Logged | Where-Object { $_ -like 'usage.copilotAccounts:*' })
+Test-That 'what the list amounts to is logged once, not on every pass' {
+    $listNotes.Count -eq 1 -and $listNotes[0] -ceq 'usage.copilotAccounts: reporting danswett on usage_copilot_2; entry 2 looks like a token, not a login, so it is not used'
+} "notes=$($listNotes -join ' | ')"
+Test-That 'and nothing logged repeats the entry shaped like a token' {
+    @($script:Logged | Where-Object { $_ -match 'ghp_|0123456789abcdef' }).Count -eq 0
+}
+
+# Another machine keeping the same login current is as good as reading it here, exactly
+# as for the signed-in account (#142) - including when that machine is signed in to
+# Copilot as the login this one lists, and so reports it on its own client sensor.
+Reset-UsagePacing
+$script:Settings['dashboard.publication'] = $writerElsewhere
+$script:Settings['usage.copilotAccounts'] = @('danswett')
+$peerSignedIn = Invoke-UsageAt 0 $none @(New-PeerUsageState -Client 'copilot' -Account 'danswett' -Updated $paceStart)
+Test-That 'a further login another machine has just read is left to it, like any account' {
+    $peerSignedIn -ceq 'copilot,claude,codex'
+} "asked=$peerSignedIn"
+Reset-UsagePacing
+$script:Settings['dashboard.publication'] = $writerElsewhere
+$script:Settings['usage.copilotAccounts'] = @('danswett')
+$peerNumbered = Invoke-UsageAt 0 $none @(New-PeerUsageState -Client 'copilot' -Account 'danswett' -Sensor 'copilot_3' -Updated $paceStart)
+Test-That 'whichever sensor that machine reported it on' {
+    $peerNumbered -ceq 'copilot,claude,codex'
+} "asked=$peerNumbered"
+Reset-UsagePacing
+$script:Settings['dashboard.publication'] = $writerElsewhere
+$script:Settings['usage.copilotAccounts'] = @('DanSwett')
+$peerCased = Invoke-UsageAt 0 $none @(New-PeerUsageState -Client 'copilot' -Account 'danswett' -Updated $paceStart)
+Test-That 'and however the list spells the login, GitHub''s logins not being case-sensitive' {
+    $peerCased -ceq 'copilot,claude,codex'
+} "asked=$peerCased"
+Reset-UsagePacing
+$script:Settings['dashboard.publication'] = $writerElsewhere
+$script:Settings['usage.copilotAccounts'] = @('danswett')
+$peerOther = Invoke-UsageAt 0 $none @(New-PeerUsageState -Client 'copilot' -Account 'hubot' -Updated $paceStart)
+Test-That 'but another login''s reading is no reason to leave this one unread' {
+    $peerOther -ceq 'copilot,claude,codex;copilot_2:danswett'
+} "asked=$peerOther"
+Reset-UsagePacing
+$script:Settings['dashboard.publication'] = $writerElsewhere
+$claudeCased = Invoke-UsageAt 0 $claudeOpen @(New-PeerUsageState -Client 'claude' -AccountId '95ADB0B680FE' -Updated $paceStart)
+Test-That 'while Claude''s opaque account id is still matched exactly' {
+    $claudeCased -ceq 'copilot,claude,codex'
+} "asked=$claudeCased"
+
+Set-Item -LiteralPath function:Get-BridgeCopilotLoginAllowance -Value $script:RealLoginAllowance
+
 Set-Item -LiteralPath function:Get-BridgeCopilotAccount -Value $script:RealCopilotAccount
 Set-Item -LiteralPath function:Get-BridgeClaudeAccountId -Value $script:RealClaudeAccountId
 
@@ -1777,8 +2199,7 @@ function Reset-GhRung {
     $script:BridgeKeychainToken = ''
     $script:BridgeKeychainAccount = ''
     $script:BridgeKeychainUnavailable = $false
-    $script:BridgeGhAccount = ''
-    $script:BridgeGhReason = ''
+    $script:BridgeGhReasons = @{}
     $script:BridgeGhUnavailable = $false
     $script:BridgeGhUnavailableAt = [DateTimeOffset]::MinValue
     foreach ($name in @('COPILOT_GITHUB_TOKEN', 'GH_TOKEN', 'GITHUB_TOKEN')) {
@@ -1801,6 +2222,16 @@ $env:GH_TOKEN = 'gho_fromenvironment'
 Test-That 'an environment token still comes first, and gh is not run' {
     (Get-BridgeCopilotToken -Login 'octocat') -ceq 'gho_fromenvironment' -and @($script:GhRuns).Count -eq 0
 }
+# The environment's token is the signed-in account's. Spent for a further login it
+# would read that account's allowance, which the login check would then refuse, so the
+# further login would never be read at all (#200).
+$script:SeenToken = ''
+$furtherFromGh = Get-BridgeCopilotLoginAllowance -Login 'hubot' -Sensor 'copilot_2' `
+    -Fetch { param($Token) $script:SeenToken = $Token; New-CopilotBody -Login 'hubot' }
+Test-That 'while a further login''s token comes from gh, asked for that login, whatever the environment holds' {
+    $script:SeenToken -ceq 'gho_fromgh' -and $furtherFromGh.source -ceq 'api' -and @($script:GhRuns).Count -eq 1 -and
+        ($script:GhRuns[0].Arguments -join ' ') -ceq 'auth token --hostname github.com --user hubot'
+} "token=$($script:SeenToken) source=$($furtherFromGh.source) ran: $(@($script:GhRuns | ForEach-Object { $_.Arguments -join ' ' }) -join ' | ')"
 $env:GH_TOKEN = ''
 
 Reset-GhRung
@@ -1863,10 +2294,14 @@ Test-That 'a gh that never answers is asked once, not on every poll' {
 Test-That 'and says that it did not answer' {
     (Get-BridgeGitHubCliRefusal -Login 'octocat') -ceq 'gh did not answer in time'
 }
-Test-That 'but another account is asked afresh' {
+# What hung was gh, not the account: a keyring holding it at a prompt holds it for any
+# login. Asked afresh for each, every login read in a poll was the prompt again, every
+# poll, once further logins were read beside Copilot's own (#200).
+Test-That 'and is held off for every other login too, saying why on each' {
     $script:GhAnswer = New-ProbeAnswer -Stdout "gho_forhubot`n"
-    (Get-BridgeCopilotToken -Login 'hubot') -ceq 'gho_forhubot'
-}
+    (Get-BridgeCopilotToken -Login 'hubot') -ceq '' -and @($script:GhRuns).Count -eq 1 -and
+        (Get-BridgeGitHubCliRefusal -Login 'hubot') -ceq 'gh did not answer in time'
+} "runs: $(@($script:GhRuns).Count)"
 
 # Held off, but not for as long as the daemon lives. "Final for the run" was final for
 # weeks on a daemon that never restarted, and a Mac's Copilot reading never moved

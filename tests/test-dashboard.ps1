@@ -1897,8 +1897,11 @@ Test-That 'and a blank entry never matches a blank user' { -not (Test-BridgeAgen
 # Test-BridgeServedCardContent is fingerprinted for the same reason: Test-BridgeActivityCardServed
 # now asks it whether the served bytes are this build at all, so what it decides is
 # part of what the renderer emits even though its own text sits in another function.
-$script:ExpectedRenderVersion = '1.11.0'
-$script:ExpectedRenderHash = 'ed1a66c59bc1f104831a0368b198273e81aa3bb57fb7133f1b13843e10b4df25'
+#
+# 1.12.0 lists the numbered usage sensors further Copilot logins go on, and names the
+# usage sensors in every machine's withdrawal list (#200).
+$script:ExpectedRenderVersion = '1.12.0'
+$script:ExpectedRenderHash = '31bcd88af7b6a8a6970bf49427d2d7d93f0e6e1b60ff03fe4b4553380d763f6f'
 $artifact = Get-BridgeRenderArtifact
 
 Test-That 'the renderer is still the one this version was pinned to' {
@@ -1927,6 +1930,19 @@ Test-That 'the renderer fingerprint moves when the form-field ceiling does' {
         $raised = (Get-BridgeRenderArtifact).hash
     }
     finally { $script:CopilotMqttMaxFields = $saved }
+    $raised -ne $pinned -and (Get-BridgeRenderArtifact).hash -eq $pinned
+}
+# The same for the number of further Copilot logins a machine can report (#200): every
+# machine's usage sensors are written into the dashboard from that constant, with no
+# source text changing when it does.
+Test-That 'and when the number of further Copilot logins a machine can report does' {
+    $pinned = (Get-BridgeRenderArtifact).hash
+    $saved = $script:CopilotMqttUsageAccountSlots
+    try {
+        $script:CopilotMqttUsageAccountSlots = $saved + 1
+        $raised = (Get-BridgeRenderArtifact).hash
+    }
+    finally { $script:CopilotMqttUsageAccountSlots = $saved }
     $raised -ne $pinned -and (Get-BridgeRenderArtifact).hash -eq $pinned
 }
 
