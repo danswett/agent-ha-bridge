@@ -1400,10 +1400,17 @@ function New-PeerUsageState {
         [string]$Slug = 'otherbox',
         # A further Copilot login's numbered sensor, rather than the client's own (#200).
         [string]$Sensor = '',
+        # A machine that tried to read the account and could not.
+        [switch]$Failed,
         [Parameter(Mandatory)][DateTimeOffset]$Updated
     )
-    $record = New-BridgeUsageRecord -Client $Client -Account $Account -AccountId $AccountId -Source 'api' `
-        -Windows @(Get-BridgeUsageWindow -Key 'main' -Label 'Main' -PercentUsed 42)
+    $record = if ($Failed) {
+        New-BridgeUsageRecord -Client $Client -Account $Account -AccountId $AccountId -Source 'none' -Problem 'No credential was available.'
+    }
+    else {
+        New-BridgeUsageRecord -Client $Client -Account $Account -AccountId $AccountId -Source 'api' `
+            -Windows @(Get-BridgeUsageWindow -Key 'main' -Label 'Main' -PercentUsed 42)
+    }
     if ($Sensor) { $record['sensor'] = $Sensor }
     $script:PeerMessages.Clear()
     & $script:RealUsagePublisher -Records @($record) -Slug $Slug -MachineName 'Other box' -Headers $headers
@@ -2057,6 +2064,35 @@ Test-That 'a machine that does not report Copilot reads no further Copilot login
     $noCopilot -ceq 'claude' -and (@($script:Withdrawn) -join '|') -ceq 'copilot_2,copilot_3,copilot_4'
 } "asked=$noCopilot withdrawn=$(@($script:Withdrawn) -join '|')"
 
+# Nothing metered left to ask about ended the pass before the numbered sensors were
+# looked at, so a machine moved from Copilot to MCP alone kept them for good.
+Reset-UsagePacing
+$script:Settings['usage.copilotAccounts'] = @('danswett')
+[void](Invoke-UsageAt 0 $none)
+$script:Selected = @('mcp')
+$script:Withdrawn.Clear()
+$mcpOnly = Invoke-UsageAt 30 $none
+Test-That 'nor does one left reporting nothing that meters an allowance, even though the pass asks nothing at all' {
+    $mcpOnly -ceq '' -and (@($script:Withdrawn) -join '|') -ceq 'copilot_2,copilot_3,copilot_4'
+} "asked=$mcpOnly withdrawn=$(@($script:Withdrawn) -join '|')"
+
+# The reconcile waits on these reads, and an endpoint that takes the connection and
+# never answers costs each one three fifteen-second attempts: three logins read in the
+# same pass could hold the daemon past the point its liveness lapses.
+Reset-UsagePacing
+$script:Settings['usage.copilotAccounts'] = @('one', 'two', 'three')
+$staggered = @(foreach ($second in 0, 15, 30, 45) { Invoke-UsageAt $second $none })
+Test-That 'one further login is read a pass at most, the rest on the passes that follow' {
+    ($staggered -join ' / ') -ceq 'copilot,claude,codex;copilot_2:one / copilot_3:two / copilot_4:three / '
+} "asks=$($staggered -join ' / ')"
+Reset-UsagePacing
+$script:Settings['dashboard.publication'] = $writerElsewhere
+$script:Settings['usage.copilotAccounts'] = @('danswett', 'hubot')
+$secondOfTwo = Invoke-UsageAt 0 $none @(New-PeerUsageState -Client 'copilot' -Account 'danswett' -Updated $paceStart)
+Test-That 'though one left to another machine is not a read, and does not hold up the next' {
+    $secondOfTwo -ceq 'copilot,claude,codex;copilot_3:hubot'
+} "asked=$secondOfTwo"
+
 Reset-UsagePacing
 $script:Settings['usage.copilotAccounts'] = @('danswett', 'ghp_0123456789abcdefABCDEF0123456789abcd')
 [void](Invoke-UsageAt 0 $none)
@@ -2107,6 +2143,30 @@ $claudeCased = Invoke-UsageAt 0 $claudeOpen @(New-PeerUsageState -Client 'claude
 Test-That 'while Claude''s opaque account id is still matched exactly' {
     $claudeCased -ceq 'copilot,claude,codex'
 } "asked=$claudeCased"
+
+# A machine that cannot read an account publishes its failure every interval, and a
+# further login listed on two machines where only one has a token for it is the
+# expected case. Counted as a reading, that failure held the machine that could read
+# the account off for the whole window.
+Reset-UsagePacing
+$script:Settings['dashboard.publication'] = $writerElsewhere
+$script:Settings['usage.copilotAccounts'] = @('danswett')
+$peerFailed = @(
+    New-PeerUsageState -Client 'copilot' -Account 'work_account' -Failed -Updated $paceStart
+    New-PeerUsageState -Client 'copilot' -Account 'danswett' -Sensor 'copilot_2' -Failed -Updated $paceStart
+)
+$despiteFailures = Invoke-UsageAt 0 $none $peerFailed
+Test-That 'another machine''s failure to read an account is no reason to leave it unread here' {
+    $despiteFailures -ceq 'copilot,claude,codex;copilot_2:danswett'
+} "asked=$despiteFailures"
+Reset-UsagePacing
+$script:Settings['dashboard.publication'] = $writerElsewhere
+$unsourced = @(New-PeerUsageState -Client 'copilot' -Account 'work_account' -Updated $paceStart)
+foreach ($entry in $unsourced) { if ($null -ne $entry.attributes) { $entry.attributes.PSObject.Properties.Remove('source') } }
+$despiteUnsourced = Invoke-UsageAt 0 $none $unsourced
+Test-That 'nor is a reading that does not say where it came from' {
+    $despiteUnsourced -ceq 'copilot,claude,codex'
+} "asked=$despiteUnsourced"
 
 Set-Item -LiteralPath function:Get-BridgeCopilotLoginAllowance -Value $script:RealLoginAllowance
 

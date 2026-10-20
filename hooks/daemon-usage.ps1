@@ -1415,7 +1415,8 @@ function Test-BridgeUsageCovered {
         Only the reading matters, never who published it: this decides whether to repeat
         work, and nothing about who may publish the dashboard. Everything unknown or
         unusable means "ask", because a gauge that silently goes flat is worse than a
-        redundant request - no state list, no account key, a reading with no timestamp,
+        redundant request - no state list, no account key, a failure rather than a
+        reading, a reading with no timestamp,
         or one stamped more than an interval into the future, which is a peer's clock
         running ahead and would otherwise hold this machine off indefinitely.
 
@@ -1457,6 +1458,14 @@ function Test-BridgeUsageCovered {
         if ($names -notcontains 'client' -or $names -notcontains 'measured_at' -or
             $names -notcontains 'machine_slug' -or $names -notcontains 'updated') { continue }
         if ([string]$attributes.client -cne $Client) { continue }
+        # A failure is nobody keeping the account current. A machine without the
+        # credential publishes one every interval, and standing down for it left a
+        # machine that could read the account waiting out the whole window - the usual
+        # case once a further Copilot login is listed on two machines and only one of
+        # them has a token for it (#200). A reading that does not say where it came from
+        # is unknown, and unknown means ask.
+        $source = if ($names -contains 'source') { [string]$attributes.source } else { '' }
+        if (-not $source -or $source -ceq 'none') { continue }
         $slug = [string]$attributes.machine_slug
         if ([string]::IsNullOrWhiteSpace($slug) -or $slug -ceq $self) { continue }
 
@@ -1616,7 +1625,6 @@ function Sync-DaemonUsage {
     $clients = Get-BridgeSelectedClients
     if ($null -eq $clients) { $clients = @('copilot', 'claude', 'codex') }
     $clients = @($clients | Where-Object { $_ -ne 'mcp' } | ForEach-Object { ([string]$_).ToLowerInvariant() } | Select-Object -Unique)
-    if ($clients.Count -eq 0) { return $false }
 
     # Further Copilot logins, each read on a clock of its own like another client
     # (#200) - and only while Copilot is one of the clients reported here.
@@ -1636,10 +1644,11 @@ function Sync-DaemonUsage {
     # reading would sit on the card with nothing left to refresh it. Done whenever the
     # set changes, and on a daemon's first pass, since nothing records what an earlier
     # run left behind - whether or not anything is read: a machine whose every account
-    # another machine is keeping current reads nothing at all, and would otherwise leave
-    # a removed login on the card for as long as that went on. A withdrawal that failed
-    # leaves the set as it was and is tried again a busy interval later, not on every
-    # fifteen-second reconcile, so a Home Assistant not taking publishes costs one
+    # another machine is keeping current reads nothing at all, and one that reports no
+    # metered client any more reads nothing ever again, and either would otherwise
+    # leave a removed login on the card for as long as that went on. A withdrawal that
+    # failed leaves the set as it was and is tried again a busy interval later, not on
+    # every fifteen-second reconcile, so a Home Assistant not taking publishes costs one
     # attempt, and one line in the log, every couple of minutes.
     $retryIn = ($script:DaemonUsageWithdrawRetryAt - $Now).TotalSeconds
     # A wait longer than a whole interval is a clock that went backwards, not a wait.
@@ -1662,6 +1671,7 @@ function Sync-DaemonUsage {
             Write-DaemonLog -Message "usage sensors no longer reported could not be withdrawn: $($_.Exception.Message)"
         }
     }
+    if ($clients.Count -eq 0) { return $false }
 
     $known = $null -ne $Live
     $streams = @($clients | ForEach-Object { [pscustomobject]@{ Key = $_; Client = $_; Login = '' } }) +
@@ -1669,6 +1679,13 @@ function Sync-DaemonUsage {
     $due = @()
     $dueLogins = @()
     foreach ($stream in $streams) {
+        # One further login is read a pass at most. The reconcile waits on these reads,
+        # and a quota endpoint that accepts connections and never answers costs each of
+        # them three fifteen-second attempts, so three logins read in one pass could hold
+        # it past the liveness expiry. The rest are left due, untouched, for the next
+        # pass a quarter of a minute later - nothing, for a login read every quarter of
+        # an hour.
+        if ($stream.Login -and $dueLogins.Count -gt 0) { continue }
         $client = $stream.Client
         $state = Get-BridgeUsageClientState -Client $stream.Key
         # The sessions open here spend the account Copilot is signed in as, never a
