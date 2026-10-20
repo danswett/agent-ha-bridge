@@ -1513,6 +1513,11 @@ Bridge release `VERSION`, card `CARD_VERSION`, the renderer's publication versio
 the fencing protocol and the operator policy generation are different things.
 Ordinary authorized publication may advance compatible artifact versions, but never
 silently replaces equal-version/different-content artifacts or lowers a fence.
+The configured writer publishes a newer renderer on its first reconcile after running
+it, so the restart that follows an update is enough; it does not wait for a session
+or machine to change. A pinned generation, a non-writer, an older build or an
+equal-version conflict leaves the accepted dashboard as it is, without a log line on
+every pass.
 
 ##### When publication is paused on an equal-version conflict
 

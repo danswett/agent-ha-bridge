@@ -1858,6 +1858,45 @@ function Repair-DaemonMachinePicker {
     }
 }
 
+function Get-DaemonRenderUpgrade {
+    <#
+        The renderer the accepted dashboard was published with, when this participant
+        runs a different one that the established policy would let it publish now;
+        otherwise $null.
+
+        A release that changes the renderer changes nothing the input signature covers,
+        and the accepted receipt goes on verifying, because it is checked against the
+        policy and only a save advances the policy. So the configured writer kept
+        serving the previous layout until some unrelated session or machine change
+        happened to rebuild it: minutes on a busy fleet, never on a quiet one. On
+        2026-10-20 a writer that updated to renderer 1.12.0 was publishing the new
+        usage sensor within a minute, while its dashboard, still verified at 1.11.0,
+        did not list it (#236).
+
+        Every participant asks this on every pass, so a refusal is an answer here, not
+        a failure. A non-writer, a pinned generation, an older build and an
+        equal-version conflict are standing conditions that no attempt can change;
+        attempting and logging one each pass would bury every line that matters. Only
+        a tripped test guard propagates.
+    #>
+    param(
+        [Parameter(Mandatory)]$Publication,
+        [Parameter(Mandatory)][System.Collections.IDictionary]$Artifact
+    )
+
+    # Verified means the receipt's renderer is the policy's, so either names what the
+    # accepted view was rendered with; the policy is what the fence compares against.
+    if (-not $Publication.Verified) { return $null }
+    $accepted = $Publication.State.Policy['render']
+    if ((ConvertTo-BridgePublicationJson $accepted) -ceq (ConvertTo-BridgePublicationJson $Artifact)) { return $null }
+    try { Assert-BridgePublicationWriter -State $Publication.State -Component render -Artifact $Artifact }
+    catch {
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        return $null
+    }
+    $accepted
+}
+
 function Sync-DaemonDashboard {
     <#
         Observes accepted shared output on every pass, publishing changes or repairs
@@ -1872,6 +1911,12 @@ function Sync-DaemonDashboard {
         appearing, disappearing or going offline changes the controls even when no
         session did. The served card URL joins it because a card upgrade changes which
         cards the dashboard can use.
+
+        A newer renderer on the writer rebuilds it as well, but the renderer is
+        deliberately not one of those inputs. Every participant computes that
+        signature, so a peer running another release would mismatch on every pass and
+        be refused on every pass. Get-DaemonRenderUpgrade asks the policy instead,
+        which only the writer's own newer renderer satisfies (#236).
     #>
     param(
         [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Descriptors,
@@ -1911,8 +1956,10 @@ function Sync-DaemonDashboard {
         $selector = if ($onlineNames.Count -gt 1) { "input_select.$($script:BridgeMachineSelectorId)" } else { '' }
         $signature = Get-BridgeDashboardInputSignature -Sessions $allDescriptors -Machines $machineCards `
             -MachineSelector $selector -ReplyCardUrl $replyCardUrl
-        if (-not $publication.Verified -or $publication.InputSignature -cne $signature) {
-            Assert-BridgePublicationWriter -State $publication.State -Component render -Artifact (Get-BridgeRenderArtifact)
+        $render = Get-BridgeRenderArtifact
+        $upgradeFrom = Get-DaemonRenderUpgrade -Publication $publication -Artifact $render
+        if (-not $publication.Verified -or $publication.InputSignature -cne $signature -or $null -ne $upgradeFrom) {
+            Assert-BridgePublicationWriter -State $publication.State -Component render -Artifact $render
             [void](Set-CopilotMqttGlobalEntityId)
             $selector = Initialize-BridgeMachineSelector -Machines $onlineNames
             Save-CopilotSessionDashboard -Sessions @($allDescriptors | Sort-Object -Property Node) `
@@ -1925,8 +1972,11 @@ function Sync-DaemonDashboard {
             if (-not $publication.Verified -or $publication.InputSignature -cne $signature) {
                 throw 'The accepted shared dashboard does not match this reconciliation.'
             }
+            # Named because nothing else in the line would show it, and a missing rebuild
+            # line was the first clue in #236.
+            $renderNote = if ($null -ne $upgradeFrom) { "; renderer $($upgradeFrom.version) -> $($render.version)" } else { '' }
             Write-DaemonLog -Message ("dashboard rebuilt for $($allDescriptors.Count) session(s) across " +
-                "$($machineCards.Count) machine(s), $($onlineNames.Count) online")
+                "$($machineCards.Count) machine(s), $($onlineNames.Count) online$renderNote")
         }
         $script:DaemonDashboardSignature = $signature
         try { [void](Clear-DaemonStaleMachineHelper -Machines $machineCards -Headers $Headers) }

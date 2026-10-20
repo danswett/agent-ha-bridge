@@ -228,7 +228,7 @@ Keep the version axes separate:
 |---|---|
 | Bridge `VERSION` | Release identity, not card/render compatibility or publication authority |
 | Card `CARD_VERSION` and bytes hash | Bump for changed card content; never relabel an old file with a publication argument |
-| `$script:BridgeDashboardRenderVersion` and renderer fingerprint | Bump when changing the generating helpers fingerprinted by `Get-BridgeRenderArtifact`; equal-version/different-content artifacts are conflicts |
+| `$script:BridgeDashboardRenderVersion` and renderer fingerprint | Bump when changing the generating helpers fingerprinted by `Get-BridgeRenderArtifact`; equal-version/different-content artifacts are conflicts. The writer republishes on its first pass after running a newer accepted renderer; never add the renderer to the input signature, which every participant computes |
 | Publication fencing protocol | Change deliberately when policy/receipt interpretation changes; unsupported formats must refuse rather than reset or guess |
 | Operator generation | Explicit expected generation/content and exactly the next configured generation for policy changes; no timestamp election |
 
