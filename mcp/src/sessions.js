@@ -32,7 +32,7 @@
  * of truth and the tests pin the ones that matter.
  */
 
-import { createHash } from 'node:crypto';
+import { createHash, randomUUID } from 'node:crypto';
 
 const SESSION_ACTIVITY = /^sensor\.agent_bridge_([0-9a-f]{16})_activity$/;
 const MACHINE_ONLINE = /^binary_sensor\.agent_bridge_(.+)_online$/;
@@ -85,8 +85,32 @@ export function machineEntities(slug) {
     newSession: `button.agent_bridge_${slug}_new_session`,
     newResult: `sensor.agent_bridge_${slug}_new_session_result`,
     newPrompt: `text.agent_bridge_${slug}_new_prompt`,
+    newPromptPayload: `sensor.agent_bridge_${slug}_new_prompt_payload`,
   };
 }
+
+/**
+ * The launch card's selectors, by the setting each one offers. Read for the options a
+ * machine has, never written: a launch an agent asks for carries its own settings, so
+ * a person's choices on the card are neither used nor changed (#227).
+ */
+export const LAUNCH_SETTINGS = ['agent', 'workspace', 'profile', 'resume', 'model', 'effort', 'context', 'permissions'];
+
+export function launchSelectEntity(slug, setting) {
+  return `select.agent_bridge_${slug}_new_${setting}`;
+}
+
+/** What a requested launch can come to once the machine is done with it. */
+const FINAL_OUTCOMES = new Set(['started', 'refused', 'failed', 'busy', 'unconfirmed']);
+const TUNING_SETTINGS = new Set(['model', 'effort', 'context']);
+const REQUEST_ID = /^[A-Za-z0-9-]{8,64}$/;
+// Exactly the daemon's two labels, case included: this one decides whether a session
+// runs without asking, and anything unclear is refused rather than read as asking.
+const PERMISSIONS = ['Ask permission', 'Allow all'];
+const NEW_SESSION_OPTION = 'New session';
+// How long a published request has to show in the slot before Launch is pressed for it.
+// Home Assistant normally shows one in well under a second.
+const LANDING_MS = 5000;
 
 /** The retained topic the reply card publishes a long reply to. */
 export function replyPayloadTopic(sessionId) {
@@ -279,27 +303,288 @@ export async function replyToSession(ha, sessionId, text, { publisher } = {}) {
 }
 
 /**
- * Starts a session on a machine, optionally with an opening prompt.
+ * Starts a session on a machine, and reports what that launch actually came to.
  *
- * The prompt goes to the retained payload topic rather than the 255-character text
- * box, and for the same reason it is cleared again when no prompt was given: the
- * payload wins over the text box whenever it holds anything, so one left behind by an
- * earlier launch would silently open the next session instead.
+ * A machine that understands launch requests (capabilities.launchRequest) is sent one:
+ * an id, the prompt, and whichever settings were given, on the retained payload topic
+ * the daemon reads at the press. What is left out is that machine's configured default
+ * - never what its card shows, so an agent cannot inherit an 'Allow all' a person left
+ * selected - and the daemon publishes what the request came to, keyed by its id, on
+ * the result sensor. This waits up to `waitSeconds` for a final answer and otherwise
+ * returns `pending` with the id, for readLaunchResult.
+ *
+ * An older machine ignores both, so settings are refused for one rather than quietly
+ * dropped, and a launch without any is sent the old way and reported as `sent`.
+ *
+ * The payload is the single slot two agents launching at once would share, so the
+ * press waits until the slot shows this request: pressing earlier could launch the
+ * request it replaced, or nothing of this one. Nothing is pressed for a request that
+ * never shows: `lost` if another replaced it, `undelivered` if it simply has not
+ * arrived (notLanded).
  */
-export async function launchSession(ha, slug, { prompt, publisher } = {}) {
+export async function launchSession(ha, slug, options = {}) {
+  const {
+    prompt,
+    publisher,
+    settings = {},
+    waitSeconds = 30,
+    now = () => Date.now(),
+    sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
+    newRequestId = () => randomUUID(),
+  } = options;
   const ids = machineEntities(slug);
-  const online = await ha.getState(ids.online);
+  const states = await ha.getStates();
+  const byId = new Map(states.map((s) => [s.entity_id, s]));
+  const online = byId.get(ids.online);
   if (!online) throw new Error(`No machine ${slug} in Home Assistant.`);
   if (online.state !== 'on') throw new Error(`${slug} is offline.`);
 
+  const wanted = launchSettings(settings);
+  const status = byId.get(ids.sessions);
+  const capabilities = attr(status, 'capabilities') ?? {};
+  if (capabilities.newSession === false) {
+    throw new Error(`Launching is turned off on ${slug} (newSession.enabled), so nothing was launched.`);
+  }
+  const held = String(attr(status, 'discovery_held') ?? '').trim();
+  if (held) throw new Error(`${slug} is holding launches until it can account for ${held}. Nothing was launched.`);
+  const supported = Number(capabilities.launchRequest ?? 0) >= 1;
+  if (!supported && Object.keys(wanted).length) {
+    throw new Error(
+      `${slug} runs a bridge too old to take launch settings, so nothing was launched. Update it ` +
+        `(button.agent_bridge_${slug}_install_update), or launch without settings to use what its card shows.`,
+    );
+  }
+
   const text = String(prompt ?? '').trim();
-  await publishVia(
-    publisher ?? ha,
-    launchPromptTopic(slug),
-    text ? { at: new Date().toISOString(), text } : '',
-    true,
-    { fellBack: !publisher },
-  );
-  await ha.callService('button', 'press', { entity_id: ids.newSession });
-  return { machine: slug, prompt: text.length };
+  if (!supported) {
+    // The old contract, unchanged: an empty prompt clears the slot, since the payload
+    // beats the text box and one left behind would open the next session instead.
+    await publishVia(
+      publisher ?? ha,
+      launchPromptTopic(slug),
+      text ? { at: new Date(now()).toISOString(), text } : '',
+      true,
+      { fellBack: !publisher },
+    );
+    await ha.callService('button', 'press', { entity_id: ids.newSession });
+    return {
+      machine: slug,
+      prompt: text.length,
+      status: 'sent',
+      note:
+        `${slug} runs a bridge from before launch requests: it launched with what its card shows, ` +
+        'and reports no outcome. Look for the new session with list_agent_sessions.',
+    };
+  }
+
+  const refusal = precheckLaunch(wanted, byId, slug);
+  if (refusal) return { machine: slug, prompt: text.length, status: 'refused', note: refusal };
+
+  const request = newRequestId();
+  const payload = { at: new Date(now()).toISOString(), text, request };
+  if (Object.keys(wanted).length) payload.settings = wanted;
+  await publishVia(publisher ?? ha, launchPromptTopic(slug), payload, true, { fellBack: !publisher });
+
+  // Pressed only once the slot shows this request, and not at all if another press
+  // has already taken it - which is a launch, reported like any other.
+  let taken = null;
+  const landBy = now() + LANDING_MS;
+  for (;;) {
+    const slot = await ha.getState(ids.newPromptPayload);
+    if (attr(slot, 'request') === request) break;
+    taken = findOutcome(await ha.getState(ids.newResult), request);
+    if (taken) break;
+    if (now() >= landBy) return notLanded(slug, request, text.length, attr(slot, 'request'));
+    await sleep(200);
+  }
+  if (!taken) await ha.callService('button', 'press', { entity_id: ids.newSession });
+  const pressedAt = now();
+
+  // Read about once a second. A request that is neither answered nor still waiting
+  // in the slot five seconds after the press was replaced before the machine took it.
+  const until = pressedAt + Math.max(0, Math.min(120, Number(waitSeconds) || 0)) * 1000;
+  let latest = taken;
+  for (;;) {
+    const [result, slot] = await Promise.all([ha.getState(ids.newResult), ha.getState(ids.newPromptPayload)]);
+    const record = findOutcome(result, request);
+    if (record) {
+      latest = record;
+      if (FINAL_OUTCOMES.has(record.outcome)) return launchResult(slug, request, record, text.length);
+    } else if (attr(slot, 'request') !== request && now() - pressedAt >= 5000) {
+      return {
+        machine: slug,
+        request,
+        prompt: text.length,
+        status: 'lost',
+        note:
+          'Another launch request replaced this one before the machine took it, so nothing was ' +
+          'launched for it. Try again.',
+      };
+    }
+    if (now() >= until) break;
+    await sleep(1000);
+  }
+  return launchResult(slug, request, latest, text.length);
+}
+
+/**
+ * What a launch requested earlier came to - for one launch_agent_session returned as
+ * `pending`. Reads the machine's outcomes once; never waits.
+ */
+export async function readLaunchResult(ha, slug, request) {
+  const id = String(request ?? '').trim();
+  if (!REQUEST_ID.test(id)) throw new Error(`'${id}' is not a launch request id.`);
+  const ids = machineEntities(slug);
+  const [result, slot] = await Promise.all([ha.getState(ids.newResult), ha.getState(ids.newPromptPayload)]);
+  if (!result && !slot) throw new Error(`No machine ${slug} in Home Assistant.`);
+  const record = findOutcome(result, id);
+  if (record) return launchResult(slug, id, record);
+  if (attr(slot, 'request') === id) {
+    return { machine: slug, request: id, status: 'pending', note: 'Waiting for the machine to take the request.' };
+  }
+  return {
+    machine: slug,
+    request: id,
+    status: 'unknown',
+    note:
+      `Not among ${slug}'s latest launch outcomes, nor waiting to be taken: it was replaced before ` +
+      'the machine took it, or is older than the five outcomes a machine keeps.',
+  };
+}
+
+/**
+ * What a machine's launch card offers, read from its selectors: the values a
+ * launch_agent_session setting may take there. Read-only.
+ *
+ * The model, effort and context lists belong to whichever agent the card currently
+ * shows, which is why they are labelled with it: another agent offers its own, and
+ * a value it does not have is refused at launch rather than guessed at.
+ */
+export async function getLaunchOptions(ha, slug) {
+  const ids = machineEntities(slug);
+  const states = await ha.getStates();
+  const byId = new Map(states.map((s) => [s.entity_id, s]));
+  const online = byId.get(ids.online);
+  if (!online) throw new Error(`No machine ${slug} in Home Assistant.`);
+  const status = byId.get(ids.sessions);
+  const capabilities = attr(status, 'capabilities') ?? {};
+  const options = (setting) => selectOptions(byId.get(launchSelectEntity(slug, setting)));
+  return {
+    machine: slug,
+    online: online.state === 'on',
+    launching: capabilities.newSession !== false,
+    launchRequest: Number(capabilities.launchRequest ?? 0) >= 1,
+    held: String(attr(status, 'discovery_held') ?? ''),
+    agents: options('agent'),
+    workspaces: options('workspace'),
+    profiles: options('profile'),
+    permissions: options('permissions'),
+    resume: options('resume').filter((label) => label !== NEW_SESSION_OPTION),
+    tuning: {
+      agent: String(byId.get(launchSelectEntity(slug, 'agent'))?.state ?? ''),
+      model: options('model'),
+      effort: options('effort'),
+      context: options('context'),
+    },
+  };
+}
+
+function selectOptions(state) {
+  const options = attr(state, 'options');
+  return Array.isArray(options) ? options.map(String) : [];
+}
+
+/** The settings a launch was given, as text, without the ones left empty. */
+function launchSettings(settings) {
+  const wanted = {};
+  for (const [key, value] of Object.entries(settings ?? {})) {
+    if (!LAUNCH_SETTINGS.includes(key)) {
+      throw new Error(`Unknown launch setting '${key}' - a launch takes ${LAUNCH_SETTINGS.join(', ')}.`);
+    }
+    const text = value === undefined || value === null ? '' : String(value).trim();
+    if (text) wanted[key] = text;
+  }
+  return wanted;
+}
+
+/**
+ * A refusal for a setting the machine's card shows it does not offer, so a doomed
+ * request does not take the payload slot. Matched as loosely as the daemon matches,
+ * never more strictly, and only where the card's list is the one the daemon will use:
+ * a session id resumes though only labels are listed, and the tuning lists belong to
+ * the card's agent, so they are checked only for a launch that names that same agent.
+ */
+function precheckLaunch(wanted, byId, slug) {
+  const same = (a, b) => a.localeCompare(b, undefined, { sensitivity: 'accent' }) === 0;
+  const offered = (setting) => selectOptions(byId.get(launchSelectEntity(slug, setting)));
+  const refuse = (setting, value, list) =>
+    `${slug} does not offer ${setting} '${value}'. It has: ${list.join(', ') || 'nothing'}. Nothing was launched.`;
+  const cardAgent = String(byId.get(launchSelectEntity(slug, 'agent'))?.state ?? '');
+
+  for (const [setting, value] of Object.entries(wanted)) {
+    if (setting === 'permissions') {
+      if (!PERMISSIONS.includes(value)) return refuse(setting, value, PERMISSIONS);
+      continue;
+    }
+    if (TUNING_SETTINGS.has(setting) && !(wanted.agent && cardAgent && same(wanted.agent, cardAgent))) continue;
+    const list = offered(setting).filter((option) => !(setting === 'resume' && option === NEW_SESSION_OPTION));
+    if (!list.length) continue;
+    if (setting === 'resume' && !list.some((option) => same(option, value))) {
+      if (/^[0-9a-f]{8}-[0-9a-f-]{4,}$/i.test(value)) continue;
+    }
+    if (!list.some((option) => same(option, value))) return refuse(setting, value, list);
+  }
+  return '';
+}
+
+function findOutcome(result, request) {
+  const recent = attr(result, 'recent');
+  if (!Array.isArray(recent)) return null;
+  return recent.find((entry) => entry?.request === request) ?? null;
+}
+
+/**
+ * A request that never showed in the slot, so Launch was not pressed for it. Replaced
+ * by another, it can never launch. Merely not shown yet - Home Assistant running slow -
+ * it still could: it is retained, so a press of Launch there while it is fresh would
+ * start it. Trying again replaces it, so only a press in between can start both, which
+ * read_launch_result shows.
+ */
+function notLanded(slug, request, promptLength, inSlot) {
+  const shaped = { machine: slug, request, prompt: promptLength };
+  if (inSlot && inSlot !== request) {
+    return {
+      ...shaped,
+      status: 'lost',
+      note:
+        `Another launch request replaced this one on ${slug} before it showed there, so Launch was not ` +
+        'pressed and nothing was launched for it. Try again.',
+    };
+  }
+  return {
+    ...shaped,
+    status: 'undelivered',
+    note:
+      `The request did not show on ${slug} within ${LANDING_MS / 1000} seconds, so Launch was not pressed. If ` +
+      'it arrives late, a press of Launch there in the next minute would start it: check read_launch_result ' +
+      'with this request before trying again. Trying again replaces it.',
+  };
+}
+
+function launchResult(slug, request, record, promptLength) {
+  const shaped = { machine: slug, request };
+  if (promptLength !== undefined) shaped.prompt = promptLength;
+  if (!record) {
+    return { ...shaped, status: 'pending', stage: '', note: 'Launch pressed; the machine has not answered yet.' };
+  }
+  const outcome = String(record.outcome ?? '');
+  const final = FINAL_OUTCOMES.has(outcome);
+  return {
+    ...shaped,
+    status: final ? outcome : 'pending',
+    stage: final ? '' : outcome,
+    session: String(record.session ?? ''),
+    note: String(record.note ?? ''),
+    launched: record.launched ?? null,
+  };
 }

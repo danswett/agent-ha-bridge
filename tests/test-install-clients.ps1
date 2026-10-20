@@ -917,6 +917,15 @@ try {
     Test-That 'and that publishing it needs the administrator token the agent does not have' {
         $script:InstrText -match '`mqtt\.publish` is administrator-only, so that publish takes `homeAssistant\.token`'
     }
+    # An agent launching on another machine got whatever that machine's card showed,
+    # and no word of what had started (#227).
+    Test-That 'and says a launch carries its own settings and reports what it started' {
+        $script:InstrText -match 'get_launch_options' -and $script:InstrText -match 'capabilities\.launchRequest' -and
+            $script:InstrText -match '_new_session_result' -and $script:InstrText -match '`recent`'
+    }
+    Test-That 'and that a launched session''s trust question stays a person''s to answer' {
+        $script:InstrText -match '`busy`' -and $script:InstrText -match 'person''s decision'
+    }
     Test-That 'and says the bridge owns the file, so nobody hand-edits it' {
         $script:InstrText -match 'uninstall' -and $script:InstrText -match 'overwritten'
     }

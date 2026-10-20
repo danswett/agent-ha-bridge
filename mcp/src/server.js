@@ -37,7 +37,15 @@ import {
 } from './entities.js';
 import { describeSchema, outlineFor, valueForLabel } from './schema.js';
 import { ensureDashboard, removeFromDashboard } from './dashboard.js';
-import { launchSession, listSessions, readSession, replyToSession } from './sessions.js';
+import {
+  getLaunchOptions,
+  LAUNCH_SETTINGS,
+  launchSession,
+  listSessions,
+  readLaunchResult,
+  readSession,
+  replyToSession,
+} from './sessions.js';
 import { startHttpTransport } from './http.js';
 import { readFileSync } from 'node:fs';
 import { loadConfig } from './config.js';
@@ -213,9 +221,17 @@ async function main() {
       {
         name: 'launch_agent_session',
         description:
-          'Start a new session on a machine, optionally with an opening prompt of any ' +
-          'length, as the agent. The machine must be online. Other launch settings come ' +
-          "from that machine's card; this does not change them.",
+          'Start a session on a machine, as the agent, and report what it came to. Any of the ' +
+          'settings below can be given; one left out is that machine\'s configured default, ' +
+          "never what its card shows, and the card's selections are never changed. A value the " +
+          'machine does not offer is refused, naming the ones it does - get_launch_options ' +
+          'lists them. Returns status: started (session is the id read_agent_session and ' +
+          'reply_to_agent_session take), refused or failed (the reason is in note), busy (the ' +
+          'machine is waiting for a person to answer a launched session\'s question; try ' +
+          'again later), unconfirmed, lost (replaced before the machine took it; nothing ' +
+          'launched), undelivered (never reached the machine, so Launch was not pressed; check ' +
+          'read_launch_result before trying again), pending (pass request to read_launch_result ' +
+          'later), or sent (an older machine that launched from its card and reports nothing back).',
         inputSchema: {
           type: 'object',
           properties: {
@@ -223,7 +239,63 @@ async function main() {
               type: 'string',
               description: 'The machine slug from list_agent_sessions.',
             },
-            prompt: { type: 'string', description: 'Optional first instruction.' },
+            prompt: { type: 'string', description: 'Optional first instruction, any length.' },
+            agent: { type: 'string', description: 'Agent to launch, e.g. Copilot, Claude, Codex or Agency.' },
+            workspace: { type: 'string', description: 'An approved workspace label on that machine.' },
+            profile: { type: 'string', description: 'An Agency profile; only for an Agency launch.' },
+            resume: {
+              type: 'string',
+              description:
+                'A session to reopen instead of starting fresh, by the label its resume list ' +
+                'shows or by id. It reopens in its own folder, so it cannot be combined with ' +
+                'workspace.',
+            },
+            model: { type: 'string', description: 'A model the chosen agent offers, or Agent default.' },
+            effort: { type: 'string', description: 'A reasoning effort the chosen agent offers, or Agent default.' },
+            context: { type: 'string', description: 'A context window the chosen agent offers, or Agent default.' },
+            permissions: {
+              type: 'string',
+              enum: ['Ask permission', 'Allow all'],
+              description:
+                'Allow all launches without permission prompts. Left out, the machine\'s own ' +
+                'configured default applies.',
+            },
+            wait_seconds: {
+              type: 'number',
+              description:
+                'How long to wait for the launch to register, 0-120 (default 30). 0 returns ' +
+                'as soon as Launch is pressed.',
+            },
+          },
+          required: ['machine'],
+        },
+      },
+      {
+        name: 'read_launch_result',
+        description:
+          'What a launch that launch_agent_session returned as pending came to. Reads once and ' +
+          'never waits; the statuses are those launch_agent_session returns, or unknown for a ' +
+          'request the machine no longer remembers.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            machine: { type: 'string', description: 'The machine slug the launch was sent to.' },
+            request: { type: 'string', description: 'The request id launch_agent_session returned.' },
+          },
+          required: ['machine', 'request'],
+        },
+      },
+      {
+        name: 'get_launch_options',
+        description:
+          "What launch_agent_session's settings may be on a machine: its agents, workspaces, " +
+          'profiles, permissions and resumable sessions, and the model, effort and context ' +
+          'lists of the agent its card currently shows. Also says whether the machine takes ' +
+          'launch settings at all (launchRequest) and anything holding its launches. Read-only.',
+        inputSchema: {
+          type: 'object',
+          properties: {
+            machine: { type: 'string', description: 'The machine slug from list_agent_sessions.' },
           },
           required: ['machine'],
         },
@@ -248,7 +320,17 @@ async function main() {
     reply_to_agent_session: (args) =>
       replyToSession(agentHa, String(args?.session_id ?? ''), args?.text, { publisher: ha }),
     launch_agent_session: (args) =>
-      launchSession(agentHa, String(args?.machine ?? ''), { prompt: args?.prompt, publisher: ha }),
+      launchSession(agentHa, String(args?.machine ?? ''), {
+        prompt: args?.prompt,
+        publisher: ha,
+        settings: Object.fromEntries(
+          LAUNCH_SETTINGS.filter((key) => args?.[key] !== undefined).map((key) => [key, args[key]]),
+        ),
+        waitSeconds: args?.wait_seconds ?? 30,
+      }),
+    // Reads, so the user's client - the same as read_agent_session.
+    read_launch_result: (args) => readLaunchResult(ha, String(args?.machine ?? ''), args?.request),
+    get_launch_options: (args) => getLaunchOptions(ha, String(args?.machine ?? '')),
   };
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
