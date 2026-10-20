@@ -625,6 +625,126 @@ foreach ($mismatchingSource in @($unpinnedSource, $sameVersionWrongSource)) {
     }
 }
 
+Write-Host '--- a release that changes the renderer reaches the dashboard on the writer''s next pass ---'
+# A renderer bump changes nothing the input signature covers, and the accepted receipt
+# verifies against a policy that only a save advances, so the writer went on serving
+# the old layout until some session or machine happened to change (#236). Published
+# here by renderer 1.0.0, then reconciled by this build's renderer with every input
+# the same - which is exactly what a self-update and daemon restart look like.
+$currentRenderVersion = $script:BridgeDashboardRenderVersion
+$acceptedRender = { (Get-TestPublicationStore).configs['agent-decisions'].agent_bridge_publication.render }
+$newLog = { param([int]$From) @($script:Log | Select-Object -Skip $From) }
+$publicationLines = { param([int]$From) @(& $newLog $From | Where-Object { $_ -match 'dashboard|publication' }) }
+Initialize-TestPublicationStore
+$renderCardSource = New-TestPublicationCard '2.0.0'
+$script:BridgeReplyCardUrlCache = ''
+$script:BridgeReplyCardUrlCachedAt = [datetime]::MinValue
+$script:DaemonDashboardSignature = $null
+$script:BridgeDashboardRenderVersion = '1.0.0'
+try {
+    Set-TestPublicationPolicy -Policy (New-TestPublicationPolicy $renderCardSource) `
+        -CardUrl (Get-BridgeInlineReplyCardUrl -SourcePath $renderCardSource -Version '2.0.0')
+    $publishedByOld = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+}
+finally { $script:BridgeDashboardRenderVersion = $currentRenderVersion }
+Test-That 'the fixture starts from a dashboard the previous renderer published' {
+    $publishedByOld -and (& $acceptedRender).version -ceq '1.0.0'
+}
+
+# A peer that updated first must not try: every machine runs this check every pass.
+Set-TestPublicationIdentity -Participant 'observer-b'
+$script:TestPublication.Commands.Clear()
+$logFrom = @($script:Log).Count
+$observerFirst = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+$observerSecond = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+Test-That 'a peer running a newer renderer leaves the writer''s dashboard alone, silently, pass after pass' {
+    $observerFirst -and $observerSecond -and @(Get-TestPublicationWrites).Count -eq 0 -and
+        (& $acceptedRender).version -ceq '1.0.0' -and @(& $publicationLines $logFrom).Count -eq 0
+} ((& $newLog $logFrom) -join ' | ')
+
+Set-TestPublicationIdentity
+$script:TestPublication.Commands.Clear()
+$logFrom = @($script:Log).Count
+$upgraded = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+$upgradedPolicy = (Read-BridgePublicationState).Policy
+Test-That 'the writer publishes its newer renderer on its next pass, though no session or machine changed' {
+    $upgraded -and @($script:TestPublication.Commands | Where-Object { $_.type -eq 'lovelace/config/save' }).Count -eq 1 -and
+        (& $acceptedRender).version -ceq $currentRenderVersion -and
+        $upgradedPolicy.render.version -ceq $currentRenderVersion -and $upgradedPolicy.highRender.version -ceq $currentRenderVersion
+} ((& $newLog $logFrom) -join ' | ')
+Test-That 'and its rebuild line names the renderer as the reason' {
+    @(& $newLog $logFrom | Where-Object { $_ -like "dashboard rebuilt for *; renderer 1.0.0 -> $currentRenderVersion" }).Count -eq 1
+} ((& $newLog $logFrom) -join ' | ')
+$script:TestPublication.Commands.Clear()
+$logFrom = @($script:Log).Count
+$settled = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+Test-That 'and having published it, settles rather than rebuilding on every pass' {
+    $settled -and @(Get-TestPublicationWrites).Count -eq 0 -and @(& $publicationLines $logFrom).Count -eq 0
+} ((& $newLog $logFrom) -join ' | ')
+
+# The refusals below are standing conditions, not events: an attempt cannot change
+# them, so one logged each pass would only bury the lines that matter.
+$script:TestPublication.Commands.Clear()
+$logFrom = @($script:Log).Count
+$script:BridgeDashboardRenderVersion = '1.0.0'
+try {
+    $olderFirst = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+    $olderSecond = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+}
+finally { $script:BridgeDashboardRenderVersion = $currentRenderVersion }
+Test-That 'a writer back on an older renderer neither replaces the newer dashboard nor retries every pass' {
+    $olderFirst -and $olderSecond -and @(Get-TestPublicationWrites).Count -eq 0 -and
+        (& $acceptedRender).version -ceq $currentRenderVersion -and @(& $publicationLines $logFrom).Count -eq 0
+} ((& $newLog $logFrom) -join ' | ')
+
+# A renderer whose output changed without a version bump - the 1.5.0 freeze. The
+# usage-sensor count is fingerprinted, so raising it is that change without editing code.
+$script:TestPublication.Commands.Clear()
+$logFrom = @($script:Log).Count
+$savedUsageSlots = $script:CopilotMqttUsageAccountSlots
+$script:CopilotMqttUsageAccountSlots = $savedUsageSlots + 1
+try {
+    $conflictingRender = Get-BridgeRenderArtifact
+    $conflictFirst = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+    $conflictSecond = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+}
+finally { $script:CopilotMqttUsageAccountSlots = $savedUsageSlots }
+Test-That 'an equal-version renderer with different content is not retried on every pass' {
+    $conflictingRender.version -ceq $currentRenderVersion -and $conflictingRender.hash -cne (& $acceptedRender).hash -and
+        $conflictFirst -and $conflictSecond -and @(Get-TestPublicationWrites).Count -eq 0 -and
+        @(& $publicationLines $logFrom).Count -eq 0
+} ((& $newLog $logFrom) -join ' | ')
+
+# An operator pin is an explicit choice of renderer; a newer build must not leave it.
+Initialize-TestPublicationStore
+$pinRenderCard = New-TestPublicationCard '2.0.0'
+$script:BridgeReplyCardUrlCache = ''
+$script:BridgeReplyCardUrlCachedAt = [datetime]::MinValue
+$script:BridgeDashboardRenderVersion = '1.0.0'
+try {
+    Initialize-TestPublicationAuthority -CardSource $pinRenderCard
+    [void](Install-BridgeReplyCard -SourcePath $pinRenderCard)
+    [void](Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers)
+    $beforeRenderPin = (Read-BridgePublicationState).Policy
+    Set-TestPublicationIdentity -Generation 2
+    Set-BridgePublicationPolicy -ExpectedGeneration 1 `
+        -ExpectedPolicyHash (Get-BridgePublicationHash (ConvertTo-BridgePublicationJson $beforeRenderPin)) `
+        -Target (Get-BridgePublicationTarget -CardSourcePath $pinRenderCard) -Mode pin | Out-Null
+    $publishedAtPin = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+}
+finally { $script:BridgeDashboardRenderVersion = $currentRenderVersion }
+$script:TestPublication.Commands.Clear()
+$logFrom = @($script:Log).Count
+$pinFirst = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+$pinSecond = Sync-DaemonDashboard -Descriptors $publicationDescriptors -Capabilities $publicationCapabilities -Headers $headers
+$pinnedPolicy = (Read-BridgePublicationState).Policy
+Test-That 'a generation pinned to an older renderer keeps it, without a refusal logged on any pass' {
+    $publishedAtPin -and $pinFirst -and $pinSecond -and @(Get-TestPublicationWrites).Count -eq 0 -and
+        $pinnedPolicy.mode -ceq 'pin' -and $pinnedPolicy.render.version -ceq '1.0.0' -and
+        (& $acceptedRender).version -ceq '1.0.0' -and @(& $publicationLines $logFrom).Count -eq 0
+} ((& $newLog $logFrom) -join ' | ')
+Set-TestPublicationIdentity
+
 Write-Host '--- migration refusal leaves actual session and machine reporting available ---'
 Initialize-TestPublicationStore -Unconfigured
 $reportSource = New-TestPublicationCard '2.0.0'
