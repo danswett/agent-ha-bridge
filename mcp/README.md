@@ -115,7 +115,7 @@ main bridge config is not deleted by MCP-only removal, and HA tokens are not rev
 
 ## Driving sessions
 
-Besides `ask_via_home_assistant`, the server exposes four tools for the bridge's own
+Besides `ask_via_home_assistant`, the server exposes six tools for the bridge's own
 sessions — the ones on your dashboard, on this machine and every other one:
 
 | Tool | What it does |
@@ -123,7 +123,9 @@ sessions — the ones on your dashboard, on this machine and every other one:
 | `list_agent_sessions` | Every session and machine the bridge knows about. Start here; the rest need an id or a machine slug |
 | `read_agent_session` | What a session last said, from its activity sensor's `response` |
 | `reply_to_agent_session` | Sends a message to a session, any length |
-| `launch_agent_session` | Starts a session on a machine, optionally with an opening prompt |
+| `launch_agent_session` | Starts a session on a machine with the settings it is given, and reports what started |
+| `read_launch_result` | What a launch that returned `pending` came to |
+| `get_launch_options` | The agents, workspaces, profiles, permissions, resumable sessions and tuning a machine offers |
 
 They exist because doing this by hand has three failure modes that are completely
 silent:
@@ -176,6 +178,50 @@ dashboard still reads as the person's. `reply_to_agent_session` returns `attribu
 for both, since both are marked — the difference is that the short path is attested by
 Home Assistant and the long one is asserted by the sender, which is sound because the
 mark decides how the card looks rather than what anyone is allowed to do.
+
+### Launching with settings, and hearing what started
+
+`launch_agent_session` takes `agent`, `workspace`, `profile`, `resume`, `model`,
+`effort`, `context` and `permissions` as well as the prompt. They travel with the
+launch itself, as a request beside the prompt on the machine's retained payload topic,
+rather than through the card's selectors:
+
+- **Your card is neither used nor changed.** A setting left out is the machine's
+  configured default, never what its card happens to show, so an agent cannot inherit
+  an **Allow all** you left selected, nor move your selectors while you are using them.
+- **A value the machine does not offer is refused**, naming the ones it does.
+  `get_launch_options` lists them from the machine's card. The model, effort and
+  context lists belong to the agent that card currently shows, and are labelled with
+  it: a launch for another agent is checked by the machine itself.
+- **It reports what the launch came to.** The machine publishes an outcome for each
+  request on its **Last launch** sensor, and the tool waits up to `wait_seconds`
+  (default 30, at most 120) for one that is final:
+
+  | `status` | Meaning |
+  |---|---|
+  | `started` | Running; `session` is the id `read_agent_session` and `reply_to_agent_session` take |
+  | `refused` | Nothing launched; `note` says why |
+  | `failed` | The launch was tried and did not come up |
+  | `busy` | The machine is waiting for *you* to answer a launched session's question, such as Claude's folder trust; try again in a couple of minutes |
+  | `unconfirmed` | Started, but the machine stopped following it before it registered; look for it with `list_agent_sessions` |
+  | `pending` | Still going when the wait ran out; pass `request` to `read_launch_result` |
+  | `lost` | Another launch replaced this request before the machine took it; nothing was launched, so it is safe to try again |
+  | `undelivered` | The request never showed on the machine, so Launch was not pressed. Home Assistant may just be slow, and a late arrival could still be started by the next press there, so check `read_launch_result` before trying again |
+  | `sent` | A machine with an older bridge: it launched with what its card shows and reports nothing back |
+
+A launch never answers a launched session's own startup questions. Trusting a folder
+lets an agent read, edit and run files there, so that stays a person's press.
+
+Machines report whether they take launch requests (`launchRequest`). An older one is
+still launched without settings, the way it always was, and settings for one are
+refused rather than silently dropped. Its **Install update** button brings it up to
+date.
+
+One payload slot serves each machine, so two agents launching on it at the same moment
+can collide. The tool presses only once the slot shows its own request. A request that
+another one replaced comes back `lost` rather than starting something else, and one
+that never showed comes back `undelivered`. The machine's side of this tells an agent's
+press from yours by `agentUserIds`.
 
 ## Remote clients (HTTP transport)
 

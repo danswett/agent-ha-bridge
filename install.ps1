@@ -1947,6 +1947,12 @@ function Get-BridgeAgentInstructions {
         docstring an agent has no reason to open - a truncation neither end could have
         seen afterwards (#192).
 
+        And the launch-settings rule. A launch used whatever the target machine's card
+        happened to show - including an 'Allow all' a person had left selected - and
+        said nothing of what it had started, so an agent could neither choose what it
+        launched nor find it afterwards (#227). An older machine still ignores the
+        settings without a word, which is why the capability check is spelled out.
+
         The worktree rule is different: it does not fail silently, it destroys
         uncommitted work belonging to other sessions. It lives here rather than only in
         the repository's own AGENTS.md for the reason below - the session that swept the
@@ -1999,7 +2005,7 @@ Installed and maintained by agent-ha-bridge. Removed when the bridge is uninstal
 local edits are overwritten on the next install.
 
 This machine runs a bridge that puts agent sessions on a Home Assistant dashboard. You
-can drive a session - yours, or one on another machine - through its entities. Three
+can drive a session - yours, or one on another machine - through its entities. Four
 things about that fail silently, so they are worth knowing before you try. The last
 section is about the worktrees the bridge creates, and is here because getting it
 wrong has already destroyed other sessions' work.
@@ -2040,6 +2046,24 @@ clears the message once used, so publish it just before the press.
 press is an ordinary write, made as above. The bridge MCP server's
 `launch_agent_session` tool does both. A prompt trimmed to fit the box is invisible
 from either end.
+
+## Launch with the settings you mean, and read back what started
+
+`launch_agent_session` also takes the agent, workspace, profile, resume, model,
+effort, context and permissions, and returns what the launch came to: `started` with
+the session id `read_agent_session` takes, or `refused` with the reason.
+`get_launch_options` lists what a machine offers. Leaving a setting out gives that
+machine's configured default, never what its card shows.
+
+By hand, add `"request": "<uuid>"` and any `"settings": {...}` to the payload above,
+then read the outcome for that id from the `recent` attribute of
+`sensor.agent_bridge_<machine>_new_session_result`. Only a machine whose
+`sensor.agent_bridge_<machine>_sessions` reports `capabilities.launchRequest` reads
+them; an older one silently launches from its card instead.
+
+A launch never answers a launched session's startup questions. Trusting a folder is a
+person's decision, so a launch arriving while one waits comes back `busy`; try again
+later rather than pressing again.
 
 ## Remove only the worktrees you made yourself
 

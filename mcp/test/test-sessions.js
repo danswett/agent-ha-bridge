@@ -13,10 +13,13 @@
  * Nothing here reaches Home Assistant: the client is a recording stub.
  */
 import {
+  getLaunchOptions,
   launchPromptTopic,
+  launchSelectEntity,
   launchSession,
   listSessions,
   machineEntities,
+  readLaunchResult,
   readSession,
   replyPayloadTopic,
   replyToSession,
@@ -375,6 +378,269 @@ console.log('\n--- when publishing is refused anyway ---');
     refusedReply = e.message;
   });
   check('a refused long reply explains itself the same way', refusedReply.includes('administrator'));
+}
+
+console.log('\n--- a launch with settings of its own, and what it came to (#227) ---');
+{
+  const slug = 'desk';
+  const payloadId = machineEntities(slug).newPromptPayload;
+  const resultId = machineEntities(slug).newResult;
+  const REQUEST = /^[A-Za-z0-9-]{8,64}$/;
+
+  // One Home Assistant that both clients talk to: the user's publishes, the agent's
+  // presses, and the daemon - played by onPress - answers on the result sensor.
+  function fakeHome({ capabilities = { newSession: true, launchRequest: 1 }, held = '', land = true, onPress, onPublish } = {}) {
+    const store = new Map();
+    const set = (entity_id, state, attributes = {}) => store.set(entity_id, { entity_id, state, attributes });
+    set(machineEntities(slug).online, 'on');
+    set(machineEntities(slug).sessions, '0', { capabilities, discovery_held: held });
+    const select = (setting, state, options) => set(launchSelectEntity(slug, setting), state, { options });
+    select('agent', 'Claude', ['Copilot', 'Claude']);
+    select('workspace', 'alpha', ['alpha', 'beta']);
+    select('profile', 'work', ['work', 'home']);
+    select('resume', 'New session', ['New session', 'Earlier work - beta']);
+    select('model', 'Agent default', ['Agent default', 'opus', 'sonnet']);
+    select('effort', 'Agent default', ['Agent default', 'high']);
+    select('context', 'Agent default', ['Agent default']);
+    // Left on 'Allow all' by a person, which a launch must never inherit or change.
+    select('permissions', 'Allow all', ['Ask permission', 'Allow all']);
+    set(payloadId, '', {});
+    set(resultId, '', { recent: [] });
+
+    const home = {
+      store,
+      log: [],
+      pressedWith: null,
+      answer(record) {
+        const result = store.get(resultId);
+        result.attributes = { recent: [record, ...result.attributes.recent].slice(0, 5) };
+      },
+    };
+    const client = (name) => ({
+      calls: [],
+      published: [],
+      async getStates() {
+        return [...store.values()].map((s) => structuredClone(s));
+      },
+      async getState(id) {
+        const s = store.get(id);
+        return s ? structuredClone(s) : null;
+      },
+      async callService(domain, service, data) {
+        this.calls.push({ domain, service, data });
+        home.log.push(`${name}:${domain}.${service}`);
+        if (domain === 'button') {
+          home.pressedWith = structuredClone(store.get(payloadId));
+          onPress?.(home);
+        }
+        return null;
+      },
+      async publishMqtt(topic, payload, retain = true) {
+        this.published.push({ topic, payload, retain });
+        home.log.push(`${name}:publish`);
+        if (land && topic === launchPromptTopic(slug)) {
+          set(payloadId, payload?.at ?? '', typeof payload === 'object' ? structuredClone(payload) : {});
+        }
+        onPublish?.(home, payload);
+        return null;
+      },
+    });
+    home.user = client('user');
+    home.agent = client('agent');
+    return home;
+  }
+  // A clock the waits move on, so a thirty-second wait costs nothing.
+  function fakeClock() {
+    let t = Date.parse('2026-10-20T17:00:00Z');
+    return { now: () => t, sleep: async (ms) => { t += ms; } };
+  }
+  const answerWith = (fields) => (h) => h.answer({ request: h.pressedWith?.attributes?.request, ...fields });
+  const launch = (home, options = {}) =>
+    launchSession(home.agent, slug, { publisher: home.user, ...fakeClock(), ...options });
+  const failure = (promise) => promise.then(() => '', (e) => e.message);
+
+  const old = fakeHome({ capabilities: { newSession: true } });
+  const tooOld = await failure(launch(old, { settings: { agent: 'Claude' } }));
+  check(
+    'settings are refused for a machine too old to take them, naming its update button',
+    tooOld.includes('too old') && tooOld.includes('install_update'),
+    tooOld,
+  );
+  check('and nothing is published or pressed there', old.user.published.length === 0 && old.agent.calls.length === 0);
+  const plain = await launch(old, { prompt: 'hello' });
+  check(
+    'without settings an older machine launches from its card, as before, and says so',
+    plain.status === 'sent' && old.agent.calls.length === 1 && !('request' in old.user.published[0].payload),
+  );
+
+  const held = fakeHome({ held: 'an unrecognised copilot process (pid 4)' });
+  const heldMessage = await failure(launch(held));
+  check(
+    'a machine holding its launches is refused before anything is sent',
+    heldMessage.includes('holding') && held.user.published.length === 0 && held.agent.calls.length === 0,
+    heldMessage,
+  );
+  const off = fakeHome({ capabilities: { newSession: false, launchRequest: 0 } });
+  check('and so is one with launching turned off', (await failure(launch(off))).includes('turned off'));
+
+  const home = fakeHome({
+    onPress: answerWith({ outcome: 'started', session: 'abcdef0123456789', note: 'Started Claude in beta.', launched: { agent: 'Claude' } }),
+  });
+  const started = await launch(home, {
+    prompt: 'do it',
+    settings: { agent: 'Claude', workspace: 'beta', permissions: 'Ask permission', profile: '' },
+  });
+  const sent = home.user.published[0];
+  check(
+    'the request is published on the user client, retained',
+    sent?.topic === launchPromptTopic(slug) && sent.retain === true,
+  );
+  check(
+    'with an id, the prompt, and only the settings that were given',
+    REQUEST.test(sent?.payload?.request ?? '') && sent.payload.text === 'do it' &&
+      JSON.stringify(sent.payload.settings) === JSON.stringify({ agent: 'Claude', workspace: 'beta', permissions: 'Ask permission' }),
+    JSON.stringify(sent?.payload),
+  );
+  check(
+    'Launch is pressed by the agent, once the request shows on the machine',
+    home.log.join(',') === 'user:publish,agent:button.press' && home.pressedWith?.attributes?.request === sent.payload.request,
+    home.log.join(','),
+  );
+  check(
+    'and the agent is told which session it started',
+    started.status === 'started' && started.session === 'abcdef0123456789' && started.request === sent.payload.request,
+    JSON.stringify(started),
+  );
+  check("while no selector on the card is written", home.agent.calls.length === 1 && home.user.calls.length === 0);
+
+  const bare = fakeHome({ onPress: answerWith({ outcome: 'started', session: '0000000000000001' }) });
+  await launch(bare);
+  check(
+    'a launch that names nothing still carries a request, so the machine uses its own defaults',
+    REQUEST.test(bare.user.published[0]?.payload?.request ?? '') && !('settings' in bare.user.published[0].payload),
+  );
+
+  // Checked against the card's lists first, so a doomed request does not take the
+  // single payload slot - but never more strictly than the machine itself checks.
+  const picky = fakeHome();
+  const badWorkspace = await launch(picky, { settings: { workspace: 'nowhere' } });
+  check(
+    'a value the machine does not offer is refused before anything is sent, naming what it has',
+    badWorkspace.status === 'refused' && badWorkspace.note.includes('alpha, beta') &&
+      picky.user.published.length === 0 && picky.agent.calls.length === 0,
+    badWorkspace.note,
+  );
+  check(
+    'permissions are matched exactly, case and all, as the machine matches them',
+    (await launch(picky, { settings: { permissions: 'allow all' } })).status === 'refused',
+  );
+  check(
+    "a model is checked against the card's list when it is for the card's own agent",
+    (await launch(picky, { settings: { agent: 'Claude', model: 'gpt-9000' } })).note?.includes('opus'),
+  );
+  check('a setting that does not exist is refused', (await failure(launch(picky, { settings: { colour: 'blue' } }))).includes("'colour'"));
+  const passes = async (settings) => {
+    const h = fakeHome({ onPress: answerWith({ outcome: 'started', session: '0000000000000002' }) });
+    await launch(h, { settings });
+    return h.user.published.length === 1;
+  };
+  check('a label in another case goes through, as the machine takes it', await passes({ workspace: 'BETA' }));
+  check(
+    "a model for another agent goes through to the machine, whose list the card does not show",
+    await passes({ agent: 'Copilot', model: 'gpt-9000' }),
+  );
+  check('and a resume by id, though the card lists only labels', await passes({ resume: '9e9e9e9e-0000-0000-0000-000000000001' }));
+
+  const refusing = fakeHome({
+    onPress: answerWith({ outcome: 'refused', note: "Unknown profile 'x' - this machine has work, home" }),
+  });
+  const refused = await launch(refusing, { settings: { profile: 'work' } });
+  check('a refusal from the machine comes back with its reason', refused.status === 'refused' && refused.note.includes('this machine has'));
+
+  const slow = fakeHome({
+    onPress: answerWith({ outcome: 'waiting', note: 'Claude is asking whether to trust beta. A person has to answer that.' }),
+  });
+  const clock = fakeClock();
+  const from = clock.now();
+  const pending = await launch(slow, { waitSeconds: 30, ...clock });
+  check(
+    'a launch still going when the wait runs out is pending, with its id and where it stands',
+    pending.status === 'pending' && pending.stage === 'waiting' && REQUEST.test(pending.request ?? '') && pending.note.includes('trust'),
+    JSON.stringify(pending),
+  );
+  check('after the wait asked for, and not much longer', clock.now() - from >= 30000 && clock.now() - from < 33000);
+  check('read_launch_result picks it up from there', (await readLaunchResult(slow.user, slug, pending.request)).stage === 'waiting');
+  slow.answer({ request: pending.request, outcome: 'started', session: '0123456789abcdef', note: '' });
+  const done = await readLaunchResult(slow.user, slug, pending.request);
+  check('and reports it started once it has', done.status === 'started' && done.session === '0123456789abcdef');
+
+  const quick = fakeHome();
+  const quickClock = fakeClock();
+  const quickFrom = quickClock.now();
+  const q = await launch(quick, { waitSeconds: 0, ...quickClock });
+  check(
+    'wait_seconds 0 returns as soon as Launch is pressed',
+    q.status === 'pending' && quick.agent.calls.length === 1 && quickClock.now() - quickFrom < 1000,
+  );
+
+  // Two agents share one payload slot. A request replaced before the machine took it
+  // launched nothing, and saying "pending" would have its agent wait for ever.
+  const racing = fakeHome({
+    onPress: (h) => h.store.set(payloadId, { entity_id: payloadId, state: 'x', attributes: { request: 'someone-else-0001' } }),
+  });
+  check('a request replaced before the machine took it is lost, not pending', (await launch(racing)).status === 'lost');
+  const nowhere = fakeHome({ land: false });
+  const nowhereClock = fakeClock();
+  const nowhereFrom = nowhereClock.now();
+  const unlanded = await launch(nowhere, nowhereClock);
+  check(
+    'one that never shows on the machine is not pressed for, and is undelivered rather than lost',
+    unlanded.status === 'undelivered' && nowhere.agent.calls.length === 0 && REQUEST.test(unlanded.request ?? ''),
+    JSON.stringify(unlanded),
+  );
+  // Retained, it could still turn up and be started by the next press, so its agent is
+  // pointed at the result before trying again rather than told nothing launched.
+  check(
+    'after giving it five seconds, and saying to check before trying again',
+    nowhereClock.now() - nowhereFrom >= 5000 && unlanded.note.includes('read_launch_result'),
+    unlanded.note,
+  );
+  const overtaken = fakeHome({ land: false });
+  overtaken.store.set(payloadId, { entity_id: payloadId, state: 'x', attributes: { request: 'someone-else-0002' } });
+  const replaced = await launch(overtaken);
+  check(
+    'one another request replaced before it ever showed is lost, and not pressed for',
+    replaced.status === 'lost' && overtaken.agent.calls.length === 0,
+    JSON.stringify(replaced),
+  );
+  const beaten = fakeHome({
+    land: false,
+    onPublish: (h, payload) => h.answer({ request: payload.request, outcome: 'started', session: 'feedfacefeedface' }),
+  });
+  const shared = await launch(beaten);
+  check(
+    "and one another agent's press already took is followed, not pressed for again",
+    shared.status === 'started' && shared.session === 'feedfacefeedface' && beaten.agent.calls.length === 0,
+  );
+
+  const empty = fakeHome();
+  check(
+    'a request a machine does not remember is unknown rather than guessed at',
+    (await readLaunchResult(empty.user, slug, 'aaaaaaaa-0000-0000-0000-000000000000')).status === 'unknown',
+  );
+  check('and an id that cannot be one is refused', (await failure(readLaunchResult(empty.user, slug, 'not an id'))).includes('not a launch request id'));
+
+  const offered = await getLaunchOptions(home.user, slug);
+  check(
+    'the options a machine offers are read from its card',
+    offered.launchRequest === true && offered.workspaces.join() === 'alpha,beta' && offered.permissions.length === 2,
+    JSON.stringify(offered),
+  );
+  check(
+    "without the resume list's own New session entry",
+    !offered.resume.includes('New session') && offered.resume.includes('Earlier work - beta'),
+  );
+  check('and the tuning lists name the agent they belong to', offered.tuning.agent === 'Claude' && offered.tuning.model.includes('opus'));
 }
 
 console.log(`\n${pass} passed, ${fail} failed`);
