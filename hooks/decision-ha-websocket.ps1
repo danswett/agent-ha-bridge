@@ -67,7 +67,13 @@
 # the renderer hands the card for its forget button - now names the usage sensors.
 # Both change what Save-CopilotSessionDashboard emits, and the sensor list comes from a
 # constant, so it is fingerprinted beside the field-slot ceiling for the same reason.
-$script:BridgeDashboardRenderVersion = '1.12.0'
+#
+# 1.13.0, not 1.12.0: the launch outcomes an agent reads (#227) are a new retained
+# topic on every machine, so every machine row's forget list gained it - a change in
+# what the dashboard holds that came from Get-CopilotMqttMachineTopic, which nothing
+# fingerprinted. Left at 1.12.0 the writer would have gone on serving forget buttons
+# that leave the outcome behind. The topic builders are fingerprinted now as well.
+$script:BridgeDashboardRenderVersion = '1.13.0'
 $script:BridgeDashboardObservation = $null
 
 function Invoke-CopilotHaWebSocket {
@@ -1010,7 +1016,13 @@ function Get-BridgePublicationHash {
 
 function Get-BridgeRenderArtifact {
     $source = @(
-        foreach ($name in @('Save-CopilotSessionDashboard', 'Test-BridgeActivityCardServed', 'Test-BridgeServedCardContent', 'Get-BridgeDashboardInputSignature', 'ConvertTo-BridgePublicationJson')) {
+        foreach ($name in @('Save-CopilotSessionDashboard', 'Test-BridgeActivityCardServed', 'Test-BridgeServedCardContent', 'Get-BridgeDashboardInputSignature', 'ConvertTo-BridgePublicationJson',
+            # Every machine row carries the topics its forget button clears, built by
+            # these, so a topic added to them changes what the dashboard holds while
+            # every line of the renderer stays the same. The launch outcomes of #227
+            # were the first to do that since the list was rendered.
+            'Get-BridgeMachineForgetTopic', 'Get-CopilotMqttMachineTopic', 'Get-CopilotMqttMachineOnlineTopic',
+            'Get-CopilotMqttUsageTopics', 'Get-CopilotMqttSessionDiscoveryTopic', 'Get-CopilotMqttSessionStateTopic')) {
             (Get-Command $name).ScriptBlock.ToString().Replace("`r`n", "`n")
         }
         # The renderer writes one field-slot entity id per slot, so this ceiling

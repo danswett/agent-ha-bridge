@@ -1900,8 +1900,11 @@ Test-That 'and a blank entry never matches a blank user' { -not (Test-BridgeAgen
 #
 # 1.12.0 lists the numbered usage sensors further Copilot logins go on, and names the
 # usage sensors in every machine's withdrawal list (#200).
-$script:ExpectedRenderVersion = '1.12.0'
-$script:ExpectedRenderHash = '31bcd88af7b6a8a6970bf49427d2d7d93f0e6e1b60ff03fe4b4553380d763f6f'
+#
+# 1.13.0 adds the launch outcome topic to every machine's withdrawal list (#227), and
+# fingerprints the topic builders that list is made from.
+$script:ExpectedRenderVersion = '1.13.0'
+$script:ExpectedRenderHash = '741e3d5baebd9d89b2d8e2a43e6874612a00e5674888aa97763cc35436a2475b'
 $artifact = Get-BridgeRenderArtifact
 
 Test-That 'the renderer is still the one this version was pinned to' {
@@ -1912,11 +1915,24 @@ renderer fingerprint moved without a version bump.
   actual : $($artifact.version) / $($artifact.hash)
 If you changed Save-CopilotSessionDashboard, Test-BridgeActivityCardServed,
 Test-BridgeServedCardContent, Get-BridgeDashboardInputSignature,
-ConvertTo-BridgePublicationJson or the form-field ceiling, bump
-`$script:BridgeDashboardRenderVersion in hooks/decision-ha-websocket.ps1
+ConvertTo-BridgePublicationJson, the form-field ceiling, or the machine and session
+topic lists the forget button clears (Get-CopilotMqttMachineTopic and the builders
+beside it), bump `$script:BridgeDashboardRenderVersion in hooks/decision-ha-websocket.ps1
 and update both constants above. Shipping the change without the bump freezes
 publication on every already-fenced machine, or leaves it serving the old dashboard.
 "@
+
+# A topic added to a machine's list lands in every machine row's forget button, while
+# the renderer's own text stays the same. That is how the launch outcomes of #227
+# would have reached the dashboard unnoticed, so a change there has to move the hash.
+Test-That 'the renderer fingerprint moves when a machine''s withdrawal list does' {
+    $pinned = (Get-BridgeRenderArtifact).hash
+    $raised = & {
+        function Get-CopilotMqttMachineTopic { param([string]$Slug) @('one/more/topic') }
+        (Get-BridgeRenderArtifact).hash
+    }
+    $raised -ne $pinned -and (Get-BridgeRenderArtifact).hash -eq $pinned
+}
 
 # The pin above only catches a ceiling change because the fingerprint now includes it.
 # This is the check that keeps that true: without the ceiling in the hash, raising it

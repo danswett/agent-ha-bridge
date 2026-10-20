@@ -556,6 +556,56 @@ Test-That 'a local resume still resolves' {
 }
 Test-That 'and fetches nothing from anywhere' { $script:Transfers -eq 0 }
 
+Write-Host '--- a resume an agent asks for, by the label shown or by id (#227) ---'
+# The request names the session itself, rather than leaning on a selector that holds a
+# person's choice: by the label every machine shows, or by the id a sharing peer
+# publishes. Everything it asks for is checked before a transcript is brought over.
+$script:HaStates["$($script:DaemonEntity.NewResume)"] = 'New session'
+function Set-AgentRequest {
+    param([hashtable]$Settings)
+    $script:DaemonLaunchRequest = [pscustomobject]@{ Id = 'resume-request-0001'; Text = ''; Settings = $Settings; Problem = '' }
+}
+try {
+    Reset-Attempt
+    Set-AgentRequest @{ resume = $localEntry.Label }
+    $byLabel = Resolve-DaemonLaunchRequest -Controls $controls -Headers $headers
+    Test-That 'an agent can resume a session by the label the card shows' {
+        $null -ne $byLabel -and [string]$byLabel.ResumeSession.SessionId -eq $localEntry.SessionId
+    }
+
+    Reset-Attempt
+    Set-AgentRequest @{ resume = $localEntry.SessionId }
+    $byId = Resolve-DaemonLaunchRequest -Controls $controls -Headers $headers
+    Test-That 'or by its id' { $null -ne $byId -and [string]$byId.ResumeSession.SessionId -eq $localEntry.SessionId }
+
+    $controls.Resumable = @($remoteEntry)
+    Reset-Attempt
+    Set-AgentRequest @{ resume = $remoteEntry.SessionId }
+    $brought = Resolve-DaemonLaunchRequest -Controls $controls -Headers $headers
+    Test-That "one another machine shares is brought over, and the copy resumed" {
+        $script:Transfers -eq 1 -and $null -ne $brought -and
+            [string]$brought.ResumeSession.SessionId -eq 'bbbbbbbb-9999-9999-9999-999999999999'
+    }
+
+    Reset-Attempt
+    Set-AgentRequest @{ resume = $remoteEntry.SessionId; agent = 'Claude' }
+    $conflict = Resolve-DaemonLaunchRequest -Controls $controls -Headers $headers
+    Test-That "naming an agent other than the session's own is refused before anything is brought over" {
+        $null -eq $conflict -and $script:Transfers -eq 0 -and ($script:Notes -join ' ') -like '*resumes in Copilot, not Claude*'
+    } ($script:Notes -join ' | ')
+
+    Reset-Attempt
+    Set-AgentRequest @{ resume = $remoteEntry.SessionId; model = 'not-a-model' }
+    $badModel = Resolve-DaemonLaunchRequest -Controls $controls -Headers $headers
+    Test-That 'and so is any other setting that is wrong' {
+        $null -eq $badModel -and $script:Transfers -eq 0 -and ($script:Notes -join ' ') -like "*'not-a-model'*"
+    } ($script:Notes -join ' | ')
+}
+finally {
+    $script:DaemonLaunchRequest = $null
+    $controls.Resumable = @($localEntry)
+}
+
 Write-Host '--- the remote half of the list is bounded by this machine, not by its peers ---'
 # Everything bounding the producing side - resumeCount, shareResumableMaxBytes - is a
 # setting on a different machine. Without a bound here, a peer decides how large this

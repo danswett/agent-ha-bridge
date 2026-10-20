@@ -1002,6 +1002,23 @@ A few deliberate choices:
 The **Last launch** row reports what happened. It confirms success only once the new
 session has actually registered itself, not merely when a process started.
 
+A launch an agent asks for carries its own settings rather than borrowing the card's.
+The request rides on the same retained prompt topic, beside the text: an id, and any of
+`agent`, `workspace`, `profile`, `resume`, `model`, `effort`, `context` and
+`permissions`. Whatever it leaves out is this machine's configured default, never what
+the card shows, so an agent never inherits an **Allow all** you left selected. A value
+the machine does not offer is refused, naming the ones it does. What each request came
+to is published, newest first, as the `recent` attribute of the **Last launch** sensor:
+`starting`, `waiting`, `started` (with the session's id), `refused`, `failed`, `busy`
+or `unconfirmed`. A machine that understands these requests reports `launchRequest` in
+its capabilities; an older one launches from the card and ignores them.
+
+A launched session's startup questions stay with you. An agent's press never answers
+Claude's folder-trust question and never types into a Codex window waiting for its
+first message. An agent's request that arrives then is told the machine is `busy`, or
+starts a session of its own. Recognising an agent's press that carries no request
+needs `agentUserIds`.
+
 ### Ending a session
 
 Every session card has an **End session** row. Starting work remotely but not being

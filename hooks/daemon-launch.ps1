@@ -1376,6 +1376,10 @@ function Sync-DaemonNewSession {
         A press is, in order of precedence: the second press that confirms a launched
         Claude session may trust its folder, the first message for a Codex opened
         without one, or a new launch.
+
+        A press carrying an agent's launch request (#227) is never the first two: it
+        cannot confirm a trust question that is a person's to answer, nor have its
+        text typed into a window somebody else opened. See Use-DaemonLaunchRequest.
     #>
     param(
         [Parameter(Mandatory)][hashtable]$Headers,
@@ -1390,12 +1394,34 @@ function Sync-DaemonNewSession {
         -Resumable $controls.Resumable -Agents $controls.Agents -Controls $controls
 
     if (-not (Test-DaemonNewSessionPressed -Headers $Headers)) { return }
-    if (Confirm-DaemonPendingTrust -Headers $Headers) { return }
-    if (Send-DaemonPendingFirstMessage -Headers $Headers) { return }
+    # Read back by the outcome below, so a note left over from an earlier press can
+    # never be reported as this one's reason.
+    $script:CopilotMqttNewSessionResultText = $null
+    try {
+        if (-not (Use-DaemonLaunchRequest -Headers $Headers)) { return }
+        if (Confirm-DaemonPendingTrust -Headers $Headers) { return }
+        if (Send-DaemonPendingFirstMessage -Headers $Headers) { return }
 
-    $request = Resolve-DaemonLaunchRequest -Controls $controls -Headers $Headers
-    if ($null -eq $request) { return }
-    Start-DaemonLaunch -Request $request -Headers $Headers
+        $request = Resolve-DaemonLaunchRequest -Controls $controls -Headers $Headers
+        if ($null -eq $request) {
+            Set-DaemonRequestedLaunchOutcome -Outcome 'refused' -Headers $Headers
+            return
+        }
+        Start-DaemonLaunch -Request $request -Headers $Headers
+        Set-DaemonRequestedLaunchOutcome -Outcome $script:DaemonLaunchVerdict -Headers $Headers
+    }
+    catch {
+        # The request has been taken out of the payload by now, so without an outcome
+        # its agent would find it nowhere and conclude it had been lost.
+        if (-not (Test-BridgeObservationGuardFailure -ErrorRecord $_)) {
+            Set-DaemonRequestedLaunchOutcome -Outcome 'failed' -Note "Launch failed: $($_.Exception.Message)" -Headers $Headers
+        }
+        throw
+    }
+    finally {
+        $script:DaemonLaunchRequest = $null
+        $script:DaemonLaunchPayloadSkip = $false
+    }
 }
 
 function Get-DaemonNewSessionControls {
@@ -1518,7 +1544,8 @@ function Test-DaemonNewSessionPressed {
 
     try {
         $button = Get-HomeAssistantState -EntityId $script:DaemonEntity.NewSession -Headers $Headers
-        $press = [string]$button.state
+        $raw = $button.state
+        $press = [string]$raw
     }
     catch {
         # The button may not exist yet on a first run.
@@ -1526,12 +1553,19 @@ function Test-DaemonNewSessionPressed {
     }
 
     if ($press -in @('unknown', 'unavailable', '')) { return $false }
+    # The press as an exact instant. Invoke-RestMethod hands the timestamp over as a
+    # DateTime, and its string form stops at the second: two presses in one second
+    # then read as one, and the second is never seen. Two agents launching at once
+    # press that close together.
+    $exact = ConvertTo-DaemonInstant -Value $raw
+    if ($null -ne $exact) { $press = $exact.ToUniversalTime().ToString('o') }
     if ($press -eq $script:DaemonNewSessionLastPress) { return $false }
     $script:DaemonNewSessionLastPress = $press
 
     $pressedAt = [DateTimeOffset]::MinValue
     if (-not [DateTimeOffset]::TryParse($press, [ref]$pressedAt)) { return $false }
     if ($pressedAt -le $script:DaemonStartedAt) { return $false }
+    $script:DaemonNewSessionPressedAt = $pressedAt
 
     # Who pressed Launch, kept for the session this press is about to produce. The
     # press is the only thing that carries the account behind it - by the time the
@@ -1541,6 +1575,433 @@ function Test-DaemonNewSessionPressed {
     $true
 }
 
+function ConvertTo-DaemonInstant {
+    <#
+        A timestamp from Home Assistant as an exact instant, or $null.
+
+        Exact matters here. Invoke-RestMethod turns an ISO timestamp into a DateTime,
+        and that cast back to a string stops at the second - enough to make a payload
+        published a few milliseconds before a press look as though it came after it.
+    #>
+    param($Value)
+
+    if ($Value -is [DateTimeOffset]) { return $Value }
+    if ($Value -is [datetime]) { return [DateTimeOffset]$Value }
+    $parsed = [DateTimeOffset]::MinValue
+    if ([DateTimeOffset]::TryParse([string]$Value, [ref]$parsed)) { return $parsed }
+    $null
+}
+
+function Get-DaemonLaunchMember {
+    <#
+        One member of an object as Home Assistant's REST API returns it - or as a test
+        hands it over, as a hashtable - and $null when it is absent.
+    #>
+    param($From, [Parameter(Mandatory)][string]$Name)
+
+    if ($null -eq $From) { return $null }
+    if ($From -is [System.Collections.IDictionary]) {
+        if ($From.Contains($Name)) { return $From[$Name] }
+        return $null
+    }
+    $property = $From.PSObject.Properties[$Name]
+    if ($null -eq $property) { return $null }
+    $property.Value
+}
+
+function Get-DaemonLaunchRequest {
+    <#
+        What an agent's press of Launch asked for (#227): the request id and settings
+        riding on the prompt payload beside its text, and whether they belong to the
+        press at -PressedAt at all.
+
+        Kind is one of:
+          none      - a prompt and nothing more, or nothing: a person's press, served
+                      from the card exactly as before this existed
+          fresh     - a request published for this press; Request holds it
+          stale     - one published over a minute before this press. Its sender gave
+                      up long ago, so nothing of it is used, not even its text
+          handled   - one this daemon has already served, still there because
+                      clearing it failed
+          newer     - one published after this press, so it is the next press's to use
+          malformed - one whose id cannot safely be echoed back to its sender
+
+        Both times are Home Assistant's: the payload sensor's last_updated and the press
+        timestamp on the button. The clock of whatever published the request never
+        comes into it.
+    #>
+    param(
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [Parameter(Mandatory)][DateTimeOffset]$PressedAt
+    )
+
+    $result = { param([string]$Kind, $Request = $null) [pscustomobject]@{ Kind = $Kind; Request = $Request } }
+    $state = $null
+    try { $state = Get-HomeAssistantState -EntityId $script:DaemonEntity.NewPromptPayload -Headers $Headers }
+    catch { return (& $result 'none') }
+
+    # An emptied payload can keep its old attributes - Home Assistant leaves them as
+    # they were when what arrives is not a JSON object - so only a payload whose stamp
+    # is live is read at all, exactly as Get-BridgeReplyPayload does.
+    $stamp = [string](Get-DaemonLaunchMember -From $state -Name 'state')
+    if ([string]::IsNullOrWhiteSpace($stamp) -or $stamp -in @('unknown', 'unavailable')) { return (& $result 'none') }
+    $attributes = Get-DaemonLaunchMember -From $state -Name 'attributes'
+    $id = Get-DaemonLaunchMember -From $attributes -Name 'request'
+    $settings = Get-DaemonLaunchMember -From $attributes -Name 'settings'
+    if ($null -eq $id -and $null -eq $settings) { return (& $result 'none') }
+
+    $published = ConvertTo-DaemonInstant -Value (Get-DaemonLaunchMember -From $state -Name 'last_updated')
+    $age = if ($null -ne $published) { ($PressedAt - $published).TotalSeconds } else { [double]::PositiveInfinity }
+    if ($age -lt 0) { return (& $result 'newer') }
+    if ($age -gt 60) { return (& $result 'stale') }
+
+    if ($id -isnot [string] -or $id -cnotmatch '^[A-Za-z0-9-]{8,64}$') { return (& $result 'malformed') }
+    if (@($script:DaemonLaunchRequestsHandled) -ccontains $id) { return (& $result 'handled') }
+
+    # Every key is checked, not only the known ones read: a misspelt setting quietly
+    # ignored is a launch that differs from what was asked for, with nothing to say so.
+    $allowed = @('agent', 'workspace', 'profile', 'resume', 'model', 'effort', 'context', 'permissions')
+    $parsed = @{}
+    $problem = ''
+    if ($null -ne $settings) {
+        $pairs = @()
+        if ($settings -is [System.Collections.IDictionary]) {
+            $pairs = @($settings.Keys | ForEach-Object { [pscustomobject]@{ Name = [string]$_; Value = $settings[$_] } })
+        }
+        elseif ($settings -is [System.Management.Automation.PSCustomObject]) {
+            $pairs = @($settings.PSObject.Properties | ForEach-Object { [pscustomobject]@{ Name = [string]$_.Name; Value = $_.Value } })
+        }
+        else { $problem = 'Launch refused: its settings were not a set of named values.' }
+        foreach ($pair in $pairs) {
+            if ($allowed -cnotcontains $pair.Name) {
+                $problem = "Launch refused: unknown setting '$($pair.Name)' - a launch takes $($allowed -join ', ')."
+                break
+            }
+            if ($null -eq $pair.Value) { continue }
+            if ($pair.Value -isnot [string]) {
+                $problem = "Launch refused: the $($pair.Name) setting has to be text."
+                break
+            }
+            $value = $pair.Value.Trim()
+            if ($value) { $parsed[$pair.Name] = $value }
+        }
+    }
+
+    $text = [string](Get-DaemonLaunchMember -From $attributes -Name 'text')
+    & $result 'fresh' ([pscustomobject]@{ Id = $id; Text = $text.Trim(); Settings = $parsed; Problem = $problem })
+}
+
+function Format-DaemonInstant {
+    <# An instant as the ISO text an outcome carries, or '' for none. #>
+    param([DateTimeOffset]$Instant)
+    if ($Instant -eq [DateTimeOffset]::MinValue) { return '' }
+    $Instant.ToUniversalTime().ToString('o')
+}
+
+function Use-DaemonLaunchRequest {
+    <#
+        Settles what the press being handled carries, before anything else may act on
+        it. Returns whether the press goes on - to a trust answer, a first message or
+        a launch - or has been dealt with here.
+
+        A request published for this press is taken at once: cleared from the payload,
+        so nothing later can serve it again, and remembered by id, so a clear that
+        failed cannot either. Then it is checked against what is in progress. A
+        launched session waiting for a person to trust its folder makes it 'busy':
+        nothing is launched, and the question stays with the person it is for, where
+        the press used to be taken as the answer. One waiting on a first message stops
+        being waited on, and the request launches (Send-DaemonPendingFirstMessage).
+
+        Without a request of its own, an agent's press is still never a trust answer.
+        Nor is one that arrives moments after another press used the single payload
+        slot: that is two agents racing for it, and launching from the card's
+        selections would start something nobody asked for, possibly with permissions
+        nobody chose. Telling an agent from a person needs agentUserIds; without it
+        those presses are treated as a person's, as they always were.
+    #>
+    param([Parameter(Mandatory)][hashtable]$Headers)
+
+    $script:DaemonLaunchRequest = $null
+    $script:DaemonLaunchPayloadSkip = $false
+    $pressedAt = $script:DaemonNewSessionPressedAt
+    $read = Get-DaemonLaunchRequest -Headers $Headers -PressedAt $pressedAt
+
+    # A request reported as held while discovery was incomplete, which this press does
+    # not carry, never launches: the payload that held it has been replaced since.
+    $held = [string]$script:DaemonLaunchHeldRequest
+    $script:DaemonLaunchHeldRequest = ''
+    if ($held -and ($read.Kind -ne 'fresh' -or $read.Request.Id -cne $held)) {
+        Set-DaemonHeldLaunchReplaced -Request $held -Headers $Headers
+    }
+
+    switch ($read.Kind) {
+        'newer' {
+            Write-DaemonLog -Message 'Launch press left alone: a launch request published after it is waiting for its own press'
+            return $false
+        }
+        'malformed' {
+            try { Clear-CopilotMqttNewSessionPrompt -Headers $Headers | Out-Null } catch { }
+            $note = 'Launch refused: the request carried an id that is not valid, so nothing was started.'
+            Write-DaemonLog -Message $note
+            Set-CopilotMqttNewSessionResult -Headers $Headers -Text $note | Out-Null
+            return $false
+        }
+        { $_ -in @('stale', 'handled') } {
+            Write-DaemonLog -Message "Launch press ignoring a $($read.Kind) launch request left in the prompt payload"
+            try { Clear-CopilotMqttNewSessionPrompt -Headers $Headers | Out-Null } catch { }
+            $script:DaemonLaunchPayloadSkip = $true
+        }
+    }
+
+    if ($read.Kind -ne 'fresh') {
+        if ($script:DaemonNewSessionPressDriver -eq 'agent') {
+            $sinceConsumed = ($pressedAt - $script:DaemonLaunchConsumedPress).TotalSeconds
+            if ($script:DaemonLaunchConsumedPress -ne [DateTimeOffset]::MinValue -and $sinceConsumed -ge 0 -and $sinceConsumed -le 10) {
+                Write-DaemonLog -Message ('Launch pressed by an agent {0:N1} s after another press used the launch request waiting in the slot; nothing launched' -f $sinceConsumed)
+                return $false
+            }
+            if (Test-DaemonTrustAwaitingPress) {
+                Write-DaemonLog -Message 'Launch pressed by an agent while a launched session waits for a person to trust its folder; left for the person'
+                return $false
+            }
+        }
+        return $true
+    }
+
+    $request = $read.Request
+    $script:DaemonLaunchRequest = $request
+    # Answered before the slot is cleared, so the request is always in one place or the
+    # other. An agent that finds it in neither takes it as replaced by another launch,
+    # with nothing started for it, and resolving a resume held on another machine can
+    # take longer than it waits before deciding that. Not through the requested-outcome
+    # helper, which would attach whatever earlier launch is still being followed.
+    Set-DaemonLaunchOutcome -Request ([string]$request.Id) -Outcome 'starting' -Headers $Headers `
+        -Note 'Received; checking its settings before launching.' -Pressed (Format-DaemonInstant -Instant $pressedAt)
+    try { Clear-CopilotMqttNewSessionPrompt -Headers $Headers | Out-Null }
+    catch { Write-DaemonLog -Message "launch request $($request.Id): clearing the prompt payload failed: $($_.Exception.Message)" }
+    $script:DaemonLaunchRequestsHandled = @(@($request.Id) + @($script:DaemonLaunchRequestsHandled) | Select-Object -First 50)
+    $script:DaemonLaunchConsumedPress = $pressedAt
+    $named = @($request.Settings.Keys | Sort-Object | ForEach-Object { "$_=$($request.Settings[$_])" }) -join ', '
+    Write-DaemonLog -Message "launch request $($request.Id) received ($(if ($named) { $named } else { 'machine defaults' }); prompt of $($request.Text.Length) chars)"
+
+    $refusal = [string]$request.Problem
+    # A press held while discovery was incomplete is served once it completes, which
+    # can be much later. An agent that asked has long since been told it is pending,
+    # so starting it now would start a session nobody is waiting for.
+    if (-not $refusal -and ([DateTimeOffset]::Now - $pressedAt).TotalMinutes -gt 5) {
+        $refusal = 'Launch refused: the request waited more than 5 minutes for this machine, so it was not started late.'
+    }
+    if ($refusal) {
+        Write-DaemonLog -Message "launch request $($request.Id) refused: $refusal"
+        Set-CopilotMqttNewSessionResult -Headers $Headers -Text $refusal | Out-Null
+        Set-DaemonRequestedLaunchOutcome -Outcome 'refused' -Note $refusal -Headers $Headers
+        return $false
+    }
+
+    if (Test-DaemonTrustAwaitingPress) {
+        $pending = $script:DaemonPendingLaunch
+        $agent = Get-BridgeLauncherLabel -Launcher ([string]$pending.Launcher)
+        Write-DaemonLog -Message "launch request $($request.Id) turned away: $agent in $($pending.Label) is waiting on a trust answer"
+        # The card's note is left as it is: it is asking the person for that answer.
+        Set-DaemonRequestedLaunchOutcome -Outcome 'busy' -Headers $Headers `
+            -Note "Busy: $agent in $($pending.Label) is waiting for a person to answer whether to trust that folder, so nothing was launched. Try again in a couple of minutes."
+        return $false
+    }
+    $true
+}
+
+function Set-DaemonLaunchOutcome {
+    <#
+        Records what one requested launch came to, and publishes the latest few, newest
+        first, for the agents waiting on them (Publish-CopilotMqttLaunchOutcome).
+
+        A record keeps what was launched and when it was pressed across later updates,
+        so 'started' still says what started. Never throws for a publish that failed:
+        the launch it describes has happened either way.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Request,
+        [Parameter(Mandatory)][ValidateSet('starting', 'waiting', 'started', 'refused', 'failed', 'busy', 'unconfirmed')][string]$Outcome,
+        [AllowEmptyString()][string]$Note = '',
+        [AllowEmptyString()][string]$Session = '',
+        $Launched = $null,
+        [AllowEmptyString()][string]$Pressed = '',
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $previous = @($script:DaemonLaunchOutcomes | Where-Object { $_.request -ceq $Request }) | Select-Object -First 1
+    if ($null -ne $previous) {
+        if ($null -eq $Launched) { $Launched = $previous.launched }
+        if (-not $Pressed) { $Pressed = [string]$previous.pressed }
+    }
+    $record = [pscustomobject][ordered]@{
+        request  = $Request
+        outcome  = $Outcome
+        session  = $Session
+        note     = $Note
+        pressed  = $Pressed
+        at       = [DateTimeOffset]::UtcNow.ToString('o')
+        launched = $Launched
+    }
+    $script:DaemonLaunchOutcomes = @(@($record) + @($script:DaemonLaunchOutcomes | Where-Object { $_.request -cne $Request }) |
+        Select-Object -First 5)
+    try { Publish-CopilotMqttLaunchOutcome -Outcomes $script:DaemonLaunchOutcomes -Headers $Headers }
+    catch {
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        Write-DaemonLog -Message "launch outcome for $Request could not be published: $($_.Exception.Message)"
+    }
+}
+
+function Set-DaemonRequestedLaunchOutcome {
+    <#
+        The outcome for the request the press being handled carried, if it carried one,
+        with the note the card was given as its reason - the text written to it whole,
+        before the 255-character cut the card's own copy takes. Nothing for a person's
+        press.
+    #>
+    param(
+        [AllowEmptyString()][string]$Outcome = '',
+        [AllowEmptyString()][string]$Note = '',
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $request = $script:DaemonLaunchRequest
+    if ($null -eq $request) { return }
+    if (-not $Outcome) { $Outcome = 'refused' }
+    if (-not $Note) { $Note = [string]$script:CopilotMqttNewSessionResultText }
+    if (-not $Note) {
+        $Note = switch ($Outcome) { 'failed' { 'Launch failed.' } 'starting' { 'Starting...' } default { 'Launch refused.' } }
+    }
+    $launched = $null
+    if ($Outcome -eq 'starting' -and $null -ne $script:DaemonPendingLaunch -and
+        $script:DaemonPendingLaunch.PSObject.Properties['Launched']) {
+        $launched = $script:DaemonPendingLaunch.Launched
+    }
+    Set-DaemonLaunchOutcome -Request ([string]$request.Id) -Outcome $Outcome -Note $Note -Launched $launched `
+        -Pressed (Format-DaemonInstant -Instant $script:DaemonNewSessionPressedAt) -Headers $Headers
+}
+
+function Set-DaemonPendingLaunchOutcome {
+    <# The outcome for the request a launch being followed was started for, if any. #>
+    param(
+        [AllowNull()]$Pending,
+        [Parameter(Mandatory)][string]$Outcome,
+        [AllowEmptyString()][string]$Note = '',
+        [AllowEmptyString()][string]$Session = '',
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    if ($null -eq $Pending -or -not $Pending.PSObject.Properties['Request'] -or -not $Pending.Request) { return }
+    $launched = if ($Pending.PSObject.Properties['Launched']) { $Pending.Launched } else { $null }
+    $pressed = if ($Pending.PSObject.Properties['Pressed']) { [string]$Pending.Pressed } else { '' }
+    Set-DaemonLaunchOutcome -Request ([string]$Pending.Request) -Outcome $Outcome -Note $Note -Session $Session `
+        -Launched $launched -Pressed $pressed -Headers $Headers
+}
+
+function Set-DaemonHeldLaunchReplaced {
+    <# A held request whose payload was replaced before discovery completed: it will never launch. #>
+    param(
+        [Parameter(Mandatory)][string]$Request,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+    Set-DaemonLaunchOutcome -Request $Request -Outcome 'refused' -Headers $Headers `
+        -Note 'Not launched: a later press of Launch on this machine replaced the request while launches were held.'
+}
+
+function Set-DaemonHeldLaunchOutcome {
+    <#
+        Tells an agent whose launch is being held - session discovery is incomplete,
+        and the press waits for it - that it is waiting, and on what.
+
+        The press is not consumed: it is served once discovery completes, so nothing is
+        cleared and the request is only remembered. A later press that replaces it can
+        then say it never launched (Use-DaemonLaunchRequest).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Note,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $button = $null
+    try { $button = Get-HomeAssistantState -EntityId $script:DaemonEntity.NewSession -Headers $Headers } catch { return }
+    $pressedAt = ConvertTo-DaemonInstant -Value (Get-DaemonLaunchMember -From $button -Name 'state')
+    if ($null -eq $pressedAt -or $pressedAt -le $script:DaemonStartedAt) { return }
+    $read = Get-DaemonLaunchRequest -Headers $Headers -PressedAt $pressedAt
+    if ($read.Kind -ne 'fresh') { return }
+
+    $id = [string]$read.Request.Id
+    if ($script:DaemonLaunchHeldRequest -and $script:DaemonLaunchHeldRequest -cne $id) {
+        Set-DaemonHeldLaunchReplaced -Request $script:DaemonLaunchHeldRequest -Headers $Headers
+    }
+    $script:DaemonLaunchHeldRequest = $id
+    Set-DaemonLaunchOutcome -Request $id -Outcome 'waiting' -Note $Note -Pressed (Format-DaemonInstant -Instant $pressedAt) -Headers $Headers
+}
+
+function Restore-DaemonLaunchOutcomes {
+    <#
+        Takes up the launch outcomes the previous daemon published, so that a restart
+        does not wipe them from under an agent still reading one.
+
+        A launch being followed does not survive a restart, so one still 'starting' or
+        'waiting' is nobody's to finish now. It becomes 'unconfirmed', which is the
+        truth: it may well have started, and nothing here can tell. Each is also
+        counted as served, so a payload still holding one is never launched late.
+    #>
+    param(
+        [AllowNull()]$State,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $known = @('starting', 'waiting', 'started', 'refused', 'failed', 'busy', 'unconfirmed')
+    $kept = [System.Collections.Generic.List[object]]::new()
+    $changed = $false
+    foreach ($entry in @(Get-DaemonLaunchMember -From (Get-DaemonLaunchMember -From $State -Name 'attributes') -Name 'recent')) {
+        if ($kept.Count -ge 5) { break }
+        $id = Get-DaemonLaunchMember -From $entry -Name 'request'
+        $outcome = [string](Get-DaemonLaunchMember -From $entry -Name 'outcome')
+        if ($id -isnot [string] -or $id -cnotmatch '^[A-Za-z0-9-]{8,64}$' -or $known -cnotcontains $outcome) { continue }
+        $note = [string](Get-DaemonLaunchMember -From $entry -Name 'note')
+        $at = ConvertTo-DaemonInstant -Value (Get-DaemonLaunchMember -From $entry -Name 'at')
+        if ($outcome -in @('starting', 'waiting')) {
+            $outcome = 'unconfirmed'
+            $note = 'Not followed to the end: the bridge on this machine restarted before the launch was confirmed. Check whether it started.'
+            $at = [DateTimeOffset]::UtcNow
+            $changed = $true
+        }
+        $pressed = ConvertTo-DaemonInstant -Value (Get-DaemonLaunchMember -From $entry -Name 'pressed')
+        $kept.Add([pscustomobject][ordered]@{
+            request  = $id
+            outcome  = $outcome
+            session  = [string](Get-DaemonLaunchMember -From $entry -Name 'session')
+            note     = $note
+            pressed  = $(if ($null -ne $pressed) { Format-DaemonInstant -Instant $pressed } else { '' })
+            at       = $(if ($null -ne $at) { Format-DaemonInstant -Instant $at } else { '' })
+            launched = Get-DaemonLaunchMember -From $entry -Name 'launched'
+        })
+        $script:DaemonLaunchRequestsHandled = @(@($script:DaemonLaunchRequestsHandled) + @($id) | Select-Object -First 50)
+    }
+    $script:DaemonLaunchOutcomes = @($kept)
+    if (-not $changed) { return }
+    try { Publish-CopilotMqttLaunchOutcome -Outcomes $script:DaemonLaunchOutcomes -Headers $Headers }
+    catch {
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        Write-DaemonLog -Message "launch outcomes from before the restart could not be republished: $($_.Exception.Message)"
+    }
+}
+
+function Test-DaemonTrustAwaitingPress {
+    <#
+        Whether a launched session is asking to trust its folder and a press of Launch
+        within the last two minutes would answer it. One test for the two places that
+        have to agree on it: Confirm-DaemonPendingTrust, which takes a person's press as
+        the answer, and Use-DaemonLaunchRequest, which must keep an agent's press from
+        being taken that way.
+    #>
+    $pending = $script:DaemonPendingLaunch
+    if ($null -eq $pending -or $null -eq $pending.TrustAskedAt -or $pending.TrustConfirmed) { return $false }
+    ([DateTimeOffset]::Now - $pending.TrustAskedAt).TotalSeconds -le 120
+}
+
 function Confirm-DaemonPendingTrust {
     <#
         Takes a press while a launched Claude session is asking whether to trust its
@@ -1548,18 +2009,25 @@ function Confirm-DaemonPendingTrust {
         lets Claude read, edit and run files there, so the bridge only ever answers it
         on this deliberate second press. The answer is sent on the next pass, from the
         screen as it is then. Returns whether the press was that.
+
+        Only a person's press. An agent pressing Launch here meant to start something
+        of its own, and used to grant the trust instead (#227); Use-DaemonLaunchRequest
+        has already turned that press away by the time this runs, and this refuses it
+        again so the rule does not rest on the order of two calls.
     #>
     param([Parameter(Mandatory)][hashtable]$Headers)
 
-    $pending = $script:DaemonPendingLaunch
-    if ($null -eq $pending -or $null -eq $pending.TrustAskedAt -or $pending.TrustConfirmed) { return $false }
-    if (([DateTimeOffset]::Now - $pending.TrustAskedAt).TotalSeconds -gt 120) { return $false }
+    if ($null -ne $script:DaemonLaunchRequest -or $script:DaemonNewSessionPressDriver -eq 'agent') { return $false }
+    if (-not (Test-DaemonTrustAwaitingPress)) { return $false }
 
+    $pending = $script:DaemonPendingLaunch
     $pending.TrustConfirmed = $true
     $pending.LastCheck = [DateTimeOffset]::MinValue
     $agent = Get-BridgeLauncherLabel -Launcher ([string]$pending.Launcher)
+    $note = "Trusting $($pending.Label) for $agent..."
     Write-DaemonLog -Message "Launch pressed again: trusting the folder for the $agent session in $($pending.Label)"
-    Set-CopilotMqttNewSessionResult -Headers $Headers -Text "Trusting $($pending.Label) for $agent..." | Out-Null
+    Set-CopilotMqttNewSessionResult -Headers $Headers -Text $note | Out-Null
+    Set-DaemonPendingLaunchOutcome -Pending $pending -Outcome 'starting' -Note $note -Headers $Headers
     Update-DaemonPendingLaunch -Headers $Headers | Out-Null
     $true
 }
@@ -1574,19 +2042,28 @@ function Get-DaemonLaunchPrompt {
         older card still writes, and Home Assistant caps that at 255 characters. The
         payload wins when it has anything in it, so a long handover prompt arrives
         whole instead of cut off mid-sentence.
+
+        An agent's launch request brings its own text, and an empty one means no
+        prompt: never the card's box, which holds whatever a person was typing. A
+        request in the payload that is not this press's - left from long ago, or
+        already served - is skipped entirely, its text included (Use-DaemonLaunchRequest).
     #>
     param([Parameter(Mandatory)][hashtable]$Headers)
 
-    try {
-        $payload = Get-BridgeReplyPayload -State (Get-HomeAssistantState `
-            -EntityId $script:DaemonEntity.NewPromptPayload -Headers $Headers)
-        if ($null -ne $payload -and -not [string]::IsNullOrWhiteSpace([string]$payload.Text)) {
-            return ([string]$payload.Text).Trim()
+    if ($null -ne $script:DaemonLaunchRequest) { return ([string]$script:DaemonLaunchRequest.Text).Trim() }
+
+    if (-not $script:DaemonLaunchPayloadSkip) {
+        try {
+            $payload = Get-BridgeReplyPayload -State (Get-HomeAssistantState `
+                -EntityId $script:DaemonEntity.NewPromptPayload -Headers $Headers)
+            if ($null -ne $payload -and -not [string]::IsNullOrWhiteSpace([string]$payload.Text)) {
+                return ([string]$payload.Text).Trim()
+            }
         }
-    }
-    catch {
-        # No payload sensor yet (a machine published before this existed), or it is
-        # unreadable. The text box still works, within its 255 characters.
+        catch {
+            # No payload sensor yet (a machine published before this existed), or it is
+            # unreadable. The text box still works, within its 255 characters.
+        }
     }
 
     $typed = ''
@@ -1618,11 +2095,25 @@ function Send-DaemonPendingFirstMessage {
         message. Only while Codex is still the chosen agent and there is a message to
         send: any other press is a new launch, and the waiting window is left to
         itself. Returns whether the press was dealt with here.
+
+        Never for an agent's press, whose text is meant for a session of its own:
+        typed into a window somebody else opened, it was a message nobody sent to it
+        (#227). That press stops the wait and launches instead, as a press for another
+        agent always has.
     #>
     param([Parameter(Mandatory)][hashtable]$Headers)
 
     $pending = $script:DaemonPendingLaunch
     if ($null -eq $pending -or -not $pending.PSObject.Properties['AwaitingFirstMessage'] -or -not $pending.AwaitingFirstMessage) { return $false }
+
+    $agent = Get-BridgeLauncherLabel -Launcher ([string]$pending.Launcher)
+    if ($null -ne $script:DaemonLaunchRequest -or $script:DaemonNewSessionPressDriver -eq 'agent') {
+        Write-DaemonLog -Message "stopped waiting on the $agent in $($pending.Label) for a first message: an agent asked for a launch of its own"
+        Set-DaemonPendingLaunchOutcome -Pending $pending -Outcome 'unconfirmed' -Headers $Headers `
+            -Note "No longer followed: an agent launched something else before $agent in $($pending.Label) got its first message."
+        $script:DaemonPendingLaunch = $null
+        return $false
+    }
 
     $first = ''
     $firstAgent = ''
@@ -1630,9 +2121,10 @@ function Send-DaemonPendingFirstMessage {
     try { $firstAgent = [string](Get-HomeAssistantState -EntityId $script:DaemonEntity.NewAgent -Headers $Headers).state } catch { }
     if ($first -in @('unknown', 'unavailable')) { $first = '' }
     $first = $first.Trim()
-    $agent = Get-BridgeLauncherLabel -Launcher ([string]$pending.Launcher)
     if (-not $first -or ($firstAgent -and (Resolve-BridgeLauncher -Label $firstAgent) -ne [string]$pending.Launcher)) {
         Write-DaemonLog -Message "stopped waiting on the $agent in $($pending.Label) for a first message: a new launch was asked for"
+        Set-DaemonPendingLaunchOutcome -Pending $pending -Outcome 'unconfirmed' -Headers $Headers `
+            -Note "No longer followed: a new launch was asked for before $agent in $($pending.Label) got its first message."
         $script:DaemonPendingLaunch = $null
         return $false
     }
@@ -1646,7 +2138,9 @@ function Send-DaemonPendingFirstMessage {
     $pending.AwaitingFirstMessage = $false
     $pending.Since = [DateTimeOffset]::Now
     $pending.LastCheck = [DateTimeOffset]::MinValue
-    Set-CopilotMqttNewSessionResult -Headers $Headers -Text "Sending your first message to $agent in $($pending.Label)..." | Out-Null
+    $sending = "Sending your first message to $agent in $($pending.Label)..."
+    Set-CopilotMqttNewSessionResult -Headers $Headers -Text $sending | Out-Null
+    Set-DaemonPendingLaunchOutcome -Pending $pending -Outcome 'starting' -Note $sending -Headers $Headers
     Clear-DaemonLaunchPrompt -Headers $Headers
     $true
 }
@@ -1677,6 +2171,11 @@ function Resolve-DaemonLaunchRequest {
         Set-CopilotMqttNewSessionResult -Headers $Headers `
             -Text 'No workspaces configured - run "agent-ha-bridge configure" on this machine' | Out-Null
         return $null
+    }
+
+    # An agent's request carries its own settings, and none of the card's (#227).
+    if ($null -ne $script:DaemonLaunchRequest) {
+        return (Resolve-DaemonRequestedLaunch -Controls $Controls -Headers $Headers)
     }
 
     # The agent. An untouched selector means the default; anything else must name an
@@ -1720,34 +2219,12 @@ function Resolve-DaemonLaunchRequest {
     }
     catch { }
     if ($null -ne $resumeSession) {
-        # A session on another machine. Bring it over if we can, and refuse plainly if we
-        # cannot - but never fall through to a launch. That matters more than it reads:
-        # a remote entry reaching the launcher arrives as `--session-id` with no
-        # transcript, and Copilot answers that by silently starting a new empty session
-        # under that id and exiting 0, which the daemon then adopts as a resume that
-        # worked. The workspace check below cannot be relied on to stop it either, since
-        # the same approved path can exist on both machines.
-        if ($resumeSession.PSObject.Properties['Remote'] -and $resumeSession.Remote) {
-            $transferred = Resolve-DaemonRemoteResume -Entry $resumeSession -Label $resumeLabel `
-                -Workspaces $workspaces -Launchers $launchers -Headers $Headers
-            if ($null -eq $transferred) { return $null }
-            $resumeSession = $transferred
-            $resumeLabel = "$resumeLabel (brought over)"
-        }
-        if (-not $resumeSession.PSObject.Properties['Folder'] -or
-            -not (Test-BridgeWorkspacePathApproved -Path ([string]$resumeSession.Folder))) {
-            Write-DaemonLog -Message 'resume refused: its working directory is missing or no longer approved'
-            Set-CopilotMqttNewSessionResult -Text 'Resume refused: the original directory must exist and be an approved workspace.' -Headers $Headers | Out-Null
-            return $null
-        }
-        # Entries from before a list carried its agent came from Agency.
-        $chosenLauncher = if ($resumeSession.PSObject.Properties['Launcher'] -and $resumeSession.Launcher) { [string]$resumeSession.Launcher } else { 'agency' }
-        if ($launchers -notcontains $chosenLauncher) {
-            $agentName = Get-BridgeLauncherLabel -Launcher $chosenLauncher
-            Write-DaemonLog -Message "resume requested for a $agentName session, but $agentName is not installed"
-            Set-CopilotMqttNewSessionResult -Text "$agentName is not installed here, so that session can't be resumed" -Headers $Headers | Out-Null
-            return $null
-        }
+        $completed = Complete-DaemonResumeChoice -Session $resumeSession -Label $resumeLabel `
+            -Workspaces $workspaces -Launchers $launchers -Headers $Headers
+        if ($null -eq $completed) { return $null }
+        $resumeSession = $completed.Session
+        $resumeLabel = $completed.Label
+        $chosenLauncher = $completed.Launcher
     }
 
     $label = ''
@@ -1773,17 +2250,7 @@ function Resolve-DaemonLaunchRequest {
     $prompt = ''
     try { $prompt = Get-DaemonLaunchPrompt -Headers $Headers } catch { }
     if ($prompt -in @('unknown', 'unavailable')) { $prompt = '' }
-    $prompt = $prompt.Trim()
-
-    # Codex creates its session - its id, its session file, its first hook call -
-    # only on a first message, so one launched without a prompt ran in a window the
-    # bridge could never attach to. It is given a short opening message instead
-    # (`newSession.codexStartPrompt`; empty turns this off, and the launch then waits
-    # for a first message sent from the card).
-    $needsFirst = (Get-BridgeLauncher -Launcher $chosenLauncher).NeedsFirstMessage
-    if ($needsFirst -and -not $prompt) {
-        $prompt = ([string](Get-BridgeSetting "newSession.${chosenLauncher}StartPrompt" $script:DaemonConfig.CodexStartPrompt)).Trim()
-    }
+    $prompt = Get-DaemonOpeningPrompt -Launcher $chosenLauncher -Prompt $prompt.Trim()
 
     # The profile only applies under Agency. An untouched selector falls back to the
     # first offered profile, and one this machine's Agency does not have is refused
@@ -1862,16 +2329,271 @@ function Resolve-DaemonLaunchRequest {
     }
 }
 
+function Resolve-DaemonRequestedLaunch {
+    <#
+        Resolve-DaemonLaunchRequest for a launch an agent asked for (#227): every
+        setting comes from the request, and none from the card.
+
+        It differs from the card's path in three ways, each deliberate:
+          - a setting left out takes this machine's configured default, never what the
+            card happens to show, so an agent cannot inherit an 'Allow all' a person
+            left selected;
+          - a value this machine does not offer is refused, naming what it does offer.
+            The card quietly drops a tuning value left over from another agent, but an
+            agent that asked for a model has to hear that it is not getting it;
+          - everything that can be checked is checked before anything is done, so a
+            refused request has not already brought a session over from another
+            machine.
+        Returns the request, or $null when it is refused, having said why on the card.
+    #>
+    param(
+        [Parameter(Mandatory)]$Controls,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    $settings = $script:DaemonLaunchRequest.Settings
+    $get = { param([string]$Key) if ($settings.ContainsKey($Key)) { [string]$settings[$Key] } else { '' } }
+    $refuse = { param([string]$Note)
+        Write-DaemonLog -Message "launch request $($script:DaemonLaunchRequest.Id) refused: $Note"
+        Set-CopilotMqttNewSessionResult -Text $Note -Headers $Headers | Out-Null
+    }
+    $workspaces = @($Controls.Workspaces)
+    $launchers = @($Controls.Launchers)
+    $profiles = @($Controls.Profiles)
+
+    $agentName = & $get 'agent'
+    $agentLabel = if ($agentName) { $agentName } else { Get-BridgeLauncherLabel -Launcher ([string]$Controls.Launcher) }
+    $chosenLauncher = Resolve-BridgeLauncher -Label $agentLabel
+    if ([string]::IsNullOrWhiteSpace($chosenLauncher)) {
+        if ($launchers.Count -gt 0) {
+            & $refuse "Unknown agent '$agentLabel' - this machine has $(@($Controls.Agents) -join ', ')"
+            return $null
+        }
+        if ($agentName) {
+            & $refuse "Unknown agent '$agentName' - no agent is installed on this machine"
+            return $null
+        }
+        # Nothing is installed: let the launch attempt name what is missing.
+        $chosenLauncher = [string]$Controls.Launcher
+    }
+
+    $resumeSession = $null
+    $resumeLabel = ''
+    $wantedResume = & $get 'resume'
+    if ($wantedResume) {
+        if (& $get 'workspace') {
+            & $refuse 'A resumed session reopens in its own folder - name a workspace or a session to resume, not both'
+            return $null
+        }
+        # By the label the card shows, or by id: a peer's sessions are listed by label
+        # on every machine, but only one that shares them publishes their ids.
+        $resumeSession = @($Controls.Resumable) | Where-Object {
+            [string]$_.Label -eq $wantedResume -or [string]$_.SessionId -eq $wantedResume
+        } | Select-Object -First 1
+        if ($null -eq $resumeSession) {
+            & $refuse "No resumable session '$wantedResume' on this machine - it is not on its resume list"
+            return $null
+        }
+        $resumeLabel = [string]$resumeSession.Label
+        $sessionLauncher = Get-DaemonResumeLauncher -Entry $resumeSession
+        if ($agentName -and $chosenLauncher -ne $sessionLauncher) {
+            $theirs = Get-BridgeLauncherLabel -Launcher $sessionLauncher
+            & $refuse "'$resumeLabel' is a $theirs session, so it resumes in $theirs, not $(Get-BridgeLauncherLabel -Launcher $chosenLauncher)"
+            return $null
+        }
+        $chosenLauncher = $sessionLauncher
+        if ($launchers -notcontains $chosenLauncher) {
+            & $refuse "$(Get-BridgeLauncherLabel -Launcher $chosenLauncher) is not installed here, so that session can't be resumed"
+            return $null
+        }
+    }
+
+    # A resume reopens in its own folder, but Start-DaemonLaunch still checks the
+    # workspace it was given, so a resume carries the default one.
+    $label = & $get 'workspace'
+    if ($label) {
+        $match = @($workspaces | Where-Object { [string]$_.Label -eq $label }) | Select-Object -First 1
+        if ($null -eq $match) {
+            & $refuse "Unknown workspace '$label' - this machine has $(@($workspaces | ForEach-Object { [string]$_.Label }) -join ', ')"
+            return $null
+        }
+        $label = [string]$match.Label
+    }
+    else { $label = Get-BridgeDefaultWorkspaceLabel }
+    $directory = Resolve-BridgeWorkspacePath -Label $label
+    if ([string]::IsNullOrWhiteSpace($directory)) {
+        & $refuse "Unknown workspace '$label'"
+        return $null
+    }
+
+    $agencyProfile = ''
+    $profileName = & $get 'profile'
+    if ($chosenLauncher -eq 'agency' -and $profiles.Count -gt 0) {
+        $wantedProfile = if ($profileName) { $profileName } else { Get-BridgeDefaultAgencyProfile }
+        $agencyProfile = [string](Resolve-BridgeAgencyProfile -Name $wantedProfile)
+        if ([string]::IsNullOrWhiteSpace($agencyProfile)) {
+            & $refuse "Unknown profile '$wantedProfile' - this machine has $($profiles -join ', ')"
+            return $null
+        }
+    }
+    elseif ($profileName) {
+        $why = if ($chosenLauncher -ne 'agency') {
+            "a profile applies only to Agency, and this launch is $(Get-BridgeLauncherLabel -Launcher $chosenLauncher)"
+        }
+        else { "this machine's Agency has no profiles" }
+        & $refuse "Profile '$profileName' refused: $why"
+        return $null
+    }
+
+    $tuning = @{}
+    foreach ($axis in @(Get-BridgeTuningAxes)) {
+        $wanted = & $get $axis
+        if (-not $wanted) {
+            $tuning[$axis] = Resolve-BridgeTuningValue -Launcher $chosenLauncher -Axis $axis `
+                -Value (Get-BridgeDefaultTuning -Launcher $chosenLauncher -Axis $axis)
+            continue
+        }
+        if ($wanted -eq $script:BridgeTuningDefaultOption) { $tuning[$axis] = ''; continue }
+        $offered = @(Get-BridgeTuningOptions -Launcher $chosenLauncher -Axis $axis)
+        $match = @($offered | Where-Object { $_ -eq $wanted -and $_ -ne $script:BridgeTuningDefaultOption }) |
+            Select-Object -First 1
+        if ([string]::IsNullOrWhiteSpace([string]$match)) {
+            $agent = Get-BridgeLauncherLabel -Launcher $chosenLauncher
+            $axisName = (Get-BridgeTuningAxisLabel -Axis $axis).ToLowerInvariant()
+            & $refuse $(if ($offered.Count -gt 1) { "Unknown $axisName '$wanted' for $agent - it offers $($offered -join ', ')" }
+                else { "$agent has no $axisName to choose here, so '$wanted' can't be used" })
+            return $null
+        }
+        $tuning[$axis] = [string]$match
+    }
+
+    # Exactly one of the two labels, case included, for the reason
+    # Test-BridgePermissionAllowsAll gives: this decides whether a session runs
+    # unattended, and anything unclear has to be refused rather than read as asking.
+    $permission = & $get 'permissions'
+    if ($permission) {
+        $options = @(Get-BridgePermissionOptions)
+        if ($options -cnotcontains $permission) {
+            & $refuse "Unknown permissions '$permission' - use '$($options -join "' or '")'"
+            return $null
+        }
+        $allowAllTools = Test-BridgePermissionAllowsAll -Value $permission
+    }
+    else { $allowAllTools = [bool](Get-BridgeSetting 'newSession.allowAllTools' $false) }
+
+    if ($null -ne $resumeSession) {
+        $completed = Complete-DaemonResumeChoice -Session $resumeSession -Label $resumeLabel `
+            -Workspaces $workspaces -Launchers $launchers -Headers $Headers
+        if ($null -eq $completed) { return $null }
+        $resumeSession = $completed.Session
+        $resumeLabel = $completed.Label
+        $chosenLauncher = $completed.Launcher
+    }
+
+    [pscustomobject]@{
+        Launcher      = $chosenLauncher
+        Directory     = $directory
+        Label         = $label
+        Prompt        = Get-DaemonOpeningPrompt -Launcher $chosenLauncher -Prompt ([string]$script:DaemonLaunchRequest.Text)
+        AgencyProfile = $agencyProfile
+        Model         = [string]$tuning['model']
+        Effort        = [string]$tuning['effort']
+        Context       = [string]$tuning['context']
+        AllowAllTools = [bool]$allowAllTools
+        ResumeSession = $resumeSession
+        ResumeLabel   = $resumeLabel
+    }
+}
+
+function Complete-DaemonResumeChoice {
+    <#
+        Finishes a resume both kinds of press settled on: brings a session over from the
+        machine that has it, and checks that its folder is approved and its agent is
+        installed here. Returns the session, its label and its agent, or $null when the
+        resume is refused, having said why on the card.
+    #>
+    param(
+        [Parameter(Mandatory)]$Session,
+        [Parameter(Mandatory)][AllowEmptyString()][string]$Label,
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Workspaces,
+        [Parameter(Mandatory)][AllowEmptyCollection()][string[]]$Launchers,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    # A session on another machine. Bring it over if we can, and refuse plainly if we
+    # cannot - but never fall through to a launch. That matters more than it reads:
+    # a remote entry reaching the launcher arrives as `--session-id` with no
+    # transcript, and Copilot answers that by silently starting a new empty session
+    # under that id and exiting 0, which the daemon then adopts as a resume that
+    # worked. The workspace check below cannot be relied on to stop it either, since
+    # the same approved path can exist on both machines.
+    if ($Session.PSObject.Properties['Remote'] -and $Session.Remote) {
+        $transferred = Resolve-DaemonRemoteResume -Entry $Session -Label $Label `
+            -Workspaces $Workspaces -Launchers $Launchers -Headers $Headers
+        if ($null -eq $transferred) { return $null }
+        $Session = $transferred
+        $Label = "$Label (brought over)"
+    }
+    if (-not $Session.PSObject.Properties['Folder'] -or
+        -not (Test-BridgeWorkspacePathApproved -Path ([string]$Session.Folder))) {
+        Write-DaemonLog -Message 'resume refused: its working directory is missing or no longer approved'
+        Set-CopilotMqttNewSessionResult -Text 'Resume refused: the original directory must exist and be an approved workspace.' -Headers $Headers | Out-Null
+        return $null
+    }
+    # Entries from before a list carried its agent came from Agency.
+    $launcher = Get-DaemonResumeLauncher -Entry $Session
+    if ($Launchers -notcontains $launcher) {
+        $agentName = Get-BridgeLauncherLabel -Launcher $launcher
+        Write-DaemonLog -Message "resume requested for a $agentName session, but $agentName is not installed"
+        Set-CopilotMqttNewSessionResult -Text "$agentName is not installed here, so that session can't be resumed" -Headers $Headers | Out-Null
+        return $null
+    }
+    [pscustomobject]@{ Session = $Session; Label = $Label; Launcher = $launcher }
+}
+
+function Get-DaemonResumeLauncher {
+    <# The agent a resumable entry reopens in. Entries from before a list carried one came from Agency. #>
+    param([Parameter(Mandatory)]$Entry)
+    if ($Entry.PSObject.Properties['Launcher'] -and $Entry.Launcher) { return [string]$Entry.Launcher }
+    'agency'
+}
+
+function Get-DaemonOpeningPrompt {
+    <#
+        The prompt a launch starts with: -Prompt, or for an agent that needs a first
+        message to exist at all, a short opening one when there is none.
+
+        Codex creates its session - its id, its session file, its first hook call -
+        only on a first message, so one launched without a prompt ran in a window the
+        bridge could never attach to. It is given a short opening message instead
+        (`newSession.codexStartPrompt`; empty turns this off, and the launch then waits
+        for a first message sent from the card).
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Launcher,
+        [AllowEmptyString()][string]$Prompt = ''
+    )
+
+    $Prompt = $Prompt.Trim()
+    if ($Prompt -or -not (Get-BridgeLauncher -Launcher $Launcher).NeedsFirstMessage) { return $Prompt }
+    ([string](Get-BridgeSetting "newSession.${Launcher}StartPrompt" $script:DaemonConfig.CodexStartPrompt)).Trim()
+}
+
 function Start-DaemonLaunch {
     <#
         Launches (or resumes) what Resolve-DaemonLaunchRequest settled on, and sets up
         the follow-up that watches for the session to register.
+
+        What it came to is left in $script:DaemonLaunchVerdict - 'refused', 'failed'
+        or 'starting' - for the outcome an agent reads (#227). Decided here, where
+        each path is taken, rather than by reading back the note it wrote.
     #>
     param(
         [Parameter(Mandatory)]$Request,
         [Parameter(Mandatory)][hashtable]$Headers
     )
 
+    $script:DaemonLaunchVerdict = 'refused'
     $chosenLauncher = $Request.Launcher
     $directory = $Request.Directory
     $label = $Request.Label
@@ -1998,6 +2720,7 @@ function Start-DaemonLaunch {
         }
 
         if (-not $launch.Launched) {
+            $script:DaemonLaunchVerdict = 'failed'
             Write-DaemonLog -Message "new session launch failed: $($launch.Detail)"
             $protectionNote = if ($null -ne $worktreeReservation) { ' The worktree remains reserved for inspection.' } else { '' }
             Set-CopilotMqttNewSessionResult -Text "Launch failed: $($launch.Detail)$protectionNote" -Headers $Headers | Out-Null
@@ -2053,6 +2776,14 @@ function Start-DaemonLaunch {
         # it got far enough to be adopted. That is followed up on each pass of the loop
         # (Update-DaemonPendingLaunch) rather than waited for here: waiting stalled the
         # whole daemon - replies, streaming, everything - for up to 25 seconds per launch.
+        #
+        # Only one launch is followed at a time. One that an agent asked for and is
+        # replaced here before it registered is not followed any further, so its agent
+        # is told that rather than left waiting on an answer that cannot come.
+        $superseded = $script:DaemonPendingLaunch
+        Set-DaemonPendingLaunchOutcome -Pending $superseded -Outcome 'unconfirmed' -Headers $Headers `
+            -Note 'No longer followed: a newer launch on this machine started before it registered. Check its window.'
+        $requested = $script:DaemonLaunchRequest
         $script:DaemonPendingLaunch = [pscustomobject]@{
             SessionId      = [string]$launch.SessionId
             ProcessId      = [int]$launch.ProcessId
@@ -2085,7 +2816,24 @@ function Start-DaemonLaunch {
             FirstMessageAsked    = $false
             WorktreeReservation  = $worktreeReservation
             Note                 = $cleanupNote
+            # The agent's request this launch answers (#227), if an agent asked, with
+            # its press and what was actually launched, so each outcome reported as the
+            # launch is followed still says what it is about.
+            Request              = $(if ($null -ne $requested) { [string]$requested.Id } else { '' })
+            Pressed              = (Format-DaemonInstant -Instant $script:DaemonNewSessionPressedAt)
+            Launched             = [pscustomobject][ordered]@{
+                agent       = Get-BridgeLauncherLabel -Launcher $chosenLauncher
+                workspace   = $(if ($null -eq $resumeSession) { [string]$label } else { '' })
+                resume      = $(if ($null -ne $resumeSession) { [string]$resumeLabel } else { '' })
+                profile     = [string]$agencyProfile
+                model       = [string]$model
+                effort      = [string]$effort
+                context     = [string]$context
+                permissions = Get-BridgePermissionLabel -AllowAllTools $allowAllTools
+                resumed     = ($null -ne $resumeSession)
+            }
         }
+        $script:DaemonLaunchVerdict = 'starting'
 
         # A launch changes what is resumable - the session just started is now live, and
         # a resumed one has to leave the list - so the cache is expired rather than left
@@ -2096,7 +2844,10 @@ function Start-DaemonLaunch {
         # Clear the prompt box so the next launch starts from a blank field instead of
         # silently reusing the previous prompt. Both boxes: the payload topic is retained,
         # so a long prompt left there would start the next session too.
-        if ($prompt) { Clear-DaemonLaunchPrompt -Headers $Headers }
+        #
+        # Not for an agent's request, whose payload was cleared when it was taken: the
+        # text box is the card's, and may hold something a person is still typing.
+        if ($prompt -and $null -eq $requested) { Clear-DaemonLaunchPrompt -Headers $Headers }
     }
     finally {
         if ($null -ne $worktreeOperation) { $worktreeOperation.Mutex.ReleaseMutex(); $worktreeOperation.Mutex.Dispose() }
@@ -2232,11 +2983,18 @@ function Update-DaemonPendingLaunch {
     if (($now - $p.LastCheck).TotalMilliseconds -lt 700) { return }
     $p.LastCheck = $now
     $agent = Get-BridgeLauncherLabel -Launcher $p.Launcher
-    $finish = { param([string]$Note, [string]$Log)
+    # Each stage is also reported to the agent that asked for this launch, if one did
+    # (#227): the note says the same thing to whoever is looking at the card.
+    $report = { param([string]$Outcome, [string]$Note, [string]$Session = '')
+        Set-DaemonPendingLaunchOutcome -Pending $p -Outcome $Outcome -Note $Note -Session $Session -Headers $Headers
+    }
+    $finish = { param([string]$Note, [string]$Log, [string]$Outcome, [string]$Session = '', [string]$Said = '')
         $script:DaemonPendingLaunch = $null
         Write-DaemonLog -Message $Log
         try { Set-CopilotMqttNewSessionResult -Headers $Headers -Text $Note } catch { }
+        & $report $Outcome $(if ($Said) { $Said } else { $Note }) $Session
     }
+    $requested = $p.PSObject.Properties['Request'] -and $p.Request
 
     if (Test-BridgeSessionRegistered -SessionId $p.SessionId -Launcher $p.Launcher -Since $p.Since) {
         if ($p.PSObject.Properties['WorktreeReservation'] -and $null -ne $p.WorktreeReservation) {
@@ -2248,9 +3006,11 @@ function Update-DaemonPendingLaunch {
         # two can never name different sessions.
         #
         # The settings the launch chose need the same answer for the same reason, so
-        # both are taken from one call rather than each guessing separately.
+        # both are taken from one call rather than each guessing separately - and so
+        # does the session an agent that asked for this launch is told it produced.
         $pendingTuning = $script:DaemonLaunchedTuning[$script:DaemonPendingTuningKey]
-        if ($p.Driver -eq 'agent' -or $null -ne $pendingTuning) {
+        $registeredId = ''
+        if ($p.Driver -eq 'agent' -or $null -ne $pendingTuning -or $requested) {
             $registeredId = Get-BridgeRegisteredSessionId -SessionId $p.SessionId -Launcher $p.Launcher -Since $p.Since
             if (-not [string]::IsNullOrWhiteSpace($registeredId)) {
                 # A launch whose session is never adopted - a publish that keeps
@@ -2280,12 +3040,21 @@ function Update-DaemonPendingLaunch {
         $script:DaemonReconcileNow = $true
         $note = if ($p.PSObject.Properties['Note']) { [string]$p.Note } else { '' }
         $script:DaemonLaunchKeptNote = $note
-        & $finish $note ("$($p.Verb) $agent in $($p.Label); registered after {0:N1} s" -f ($now - $p.Since).TotalSeconds)
+        # The id an agent passes to read_agent_session and reply_to_agent_session: the
+        # session's node, as every one of its entities is named.
+        $session = ''
+        if ($requested) {
+            $produced = if (-not [string]::IsNullOrWhiteSpace($registeredId)) { $registeredId } else { [string]$p.SessionId }
+            if ($produced) { $session = (Get-CopilotMqttNodeId -SessionId $produced) -replace '^agent_bridge_', '' }
+        }
+        $registered = "$($p.Verb) $agent in $($p.Label)"
+        & $finish $note ("$registered; registered after {0:N1} s" -f ($now - $p.Since).TotalSeconds) 'started' $session `
+            $(if ($note) { $note } else { "$registered." })
         return
     }
 
     if ($p.ProcessId -gt 0 -and $null -eq (Get-Process -Id $p.ProcessId -ErrorAction SilentlyContinue)) {
-        & $finish "$agent in $($p.Label) closed before it started." "launched $agent (pid $($p.ProcessId)) exited before registering"
+        & $finish "$agent in $($p.Label) closed before it started." "launched $agent (pid $($p.ProcessId)) exited before registering" 'failed'
         return
     }
 
@@ -2306,12 +3075,15 @@ function Update-DaemonPendingLaunch {
             elseif ($null -eq $p.TrustAskedAt) {
                 $p.TrustAskedAt = $now
                 Write-DaemonLog -Message "$agent in $($p.Label) is asking whether to trust the folder; waiting for a second press"
-                Set-CopilotMqttNewSessionResult -Headers $Headers `
-                    -Text "$agent is asking whether to trust $($p.Label). Press Launch again within 2 minutes to trust it and start."
+                $asking = "$agent is asking whether to trust $($p.Label). Press Launch again within 2 minutes to trust it and start."
+                Set-CopilotMqttNewSessionResult -Headers $Headers -Text $asking
+                # Told to the agent in its own words: the press is a person's to make,
+                # and the agent's own would be turned away as busy.
+                & $report 'waiting' "$agent is asking whether to trust $($p.Label). A person has to answer that on the card or in its window, within 2 minutes."
             }
             elseif (($now - $p.TrustAskedAt).TotalSeconds -gt 120) {
                 & $finish "$agent is still asking whether to trust $($p.Label) - answer it in its window." `
-                    "trust confirmation for $($p.Label) expired; left for the window"
+                    "trust confirmation for $($p.Label) expired; left for the window" 'unconfirmed'
             }
             return
         }
@@ -2335,13 +3107,14 @@ function Update-DaemonPendingLaunch {
                 $blocked = $true
                 Write-DaemonLog -Message "$agent in $($p.Label) is waiting on a question in its window: $note"
                 try { Set-CopilotMqttNewSessionResult -Headers $Headers -Text ($note -f $p.Label) } catch { }
+                & $report 'waiting' ($note -f $p.Label)
             }
         }
     }
     if ($blocked) {
         if (($now - $p.BlockedAt).TotalMinutes -gt 10) {
             & $finish "$agent in $($p.Label) is still waiting on a question in its window - answer it there." `
-                "launched $agent (pid $($p.ProcessId)) still blocked after 10 minutes; stopped waiting"
+                "launched $agent (pid $($p.ProcessId)) still blocked after 10 minutes; stopped waiting" 'unconfirmed'
         }
         return
     }
@@ -2354,11 +3127,13 @@ function Update-DaemonPendingLaunch {
         if (-not $p.FirstMessageAsked -and ($now - $p.Since).TotalSeconds -ge 4) {
             $p.FirstMessageAsked = $true
             Write-DaemonLog -Message "$agent in $($p.Label) is open and waiting for its first message"
-            Set-CopilotMqttNewSessionResult -Headers $Headers `
-                -Text "$agent is open in $($p.Label). It appears here after its first message: type one under First message and press Launch, or type it in its window."
+            $waitingFirst = "$agent is open in $($p.Label). It appears here after its first message: type one under First message and press Launch, or type it in its window."
+            Set-CopilotMqttNewSessionResult -Headers $Headers -Text $waitingFirst
+            & $report 'waiting' $waitingFirst
         }
         if (($now - $p.Since).TotalMinutes -gt 60) {
-            & $finish '' "$agent in $($p.Label) never got a first message; stopped waiting"
+            & $finish '' "$agent in $($p.Label) never got a first message; stopped waiting" 'unconfirmed' '' `
+                "$agent in $($p.Label) never got a first message, so it was not followed any further."
         }
         return
     }
@@ -2371,11 +3146,10 @@ function Update-DaemonPendingLaunch {
         # still be starting keeps the note true when that happens; the session
         # registering clears it (Clear-DaemonLaunchNoteOnRegistration).
         Write-DaemonLog -Message "launched $agent (pid $($p.ProcessId)) has not registered within 90 s; still watching"
-        try {
-            Set-CopilotMqttNewSessionResult -Headers $Headers `
-                -Text "$agent started in $($p.Label) (pid $($p.ProcessId)) and may still be starting - check its window."
-        }
+        $slow = "$agent started in $($p.Label) (pid $($p.ProcessId)) and may still be starting - check its window."
+        try { Set-CopilotMqttNewSessionResult -Headers $Headers -Text $slow }
         catch { }
+        & $report 'starting' $slow
     }
 
     # The launch stays under watch instead of being dropped at 90 seconds.
@@ -2391,6 +3165,6 @@ function Update-DaemonPendingLaunch {
     # backstop, as it is for a window already known to be blocked.
     if (($now - $p.Since).TotalMinutes -gt 10) {
         & $finish "$agent in $($p.Label) never registered - check its window." `
-            "launched $agent (pid $($p.ProcessId)) did not register within 10 minutes; stopped waiting"
+            "launched $agent (pid $($p.ProcessId)) did not register within 10 minutes; stopped waiting" 'unconfirmed'
     }
 }
