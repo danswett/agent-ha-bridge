@@ -1688,6 +1688,15 @@ function Sync-DaemonUsage {
         if ($stream.Login -and $dueLogins.Count -gt 0) { continue }
         $client = $stream.Client
         $state = Get-BridgeUsageClientState -Client $stream.Key
+        # A slot given another login is another stream: when the login it carried was
+        # read, and whether it was published, says nothing about this one.
+        if ($stream.Login) {
+            if ($state.ContainsKey('Login') -and [string]$state.Login -ne $stream.Login) {
+                [void]$script:DaemonUsageClients.Remove($stream.Key)
+                $state = Get-BridgeUsageClientState -Client $stream.Key
+            }
+            $state.Login = $stream.Login
+        }
         # The sessions open here spend the account Copilot is signed in as, never a
         # further login, so one of those is read at the idle pace whatever is open.
         $busy = if ($stream.Login) { $false } else { Test-BridgeUsageBusy -Client $client -Live $Live }
@@ -1712,7 +1721,14 @@ function Sync-DaemonUsage {
         $state.Retry = $false
 
         $covered = $false
-        if ($role -ceq 'participant') {
+        # A further login's slot is left to another machine only once this daemon has
+        # put a reading of its own on it. Until then the slot may still carry another
+        # login - an earlier configuration's, from before a restart or before the slot
+        # was given to this one - and standing down would leave that on the card for as
+        # long as somebody else kept the new login current. One read per login per
+        # daemon start, at the idle pace, is what it costs.
+        $deferrable = -not ($stream.Login -and $state.PublishedAt -eq [DateTimeOffset]::MinValue)
+        if ($role -ceq 'participant' -and $deferrable) {
             # A further login is its own key: whose allowance it is was configured, not
             # read from anything.
             $key = [string]$stream.Login

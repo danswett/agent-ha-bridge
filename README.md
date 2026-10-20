@@ -1155,7 +1155,9 @@ under the wrong name, and a login `gh` holds no token for stays on the card sayi
 The sessions on a machine spend the account Copilot is signed in as, never a further
 one, so a further login is read at the idle pace (`usage.idleIntervalSeconds`) whatever
 is open — and, like any account, it is left to another machine that has just read it
-(see [How current it is](#how-current-it-is)). Listing the account Copilot is already
+(see [How current it is](#how-current-it-is)), once this machine has put a reading of
+its own on its sensor since it started, so that nothing an earlier configuration left
+there outlasts it. Listing the account Copilot is already
 signed in as costs a second read and nothing else, the card drawing one row per
 account. An entry that is not a login is skipped, logged, and keeps its place, so the
 logins after it keep their sensors; one shaped like a token is refused without being

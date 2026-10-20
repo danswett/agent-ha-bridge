@@ -2088,7 +2088,9 @@ Test-That 'one further login is read a pass at most, the rest on the passes that
 Reset-UsagePacing
 $script:Settings['dashboard.publication'] = $writerElsewhere
 $script:Settings['usage.copilotAccounts'] = @('danswett', 'hubot')
-$secondOfTwo = Invoke-UsageAt 0 $none @(New-PeerUsageState -Client 'copilot' -Account 'danswett' -Updated $paceStart)
+[void](Invoke-UsageAt 0 $none)
+[void](Invoke-UsageAt 15 $none)
+$secondOfTwo = Invoke-UsageAt 915 $none @(New-PeerUsageState -Client 'copilot' -Account 'danswett' -Updated $paceStart.AddSeconds(915))
 Test-That 'though one left to another machine is not a read, and does not hold up the next' {
     $secondOfTwo -ceq 'copilot,claude,codex;copilot_3:hubot'
 } "asked=$secondOfTwo"
@@ -2108,35 +2110,59 @@ Test-That 'and nothing logged repeats the entry shaped like a token' {
 
 # Another machine keeping the same login current is as good as reading it here, exactly
 # as for the signed-in account (#142) - including when that machine is signed in to
-# Copilot as the login this one lists, and so reports it on its own client sensor.
-Reset-UsagePacing
-$script:Settings['dashboard.publication'] = $writerElsewhere
-$script:Settings['usage.copilotAccounts'] = @('danswett')
-$peerSignedIn = Invoke-UsageAt 0 $none @(New-PeerUsageState -Client 'copilot' -Account 'danswett' -Updated $paceStart)
+# Copilot as the login this one lists, and so reports it on its own client sensor. Once
+# this machine has put a reading of its own on the slot, that is (see below), so each of
+# these reads the login on its first pass and meets the other machine's reading when it
+# is next due.
+function Invoke-ExtraAgainstPeer {
+    param([string]$Listed, $Peer)
+    Reset-UsagePacing
+    $script:Settings['dashboard.publication'] = $writerElsewhere
+    $script:Settings['usage.copilotAccounts'] = @($Listed)
+    [void](Invoke-UsageAt 0 $none)
+    Invoke-UsageAt 900 $none @($Peer)
+}
+$peerAt = $paceStart.AddSeconds(900)
+$peerSignedIn = Invoke-ExtraAgainstPeer 'danswett' (New-PeerUsageState -Client 'copilot' -Account 'danswett' -Updated $peerAt)
 Test-That 'a further login another machine has just read is left to it, like any account' {
     $peerSignedIn -ceq 'copilot,claude,codex'
 } "asked=$peerSignedIn"
-Reset-UsagePacing
-$script:Settings['dashboard.publication'] = $writerElsewhere
-$script:Settings['usage.copilotAccounts'] = @('danswett')
-$peerNumbered = Invoke-UsageAt 0 $none @(New-PeerUsageState -Client 'copilot' -Account 'danswett' -Sensor 'copilot_3' -Updated $paceStart)
+$peerNumbered = Invoke-ExtraAgainstPeer 'danswett' (New-PeerUsageState -Client 'copilot' -Account 'danswett' -Sensor 'copilot_3' -Updated $peerAt)
 Test-That 'whichever sensor that machine reported it on' {
     $peerNumbered -ceq 'copilot,claude,codex'
 } "asked=$peerNumbered"
-Reset-UsagePacing
-$script:Settings['dashboard.publication'] = $writerElsewhere
-$script:Settings['usage.copilotAccounts'] = @('DanSwett')
-$peerCased = Invoke-UsageAt 0 $none @(New-PeerUsageState -Client 'copilot' -Account 'danswett' -Updated $paceStart)
+$peerCased = Invoke-ExtraAgainstPeer 'DanSwett' (New-PeerUsageState -Client 'copilot' -Account 'danswett' -Updated $peerAt)
 Test-That 'and however the list spells the login, GitHub''s logins not being case-sensitive' {
     $peerCased -ceq 'copilot,claude,codex'
 } "asked=$peerCased"
-Reset-UsagePacing
-$script:Settings['dashboard.publication'] = $writerElsewhere
-$script:Settings['usage.copilotAccounts'] = @('danswett')
-$peerOther = Invoke-UsageAt 0 $none @(New-PeerUsageState -Client 'copilot' -Account 'hubot' -Updated $paceStart)
+$peerOther = Invoke-ExtraAgainstPeer 'danswett' (New-PeerUsageState -Client 'copilot' -Account 'hubot' -Updated $peerAt)
 Test-That 'but another login''s reading is no reason to leave this one unread' {
     $peerOther -ceq 'copilot,claude,codex;copilot_2:danswett'
 } "asked=$peerOther"
+
+# Until this machine has put its own reading on a slot, the slot may still carry another
+# login: an earlier configuration's, retained from before a restart, or the one it
+# carried before it was given to this login. Standing down for whoever keeps the new
+# login current left that on the card for as long as they did.
+Reset-UsagePacing
+$script:Settings['dashboard.publication'] = $writerElsewhere
+$script:Settings['usage.copilotAccounts'] = @('danswett')
+$freshSlot = Invoke-UsageAt 0 $none @(New-PeerUsageState -Client 'copilot' -Account 'danswett' -Updated $paceStart)
+Test-That 'a slot this daemon has not yet published on is read, though another machine keeps its login current' {
+    $freshSlot -ceq 'copilot,claude,codex;copilot_2:danswett'
+} "asked=$freshSlot"
+Reset-UsagePacing
+$script:Settings['dashboard.publication'] = $writerElsewhere
+$script:Settings['usage.copilotAccounts'] = @('hubot')
+[void](Invoke-UsageAt 0 $none)
+$script:Settings['usage.copilotAccounts'] = @('danswett')
+$script:PublishedRecords.Clear()
+$reassigned = Invoke-UsageAt 30 $none @(New-PeerUsageState -Client 'copilot' -Account 'danswett' -Updated $paceStart.AddSeconds(30))
+$reassignedRows = @($script:PublishedRecords | Where-Object { (Get-CopilotMqttUsageRecordKey -Record $_) -ceq 'copilot_2' })
+Test-That 'and so is one given another login, its reading replacing the login it carried before' {
+    $reassigned -ceq 'copilot_2:danswett' -and $reassignedRows.Count -eq 1 -and $reassignedRows[0].account -ceq 'danswett'
+} "asked=$reassigned rows=$(@($reassignedRows | ForEach-Object { $_.account }) -join ',')"
+
 Reset-UsagePacing
 $script:Settings['dashboard.publication'] = $writerElsewhere
 $claudeCased = Invoke-UsageAt 0 $claudeOpen @(New-PeerUsageState -Client 'claude' -AccountId '95ADB0B680FE' -Updated $paceStart)
@@ -2148,14 +2174,10 @@ Test-That 'while Claude''s opaque account id is still matched exactly' {
 # further login listed on two machines where only one has a token for it is the
 # expected case. Counted as a reading, that failure held the machine that could read
 # the account off for the whole window.
-Reset-UsagePacing
-$script:Settings['dashboard.publication'] = $writerElsewhere
-$script:Settings['usage.copilotAccounts'] = @('danswett')
-$peerFailed = @(
-    New-PeerUsageState -Client 'copilot' -Account 'work_account' -Failed -Updated $paceStart
-    New-PeerUsageState -Client 'copilot' -Account 'danswett' -Sensor 'copilot_2' -Failed -Updated $paceStart
+$despiteFailures = Invoke-ExtraAgainstPeer 'danswett' @(
+    New-PeerUsageState -Client 'copilot' -Account 'work_account' -Failed -Updated $peerAt
+    New-PeerUsageState -Client 'copilot' -Account 'danswett' -Sensor 'copilot_2' -Failed -Updated $peerAt
 )
-$despiteFailures = Invoke-UsageAt 0 $none $peerFailed
 Test-That 'another machine''s failure to read an account is no reason to leave it unread here' {
     $despiteFailures -ceq 'copilot,claude,codex;copilot_2:danswett'
 } "asked=$despiteFailures"
