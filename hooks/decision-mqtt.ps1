@@ -44,6 +44,11 @@ $script:CopilotMqttDiscoveryResetMs = 1500
 # selector's state against it and the dashboard shows it as the default.
 $script:CopilotMqttNewSessionOption = 'New session'
 
+# The last launch note Set-CopilotMqttNewSessionResult was given, whole. Declared here
+# so that a reader under StrictMode finds $null rather than an error before any note
+# has been sent.
+$script:CopilotMqttNewSessionResultText = $null
+
 # What the card's status line says while End session is waiting for the second press
 # that confirms it, and what it says when nobody made one in time.
 #
@@ -1032,6 +1037,11 @@ function Publish-CopilotMqttNewSession {
         unique_id   = "agent_bridge_${Slug}_new_session_result"
         object_id   = "agent_bridge_${Slug}_new_session_result"
         state_topic = $resultTopic
+        # What the launches an agent asked for came to, by request id: started and
+        # under which session, refused and why. The state cannot carry it - it is the
+        # note a person reads, capped at 255 characters and cleared once a launch
+        # succeeds - so an agent asking "did it start?" had nothing to read (#227).
+        json_attributes_topic = "$root/newsession/outcome"
         icon        = 'mdi:information-outline'
         device      = $device
     }
@@ -1121,11 +1131,34 @@ function Set-CopilotMqttNewSessionResult {
     )
 
     $value = [string]$Text
+    # Kept whole for the launch outcome an agent reads, which has no state cap and is
+    # where the reason for a refusal has to reach it (Set-DaemonLaunchOutcome).
+    $script:CopilotMqttNewSessionResultText = $value
     $limit = $script:CopilotMqttConfig.StateMaxChars
     if ($value.Length -gt $limit) { $value = $value.Substring(0, $limit - 3) + '...' }
 
     Publish-CopilotMqttMessage -Topic "$(Get-CopilotMqttMachineTopicRoot -Slug $Slug)/newsession/result" `
         -Payload $value -Headers $Headers -Retain
+}
+
+function Publish-CopilotMqttLaunchOutcome {
+    <#
+        Publishes what this machine's most recent requested launches came to, newest
+        first, as the attributes of its new_session_result sensor.
+
+        Several rather than the last, because two agents can launch on one machine
+        moments apart and each waits on its own request id: a single slot would let
+        the second outcome erase the first before its agent had read it. Retained, so
+        an agent that asks again after a broker reconnect still finds the answer.
+    #>
+    param(
+        [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Outcomes,
+        [string]$Slug,
+        [Parameter(Mandatory)][hashtable]$Headers
+    )
+
+    Publish-CopilotMqttMessage -Topic "$(Get-CopilotMqttMachineTopicRoot -Slug $Slug)/newsession/outcome" `
+        -Payload (@{ recent = @($Outcomes) } | ConvertTo-Json -Depth 6 -Compress) -Headers $Headers -Retain
 }
 
 function Clear-CopilotLegacyMqttEntities {
@@ -1700,6 +1733,8 @@ function Get-CopilotMqttMachineTopic {
         # stage its predecessor finished on.
         "$root/update/attributes"
         "$root/newsession/result"
+        # The launch outcomes an agent reads (#227), retained like the note beside it.
+        "$root/newsession/outcome"
         "$root/newsession/promptpayload"
         "$root/transfer/request"
         "$root/online/state"

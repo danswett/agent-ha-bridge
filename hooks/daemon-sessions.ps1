@@ -1242,6 +1242,12 @@ function Get-DaemonLaunchCapabilities {
         # The allow-all selector, for the same reason: a peer that has not published
         # it yet gets no permissions row rather than one pointing at nothing.
         permissions = [bool]$newSessionEnabled
+        # Launch requests that carry their own settings and report what they came to
+        # (#227). A number rather than a flag, so the contract can change shape later
+        # without an older MCP server reading a newer one as the same thing. A daemon
+        # without it ignores the settings and launches from the card, so an MCP server
+        # refuses to send them there.
+        launchRequest = $(if ($newSessionEnabled) { 1 } else { 0 })
         # This bridge publishes a Detailed activity switch for itself. Peers read it
         # to decide whether to draw a toggle for this machine; one that does not
         # report it gets no toggle rather than a row pointing at a helper that does

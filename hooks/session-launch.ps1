@@ -3142,8 +3142,9 @@ function Resolve-BridgeModelEffort {
 function Resolve-BridgeLaunchTuning {
     <#
         What a launch passes on each tuning axis, as a hashtable by axis with ''
-        meaning nothing: what the card chose, or - when it chose nothing - what the
-        config asks for, each through Resolve-BridgeTuningValue.
+        meaning nothing: what was chosen, or - for an axis left empty - what the config
+        asks for, each through Resolve-BridgeTuningValue. 'Agent default' named outright
+        is a choice of nothing, so the config does not fill it.
 
         An effort the chosen model does not take is then moved to one it does
         (Resolve-BridgeModelEffort), and the move is logged. Passed on as chosen, the
@@ -3161,7 +3162,11 @@ function Resolve-BridgeLaunchTuning {
     foreach ($axis in @(Get-BridgeTuningAxes)) {
         $asked = switch ($axis) { 'model' { $Model } 'effort' { $Effort } 'context' { $Context } }
         $value = Resolve-BridgeTuningValue -Launcher $Launcher -Axis $axis -Value $asked
-        if ([string]::IsNullOrWhiteSpace($value)) {
+        # Only an empty axis was left unchosen. The sentinel itself is a choice - the
+        # agent's own default over the one configured here - as the parameters of
+        # Start-BridgeCopilotSession have always said, though until a launch request
+        # could name it, it arrived here already emptied and the config won (#227).
+        if ([string]::IsNullOrWhiteSpace($value) -and ([string]$asked).Trim() -ne $script:BridgeTuningDefaultOption) {
             $value = Resolve-BridgeTuningValue -Launcher $Launcher -Axis $axis `
                 -Value (Get-BridgeDefaultTuning -Launcher $Launcher -Axis $axis)
         }

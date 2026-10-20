@@ -2022,6 +2022,13 @@ Test-That 'a configured list replaces the built-in one outright' {
 Test-That 'and a configured default opens the selector there' {
     (Get-BridgeDefaultTuning -Launcher 'claude' -Axis 'effort') -eq 'high'
 }
+# Named outright, Agent default chooses the agent's own default over the one configured
+# here. Only an axis left empty takes what the config asks for (#227).
+$filled = Resolve-BridgeLaunchTuning -Launcher 'claude' -Model '' -Effort '' -Context ''
+$waived = Resolve-BridgeLaunchTuning -Launcher 'claude' -Model '' -Effort 'Agent default' -Context ''
+Test-That 'an effort left empty takes the configured default, while Agent default named outright passes none' {
+    $filled['effort'] -ceq 'high' -and $waived['effort'] -ceq ''
+} "$(ConvertTo-Json -InputObject $filled -Compress) / $(ConvertTo-Json -InputObject $waived -Compress)"
 Test-That 'a launcher with nothing configured is unaffected' {
     (Get-BridgeTuningOptions -Launcher 'codex' -Axis 'model') -contains 'gpt-6.1-sol'
 }
@@ -2473,6 +2480,12 @@ Test-That 'the select offers both workspaces'  { (Get-Config 'new_workspace/conf
 Test-That 'they all land on the bridge device' { (Get-Config 'new_prompt/config') -match (Dev) }
 Test-That 'the prompt box is optimistic (no state topic)' { (Get-Config 'new_prompt/config') -notmatch '"state_topic"' }
 Test-That 'the result sensor does have a state topic' { (Get-Config 'new_session_result/config') -match '"state_topic"' }
+# What a launch an agent asked for came to rides beside the note as attributes (#227):
+# the note is a person's, capped at 255 characters and cleared once a launch succeeds,
+# so it could never say which session a request produced.
+Test-That 'the result sensor carries launch outcomes as its attributes' {
+    (Get-Config 'new_session_result/config') -match ('"json_attributes_topic":"copilot/cli/machine/' + $slug + '/newsession/outcome"')
+} (Get-Config 'new_session_result/config')
 Test-That 'a select is published for each tuning axis' {
     @('model', 'effort', 'context') | ForEach-Object { (Get-Config "select/${node}/new_$_/config") -match (Uid "new_$_") } |
         Where-Object { -not $_ } | Measure-Object | ForEach-Object { $_.Count -eq 0 }
@@ -2509,6 +2522,18 @@ Set-CopilotMqttNewSessionResult -Text ('y' * 400) -Headers $headers
 Test-That 'a long result is truncated to the state limit' {
     ($script:MqttMsgs | Where-Object { $_.Topic -match '/newsession/result$' } | Select-Object -First 1).Payload.Length -le 255
 }
+# Whole, unlike the state: an agent needs the full reason a launch was refused, and a
+# refusal that lists the models on offer runs well past 255 characters.
+Test-That 'though it is remembered whole, for the outcome an agent reads' {
+    ([string]$script:CopilotMqttNewSessionResultText).Length -eq 400
+}
+
+$script:MqttMsgs = @()
+Publish-CopilotMqttLaunchOutcome -Outcomes @([pscustomobject]@{ request = 'req-00000001'; outcome = 'started'; session = 'abcdef0123456789' }) -Headers $headers
+$outcomeMessage = $script:MqttMsgs | Where-Object { $_.Topic -eq "copilot/cli/machine/$slug/newsession/outcome" } | Select-Object -First 1
+Test-That 'launch outcomes are published as a list, even when there is only one' {
+    $null -ne $outcomeMessage -and $outcomeMessage.Payload -match '^\{"recent":\[\{"request":"req-00000001"'
+} $(if ($outcomeMessage) { [string]$outcomeMessage.Payload } else { 'nothing was published' })
 
 # --- the daemon reconcile --------------------------------------------------------
 
@@ -2525,10 +2550,17 @@ function Get-HomeAssistantState {
     if (-not $script:HaStates.ContainsKey($EntityId)) { throw "no such entity $EntityId" }
     $value = $script:HaStates[$EntityId]
     # A hashtable stands for an entity whose attributes matter - the prompt payload
-    # sensor, whose text is in an attribute because a state is capped at 255 chars.
+    # sensor, whose text is in an attribute because a state is capped at 255 chars -
+    # and carries Home Assistant's last_updated when a test needs to say when it was
+    # written.
     if ($value -is [hashtable]) {
-        return [pscustomobject]@{ state = [string]$value.state; attributes = [pscustomobject]$value.attributes }
+        $entity = [ordered]@{ state = [string]$value.state; attributes = [pscustomobject]$value.attributes }
+        if ($value.ContainsKey('last_updated')) { $entity['last_updated'] = $value['last_updated'] }
+        return [pscustomobject]$entity
     }
+    # Already shaped as Home Assistant's REST API hands it over - timestamps turned
+    # into DateTime by Invoke-RestMethod, a press carrying the account behind it.
+    if ($value -is [System.Management.Automation.PSCustomObject]) { return $value }
     [pscustomobject]@{ state = $value }
 }
 function Publish-CopilotMqttNewSession { param([object[]]$Workspaces, [string[]]$Profiles = @(), [object[]]$Resumable = @(), [string[]]$Agents = @(), [hashtable]$Tuning = @{}, [string]$LastResult = '', [hashtable]$Headers) }
@@ -3155,6 +3187,508 @@ $script:Launches = @()
 Sync-DaemonNewSession -Headers $headers -Live $noLive
 Test-That 'the retained payload is cleared once it has been used' { $script:PromptPayloadCleared -ge 1 } "$script:PromptPayloadCleared"
 Test-That 'and the text box is blanked alongside it' { $script:Cleared -contains 'text.set_value' } ($script:Cleared -join ',')
+
+Write-Host ''
+Write-Host '--- a launch an agent asks for, with settings of its own (#227) ---'
+# An agent's launch used to be whatever the card showed - your workspace, your agent,
+# an 'Allow all' you left selected - and it was never told what it had started. Its
+# request now rides on the prompt payload beside the text, and what it came to is
+# published back, keyed by the request id.
+$script:FakeSettings = @{
+    'newSession.workspaces' = @($alpha, $beta)
+    'newSession.launcher'   = 'agency'
+    'newSession.profiles'   = @('work', 'home', 'local')
+}
+$script:AgencyPresent = $true; $script:CopilotPresent = $true; $script:ClaudePresent = $true; $script:CodexPresent = $false
+$script:FakeRegistered = $false
+$script:FakeTrustScreen = ''
+$script:DaemonPendingLaunch = $null
+
+$script:Published = @()
+$script:SlotAtPublish = @()
+function Publish-CopilotMqttLaunchOutcome {
+    param([object[]]$Outcomes, [string]$Slug, [hashtable]$Headers)
+    $script:Published += , @($Outcomes)
+    # Which request the payload slot held as each answer went out.
+    $slot = $script:HaStates[$payloadEntity]
+    $script:SlotAtPublish += [string]$(if ($slot -is [hashtable] -and $slot['attributes'] -is [hashtable]) { $slot['attributes']['request'] })
+}
+function Get-Outcome {
+    param([string]$Request)
+    if ($script:Published.Count -eq 0) { return $null }
+    @($script:Published[-1]) | Where-Object { $_.request -ceq $Request } | Select-Object -First 1
+}
+function Set-CopilotMqttNewSessionResult {
+    param([string]$Text = '', [hashtable]$Headers)
+    $script:Results += $Text
+    $script:CopilotMqttNewSessionResultText = $Text
+}
+$script:PayloadClearFails = $false
+function Clear-CopilotMqttNewSessionPrompt {
+    param([string]$Slug, [hashtable]$Headers)
+    $script:PromptPayloadCleared++
+    # As Home Assistant has it once the empty object arrives: no stamp, no attributes.
+    if (-not $script:PayloadClearFails) { $script:HaStates[$payloadEntity] = @{ state = ''; attributes = @{} } }
+}
+function Test-BridgeAgentUserId { param([string]$UserId) $UserId -ceq 'agent-user' }
+function Start-BridgeCopilotSession {
+    param(
+        [string]$WorkingDirectory, [string]$Prompt = '', [string]$SessionId = '', [string]$AgencyProfile = '',
+        [string]$Launcher = '', [string]$Model = '', [string]$Effort = '', [string]$Context = '',
+        [switch]$AllowAllTools, [switch]$Resume
+    )
+    $script:Launches += [pscustomobject]@{
+        Directory = $WorkingDirectory; Prompt = $Prompt; AgencyProfile = $AgencyProfile; SessionId = $SessionId
+        Resumed = $Resume.IsPresent; Launcher = $Launcher; Model = $Model; Effort = $Effort; Context = $Context
+        AllowAllTools = $AllowAllTools.IsPresent
+    }
+    # Codex picks its own id once it is running, so a launch of it hands none back.
+    $id = if ($SessionId) { $SessionId } elseif ($Launcher -eq 'codex') { '' } else { '11111111-2222-3333-4444-555555555555' }
+    # What the session was started with, as the real one reports it: a configured
+    # default fills an axis left empty, and an effort the model does not take is moved.
+    $chosen = Resolve-BridgeLaunchTuning -Launcher $Launcher -Model $Model -Effort $Effort -Context $Context
+    [pscustomobject]@{
+        Launched = $true; SessionId = $id; ProcessId = $PID; Launcher = $Launcher; Detail = "started pid $PID"
+        Model = $chosen['model']; Effort = $chosen['effort']; Context = $chosen['context']
+    }
+}
+$script:CodexRegisteredId = ''
+function Get-BridgeRegisteredSessionId {
+    param([string]$SessionId, [string]$Launcher, [DateTimeOffset]$Since)
+    if ($Launcher -eq 'codex') { return $script:CodexRegisteredId }
+    $SessionId
+}
+
+# A press as Home Assistant's REST API returns it: when, and the account behind it.
+function New-LaunchPress {
+    param([DateTimeOffset]$At = [DateTimeOffset]::Now, [string]$UserId = 'agent-user')
+    [pscustomobject]@{ state = $At.ToUniversalTime().ToString('o'); context = [pscustomobject]@{ user_id = $UserId } }
+}
+# A request as the MCP server publishes it, landing on the payload sensor
+# -SecondsBefore the press it is for, by Home Assistant's own clock.
+function Set-LaunchRequest {
+    param([string]$Request, $Settings, [string]$Text = '', [DateTimeOffset]$Press, [double]$SecondsBefore = 0.4)
+    $written = $Press.AddSeconds(-$SecondsBefore).ToUniversalTime().ToString('o')
+    $attributes = @{ at = $written; text = $Text; request = $Request }
+    if ($null -ne $Settings) { $attributes['settings'] = $Settings }
+    $script:HaStates[$payloadEntity] = @{ state = $written; last_updated = $written; attributes = $attributes }
+}
+# An agent's launch end to end: the card as a person left it, the request published,
+# the press made and the daemon handling it.
+function Invoke-AgentLaunch {
+    param(
+        $Settings = @{}, [string]$Text = '', [string]$Request = ([guid]::NewGuid().ToString()),
+        [double]$SecondsBefore = 0.4, [DateTimeOffset]$At = [DateTimeOffset]::Now, [string]$UserId = 'agent-user',
+        [hashtable]$Card = @{}, [string]$CardPermissions = '', [switch]$KeepPending
+    )
+    Reset-NewSessionTest -Press 'unknown' @Card
+    if ($CardPermissions) { $script:HaStates["select.agent_bridge_${slug}_new_permissions"] = $CardPermissions }
+    if (-not $KeepPending) { $script:DaemonPendingLaunch = $null }
+    $script:HaStates["button.agent_bridge_${slug}_new_session"] = New-LaunchPress -At $At -UserId $UserId
+    Set-LaunchRequest -Request $Request -Settings $Settings -Text $Text -Press $At -SecondsBefore $SecondsBefore
+    $script:PromptPayloadCleared = 0
+    $script:Sent = @()
+    Sync-DaemonNewSession -Headers $headers -Live $noLive | Out-Null
+    $Request
+}
+$claudeModel = @(Get-BridgeTuningOptions -Launcher 'claude' -Axis 'model') | Where-Object { $_ -ne 'Agent default' } | Select-Object -First 1
+$claudeEffort = @(Get-BridgeTuningOptions -Launcher 'claude' -Axis 'effort') | Where-Object { $_ -ne 'Agent default' } | Select-Object -First 1
+Test-That 'Claude offers a model and an effort to ask for' { $claudeModel -and $claudeEffort } "$claudeModel / $claudeEffort"
+
+$id = Invoke-AgentLaunch -Text 'from the agent' -Settings @{
+    agent = 'Claude'; workspace = 'beta'; model = $claudeModel; effort = $claudeEffort; permissions = 'Allow all'
+}
+$l = if ($script:Launches.Count) { $script:Launches[0] } else { $null }
+Test-That "an agent's settings decide its launch, not the card's" {
+    $script:Launches.Count -eq 1 -and $l.Launcher -eq 'claude' -and $l.Directory -eq $beta -and
+        $l.Model -eq $claudeModel -and $l.Effort -eq $claudeEffort -and $l.AllowAllTools
+} ($l | ConvertTo-Json -Compress)
+Test-That 'its own text is the prompt, not the card''s box' { $l.Prompt -eq 'from the agent' }
+Test-That 'the request is taken out of the payload as it is used' { $script:PromptPayloadCleared -ge 1 }
+Test-That 'while the box a person types in is left alone' { $script:Cleared -notcontains 'text.set_value' } ($script:Cleared -join ',')
+Test-That 'and the agent is told it is starting, and with what' {
+    $o = Get-Outcome -Request $id
+    $null -ne $o -and $o.outcome -eq 'starting' -and $o.launched.agent -eq 'Claude' -and
+        $o.launched.workspace -eq 'beta' -and $o.launched.permissions -eq 'Allow all' -and $o.pressed
+} ((Get-Outcome -Request $id) | ConvertTo-Json -Compress)
+
+# An agent that finds its request neither waiting in the slot nor answered takes it as
+# replaced by another launch, with nothing started for it. So it is answered before the
+# slot is emptied, however long working out what it asks for takes after that.
+$script:Published = @(); $script:SlotAtPublish = @()
+$id = Invoke-AgentLaunch -Settings @{ workspace = 'beta' }
+$firstAnswer = -1
+for ($i = 0; $i -lt $script:Published.Count; $i++) {
+    if (@($script:Published[$i]) | Where-Object { $_.request -ceq $id }) { $firstAnswer = $i; break }
+}
+Test-That 'a request is answered before it leaves the slot, so it is never in neither place' {
+    $firstAnswer -ge 0 -and $script:SlotAtPublish[$firstAnswer] -ceq $id -and $script:PromptPayloadCleared -ge 1
+} ("slot held '{0}' when it was first answered" -f $(if ($firstAnswer -ge 0) { $script:SlotAtPublish[$firstAnswer] } else { 'n/a' }))
+
+# D1: what the request leaves out is the machine's configured default. Never the card:
+# that is somebody else's choice, made for a launch of their own.
+$id = Invoke-AgentLaunch -Card @{ Workspace = 'beta'; AgentState = 'Claude'; ProfileState = 'home'; Prompt = 'typed by a person' } `
+    -CardPermissions 'Allow all'
+$l = if ($script:Launches.Count) { $script:Launches[0] } else { $null }
+Test-That "what an agent leaves out comes from this machine's defaults, not the card" {
+    $script:Launches.Count -eq 1 -and $l.Launcher -eq 'agency' -and $l.Directory -eq $alpha -and
+        $l.AgencyProfile -eq 'work' -and $l.Model -eq '' -and $l.Effort -eq ''
+} ($l | ConvertTo-Json -Compress)
+Test-That "so an 'Allow all' left on the card is never inherited" { -not $l.AllowAllTools }
+Test-That 'nor is what a person was typing' { $l.Prompt -eq '' }
+# The other way round: a machine configured to launch unattended does so for an agent
+# that does not say, whatever the card shows.
+$script:FakeSettings['newSession.allowAllTools'] = $true
+$id = Invoke-AgentLaunch -CardPermissions 'Ask permission'
+$script:FakeSettings.Remove('newSession.allowAllTools')
+Test-That 'and a machine set to allow all does, though the card says ask' {
+    $script:Launches.Count -eq 1 -and $script:Launches[0].AllowAllTools -and (Get-Outcome -Request $id).launched.permissions -eq 'Allow all'
+}
+
+# Agent default named outright is the agent's own default, not the one configured here,
+# which only an axis left out takes. Emptied on the way to the launcher, it was filled
+# from the config again - the very setting it asked to be without.
+$script:FakeSettings['newSession.effort.claude'] = 'high'
+$id = Invoke-AgentLaunch -Settings @{ agent = 'Claude'; effort = 'Agent default' }
+$waivedLaunch = if ($script:Launches.Count) { $script:Launches[0] } else { $null }
+$waivedOutcome = Get-Outcome -Request $id
+$id = Invoke-AgentLaunch -Settings @{ agent = 'Claude' }
+$filledOutcome = Get-Outcome -Request $id
+$script:FakeSettings.Remove('newSession.effort.claude')
+Test-That "an agent naming Agent default gets the agent's own effort, not the one configured here" {
+    $null -ne $waivedLaunch -and $waivedLaunch.Effort -eq 'Agent default' -and
+        $null -ne $waivedOutcome -and $waivedOutcome.launched.effort -ceq ''
+} "passed '$(if ($waivedLaunch) { $waivedLaunch.Effort })'; $($waivedOutcome | ConvertTo-Json -Compress -Depth 4)"
+Test-That 'while one that leaves effort out gets the configured one, and is told so' {
+    $null -ne $filledOutcome -and $filledOutcome.launched.effort -ceq 'high'
+} ($filledOutcome | ConvertTo-Json -Compress -Depth 4)
+
+# The launcher moves an effort the model does not take to one it does, so what the
+# agent is told is the effort the session got, as the session card's record is.
+$discoveryStub = ${function:Get-BridgeLauncherModelDiscovery}
+function Get-BridgeLauncherModelDiscovery {
+    param([string]$Launcher, [string]$Path)
+    $takes = @{}
+    if ($Launcher -eq 'claude') { $takes[$claudeModel] = @('low') }
+    [pscustomobject]@{ Models = @(); Efforts = @(); EffortsKnown = $false; ModelEfforts = $takes }
+}
+try { $id = Invoke-AgentLaunch -Settings @{ agent = 'Claude'; model = $claudeModel; effort = 'high' } }
+finally { ${function:Get-BridgeLauncherModelDiscovery} = $discoveryStub }
+$moved = Get-Outcome -Request $id
+Test-That 'the outcome names the effort the agent was started with, not the one asked for' {
+    $null -ne $moved -and $moved.launched.model -ceq $claudeModel -and $moved.launched.effort -ceq 'low'
+} ($moved | ConvertTo-Json -Compress -Depth 4)
+
+# Refused rather than guessed at, naming what this machine does offer, so the agent can
+# put it right without anyone looking at the card.
+$refusals = @(
+    @{ Name = 'an agent that is not installed'; Settings = @{ agent = 'Gemini' }; Says = "Unknown agent 'Gemini' - this machine has *Claude*" }
+    @{ Name = 'a workspace that is not approved'; Settings = @{ workspace = 'nowhere' }; Says = "Unknown workspace 'nowhere' - this machine has alpha, beta" }
+    @{ Name = 'a profile Agency does not have'; Settings = @{ profile = 'prod' }; Says = "Unknown profile 'prod' - this machine has work, home, local" }
+    @{ Name = 'a profile for an agent that has none'; Settings = @{ agent = 'Claude'; profile = 'work' }; Says = '*applies only to Agency*' }
+    @{ Name = 'a model the agent does not offer'; Settings = @{ agent = 'Claude'; model = 'gpt-9000' }; Says = "Unknown model 'gpt-9000' for Claude - it offers Agent default, $claudeModel*" }
+    @{ Name = 'permissions in the wrong case'; Settings = @{ permissions = 'allow all' }; Says = "Unknown permissions 'allow all' - use 'Ask permission' or 'Allow all'" }
+    @{ Name = 'a setting that does not exist'; Settings = @{ colour = 'blue' }; Says = "*unknown setting 'colour'*" }
+    @{ Name = 'a setting that is not text'; Settings = @{ model = 5 }; Says = '*the model setting has to be text*' }
+    @{ Name = 'a session that is not resumable'; Settings = @{ resume = 'Long gone - alpha' }; Says = "No resumable session 'Long gone - alpha'*" }
+    @{ Name = 'a resume and a workspace together'; Settings = @{ resume = 'Long gone - alpha'; workspace = 'alpha' }; Says = '*reopens in its own folder*' }
+)
+foreach ($case in $refusals) {
+    $id = Invoke-AgentLaunch -Settings $case.Settings
+    $o = Get-Outcome -Request $id
+    Test-That "$($case.Name) is refused, says what there is instead, and starts nothing" {
+        $script:Launches.Count -eq 0 -and $null -ne $o -and $o.outcome -eq 'refused' -and
+            $o.note -like "*$($case.Says)" -and $script:PromptPayloadCleared -ge 1
+    } "$($script:Launches.Count) launch(es); outcome $(if ($o) { "$($o.outcome): $($o.note)" } else { 'none' })"
+}
+
+# Freshness is judged on Home Assistant's clock alone: when the payload sensor last
+# changed against when the button was pressed.
+$id = Invoke-AgentLaunch -Settings @{ workspace = 'beta' } -Text 'long forgotten' -SecondsBefore 120 -UserId 'a-person' `
+    -Card @{ Prompt = 'typed by a person' }
+Test-That 'a request left from long before the press is not this press''s' {
+    $script:Launches.Count -eq 1 -and $script:Launches[0].Directory -eq $alpha -and $null -eq (Get-Outcome -Request $id)
+}
+Test-That 'not even its text: the press takes the card''s' { $script:Launches[0].Prompt -eq 'typed by a person' } ($script:Launches | ConvertTo-Json -Compress)
+
+$at = [DateTimeOffset]::Now
+$id = Invoke-AgentLaunch -Settings @{ workspace = 'beta' } -SecondsBefore -1 -At $at
+Test-That 'a request published after the press is left for the press it belongs to' {
+    $script:Launches.Count -eq 0 -and $script:PromptPayloadCleared -eq 0
+}
+$script:HaStates["button.agent_bridge_${slug}_new_session"] = New-LaunchPress -At $at.AddSeconds(2)
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+Test-That 'which then launches it' {
+    $script:Launches.Count -eq 1 -and $script:Launches[0].Directory -eq $beta -and (Get-Outcome -Request $id).outcome -eq 'starting'
+}
+
+$id = Invoke-AgentLaunch -Request 'not a valid id!' -Settings @{ workspace = 'beta' }
+Test-That 'a request whose id cannot be echoed back is refused, and nothing starts' {
+    $script:Launches.Count -eq 0 -and $script:PromptPayloadCleared -ge 1 -and ($script:Results -join ' ') -match 'id that is not valid'
+}
+Test-That 'and no outcome repeats that id' {
+    @($script:Published | ForEach-Object { $_ } | Where-Object { $_.request -eq 'not a valid id!' }).Count -eq 0
+}
+
+# A clear that failed leaves the request where it was. Served by id once, it is never
+# served again - a later press uses the card, and not the request's text.
+$script:PayloadClearFails = $true
+$id = Invoke-AgentLaunch -Settings @{ workspace = 'beta' } -Text 'only once'
+$script:PayloadClearFails = $false
+$servedFirst = $script:Launches.Count
+$script:Launches = @()
+$script:DaemonPendingLaunch = $null
+$script:HaStates["button.agent_bridge_${slug}_new_session"] = New-LaunchPress -UserId 'a-person'
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+Test-That 'a request still in the payload after it was served is never served again' {
+    $servedFirst -eq 1 -and $script:Launches.Count -eq 1 -and $script:Launches[0].Directory -eq $alpha -and
+        $script:Launches[0].Prompt -eq 'do the thing'
+} "$servedFirst, then $($script:Launches.Count): $($script:Launches | ConvertTo-Json -Compress)"
+
+# Two agents can launch on one machine moments apart, each waiting on its own id, so a
+# single slot would let the second answer erase the first before it was read.
+$ids = @(foreach ($n in 1..6) { Invoke-AgentLaunch -Settings @{ workspace = "nowhere-$n" } })
+Test-That 'the latest five outcomes are kept, newest first' {
+    $list = @($script:Published[-1])
+    $list.Count -eq 5 -and $list[0].request -eq $ids[5] -and @($list | ForEach-Object { $_.request }) -notcontains $ids[0]
+}
+
+# Held while discovery is incomplete: the press waits for it rather than being refused,
+# so the agent hears that it is waiting - and the request stays where it is.
+Reset-NewSessionTest -Press 'unknown'
+$script:DaemonPendingLaunch = $null
+$script:PromptPayloadCleared = 0
+$at = [DateTimeOffset]::Now
+$script:HaStates["button.agent_bridge_${slug}_new_session"] = New-LaunchPress -At $at
+Set-LaunchRequest -Request 'held-request-0001' -Settings @{ workspace = 'beta' } -Press $at
+$script:DaemonDiscoverySnapshot = $null
+Invoke-DaemonHit -Hit ([pscustomobject]@{ EntityId = $script:DaemonEntity.NewSession }) -Headers $headers -State @{}
+Test-That 'a held launch tells its agent it is waiting, and on what' {
+    $o = Get-Outcome -Request 'held-request-0001'
+    $null -ne $o -and $o.outcome -eq 'waiting' -and $o.note -match 'held'
+} ((Get-Outcome -Request 'held-request-0001') | ConvertTo-Json -Compress)
+Test-That 'without using the request up' { $script:Launches.Count -eq 0 -and $script:PromptPayloadCleared -eq 0 }
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+Test-That 'which launches once discovery completes' {
+    $script:Launches.Count -eq 1 -and $script:Launches[0].Directory -eq $beta -and (Get-Outcome -Request 'held-request-0001').outcome -eq 'starting'
+}
+
+# The same, but a person's press replaces the request before discovery completes: that
+# request will now never launch, and its agent is told so rather than left waiting.
+Reset-NewSessionTest -Press 'unknown'
+$script:DaemonPendingLaunch = $null
+$at = [DateTimeOffset]::Now
+$script:HaStates["button.agent_bridge_${slug}_new_session"] = New-LaunchPress -At $at
+Set-LaunchRequest -Request 'held-request-0002' -Settings @{ workspace = 'beta' } -Press $at
+Invoke-DaemonHit -Hit ([pscustomobject]@{ EntityId = $script:DaemonEntity.NewSession }) -Headers $headers -State @{}
+$script:HaStates[$payloadEntity] = @{
+    state = $at.AddSeconds(1).ToString('o'); last_updated = $at.AddSeconds(1).ToString('o')
+    attributes = @{ at = $at.AddSeconds(1).ToString('o'); text = 'mine'; card_version = '1.18.0' }
+}
+$script:HaStates["button.agent_bridge_${slug}_new_session"] = New-LaunchPress -At $at.AddSeconds(2) -UserId 'a-person'
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+Test-That 'a held request replaced by a later press is reported as never launched' {
+    $o = Get-Outcome -Request 'held-request-0002'
+    $null -ne $o -and $o.outcome -eq 'refused' -and $o.note -match 'replaced'
+} ((Get-Outcome -Request 'held-request-0002') | ConvertTo-Json -Compress)
+Test-That 'while the press that replaced it launches as its own' {
+    $script:Launches.Count -eq 1 -and $script:Launches[0].Prompt -eq 'mine'
+}
+
+# A press used to be taken as the answer to whatever a launch in progress was waiting
+# for - a trust question, or a Codex's first message - whoever made it and whatever it
+# was for. An agent's launch could grant trust to a folder on a person's behalf, or
+# type its prompt into somebody else's window.
+function Set-TrustWait {
+    $script:DaemonPendingLaunch = [pscustomobject]@{
+        SessionId = 'p'; ProcessId = $PID; Launcher = 'claude'; Label = 'alpha'; Verb = 'Started'
+        Since = [DateTimeOffset]::Now; LastCheck = [DateTimeOffset]::Now
+        TrustAskedAt = [DateTimeOffset]::Now; TrustConfirmed = $false; TrustAnswers = 0
+    }
+}
+Set-TrustWait
+$id = Invoke-AgentLaunch -KeepPending -Settings @{ agent = 'Claude' }
+Test-That "an agent's launch never answers a trust question that is a person's" {
+    -not $script:DaemonPendingLaunch.TrustConfirmed -and $script:Launches.Count -eq 0
+}
+Test-That 'it is told the machine is busy, and why' {
+    $o = Get-Outcome -Request $id
+    $null -ne $o -and $o.outcome -eq 'busy' -and $o.note -match 'trust'
+}
+Test-That 'and the card goes on asking the person' { $script:Results.Count -eq 0 } ($script:Results -join ' | ')
+
+Set-TrustWait
+Reset-NewSessionTest -Press 'unknown'
+$script:DaemonLaunchConsumedPress = [DateTimeOffset]::MinValue
+$script:HaStates["button.agent_bridge_${slug}_new_session"] = New-LaunchPress -UserId 'agent-user'
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+Test-That "nor does an agent's press that carries no request" {
+    -not $script:DaemonPendingLaunch.TrustConfirmed -and $script:Launches.Count -eq 0
+}
+$script:HaStates["button.agent_bridge_${slug}_new_session"] = New-LaunchPress -At ([DateTimeOffset]::Now.AddSeconds(1)) -UserId 'a-person'
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+Test-That "while a person's press still answers it" { $script:DaemonPendingLaunch.TrustConfirmed }
+
+$script:CodexPresent = $true
+$script:Sent = @()
+function Set-FirstMessageWait {
+    $script:DaemonPendingLaunch = [pscustomobject]@{
+        SessionId = ''; ProcessId = $PID; Launcher = 'codex'; Label = 'alpha'; Verb = 'Started'
+        Since = [DateTimeOffset]::Now; LastCheck = [DateTimeOffset]::Now
+        TrustAskedAt = $null; TrustConfirmed = $false; TrustAnswers = 0
+        AwaitingFirstMessage = $true; FirstMessageAsked = $true
+    }
+}
+Set-FirstMessageWait
+$id = Invoke-AgentLaunch -KeepPending -Text 'meant for a session of my own' -Card @{ AgentState = 'Codex' } -Settings @{ agent = 'Claude' }
+Test-That "an agent's text is never typed into a window waiting on somebody else's first message" { $script:Sent.Count -eq 0 }
+Test-That 'the agent gets the launch it asked for instead' {
+    $script:Launches.Count -eq 1 -and $script:Launches[0].Launcher -eq 'claude' -and $script:Launches[0].Prompt -eq 'meant for a session of my own'
+}
+
+Set-FirstMessageWait
+Reset-NewSessionTest -Press 'unknown' -AgentState 'Codex' -Prompt 'from the card'
+$script:DaemonLaunchConsumedPress = [DateTimeOffset]::MinValue
+$script:HaStates["button.agent_bridge_${slug}_new_session"] = New-LaunchPress -UserId 'agent-user'
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+Test-That "nor is the card's text typed there on an agent's press" { $script:Sent.Count -eq 0 }
+$script:CodexPresent = $false
+
+# One payload slot, so two agents launching at once can have one press use the other's
+# request. The second press then finds the slot empty, and launching the card's
+# selections for it would start something nobody asked for.
+$at = [DateTimeOffset]::Now
+$id = Invoke-AgentLaunch -At $at -Settings @{ workspace = 'beta' }
+$script:Launches = @()
+$script:DaemonPendingLaunch = $null
+$script:HaStates["button.agent_bridge_${slug}_new_session"] = New-LaunchPress -At $at.AddSeconds(2) -UserId 'agent-user'
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+Test-That "a second agent's press arriving to a slot just used launches nothing" { $script:Launches.Count -eq 0 }
+$script:HaStates["button.agent_bridge_${slug}_new_session"] = New-LaunchPress -At $at.AddSeconds(3) -UserId 'a-person'
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+Test-That "while a person's press moments later still launches from the card" {
+    $script:Launches.Count -eq 1 -and $script:Launches[0].Directory -eq $alpha
+}
+
+# A press held for discovery is served whenever discovery completes. An agent that
+# asked was long since told its launch was pending, so it is not started that late.
+$id = Invoke-AgentLaunch -At ([DateTimeOffset]::Now.AddMinutes(-6)) -Settings @{ workspace = 'beta' }
+Test-That 'a request served more than five minutes after its press is refused, not started late' {
+    $o = Get-Outcome -Request $id
+    $script:Launches.Count -eq 0 -and $null -ne $o -and $o.outcome -eq 'refused' -and $o.note -match '5 minutes'
+}
+
+# What the launch came to, followed to the end. The session is named as the MCP tools
+# name it - the node every one of its entities is called after.
+$id = Invoke-AgentLaunch -Settings @{ agent = 'Claude' }
+$script:FakeRegistered = $true
+Invoke-FollowUp
+$script:FakeRegistered = $false
+Test-That 'once it registers, the agent is told which session it produced' {
+    $o = Get-Outcome -Request $id
+    $null -ne $o -and $o.outcome -eq 'started' -and $o.session -ceq '1111111122223333' -and $o.launched.agent -eq 'Claude'
+} ((Get-Outcome -Request $id) | ConvertTo-Json -Compress)
+
+$script:CodexPresent = $true
+$script:CodexRegisteredId = 'C0DEC0DE-aaaa-bbbb-cccc-000000000001'
+$id = Invoke-AgentLaunch -Settings @{ agent = 'Codex' } -Text 'hello'
+$script:FakeRegistered = $true
+Invoke-FollowUp
+$script:FakeRegistered = $false
+Test-That 'Codex too, though it picks its own id only once it is running' {
+    (Get-Outcome -Request $id).session -ceq 'c0dec0deaaaabbbb'
+} ((Get-Outcome -Request $id) | ConvertTo-Json -Compress)
+$script:CodexPresent = $false
+
+$first = Invoke-AgentLaunch -Settings @{ workspace = 'alpha' }
+$second = Invoke-AgentLaunch -KeepPending -Settings @{ workspace = 'beta' }
+Test-That 'a launch replaced before it registered is reported as no longer followed' {
+    (Get-Outcome -Request $first).outcome -eq 'unconfirmed' -and (Get-Outcome -Request $second).outcome -eq 'starting'
+}
+
+$id = Invoke-AgentLaunch
+$script:DaemonPendingLaunch.ProcessId = 999999
+Invoke-FollowUp
+Test-That 'one whose window closes before it registers has failed' {
+    $o = Get-Outcome -Request $id
+    $o.outcome -eq 'failed' -and $o.note -match 'closed before it started' -and $o.launched.agent -eq 'Agency'
+}
+
+# A launch that throws partway has still used its request up, so it has to say it
+# failed: otherwise its agent finds the request nowhere and takes it for lost.
+$launchStub = ${function:Start-BridgeCopilotSession}
+function Start-BridgeCopilotSession { throw 'the terminal would not open' }
+$threw = $false
+try { [void](Invoke-AgentLaunch -Request 'throwing-launch-0001') } catch { $threw = $true }
+${function:Start-BridgeCopilotSession} = $launchStub
+Test-That 'one that throws is reported as failed, with what went wrong' {
+    $o = Get-Outcome -Request 'throwing-launch-0001'
+    $threw -and $null -ne $o -and $o.outcome -eq 'failed' -and $o.note -match 'would not open'
+} ((Get-Outcome -Request 'throwing-launch-0001') | ConvertTo-Json -Compress)
+
+$id = Invoke-AgentLaunch -Settings @{ agent = 'Claude' }
+$script:FakeTrustScreen = 'no'
+Invoke-FollowUp
+$script:FakeTrustScreen = ''
+Test-That 'a trust question leaves it waiting, on a person rather than on the agent' {
+    $o = Get-Outcome -Request $id
+    $o.outcome -eq 'waiting' -and $o.note -match 'A person has to answer'
+}
+$script:DaemonPendingLaunch = $null
+
+# A launch being followed does not survive a restart. What the last daemon published is
+# taken up rather than wiped, and one it was still following becomes unconfirmed.
+$script:Published = @()
+$script:DaemonLaunchOutcomes = @()
+$retained = @'
+{"state":"","attributes":{"recent":[
+  {"request":"restored-request-1","outcome":"starting","session":"","note":"Starting...","pressed":"2026-10-20T17:00:00.5+00:00","at":"2026-10-20T17:00:01+00:00","launched":{"agent":"Claude"}},
+  {"request":"restored-request-2","outcome":"started","session":"abcdef0123456789","note":"","pressed":"2026-10-20T16:00:00+00:00","at":"2026-10-20T16:00:05+00:00","launched":null},
+  {"request":"not valid!","outcome":"started"}
+]}}
+'@ | ConvertFrom-Json
+Restore-DaemonLaunchOutcomes -State $retained -Headers $headers
+Test-That 'after a restart, a launch still being followed becomes unconfirmed' {
+    $o = @($script:DaemonLaunchOutcomes | Where-Object { $_.request -eq 'restored-request-1' })[0]
+    $o.outcome -eq 'unconfirmed' -and $o.note -match 'restarted' -and $o.launched.agent -eq 'Claude' -and $script:Published.Count -eq 1
+}
+Test-That 'finished ones are kept as they were, and nothing malformed is carried over' {
+    $kept = @($script:DaemonLaunchOutcomes)
+    $kept.Count -eq 2 -and $kept[1].outcome -eq 'started' -and $kept[1].session -eq 'abcdef0123456789' -and
+        $kept[1].pressed -eq '2026-10-20T16:00:00.0000000+00:00'
+} ($script:DaemonLaunchOutcomes | ConvertTo-Json -Compress -Depth 4)
+Test-That 'and none of them can be served again by a payload left behind' {
+    @($script:DaemonLaunchRequestsHandled) -ccontains 'restored-request-1'
+}
+
+# Invoke-RestMethod hands a timestamp over as a DateTime, whose string form stops at the
+# second. Both of these were lost to it: a second press inside the same second read as
+# the first, and a request published milliseconds before its press as coming after it.
+$second0 = [DateTimeOffset]::FromUnixTimeSeconds([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())
+Reset-NewSessionTest -Press 'unknown'
+$script:DaemonPendingLaunch = $null
+$script:HaStates["button.agent_bridge_${slug}_new_session"] = [pscustomobject]@{ state = $second0.AddMilliseconds(100).LocalDateTime }
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+$script:DaemonPendingLaunch = $null
+$script:HaStates["button.agent_bridge_${slug}_new_session"] = [pscustomobject]@{ state = $second0.AddMilliseconds(600).LocalDateTime }
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+Test-That 'two presses within one second are two presses' { $script:Launches.Count -eq 2 } "$($script:Launches.Count) launch(es)"
+
+Reset-NewSessionTest -Press 'unknown'
+$script:DaemonPendingLaunch = $null
+$written = $second0.AddMilliseconds(470).ToString('o')
+$script:HaStates[$payloadEntity] = (@{
+    state = $written; last_updated = $written
+    attributes = @{ at = $written; text = 'over REST'; request = 'rest-shaped-0001'; settings = @{ workspace = 'beta' } }
+} | ConvertTo-Json -Depth 4 | ConvertFrom-Json)
+$script:HaStates["button.agent_bridge_${slug}_new_session"] = ([pscustomobject]@{
+    state = $second0.AddMilliseconds(500).ToString('o'); context = @{ user_id = 'agent-user' }
+} | ConvertTo-Json | ConvertFrom-Json)
+Sync-DaemonNewSession -Headers $headers -Live $noLive
+Test-That 'a request read back as Home Assistant returns it, milliseconds before its press, is that press''s' {
+    $script:Launches.Count -eq 1 -and $script:Launches[0].Directory -eq $beta -and $script:Launches[0].Prompt -eq 'over REST'
+} "$($script:Launches.Count) launch(es): $($script:Launches | ConvertTo-Json -Compress)"
+$script:DaemonPendingLaunch = $null
 
 Remove-Item -LiteralPath $root -Recurse -Force -ErrorAction SilentlyContinue
 Remove-Item -LiteralPath $testLogFile -Force -ErrorAction SilentlyContinue

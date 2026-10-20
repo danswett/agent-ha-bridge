@@ -426,6 +426,21 @@ $script:FakeProfiles = @('work', 'home')
 $script:FakeLaunchers = @('copilot')
 Test-That 'and a machine without Agency never gets one' { -not (Get-DaemonLaunchCapabilities).profile }
 
+# What an MCP server checks before sending a launch its own settings (#227). A daemon
+# without it launches from the card and ignores them, so it must never be implied.
+Test-That 'a machine that launches says it takes launch requests' { (Get-DaemonLaunchCapabilities).launchRequest -eq 1 }
+function Get-BridgeSetting {
+    param([Parameter(Mandatory)][string]$Path, $Default = $null)
+    if ($Path -eq 'newSession.enabled') { return $false }
+    $Default
+}
+Test-That 'and one with launching turned off does not' { (Get-DaemonLaunchCapabilities).launchRequest -eq 0 }
+function Get-BridgeSetting {
+    param([Parameter(Mandatory)][string]$Path, $Default = $null)
+    if ($Path -eq 'newSession.enabled') { return $true }
+    $Default
+}
+
 Remove-Item -LiteralPath $script:DaemonConfig.LogFile -Force -ErrorAction SilentlyContinue
 Write-Host '--- real publication, external deletion and retirement ---'
 . (Join-Path $PSScriptRoot 'test-dashboard.ps1') -PublicationFixturesOnly

@@ -237,6 +237,23 @@ $script:DaemonLaunchKeptNote = ''
 $script:DaemonNewSessionPressDriver = ''
 $script:DaemonLaunchDrivers = @{}
 
+# Launches an agent asks for with settings of its own (#227). The request a press
+# carries, while that press is being handled; whether the prompt payload holds a
+# request this press must not take its text from; the requests already served, so a
+# payload that could not be cleared is never served twice; the press that last
+# consumed one, which is how a second agent's press finding the slot already emptied
+# is recognised; the request reported as held while discovery was incomplete; what
+# Start-DaemonLaunch came to; the exact moment of the press being handled; and what
+# the latest requests came to, newest first, as published for the agents waiting.
+$script:DaemonLaunchRequest = $null
+$script:DaemonLaunchPayloadSkip = $false
+$script:DaemonLaunchRequestsHandled = @()
+$script:DaemonLaunchConsumedPress = [DateTimeOffset]::MinValue
+$script:DaemonLaunchHeldRequest = ''
+$script:DaemonLaunchVerdict = ''
+$script:DaemonNewSessionPressedAt = [DateTimeOffset]::MinValue
+$script:DaemonLaunchOutcomes = @()
+
 # Adapter installs started for agents installed after the bridge (Sync-DaemonClients),
 # and why the daemon should restart once the pass is done - to load a new adapter.
 $script:DaemonClientSetup = @{}
@@ -723,14 +740,22 @@ function Initialize-DaemonStartup {
     # progress ("Starting...", "Codex is open in...", "press Launch again to trust")
     # would otherwise stay up with nothing left to clear it. Other notes - an agent
     # just set up, which restarts the daemon on purpose - are left to expire.
+    $resultState = $null
     try {
-        $note = [string](Get-HomeAssistantState -EntityId $script:DaemonEntity.NewResult -Headers $headers).state
+        $resultState = Get-HomeAssistantState -EntityId $script:DaemonEntity.NewResult -Headers $headers
+        $note = [string]$resultState.state
         if (Test-DaemonLaunchProgressNote -Text $note) {
             Set-CopilotMqttNewSessionResult -Headers $headers -Text ''
             Write-DaemonLog -Message "cleared a launch note left from before the restart: $note"
         }
     }
     catch { }
+    # What launches agents asked for came to, as the previous daemon left it (#227).
+    try { Restore-DaemonLaunchOutcomes -State $resultState -Headers $headers }
+    catch {
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        Write-DaemonLog -Message "launch outcomes from before the restart could not be read: $($_.Exception.Message)"
+    }
 
     # Compile the console injector now rather than on the first reply. The compile
     # takes about 650 ms, which the first reply after every start used to wait for.
@@ -991,6 +1016,9 @@ function Invoke-DaemonHit {
                 $text = if ($held) { "Launch held: waiting on $held." }
                     else { 'Session discovery is incomplete; launch is temporarily held.' }
                 Set-CopilotMqttNewSessionResult -Headers $headers -Text $text
+                # The press is served once discovery completes. An agent waiting on
+                # it is told so, rather than hearing nothing at all (#227).
+                Set-DaemonHeldLaunchOutcome -Note $text -Headers $headers
                 return
             }
             $liveNow = if ($script:DaemonLive -is [hashtable]) { $script:DaemonLive } else { @{} }

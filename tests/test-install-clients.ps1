@@ -1973,6 +1973,9 @@ function Invoke-AdapterEntityCleanupFixture {
                     @($without | Where-Object { -not $_.retain }).Count -eq 0 -and
                     @($without | Select-Object -Skip 1 | Where-Object { $_.payload -cne '' }).Count -eq 0
             }
+            # 28 rather than 27 since the launch outcomes an agent reads joined the
+            # machine list (#227): retained beside the launch note, so a machine
+            # removed from the dashboard must take them with it.
             # 27 rather than 26 since the per-machine check button joined the machine
             # list - the control that asks this machine to look for a release now, and
             # which the dashboard card fans out across every machine at once.
@@ -1991,8 +1994,8 @@ function Invoke-AdapterEntityCleanupFixture {
             # (#200). They were missing from the machine list until then, so an
             # uninstall left a machine's allowance rows behind. Counted from the list of
             # sensors, like the field slots above, because the number of further Copilot
-            # logins legitimately moves it; the 27 stays the tripwire.
-            $expectedMachineCleanup = 27 + 3 * @(Get-CopilotMqttUsageSensorKey).Count
+            # logins legitimately moves it; the 28 stays the tripwire.
+            $expectedMachineCleanup = 28 + 3 * @(Get-CopilotMqttUsageSensorKey).Count
             Test-That "$fixtureClient-only machine cleanup remains a separate $expectedMachineCleanup-topic control" {
                 $script:CleanupPublications.Count - $without.Count -eq $expectedMachineCleanup
             }
