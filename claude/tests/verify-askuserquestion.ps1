@@ -69,13 +69,23 @@ try {
     $raw = & claude -p 'say ok' --output-format stream-json --verbose 2>&1 | Out-String
     Pop-Location
 
-    $init = ($raw -split "`n") | Where-Object { $_ -match '"type"\s*:\s*"system"' } | Select-Object -First 1
+    # The tool list is on the init event. Hooks report on the same stream, and the
+    # bridge's own SessionStart hook puts hook_started and hook_response events ahead
+    # of it - so the first system line is a hook's, which carries no tool list. Read
+    # that way, Claude Code 2.1.285 advertised one "tool", and AskUserQuestion could
+    # never have been found, exposed or not.
+    $init = ($raw -split "`n") | Where-Object { $_.Trim() } | ForEach-Object {
+        try { $_ | ConvertFrom-Json -ErrorAction Stop } catch { }
+    } | Where-Object {
+        $null -ne $_ -and $_.PSObject.Properties['type'] -and $_.type -eq 'system' -and
+            $_.PSObject.Properties['subtype'] -and $_.subtype -eq 'init'
+    } | Select-Object -First 1
     if (-not $init) {
         Write-Host '  Could not read the tool list from Claude.' -ForegroundColor Yellow
         exit 2
     }
 
-    $tools = @(($init | ConvertFrom-Json).tools)
+    $tools = @($init.tools)
     $available = $tools -contains 'AskUserQuestion'
     Write-Host "  Claude advertises $($tools.Count) tools; AskUserQuestion present: $available"
 
