@@ -1601,9 +1601,10 @@ function Sync-DaemonUsage {
 
         Further Copilot logins named in usage.copilotAccounts (#200) are read on clocks
         of their own, each like another client: at the idle pace, since the sessions here
-        spend the signed-in account and never theirs, deferring to another machine's
-        reading of the same login exactly as a client does, and published on numbered
-        sensors that are withdrawn again once their login is no longer listed.
+        spend the signed-in account and never theirs, one a pass at most and the one that
+        has waited longest, deferring to another machine's reading of the same login
+        exactly as a client does, and published on numbered sensors that are withdrawn
+        again once their login is no longer listed.
     #>
     param(
         [Parameter(Mandatory)][hashtable]$Headers,
@@ -1674,29 +1675,44 @@ function Sync-DaemonUsage {
     if ($clients.Count -eq 0) { return $false }
 
     $known = $null -ne $Live
+    $logins = [System.Collections.Generic.List[object]]::new()
+    for ($slot = 0; $slot -lt $extras.Count; $slot++) {
+        $sensor = [string]$extras[$slot].Sensor
+        $login = [string]$extras[$slot].Login
+        $state = Get-BridgeUsageClientState -Client $sensor
+        # A slot given another login is another stream: when the login it carried was
+        # read, and whether it was published, says nothing about this one.
+        if ($state.ContainsKey('Login') -and [string]$state.Login -ne $login) {
+            [void]$script:DaemonUsageClients.Remove($sensor)
+            $state = Get-BridgeUsageClientState -Client $sensor
+        }
+        $state.Login = $login
+        # A turn stamped ahead of the clock has waited longest of all, as
+        # Test-BridgeUsageDue counts it overdue.
+        $waited = ($Now - $state.CheckedAt).TotalSeconds
+        $logins.Add([pscustomobject]@{
+                Key = $sensor; Client = 'copilot'; Login = $login; Slot = $slot
+                Waited = $(if ($waited -lt 0) { [double]::PositiveInfinity } else { $waited })
+            })
+    }
+    # Further logins are taken longest-waiting first, the one read a pass being the one
+    # owed it longest. Taken in slot order, the first slot was owed a read again on every
+    # pass wherever the paces were set no longer than the reconcile's quarter of a minute,
+    # or than an endpoint that never answers holds a read, and the slots after it were
+    # never read at all.
     $streams = @($clients | ForEach-Object { [pscustomobject]@{ Key = $_; Client = $_; Login = '' } }) +
-        @($extras | ForEach-Object { [pscustomobject]@{ Key = [string]$_.Sensor; Client = 'copilot'; Login = [string]$_.Login } })
+        @($logins | Sort-Object -Property @{ Expression = 'Waited'; Descending = $true }, @{ Expression = 'Slot'; Descending = $false })
     $due = @()
     $dueLogins = @()
     foreach ($stream in $streams) {
         # One further login is read a pass at most. The reconcile waits on these reads,
         # and a quota endpoint that accepts connections and never answers costs each of
         # them three fifteen-second attempts, so three logins read in one pass could hold
-        # it past the liveness expiry. The rest are left due, untouched, for the next
-        # pass a quarter of a minute later - nothing, for a login read every quarter of
-        # an hour.
+        # it past the liveness expiry. The rest are left due for the next pass a quarter
+        # of a minute later - nothing, for a login read every quarter of an hour.
         if ($stream.Login -and $dueLogins.Count -gt 0) { continue }
         $client = $stream.Client
         $state = Get-BridgeUsageClientState -Client $stream.Key
-        # A slot given another login is another stream: when the login it carried was
-        # read, and whether it was published, says nothing about this one.
-        if ($stream.Login) {
-            if ($state.ContainsKey('Login') -and [string]$state.Login -ne $stream.Login) {
-                [void]$script:DaemonUsageClients.Remove($stream.Key)
-                $state = Get-BridgeUsageClientState -Client $stream.Key
-            }
-            $state.Login = $stream.Login
-        }
         # The sessions open here spend the account Copilot is signed in as, never a
         # further login, so one of those is read at the idle pace whatever is open.
         $busy = if ($stream.Login) { $false } else { Test-BridgeUsageBusy -Client $client -Live $Live }

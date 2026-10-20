@@ -2095,6 +2095,29 @@ Test-That 'though one left to another machine is not a read, and does not hold u
     $secondOfTwo -ceq 'copilot,claude,codex;copilot_3:hubot'
 } "asked=$secondOfTwo"
 
+# Paced no longer than the reconcile's quarter of a minute - or than an endpoint that
+# never answers holds a read - the first slot is owed a read again on every pass. Taken
+# in slot order, it was the only one ever read.
+Reset-UsagePacing
+$script:Settings['usage.intervalSeconds'] = 10
+$script:Settings['usage.idleIntervalSeconds'] = 10
+$script:Settings['usage.copilotAccounts'] = @('one', 'two', 'three')
+$turns = @(foreach ($second in 0, 15, 30, 45) { Invoke-UsageAt $second $none })
+Test-That 'each further login takes its turn, though the first is owed a read again on every pass' {
+    ($turns -join ' / ') -ceq ('copilot,claude,codex;copilot_2:one / copilot,claude,codex;copilot_3:two / ' +
+        'copilot,claude,codex;copilot_4:three / copilot,claude,codex;copilot_2:one')
+} "asks=$($turns -join ' / ')"
+Reset-UsagePacing
+$script:Settings['usage.intervalSeconds'] = 10
+$script:Settings['usage.idleIntervalSeconds'] = 10
+$script:Settings['usage.copilotAccounts'] = @('one', 'two')
+[void](Invoke-UsageAt 0 $none)
+[void](Invoke-UsageAt 15 $none)
+$setBack = @(foreach ($second in -1000, -985) { Invoke-UsageAt $second $none })
+Test-That 'and a clock set back holds none of them up, a turn stamped ahead of it being the longest owed' {
+    ($setBack -join ' / ') -ceq 'copilot,claude,codex;copilot_2:one / copilot,claude,codex;copilot_3:two'
+} "asks=$($setBack -join ' / ')"
+
 Reset-UsagePacing
 $script:Settings['usage.copilotAccounts'] = @('danswett', 'ghp_0123456789abcdefABCDEF0123456789abcd')
 [void](Invoke-UsageAt 0 $none)
