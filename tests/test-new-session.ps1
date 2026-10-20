@@ -2022,6 +2022,13 @@ Test-That 'a configured list replaces the built-in one outright' {
 Test-That 'and a configured default opens the selector there' {
     (Get-BridgeDefaultTuning -Launcher 'claude' -Axis 'effort') -eq 'high'
 }
+# Named outright, Agent default chooses the agent's own default over the one configured
+# here. Only an axis left empty takes what the config asks for (#227).
+$filled = Resolve-BridgeLaunchTuning -Launcher 'claude' -Model '' -Effort '' -Context ''
+$waived = Resolve-BridgeLaunchTuning -Launcher 'claude' -Model '' -Effort 'Agent default' -Context ''
+Test-That 'an effort left empty takes the configured default, while Agent default named outright passes none' {
+    $filled['effort'] -ceq 'high' -and $waived['effort'] -ceq ''
+} "$(ConvertTo-Json -InputObject $filled -Compress) / $(ConvertTo-Json -InputObject $waived -Compress)"
 Test-That 'a launcher with nothing configured is unaffected' {
     (Get-BridgeTuningOptions -Launcher 'codex' -Axis 'model') -contains 'gpt-6.1-sol'
 }
@@ -3237,9 +3244,12 @@ function Start-BridgeCopilotSession {
     }
     # Codex picks its own id once it is running, so a launch of it hands none back.
     $id = if ($SessionId) { $SessionId } elseif ($Launcher -eq 'codex') { '' } else { '11111111-2222-3333-4444-555555555555' }
+    # What the session was started with, as the real one reports it: a configured
+    # default fills an axis left empty, and an effort the model does not take is moved.
+    $chosen = Resolve-BridgeLaunchTuning -Launcher $Launcher -Model $Model -Effort $Effort -Context $Context
     [pscustomobject]@{
         Launched = $true; SessionId = $id; ProcessId = $PID; Launcher = $Launcher; Detail = "started pid $PID"
-        Model = $Model; Effort = $Effort; Context = $Context
+        Model = $chosen['model']; Effort = $chosen['effort']; Context = $chosen['context']
     }
 }
 $script:CodexRegisteredId = ''
@@ -3334,6 +3344,40 @@ $script:FakeSettings.Remove('newSession.allowAllTools')
 Test-That 'and a machine set to allow all does, though the card says ask' {
     $script:Launches.Count -eq 1 -and $script:Launches[0].AllowAllTools -and (Get-Outcome -Request $id).launched.permissions -eq 'Allow all'
 }
+
+# Agent default named outright is the agent's own default, not the one configured here,
+# which only an axis left out takes. Emptied on the way to the launcher, it was filled
+# from the config again - the very setting it asked to be without.
+$script:FakeSettings['newSession.effort.claude'] = 'high'
+$id = Invoke-AgentLaunch -Settings @{ agent = 'Claude'; effort = 'Agent default' }
+$waivedLaunch = if ($script:Launches.Count) { $script:Launches[0] } else { $null }
+$waivedOutcome = Get-Outcome -Request $id
+$id = Invoke-AgentLaunch -Settings @{ agent = 'Claude' }
+$filledOutcome = Get-Outcome -Request $id
+$script:FakeSettings.Remove('newSession.effort.claude')
+Test-That "an agent naming Agent default gets the agent's own effort, not the one configured here" {
+    $null -ne $waivedLaunch -and $waivedLaunch.Effort -eq 'Agent default' -and
+        $null -ne $waivedOutcome -and $waivedOutcome.launched.effort -ceq ''
+} "passed '$(if ($waivedLaunch) { $waivedLaunch.Effort })'; $($waivedOutcome | ConvertTo-Json -Compress -Depth 4)"
+Test-That 'while one that leaves effort out gets the configured one, and is told so' {
+    $null -ne $filledOutcome -and $filledOutcome.launched.effort -ceq 'high'
+} ($filledOutcome | ConvertTo-Json -Compress -Depth 4)
+
+# The launcher moves an effort the model does not take to one it does, so what the
+# agent is told is the effort the session got, as the session card's record is.
+$discoveryStub = ${function:Get-BridgeLauncherModelDiscovery}
+function Get-BridgeLauncherModelDiscovery {
+    param([string]$Launcher, [string]$Path)
+    $takes = @{}
+    if ($Launcher -eq 'claude') { $takes[$claudeModel] = @('low') }
+    [pscustomobject]@{ Models = @(); Efforts = @(); EffortsKnown = $false; ModelEfforts = $takes }
+}
+try { $id = Invoke-AgentLaunch -Settings @{ agent = 'Claude'; model = $claudeModel; effort = 'high' } }
+finally { ${function:Get-BridgeLauncherModelDiscovery} = $discoveryStub }
+$moved = Get-Outcome -Request $id
+Test-That 'the outcome names the effort the agent was started with, not the one asked for' {
+    $null -ne $moved -and $moved.launched.model -ceq $claudeModel -and $moved.launched.effort -ceq 'low'
+} ($moved | ConvertTo-Json -Compress -Depth 4)
 
 # Refused rather than guessed at, naming what this machine does offer, so the agent can
 # put it right without anyone looking at the card.

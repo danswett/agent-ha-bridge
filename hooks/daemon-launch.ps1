@@ -2453,7 +2453,10 @@ function Resolve-DaemonRequestedLaunch {
                 -Value (Get-BridgeDefaultTuning -Launcher $chosenLauncher -Axis $axis)
             continue
         }
-        if ($wanted -eq $script:BridgeTuningDefaultOption) { $tuning[$axis] = ''; continue }
+        # Kept as it is, not emptied: empty means "nothing chosen", which the launcher
+        # fills from this machine's configured default - the very thing a request naming
+        # Agent default is asking to be without (Resolve-BridgeLaunchTuning).
+        if ($wanted -eq $script:BridgeTuningDefaultOption) { $tuning[$axis] = $script:BridgeTuningDefaultOption; continue }
         $offered = @(Get-BridgeTuningOptions -Launcher $chosenLauncher -Axis $axis)
         $match = @($offered | Where-Object { $_ -eq $wanted -and $_ -ne $script:BridgeTuningDefaultOption }) |
             Select-Object -First 1
@@ -2622,7 +2625,7 @@ function Start-DaemonLaunch {
     }
     else { [bool](Get-BridgeSetting 'newSession.allowAllTools' $false) }
     # For the log line and the card note: "gpt-5.4 · xhigh · long_context", or nothing.
-    $tuningNote = (@($model, $effort, $context) | Where-Object { $_ }) -join ' / '
+    $tuningNote = (@($model, $effort, $context) | Where-Object { $_ -and $_ -ne $script:BridgeTuningDefaultOption }) -join ' / '
     if ($allowAllTools) { $tuningNote = (@($tuningNote, 'allow all') | Where-Object { $_ }) -join ' / ' }
 
     $worktreeOperation = $null
@@ -2826,9 +2829,12 @@ function Start-DaemonLaunch {
                 workspace   = $(if ($null -eq $resumeSession) { [string]$label } else { '' })
                 resume      = $(if ($null -ne $resumeSession) { [string]$resumeLabel } else { '' })
                 profile     = [string]$agencyProfile
-                model       = [string]$model
-                effort      = [string]$effort
-                context     = [string]$context
+                # What the agent was actually started with, as the session card's own
+                # record is: a configured default fills an axis left empty, and an effort
+                # the model does not take is moved to one it does.
+                model       = $launchTuning.Model
+                effort      = $launchTuning.Effort
+                context     = $launchTuning.Context
                 permissions = Get-BridgePermissionLabel -AllowAllTools $allowAllTools
                 resumed     = ($null -ne $resumeSession)
             }
