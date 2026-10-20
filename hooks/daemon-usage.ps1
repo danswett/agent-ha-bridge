@@ -25,7 +25,8 @@
     Part of agent-bridge-daemon.ps1, which dot-sources it into its own scope after
     declaring the shared $script: state; see docs/daemon-split.md.
     Shared state it changes: DaemonUsageClients, DaemonUsageEntityIds,
-    DaemonUsageExtraSensors, DaemonUsageExtraNote.
+    DaemonUsageExtraSensors, DaemonUsageExtraNote, DaemonUsageWithdrawRetryAt,
+    DaemonUsageLoginSpellings.
 #>
 
 # Asked once per daemon, then left alone - see the macOS branch of
@@ -130,10 +131,15 @@ $script:DaemonUsageClients = @{}
 $script:DaemonUsageEntityIds = ''
 # The numbered sensors further Copilot logins were last reconciled onto, joined with
 # commas, and what was last said about usage.copilotAccounts. $null until the first
-# pass that reads anything, which withdraws every numbered sensor not in use, because
-# nothing records what an earlier run of the daemon left behind (#200).
+# pass, which withdraws every numbered sensor not in use, because nothing records what
+# an earlier run of the daemon left behind (#200). A withdrawal that failed is not
+# tried again before DaemonUsageWithdrawRetryAt.
 $script:DaemonUsageExtraSensors = $null
 $script:DaemonUsageExtraNote = ''
+$script:DaemonUsageWithdrawRetryAt = [DateTimeOffset]::MinValue
+# How GitHub spells each further login, by its lowercase form, as this machine last
+# read it; see Get-BridgeCopilotLoginSpelling.
+$script:DaemonUsageLoginSpellings = @{}
 
 function Get-BridgeUsageLabel {
     param([Parameter(Mandatory)][string]$Client)
@@ -974,6 +980,39 @@ function Get-BridgeCopilotLoginAllowance {
     $record
 }
 
+function Get-BridgeCopilotLoginSpelling {
+    <#
+        How GitHub spells a further Copilot login, for the account a reading of it that
+        failed is published under (#200).
+
+        The card groups its rows on the exact account string. A reading carries GitHub's
+        spelling, and a failure only the one usage.copilotAccounts was given, so a login
+        listed as DanSwett here and read as danswett elsewhere was one account drawn
+        twice - once with the figure, once with this machine's error - where a failure
+        is meant to give way to a reading of the same account. So it is GitHub's
+        spelling wherever that is known: this machine's own last reading of the login,
+        then any machine's published reading of it, and only failing both, the spelling
+        as listed.
+    #>
+    param([Parameter(Mandatory)][string]$Login, [AllowNull()]$States = $null)
+
+    $folded = $Login.ToLowerInvariant()
+    if ($script:DaemonUsageLoginSpellings.ContainsKey($folded)) { return [string]$script:DaemonUsageLoginSpellings[$folded] }
+    foreach ($entry in @($States)) {
+        if ($null -eq $entry -or -not $entry.PSObject.Properties['attributes'] -or $null -eq $entry.attributes) { continue }
+        $attributes = $entry.attributes
+        $names = @($attributes.PSObject.Properties.Name)
+        if ($names -notcontains 'client' -or $names -notcontains 'account' -or $names -notcontains 'source') { continue }
+        if ([string]$attributes.client -cne 'copilot') { continue }
+        # A failure carries whatever spelling its machine was given; only a reading
+        # carries GitHub's.
+        if ([string]$attributes.source -ceq 'none' -or [string]::IsNullOrEmpty([string]$attributes.source)) { continue }
+        $account = [string]$attributes.account
+        if ($account -and $account.ToLowerInvariant() -ceq $folded) { return $account }
+    }
+    $Login
+}
+
 function Get-BridgeClaudeAccountId {
     <#
         An opaque id for the Claude account this machine is signed in to, or '' when it
@@ -1555,8 +1594,7 @@ function Sync-DaemonUsage {
         of their own, each like another client: at the idle pace, since the sessions here
         spend the signed-in account and never theirs, deferring to another machine's
         reading of the same login exactly as a client does, and published on numbered
-        sensors that are withdrawn again, with the next reading, once their login is no
-        longer listed.
+        sensors that are withdrawn again once their login is no longer listed.
     #>
     param(
         [Parameter(Mandatory)][hashtable]$Headers,
@@ -1594,6 +1632,36 @@ function Sync-DaemonUsage {
         if ($said) { Write-DaemonLog -Message "usage.copilotAccounts: $said" }
     }
     $active = @($extras | ForEach-Object { [string]$_.Sensor })
+    # A numbered sensor no login is reported on any more is withdrawn, or its last
+    # reading would sit on the card with nothing left to refresh it. Done whenever the
+    # set changes, and on a daemon's first pass, since nothing records what an earlier
+    # run left behind - whether or not anything is read: a machine whose every account
+    # another machine is keeping current reads nothing at all, and would otherwise leave
+    # a removed login on the card for as long as that went on. A withdrawal that failed
+    # leaves the set as it was and is tried again a busy interval later, not on every
+    # fifteen-second reconcile, so a Home Assistant not taking publishes costs one
+    # attempt, and one line in the log, every couple of minutes.
+    $retryIn = ($script:DaemonUsageWithdrawRetryAt - $Now).TotalSeconds
+    # A wait longer than a whole interval is a clock that went backwards, not a wait.
+    if (($active -join ',') -cne $script:DaemonUsageExtraSensors -and ($retryIn -le 0 -or $retryIn -gt $interval)) {
+        $unused = @(Get-CopilotMqttUsageSensorKey | Where-Object { $_ -cmatch '^copilot_\d+$' -and $active -cnotcontains $_ })
+        try {
+            [void](Remove-CopilotMqttUsageSensors -Keys $unused -Headers $Headers)
+            foreach ($key in $unused) { [void]$script:DaemonUsageClients.Remove($key) }
+            # A withdrawn sensor leaves Home Assistant's registry, and one listed again is
+            # registered afresh under an id of Home Assistant's choosing. The set of
+            # sensors could read the same as when its id was last forced, so what was
+            # forced then is not taken to hold now.
+            $script:DaemonUsageEntityIds = ''
+            $script:DaemonUsageExtraSensors = $active -join ','
+            $script:DaemonUsageWithdrawRetryAt = [DateTimeOffset]::MinValue
+        }
+        catch {
+            if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+            $script:DaemonUsageWithdrawRetryAt = $Now.AddSeconds($interval)
+            Write-DaemonLog -Message "usage sensors no longer reported could not be withdrawn: $($_.Exception.Message)"
+        }
+    }
 
     $known = $null -ne $Live
     $streams = @($clients | ForEach-Object { [pscustomobject]@{ Key = $_; Client = $_; Login = '' } }) +
@@ -1672,42 +1740,23 @@ function Sync-DaemonUsage {
     # Each on its own, as Get-BridgeAgentAllowance takes each client: a login that cannot
     # be read is that login's failure, and says so on its own row.
     foreach ($stream in $dueLogins) {
-        try { $records += Get-BridgeCopilotLoginAllowance -Login $stream.Login -Sensor $stream.Key }
+        $record = $null
+        try { $record = Get-BridgeCopilotLoginAllowance -Login $stream.Login -Sensor $stream.Key }
         catch {
             if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
-            $failed = New-BridgeUsageRecord -Client 'copilot' -Account $stream.Login -Source 'none' `
+            $record = New-BridgeUsageRecord -Client 'copilot' -Account $stream.Login -Source 'none' `
                 -Problem "Usage for $($stream.Login) could not be collected: $($_.Exception.Message)"
-            $failed['sensor'] = $stream.Key
-            $records += $failed
+            $record['sensor'] = $stream.Key
         }
+        # A reading names the account as GitHub spells it, which is remembered; a failure
+        # is published under that spelling too, so the card counts it as the same account.
+        if ([string]$record.source -cne 'none' -and $record.account) {
+            $script:DaemonUsageLoginSpellings[([string]$record.account).ToLowerInvariant()] = [string]$record.account
+        }
+        else { $record.account = Get-BridgeCopilotLoginSpelling -Login $stream.Login -States $States }
+        $records += $record
     }
     if ($records.Count -eq 0) { return $false }
-
-    # A numbered sensor no login is reported on any more is withdrawn, or its last
-    # reading would sit on the card with nothing left to refresh it. Done whenever the
-    # set changes, and on a daemon's first pass that reads anything, since nothing
-    # records what an earlier run left behind. Only on a pass that has read something:
-    # a withdrawal is an MQTT publish, and one that failed would otherwise be retried,
-    # and logged, on every fifteen-second reconcile; this way it is paced like the
-    # readings, and a machine with nothing to report writes nothing for it. A failure
-    # leaves the set as it was, so the next reading tries again.
-    if (($active -join ',') -cne $script:DaemonUsageExtraSensors) {
-        $unused = @(Get-CopilotMqttUsageSensorKey | Where-Object { $_ -cmatch '^copilot_\d+$' -and $active -cnotcontains $_ })
-        try {
-            [void](Remove-CopilotMqttUsageSensors -Keys $unused -Headers $Headers)
-            foreach ($key in $unused) { [void]$script:DaemonUsageClients.Remove($key) }
-            # A withdrawn sensor leaves Home Assistant's registry, and one listed again is
-            # registered afresh under an id of Home Assistant's choosing. The set of
-            # sensors could read the same as when its id was last forced, so what was
-            # forced then is not taken to hold now.
-            $script:DaemonUsageEntityIds = ''
-            $script:DaemonUsageExtraSensors = $active -join ','
-        }
-        catch {
-            if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
-            Write-DaemonLog -Message "usage sensors no longer reported could not be withdrawn: $($_.Exception.Message)"
-        }
-    }
 
     # Where no machine defers to any other, an unchanged reading still stays off the bus
     # between polls, but only for RepublishSeconds: never republishing it made a daemon

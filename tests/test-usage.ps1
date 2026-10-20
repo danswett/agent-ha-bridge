@@ -910,6 +910,8 @@ $script:DaemonUsageClients = @{}
 $script:DaemonUsageEntityIds = ''
 $script:DaemonUsageExtraSensors = $null
 $script:DaemonUsageExtraNote = ''
+$script:DaemonUsageWithdrawRetryAt = [DateTimeOffset]::MinValue
+$script:DaemonUsageLoginSpellings = @{}
 $clock = [DateTimeOffset]::Parse('2026-10-07T12:00:00Z')
 
 Test-That 'the first pass collects and publishes' {
@@ -1011,6 +1013,8 @@ function Reset-UsagePacing {
     $script:DaemonUsageEntityIds = ''
     $script:DaemonUsageExtraSensors = $null
     $script:DaemonUsageExtraNote = ''
+    $script:DaemonUsageWithdrawRetryAt = [DateTimeOffset]::MinValue
+    $script:DaemonUsageLoginSpellings = @{}
     $script:Withdrawn.Clear()
     $script:WithdrawThrows = $false
     $script:Settings = @{}
@@ -1865,12 +1869,21 @@ Test-That 'forcing the ids renames what is registered, and says the correction i
 # it was asked, and which sensor each reading went out on.
 $script:RealLoginAllowance = (Get-Item function:Get-BridgeCopilotLoginAllowance).ScriptBlock
 $script:LoginThrows = $false
+# A failure the reader reports rather than throws - no token, say - and the spelling
+# GitHub gives the login back in, when that is not how the list spelt it.
+$script:LoginFails = $false
+$script:LoginAsGitHubSpellsIt = ''
 function Get-BridgeCopilotLoginAllowance {
     param([string]$Login, [string]$Sensor)
     $script:AskLog.Add("${Sensor}:$Login")
     if ($script:LoginThrows) { throw 'gh went away' }
-    $record = New-BridgeUsageRecord -Client 'copilot' -Account $Login -Source 'api' `
-        -Windows @(Get-BridgeUsageWindow -Key 'plan' -Label 'Plan' -PercentUsed 5)
+    $record = if ($script:LoginFails) {
+        New-BridgeUsageRecord -Client 'copilot' -Account $Login -Source 'none' -Problem "No Copilot credential was available for $Login."
+    }
+    else {
+        New-BridgeUsageRecord -Client 'copilot' -Source 'api' -Windows @(Get-BridgeUsageWindow -Key 'plan' -Label 'Plan' -PercentUsed 5) `
+            -Account $(if ($script:LoginAsGitHubSpellsIt) { $script:LoginAsGitHubSpellsIt } else { $Login })
+    }
     $record['sensor'] = $Sensor
     $record
 }
@@ -1945,20 +1958,70 @@ $script:WithdrawThrows = $true
 $withdrawFailedAsk = Invoke-UsageAt 0 $none
 $script:WithdrawThrows = $false
 [void](Invoke-UsageAt 15 $none)
-$withdrawnBeforeReading = @($script:Withdrawn).Count
-[void](Invoke-UsageAt 30 $claudeOpen)
-Test-That 'a withdrawal that fails holds up no reading, is said, and is tried again with the next reading, not on every pass' {
-    $withdrawFailedAsk -ceq 'copilot,claude,codex;copilot_2:danswett' -and $withdrawnBeforeReading -eq 0 -and
+[void](Invoke-UsageAt 119 $none)
+$withdrawnBeforeRetry = @($script:Withdrawn).Count
+$retryAsk = Invoke-UsageAt 120 $none
+Test-That 'a withdrawal that fails holds up no reading, is said, and is tried again a busy interval later, not on every pass' {
+    $withdrawFailedAsk -ceq 'copilot,claude,codex;copilot_2:danswett' -and $withdrawnBeforeRetry -eq 0 -and
         @($script:Logged | Where-Object { $_ -match 'could not be withdrawn' }).Count -eq 1 -and
         (@($script:Withdrawn) -join '|') -ceq 'copilot_3,copilot_4'
-} "asked=$withdrawFailedAsk early=$withdrawnBeforeReading withdrawn=$(@($script:Withdrawn) -join '|') log=$(@($script:Logged) -join ' | ')"
+} "asked=$withdrawFailedAsk early=$withdrawnBeforeRetry retry-pass=$retryAsk withdrawn=$(@($script:Withdrawn) -join '|') log=$(@($script:Logged) -join ' | ')"
+Test-That 'whether or not that pass reads anything' {
+    $retryAsk -ceq ''
+}
+
+# A machine whose every account another machine is keeping current reads nothing at
+# all, pass after pass. Withdrawing only alongside a reading left a login taken off its
+# list on the card for as long as that went on.
+Reset-UsagePacing
+$script:Settings['dashboard.publication'] = $writerElsewhere
+$script:Selected = @('copilot')
+$allCovered = Invoke-UsageAt 0 $none @(New-PeerCopilotState 0)
+Test-That 'a machine that reads nothing, its accounts being read elsewhere, still withdraws the numbered sensors no login is on' {
+    $allCovered -ceq '' -and (@($script:Withdrawn) -join '|') -ceq 'copilot_2,copilot_3,copilot_4'
+} "asked=$allCovered withdrawn=$(@($script:Withdrawn) -join '|')"
+
+# The card groups on the exact account string. A reading names the login as GitHub
+# spells it and a failure only as it was listed, so a login listed as DanSwett here and
+# read as danswett anywhere else was one account drawn as two rows - one with the
+# figure, one with this machine's error.
+Reset-UsagePacing
+$script:Settings['usage.copilotAccounts'] = @('DanSwett')
+$script:LoginAsGitHubSpellsIt = 'danswett'
+[void](Invoke-UsageAt 0 $none)
+$script:LoginAsGitHubSpellsIt = ''
+$script:LoginFails = $true
+$script:PublishedRecords.Clear()
+[void](Invoke-UsageAt 900 $none)
+$spelledAsRead = @($script:PublishedRecords | Where-Object { (Get-CopilotMqttUsageRecordKey -Record $_) -ceq 'copilot_2' })
+Test-That 'a further login that could not be read is published under the spelling GitHub gave it here, not as listed' {
+    $spelledAsRead.Count -eq 1 -and $spelledAsRead[0].source -ceq 'none' -and $spelledAsRead[0].account -ceq 'danswett'
+} "rows=$(@($spelledAsRead | ForEach-Object { "$($_.source):$($_.account)" }) -join ',')"
+$script:LoginFails = $false
 
 Reset-UsagePacing
-$script:Readings = @{}
-[void](Invoke-UsageAt 0 $none)
-Test-That 'and a pass that read nothing withdraws nothing, so a machine with nothing to report writes nothing for it' {
-    @($script:Withdrawn).Count -eq 0 -and $null -eq $script:DaemonUsageExtraSensors
-} "withdrawn=$(@($script:Withdrawn) -join '|')"
+$script:Settings['usage.copilotAccounts'] = @('DanSwett')
+$script:LoginThrows = $true
+$script:PublishedRecords.Clear()
+$peerSpelling = @(New-PeerUsageState -Client 'copilot' -Account 'danswett' -Updated $paceStart.AddSeconds(-7200))
+[void](Invoke-UsageAt 0 $none $peerSpelling)
+$spelledAsPeer = @($script:PublishedRecords | Where-Object { (Get-CopilotMqttUsageRecordKey -Record $_) -ceq 'copilot_2' })
+Test-That 'or, before this machine has read it at all, under the spelling another machine''s reading of it carries' {
+    $spelledAsPeer.Count -eq 1 -and $spelledAsPeer[0].source -ceq 'none' -and $spelledAsPeer[0].account -ceq 'danswett'
+} "rows=$(@($spelledAsPeer | ForEach-Object { "$($_.source):$($_.account)" }) -join ',')"
+
+Reset-UsagePacing
+$script:Settings['usage.copilotAccounts'] = @('DanSwett')
+$script:PublishedRecords.Clear()
+$peerFailure = New-BridgeUsageRecord -Client 'copilot' -Account 'DANSWETT' -Source 'none' -Problem 'No Copilot credential was available.'
+$script:PeerMessages.Clear()
+& $script:RealUsagePublisher -Records @($peerFailure) -Slug 'otherbox' -MachineName 'Other box' -Headers $headers
+[void](Invoke-UsageAt 0 $none @(ConvertTo-PeerUsageState))
+$spelledAsListed = @($script:PublishedRecords | Where-Object { (Get-CopilotMqttUsageRecordKey -Record $_) -ceq 'copilot_2' })
+Test-That 'and as listed when nobody has read it, another machine''s failure saying nothing about how GitHub spells it' {
+    $spelledAsListed.Count -eq 1 -and $spelledAsListed[0].source -ceq 'none' -and $spelledAsListed[0].account -ceq 'DanSwett'
+} "rows=$(@($spelledAsListed | ForEach-Object { "$($_.source):$($_.account)" }) -join ',')"
+$script:LoginThrows = $false
 
 Reset-UsagePacing
 $script:Settings['usage.copilotAccounts'] = @('danswett')
