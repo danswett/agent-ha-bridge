@@ -281,6 +281,46 @@ Test-That 'an untagged payload is still read, so the reply box and older cards k
     (Read-DaemonDecisionCardText -SessionId $sid -Marker $stale -Headers $headers).Text -eq 'typed in the box'
 }
 
+Write-Host '--- words typed at a question with nowhere to put them ---'
+# A legacy `choices` question has no field behind it. Copilot's prompt for one takes
+# words only in a box that Enter does not submit, and has no "Other" row at all unless
+# the question allows one, so the words went down a walk that answered with one of the
+# options instead (#240). They are refused out loud.
+$legacyChoice = [pscustomobject]@{
+    mode = 'multiple_choice'; decisionId = 'd-legacy'; question = 'Pick'; fields = @(); choices = @('Yes', 'No')
+    injectedAnswer = ''; armedAt = $armedAt.ToString('o')
+}
+Set-Baseline -DecisionId 'd-legacy' -PayloadState 'present' -PayloadValue 'held-when-armed' -SubmitState 'present' -SubmitValue $oldPress
+$script:Transient = @()
+$script:Ha = @{
+    "select.${node}_decision" = 'Awaiting answer...'
+    "button.${node}_submit" = $oldPress
+    "sensor.${node}_reply_payload" = New-PayloadState -Stamp 'typed-at-a-legacy-question' -Text 'neither of those'
+}
+$legacyRead = Read-DaemonDecisionAnswer -SessionId $sid -Marker $legacyChoice -State $state -Headers $headers
+Test-That 'words typed at a Copilot question with no field are not taken as its answer' {
+    $null -ne $legacyRead -and $legacyRead.Answer -eq ''
+} "read=[$(if ($null -ne $legacyRead) { $legacyRead.Answer } else { '<unreadable>' })]"
+Test-That 'and the card says the question takes options' {
+    @($script:Transient) -contains 'Not sent - this question takes options'
+} ($script:Transient -join '|')
+$toldLegacy = @($script:Transient).Count
+[void](Read-DaemonDecisionAnswer -SessionId $sid -Marker $legacyChoice -State $state -Headers $headers)
+Test-That 'once for those words, not at every pass over the question' {
+    @($script:Transient).Count -eq $toldLegacy
+} ($script:Transient -join '|')
+# One option list behind the same selector - a card armed before it said which
+# controls it shows - still has an "Other" entry the words can be walked into.
+$selectorField = [pscustomobject]@{
+    mode = 'multiple_choice'; decisionId = 'd-legacy'; question = 'Pick'; choices = @('Yes', 'No')
+    fields = @([pscustomobject]@{ Label = 'Pick'; Options = @('Yes', 'No'); IsText = $false })
+    injectedAnswer = ''; armedAt = $armedAt.ToString('o')
+}
+$fieldRead = Read-DaemonDecisionAnswer -SessionId $sid -Marker $selectorField -State $state -Headers $headers
+Test-That 'a question with one option list still takes them, as typed rather than chosen' {
+    $null -ne $fieldRead -and $fieldRead.Answer -eq 'neither of those' -and $fieldRead.IsFreeText -and $fieldRead.IsChoice
+} "read=[$(if ($null -ne $fieldRead) { $fieldRead.Answer } else { '<unreadable>' })]"
+
 Write-Host '--- the baseline belongs to one question, and is written once ---'
 # A session of its own: the last check here clears everything belonging to it, and
 # the questions the rest of this suite answers must survive that.
@@ -586,8 +626,8 @@ function Send-CopilotSessionForm { param($SessionId, $Fields, $Selections, $Proc
     $script:Typed.Add([pscustomobject]@{ Route = 'form'; Selections = @($Selections) })
     [pscustomobject]@{ Delivered = $script:Outcome.Delivered; ProcessId = 42; Detail = $script:Outcome.Detail; Wrote = $script:Outcome.Wrote }
 }
-function Send-CopilotSessionChoice { param($SessionId, $Text, $ChoiceCount, $ProcessId)
-    $script:Typed.Add([pscustomobject]@{ Route = 'choice'; Text = $Text })
+function Send-CopilotSessionChoice { param($SessionId, $Text, $ChoiceCount, $ProcessId, [switch]$ExactWalk, $Field)
+    $script:Typed.Add([pscustomobject]@{ Route = 'choice'; Text = $Text; ExactWalk = [bool]$ExactWalk; Field = $Field })
     [pscustomobject]@{ Delivered = $script:Outcome.Delivered; ProcessId = 42; Detail = $script:Outcome.Detail; Wrote = $script:Outcome.Wrote }
 }
 function Send-CopilotSessionPrompt { param($SessionId, $Text, $ProcessId)
@@ -596,7 +636,8 @@ function Send-CopilotSessionPrompt { param($SessionId, $Text, $ProcessId)
 }
 function Get-DaemonSessionProcessId { param($SessionId) 42 }
 function Complete-DaemonClaudeAnswer { param($SessionId, $Delivery, $Marker) $Delivery }
-function Set-CopilotDecisionMarkerInjected { param($SessionId, $Answer, $Selections) }
+$script:MarkedTyped = $null
+function Set-CopilotDecisionMarkerInjected { param($SessionId, $Answer, $Selections, [switch]$Typed) $script:MarkedTyped = [bool]$Typed }
 $dispMarker = [pscustomobject]@{
     decisionId = 'disp1'; mode = 'multiple_choice'; choices = @(); fields = @(
         [pscustomobject]@{ Label = 'F'; Options = @('Auth', 'Billing'); IsText = $false })
@@ -716,6 +757,11 @@ Test-That 'a form that never wrote still falls back to the text route' {
     [void](Invoke-Dispatch)
     (@($script:Typed | ForEach-Object { $_.Route }) -join '|') -eq 'form|choice'
 } "routes=[$(@($script:Typed | ForEach-Object { $_.Route }) -join '|')]"
+Test-That 'and that fallback reaches Copilot''s Other by the exact walk, counted from the field' {
+    # The walk it used to take committed the last option instead (#240).
+    $script:Typed.Count -eq 2 -and $script:Typed[1].ExactWalk -and $null -ne $script:Typed[1].Field -and
+        (@($script:Typed[1].Field.Options) -join '|') -ceq 'Auth|Billing'
+}
 
 Remove-CopilotDecisionMarker -SessionId $dispSid -DecisionId 'disp1'
 $script:Outcome = @{ Delivered = $true; Detail = 'ok:form'; Wrote = $true }
@@ -758,6 +804,54 @@ Test-That 'and that refusal releases it, because nothing was typed' {
     $null -eq (Get-CopilotDecisionAttempt -SessionId $dispSid -DecisionId 'disp1') -or
     (Get-DispState) -ceq 'rejected'
 } "state=$(Get-DispState)"
+
+Write-Host '--- words typed at a choice question go the way its prompt takes them ---'
+# On the card or in a phone notification's text field alike: both arrive here as an
+# answer typed rather than chosen, and which keys carry it depends on whose prompt it is.
+$typedSid = '11111111-0000-4000-8000-0000000000d2'
+$script:Outcome = @{ Delivered = $true; Detail = 'ok:other'; Wrote = $true }
+function Invoke-TypedDispatch {
+    param([Parameter(Mandatory)][string]$DecisionId, [Parameter(Mandatory)][AllowEmptyCollection()][object[]]$Fields, [string]$Kind = 'copilot')
+    $marker = [pscustomobject]@{ decisionId = $DecisionId; mode = 'multiple_choice'; choices = @(); fields = $Fields }
+    $before = $script:DaemonLive
+    $script:DaemonLive = @{ $typedSid = [pscustomobject]@{ Kind = $Kind } }
+    $script:Typed.Clear(); $script:MarkedTyped = $null
+    try {
+        Invoke-DaemonDecisionAnswer -SessionId $typedSid -Marker $marker -Answer 'neither of those' `
+            -IsChoice $true -IsFreeText $true -Selections @() -State @{} -Headers $headers
+    }
+    finally { $script:DaemonLive = $before }
+}
+$typedChoiceField = [pscustomobject]@{ Label = 'Pick'; Options = @('Proceed', 'skip'); IsText = $false }
+$typedOk = Invoke-TypedDispatch -DecisionId 'typed1' -Fields @($typedChoiceField)
+Test-That 'a Copilot question is answered in words by the exact walk into Other, counted from its field' {
+    $typedOk -and $script:Typed.Count -eq 1 -and $script:Typed[0].Route -ceq 'choice' -and
+        $script:Typed[0].ExactWalk -and $script:Typed[0].Text -ceq 'neither of those' -and
+        (@($script:Typed[0].Field.Options) -join '|') -ceq 'Proceed|skip'
+}
+Test-That 'and the marker records that it went in as words, so completion checks the words' {
+    $script:MarkedTyped -eq $true
+}
+[void](Invoke-TypedDispatch -DecisionId 'typed2' -Fields @($typedChoiceField) -Kind 'claude')
+Test-That 'a Claude question keeps the walk its own prompt was answered by' {
+    $script:Typed.Count -eq 1 -and $script:Typed[0].Route -ceq 'choice' -and -not $script:Typed[0].ExactWalk -and
+        $script:MarkedTyped -eq $false
+}
+# The phone's text field is offered for a lone free-text question too, which reaches
+# this route as words at a multiple_choice marker. Walked like a list, its first Enter
+# submitted the box empty and the words followed as a message of their own.
+[void](Invoke-TypedDispatch -DecisionId 'typed3' -Fields @([pscustomobject]@{ Label = 'Notes'; Options = @(); IsText = $true }))
+Test-That 'words for a free-text question are typed into its box, the way the card answers it' {
+    $script:Typed.Count -eq 1 -and $script:Typed[0].Route -ceq 'form' -and
+        (@($script:Typed[0].Selections) -join '|') -ceq 'neither of those' -and $script:MarkedTyped -eq $false
+}
+# Nowhere to put them: the exact walk is still asked for, and the sender refuses it
+# before a key is typed (see the real senders below).
+[void](Invoke-TypedDispatch -DecisionId 'typed4' -Fields @())
+Test-That 'a Copilot question with no single field is never walked the old way' {
+    $script:Typed.Count -eq 1 -and $script:Typed[0].ExactWalk -and $null -eq $script:Typed[0].Field
+}
+$script:Outcome = @{ Delivered = $true; Detail = 'ok:form'; Wrote = $true }
 
 Write-Host '--- the barrier returns the record it changed, not one read beforehand ---'
 # Reading the claim first and acting on that is a different record if the claim is
@@ -864,6 +958,131 @@ Test-That 'an exception from the transport still reads as possibly written' {
     function Invoke-BridgeConsoleSend { param($ProcessId, $Text, $Submit, $DelayMs) throw 'console went away' }
     $d = Send-CopilotSessionPrompt -SessionId $sid -Text 'hello' -ProcessId 4242
     $d.Wrote -and -not $d.Delivered
+}
+function Invoke-BridgeConsoleSend { param($ProcessId, $Text, $Submit, $DelayMs) $script:ConsoleWrites++; 'ok:sent' }
+function Invoke-BridgeConsoleChoice { param($ProcessId, $DownCount, $Text, $StepDelayMs) $script:ConsoleWrites++; 'ok:choice' }
+
+Write-Host '--- words typed at a choice question, against the prompt Copilot draws ---'
+# Copilot's single-choice field as its CLI bundle has it (1.0.96 to 1.0.101), and as a
+# live 1.0.101 session answered on 2026-10-20: Up stops at the first option. Down on
+# the last option opens "Other" at once - there is no row below the options to rest
+# on. Letters typed at the list are ignored. In "Other" the words go to the session's
+# input box and Enter submits them trimmed, but an empty submit closes "Other" and puts
+# the caret back on the LAST option. A Yes/No field behaves the same way.
+#
+# The senders' real keystrokes are played into it, so a walk that only looks right
+# cannot pass.
+function New-CopilotChoicePrompt {
+    param([Parameter(Mandatory)][string[]]$Options, [int]$Caret = 0)
+    [pscustomobject]@{ Options = $Options; Caret = $Caret; Other = $false; Input = ''; Answer = $null }
+}
+function Send-PromptKeys {
+    param([Parameter(Mandatory)]$Prompt, [Parameter(Mandatory)][AllowEmptyString()][string]$Keys)
+    $esc = [string][char]27
+    $at = 0
+    # Once answered the form is gone, and nothing after that reaches it.
+    while ($at -lt $Keys.Length -and $null -eq $Prompt.Answer) {
+        if ($Keys.Substring($at).StartsWith("$esc[A")) { $key = '<up>'; $at += 3 }
+        elseif ($Keys.Substring($at).StartsWith("$esc[B")) { $key = '<down>'; $at += 3 }
+        elseif ($Keys[$at] -eq "`r") { $key = '<enter>'; $at++ }
+        else { $key = [string]$Keys[$at]; $at++ }
+        $last = $Prompt.Options.Count - 1
+        if ($Prompt.Other) {
+            if ($key -ceq '<up>') { $Prompt.Other = $false; $Prompt.Caret = $last }
+            elseif ($key -ceq '<enter>') {
+                $words = $Prompt.Input.Trim()
+                $Prompt.Input = ''
+                if ($words) { $Prompt.Answer = $words } else { $Prompt.Other = $false; $Prompt.Caret = $last }
+            }
+            elseif ($key -cne '<down>') { $Prompt.Input += $key }
+        }
+        elseif ($key -ceq '<up>') { $Prompt.Caret = [Math]::Max(0, $Prompt.Caret - 1) }
+        elseif ($key -ceq '<down>') { if ($Prompt.Caret -eq $last) { $Prompt.Other = $true } else { $Prompt.Caret++ } }
+        elseif ($key -ceq '<enter>') { $Prompt.Answer = $Prompt.Options[$Prompt.Caret] }
+    }
+}
+$script:Prompt = $null
+$script:PromptWrites = 0
+function Invoke-BridgeConsoleSend {
+    param($ProcessId, $Text, $Submit, $DelayMs)
+    $script:PromptWrites++
+    Send-PromptKeys -Prompt $script:Prompt -Keys $Text
+    if ($Submit) { Send-PromptKeys -Prompt $script:Prompt -Keys "`r" }
+    "ok:$($Text.Length)"
+}
+# ConsoleInjector.SendChoice: Down DownCount times, Enter, the words, Enter.
+function Invoke-BridgeConsoleChoice {
+    param($ProcessId, $DownCount, $Text, $StepDelayMs)
+    $script:PromptWrites++
+    Send-PromptKeys -Prompt $script:Prompt -Keys (((([string][char]27) + '[B') * $DownCount) + "`r" + $Text + "`r")
+    'ok:choice'
+}
+
+$script:Prompt = New-CopilotChoicePrompt -Options @('Proceed', 'skip')
+[void](Send-CopilotSessionChoice -SessionId $sid -Text 'Use the X approach' -ChoiceCount 2 -ProcessId 4242)
+Test-That 'the walk the words used to take answered with the last option, which is what #240 saw' {
+    $script:Prompt.Answer -ceq 'skip'
+} "answer=[$($script:Prompt.Answer)]"
+$script:Prompt = New-CopilotChoicePrompt -Options @('A', 'B', 'C', 'D')
+[void](Send-CopilotSessionChoice -SessionId $sid -Text 'none of these' -ChoiceCount 4 -ProcessId 4242)
+Test-That 'with any number of options, not only the second of two' {
+    $script:Prompt.Answer -ceq 'D'
+} "answer=[$($script:Prompt.Answer)]"
+
+foreach ($case in @(
+    @{ Options = @('Proceed', 'skip'); Caret = 0; Why = 'from the first option' }
+    @{ Options = @('Alpha', 'Beta', 'Gamma'); Caret = 1; Why = 'from a default in the middle' }
+    @{ Options = @('Alpha', 'Beta', 'Gamma'); Caret = 2; Why = 'from a default on the last option' }
+    @{ Options = @('Yes', 'No'); Caret = 1; Why = 'on a Yes/No field' }
+)) {
+    $script:Prompt = New-CopilotChoicePrompt -Options $case.Options -Caret $case.Caret
+    $field = [pscustomobject]@{ Label = 'F'; Options = $case.Options; IsText = $false; DefaultIndex = $case.Caret }
+    $sent = Send-CopilotSessionChoice -SessionId $sid -Text ' Use the X approach ' -ChoiceCount $case.Options.Count `
+        -ProcessId 4242 -ExactWalk -Field $field -OpenDelayMs 0 -SubmitDelayMs 0
+    Test-That "the exact walk delivers the words themselves, $($case.Why)" {
+        $sent.Delivered -and $sent.Wrote -and $script:Prompt.Answer -ceq 'Use the X approach'
+    } "answer=[$($script:Prompt.Answer)] detail=$($sent.Detail)"
+}
+# The default is the third option and somebody pressed Up at the terminal. A walk
+# counted from the default stops on an option, and its Enter commits that option.
+$script:Prompt = New-CopilotChoicePrompt -Options @('Alpha', 'Beta', 'Gamma', 'Delta') -Caret 1
+$movedField = [pscustomobject]@{ Label = 'F'; Options = @('Alpha', 'Beta', 'Gamma', 'Delta'); IsText = $false; DefaultIndex = 2 }
+$sent = Send-CopilotSessionChoice -SessionId $sid -Text 'typed four' -ChoiceCount 4 -ProcessId 4242 `
+    -ExactWalk -Field $movedField -OpenDelayMs 0 -SubmitDelayMs 0
+Test-That 'and from wherever somebody left the caret at the terminal' {
+    $sent.Delivered -and $script:Prompt.Answer -ceq 'typed four'
+} "answer=[$($script:Prompt.Answer)] detail=$($sent.Detail)"
+
+foreach ($refused in @(
+    @{ Field = $null; Text = 'words'; Why = 'no field at all' }
+    @{ Field = [pscustomobject]@{ Label = 'N'; Options = @(); IsText = $true }; Text = 'words'; Why = 'a free-text field' }
+    @{ Field = [pscustomobject]@{ Label = 'M'; Options = @('A', 'B'); IsText = $false; MultiSelect = $true }; Text = 'words'; Why = 'a multi-select list' }
+    @{ Field = $typedChoiceField; Text = "$([char]1)$([char]2)"; Why = 'words that are only control characters' }
+)) {
+    $script:Prompt = New-CopilotChoicePrompt -Options @('Proceed', 'skip')
+    $script:PromptWrites = 0
+    $sent = Send-CopilotSessionChoice -SessionId $sid -Text $refused.Text -ChoiceCount 2 -ProcessId 4242 `
+        -ExactWalk -Field $refused.Field -OpenDelayMs 0 -SubmitDelayMs 0
+    Test-That "the exact walk refuses $($refused.Why) before typing a key" {
+        -not $sent.Delivered -and -not $sent.Wrote -and $script:PromptWrites -eq 0 -and $null -eq $script:Prompt.Answer
+    } "writes=$($script:PromptWrites) detail=$($sent.Detail)"
+}
+Test-That 'a walk the console refused before writing says nothing was typed' {
+    function Invoke-BridgeConsoleSend { param($ProcessId, $Text, $Submit, $DelayMs) 'attach-failed:1341' }
+    $d = Send-CopilotSessionChoice -SessionId $sid -Text 'words' -ChoiceCount 2 -ProcessId 4242 `
+        -ExactWalk -Field $typedChoiceField -OpenDelayMs 0 -SubmitDelayMs 0
+    -not $d.Wrote -and -not $d.Delivered
+}
+Test-That 'but words that failed after the walk landed say something was, so the question is not retried' {
+    $script:WalkSends = 0
+    function Invoke-BridgeConsoleSend {
+        param($ProcessId, $Text, $Submit, $DelayMs)
+        $script:WalkSends++
+        if ($script:WalkSends -eq 1) { 'ok:9' } else { 'write-failed:6' }
+    }
+    $d = Send-CopilotSessionChoice -SessionId $sid -Text 'words' -ChoiceCount 2 -ProcessId 4242 `
+        -ExactWalk -Field $typedChoiceField -OpenDelayMs 0 -SubmitDelayMs 0
+    $d.Wrote -and -not $d.Delivered -and $script:WalkSends -eq 2
 }
 function Invoke-BridgeConsoleSend { param($ProcessId, $Text, $Submit, $DelayMs) $script:ConsoleWrites++; 'ok:sent' }
 function Invoke-BridgeConsoleChoice { param($ProcessId, $DownCount, $Text, $StepDelayMs) $script:ConsoleWrites++; 'ok:choice' }

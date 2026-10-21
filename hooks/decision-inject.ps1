@@ -893,23 +893,65 @@ function Send-CopilotSessionForm {
     $result
 }
 
+function Get-CopilotTypedChoiceWalk {
+    <#
+        The keys that take a Copilot option list from wherever its caret rests to its
+        "Other (type your answer)" input, as { Ups, Downs, Payload }.
+
+        Read from the CLI bundle (1.0.96 to 1.0.101), for an enum field and a Yes/No
+        one alike, and driven against a live 1.0.101 session on 2026-10-20: Up stops at
+        the first option, and Down on the last option opens "Other" at once - there is
+        no row below the options to rest on, and no Enter is wanted. So the walk is Up
+        far enough to reach the top from any option, then one Down per option: the last
+        Down is the one that opens it, and nothing is pressed after that.
+
+        Starting from the top rather than from the field's default is deliberate. A
+        caret somebody moved at the terminal would otherwise leave the walk short, on
+        an option, and the Enter that submits the words would commit that option
+        instead.
+
+        Throws for a field that has no such entry to walk to: a free-text box is typed
+        into directly, and a multi-select list's "Other" row sits among checkboxes.
+    #>
+    param([AllowNull()][object]$Field)
+
+    if ($null -eq $Field) { throw 'a typed answer needs the question''s one field' }
+    if (Test-DecisionFieldIsText -Field $Field) { throw 'a free-text field is typed into, not walked to' }
+    if (Test-DecisionFieldIsMultiSelect -Field $Field) { throw 'a multi-select list has no text input to walk to' }
+    $count = @($Field.Options).Count
+    if ($count -lt 1) { throw 'a field with no options has no Other entry' }
+
+    $esc = [string][char]27
+    [pscustomobject]@{
+        Ups     = $count - 1
+        Downs   = $count
+        Payload = (($esc + '[A') * ($count - 1)) + (($esc + '[B') * $count)
+    }
+}
+
 function Send-CopilotSessionChoice {
     <#
-        Answers a live ask_user choice prompt.
+        Answers a live ask_user choice prompt with words, through its own "Other"
+        entry: the one place words get into an arrow-key option list, and the only
+        workable path for a combined multi-field answer whose text matches no single
+        entry.
 
-        The CLI renders choices as an arrow-key select list whose final entry is
-        "Other (type your answer)" - confirmed from the CLI bundle, whose footer hints
-        read {"up-down":"to select", enter:"to confirm"}. Selecting that entry opens a
-        text input.
+        -ExactWalk is how Copilot's prompt is answered. Its "Other" entry is not a row
+        to land on and press Enter at: Down past the last option opens it, the words go
+        into the session's main input box, and Enter there submits them. The walk to it
+        is exact (Get-CopilotTypedChoiceWalk), written on its own, and given a moment to
+        hand the input over before the words follow it - typed sooner, they reach the
+        list, which ignores letters.
 
-        Walking to the "Other" entry and typing the answer is deliberately preferred
-        over counting arrow presses to a specific option: it is correct no matter how
-        the option list is ordered or rendered, and it is the only workable path for a
-        combined multi-field answer whose text matches no single entry.
-
-        `ChoiceCount` is how many options the prompt lists; the walk is that many Downs
-        (plus a margin) to land on the trailing "Other" entry. Extra Downs are harmless
-        because the list stops at its last entry.
+        Without -ExactWalk this types the original walk: `ChoiceCount` Downs plus a
+        margin, Enter to open "Other", the words, Enter. Against Copilot every step of
+        that was wrong. The surplus Downs went nowhere, the first Enter submitted the
+        still-empty input - which Copilot answers by closing "Other" and putting the
+        caret back on the LAST option - the words were typed at the list, and the final
+        Enter committed that last option in the user's name. The card said "Answer
+        sent", and the session was told the user had chosen the last option whatever
+        they had typed (#240). It is kept only for Claude Code, whose question is a
+        different prompt and was not re-verified here.
     #>
     param(
         [Parameter(Mandatory)]
@@ -924,7 +966,20 @@ function Send-CopilotSessionChoice {
         [int]$StepDelayMs = 120,
 
         # Explicit target process, as for Send-CopilotSessionForm.
-        [int]$ProcessId = 0
+        [int]$ProcessId = 0,
+
+        # Copilot's walk, counted from the question's one field. Refused before
+        # anything is typed when there is no field it can walk.
+        [switch]$ExactWalk,
+        [AllowNull()][object]$Field = $null,
+
+        # Between the walk and the words: how long "Other" is given to hand the main
+        # input box over.
+        [int]$OpenDelayMs = 400,
+
+        # Between the words and the Enter that submits them, as for a reply: a burst
+        # of characters is a paste, and only a separate keypress submits it.
+        [int]$SubmitDelayMs = 300
     )
 
     $result = [pscustomobject]@{
@@ -944,6 +999,25 @@ function Send-CopilotSessionChoice {
         return $result
     }
 
+    $clean = Get-CopilotInjectableText -Text $Text
+    $walk = $null
+    if ($ExactWalk) {
+        # Both refusals come before the process is even looked up, so they can never
+        # be mistaken for something that reached the keyboard.
+        try { $walk = Get-CopilotTypedChoiceWalk -Field $Field }
+        catch {
+            $result.Detail = "typed answer cannot reach this prompt: $($_.Exception.Message)"
+            return $result
+        }
+        # Words made only of control characters are spaces by now, and Copilot trims
+        # what it is given: an empty submit closes "Other" and leaves the question
+        # sitting on its last option, so nothing would be answered at all.
+        if ([string]::IsNullOrWhiteSpace($clean)) {
+            $result.Detail = 'empty text'
+            return $result
+        }
+    }
+
     # $targetPid, not $processId; see Send-CopilotSessionPrompt.
     $targetPid = if ($ProcessId -gt 0) { $ProcessId } else { Get-CopilotSessionProcessId -SessionId $SessionId }
     if ($null -eq $targetPid) {
@@ -952,7 +1026,28 @@ function Send-CopilotSessionChoice {
     }
     $result.ProcessId = $targetPid
 
-    $clean = Get-CopilotInjectableText -Text $Text
+    if ($ExactWalk) {
+        try {
+            # Recorded before the write, as everywhere else, and taken back only for an
+            # outcome the transport returns ahead of its first key.
+            $result.Wrote = $true
+            $moved = [string](Invoke-BridgeConsoleSend -ProcessId $targetPid -Text $walk.Payload -Submit $false -DelayMs 0)
+            if (Test-BridgeConsoleOutcomeBeforeWrite -Outcome $moved) { $result.Wrote = $false }
+            if (-not $moved.StartsWith('ok:')) {
+                $result.Detail = "walk:$moved"
+                return $result
+            }
+            Start-Sleep -Milliseconds $OpenDelayMs
+            $typed = [string](Invoke-BridgeConsoleSend -ProcessId $targetPid -Text $clean -Submit $true -DelayMs $SubmitDelayMs)
+            $result.Detail = "other:$($walk.Ups)up+$($walk.Downs)down:$typed"
+            $result.Delivered = $typed.StartsWith('ok:')
+        }
+        catch {
+            $result.Detail = "exception: $($_.Exception.Message)"
+        }
+        return $result
+    }
+
     # A couple of extra Downs guarantee the caret reaches the trailing "Other" entry
     # even if the prompt adds an option the bridge did not know about.
     $downs = [Math]::Max(1, $ChoiceCount + 2)

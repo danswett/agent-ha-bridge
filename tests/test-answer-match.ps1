@@ -311,6 +311,67 @@ Test-That 'a comma in an option the answer is not does not refuse the answer it 
         -Fields @($unrelatedCommaField) -Selections @('#1,2') -Detailed).Status -ceq 'Matched'
 }
 
+Write-Host "`n--- words typed through Other are checked as words ---"
+
+# Words carry no selection, so nothing used to check them at all: the card said "Answer
+# sent" while the session was told the user had picked the last option (#240). Both
+# result strings below are what a live Copilot CLI 1.0.101 recorded on 2026-10-20 for
+# this question - the words, and the option the old walk committed instead.
+$typedArgs = ('{"message":"Q1","requestedSchema":{"properties":{"choice":{"type":"string","title":"Choice",' +
+    '"enum":["Proceed","skip"],"default":"Proceed"}},"required":["choice"]}}') | ConvertFrom-Json
+$typedParsed = & { Set-StrictMode -Off; Repair-DecisionToolArguments -ToolArgs $typedArgs }
+$typedSession = "test-answer-match-$([guid]::NewGuid().ToString('N'))"
+$typedMarkerPath = Get-CopilotDecisionMarkerPath -SessionId $typedSession
+try {
+    Write-CopilotDecisionMarker -SessionId $typedSession -DecisionId 't1' -Question $typedParsed.Question `
+        -Choices @($typedParsed.Choices) -Combos @($typedParsed.Combos) -Fields @($typedParsed.Fields) -Mode 'multiple_choice'
+    Set-CopilotDecisionMarkerInjected -SessionId $typedSession -Answer 'typed two words' -Typed
+    $typedMarker = Get-CopilotDecisionMarker -SessionId $typedSession
+    $typedFields = @($typedMarker.fields)
+    $words = [string]$typedMarker.injectedAnswer
+
+    Test-That 'the marker on disk remembers the answer went in as words' { [bool]$typedMarker.injectedTyped }
+    Test-That 'words recorded as they were typed are confirmed' {
+        (Test-CopilotTypedAnswerRecorded -ResultContent 'User responded: typed two words' -Fields $typedFields -Text $words).Status -ceq 'Matched'
+    }
+    Test-That 'words recorded as one of the options are a mismatch, which is what #240 looked like' {
+        $r = Test-CopilotTypedAnswerRecorded -ResultContent 'User responded: skip' -Fields $typedFields -Text $words
+        $r.Status -ceq 'Mismatch' -and $r.Recorded -ceq 'skip'
+    }
+    Test-That 'and so is a structured result naming an option' {
+        (Test-CopilotTypedAnswerRecorded -ResultContent '{"choice":"Proceed"}' -Fields $typedFields -Text $words).Status -ceq 'Mismatch'
+    }
+    Test-That 'words that happen to be an option are matched, never called a mismatch' {
+        (Test-CopilotTypedAnswerRecorded -ResultContent 'User responded: skip' -Fields $typedFields -Text 'skip').Status -ceq 'Matched'
+    }
+    Test-That 'spacing the prompt collapsed is still the same words' {
+        (Test-CopilotTypedAnswerRecorded -ResultContent 'User responded: typed two words' -Fields $typedFields `
+            -Text "typed  two`twords ").Status -ceq 'Matched'
+    }
+    Test-That 'different words are unconfirmed rather than a mismatch, because the result is only a rendering' {
+        (Test-CopilotTypedAnswerRecorded -ResultContent 'User responded: typed two words, then stop' -Fields $typedFields -Text $words).Status -ceq 'Unconfirmed'
+    }
+    Test-That 'and a result that says nothing about the field confirms nothing' {
+        $statuses = @(foreach ($content in @('', 'garbage', '{"other":"typed two words"}')) {
+            (Test-CopilotTypedAnswerRecorded -ResultContent $content -Fields $typedFields -Text $words).Status
+        })
+        ($statuses -join '|') -ceq 'Unconfirmed|Unconfirmed|Unconfirmed'
+    }
+}
+finally {
+    Remove-CopilotDecisionMarker -SessionId $typedSession
+    $dir = Split-Path $typedMarkerPath -Parent
+    if ($dir -like '*copilot-bridge-markers*' -and (Test-Path -LiteralPath $dir)) {
+        Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+    }
+}
+# A Yes/No field records true or false, which the card shows as Yes and No.
+$typedBool = [pscustomobject]@{ Name = 'ok'; Label = 'OK'; Options = @('Yes', 'No'); Values = @($true, $false); IsText = $false }
+Test-That 'a Yes/No field that recorded its value instead of the words is a mismatch' {
+    (Test-CopilotTypedAnswerRecorded -ResultContent '{"ok":true}' -Fields @($typedBool) -Text 'later').Status -ceq 'Mismatch' -and
+    (Test-CopilotTypedAnswerRecorded -ResultContent 'User responded: true' -Fields @($typedBool) -Text 'later').Status -ceq 'Mismatch'
+}
+
 if ($script:Failures -gt 0) {
     Write-Host "`n$($script:Failures) failed" -ForegroundColor Red
     exit 1

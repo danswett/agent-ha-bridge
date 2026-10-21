@@ -2121,6 +2121,15 @@ Two `ask_user` argument shapes are handled. Current builds pass **`message`** pl
   commits what is ticked, and not on a Codex approval. Where words cannot be used -
   a form with no free-text field, or a choice already tapped - the card says so
   rather than dropping them.
+* **The words arrive as words.** In Copilot's prompt, Down past the last option opens
+  "Other" straight into the session's input box, so the bridge walks there exactly
+  and submits the words with a single Enter. The walk it used before pressed Enter at
+  that input while it was still empty, which Copilot answers by going back to the
+  last option - so the session was told the last option had been chosen, whatever was
+  typed (#240). Once the question completes the words are checked against what the
+  session recorded, and a result naming one of the options instead reads *Answer
+  differs - check the terminal*. A Copilot question with no single field to type into
+  (a legacy `choices` list) says it cannot take words rather than guessing.
 * Questions are carried up to 6,000 characters and each choice up to 600; anything
   longer is truncated and the card says so.
 * **An answer is read by identity, never by a clock.** As a question is armed the

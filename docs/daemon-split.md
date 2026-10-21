@@ -107,6 +107,8 @@ after the Claude and Codex checks, so the table has to name it outright.
 - [x] **C. Decisions and replies**. Claude's question parser, Codex approvals,
   Claude's reply confirmation. *Done.* Slots `AskUserState`
   (inherited), `ApprovalMarker`; flag `TranscriptConfirmsInput` (replies and answers).
+  Flag `ExactOtherWalk` (Copilot) chooses how words typed at a choice question are
+  walked into its prompt (`Get-DaemonTypedAnswerRoute`, #240).
   `Invoke-DaemonReply`'s fallback process scan loops agents with `KnowsProcessId`.
   `Invoke-PendingCodexApprovals` keeps its name but serves any agent with an
   `ApprovalMarker`.

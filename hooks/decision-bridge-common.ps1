@@ -2728,7 +2728,12 @@ function Set-CopilotDecisionMarkerInjected {
 
         # The per-field option labels that were driven into the prompt, kept so the
         # recorded answer can be checked against them once the tool completes.
-        [AllowNull()][AllowEmptyCollection()][string[]]$Selections = @()
+        [AllowNull()][AllowEmptyCollection()][string[]]$Selections = @(),
+
+        # The answer went in as words through the prompt's own "Other" input, so what
+        # completion checks is that those words are what was recorded - not a
+        # selection, of which there was none.
+        [switch]$Typed
     )
     $marker = Get-CopilotDecisionMarker -SessionId $SessionId
     if ($null -eq $marker) { return }
@@ -2737,6 +2742,7 @@ function Set-CopilotDecisionMarkerInjected {
     foreach ($p in $marker.PSObject.Properties) { $obj[$p.Name] = $p.Value }
     $obj['injectedAnswer'] = $Answer
     $obj['injectedSelections'] = @($Selections)
+    $obj['injectedTyped'] = [bool]$Typed
     Set-Content -LiteralPath $path -Value ($obj | ConvertTo-Json -Depth 8 -Compress) -Encoding UTF8
 }
 
@@ -3912,6 +3918,106 @@ function Test-CopilotAnswerMatchesSelections {
     if ($verified -eq 0) { return (& $finish 'Unconfirmed') }
     if ($mismatch) { return (& $finish 'Mismatch') }
     & $finish 'Matched'
+}
+
+function Test-CopilotTypedAnswerRecorded {
+    <#
+        Whether words typed through a choice question's "Other" input are what the
+        session recorded, as { Status, Recorded }: Matched, Mismatch or Unconfirmed.
+
+        Mismatch is kept for the one failure this can name for certain: the result
+        holds one of the question's own options instead of the words. That is how #240
+        looked from outside - words typed on the phone, "Answer sent" on the card, and
+        the session told the user had picked the last option. Words that are
+        themselves an option are matched first, so they never read as that.
+
+        Anything else that differs is Unconfirmed rather than a mismatch: the result is
+        a rendering of the answer, and one that reflowed the words is not evidence of a
+        different answer.
+    #>
+    param(
+        [AllowNull()][AllowEmptyString()][object]$ResultContent,
+        [AllowNull()][AllowEmptyCollection()][object[]]$Fields,
+        [AllowNull()][AllowEmptyString()][string]$Text
+    )
+
+    $finish = { param([string]$Status, $Recorded) [pscustomobject]@{ Status = $Status; Recorded = $Recorded } }
+    $fieldList = @($Fields | Where-Object { $null -ne $_ })
+    if ($fieldList.Count -ne 1 -or [string]::IsNullOrWhiteSpace($Text) -or $null -eq $ResultContent) {
+        return (& $finish 'Unconfirmed' $null)
+    }
+    $field = $fieldList[0]
+    $name = if ($field.PSObject.Properties['Name']) { [string]$field.Name } else { '' }
+
+    # Every way the result can be read as this one field's value.
+    $readings = [Collections.Generic.List[object]]::new()
+    $content = $ResultContent
+    if ($content -is [string]) {
+        $trimmed = $content.Trim()
+        if ($trimmed.StartsWith('User responded: ', [StringComparison]::Ordinal)) {
+            $rest = $trimmed.Substring('User responded: '.Length)
+            $readings.Add($rest)
+            # A lone field's answer has been seen written bare; "name=value" is read
+            # as well rather than assumed never to happen.
+            if ($name -and $rest.StartsWith("$name=", [StringComparison]::Ordinal)) {
+                $readings.Add($rest.Substring($name.Length + 1))
+            }
+        }
+        elseif ($trimmed.StartsWith('{', [StringComparison]::Ordinal)) {
+            try { $content = ConvertFrom-DecisionJson -Json $trimmed }
+            catch { return (& $finish 'Unconfirmed' $null) }
+        }
+        else { return (& $finish 'Unconfirmed' $null) }
+    }
+    if ($readings.Count -eq 0) {
+        $pairs = @()
+        if ($content -is [Collections.IDictionary]) {
+            $pairs = @(foreach ($key in $content.Keys) { [pscustomobject]@{ Name = $key; Value = $content[$key] } })
+        }
+        elseif ($content -is [pscustomobject]) {
+            $pairs = @(foreach ($property in $content.PSObject.Properties) { [pscustomobject]@{ Name = $property.Name; Value = $property.Value } })
+        }
+        if ($pairs.Count -ne 1 -or -not $name -or -not [StringComparer]::Ordinal.Equals([string]$pairs[0].Name, $name)) {
+            return (& $finish 'Unconfirmed' $null)
+        }
+        $readings.Add($pairs[0].Value)
+    }
+
+    $flat = { param([AllowNull()][AllowEmptyString()][string]$Value) (([string]$Value) -replace '\s+', ' ').Trim() }
+    # Normalised as the words were when they were typed (Get-CopilotInjectableText,
+    # which this file does not load): every control character became a space.
+    $expected = & $flat ($Text -replace '\p{Cc}', ' ')
+    foreach ($reading in $readings) {
+        if ($reading -is [string] -and [StringComparer]::Ordinal.Equals((& $flat $reading), $expected)) {
+            return (& $finish 'Matched' $reading)
+        }
+    }
+
+    # An option, by any spelling the result could give it: its label, or its value -
+    # as written in text, or as the JSON scalar the schema declared.
+    $scalar = {
+        param([AllowNull()]$Value)
+        if ($null -ne $Value -and [Type]::GetTypeCode($Value.GetType()).ToString() -notin
+            @('String', 'Boolean', 'SByte', 'Byte', 'Int16', 'UInt16', 'Int32', 'UInt32', 'Int64', 'UInt64', 'Single', 'Double', 'Decimal')) { return $null }
+        ConvertTo-Json -InputObject $Value -Compress
+    }
+    $options = @($field.Options | ForEach-Object { [string]$_ })
+    $values = @(if ($field.PSObject.Properties['Values']) { $field.Values } else { $options })
+    $spellings = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    $encodings = [Collections.Generic.HashSet[string]]::new([StringComparer]::Ordinal)
+    foreach ($label in $options) { [void]$spellings.Add($label) }
+    foreach ($value in $values) {
+        $encoding = & $scalar $value
+        if ($null -eq $encoding) { continue }
+        [void]$encodings.Add($encoding)
+        [void]$spellings.Add($(if ($value -is [string]) { $value } else { $encoding }))
+    }
+    foreach ($reading in $readings) {
+        $hit = if ($reading -is [string]) { $spellings.Contains($reading.Trim()) }
+               else { $encoding = & $scalar $reading; $null -ne $encoding -and $encodings.Contains($encoding) }
+        if ($hit) { return (& $finish 'Mismatch' $reading) }
+    }
+    & $finish 'Unconfirmed' $readings[0]
 }
 
 function Get-DecisionFieldOptionValue {
