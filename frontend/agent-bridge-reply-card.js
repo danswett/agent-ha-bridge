@@ -82,7 +82,7 @@
  * was away never appeared, and a hard reload was the only way to see it. The cards
  * now hold a subscription of their own; see CONFIG_WATCH.
  */
-const CARD_VERSION = '1.40.0';
+const CARD_VERSION = '1.41.0';
 
 /*
  * How large a non-image attachment may be.
@@ -3600,8 +3600,9 @@ class AgentBridgeUsageCard extends HTMLElement {
         .chev { transition: transform 0.2s ease; color: var(--secondary-text-color); --mdc-icon-size: 20px; display: inline-flex; margin-left: -4px; }
         .open .chev { transform: rotate(90deg); }
         .summary { color: var(--secondary-text-color); font-size: 0.9em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-        .summary.warn { color: var(--warning-color); }
-        .summary.crit { color: var(--error-color, #f44336); }
+        /* The same colours as the bars, figure by figure: see _render. */
+        .summary .figure.warn { color: var(--warning-color, #ff9800); }
+        .summary .figure.crit { color: var(--error-color, #f44336); }
         .groups { margin-top: 4px; }
         .group { padding: 10px 0 4px; border-top: 1px solid var(--divider-color); }
         .ghead { display: flex; align-items: baseline; gap: 8px; }
@@ -3780,13 +3781,26 @@ class AgentBridgeUsageCard extends HTMLElement {
 
     const entries = this._collect();
     const worst = entries.length ? entries[0] : null;
-    this._els.summary.textContent = worst && Number.isFinite(worst.percent)
-      ? entries.filter((e) => Number.isFinite(e.percent))
-        .map((e) => `${e.label} ${Math.round(e.percent)}%`).join(' \u00b7 ')
-      : 'No usage reported yet';
-    const severity = worst ? AgentBridgeUsageCard._severity(worst.percent) : '';
-    this._els.summary.classList.toggle('warn', severity === 'warn');
-    this._els.summary.classList.toggle('crit', severity === 'crit');
+    // Each figure takes the colour of its own bars. The line used to take the colour
+    // of the worst one as a whole, so one account past 75% turned every agent beside
+    // it amber as well, and the line you read folded shut no longer said which agent
+    // was running short. An entry's percent is its fullest window (the daemon's
+    // headline), so this is the colour of its most-used bar.
+    const summary = this._els.summary;
+    summary.textContent = '';
+    if (worst && Number.isFinite(worst.percent)) {
+      entries.filter((e) => Number.isFinite(e.percent)).forEach((e, i) => {
+        if (i > 0) { summary.append(' \u00b7 '); }
+        const figure = document.createElement('span');
+        figure.className = 'figure';
+        figure.textContent = `${e.label} ${Math.round(e.percent)}%`;
+        const severity = AgentBridgeUsageCard._severity(e.percent);
+        if (severity) { figure.classList.add(severity); }
+        summary.append(figure);
+      });
+    } else {
+      summary.textContent = 'No usage reported yet';
+    }
 
     if (!this._open) { return }
     this._els.groups.textContent = '';

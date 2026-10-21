@@ -1390,6 +1390,57 @@ check('Copilot, which names its account, is grouped on that exactly as before',
 check('and is never given an id-shaped name', logins.every((e) => !e.account.startsWith('#')));
 
 console.log('');
+console.log('--- the folded line colours each figure the way its own bars are coloured ---');
+/*
+ * The line used to take the colour of whichever window was closest to running out, so
+ * one account past 75% turned every agent on it amber - "if any one of those has a
+ * yellow bar when it's open, all of them are yellow" - and folded shut, the line said
+ * something was running short without saying which.
+ */
+function foldedLine(records) {
+  const line = new AgentBridgeUsageCard();
+  line.setConfig({ entities: Object.keys(records) });
+  line._open = false;
+  line.hass = { states: records, callService: () => {} };
+  return line._els.summary;
+}
+const colourOf = (element) => (element.classList.contains('crit') ? 'crit'
+  : (element.classList.contains('warn') ? 'warn' : ''));
+const figuresOf = (line) => JSON.stringify(line.children.map((figure) => [figure.textContent, colourOf(figure)]));
+
+// The dashboard as it was reported: one Copilot account at 77% and nothing else close.
+const reported = foldedLine({
+  'sensor.work': usageRecord({ account: 'dswett_microsoft', ageMs: 1 * MINUTE, percent: 77.3 }),
+  'sensor.personal': usageRecord({ account: 'danswett', ageMs: 13 * MINUTE, percent: 19.5 }),
+  'sensor.codex': {
+    state: '7',
+    attributes: {
+      client: 'codex', label: 'Codex', plan: 'plus', source: 'transcript', error: '',
+      measured_at: agoIso(13 * 24 * HOUR),
+      windows: [{ key: 'primary', label: '5h limit', percent: 7 }, { key: 'secondary', label: 'Weekly', percent: 5 }],
+    },
+  },
+  'sensor.claude': claudeRecord({ id: 'a1b2c3d4e5f6', ageMs: 19 * HOUR, percent: 0, plan: 'pro' }),
+});
+check('only the account whose bar is amber is amber on the folded line',
+  figuresOf(reported) === JSON.stringify([
+    ['GitHub Copilot 77%', 'warn'], ['GitHub Copilot 20%', ''], ['Codex 7%', ''], ['Claude Code 0%', ''],
+  ]), figuresOf(reported));
+check('and it still reads as the one line it was, closest to running out first',
+  reported.textContent === 'GitHub Copilot 77% \u00b7 GitHub Copilot 20% \u00b7 Codex 7% \u00b7 Claude Code 0%',
+  reported.textContent);
+
+const redBesideAmber = foldedLine({
+  'sensor.work': usageRecord({ account: 'dswett_microsoft', ageMs: 1 * MINUTE, percent: 93.4 }),
+  'sensor.personal': usageRecord({ account: 'danswett', ageMs: 1 * MINUTE, percent: 80 }),
+  'sensor.claude': claudeRecord({ id: 'a1b2c3d4e5f6', percent: 12 }),
+});
+check('one nearly gone beside one past amber is red beside amber, not red twice',
+  figuresOf(redBesideAmber) === JSON.stringify([
+    ['GitHub Copilot 93%', 'crit'], ['GitHub Copilot 80%', 'warn'], ['Claude Code 12%', ''],
+  ]), figuresOf(redBesideAmber));
+
+console.log('');
 console.log('--- the launch card carries model, effort and context ---');
 /*
  * The three tuning selectors are the launch card's only controls whose options change
