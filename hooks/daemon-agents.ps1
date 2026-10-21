@@ -26,6 +26,10 @@
       ApprovalMarker    a pending tool approval its hook recorded, or $null
       TranscriptConfirmsInput  its transcript shows whether typed input was submitted,
                         so a reply or an answer is confirmed rather than assumed
+      ExactOtherWalk    its option list opens "Other" on the Down past the last option
+                        and takes the words in the main input, so words typed at a
+                        choice question are walked there exactly rather than by the
+                        original walk, which commits its last option (#240)
       AdapterInstalled  whether its bridge adapter is in place; an agent without this
                         slot has no adapter the daemon can set up
       Installer         how to install its adapter, given the installer payload; without
@@ -75,6 +79,8 @@ $script:DaemonAgents = [ordered]@{
         # Copilot writes its thinking as messages of its own, interleaved with the ones
         # carrying text, so the card can show them in order (Add-DaemonCardText).
         InlineReasoning = $true
+        # Read from the CLI bundle, 1.0.96 to 1.0.101 (Get-CopilotTypedChoiceWalk).
+        ExactOtherWalk = $true
     }
 
     claude = @{
@@ -240,6 +246,7 @@ function Get-DaemonAgent {
         FindSessions = $null; PollRegistration = $null; FastActivity = $null; KnownActivity = $null; ApprovalMarker = $null
         AdapterInstalled = $null; Installer = $null; SetupNote = $null
         HookStatus = $false; InlineReasoning = $false; RefreshName = $false; KnowsProcessId = $false; TranscriptConfirmsInput = $false
+        ExactOtherWalk = $false
     }
     foreach ($slot in 'Display', 'ReadAppend', 'Activity', 'CountCompactions', 'IsWorking', 'AskUserState') { $agent[$slot] = $default[$slot] }
     foreach ($slot in $own.Keys) { $agent[$slot] = $own[$slot] }

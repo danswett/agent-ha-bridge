@@ -99,8 +99,9 @@ function Invoke-PendingDecisions {
 function Complete-DaemonAnsweredDecision {
     <#
         Tidies up after a question answered by either input: checks that an injected
-        selection is what the CLI recorded, reports uncertainty or a mismatch without
-        overwriting the terminal answer, then clears the card and removes the marker.
+        selection - or words typed through "Other" - is what the CLI recorded, reports
+        uncertainty or a mismatch without overwriting the terminal answer, then clears
+        the card and removes the marker.
     #>
     param(
         [Parameter(Mandatory)][string]$SessionId,
@@ -120,8 +121,28 @@ function Complete-DaemonAnsweredDecision {
     try {
         $injected = @()
         if ($marker.PSObject.Properties['injectedSelections']) { $injected = @($marker.injectedSelections) }
-        if ($injected.Count -gt 0) {
-            $content = if ($askState.PSObject.Properties['ResultContent']) { $askState.ResultContent } else { $null }
+        $typed = $marker.PSObject.Properties['injectedTyped'] -and [bool]$marker.injectedTyped
+        $content = if ($askState.PSObject.Properties['ResultContent']) { $askState.ResultContent } else { $null }
+        if ($typed) {
+            # Words sent through "Other" carry no selection to check, which is why one
+            # recorded as an option went unremarked: the card said "Answer sent" while
+            # the session was told the user had picked its last option (#240).
+            $sent = [string]$marker.injectedAnswer
+            $verification = Test-CopilotTypedAnswerRecorded -ResultContent $content -Fields @($marker.fields) -Text $sent
+            if ($verification.Status -ceq 'Mismatch') {
+                $recorded = if ($verification.Recorded -is [string]) { $verification.Recorded }
+                            else { ConvertTo-Json -InputObject $verification.Recorded -Compress }
+                Write-DaemonLog -Message "MISMATCH for $($sessionId.Substring(0,8)): typed words recorded as an option; terminal result retained"
+                Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Answer differs - check the terminal' `
+                    -Extra @{ sent = $sent; recorded = $recorded; verification = 'Mismatch' } -Headers $Headers | Out-Null
+            }
+            elseif ($verification.Status -ceq 'Unconfirmed') {
+                Write-DaemonLog -Message "typed answer unconfirmed for $($sessionId.Substring(0,8)); terminal result retained"
+                Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Answer unconfirmed - check the terminal' `
+                    -Extra @{ verification = 'Unconfirmed' } -Headers $Headers | Out-Null
+            }
+        }
+        elseif ($injected.Count -gt 0) {
             $verification = Test-CopilotAnswerMatchesSelections -ResultContent $content `
                 -Fields @($marker.fields) -Selections $injected -Detailed
             if ($verification.Status -ceq 'Mismatch') {
@@ -274,6 +295,76 @@ function Test-DaemonDecisionUsesFields {
     } else { $null }
     if ($null -ne $attrs -and $attrs.PSObject.Properties['multi_field']) { return [bool]$attrs.multi_field }
     @($Marker.fields).Count -gt 1
+}
+
+function Get-DaemonTypedAnswerRoute {
+    <#
+        How words typed at a choice question - in the reply box, or in a phone
+        notification's text field - reach its prompt, as { Route, Field }:
+
+          other   walked into the one option list's own "Other" input
+                  (Send-CopilotSessionChoice -ExactWalk)
+          field   typed into the question's one free-text field, the way the card
+                  answers that field (Send-CopilotSessionForm)
+          legacy  an agent whose prompt keeps the original walk (Claude Code)
+          ''      nowhere
+
+        Nowhere is a Copilot question with no single field to put words in. Its legacy
+        `choices` prompt takes them only in a box that Enter does not submit, and has
+        no "Other" row at all unless the question allows one; a tabbed form is
+        answered field by field; a multi-select list's "Other" row sits among
+        checkboxes. The original walk typed at any of those answered something other
+        than the words, so nothing is typed.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)]$Marker
+    )
+
+    $session = if ($script:DaemonLive) { $script:DaemonLive[$SessionId] } else { $null }
+    if (-not (Get-DaemonAgent -Kind (Get-DaemonEntryKind -Entry $session)).ExactOtherWalk) {
+        return [pscustomobject]@{ Route = 'legacy'; Field = $null }
+    }
+    # @() around the whole if: a branch yielding an empty array assigns $null, and
+    # reading Count off that is a terminating error under strict mode.
+    $fields = @(if ($Marker.PSObject.Properties['fields']) { $Marker.fields | Where-Object { $null -ne $_ } })
+    if ($fields.Count -eq 1) {
+        if (Test-DecisionFieldIsText -Field $fields[0]) { return [pscustomobject]@{ Route = 'field'; Field = $fields[0] } }
+        if (-not (Test-DecisionFieldIsMultiSelect -Field $fields[0])) { return [pscustomobject]@{ Route = 'other'; Field = $fields[0] } }
+    }
+    [pscustomobject]@{ Route = ''; Field = $null }
+}
+
+function Write-DaemonUnusableTextNotice {
+    <#
+        Says, once per reply-card publish, that words typed at a question were not sent
+        because the question cannot take them. Silently dropping what somebody typed is
+        the bug this work exists to fix, and it is no better when the words cannot be
+        used.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][hashtable]$State,
+        [Parameter(Mandatory)]$Card,
+        [Parameter(Mandatory)][hashtable]$Headers,
+        [string]$Hint = ''
+    )
+
+    $entry = $State[$SessionId]
+    $toldAt = if ($entry.PSObject.Properties['LastDecisionTextNoticeAt']) { [string]$entry.LastDecisionTextNoticeAt } else { '' }
+    if ($toldAt -eq $Card.Stamp) { return }
+    if ($entry.PSObject.Properties['LastDecisionTextNoticeAt']) { $entry.LastDecisionTextNoticeAt = $Card.Stamp }
+    else { $entry | Add-Member -NotePropertyName LastDecisionTextNoticeAt -NotePropertyValue $Card.Stamp -Force }
+    $extra = @{ typed = $Card.Text }
+    if ($Hint) { $extra['hint'] = $Hint }
+    try {
+        Set-DaemonTransientActivity -SessionId $SessionId -Summary 'Not sent - this question takes options' `
+            -Extra $extra -Headers $Headers | Out-Null
+    }
+    catch {
+        if (Test-DaemonMarkedGuardError -ErrorRecord $_) { throw }
+    }
+    Write-DaemonLog -Message "reply card text for $($SessionId.Substring(0,8)) is not answerable by this question"
 }
 
 function Test-DaemonMarkedGuardError {
@@ -601,9 +692,17 @@ function Read-DaemonDecisionAnswer {
                 # payload's arrival is itself the explicit send.
                 $card = Read-DaemonDecisionCardText -SessionId $SessionId -Marker $Marker -Headers $Headers
                 if (-not [string]::IsNullOrWhiteSpace($card.Text)) {
-                    $answer = $card.Text
-                    $isFreeText = $true
-                    $stamp = $card.Stamp
+                    # Unless the prompt has nowhere to put them. Taken anyway, they went
+                    # down a walk that answered with one of the options instead (#240).
+                    if ((Get-DaemonTypedAnswerRoute -SessionId $SessionId -Marker $Marker).Route -ceq '') {
+                        Write-DaemonUnusableTextNotice -SessionId $SessionId -State $State -Card $card `
+                            -Headers $Headers -Hint 'tap an option, or answer in the terminal'
+                    }
+                    else {
+                        $answer = $card.Text
+                        $isFreeText = $true
+                        $stamp = $card.Stamp
+                    }
                 }
                 else {
                     # Send pressed at a question with nothing tapped and nothing typed.
@@ -852,24 +951,9 @@ function Read-DaemonFormAnswer {
 
     # Words typed at a question that cannot take them - a form with no free-text
     # field, or a single choice that has already been tapped. Said out loud once per
-    # publish rather than swallowed: silently dropping what somebody typed is the
-    # whole bug this work exists to fix, and it is no better when the words cannot
-    # be used.
+    # publish rather than swallowed.
     if (-not [string]::IsNullOrWhiteSpace($card.Text) -and -not $takesText) {
-        $entry = $State[$sessionId]
-        $toldAt = if ($entry.PSObject.Properties['LastDecisionTextNoticeAt']) { [string]$entry.LastDecisionTextNoticeAt } else { '' }
-        if ($toldAt -ne $card.Stamp) {
-            if ($entry.PSObject.Properties['LastDecisionTextNoticeAt']) { $entry.LastDecisionTextNoticeAt = $card.Stamp }
-            else { $entry | Add-Member -NotePropertyName LastDecisionTextNoticeAt -NotePropertyValue $card.Stamp -Force }
-            try {
-                Set-DaemonTransientActivity -SessionId $sessionId -Summary 'Not sent - this question takes options' `
-                    -Extra @{ typed = $card.Text } -Headers $Headers | Out-Null
-            }
-            catch {
-                if (Test-DaemonMarkedGuardError -ErrorRecord $_) { throw }
-            }
-            Write-DaemonLog -Message "reply card text for $($sessionId.Substring(0,8)) is not answerable by this question"
-        }
+        Write-DaemonUnusableTextNotice -SessionId $sessionId -State $State -Card $card -Headers $Headers
     }
 
     # Send on the reply card submits too, but only a complete form: an incomplete one
@@ -998,6 +1082,11 @@ function Invoke-DaemonDecisionAnswer {
     # Claude and Codex leave no lock file for the injector to find their process by.
     $processId = Get-DaemonSessionProcessId -SessionId $SessionId
     $deliveredSelections = @()
+    # Where words go in this prompt, for the two routes below that type them, and
+    # whether they went through "Other" - which is what completion then checks.
+    # Worked out before anything is claimed, so nothing here can strand a claim.
+    $typed = Get-DaemonTypedAnswerRoute -SessionId $SessionId -Marker $Marker
+    $typedThroughOther = $false
 
     # One attempt per question, claimed before a key is typed.
     #
@@ -1070,12 +1159,22 @@ function Invoke-DaemonDecisionAnswer {
     $IsFreeText = $attempt.IsFreeText
     $PayloadStamp = $attempt.PayloadStamp
 
-    if ($IsChoice -and $IsFreeText) {
+    if ($IsChoice -and $IsFreeText -and $typed.Route -ceq 'field') {
+        # The question is a free-text box, so the words are typed into it the way the
+        # card's own answer to it is. Down the walk below, its first Enter submitted
+        # the box empty and the words followed as a message of their own.
+        $delivery = Send-CopilotSessionForm -SessionId $SessionId -Fields @($typed.Field) `
+            -Selections @($Answer) -ProcessId $processId
+        if ($null -ne $delivery -and $delivery.Delivered) { $deliveredSelections = @($Answer) }
+    }
+    elseif ($IsChoice -and $IsFreeText) {
         # Typed, not chosen. The prompt's own "Other (type your answer)" entry is the
         # only way words get into an arrow-key option list, and hunting for the text
         # among the options would simply fail - it was never one of them.
         $delivery = Send-CopilotSessionChoice -SessionId $SessionId -Text $Answer `
-            -ChoiceCount (@($Marker.choices).Count) -ProcessId $processId
+            -ChoiceCount (@($Marker.choices).Count) -ProcessId $processId `
+            -ExactWalk:($typed.Route -cne 'legacy') -Field $typed.Field
+        $typedThroughOther = ($typed.Route -ceq 'other')
     }
     elseif ($IsChoice) {
         # The native prompt is one arrow-key option list per field (tabbed when there
@@ -1111,7 +1210,9 @@ function Invoke-DaemonDecisionAnswer {
                     Write-DaemonLog -Message "form injection unavailable for $short ($($delivery.Detail)); falling back to text"
                 }
                 $delivery = Send-CopilotSessionChoice -SessionId $SessionId -Text $Answer `
-                    -ChoiceCount (@($Marker.choices).Count) -ProcessId $processId
+                    -ChoiceCount (@($Marker.choices).Count) -ProcessId $processId `
+                    -ExactWalk:($typed.Route -cne 'legacy') -Field $typed.Field
+                $typedThroughOther = ($typed.Route -ceq 'other')
             }
         }
     }
@@ -1126,7 +1227,8 @@ function Invoke-DaemonDecisionAnswer {
     }
 
     if ($delivery.Delivered) {
-        Set-CopilotDecisionMarkerInjected -SessionId $SessionId -Answer $Answer -Selections $deliveredSelections
+        Set-CopilotDecisionMarkerInjected -SessionId $SessionId -Answer $Answer -Selections $deliveredSelections `
+            -Typed:$typedThroughOther
         # Mark the reply-card publish used only now. Recorded under the same name the
         # reply path reads, so the words that answered a question are never delivered
         # again as a fresh reply once the card clears.

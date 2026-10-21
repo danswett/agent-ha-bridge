@@ -645,6 +645,27 @@ function Invoke-WebRequest {
                 $null -eq (Get-CopilotDecisionMarker -SessionId $sid) -and $state[$sid].LastReply -ceq ''
             }
         }
+        # Words typed through "Other" carry no selection, so they used to complete with
+        # nothing checked: the card said "Answer sent" while the session was told the
+        # user had picked an option (#240).
+        foreach ($completion in @(
+            @{ Content = 'User responded: neither, rebase first'; Warning = '' }
+            @{ Content = 'User responded: Not now'; Warning = 'differs' }
+            @{ Content = ''; Warning = 'unconfirmed' }
+        )) {
+            Write-CopilotDecisionMarker -SessionId $sid -DecisionId 'completion' -Question Synthetic -Fields @($field) -Mode multiple_choice
+            Set-CopilotDecisionMarkerInjected -SessionId $sid -Answer 'neither, rebase first' -Typed
+            $completionMarker = Get-CopilotDecisionMarker -SessionId $sid
+            $state = @{ $sid = [pscustomobject]@{ Name = 'Synthetic'; Machine = 'TEST'; LastReply = 'old' } }
+            $script:P3bWarnings.Clear()
+            Complete-DaemonAnsweredDecision -SessionId $sid -Marker $completionMarker -Headers @{} -State $state `
+                -AskState ([pscustomobject]@{ Started = $true; Pending = $false; ResultContent = $completion.Content })
+            Test-That "typed words completed as '$($completion.Content)' report '$($completion.Warning)' and type nothing" {
+                $script:P3bNativeCount -eq 0 -and $null -eq (Get-CopilotDecisionMarker -SessionId $sid) -and
+                    $(if ($completion.Warning) { $script:P3bWarnings.Count -eq 1 -and $script:P3bWarnings[0] -match $completion.Warning }
+                      else { $script:P3bWarnings.Count -eq 0 })
+            }
+        }
     }
 
     $deliveryInitialFailures = $script:Failures
