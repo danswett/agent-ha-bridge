@@ -1104,8 +1104,8 @@ with the line underneath naming it: `│ even pace 20% · 48% ahead of pace`. Tw
 of a monthly allowance gone means nothing on its own — on the 25th it is thrift, on the
 5th it is a problem, and the bar alone cannot tell you which. Being ahead of the clock
 by more than a tenth of the window is coloured; anything closer is noise. Bars turn
-amber at 75% and red at 90%, and the folded summary line takes the colour of whichever
-window is closest to running out.
+amber at 75% and red at 90%, and each figure on the folded summary line takes the
+colour of its own bars, so only the allowance running short stands out there.
 
 Tokens are read, spent on the one request, and dropped — never logged, never
 published, never written anywhere. Turn the whole thing off with `usage.publish:

@@ -847,9 +847,18 @@ $hotDrawn = ($hotJob | & $nodeExe.Source $driver) | ConvertFrom-Json -Depth 40
 Test-That 'an allowance nearly gone colours its bar as critical' {
     (@($hotDrawn.groups | Where-Object { $_.name -eq 'GitHub Copilot' })[0]).windows[0].severity -ceq 'crit'
 }
+$hotFigures = @($hotDrawn.figures | ForEach-Object { "$($_.text):$($_.severity)" }) -join ', '
 Test-That 'and says so on the line you see without opening the card' {
-    $hotDrawn.severity -ceq 'crit'
-}
+    $figure = @($hotDrawn.figures | Where-Object { $_.text -like 'GitHub Copilot *' })
+    $figure.Count -eq 1 -and $figure[0].severity -ceq 'crit'
+} "figures=$hotFigures"
+# The whole line used to take the colour of the client closest to running out, so one
+# allowance nearly gone painted every client beside it too, and the line folded shut
+# no longer said which one it was.
+Test-That 'but only on its own figure, not on the clients beside it with room to spare' {
+    $others = @($hotDrawn.figures | Where-Object { $_.text -notlike 'GitHub Copilot *' })
+    $others.Count -eq 2 -and @($others | Where-Object { $_.severity }).Count -eq 0
+} "figures=$hotFigures"
 
 $closed = @{ config = $usageCard; states = $haStates; open = $false } | ConvertTo-Json -Depth 40
 $closedDrawn = ($closed | & $nodeExe.Source $driver) | ConvertFrom-Json -Depth 40

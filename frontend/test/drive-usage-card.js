@@ -8,7 +8,7 @@
  * `states` are the entity states Publish-CopilotMqttUsage really produces.
  *
  * Writes on stdout:
- *   { summary, severity, hidden, size, groups: [...] }
+ *   { summary, figures: [{ text, severity }], hidden, size, groups: [...] }
  *
  * Nothing here knows which entity a row should read, how two machines reporting one
  * account should be reconciled, or what a bar should be filled to - that is what is
@@ -81,10 +81,16 @@ process.stdin.on('end', () => {
     }),
   }));
 
+  const severityOf = (element) => (element.classList.contains('crit') ? 'crit'
+    : (element.classList.contains('warn') ? 'warn' : ''));
+
   process.stdout.write(JSON.stringify({
     summary: card._els.summary.textContent,
-    severity: card._els.summary.classList.contains('crit') ? 'crit'
-      : (card._els.summary.classList.contains('warn') ? 'warn' : ''),
+    // One per client on the folded line, each with the colour it was drawn in.
+    figures: pickAll(card._els.summary, 'figure').map((figure) => ({
+      text: figure.textContent,
+      severity: severityOf(figure),
+    })),
     hidden: !!card._els.groups.hidden,
     size: card.getCardSize(),
     groups,
