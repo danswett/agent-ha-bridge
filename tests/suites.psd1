@@ -73,6 +73,7 @@
         'tests\test-update-intake.ps1'
         'tests\test-update-outcome.ps1'
         'tests\test-usage.ps1'
+        'tests\test-vbs-launchers.ps1'
         'tests\test-verbose-toggle.ps1'
         'tests\test-worktree-isolation.ps1'
         'tests\test-write-boundary-callers.ps1'

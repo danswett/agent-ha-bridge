@@ -1975,6 +1975,7 @@ inside a disposable machine, not permission to exercise installation on a real o
 | `Publication policy was lost after establishment` | Preserve receipts and restore the operator-verified policy resource; do not erase local evidence or bootstrap again. |
 | Sessions stop appearing on a page left open, until it is reloaded | Home Assistant parks the whole dashboard panel after the tab has been hidden for five minutes and drops its config subscription for good. From card 1.39.0 the cards hold a subscription of their own and ask the panel to refetch, so the page catches up within a few seconds. Below that, reload it. |
 | A Dev Box goes offline mid-session every evening | Its pool hibernates on disconnect. See [Running on a Microsoft Dev Box](#running-on-a-microsoft-dev-box). |
+| A *Windows Script Host* "Permission denied" (800A0046) dialog naming `agent-bridge-launch.vbs` at logon, and the bridge offline | An older launcher could not start a Microsoft Store PowerShell while Windows was applying an update to it. The always-running bridge holds that update back until the next logon. Dismiss the dialog and run `agent-ha-bridge restart`, or update. The current launcher waits for PowerShell and records a start it could not make in `agent-bridge-supervisor.log`. |
 
 On Windows the daemon runs under an installation-scoped hidden task. For the default
 installation (set `$bridgeRoot` to the intended root for a custom installation):
@@ -2182,6 +2183,12 @@ after `/restart`; the daemon is shared and picks up new sessions on its own reco
 * The daemon must keep a **real** console for `AttachConsole` to work. It is launched
   hidden via `agent-bridge-launch.vbs` (`WScript.Shell.Run(..., 0, …)`). Do not switch
   it to `conhost --headless`, which gives a pseudoconsole and breaks injection.
+* The launcher handles every error itself, because an unhandled one is a modal Windows
+  Script Host dialog at logon. A `pwsh` that cannot start yet (a Microsoft Store
+  PowerShell is refused while Windows applies a pending update at logon) is tried again
+  every 5 seconds for 10 minutes. If it gives up, the reason goes to
+  `agent-bridge-supervisor.log` and it exits 1. The Dev Box keep-awake launcher does
+  the same for 5 minutes, logging to its own log.
 
 ---
 
