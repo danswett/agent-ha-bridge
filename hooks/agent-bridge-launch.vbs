@@ -8,14 +8,16 @@
 ' "conhost --headless", which gives a pseudoconsole that breaks injection.
 '
 ' Every error is handled here. An unhandled one is a modal Windows Script Host
-' dialog on the desktop at logon, and wscript still exits 0 after it, so the task's
-' RestartCount never fires either. On DSWETT-ARM8 on 2026-10-22 that left the bridge
-' down after a boot: the bridge keeps PowerShell running, so a Microsoft Store
-' update to it cannot apply ("apps need to be closed", 0x80073D02) until the next
-' logon - the moment this task fires - and until Windows had re-registered the
-' package, under a minute later, starting pwsh failed with "Permission denied"
-' (800A0046). So a refused start is retried every 5 seconds for 10 minutes, and one
-' that never succeeds is recorded in the supervisor's log and exits 1 instead.
+' dialog on the desktop at logon, after which wscript exits 0, so the task reads as
+' a success, and the bridge stays down until something else starts the task: its
+' RestartCount covers only a task that cannot be launched at all, never an exit
+' code. On DSWETT-ARM8 on 2026-10-22 that is what happened after a boot. The bridge
+' keeps PowerShell running, so a Microsoft Store update to it cannot apply ("apps
+' need to be closed", 0x80073D02) until the next logon - the moment this task
+' fires - and until Windows had re-registered the package, under a minute later,
+' starting pwsh failed with "Permission denied" (800A0046). So a refused start is
+' retried every 5 seconds for 10 minutes, and one that never succeeds is recorded
+' in the supervisor's log and exits 1, which the task shows as its last run result.
 '
 ' /pwsh:, /attempts: and /interval: (milliseconds) are for tests; the scheduled
 ' task passes none of them.

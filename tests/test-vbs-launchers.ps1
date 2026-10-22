@@ -10,8 +10,8 @@
     update to PowerShell, held back for a week because the bridge keeps pwsh running,
     was applied at logon just as the task fired, and starting pwsh failed with
     "Permission denied" (800A0046) for under a minute. Unhandled, that was a Windows
-    Script Host error dialog at boot and no bridge - and wscript still exited 0, so
-    nothing tried again.
+    Script Host error dialog at boot and no bridge, and wscript exited 0 after it, as
+    though the bridge had started.
 
     Each launcher is copied into a throwaway installation beside a stub of the script
     it starts, and run by the real script host. cscript rather than wscript, because
