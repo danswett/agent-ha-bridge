@@ -1289,9 +1289,14 @@ function Invoke-DaemonDecisionAnswer {
             }
         }
         try {
+            # A session that outranks the bridge is the one failure with something to
+            # do about it, and it can only happen before a key was typed.
+            $answerHint = Get-BridgeConsoleFailureHint -Detail $detail
+            if (-not $answerHint) {
+                $answerHint = if ($wrote) { 'part of it may have reached the terminal - check there' } else { 'nothing reached the terminal' }
+            }
             Set-DaemonTransientActivity -SessionId $SessionId -Summary 'Answer NOT sent' `
-                -Extra @{ error = $detail
-                    hint = $(if ($wrote) { 'part of it may have reached the terminal - check there' } else { 'nothing reached the terminal' }) } `
+                -Extra @{ error = $detail; hint = $answerHint } `
                 -Headers $Headers
         }
         catch { }

@@ -945,8 +945,13 @@ function Invoke-DaemonReply {
                 -Extra @{ sent = $preview; at = [DateTimeOffset]::Now.ToString('HH:mm:ss') } -Headers $Headers
         }
         else {
+            $failed = @{ error = [string]$delivery.Detail; unsent = $preview }
+            # The card shows a hint in place of the error, so the raw code stays in the
+            # attributes for diagnosis while the line says what to do about it.
+            $hint = Get-BridgeConsoleFailureHint -Detail ([string]$delivery.Detail)
+            if ($hint) { $failed['hint'] = $hint }
             Set-DaemonTransientActivity -SessionId $SessionId -Summary 'Reply NOT sent' `
-                -Extra @{ error = [string]$delivery.Detail; unsent = $preview } -Headers $Headers
+                -Extra $failed -Headers $Headers
         }
     }
     catch { }

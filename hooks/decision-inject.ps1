@@ -42,7 +42,8 @@ function Invoke-BridgeConsoleSend {
     # A failed compile has typed nothing, so it says so rather than throwing past the
     # caller's write boundary as though a key might have gone.
     try { Initialize-CopilotConsoleInjector } catch { return "init-failed:$($_.Exception.Message)" }
-    [string][CopilotCli.ConsoleInjector]::Send([uint32]$ProcessId, $Text, $Submit, $DelayMs)
+    $outcome = [string][CopilotCli.ConsoleInjector]::Send([uint32]$ProcessId, $Text, $Submit, $DelayMs)
+    Resolve-BridgeConsoleOutcome -ProcessId $ProcessId -Outcome $outcome
 }
 
 function Invoke-BridgeConsoleChoice {
@@ -57,7 +58,8 @@ function Invoke-BridgeConsoleChoice {
         return Send-BridgeTmuxChoice -ProcessId $ProcessId -DownCount $DownCount -Text $Text -StepDelayMs $StepDelayMs
     }
     try { Initialize-CopilotConsoleInjector } catch { return "init-failed:$($_.Exception.Message)" }
-    [string][CopilotCli.ConsoleInjector]::SendChoice([uint32]$ProcessId, $DownCount, $Text, $StepDelayMs)
+    $outcome = [string][CopilotCli.ConsoleInjector]::SendChoice([uint32]$ProcessId, $DownCount, $Text, $StepDelayMs)
+    Resolve-BridgeConsoleOutcome -ProcessId $ProcessId -Outcome $outcome
 }
 
 function Test-BridgeConsoleOutcomeBeforeWrite {
@@ -79,6 +81,135 @@ function Test-BridgeConsoleOutcomeBeforeWrite {
 
     if ([string]::IsNullOrEmpty($Outcome)) { return $false }
     ($Outcome -match '^(init-failed|attach-failed|conin-failed)(:|$)') -or ($Outcome -cin @('no-tmux', 'not-in-tmux'))
+}
+
+$script:CopilotIntegrityTypeName = 'CopilotCli.ProcessIntegrity'
+
+# What the card says beside "Reply NOT sent" or "Answer NOT sent" when the session
+# outranks the bridge. Written for the phone, where the raw code is all that used to
+# appear. End session still works: only typing needs the console, and Windows grants
+# the bridge the right to terminate an elevated process of the same user (checked
+# against an elevated copilot.exe on 2026-10-23), so the remedy needs no keyboard.
+$script:BridgeElevatedSessionHint = 'This session runs as administrator, and Windows blocks the bridge from typing into it. Use its terminal, or end it and resume it from the dashboard.'
+
+function Get-BridgeProcessIntegrityLevel {
+    <#
+        The mandatory integrity level of a Windows process - 0x2000 for one running as
+        the user, 0x3000 for an elevated one - or -1 when it cannot be read, and always
+        -1 off Windows.
+
+        Only PROCESS_QUERY_LIMITED_INFORMATION and TOKEN_QUERY are asked for. Both were
+        granted against an elevated copilot.exe from a non-elevated process of the same
+        user, which is exactly the pair this has to tell apart.
+    #>
+    param([Parameter(Mandatory)][int]$ProcessId)
+
+    if (-not $script:BridgeIsWindows -or $ProcessId -le 0) { return -1L }
+    try {
+        if (-not ([Management.Automation.PSTypeName]$script:CopilotIntegrityTypeName).Type) {
+            Add-BridgeCompiledType -TypeName $script:CopilotIntegrityTypeName -Source @'
+using System;
+using System.Runtime.InteropServices;
+
+namespace CopilotCli {
+    public static class ProcessIntegrity {
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern IntPtr OpenProcess(uint dwDesiredAccess, bool bInheritHandle, uint dwProcessId);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool OpenProcessToken(IntPtr processHandle, uint desiredAccess, out IntPtr tokenHandle);
+
+        [DllImport("advapi32.dll", SetLastError = true)]
+        private static extern bool GetTokenInformation(IntPtr tokenHandle, int tokenInformationClass,
+            IntPtr tokenInformation, int tokenInformationLength, out int returnLength);
+
+        [DllImport("advapi32.dll")]
+        private static extern IntPtr GetSidSubAuthorityCount(IntPtr sid);
+
+        [DllImport("advapi32.dll")]
+        private static extern IntPtr GetSidSubAuthority(IntPtr sid, uint subAuthority);
+
+        [DllImport("kernel32.dll", SetLastError = true)]
+        private static extern bool CloseHandle(IntPtr handle);
+
+        private const uint PROCESS_QUERY_LIMITED_INFORMATION = 0x1000;
+        private const uint TOKEN_QUERY = 0x0008;
+        private const int TokenIntegrityLevel = 25;
+
+        public static long Get(uint processId) {
+            IntPtr process = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, false, processId);
+            if (process == IntPtr.Zero) { return -1; }
+            IntPtr token = IntPtr.Zero;
+            IntPtr buffer = IntPtr.Zero;
+            try {
+                if (!OpenProcessToken(process, TOKEN_QUERY, out token)) { return -1; }
+                int length;
+                GetTokenInformation(token, TokenIntegrityLevel, IntPtr.Zero, 0, out length);
+                if (length <= 0) { return -1; }
+                buffer = Marshal.AllocHGlobal(length);
+                if (!GetTokenInformation(token, TokenIntegrityLevel, buffer, length, out length)) { return -1; }
+                // TOKEN_MANDATORY_LABEL starts with the label's SID, whose last
+                // sub-authority is the level itself.
+                IntPtr sid = Marshal.ReadIntPtr(buffer);
+                int count = Marshal.ReadByte(GetSidSubAuthorityCount(sid));
+                if (count < 1) { return -1; }
+                return (uint)Marshal.ReadInt32(GetSidSubAuthority(sid, (uint)(count - 1)));
+            }
+            finally {
+                if (buffer != IntPtr.Zero) { Marshal.FreeHGlobal(buffer); }
+                if (token != IntPtr.Zero) { CloseHandle(token); }
+                CloseHandle(process);
+            }
+        }
+    }
+}
+'@
+        }
+        [long][CopilotCli.ProcessIntegrity]::Get([uint32]$ProcessId)
+    }
+    catch { -1L }
+}
+
+function Resolve-BridgeConsoleOutcome {
+    <#
+        Names the one attach failure that no retry can fix.
+
+        AttachConsole answers ERROR_ACCESS_DENIED (5) when the session's process runs at
+        a higher integrity level than the bridge: a CLI started from an elevated ("Run
+        as administrator") terminal, while the daemon runs as the user. Windows refuses
+        that deliberately, so "attach-failed:5" was all the card could say, and on
+        2026-10-23 every reply to a session resumed from an elevated pwsh failed that
+        way for hours with nothing saying why.
+
+        The "attach-failed:" prefix is kept, so the outcome still reads as failing
+        before anything was typed (Test-BridgeConsoleOutcomeBeforeWrite). Anything this
+        cannot establish - either level unreadable, or the target not above the bridge
+        - leaves the outcome exactly as it was.
+    #>
+    param(
+        [Parameter(Mandatory)][int]$ProcessId,
+        [AllowNull()][AllowEmptyString()][string]$Outcome
+    )
+
+    if ($Outcome -cne 'attach-failed:5') { return $Outcome }
+    $target = Get-BridgeProcessIntegrityLevel -ProcessId $ProcessId
+    $own = Get-BridgeProcessIntegrityLevel -ProcessId $PID
+    if ($target -gt 0 -and $own -gt 0 -and $target -gt $own) { return 'attach-failed:5:elevated' }
+    $Outcome
+}
+
+function Get-BridgeConsoleFailureHint {
+    <#
+        What a person can do about a failed delivery, for the card - or '' when the
+        detail says nothing more useful than itself. Matched anywhere in the detail,
+        because a form prefixes it with its field ("field0:...").
+    #>
+    param([AllowNull()][AllowEmptyString()][string]$Detail)
+
+    if (-not [string]::IsNullOrEmpty($Detail) -and $Detail -cmatch 'attach-failed:5:elevated') {
+        return $script:BridgeElevatedSessionHint
+    }
+    ''
 }
 
 function Initialize-CopilotConsoleInjector {
