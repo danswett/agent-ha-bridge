@@ -52,10 +52,12 @@ Write-Host '--- stopping a session ---'
 
 $script:Injected = @()
 $script:InjectResult = $true
+$script:InjectDetail = ''
 function Send-CopilotSessionPrompt {
     param([string]$SessionId, [string]$Text, [switch]$NoSubmit, [int]$SubmitDelayMs = 300, [int]$ProcessId = 0)
     $script:Injected += [pscustomobject]@{ SessionId = $SessionId; Text = $Text; ProcessId = $ProcessId }
-    [pscustomobject]@{ Delivered = $script:InjectResult; ProcessId = $ProcessId; Detail = if ($script:InjectResult) { 'ok:5' } else { 'attach-failed:5' } }
+    $detail = if ($script:InjectResult) { 'ok:5' } elseif ($script:InjectDetail) { $script:InjectDetail } else { 'attach-failed:5' }
+    [pscustomobject]@{ Delivered = $script:InjectResult; ProcessId = $ProcessId; Detail = $detail }
 }
 
 # Process liveness is modelled rather than scripted: the process is alive until it
@@ -1397,6 +1399,7 @@ function Get-LiveCodexSessions { @{} }
 function Set-DaemonTransientActivity {
     param([string]$SessionId, [string]$Summary, $Extra, [hashtable]$Headers)
     $script:Activity += $Summary
+    $script:ActivityExtra = $Extra
 }
 function Get-HomeAssistantState {
     param([string]$EntityId, [hashtable]$Headers)
@@ -1429,6 +1432,22 @@ $script:InjectResult = $false
 Test-That 'a failed delivery still clears, so it is not silently resent' {
     $script:ClearCalls.Count -eq 1
 }
+
+# "Reply NOT sent - attach-failed:5" was all the card said on 2026-10-23, for a session
+# resumed from an elevated terminal, through three tries from the phone.
+$script:InjectDetail = 'attach-failed:5:elevated'
+[void](Invoke-DaemonReply -SessionId $replySession -Text 'the message that was just sent' -Headers $headers)
+Test-That 'a reply refused by a session running as administrator says why, and keeps the code' {
+    $script:Activity[-1] -eq 'Reply NOT sent' -and
+        $script:ActivityExtra['hint'] -ceq $script:BridgeElevatedSessionHint -and
+        $script:ActivityExtra['error'] -ceq 'attach-failed:5:elevated'
+} "activity=$($script:Activity[-1]) hint=$($script:ActivityExtra['hint'])"
+$script:InjectDetail = 'attach-failed:1341'
+[void](Invoke-DaemonReply -SessionId $replySession -Text 'the message that was just sent' -Headers $headers)
+Test-That 'while any other failure still shows its own code' {
+    -not $script:ActivityExtra.ContainsKey('hint') -and $script:ActivityExtra['error'] -ceq 'attach-failed:1341'
+}
+$script:InjectDetail = ''
 $script:InjectResult = $true
 
 Write-Host ''

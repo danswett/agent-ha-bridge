@@ -48,7 +48,8 @@ function Get-HomeAssistantState {
     [pscustomobject]@{ state = [string]$v; attributes = [pscustomobject]@{ question = 'Pick' } }
 }
 $script:Transient = @()
-function Set-DaemonTransientActivity { param($SessionId, $Summary, $Extra, $Headers) $script:Transient += $Summary; 'emitted' }
+$script:TransientExtra = @{}
+function Set-DaemonTransientActivity { param($SessionId, $Summary, $Extra, $Headers) $script:Transient += $Summary; $script:TransientExtra = $Extra; 'emitted' }
 function Write-DaemonLog { param([string]$Message) }
 
 $armedAt = [DateTimeOffset]::Now.AddMinutes(-2)
@@ -720,6 +721,26 @@ Test-That 'and the next pass really does try again' {
     $script:Typed.Count -eq 2
 } "state=$(Get-DispState)"
 
+# Windows refused the attach because the session runs as administrator. The card used
+# to say only "attach-failed:5", which a phone user cannot act on.
+Remove-CopilotDecisionMarker -SessionId $dispSid -DecisionId 'disp1'
+$script:Outcome = @{ Delivered = $false; Detail = "field0:attach-failed:5:elevated | F='Auth' idx=0 of [Auth,Billing]"; Wrote = $false }
+Test-That 'an answer refused by a session running as administrator says why on the card' {
+    $script:Typed.Clear()
+    [void](Invoke-Dispatch)
+    $script:Transient[-1] -ceq 'Answer NOT sent' -and
+        $script:TransientExtra['hint'] -ceq $script:BridgeElevatedSessionHint -and
+        $script:TransientExtra['error'] -cmatch 'attach-failed:5:elevated'
+} "summary=$($script:Transient[-1]) hint=$($script:TransientExtra['hint'])"
+Test-That 'and leaves the question answerable, because nothing reached it' {
+    $null -eq (Get-CopilotDecisionAttempt -SessionId $dispSid -DecisionId 'disp1')
+} "state=$(Get-DispState)"
+$script:Outcome = @{ Delivered = $false; Detail = 'no live process for session'; Wrote = $false }
+Test-That 'while any other failure keeps the hint it had' {
+    [void](Invoke-Dispatch)
+    $script:TransientExtra['hint'] -ceq 'nothing reached the terminal'
+} "hint=$($script:TransientExtra['hint'])"
+
 # The same rejection, but the record outlived it - a daemon that stopped between the
 # transition and the delete, or a delete that failed. The question was answerable and
 # nothing had been typed, yet nothing could ever claim it again: the barrier only moves
@@ -919,7 +940,7 @@ Test-That 'and a form refused before the console says it did not' {
 # that could not even be attached settled the attempt as 'unknown' and the question was
 # never retried, though nothing had been typed. Only the outcomes a transport returns
 # ahead of its first write may say otherwise; a failure part-way still reads as written.
-foreach ($before in 'attach-failed:1341', 'conin-failed:5', 'init-failed:compile', 'no-tmux', 'not-in-tmux') {
+foreach ($before in 'attach-failed:1341', 'attach-failed:5:elevated', 'conin-failed:5', 'init-failed:compile', 'no-tmux', 'not-in-tmux') {
     $script:SendOutcome = $before
     function Invoke-BridgeConsoleSend { param($ProcessId, $Text, $Submit, $DelayMs) $script:ConsoleWrites++; $script:SendOutcome }
     function Invoke-BridgeConsoleChoice { param($ProcessId, $DownCount, $Text, $StepDelayMs) $script:ConsoleWrites++; $script:SendOutcome }
@@ -961,6 +982,51 @@ Test-That 'an exception from the transport still reads as possibly written' {
 }
 function Invoke-BridgeConsoleSend { param($ProcessId, $Text, $Submit, $DelayMs) $script:ConsoleWrites++; 'ok:sent' }
 function Invoke-BridgeConsoleChoice { param($ProcessId, $DownCount, $Text, $StepDelayMs) $script:ConsoleWrites++; 'ok:choice' }
+
+Write-Host '--- a session running above the bridge is named, not just numbered ---'
+# AttachConsole answers ERROR_ACCESS_DENIED when the session's CLI is elevated and the
+# daemon is not. Read for real first: the comparison means nothing unless the probe
+# can read an actual token, and the test's own process is one every runner has.
+$ownLevel = Get-BridgeProcessIntegrityLevel -ProcessId $PID
+if ($script:BridgeIsWindows) {
+    Test-That 'the integrity level of a running process can be read' {
+        $ownLevel -in @(0x1000, 0x2000, 0x2100, 0x3000, 0x4000)
+    } "level=$ownLevel"
+}
+else {
+    Test-That 'off Windows there is no integrity level to read' { $ownLevel -eq -1 }
+}
+Test-That 'a process that cannot be opened reads as unknown rather than as any level' {
+    (Get-BridgeProcessIntegrityLevel -ProcessId 0) -eq -1 -and
+        (Get-BridgeProcessIntegrityLevel -ProcessId ([int]::MaxValue - 3)) -eq -1
+}
+
+$script:Levels = @{}
+$script:LevelReads = 0
+function Get-BridgeProcessIntegrityLevel {
+    param([int]$ProcessId)
+    $script:LevelReads++
+    if ($script:Levels.ContainsKey($ProcessId)) { $script:Levels[$ProcessId] } else { -1L }
+}
+$script:Levels = @{ 4242 = 0x3000L; $PID = 0x2000L }
+Test-That 'access denied by a session running above the bridge is named as such' {
+    (Resolve-BridgeConsoleOutcome -ProcessId 4242 -Outcome 'attach-failed:5') -ceq 'attach-failed:5:elevated'
+}
+$script:Levels = @{ 4242 = 0x2000L; $PID = 0x2000L }
+Test-That 'access denied by a session at the bridge''s own level keeps its bare code' {
+    (Resolve-BridgeConsoleOutcome -ProcessId 4242 -Outcome 'attach-failed:5') -ceq 'attach-failed:5'
+}
+$script:Levels = @{ $PID = 0x2000L }
+Test-That 'and so does one whose level cannot be read' {
+    (Resolve-BridgeConsoleOutcome -ProcessId 4242 -Outcome 'attach-failed:5') -ceq 'attach-failed:5'
+}
+$script:Levels = @{ 4242 = 0x3000L; $PID = 0x2000L }
+$script:LevelReads = 0
+Test-That 'any other outcome passes through without probing anything' {
+    (Resolve-BridgeConsoleOutcome -ProcessId 4242 -Outcome 'attach-failed:1341') -ceq 'attach-failed:1341' -and
+        (Resolve-BridgeConsoleOutcome -ProcessId 4242 -Outcome 'ok:12') -ceq 'ok:12' -and
+        $script:LevelReads -eq 0
+} "reads=$($script:LevelReads)"
 
 Write-Host '--- words typed at a choice question, against the prompt Copilot draws ---'
 # Copilot's single-choice field as its CLI bundle has it (1.0.96 to 1.0.101), and as a

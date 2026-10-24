@@ -1976,6 +1976,7 @@ inside a disposable machine, not permission to exercise installation on a real o
 | Sessions stop appearing on a page left open, until it is reloaded | Home Assistant parks the whole dashboard panel after the tab has been hidden for five minutes and drops its config subscription for good. From card 1.39.0 the cards hold a subscription of their own and ask the panel to refetch, so the page catches up within a few seconds. Below that, reload it. |
 | A Dev Box goes offline mid-session every evening | Its pool hibernates on disconnect. See [Running on a Microsoft Dev Box](#running-on-a-microsoft-dev-box). |
 | A *Windows Script Host* "Permission denied" (800A0046) dialog naming `agent-bridge-launch.vbs` at logon, and the bridge offline | An older launcher could not start a Microsoft Store PowerShell while Windows was applying an update to it. The always-running bridge holds that update back until the next logon. Dismiss the dialog and run `agent-ha-bridge restart`, or update. The current launcher waits for PowerShell and records a start it could not make in `agent-bridge-supervisor.log`. |
+| **Reply NOT sent** or **Answer NOT sent** with "This session runs as administrator", or `attach-failed:5:elevated` in the daemon log | The session was started from an elevated ("Run as administrator") terminal, and the bridge runs as you. Windows deliberately stops a process from typing into a console at a higher integrity level, so no retry can work. Use the session's terminal, or press **End session** and resume it from the dashboard, which starts it unelevated. End session still works: its `/exit` is refused the same way, but Windows lets the bridge terminate the process once the grace period is over. Older bridges showed only `attach-failed:5`. |
 
 On Windows the daemon runs under an installation-scoped hidden task. For the default
 installation (set `$bridgeRoot` to the intended root for a custom installation):
@@ -2053,9 +2054,14 @@ locations until upgraded. No shared scheduled task is created by an isolated ins
 * The daemon idles at a few percent of one core and reconciles every ~15 s, with
   WebSocket pushes for anything latency-sensitive.
 * **On macOS, only sessions in tmux can be replied to.** Windows can type into any
-  console; macOS offers no way to type into a terminal another app owns, so the bridge
+  unelevated console; macOS offers no way to type into a terminal another app owns, so the bridge
   goes through tmux. A session outside tmux still gets its card - status, reasoning,
   responses, questions - from its hooks and transcript.
+* **On Windows, a session running as administrator cannot be replied to.** Windows
+  does not let the bridge, which runs as you, type into a console at a higher integrity
+  level. Its card still works from its hooks and transcript, a failed reply says why,
+  and **End session** still ends it. Start sessions unelevated if you want to drive
+  them from the phone.
 
 ---
 
