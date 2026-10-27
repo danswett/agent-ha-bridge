@@ -7,7 +7,7 @@
     Part of agent-bridge-daemon.ps1, which dot-sources it into its own scope after
     declaring the shared $script: state; see docs/daemon-split.md.
     Shared state it changes: DaemonDashboardSignature, DaemonEntityRestore,
-    DaemonGlobalLastPublish, DaemonGlobalSignature, DaemonLive,
+    DaemonGlobalEntityIdPinnedAt, DaemonGlobalLastPublish, DaemonGlobalSignature, DaemonLive,
     DaemonOnlineLastPublish, DaemonOnlineRepairGivenUp, DaemonOnlineRepairs,
     DaemonOnlineReporting, DaemonPayloadSensorChecked, DaemonPendingRetire,
     DaemonVerbose.
@@ -1903,6 +1903,35 @@ function Get-DaemonRenderUpgrade {
     $accepted
 }
 
+function Confirm-DaemonGlobalEntityId {
+    <#
+        Every machine owns its sessions sensor, even when it cannot write the shared
+        dashboard. Pinning only during a writer's rebuild left new participants
+        invisible to peer discovery. The reconcile snapshot makes confirmation free;
+        delayed MQTT discovery and refused registry writes retry at most once a minute.
+    #>
+    param([DateTimeOffset]$Now = [DateTimeOffset]::Now)
+
+    if ($null -eq $script:DaemonReconcileStates) { return $false }
+    $expected = Get-CopilotMqttGlobalEntityId
+    if ($script:DaemonReconcileStates.ContainsKey($expected)) { return $true }
+    if (($Now - $script:DaemonGlobalEntityIdPinnedAt).TotalSeconds -lt 60) { return $false }
+    $script:DaemonGlobalEntityIdPinnedAt = $Now
+    try {
+        $unregistered = [Collections.Generic.List[string]]::new()
+        [void](Set-CopilotMqttGlobalEntityId -Unregistered $unregistered)
+        if ($unregistered.Count) {
+            Write-DaemonLog -Message "sessions sensor '$expected' is not registered yet; retrying the entity id pin"
+        }
+    }
+    catch {
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        Write-DaemonLog -Message ("sessions sensor '$expected' could not be pinned; entity registry updates require " +
+            "an administrator homeAssistant.token: $($_.Exception.Message)")
+    }
+    $false
+}
+
 function Sync-DaemonDashboard {
     <#
         Observes accepted shared output on every pass, publishing changes or repairs
@@ -1931,6 +1960,7 @@ function Sync-DaemonDashboard {
         [switch]$ObserveOnly
     )
 
+    [void](Confirm-DaemonGlobalEntityId)
     if ($ObserveOnly) {
         $script:BridgeDashboardObservation = $null
         try {
@@ -1966,7 +1996,6 @@ function Sync-DaemonDashboard {
         $upgradeFrom = Get-DaemonRenderUpgrade -Publication $publication -Artifact $render
         if (-not $publication.Verified -or $publication.InputSignature -cne $signature -or $null -ne $upgradeFrom) {
             Assert-BridgePublicationWriter -State $publication.State -Component render -Artifact $render
-            [void](Set-CopilotMqttGlobalEntityId)
             $selector = Initialize-BridgeMachineSelector -Machines $onlineNames
             Save-CopilotSessionDashboard -Sessions @($allDescriptors | Sort-Object -Property Node) `
                 -Machines $machineCards -MachineSelector $selector `

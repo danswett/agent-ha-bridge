@@ -207,6 +207,119 @@ Test-That 'and an older renderer still cannot cross a newer fence' {
     $null -ne $refused -and $refused.Exception.Message -match 'cannot cross the publication version fence'
 }
 
+Write-Host '--- new machines join established publication without changing authority ---'
+Initialize-TestPublicationStore -Unconfigured
+$joinCard = New-TestPublicationCard '1.1.0'
+$joinPolicy = New-TestPublicationPolicy -CardSource $joinCard -Generation 2
+Set-TestPublicationPolicy -Policy $joinPolicy
+$sharedBeforeJoin = (Get-FileHash -LiteralPath $script:TestPublication.Path -Algorithm SHA256).Hash
+Test-That 'a missing local publication setting is filled from the established shared policy' {
+    $changed = Initialize-BridgePublicationParticipant
+    $settings = Get-BridgePublicationSettings
+    $changed -and $settings.authority -ceq $joinPolicy.authority -and
+        $settings.writer -ceq $joinPolicy.writer -and $settings.generation -eq 2 -and
+        $settings.participant -ceq (Get-BridgeMachineSlug)
+}
+Test-That 'joining persists only local participant settings and never changes shared resources' {
+    $persisted = Get-BridgeUserConfig
+    $persisted.dashboard.publication.participant -ceq (Get-BridgeMachineSlug) -and
+        @(Get-TestPublicationWrites).Count -eq 0 -and
+        (Get-FileHash -LiteralPath $script:TestPublication.Path -Algorithm SHA256).Hash -ceq $sharedBeforeJoin
+}
+$configBeforeRepeat = (Get-FileHash -LiteralPath $script:BridgeInstallContext.ConfigPath -Algorithm SHA256).Hash
+$script:TestPublication.Commands.Clear()
+Test-That 'an explicit local publication setting is preserved without even reading shared state' {
+    -not (Initialize-BridgePublicationParticipant) -and $script:TestPublication.Commands.Count -eq 0 -and
+        (Get-FileHash -LiteralPath $script:BridgeInstallContext.ConfigPath -Algorithm SHA256).Hash -ceq $configBeforeRepeat
+}
+
+foreach ($case in @('empty', 'legacy', 'unreadable', 'corrupt', 'lost')) {
+    Initialize-TestPublicationStore -Unconfigured
+    if ($case -eq 'legacy') { Set-TestPublicationCardUrl -Url '/local/agent-bridge-reply-card.js?v=1.1.0' }
+    if ($case -eq 'unreadable') { $script:TestPublication.Reject['lovelace/resources'] = '{"code":"unauthorized","message":"Synthetic refusal"}' }
+    if ($case -in @('corrupt', 'lost')) {
+        Set-TestPublicationPolicy -Policy $joinPolicy
+        if ($case -eq 'lost') { Read-BridgePublicationState | Out-Null }
+        $store = Get-TestPublicationStore
+        if ($case -eq 'corrupt') { $store.resources[0].url = 'data:text/javascript;base64,ZXhwb3J0IHt9Ow==#agent-bridge-publication-policy.js?policy=bad' }
+        else { $store.resources = @() }
+        Set-TestPublicationStore $store
+    }
+    $configBeforeFailure = (Get-FileHash -LiteralPath $script:BridgeInstallContext.ConfigPath -Algorithm SHA256).Hash
+    $script:TestPublication.Commands.Clear()
+    Test-That "$case publication state is reported instead of inventing participant authority" {
+        $failure = $null
+        try { Initialize-BridgePublicationParticipant | Out-Null }
+        catch { $failure = $_ }
+        $null -ne $failure -and
+            ($case -notin @('empty', 'legacy') -or $failure.Exception.Message -match 'Choose a designated writer.*Set-BridgePublicationPolicy') -and
+            @(Get-TestPublicationWrites).Count -eq 0 -and
+            (Get-FileHash -LiteralPath $script:BridgeInstallContext.ConfigPath -Algorithm SHA256).Hash -ceq $configBeforeFailure
+    }
+}
+
+Write-Host '--- health observes publication and this machine, not just a quiet log ---'
+Initialize-TestPublicationStore
+Initialize-TestPublicationAuthority -ServeCard
+Save-CopilotSessionDashboard -Sessions @()
+Set-TestPublicationIdentity -Participant 'observer-b'
+$selfEntity = Get-CopilotMqttGlobalEntityId
+$selfStates = @([pscustomobject]@{
+    entity_id = $selfEntity; state = '0'
+    attributes = [pscustomobject]@{ machine = 'Synthetic participant'; sessions = @() }
+})
+$script:TestPublication.Commands.Clear()
+Test-That 'a configured non-writer observing verified publication is healthy' {
+    (Get-BridgeMachineHealth -States $selfStates).Ok -and @(Get-TestPublicationWrites).Count -eq 0
+}
+Test-That 'a missing self sensor and machine-list entry are both diagnosed' {
+    $health = Get-BridgeMachineHealth -States @()
+    -not $health.Ok -and $health.Detail.Contains($selfEntity) -and
+        $health.Detail -match 'missing from its own machine list'
+}
+Test-That 'a sensor left at Home Assistant''s derived id cannot make the machine healthy' {
+    $wrongId = $selfEntity -replace '^sensor\.agent_bridge_', 'sensor.ai_agent_bridge_'
+    $health = Get-BridgeMachineHealth -States @([pscustomobject]@{
+        entity_id = $wrongId; state = '0'; attributes = $selfStates[0].attributes
+    })
+    -not $health.Ok -and $health.Detail -match 'wrong entity id.*administrator homeAssistant.token'
+}
+Set-TestPublicationIdentity -Participant 'observer-b' -Generation 2
+Test-That 'local authority settings that disagree with shared policy need attention' {
+    $health = Get-BridgeMachineHealth -States $selfStates
+    -not $health.Ok -and $health.Detail -match 'does not match the established authority'
+}
+Set-TestPublicationIdentity
+$savedRenderVersion = $script:BridgeDashboardRenderVersion
+try {
+    $script:BridgeDashboardRenderVersion = '1.0.0'
+    Test-That 'a writer whose installed renderer is refused cannot report healthy' {
+        $health = Get-BridgeMachineHealth -States $selfStates
+        -not $health.Ok -and $health.Detail -match 'cannot cross the publication version fence'
+    }
+}
+finally { $script:BridgeDashboardRenderVersion = $savedRenderVersion }
+Test-That 'a wrapped publication read guard propagates instead of becoming a cosmetic health warning' {
+    & {
+        function Invoke-CopilotHaWebSocket {
+            param([hashtable[]]$Commands)
+            $guard = [InvalidOperationException]::new('synthetic blocked publication read')
+            $guard.Data['BridgeTestNetworkBlocked'] = $true
+            throw [InvalidOperationException]::new('synthetic wrapper', $guard)
+        }
+        try { Get-BridgeMachineHealth -States $selfStates | Out-Null; $false }
+        catch { Test-BridgeObservationGuardFailure -ErrorRecord $_ }
+    }
+}
+$config = Get-Content -LiteralPath $script:BridgeInstallContext.ConfigPath -Raw | ConvertFrom-Json -AsHashtable
+[void]$config.dashboard.Remove('publication')
+Write-BridgeSecretFile -Path $script:BridgeInstallContext.ConfigPath -Content ($config | ConvertTo-Json -Depth 10)
+$script:BridgeUserConfig = Get-BridgeUserConfig
+Test-That 'unconfigured publication is unhealthy even when the expected self sensor exists' {
+    $health = Get-BridgeMachineHealth -States $selfStates
+    -not $health.Ok -and $health.Detail -match 'Publication is not configured'
+}
+
 if ($script:Failures) {
     Write-Host "$($script:Failures) publication policy checks failed"
     exit 1

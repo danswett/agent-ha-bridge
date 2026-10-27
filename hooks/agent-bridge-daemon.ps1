@@ -287,6 +287,7 @@ $script:DaemonStateLastWritten = $null
 # interval elapses, instead of on every reconcile. Initialised for StrictMode.
 $script:DaemonGlobalSignature = $null
 $script:DaemonGlobalLastPublish = [DateTimeOffset]::MinValue
+$script:DaemonGlobalEntityIdPinnedAt = [DateTimeOffset]::MinValue
 $script:DaemonOnlineLastPublish = [DateTimeOffset]::MinValue
 # What the online sensor last said about when it took a beat, when the daemon first
 # saw it say that, and how many beats have gone unanswered since. A beat that Home
