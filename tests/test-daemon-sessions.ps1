@@ -1316,6 +1316,91 @@ $script:RepairEntityStatus = 200
 Repair-CopilotSessionEntities -Headers $headers -State (New-TornState) -Live (New-TornLive)
 Test-That 'and a session whose entities are all there is not republished over' { $script:RepairPublished.Count -eq 0 }
 
+Write-Host '--- each participant pins its own sessions sensor before the writer gate ---'
+& {
+    . (Join-Path $PSScriptRoot '..\hooks\decision-bridge-common.ps1')
+    . (Join-Path $PSScriptRoot '..\hooks\decision-ha-websocket.ps1')
+    $script:GlobalPinRegistry = @()
+    $script:GlobalPinCommands = [Collections.Generic.List[object]]::new()
+    $script:GlobalPinLog = [Collections.Generic.List[string]]::new()
+    $script:GlobalPinRefused = $false
+    function Write-DaemonLog { param([string]$Message) $script:GlobalPinLog.Add($Message) }
+    function Invoke-CopilotHaWebSocket {
+        param([hashtable[]]$Commands)
+        if ($Commands.Count -eq 1 -and $Commands[0].type -like 'config/entity_registry/*') {
+            $command = $Commands[0]
+            $script:GlobalPinCommands.Add($command)
+            if ($command.type -ceq 'config/entity_registry/list') {
+                Write-Output -NoEnumerate (, @($script:GlobalPinRegistry))
+                return
+            }
+            if ($command.type -cne 'config/entity_registry/update' -or
+                @($command.Keys | Where-Object { $_ -notin @('type', 'entity_id', 'new_entity_id') }).Count) {
+                throw 'Unexpected synthetic entity registry command.'
+            }
+            if ($script:GlobalPinRefused) { throw 'WebSocket command ''config/entity_registry/update'' failed: {"code":"unauthorized"}' }
+            $entries = @($script:GlobalPinRegistry | Where-Object { $_.entity_id -ceq $command.entity_id })
+            if ($entries.Count -ne 1) { throw 'Expected exactly one synthetic registry entry.' }
+            $entries[0].entity_id = $command.new_entity_id
+            Write-Output -NoEnumerate (, $entries[0])
+            return
+        }
+        Invoke-TestPublicationCommands -Commands $Commands
+    }
+    Initialize-TestPublicationStore
+    Initialize-TestPublicationAuthority -ServeCard
+    Save-CopilotSessionDashboard -Sessions @()
+    Set-TestPublicationIdentity -Participant 'observer-b'
+    $expected = Get-CopilotMqttGlobalEntityId
+    $derived = $expected -replace '^sensor\.agent_bridge_', 'sensor.ai_agent_bridge_'
+    $script:GlobalPinRegistry = @([pscustomobject]@{
+        unique_id = "agent_bridge_$(Get-BridgeMachineSlug)_sessions"; entity_id = $derived
+    })
+    $script:DaemonReconcileStates = @{}
+    $script:DaemonGlobalEntityIdPinnedAt = [DateTimeOffset]::MinValue
+    $script:TestPublication.Commands.Clear()
+    $pinCapabilities = @{ profile = $false; resume = $false; agent = $false }
+    [void](Sync-DaemonDashboard -Descriptors @() -Capabilities $pinCapabilities -Headers $headers)
+    Test-That 'a non-writer pins its sensor even when its dashboard rebuild is refused' {
+        $script:GlobalPinRegistry[0].entity_id -ceq $expected -and
+            @($script:GlobalPinCommands | Where-Object type -eq 'config/entity_registry/update').Count -eq 1 -and
+            @(Get-TestPublicationWrites).Count -eq 0
+    }
+    $script:DaemonReconcileStates = @{ $expected = [pscustomobject]@{ entity_id = $expected } }
+    $pinCalls = $script:GlobalPinCommands.Count
+    [void](Sync-DaemonDashboard -Descriptors @() -Capabilities $pinCapabilities -Headers $headers)
+    Test-That 'a confirmed canonical sensor costs no further registry calls' {
+        $script:GlobalPinCommands.Count -eq $pinCalls
+    }
+
+    $pinNow = [DateTimeOffset]::Now
+    $script:DaemonReconcileStates = @{}
+    $script:DaemonGlobalEntityIdPinnedAt = [DateTimeOffset]::MinValue
+    $script:GlobalPinRegistry = @()
+    $script:GlobalPinCommands.Clear()
+    [void](Confirm-DaemonGlobalEntityId -Now $pinNow)
+    $script:GlobalPinRegistry = @([pscustomobject]@{
+        unique_id = "agent_bridge_$(Get-BridgeMachineSlug)_sessions"; entity_id = $derived
+    })
+    [void](Confirm-DaemonGlobalEntityId -Now $pinNow.AddSeconds(30))
+    Test-That 'discovery that has not registered yet is reported and retried no more than once a minute' {
+        $script:GlobalPinCommands.Count -eq 1 -and
+            @($script:GlobalPinLog | Where-Object { $_ -match 'not registered yet' }).Count -eq 1
+    }
+    [void](Confirm-DaemonGlobalEntityId -Now $pinNow.AddSeconds(61))
+    Test-That 'delayed discovery is pinned on a later pass without a dashboard rebuild' {
+        $script:GlobalPinRegistry[0].entity_id -ceq $expected
+    }
+    $script:GlobalPinRegistry[0].entity_id = $derived
+    $script:GlobalPinRefused = $true
+    [void](Confirm-DaemonGlobalEntityId -Now $pinNow.AddSeconds(122))
+    Test-That 'a refused registry update names the sensor and the administrator token requirement' {
+        @($script:GlobalPinLog | Where-Object {
+            $_.Contains($expected) -and $_ -match 'could not be pinned.*administrator homeAssistant.token.*unauthorized'
+        }).Count -eq 1
+    }
+}
+
 Write-Host ''
 if ($script:Failures) {
     Write-Host "$($script:Failures) check(s) failed" -ForegroundColor Red

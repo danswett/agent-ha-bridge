@@ -482,12 +482,15 @@ function Set-CopilotMqttGlobalEntityId {
         rename it once so the dashboard, the peer lookup and any templates can rely on
         sensor.agent_bridge_<machine>_sessions.
     #>
-    param([string]$Slug)
+    param(
+        [string]$Slug,
+        [System.Collections.Generic.List[string]]$Unregistered = $null
+    )
     if (-not $Slug) { $Slug = Get-BridgeMachineSlug }
 
     Set-CopilotMqttMachineEntityId -Wanted @{
         "agent_bridge_${Slug}_sessions" = Get-CopilotMqttGlobalEntityId -Slug $Slug
-    }
+    } -Unregistered $Unregistered
 }
 
 function Initialize-CopilotVerboseToggle {
@@ -1148,7 +1151,7 @@ function Assert-BridgePublicationPolicy {
 function Get-BridgePublicationSettings {
     $value = Get-BridgeSetting 'dashboard.publication' $null
     if ($null -eq $value) {
-        throw 'Publication is not configured. Choose a designated writer and explicitly bootstrap or migrate with Set-BridgePublicationPolicy.'
+        throw 'Publication is not configured. Run agent-ha-bridge configure to join an established shared policy; otherwise choose a designated writer and explicitly bootstrap or migrate with Set-BridgePublicationPolicy.'
     }
     $settings = $value | ConvertTo-Json -Depth 10 | ConvertFrom-Json -AsHashtable
     if ($settings -isnot [System.Collections.IDictionary]) { throw 'dashboard.publication must be an explicit configuration object.' }
@@ -1164,6 +1167,95 @@ function Get-BridgePublicationSettings {
         throw 'Configure an explicit positive integer dashboard.publication.generation.'
     }
     $settings
+}
+
+function Initialize-BridgePublicationParticipant {
+    <#
+        Joins an established policy without electing a writer or changing shared
+        resources. An explicit local publication setting is never replaced.
+    #>
+    $config = Get-BridgeUserConfig
+    if (-not $config) { throw 'A readable bridge configuration is required to join dashboard publication.' }
+    $dashboard = $config.PSObject.Properties['dashboard']
+    if ($dashboard -and $null -ne $dashboard.Value -and
+        $dashboard.Value.PSObject.Properties['publication'] -and $null -ne $dashboard.Value.publication) {
+        return $false
+    }
+
+    $state = Read-BridgePublicationState
+    if (-not $state.Policy) {
+        $action = if ($state.Kind -ceq 'legacy') { 'migrate the existing dashboard' } else { 'bootstrap publication' }
+        throw ("No established dashboard publication policy to join. Choose a designated writer and explicitly " +
+            "$action with Set-BridgePublicationPolicy; this machine has not acquired publication authority.")
+    }
+    $settings = [pscustomobject]@{
+        authority = $state.Policy.authority
+        participant = Get-BridgeMachineSlug
+        writer = $state.Policy.writer
+        generation = $state.Policy.generation
+    }
+    if (-not $dashboard -or $null -eq $dashboard.Value) {
+        $config | Add-Member -NotePropertyName dashboard -NotePropertyValue ([pscustomobject]@{}) -Force
+    }
+    $config.dashboard | Add-Member -NotePropertyName publication -NotePropertyValue $settings -Force
+    Write-BridgeSecretFile -Path $script:BridgeInstallContext.ConfigPath -Content ($config | ConvertTo-Json -Depth 100)
+    $script:BridgeUserConfig = $config
+    $true
+}
+
+function Get-BridgeMachineHealth {
+    <#
+        Checks the actual shared publication and this machine's discoverability.
+        A quiet daemon log cannot prove either: a new participant used to report
+        healthy while its unpinned sessions sensor made it invisible to every peer.
+    #>
+    param([AllowEmptyCollection()][object[]]$States)
+
+    $problems = [Collections.Generic.List[string]]::new()
+    try {
+        $settings = Get-BridgePublicationSettings
+        $publication = Get-BridgeDashboardPublication
+        if (-not $publication.Verified) { throw "Shared dashboard publication is not current: $($publication.Reason)." }
+        $policy = $publication.State.Policy
+        if ($settings.authority -cne $policy.authority -or $settings.writer -cne $policy.writer -or
+            $settings.generation -ne $policy.generation) {
+            throw 'dashboard.publication does not match the established authority, writer and generation; review the local configuration against the shared policy.'
+        }
+        # A participant observes accepted output; only the designated writer must
+        # also be able to publish its installed renderer.
+        if ($settings.participant -ceq $policy.writer) {
+            Assert-BridgePublicationWriter -State $publication.State -Component render -Artifact (Get-BridgeRenderArtifact)
+        }
+    }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        $problems.Add("dashboard publication: $($_.Exception.Message)")
+    }
+
+    try {
+        if (-not $PSBoundParameters.ContainsKey('States')) {
+            $States = Invoke-DecisionHttpRequest -Parameters @{
+                Method = 'Get'
+                Uri = "$($script:DecisionBridgeConfig.HomeAssistantBaseUrl)/api/states"
+                Headers = (Get-HomeAssistantHeaders)
+                TimeoutSec = 15
+            }
+        }
+        $expected = Get-CopilotMqttGlobalEntityId
+        if (-not @($States | Where-Object { $null -ne $_ -and [string]$_.entity_id -ceq $expected }).Count) {
+            $problems.Add("sessions sensor '$expected' is missing or has the wrong entity id; pinning it requires an administrator homeAssistant.token")
+        }
+        $self = @(Get-BridgePeerMachine -States $States | Where-Object { $_.IsSelf })
+        if ($self.Count -ne 1) { $problems.Add('this machine is missing from its own machine list') }
+    }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        $problems.Add("machine visibility could not be checked: $($_.Exception.Message)")
+    }
+    [pscustomobject]@{
+        Ok = ($problems.Count -eq 0)
+        Detail = if ($problems.Count) { $problems -join '; ' } else { 'shared publication verified and this machine is registered at its expected sessions sensor' }
+    }
 }
 
 function Get-BridgePublicationReceiptPath {

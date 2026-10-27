@@ -806,8 +806,10 @@ Write-Host '--- the install says whether it actually worked ---'
 # The install used to end on the same "Next steps" list whether or not any of it had
 # worked, so a recovered "Bootstrap failed: 5" scrolling past read as a broken
 # install, and a genuinely broken one read as a success.
+$healthyDashboard = { [pscustomobject]@{ Ok = $true; Detail = 'synthetic healthy dashboard' } }
 $allGood = Get-BridgeInstallHealth -Clients @('copilot', 'claude') -OnWindows $true `
     -DaemonProbe { $true } -CommandProbe { $true } -ClientProbe { param($n) $true } `
+    -RegistrationProbe { Get-BridgeRegistrationHealth -Context $installContext -DashboardProbe $healthyDashboard } `
     -ConnectionProbe { [pscustomobject]@{ Ok = $true; Version = '2026.9.4'; Error = '' } }
 Test-That 'every check passes when everything is in place' {
     @($allGood | Where-Object { -not $_.Ok }).Count -eq 0
@@ -821,6 +823,7 @@ Test-That 'the connected version is shown, not just a tick' {
 Test-That 'no tmux check on Windows' { @($allGood | Where-Object { $_.Name -match 'tmux' }).Count -eq 0 }
 Test-That 'and one on macOS' {
     $mac = Get-BridgeInstallHealth -Clients @() -OnWindows $false -DaemonProbe { $true } -CommandProbe { $true } `
+        -RegistrationProbe { Get-BridgeRegistrationHealth -Context $installContext -DashboardProbe $healthyDashboard } `
         -TmuxProbe { $false } -ConnectionProbe { [pscustomobject]@{ Ok = $true; Version = 'x'; Error = '' } }
     @($mac | Where-Object { $_.Name -match 'tmux' -and -not $_.Ok }).Count -eq 1
 }
@@ -834,6 +837,7 @@ Test-That 'mcp is not probed as a command, because it is not one' {
 
 $halfBroken = Get-BridgeInstallHealth -Clients @('claude') -OnWindows $true `
     -DaemonProbe { $false } -CommandProbe { $true } -ClientProbe { param($n) $false } `
+    -RegistrationProbe { Get-BridgeRegistrationHealth -Context $installContext -DashboardProbe $healthyDashboard } `
     -ConnectionProbe { [pscustomobject]@{ Ok = $false; Version = ''; Error = 'no Home Assistant token' } }
 Test-That 'a dead daemon is caught' { @($halfBroken | Where-Object { $_.Name -match 'daemon' -and -not $_.Ok }).Count -eq 1 }
 Test-That 'a half-installed agent is caught, the same way the launcher catches it' {
@@ -2213,12 +2217,12 @@ function New-SustainedLogLines {
 }
 
 Test-That 'a machine with no daemon log yet claims nothing either way' {
-    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe { @() }
+    $health = Get-BridgeRegistrationHealth -Context $installContext -DashboardProbe $healthyDashboard -LogProbe { @() }
     $health.Ok -and $health.Detail -match 'no daemon log'
 }
 
 Test-That 'an ordinary log is reported as nothing wrong' {
-    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -DashboardProbe $healthyDashboard -LogProbe {
         @((New-DaemonLogLine 'published machine status'), (New-DaemonLogLine 'session abc registered'))
     }
     $health.Ok -and $health.Detail -match 'nothing wrong'
@@ -2227,28 +2231,28 @@ Test-That 'an ordinary log is reported as nothing wrong' {
 # The line the user's Mac was printing every time a launch was tried, while status
 # went on saying everything was fine.
 Test-That 'a session that died before registering is reported' {
-    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -DashboardProbe $healthyDashboard -LogProbe {
         @(New-DaemonLogLine 'launched Codex (pid 31857) exited before registering')
     }
     (-not $health.Ok) -and $health.Detail -match 'died before it could register'
 }
 
 Test-That 'and says how long ago it happened' {
-    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -DashboardProbe $healthyDashboard -LogProbe {
         @(New-DaemonLogLine 'launched Codex (pid 31857) exited before registering' -AgeMinutes 12)
     }
     $health.Detail -match 'last 1[12] min ago'
 }
 
 Test-That 'launches being refused for incomplete discovery is reported' {
-    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -DashboardProbe $healthyDashboard -LogProbe {
         @(New-DaemonLogLine 'Session discovery is incomplete; launch is temporarily held.')
     }
     (-not $health.Ok) -and $health.Detail -match 'launches are being refused'
 }
 
 Test-That 'discovery held on a process it cannot account for is reported' {
-    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -DashboardProbe $healthyDashboard -LogProbe {
         New-SustainedLogLines 'holding for codex process 4412 (node): it has no readable start time'
     }
     (-not $health.Ok) -and $health.Detail -match 'cannot account for'
@@ -2258,14 +2262,14 @@ Test-That 'discovery held on a process it cannot account for is reported' {
 # because a bare code sent people hunting. Collapsing it back to a fixed sentence here
 # would throw that away again on the screen most likely to be read.
 Test-That 'the held kind and pid are carried through, not collapsed into a fixed phrase' {
-    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -DashboardProbe $healthyDashboard -LogProbe {
         New-SustainedLogLines 'session discovery uncertain (codex/UnaccountedProcess pid 4412); absence-based work is held'
     }
     $health.Detail -match 'codex/UnaccountedProcess pid 4412'
 }
 
 Test-That 'an adapter reason survives to the status line too' {
-    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -DashboardProbe $healthyDashboard -LogProbe {
         New-SustainedLogLines 'session discovery uncertain (copilot/AdapterReadFailed: Registration directory is unreadable.); absence-based work is held'
     }
     $health.Detail -match 'AdapterReadFailed: Registration directory is unreadable\.'
@@ -2275,7 +2279,7 @@ Test-That 'an adapter reason survives to the status line too' {
 # a path, or a command with arguments. Ending the capture at the first ")" truncated
 # it exactly where it got interesting. Found by review on #138.
 Test-That 'a reason containing brackets is carried whole, not cut at the first one' {
-    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -DashboardProbe $healthyDashboard -LogProbe {
         New-SustainedLogLines 'session discovery uncertain (codex/AdapterReadFailed: cannot read /Users/d/Library/Application Support (sandboxed) registrations); absence-based work is held'
     }
     $health.Detail -match 'Application Support \(sandboxed\) registrations'
@@ -2285,7 +2289,7 @@ Test-That 'a reason containing brackets is carried whole, not cut at the first o
 # the last left "(x4)" standing over a single process while the others went unmentioned
 # - and they have to be dealt with too. Found by review on #138.
 Test-That 'several processes holding at once are all named, not just the last' {
-    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -DashboardProbe $healthyDashboard -LogProbe {
         @((New-SustainedLogLines 'session discovery uncertain (copilot/UnaccountedProcess pid 11); absence-based work is held' -Count 11),
           (New-SustainedLogLines 'session discovery uncertain (codex/UnaccountedProcess pid 22); absence-based work is held' -Count 11)) |
             ForEach-Object { $_ }
@@ -2294,7 +2298,7 @@ Test-That 'several processes holding at once are all named, not just the last' {
 }
 
 Test-That 'which agent died before registering is named' {
-    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -DashboardProbe $healthyDashboard -LogProbe {
         @(New-DaemonLogLine 'launched Codex (pid 31857) exited before registering')
     }
     $health.Detail -match 'Codex \(pid 31857\)'
@@ -2303,7 +2307,7 @@ Test-That 'which agent died before registering is named' {
 # The cause can change while the hold persists, and every one of them is something
 # that was holding - so they are all named rather than only whichever was last.
 Test-That 'a cause that has changed over the window keeps both, newest first' {
-    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -DashboardProbe $healthyDashboard -LogProbe {
         @((New-SustainedLogLines 'session discovery uncertain (claude/UnaccountedProcess pid 1); absence-based work is held' -AgeMinutes 90),
           (New-SustainedLogLines 'session discovery uncertain (codex/UnaccountedProcess pid 2); absence-based work is held' -AgeMinutes 2)) |
             ForEach-Object { $_ }
@@ -2312,7 +2316,7 @@ Test-That 'a cause that has changed over the window keeps both, newest first' {
 }
 
 Test-That 'several different faults are all named, not just the first' {
-    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -DashboardProbe $healthyDashboard -LogProbe {
         @((New-DaemonLogLine 'launched Codex (pid 1) exited before registering')) +
             (New-SustainedLogLines 'session discovery uncertain (codex/AdapterReadFailed); absence-based work is held')
     }
@@ -2320,7 +2324,7 @@ Test-That 'several different faults are all named, not just the first' {
 }
 
 Test-That 'a fault repeating is counted rather than listed twice' {
-    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -DashboardProbe $healthyDashboard -LogProbe {
         @((New-DaemonLogLine 'launched Codex (pid 1) exited before registering'),
           (New-DaemonLogLine 'launched Codex (pid 2) exited before registering'),
           (New-DaemonLogLine 'launched Codex (pid 3) exited before registering'))
@@ -2333,14 +2337,14 @@ Test-That 'a fault repeating is counted rather than listed twice' {
 # heals. Reporting that as NOT registering was read as the bridge being broken on a
 # machine that was fine, which is worse than saying nothing at all.
 Test-That 'a hold that happened and healed is not reported as a fault' {
-    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -DashboardProbe $healthyDashboard -LogProbe {
         New-SustainedLogLines 'session discovery uncertain (copilot/UnaccountedProcess pid 81696); absence-based work is held' -Count 6
     }
     $health.Ok -and $health.Detail -match 'nothing wrong'
 }
 
 Test-That 'but one that keeps happening is' {
-    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -DashboardProbe $healthyDashboard -LogProbe {
         New-SustainedLogLines 'session discovery uncertain (copilot/UnaccountedProcess pid 32741); absence-based work is held' -Count 207
     }
     (-not $health.Ok) -and $health.Detail -match 'discovery is held'
@@ -2349,7 +2353,7 @@ Test-That 'but one that keeps happening is' {
 # A blip alongside a real fault must not date the verdict: "last 2 min ago" drawn from
 # something that was never worth reporting is a worse answer than the fault's own age.
 Test-That 'a blip does not lend its timestamp to a fault found elsewhere' {
-    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -DashboardProbe $healthyDashboard -LogProbe {
         @((New-DaemonLogLine 'launched Codex (pid 1) exited before registering' -AgeMinutes 40),
           (New-DaemonLogLine 'session discovery uncertain (codex/UnaccountedProcess pid 2); absence-based work is held' -AgeMinutes 1))
     }
@@ -2357,7 +2361,7 @@ Test-That 'a blip does not lend its timestamp to a fault found elsewhere' {
 }
 
 Test-That 'a session that died before registering still counts from the first one' {
-    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -DashboardProbe $healthyDashboard -LogProbe {
         @(New-DaemonLogLine 'launched Codex (pid 31857) exited before registering')
     }
     -not $health.Ok
@@ -2366,14 +2370,14 @@ Test-That 'a session that died before registering still counts from the first on
 # A fault that was fixed yesterday must not keep the verdict red today, or the check
 # becomes something to be ignored - which is where the old one ended up.
 Test-That 'a fault older than the window is not held against the machine' {
-    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -DashboardProbe $healthyDashboard -LogProbe {
         @(New-DaemonLogLine 'launched Codex (pid 1) exited before registering' -AgeMinutes (60 * 48))
     }
     $health.Ok
 }
 
 Test-That 'a line that is not the daemon''s is left alone rather than guessed at' {
-    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -DashboardProbe $healthyDashboard -LogProbe {
         @('something else wrote this: exited before registering')
     }
     $health.Ok
@@ -2397,6 +2401,25 @@ Test-That 'and still says All good when registration is working' {
         -RegistrationProbe { [pscustomobject]@{ Ok = $true; Examined = 10; Detail = 'nothing wrong' } } `
         -OnWindows $true
     Show-BridgeInstallVerdict -Checks $checks
+}
+
+foreach ($problem in @('dashboard publication is not configured', 'publication was refused',
+        'this machine is missing from its own machine list', 'sessions sensor has the wrong entity id')) {
+    Test-That "a clean log cannot hide that $problem" {
+        $registration = Get-BridgeRegistrationHealth -Context $installContext -LogProbe { @() } `
+            -DashboardProbe { [pscustomobject]@{ Ok = $false; Detail = $problem } }
+        $checks = Get-BridgeInstallHealth -Clients @() -OnWindows $true `
+            -DaemonProbe { $true } -CommandProbe { $true } `
+            -ConnectionProbe { [pscustomobject]@{ Ok = $true; Version = 'synthetic'; Error = '' } } `
+            -RegistrationProbe { $registration }
+        -not $registration.Ok -and $registration.Detail -ceq $problem -and
+            -not (Show-BridgeInstallVerdict -Checks $checks 6>$null)
+    }
+}
+Test-That 'a dashboard check that cannot answer is not registration success' {
+    $health = Get-BridgeRegistrationHealth -Context $installContext -LogProbe { @() } `
+        -DashboardProbe { throw 'synthetic read refused' }
+    -not $health.Ok -and $health.Detail -match 'could not be checked: synthetic read refused'
 }
 
 # A probe nothing calls is worth nothing, and `agent-ha-bridge status` is the command

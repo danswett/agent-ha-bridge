@@ -1133,6 +1133,25 @@ function Get-BridgeDaemonProcess {
     @(Get-BridgeOwnedRuntimeProcesses -Context $installContext -Roles daemon)
 }
 
+function Initialize-BridgeInstallPublication {
+    param([Parameter(Mandatory)][string]$HooksDir, [Parameter(Mandatory)][string]$ConfigFile)
+
+    $previous = $env:AGENT_HA_BRIDGE_CONFIG
+    try {
+        $env:AGENT_HA_BRIDGE_CONFIG = $ConfigFile
+        . (Join-Path $HooksDir 'decision-bridge-common.ps1')
+        . (Join-Path $HooksDir 'decision-ha-websocket.ps1')
+        if (Initialize-BridgePublicationParticipant) {
+            $settings = Get-BridgePublicationSettings
+            Write-Host "    participant $($settings.participant); writer $($settings.writer), generation $($settings.generation)"
+        }
+    }
+    finally {
+        if ($null -eq $previous) { Remove-Item Env:\AGENT_HA_BRIDGE_CONFIG -ErrorAction SilentlyContinue }
+        else { $env:AGENT_HA_BRIDGE_CONFIG = $previous }
+    }
+}
+
 function Get-BridgeInstallHealth {
     <#
         The checks behind the install's closing verdict, as { Name, Ok, Detail, Fix }.
@@ -3377,6 +3396,16 @@ if ($isDevBox) {
     Write-Host "    Dev Box      : $(if ($devBoxDecision.Enabled) { "keep-awake on - '$devBoxTaskName' every ${devBoxIntervalMinutes}m" } else { "keep-awake off ($($devBoxDecision.Reason))" })"
 }
 
+$canReachHomeAssistant = $homeAssistantReady -or (-not [string]::IsNullOrWhiteSpace($effectiveToken))
+if ($canReachHomeAssistant -and -not $installContext.Isolated) {
+    Write-Step 'Checking dashboard participation'
+    try { Initialize-BridgeInstallPublication -HooksDir $hooksDir -ConfigFile $configPath }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        Write-Warning "Dashboard participation needs attention: $($_.Exception.Message)"
+    }
+}
+
 # ------------------------------------------------------------- session sharing
 # After the config is written, not before: the step runs as its own process against the
 # installed hooks and writes the fleet secret into the file itself, so nothing here can
@@ -3446,7 +3475,6 @@ if ($agentIdentityWarning) { Write-Warning $agentIdentityWarning }
 # feature could ship and simply never appear. -SkipVerify means "do not fail the
 # install on the check", not "do not talk to Home Assistant" - so with a token to hand,
 # try. Nothing here throws: the card check reports and returns.
-$canReachHomeAssistant = $homeAssistantReady -or (-not [string]::IsNullOrWhiteSpace($effectiveToken))
 if ($canReachHomeAssistant -and -not $installContext.Isolated) {
     Write-Step 'Checking the dashboard frontend cards'
     [void](Invoke-BridgeFrontendCardCheck -HooksDir $hooksDir -ConfigPath $configPath -Register)

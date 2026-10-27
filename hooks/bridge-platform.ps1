@@ -2126,6 +2126,9 @@ function Get-BridgeRegistrationHealth {
         check that fires on a working machine gets ignored, and then it is worth less
         than nothing.
 
+        The shared dashboard and this machine's sessions sensor are checked live too:
+        no registration error is logged when a participant is simply invisible.
+
         Counting live agent processes instead was the obvious alternative and is a
         trap. Get-BridgeAgentProcesses deliberately includes node and bun, because an
         agent CLI is often a script run under one; on any Mac doing other work that
@@ -2139,7 +2142,8 @@ function Get-BridgeRegistrationHealth {
         [int]$WithinHours = 6,
 
         [int]$TailLines = 800,
-        [scriptblock]$LogProbe
+        [scriptblock]$LogProbe,
+        [scriptblock]$DashboardProbe
     )
 
     if (-not $LogProbe) {
@@ -2255,8 +2259,36 @@ function Get-BridgeRegistrationHealth {
     elseif ($lines.Count -eq 0) { $detail = 'no daemon log to read yet' }
     else { $detail = "nothing wrong in the last $WithinHours hours of the daemon log" }
 
+    $dashboardHealth = $null
+    try {
+        if ($DashboardProbe) { $dashboardHealth = & $DashboardProbe }
+        else {
+            $healthHooks = Join-Path $Context.BridgeHome 'hooks'
+            $previousConfig = $env:AGENT_HA_BRIDGE_CONFIG
+            try {
+                $env:AGENT_HA_BRIDGE_CONFIG = $Context.ConfigPath
+                . (Join-Path $healthHooks 'decision-bridge-common.ps1')
+                . (Join-Path $healthHooks 'decision-mqtt.ps1')
+                . (Join-Path $healthHooks 'decision-ha-websocket.ps1')
+                $dashboardHealth = Get-BridgeMachineHealth
+            }
+            finally {
+                if ($null -eq $previousConfig) { Remove-Item Env:\AGENT_HA_BRIDGE_CONFIG -ErrorAction SilentlyContinue }
+                else { $env:AGENT_HA_BRIDGE_CONFIG = $previousConfig }
+            }
+        }
+        if ($null -eq $dashboardHealth) { throw 'The dashboard health check returned no result.' }
+    }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        $dashboardHealth = [pscustomobject]@{ Ok = $false; Detail = "dashboard health could not be checked: $($_.Exception.Message)" }
+    }
+    if (-not $dashboardHealth.Ok) {
+        $detail = if ($found.Count) { "$detail; $($dashboardHealth.Detail)" } else { [string]$dashboardHealth.Detail }
+    }
+
     [pscustomobject]@{
-        Ok       = ($found.Count -eq 0)
+        Ok       = ($found.Count -eq 0 -and $dashboardHealth.Ok)
         Examined = $lines.Count
         Detail   = $detail
     }

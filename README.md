@@ -1422,6 +1422,13 @@ fences. Their local serialization is **not a distributed lease**.
 
 #### Configure the participants
 
+When local `dashboard.publication` is absent, the installer (including
+`agent-ha-bridge configure`) joins an established shared policy using its authority,
+writer and generation, with this machine's slug as the participant. It preserves
+explicit local settings and never creates or changes shared policy. Without a
+readable established policy, setup reports the required operator action instead of
+claiming a healthy install.
+
 Merge this section into the selected installation's existing protected
 `config.json`; do not replace its other settings or copy credentials into a command:
 
