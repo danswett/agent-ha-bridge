@@ -2421,6 +2421,17 @@ Test-That 'a dashboard check that cannot answer is not registration success' {
         -DashboardProbe { throw 'synthetic read refused' }
     -not $health.Ok -and $health.Detail -match 'could not be checked: synthetic read refused'
 }
+Test-That 'a wrapped dashboard observation guard still propagates through registration health' {
+    try {
+        Get-BridgeRegistrationHealth -Context $installContext -LogProbe { @() } -DashboardProbe {
+            $guard = [InvalidOperationException]::new('synthetic blocked observation')
+            $guard.Data['BridgeTestNetworkBlocked'] = $true
+            throw [InvalidOperationException]::new('synthetic wrapper', $guard)
+        } | Out-Null
+        $false
+    }
+    catch { Test-BridgeObservationGuardFailure -ErrorRecord $_ }
+}
 
 # A probe nothing calls is worth nothing, and `agent-ha-bridge status` is the command
 # the report was about - it does not go anywhere near the install verdict. Asserted

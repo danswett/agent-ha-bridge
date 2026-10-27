@@ -3401,7 +3401,7 @@ if ($canReachHomeAssistant -and -not $installContext.Isolated) {
     Write-Step 'Checking dashboard participation'
     try { Initialize-BridgeInstallPublication -HooksDir $hooksDir -ConfigFile $configPath }
     catch {
-        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
         Write-Warning "Dashboard participation needs attention: $($_.Exception.Message)"
     }
 }

@@ -2280,7 +2280,7 @@ function Get-BridgeRegistrationHealth {
         if ($null -eq $dashboardHealth) { throw 'The dashboard health check returned no result.' }
     }
     catch {
-        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
         $dashboardHealth = [pscustomobject]@{ Ok = $false; Detail = "dashboard health could not be checked: $($_.Exception.Message)" }
     }
     if (-not $dashboardHealth.Ok) {

@@ -1228,7 +1228,7 @@ function Get-BridgeMachineHealth {
         }
     }
     catch {
-        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
         $problems.Add("dashboard publication: $($_.Exception.Message)")
     }
 
@@ -1249,7 +1249,7 @@ function Get-BridgeMachineHealth {
         if ($self.Count -ne 1) { $problems.Add('this machine is missing from its own machine list') }
     }
     catch {
-        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
         $problems.Add("machine visibility could not be checked: $($_.Exception.Message)")
     }
     [pscustomobject]@{

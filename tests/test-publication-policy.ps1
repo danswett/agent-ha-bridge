@@ -299,6 +299,18 @@ try {
     }
 }
 finally { $script:BridgeDashboardRenderVersion = $savedRenderVersion }
+Test-That 'a wrapped publication read guard propagates instead of becoming a cosmetic health warning' {
+    & {
+        function Invoke-CopilotHaWebSocket {
+            param([hashtable[]]$Commands)
+            $guard = [InvalidOperationException]::new('synthetic blocked publication read')
+            $guard.Data['BridgeTestNetworkBlocked'] = $true
+            throw [InvalidOperationException]::new('synthetic wrapper', $guard)
+        }
+        try { Get-BridgeMachineHealth -States $selfStates | Out-Null; $false }
+        catch { Test-BridgeObservationGuardFailure -ErrorRecord $_ }
+    }
+}
 $config = Get-Content -LiteralPath $script:BridgeInstallContext.ConfigPath -Raw | ConvertFrom-Json -AsHashtable
 [void]$config.dashboard.Remove('publication')
 Write-BridgeSecretFile -Path $script:BridgeInstallContext.ConfigPath -Content ($config | ConvertTo-Json -Depth 10)
