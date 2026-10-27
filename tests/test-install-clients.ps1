@@ -2433,6 +2433,55 @@ Test-That 'a wrapped dashboard observation guard still propagates through regist
     catch { Test-BridgeObservationGuardFailure -ErrorRecord $_ }
 }
 
+Test-That 'status itself propagates a blocked registration observation instead of printing a cosmetic warning' {
+    & {
+        $statusFixture = Join-Path ([IO.Path]::GetTempPath()) ('status-guard-' + [guid]::NewGuid().ToString('N'))
+        $bridgeHome = Join-Path $statusFixture '.agent-ha-bridge'
+        $configPath = Join-Path $bridgeHome 'config.json'
+        $wasWindows = $script:BridgeIsWindows
+        try {
+            Write-BridgeSecretFile -Path $configPath -Content (@{
+                clients = @()
+                homeAssistant = @{ baseUrl = 'http://status.invalid:8123'; token = 'synthetic-status-token'; tokenEnvVar = '' }
+                dashboard = @{ urlPath = 'agent-decisions' }
+            } | ConvertTo-Json -Depth 5)
+            $context = Resolve-BridgeInstallContext -TargetHome $statusFixture -BridgeHome $bridgeHome -ConfigPath $configPath
+            $commandContext = Initialize-BridgeInstallIdentity -Context $context
+            $taskName = $commandContext.TaskName
+            Set-Variable -Name root -Value $bridgeHome
+            Set-Variable -Name daemonLog -Value ''
+            $script:BridgeIsWindows = $true
+            function Get-ScheduledTask { param($TaskName) }
+            function Get-InstalledVersion { 'synthetic' }
+            function Get-BridgeStatusDaemonPid { param($HooksDir) 0 }
+            function Get-BridgeStatusAgentIdentityWarning { param($HooksDir) '' }
+            function Get-BridgeUpdateCheckSummary { param($Path) $null }
+            function Show-HomeAssistantStatus { param($BaseUrl, $Token, $InstallerPath) }
+            function Get-BridgeScript { param($Name) 'synthetic-installer.ps1' }
+            function Show-BridgeMachines { param($HooksDir, $ConfigPath) }
+            function Get-BridgeRegistrationHealth {
+                param($Context)
+                $guard = [InvalidOperationException]::new('synthetic blocked registration read')
+                $guard.Data['BridgeTestNetworkBlocked'] = $true
+                throw [InvalidOperationException]::new('synthetic wrapper', $guard)
+            }
+            $ast = [Management.Automation.Language.Parser]::ParseFile(
+                (Join-Path $PSScriptRoot '..\bin\agent-ha-bridge.ps1'), [ref]$null, [ref]$null)
+            $statusFunction = $ast.Find({
+                param($node)
+                $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq 'Show-Status'
+            }, $true)
+            Set-Item Function:\Show-Status -Value $statusFunction.Body.GetScriptBlock()
+            try { Show-Status 6>$null; $false }
+            catch { Test-BridgeObservationGuardFailure -ErrorRecord $_ }
+        }
+        finally {
+            $script:BridgeIsWindows = $wasWindows
+            if (Test-Path -LiteralPath $statusFixture) { Remove-Item -LiteralPath $statusFixture -Recurse -Force }
+        }
+    }
+}
+
 # A probe nothing calls is worth nothing, and `agent-ha-bridge status` is the command
 # the report was about - it does not go anywhere near the install verdict. Asserted
 # against the source because Show-Status lives in the CLI entry point rather than a

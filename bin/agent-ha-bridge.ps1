@@ -378,7 +378,10 @@ function Show-Status {
     if ($commandContext -and (Get-Command Get-BridgeRegistrationHealth -ErrorAction SilentlyContinue)) {
         $registration = $null
         try { $registration = Get-BridgeRegistrationHealth -Context $commandContext }
-        catch { Write-Host "    sessions   : could not be checked - $($_.Exception.Message)" -ForegroundColor Yellow }
+        catch {
+            if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+            Write-Host "    sessions   : could not be checked - $($_.Exception.Message)" -ForegroundColor Yellow
+        }
         if ($registration -and $registration.Ok) {
             Write-Host "    sessions   : registering normally - $($registration.Detail)" -ForegroundColor Green
         }
