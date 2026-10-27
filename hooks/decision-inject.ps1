@@ -240,7 +240,11 @@ namespace CopilotCli {
         [DllImport("kernel32.dll", SetLastError = true)]
         private static extern bool CloseHandle(IntPtr hObject);
 
-        [StructLayout(LayoutKind.Sequential)]
+        // CharSet.Unicode is what makes UnicodeChar a UTF-16 code unit. Without it .NET
+        // marshals a struct's char through the ANSI code page while the layout still
+        // looks right, so every reply lost what cp1252 lacks: '–' became U+0096 and
+        // vanished, and CJK, symbols and emoji arrived as '?'.
+        [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
         private struct KEY_EVENT_RECORD {
             public bool bKeyDown;
             public ushort wRepeatCount;
@@ -250,7 +254,7 @@ namespace CopilotCli {
             public uint dwControlKeyState;
         }
 
-        [StructLayout(LayoutKind.Explicit)]
+        [StructLayout(LayoutKind.Explicit, CharSet = CharSet.Unicode)]
         private struct INPUT_RECORD {
             [FieldOffset(0)] public ushort EventType;
             [FieldOffset(4)] public KEY_EVENT_RECORD Key;
