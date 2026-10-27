@@ -1028,6 +1028,46 @@ Test-That 'any other outcome passes through without probing anything' {
         $script:LevelReads -eq 0
 } "reads=$($script:LevelReads)"
 
+Write-Host '--- the words typed into a session are the characters that were sent ---'
+# Every reply and typed answer goes into the console as KEY_EVENT_RECORDs. The struct
+# had no CharSet, so .NET marshalled UnicodeChar through the ANSI code page while the
+# record layout still looked right: an en dash became the control U+0096 and vanished,
+# and CJK, symbols and emoji became '?'. A live Copilot CLI 1.0.104 session recorded
+# "café – 世界 ✓ “smart” 🚀" as "café  ?? ? smart ??". Checked on the marshalled bytes,
+# which are what WriteConsoleInputW actually reads.
+if ($script:BridgeIsWindows) {
+    Initialize-CopilotConsoleInjector
+    $nonPublic = [Reflection.BindingFlags]::NonPublic
+    $keyType = [CopilotCli.ConsoleInjector].GetNestedType('KEY_EVENT_RECORD', $nonPublic)
+    $recordType = [CopilotCli.ConsoleInjector].GetNestedType('INPUT_RECORD', $nonPublic)
+    $sent = @('é', '–', '世', '✓', [char]0x201C, [char]0xD83D, [char]0xDE80)
+    $marshalled = @()
+    $marshalError = ''
+    try {
+        $marshalled = foreach ($c in $sent) {
+            $key = [Activator]::CreateInstance($keyType)
+            $keyType.GetField('UnicodeChar').SetValue($key, [char]$c)
+            $record = [Activator]::CreateInstance($recordType)
+            $recordType.GetField('Key').SetValue($record, $key)
+            # SizeOf the boxed record: PowerShell binds a Type argument to SizeOf(object).
+            $buffer = [Runtime.InteropServices.Marshal]::AllocHGlobal([Runtime.InteropServices.Marshal]::SizeOf($record))
+            try {
+                [Runtime.InteropServices.Marshal]::StructureToPtr($record, $buffer, $false)
+                # INPUT_RECORD.Event starts at 4, and KEY_EVENT_RECORD.uChar at 10 within it.
+                [char]([int][Runtime.InteropServices.Marshal]::ReadInt16($buffer, 14) -band 0xFFFF)
+            }
+            finally { [Runtime.InteropServices.Marshal]::FreeHGlobal($buffer) }
+        }
+    }
+    catch { $marshalError = $_.Exception.Message }
+    Test-That 'each character reaches the console record as the UTF-16 code unit it was' {
+        -not $marshalError -and (-join $marshalled) -ceq (-join $sent)
+    } "sent=$(($sent | ForEach-Object { '{0:X4}' -f [int][char]$_ }) -join ',') marshalled=$(($marshalled | ForEach-Object { '{0:X4}' -f [int]$_ }) -join ',') $marshalError"
+}
+else {
+    Write-Host '  SKIP console records are Windows-only; macOS types through tmux'
+}
+
 Write-Host '--- words typed at a choice question, against the prompt Copilot draws ---'
 # Copilot's single-choice field as its CLI bundle has it (1.0.96 to 1.0.101), and as a
 # live 1.0.101 session answered on 2026-10-20: Up stops at the first option. Down on
