@@ -441,6 +441,33 @@ Test-That 'nothing is sent when no phone has been named' {
     $script:Sent.Count -eq 0
 }
 
+Test-That 'a freeform question still reaches the phone, with only the text action' {
+    # It has no options, and the bare empty list used to arrive as $null and fail the
+    # whole send with "Cannot index into a null array" on every pass.
+    Reset-TestWorld
+    $state = @{ $session = [pscustomobject]@{ Name = 'bridge'; Status = 'idle' } }
+    $m = New-TestMarker -DecisionId 'd-free' -Choices @() -Mode 'freeform'
+    Sync-DaemonAnswerButtons -SessionId $session -Marker $m -State $state -Headers $headers
+    $actions = @(if ($script:Sent.Count -eq 1) { $script:Sent[0].Data.data.actions })
+    $script:Sent.Count -eq 1 -and $actions.Count -eq 1 -and $actions[0].behavior -eq 'textInput'
+}
+
+Test-That 'a form still reaches the phone, with no buttons to answer it wrongly' {
+    Reset-TestWorld
+    $state = @{ $session = [pscustomobject]@{ Name = 'bridge'; Status = 'idle' } }
+    $a = [pscustomobject]@{ Label = 'A'; Options = @('x'); IsText = $false }
+    $b = [pscustomobject]@{ Label = 'B'; Options = @('y'); IsText = $false }
+    $m = New-TestMarker -DecisionId 'd-form' -Choices @() -Fields @($a, $b)
+    Sync-DaemonAnswerButtons -SessionId $session -Marker $m -State $state -Headers $headers
+    $script:Sent.Count -eq 1 -and @($script:Sent[0].Data.data.actions).Count -eq 0 -and
+        $script:DaemonAnswerButtonSent.ContainsKey('d-form')
+}
+
+Test-That 'a missing option list offers no buttons rather than failing' {
+    $actions = @(Get-BridgeAnswerButtonActions -Marker (New-TestMarker -Mode 'freeform') -DecisionId 'd1' -Options $null)
+    $actions.Count -eq 1 -and $actions[0].behavior -eq 'textInput'
+}
+
 Write-Host ''
 Write-Host '--- a tap is queued, never dropped for want of a listener ---'
 
