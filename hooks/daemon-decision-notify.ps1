@@ -284,9 +284,12 @@ function Get-BridgeAnswerButtonActions {
     param(
         [Parameter(Mandatory)]$Marker,
         [Parameter(Mandatory)][string]$DecisionId,
-        [AllowEmptyCollection()][string[]]$Options = @(),
+        [AllowEmptyCollection()][AllowNull()][string[]]$Options = @(),
         [int]$MaxButtons = 6
     )
+
+    # @($null).Count is 1, so a null list would otherwise ask for a button at $null[0].
+    if ($null -eq $Options) { $Options = @() }
 
     # Short, stable, and unique to this question: actions are shared across every
     # notification on the device, so a fixed identifier would let an old notification
@@ -375,7 +378,7 @@ function Get-BridgeAnswerButtonPayload {
     $data = @{
         tag         = Get-BridgeAnswerButtonTag -SessionId $SessionId
         url         = "/$DashboardUrlPath/decision"
-        actions     = @($Actions)
+        actions     = @($Actions | Where-Object { $null -ne $_ })
         # Several questions at once stack under one heading instead of scattering.
         group       = 'agent-bridge'
         action_data = @{
@@ -469,9 +472,15 @@ function Sync-DaemonAnswerButtons {
         }
         if ([string]::IsNullOrWhiteSpace($name)) { $name = 'Agent session' }
 
-        $options = Get-BridgeAnswerButtonOptions -Marker $Marker
-        $actions = Get-BridgeAnswerButtonActions -Marker $Marker -DecisionId $decisionId `
-            -Options $options -MaxButtons ([int]$script:DecisionBridgeConfig.AnswerButtonMax)
+        # Wrapped, because a form or freeform question has no options and the bare
+        # empty array comes back as $null. Unwrapped, every such question failed with
+        # "Cannot index into a null array" and never reached the phone at all. The
+        # actions need the same: none came back as $null, which put a null action in
+        # the payload and then threw on .Count after the send, so the question was
+        # never recorded as sent and would have been re-sent on every pass.
+        $options = @(Get-BridgeAnswerButtonOptions -Marker $Marker)
+        $actions = @(Get-BridgeAnswerButtonActions -Marker $Marker -DecisionId $decisionId `
+            -Options $options -MaxButtons ([int]$script:DecisionBridgeConfig.AnswerButtonMax))
         $payload = Get-BridgeAnswerButtonPayload -SessionId $SessionId -SessionName $name -Marker $Marker `
             -Actions $actions -DashboardUrlPath ([string]$script:DecisionBridgeConfig.DashboardUrlPath) `
             -MachineName $script:DaemonMachineName `
