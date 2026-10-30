@@ -215,17 +215,20 @@ try {
     Add-Burst -Path $restart -Fillers 100
     Write-CopilotDecisionMarker -SessionId $sid -DecisionId 'd-259' -Mode freeform
     $live = [pscustomobject]@{ SessionId = $sid; Transcript = $restart }
+    $markerBytes = [IO.File]::ReadAllText((Get-CopilotDecisionMarkerPath -SessionId $sid))
     $script:CopilotAskUserStateCache.Clear()
     $seen = Get-DaemonCopilotAskUserState -Session $live -Marker (Get-CopilotDecisionMarker -SessionId $sid)
-    $remembered = Get-CopilotDecisionMarker -SessionId $sid
+    $remembered = Get-CopilotDecisionAskHint -SessionId $sid -DecisionId 'd-259'
     Test-That 'a waiting question is found' { $seen.Pending -and $seen.ToolCallId -eq 'toolu_burst' }
-    Test-That 'and its marker remembers which question it is' {
-        $remembered.PSObject.Properties['askToolCallId'] -and $remembered.askToolCallId -eq 'toolu_burst'
+    Test-That 'and which question it is is remembered for that decision' { $null -ne $remembered -and $remembered.ToolCallId -eq 'toolu_burst' }
+    Test-That 'with where its start line begins: past the session''s start, not past the question''s' {
+        $remembered.From -gt 0 -and $remembered.From -eq [IO.File]::ReadAllText($restart).IndexOf($askStart)
+    } "from=$(if ($remembered) { $remembered.From })"
+    # Rewriting the marker to remember it could overwrite the next question, armed by
+    # the hook between the read and the write.
+    Test-That 'without the marker itself being rewritten' {
+        [IO.File]::ReadAllText((Get-CopilotDecisionMarkerPath -SessionId $sid)) -ceq $markerBytes
     }
-    Test-That 'and where to read from: past the session''s start, not past the question''s' {
-        $remembered.PSObject.Properties['askFrom'] -and [long]$remembered.askFrom -gt 0 -and
-        [long]$remembered.askFrom -le ([IO.File]::ReadAllText($restart).IndexOf('toolu_burst'))
-    } "askFrom=$(if ($remembered.PSObject.Properties['askFrom']) { $remembered.askFrom })"
 
     # The restart: nothing read is remembered in memory any more.
     $script:CopilotAskUserStateCache.Clear()
@@ -234,7 +237,7 @@ try {
     $after = Get-DaemonCopilotAskUserState -Session $live -Marker (Get-CopilotDecisionMarker -SessionId $sid)
     Test-That 'the new daemon pairs the answer with it' { $after.Started -and -not $after.Pending -and $after.ToolCallId -eq 'toolu_burst' }
     Test-That 'reading from where the question started, not the whole session' {
-        @($script:ReadFrom).Count -eq 1 -and $script:ReadFrom[0] -eq [long]$remembered.askFrom
+        @($script:ReadFrom).Count -eq 1 -and $script:ReadFrom[0] -eq $remembered.From
     } "from=$($script:ReadFrom -join ',')"
 
     # A place to start that is wrong - past the question - costs a second read, never

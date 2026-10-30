@@ -1015,35 +1015,35 @@ function Get-DaemonCopilotAskUserState {
 
         The answer is paired with its question by tool call id however far back the
         question was asked (Get-CopilotAskUserState), and only bytes written since the
-        last look are read. What a restart would lose is kept on the marker: once the
-        question is seen waiting, its id and a place at or before its start are written
-        there, and handed back as From, so a daemon that restarts mid-question reads on
-        from the question rather than through the whole session again (#259).
+        last look are read. What a restart would lose is remembered beside the marker:
+        once the question is seen waiting, its id and the offset its start line begins
+        at are recorded for that decision (Set-CopilotDecisionAskHint) and handed back
+        as From, so a daemon that restarts mid-question reads on from the question
+        rather than through the whole session again (#259). Before that, the place the
+        hook marked when it armed the question serves.
     #>
     param([Parameter(Mandatory)]$Session, [AllowNull()]$Marker = $null)
 
+    $sessionId = if ($Session.PSObject.Properties['SessionId']) { [string]$Session.SessionId } else { '' }
+    $decisionId = if ($null -ne $Marker -and $Marker.PSObject.Properties['decisionId']) { [string]$Marker.decisionId } else { '' }
+    $hint = $null
+    if ($sessionId -and $decisionId) { $hint = Get-CopilotDecisionAskHint -SessionId $sessionId -DecisionId $decisionId }
     $from = [long]0
-    if ($null -ne $Marker -and $Marker.PSObject.Properties['askFrom']) {
+    if ($null -ne $hint) { $from = [long]$hint.From }
+    elseif ($null -ne $Marker -and $Marker.PSObject.Properties['askFrom']) {
         try { $from = [long]$Marker.askFrom } catch { $from = 0 }
     }
     $state = Get-CopilotAskUserState -TranscriptPath ([string]$Session.Transcript) -From $from
 
-    if ($null -ne $Marker -and $state.Started -and $state.Pending -and
-        $Marker.PSObject.Properties['decisionId'] -and $Session.PSObject.Properties['SessionId']) {
-        $known = if ($Marker.PSObject.Properties['askToolCallId']) { [string]$Marker.askToolCallId } else { '' }
-        if ($known -cne [string]$state.ToolCallId) {
-            try {
-                Set-CopilotDecisionMarkerQuestion -SessionId ([string]$Session.SessionId) -DecisionId ([string]$Marker.decisionId) `
-                    -ToolCallId ([string]$state.ToolCallId) -From ([long]$state.ScanFrom)
-                # And on the copy in hand, so a recheck later in this pass does not
-                # write it again.
-                $Marker | Add-Member -NotePropertyName askToolCallId -NotePropertyValue ([string]$state.ToolCallId) -Force
-                $Marker | Add-Member -NotePropertyName askFrom -NotePropertyValue ([long]$state.ScanFrom) -Force
-            }
-            catch {
-                if (Test-DecisionMarkedGuardError -ErrorRecord $_) { throw }
-                # Only a shortcut for after a restart; the question is read either way.
-            }
+    if ($sessionId -and $decisionId -and $state.Started -and $state.Pending -and
+        ($null -eq $hint -or $hint.ToolCallId -cne [string]$state.ToolCallId)) {
+        try {
+            Set-CopilotDecisionAskHint -SessionId $sessionId -DecisionId $decisionId `
+                -ToolCallId ([string]$state.ToolCallId) -From ([long]$state.ScanFrom)
+        }
+        catch {
+            if (Test-DecisionMarkedGuardError -ErrorRecord $_) { throw }
+            # Only a shortcut for after a restart; the question is read either way.
         }
     }
     $state

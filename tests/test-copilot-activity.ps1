@@ -704,6 +704,27 @@ try {
     }
     finally { $script:DaemonConfig.MaxTailBytes = $previousCap }
 
+    # A message can carry a reply, a thought and a model, and the reader keeps each on
+    # its own - so the newest message alone is not enough to keep. A reply followed by
+    # a thought-only message, both in the skipped part, lost the reply.
+    $skipped = Join-Path ([IO.Path]::GetTempPath()) "copilot-skipped-$([guid]::NewGuid().ToString('N')).jsonl"
+    try {
+        [IO.File]::WriteAllText($skipped, ((@(
+            (New-ReplyFrom 'an older reply' 'model-a'), (New-ReplyFrom 'the reply that matters' 'model-b'),
+            (New-Thought 'then a thought'), '{"type":"tool.execution_start","data":{"toolName":"grep"}}'
+        ) -join "`n") + "`n"))
+        $stream = [IO.File]::OpenRead($skipped)
+        try { $landmarks = @(Get-CopilotTranscriptLandmarks -Stream $stream -From 0 -Through $stream.Length) }
+        finally { $stream.Dispose() }
+        $fromLandmarks = Get-ActivityFromEvents -Lines $landmarks -VerboseMode $false
+        Test-That 'a skipped reply followed by a skipped thought is still the reply shown' {
+            $fromLandmarks.Response -eq 'the reply that matters' -and $fromLandmarks.Reasoning -eq 'then a thought'
+        } "response=$($fromLandmarks.Response) reasoning=$($fromLandmarks.Reasoning)"
+        Test-That 'with the model it named' { $fromLandmarks.Model -eq 'model-b' } "$($fromLandmarks.Model)"
+        Test-That 'and only the newest of each is kept' { $landmarks.Count -eq 3 } "$($landmarks.Count) kept"
+    }
+    finally { Remove-Item -LiteralPath $skipped -Force -ErrorAction SilentlyContinue }
+
     StepShells -Lines @((New-ShellStarted 'rel137'), '{"type":"assistant.turn_end"}')
     Test-That 'and a restart finds it waiting, not idle' {
         (Get-DaemonStartupStatus -Session $shellSession -Entry $shellEntry) -eq 'shell'

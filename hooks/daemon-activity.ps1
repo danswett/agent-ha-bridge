@@ -259,11 +259,13 @@ function Get-CopilotTranscriptLandmarks {
           - every one that changes a running account: a subagent starting or ending,
             a shell starting or settling, a CLI attaching. These are a few short lines
             in megabytes of tool output.
-          - the newest of each kind that only says what the session is doing now - a
-            turn starting or ending, a message, a tool call. Their older ones would be
-            overwritten by it anyway, and its own place among the records above is
-            kept, so the reader below sees the same final state it would have from
-            the whole range.
+          - the newest of each thing that only says what the session is doing now - a
+            turn starting or ending, your message, a tool call, and for assistant
+            messages separately the newest reply, the newest thought and the newest
+            model named, since a message may carry any of them and the reader keeps
+            each on its own. Older ones would be overwritten anyway, and each kept
+            record's own place among the others is kept, so the reader below sees the
+            same final state it would have from the whole range.
 
         Memory is the window and what is kept, never the range. A shell result long
         enough to matter for that is cut down to its marker lines.
@@ -274,34 +276,58 @@ function Get-CopilotTranscriptLandmarks {
         [Parameter(Mandatory)][long]$Through
     )
 
+    # Each kept record with how many "newest of" slots still point at it, so a record
+    # that is the newest reply and the newest thought at once is dropped only when it
+    # is neither. A running-account record is held for good.
     $kept = [Collections.Generic.List[object]]::new()
     $newest = @{}
+    $keep = {
+        param([string]$Text, [string[]]$Slots)
+        $entry = [pscustomobject]@{ Line = $Text; Refs = 0 }
+        if (@($Slots).Count -eq 0) { $entry.Refs = 1 }
+        foreach ($slot in @($Slots)) {
+            if ($newest.ContainsKey($slot)) {
+                $previous = $kept[$newest[$slot]]
+                $previous.Refs--
+                if ($previous.Refs -le 0) { $previous.Line = $null }
+            }
+            $newest[$slot] = $kept.Count
+            $entry.Refs++
+        }
+        $kept.Add($entry)
+    }
     $visit = {
         param([string]$Line)
         if ($Line -notmatch '"type":"([^"]+)"') { return }
         $type = $Matches[1]
+        # A subagent's turn is not the session's, so the two are kept apart; the
+        # reader tells them apart properly (Test-BridgeSubagentEvent).
+        $who = if ($Line.Contains('"agentId"')) { 'agent' } else { 'session' }
         switch ($type) {
             { $_ -in @('subagent.started', 'subagent.completed', 'session.resume', 'session.start') } {
-                $kept.Add($Line)
+                & $keep $Line @()
                 return
             }
             'system.notification' {
-                if ($Line.Contains('"shell_completed"')) { $kept.Add($Line) }
+                if ($Line.Contains('"shell_completed"')) { & $keep $Line @() }
                 return
             }
             'tool.execution_complete' {
                 # The same cheap test the activity reader makes before its parse.
                 if (-not $Line.Contains('shellId') -and -not $Line.Contains('command with id: ')) { return }
-                $kept.Add((Get-CopilotShellResultMarkers -Line $Line))
+                & $keep (Get-CopilotShellResultMarkers -Line $Line) @()
                 return
             }
-            { $_ -in @('assistant.turn_start', 'assistant.turn_end', 'user.message', 'assistant.message', 'tool.execution_start') } {
-                # A subagent's turn is not the session's, so the two are kept apart;
-                # the reader tells them apart properly (Test-BridgeSubagentEvent).
-                $key = "$type|$($Line.Contains('"agentId"'))"
-                if ($newest.ContainsKey($key)) { $kept[$newest[$key]] = $null }
-                $kept.Add($Line)
-                $newest[$key] = $kept.Count - 1
+            'assistant.message' {
+                try { $data = ($Line | ConvertFrom-Json).data } catch { return }
+                $slots = @(foreach ($field in @('content', 'reasoningText', 'model')) {
+                    if (-not [string]::IsNullOrWhiteSpace((Get-BridgeEventField -Data $data -Name $field))) { "$type|$field|$who" }
+                })
+                if ($slots.Count -gt 0) { & $keep $Line $slots }
+                return
+            }
+            { $_ -in @('assistant.turn_start', 'assistant.turn_end', 'user.message', 'tool.execution_start') } {
+                & $keep $Line @("$type|$who")
                 return
             }
         }
@@ -310,7 +336,7 @@ function Get-CopilotTranscriptLandmarks {
         'subagent.started', 'subagent.completed', 'session.resume', 'session.start', 'system.notification',
         'tool.execution_complete', 'assistant.turn_start', 'assistant.turn_end', 'user.message',
         'assistant.message', 'tool.execution_start'))
-    @($kept | Where-Object { $null -ne $_ })
+    @($kept | Where-Object { $null -ne $_.Line } | ForEach-Object { $_.Line })
 }
 
 function Get-CopilotShellResultMarkers {

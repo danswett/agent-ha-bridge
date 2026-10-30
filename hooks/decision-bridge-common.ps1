@@ -2752,13 +2752,26 @@ function Set-CopilotDecisionMarkerInjected {
     Set-Content -LiteralPath $path -Value ($obj | ConvertTo-Json -Depth 8 -Compress) -Encoding UTF8
 }
 
-function Set-CopilotDecisionMarkerQuestion {
+function Get-CopilotDecisionAskPath {
     <#
-        Remembers, on a waiting question's marker, which ask_user it is and a place in
-        the transcript at or before where it started (Get-CopilotAskUserState's From),
-        so a daemon that restarts while it waits reads on from there instead of the
-        whole session. Written only to the marker for the same question, by its
-        decision id: the hook may have replaced it with the next one meanwhile.
+        Where one question's place in the transcript is remembered, beside its
+        baseline and for the same reason (Get-CopilotDecisionBaselinePath): written into
+        the marker, a read-modify-write could overwrite the next question the hook
+        armed in between. A file per decision id cannot touch another question's.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][string]$DecisionId
+    )
+
+    (Get-CopilotDecisionBaselinePath -SessionId $SessionId -DecisionId $DecisionId) -replace '\.json$', '.ask.json'
+}
+
+function Set-CopilotDecisionAskHint {
+    <#
+        Remembers which ask_user a waiting question is and the byte offset its start
+        line begins at (Get-CopilotAskUserState's From), so a daemon that restarts
+        while it waits reads on from there instead of through the whole session.
     #>
     param(
         [Parameter(Mandatory)][string]$SessionId,
@@ -2766,14 +2779,22 @@ function Set-CopilotDecisionMarkerQuestion {
         [Parameter(Mandatory)][string]$ToolCallId,
         [Parameter(Mandatory)][long]$From
     )
-    $marker = Get-CopilotDecisionMarker -SessionId $SessionId
-    if ($null -eq $marker -or -not $marker.PSObject.Properties['decisionId'] -or [string]$marker.decisionId -cne $DecisionId) { return }
-    $path = Get-CopilotDecisionMarkerPath -SessionId $SessionId
-    $obj = @{}
-    foreach ($p in $marker.PSObject.Properties) { $obj[$p.Name] = $p.Value }
-    $obj['askToolCallId'] = $ToolCallId
-    $obj['askFrom'] = $From
-    Set-Content -LiteralPath $path -Value ($obj | ConvertTo-Json -Depth 8 -Compress) -Encoding UTF8
+    $json = @{ decisionId = $DecisionId; toolCallId = $ToolCallId; from = $From } | ConvertTo-Json -Compress
+    [IO.File]::WriteAllText((Get-CopilotDecisionAskPath -SessionId $SessionId -DecisionId $DecisionId), $json)
+}
+
+function Get-CopilotDecisionAskHint {
+    <# What Set-CopilotDecisionAskHint remembered for this question, or $null. #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][string]$DecisionId
+    )
+    try {
+        $record = [IO.File]::ReadAllText((Get-CopilotDecisionAskPath -SessionId $SessionId -DecisionId $DecisionId)) | ConvertFrom-Json
+        if ([string]$record.decisionId -cne $DecisionId) { return $null }
+        [pscustomobject]@{ ToolCallId = [string]$record.toolCallId; From = [long]$record.from }
+    }
+    catch { $null }
 }
 function Test-DecisionMarkedGuardError {
     <#
@@ -3594,7 +3615,8 @@ function Remove-CopilotDecisionMarker {
     elseif (-not [string]::IsNullOrWhiteSpace($DecisionId)) {
         foreach ($companion in @(
             (Get-CopilotDecisionBaselinePath -SessionId $SessionId -DecisionId $DecisionId),
-            (Get-CopilotDecisionAttemptPath -SessionId $SessionId -DecisionId $DecisionId))) {
+            (Get-CopilotDecisionAttemptPath -SessionId $SessionId -DecisionId $DecisionId),
+            (Get-CopilotDecisionAskPath -SessionId $SessionId -DecisionId $DecisionId))) {
             if (Test-Path -LiteralPath $companion) {
                 Remove-Item -LiteralPath $companion -Force -ErrorAction SilentlyContinue
             }
