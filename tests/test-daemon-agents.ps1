@@ -186,7 +186,7 @@ Test-That 'Claude and Codex sessions give their process' { (Get-DaemonSessionPro
 Test-That 'Copilot and others leave it to the lock file' { (Get-DaemonSessionProcessId -SessionId 'a') -eq 0 -and (Get-DaemonSessionProcessId -SessionId 'm') -eq 0 }
 
 Write-Host '--- questions and approvals ---'
-function Get-CopilotAskUserState { param($TranscriptPath) [pscustomobject]@{ Reader = 'copilot' } }
+function Get-CopilotAskUserState { param($TranscriptPath, $From) [pscustomobject]@{ Reader = 'copilot' } }
 function Get-ClaudeAskUserState { param($TranscriptPath, $ToolCallId, $Since) [pscustomobject]@{ Reader = 'claude'; ToolCallId = $ToolCallId; Since = $Since } }
 $script:ClaudeAdapterLoaded = $true
 $ask = Get-DaemonAskUserState -Session ([pscustomobject]@{ Kind = 'claude'; Transcript = 't' }) -Marker ([pscustomobject]@{ toolCallId = 'tc1'; armedAt = 'then' })

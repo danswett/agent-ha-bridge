@@ -1008,6 +1008,46 @@ function Get-DaemonAskUserState {
     & (Get-DaemonAgent -Kind (Get-DaemonEntryKind -Entry $Session)).AskUserState $Session $Marker
 }
 
+function Get-DaemonCopilotAskUserState {
+    <#
+        Whether a Copilot session's question is still waiting, read from where that
+        question started rather than from a fixed window.
+
+        The answer is paired with its question by tool call id however far back the
+        question was asked (Get-CopilotAskUserState), and only bytes written since the
+        last look are read. What a restart would lose is kept on the marker: once the
+        question is seen waiting, its id and a place at or before its start are written
+        there, and handed back as From, so a daemon that restarts mid-question reads on
+        from the question rather than through the whole session again (#259).
+    #>
+    param([Parameter(Mandatory)]$Session, [AllowNull()]$Marker = $null)
+
+    $from = [long]0
+    if ($null -ne $Marker -and $Marker.PSObject.Properties['askFrom']) {
+        try { $from = [long]$Marker.askFrom } catch { $from = 0 }
+    }
+    $state = Get-CopilotAskUserState -TranscriptPath ([string]$Session.Transcript) -From $from
+
+    if ($null -ne $Marker -and $state.Started -and $state.Pending -and
+        $Marker.PSObject.Properties['decisionId'] -and $Session.PSObject.Properties['SessionId']) {
+        $known = if ($Marker.PSObject.Properties['askToolCallId']) { [string]$Marker.askToolCallId } else { '' }
+        if ($known -cne [string]$state.ToolCallId) {
+            try {
+                Set-CopilotDecisionMarkerQuestion -SessionId ([string]$Session.SessionId) -DecisionId ([string]$Marker.decisionId) `
+                    -ToolCallId ([string]$state.ToolCallId) -From ([long]$state.ScanFrom)
+                # And on the copy in hand, so a recheck later in this pass does not
+                # write it again.
+                $Marker | Add-Member -NotePropertyName askToolCallId -NotePropertyValue ([string]$state.ToolCallId) -Force
+                $Marker | Add-Member -NotePropertyName askFrom -NotePropertyValue ([long]$state.ScanFrom) -Force
+            }
+            catch {
+                if (Test-DecisionMarkedGuardError -ErrorRecord $_) { throw }
+                # Only a shortcut for after a restart; the question is read either way.
+            }
+        }
+    }
+    $state
+}
 function Complete-DaemonClaudeAnswer {
     <#
         Makes sure an answer driven into a Claude question was submitted.

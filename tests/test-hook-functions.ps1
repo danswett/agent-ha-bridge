@@ -75,7 +75,7 @@ $out = Invoke-ClaudeStopHook -HookEvent ([pscustomobject]@{ session_id = 'c1'; t
 Test-That 'Stop marks it idle even with Home Assistant away, and says nothing' { $script:Registered[-1].Status -eq 'idle' -and $null -eq $out }
 
 $script:Markers = @()
-function Write-CopilotDecisionMarker { param($SessionId, $DecisionId, $Question, $Choices, $Combos, $Fields, $Mode, [switch]$TerminalOnly, $ToolCallId) $script:Markers += [pscustomobject]@{ Question = $Question; ToolCallId = $ToolCallId } }
+function Write-CopilotDecisionMarker { param($SessionId, $DecisionId, $Question, $Choices, $Combos, $Fields, $Mode, [switch]$TerminalOnly, $ToolCallId, $AskFrom) $script:Markers += [pscustomobject]@{ Question = $Question; ToolCallId = $ToolCallId } }
 $ask = [pscustomobject]@{
     session_id = 'c1'; transcript_path = 't'; cwd = 'w'; tool_name = 'AskUserQuestion'; tool_use_id = 'tu1'
     tool_input = [pscustomobject]@{ questions = @([pscustomobject]@{ question = 'Which?'; header = 'Pick'; multiSelect = $false; options = @([pscustomobject]@{ label = 'A' }, [pscustomobject]@{ label = 'B' }) }) }
@@ -91,7 +91,7 @@ Test-That 'any other tool is ignored' { $script:Markers.Count -eq 0 }
 # one. The card used to be armed with working dropdowns all the same, so it looked
 # answerable and silently was not - every Send was dropped at the daemon's
 # terminal-only check with nothing said on the card.
-function Write-CopilotDecisionMarker { param($SessionId, $DecisionId, $Question, $Choices, $Combos, $Fields, $Mode, [switch]$TerminalOnly, $ToolCallId) $script:Markers += [pscustomobject]@{ Question = $Question; Choices = @($Choices); Fields = @($Fields); TerminalOnly = [bool]$TerminalOnly } }
+function Write-CopilotDecisionMarker { param($SessionId, $DecisionId, $Question, $Choices, $Combos, $Fields, $Mode, [switch]$TerminalOnly, $ToolCallId, $AskFrom) $script:Markers += [pscustomobject]@{ Question = $Question; Choices = @($Choices); Fields = @($Fields); TerminalOnly = [bool]$TerminalOnly; AskFrom = $AskFrom } }
 $script:Published = @()
 function Get-ClaudeSessionDisplay { param($SessionId, $WorkingDirectory) [pscustomobject]@{ Name = 'Claude: t'; Machine = 'M' } }
 function Confirm-BridgeSessionEntities { param($SessionId, $SessionName, $Machine, $Headers, $ProbeEntity) $true }
@@ -204,6 +204,24 @@ Test-That 'ask_user with Home Assistant away retains its marker and leaves the n
     $null -eq $out -and $script:Markers.Count -eq 1 -and
     $script:Markers[0].Question -ceq 'Pick' -and
     ($script:Markers[0].Choices -join '|') -ceq 'A|B' -and -not $script:Markers[0].TerminalOnly
+}
+# Where the daemon starts looking for the question (#259): just before the end of the
+# transcript as the hook found it, since Copilot writes the start just before the hook.
+$askTranscript = Join-Path ([IO.Path]::GetTempPath()) "hook-ask-$([guid]::NewGuid().ToString('N')).jsonl"
+[IO.File]::WriteAllText($askTranscript, ('x' * 99) + "`n")
+$previousMargin = $script:CopilotAskFromMargin
+try {
+    $script:CopilotAskFromMargin = 40
+    $script:Markers = @()
+    $null = Invoke-CopilotAskUserHook -HookEvent ([pscustomobject]@{ sessionId = 's2'; cwd = 'w'; timestamp = 2; transcriptPath = $askTranscript; toolArgs = [pscustomobject]@{ question = 'Pick'; choices = @('A', 'B') } })
+    Test-That 'ask_user marks where in the transcript to look for its question' { $script:Markers[-1].AskFrom -eq 60 } "$($script:Markers[-1].AskFrom)"
+    $script:Markers = @()
+    $null = Invoke-CopilotAskUserHook -HookEvent ([pscustomobject]@{ sessionId = 's3'; cwd = 'w'; timestamp = 3; transcriptPath = (Join-Path ([IO.Path]::GetTempPath()) 'no-such-transcript.jsonl'); toolArgs = [pscustomobject]@{ question = 'Pick'; choices = @('A', 'B') } })
+    Test-That 'and, with no transcript to measure, the start of it' { $script:Markers[-1].AskFrom -eq 0 } "$($script:Markers[-1].AskFrom)"
+}
+finally {
+    $script:CopilotAskFromMargin = $previousMargin
+    Remove-Item -LiteralPath $askTranscript -Force -ErrorAction SilentlyContinue
 }
 $script:Sent = @()
 function Send-BridgeNotification { param($Title, $Message, $Headers) $script:Sent += $Title }

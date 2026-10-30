@@ -240,6 +240,108 @@ function Measure-CopilotTranscriptCompaction {
     }
 }
 
+function Get-CopilotTranscriptLandmarks {
+    <#
+        From a range of a Copilot transcript the tail reader skipped, the records whose
+        loss would leave the card wrong, in the order they were written.
+
+        The tail reader keeps a window rather than everything, so one burst cannot
+        stall the loop, and that is right for what the session is saying. It is wrong
+        for anything the card keeps a running account of. A background shell or agent
+        that ended in the skipped part stayed listed until the session ended, and the
+        card said it was waiting on work that had finished (#259) - and large bursts
+        are routine: a session with background agents wrote 7.1 MB in one on
+        2026-10-30.
+
+        So every byte of the range is read, a window at a time, and two kinds of record
+        are kept:
+
+          - every one that changes a running account: a subagent starting or ending,
+            a shell starting or settling, a CLI attaching. These are a few short lines
+            in megabytes of tool output.
+          - the newest of each kind that only says what the session is doing now - a
+            turn starting or ending, a message, a tool call. Their older ones would be
+            overwritten by it anyway, and its own place among the records above is
+            kept, so the reader below sees the same final state it would have from
+            the whole range.
+
+        Memory is the window and what is kept, never the range. A shell result long
+        enough to matter for that is cut down to its marker lines.
+    #>
+    param(
+        [Parameter(Mandatory)][IO.Stream]$Stream,
+        [Parameter(Mandatory)][long]$From,
+        [Parameter(Mandatory)][long]$Through
+    )
+
+    $kept = [Collections.Generic.List[object]]::new()
+    $newest = @{}
+    $visit = {
+        param([string]$Line)
+        if ($Line -notmatch '"type":"([^"]+)"') { return }
+        $type = $Matches[1]
+        switch ($type) {
+            { $_ -in @('subagent.started', 'subagent.completed', 'session.resume', 'session.start') } {
+                $kept.Add($Line)
+                return
+            }
+            'system.notification' {
+                if ($Line.Contains('"shell_completed"')) { $kept.Add($Line) }
+                return
+            }
+            'tool.execution_complete' {
+                # The same cheap test the activity reader makes before its parse.
+                if (-not $Line.Contains('shellId') -and -not $Line.Contains('command with id: ')) { return }
+                $kept.Add((Get-CopilotShellResultMarkers -Line $Line))
+                return
+            }
+            { $_ -in @('assistant.turn_start', 'assistant.turn_end', 'user.message', 'assistant.message', 'tool.execution_start') } {
+                # A subagent's turn is not the session's, so the two are kept apart;
+                # the reader tells them apart properly (Test-BridgeSubagentEvent).
+                $key = "$type|$($Line.Contains('"agentId"'))"
+                if ($newest.ContainsKey($key)) { $kept[$newest[$key]] = $null }
+                $kept.Add($Line)
+                $newest[$key] = $kept.Count - 1
+                return
+            }
+        }
+    }
+    [void](Invoke-BridgeTranscriptLineWalk -Stream $Stream -From $From -Limit $Through -OnLine $visit -Types @(
+        'subagent.started', 'subagent.completed', 'session.resume', 'session.start', 'system.notification',
+        'tool.execution_complete', 'assistant.turn_start', 'assistant.turn_end', 'user.message',
+        'assistant.message', 'tool.execution_start'))
+    @($kept | Where-Object { $null -ne $_ })
+}
+
+function Get-CopilotShellResultMarkers {
+    <#
+        A shell tool result small enough to keep. One under 64 KB is returned as it
+        is. A longer one - a command's whole output - is rewritten to carry only its
+        lines that start with '<', where every shell marker the activity reader looks
+        for sits, and a closing line that keeps the rewrite from ever reading as one
+        of the markers that must be the whole of a result.
+    #>
+    param([Parameter(Mandatory)][string]$Line)
+
+    if ($Line.Length -le 65536) { return $Line }
+    try {
+        $parsed = $Line | ConvertFrom-Json
+        $data = if ($parsed.PSObject.Properties['data']) { $parsed.data } else { $null }
+        $resultData = if ($null -ne $data -and $data.PSObject.Properties['result']) { $data.result } else { $null }
+        $content = Get-BridgeEventField -Data $resultData -Name 'content'
+        $markers = @($content -split "`n" | Where-Object { $_.StartsWith('<') })
+        $markers += '(output omitted by agent-ha-bridge)'
+        ConvertTo-Json -Compress -Depth 4 -InputObject @{
+            type = 'tool.execution_complete'
+            data = @{
+                toolCallId = Get-BridgeEventField -Data $data -Name 'toolCallId'
+                result = @{ content = ($markers -join "`n") }
+            }
+        }
+    }
+    catch { '{"type":"tool.execution_complete","data":{}}' }
+}
+
 function Read-TranscriptAppend {
     <#
         Returns transcript lines appended since $Offset, plus the new offset.
@@ -278,7 +380,14 @@ function Read-TranscriptAppend {
         # The shared framer withholds them using byte boundaries, not decoded lengths.
         $append = Read-BridgeTranscriptStream -Stream $stream -Offset $Offset `
             -SnapshotLength $length -MaxTailBytes $script:DaemonConfig.MaxTailBytes
-        $result.Lines = @($append.Lines | Where-Object { $_.Trim().StartsWith('{') })
+        $lines = @($append.Lines)
+        # More arrived than the window holds, and the framer skipped the start of it.
+        # What in there ended a shell or an agent, or said what the session was doing,
+        # is read back out of it rather than lost with it (#259).
+        if ([long]$append.From -gt $Offset) {
+            $lines = @(Get-CopilotTranscriptLandmarks -Stream $stream -From $Offset -Through ([long]$append.From)) + $lines
+        }
+        $result.Lines = @($lines | Where-Object { $_.Trim().StartsWith('{') })
         $result.Offset = $append.Offset
     }
     catch {
