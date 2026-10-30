@@ -119,6 +119,20 @@ try {
     Write-BridgeLaunchWarning 'Workspace approval could not be established: somewhere'
     Test-That 'and the first is said again an hour later' { $script:Logged.Count -eq 3 } "$($script:Logged.Count) lines"
 
+    # More distinct warnings than are tracked, recurring every pass. Forgetting the
+    # tracked ones to make room would write all of them again on the next pass.
+    $script:BridgeLaunchWarningLogged.Clear()
+    $script:BridgeLaunchWarningOverflowAt = $null
+    $script:Logged.Clear()
+    $many = @(1..300 | ForEach-Object { "Workspace approval could not be established: folder $_" })
+    foreach ($warning in $many) { Write-BridgeLaunchWarning $warning }
+    $firstPass = $script:Logged.Count
+    Test-That 'more distinct warnings than are tracked are each logged once, then summed up in one line' {
+        $firstPass -eq $script:BridgeLaunchWarningLimit + 1 -and $script:Logged[$script:Logged.Count - 1] -like '*different warnings this hour*'
+    } "$firstPass lines"
+    foreach ($warning in $many) { Write-BridgeLaunchWarning $warning }
+    Test-That 'and the next pass over the same ones writes nothing' { $script:Logged.Count -eq $firstPass } "$($script:Logged.Count - $firstPass) more lines"
+
     Write-Host "`n--- anything else's warnings ---"
     # The installer and the launch command are run by a person, at a console, once.
     $script:BridgeLaunchWarningsToLog = $false

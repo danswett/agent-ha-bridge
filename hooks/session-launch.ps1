@@ -26,9 +26,12 @@
 # Set by the daemon when it starts for real: its warnings go to the log, never to a
 # console (see Write-BridgeLaunchWarning).
 $script:BridgeLaunchWarningsToLog = $false
-# When each warning the daemon logged was last written, keyed by its text.
+# When each warning the daemon logged was last written, keyed by its text, and when the
+# note that there were too many distinct ones to track was.
 $script:BridgeLaunchWarningLogged = @{}
+$script:BridgeLaunchWarningOverflowAt = $null
 $script:BridgeLaunchWarningInterval = [TimeSpan]::FromHours(1)
+$script:BridgeLaunchWarningLimit = 256
 
 function Write-BridgeLaunchWarning {
     <#
@@ -54,8 +57,24 @@ function Write-BridgeLaunchWarning {
         $now = [DateTimeOffset]::Now
         $last = $script:BridgeLaunchWarningLogged[$Message]
         if ($null -ne $last -and ($now - [DateTimeOffset]$last) -lt $script:BridgeLaunchWarningInterval) { return }
-        # Bounded: a warning naming a path can be as varied as the paths are.
-        if ($script:BridgeLaunchWarningLogged.Count -ge 256) { $script:BridgeLaunchWarningLogged.Clear() }
+        # Bounded, since a warning naming a path can be as varied as the paths are -
+        # but never by forgetting one still inside its hour, or a set of more distinct
+        # warnings than fit would all be written again on every pass. Only expired
+        # ones make room; past that, new ones are summed up in one line an hour.
+        if ($null -eq $last -and $script:BridgeLaunchWarningLogged.Count -ge $script:BridgeLaunchWarningLimit) {
+            foreach ($key in @($script:BridgeLaunchWarningLogged.Keys)) {
+                if (($now - [DateTimeOffset]$script:BridgeLaunchWarningLogged[$key]) -ge $script:BridgeLaunchWarningInterval) {
+                    $script:BridgeLaunchWarningLogged.Remove($key)
+                }
+            }
+            if ($script:BridgeLaunchWarningLogged.Count -ge $script:BridgeLaunchWarningLimit) {
+                $overflow = $script:BridgeLaunchWarningOverflowAt
+                if ($null -ne $overflow -and ($now - [DateTimeOffset]$overflow) -lt $script:BridgeLaunchWarningInterval) { return }
+                $script:BridgeLaunchWarningOverflowAt = $now
+                try { Write-DecisionBridgeLog -Message "launch warning: more than $($script:BridgeLaunchWarningLimit) different warnings this hour; further new ones are not logged until older ones expire. Latest: $Message" } catch { }
+                return
+            }
+        }
         $script:BridgeLaunchWarningLogged[$Message] = $now
         try { Write-DecisionBridgeLog -Message "launch warning: $Message" } catch { }
         return
