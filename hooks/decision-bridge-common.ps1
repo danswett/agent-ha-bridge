@@ -2666,7 +2666,12 @@ function Write-CopilotDecisionMarker {
 
         # The agent's own id for this question (Claude's tool_use_id), so its answer
         # is matched to this card and not to an earlier question in the transcript.
-        [string]$ToolCallId = ''
+        [string]$ToolCallId = '',
+
+        # A place in the transcript at or before this question's start, so it is
+        # looked for from there rather than through the whole session
+        # (Get-CopilotAskUserState's From). 0 is "from the start".
+        [long]$AskFrom = 0
     )
 
     $marker = @{
@@ -2683,6 +2688,7 @@ function Write-CopilotDecisionMarker {
         armedAt = [DateTimeOffset]::Now.ToString('o')
         injectedAnswer = ''
     }
+    if ($AskFrom -gt 0) { $marker['askFrom'] = $AskFrom }
     $path = Get-CopilotDecisionMarkerPath -SessionId $SessionId
     $json = $marker | ConvertTo-Json -Depth 8 -Compress
     Set-Content -LiteralPath $path -Value $json -Encoding UTF8
@@ -2746,6 +2752,50 @@ function Set-CopilotDecisionMarkerInjected {
     Set-Content -LiteralPath $path -Value ($obj | ConvertTo-Json -Depth 8 -Compress) -Encoding UTF8
 }
 
+function Get-CopilotDecisionAskPath {
+    <#
+        Where one question's place in the transcript is remembered, beside its
+        baseline and for the same reason (Get-CopilotDecisionBaselinePath): written into
+        the marker, a read-modify-write could overwrite the next question the hook
+        armed in between. A file per decision id cannot touch another question's.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][string]$DecisionId
+    )
+
+    (Get-CopilotDecisionBaselinePath -SessionId $SessionId -DecisionId $DecisionId) -replace '\.json$', '.ask.json'
+}
+
+function Set-CopilotDecisionAskHint {
+    <#
+        Remembers which ask_user a waiting question is and the byte offset its start
+        line begins at (Get-CopilotAskUserState's From), so a daemon that restarts
+        while it waits reads on from there instead of through the whole session.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][string]$DecisionId,
+        [Parameter(Mandatory)][string]$ToolCallId,
+        [Parameter(Mandatory)][long]$From
+    )
+    $json = @{ decisionId = $DecisionId; toolCallId = $ToolCallId; from = $From } | ConvertTo-Json -Compress
+    [IO.File]::WriteAllText((Get-CopilotDecisionAskPath -SessionId $SessionId -DecisionId $DecisionId), $json)
+}
+
+function Get-CopilotDecisionAskHint {
+    <# What Set-CopilotDecisionAskHint remembered for this question, or $null. #>
+    param(
+        [Parameter(Mandatory)][string]$SessionId,
+        [Parameter(Mandatory)][string]$DecisionId
+    )
+    try {
+        $record = [IO.File]::ReadAllText((Get-CopilotDecisionAskPath -SessionId $SessionId -DecisionId $DecisionId)) | ConvertFrom-Json
+        if ([string]$record.decisionId -cne $DecisionId) { return $null }
+        [pscustomobject]@{ ToolCallId = [string]$record.toolCallId; From = [long]$record.from }
+    }
+    catch { $null }
+}
 function Test-DecisionMarkedGuardError {
     <#
         Whether an error is the test boundary refusing a forbidden operation rather
@@ -3565,7 +3615,8 @@ function Remove-CopilotDecisionMarker {
     elseif (-not [string]::IsNullOrWhiteSpace($DecisionId)) {
         foreach ($companion in @(
             (Get-CopilotDecisionBaselinePath -SessionId $SessionId -DecisionId $DecisionId),
-            (Get-CopilotDecisionAttemptPath -SessionId $SessionId -DecisionId $DecisionId))) {
+            (Get-CopilotDecisionAttemptPath -SessionId $SessionId -DecisionId $DecisionId),
+            (Get-CopilotDecisionAskPath -SessionId $SessionId -DecisionId $DecisionId))) {
             if (Test-Path -LiteralPath $companion) {
                 Remove-Item -LiteralPath $companion -Force -ErrorAction SilentlyContinue
             }
@@ -3576,9 +3627,17 @@ function Remove-CopilotDecisionMarker {
     }
 }
 
-# Answers already read out of a transcript, keyed by its path, each with the length
-# and write time they were read at (see Get-CopilotAskUserState).
+# What has been read of each transcript's questions, keyed by its path: how far, what
+# that showed, and the length and write time it was read at (see Get-CopilotAskUserState).
 $script:CopilotAskUserStateCache = @{}
+
+# The only records a question scan reads (Read-BridgeTranscriptStream's Types).
+$script:CopilotAskUserTypes = @('tool.execution_start', 'tool.execution_complete', 'abort', 'session.shutdown')
+
+# How far before the transcript's end, when a question is armed, its start is looked for:
+# generous, because a spooled hook runs a moment after Copilot wrote the start, and
+# background agents may have written in between.
+$script:CopilotAskFromMargin = [long]4194304
 
 function Get-CopilotAskUserState {
     <#
@@ -3588,81 +3647,187 @@ function Get-CopilotAskUserState {
         The pair (tool.execution_start with toolName=ask_user) → (tool.execution_complete
         with the same toolCallId) is the authoritative "answered" signal, regardless of
         whether the answer came from the terminal or from an injected Home Assistant
-        reply. Returns:
+        reply. An abort or a session.shutdown after the start ends it too: the prompt
+        that question was waiting in has gone, and nothing will ever complete it.
+        Returns:
           Started   - $true if an ask_user start was found
-          Pending   - $true if that start has no matching complete yet
+          Pending   - $true if that start has not been completed or ended
           ToolCallId- the id of the most recent ask_user
           StartedAt - its timestamp
+          ScanFrom  - the byte offset its line starts at, to hand back as From
+
+        Every byte of the transcript is read, once. This used to look at its last 4 MB,
+        and a question is not always in them: on 2026-10-30 an ask_user sat waiting
+        while background agents wrote 5.5 MB beside it, and was answered in a 7.1 MB
+        burst. Its start and its completion were both behind the window by then, so the
+        question read as never asked, the daemon waited "a cycle" for a start that was
+        already written, and the card said "waiting for you" until it was cleared by
+        hand (#259).
+
+        So what has been read is kept per transcript, and each call reads only what
+        was appended since. The first call for a transcript reads all of it - 268 MB
+        in a few seconds, once, the same price the compaction count pays at adoption -
+        and every later one reads the new bytes alone, however many there are.
+
+        A daemon restart loses that, so the daemon also remembers where a waiting
+        question started, on its marker, and passes it back as From. A transcript the
+        process has not read yet is then read from there rather than from its start -
+        the bytes since the question was asked, not the whole session. From is only a
+        place to start looking: if no question is found after it, the transcript is
+        read from the start after all, so a wrong one costs time and never an answer.
     #>
     param(
-        [Parameter(Mandatory)][string]$TranscriptPath
+        [Parameter(Mandatory)][string]$TranscriptPath,
+        [long]$From = 0
     )
 
-    $result = [pscustomobject]@{ Started = $false; Pending = $false; ToolCallId = ''; StartedAt = $null; ResultContent = '' }
+    $empty = [pscustomobject]@{ Started = $false; Pending = $false; ToolCallId = ''; StartedAt = $null; ResultContent = ''; ScanFrom = [long]0 }
 
     # A transcript is append-only, so the same length means the same events, and the
-    # answer to "is this question still waiting?" cannot have changed. Parsing it
-    # again costs 93 ms of the daemon's reconcile, paid per armed question per pass -
-    # and a question sits armed for as long as it takes someone to look at their
-    # phone.
+    # answer to "is this question still waiting?" cannot have changed. Reading it
+    # again would cost a file open per armed question per pass - and a question sits
+    # armed for as long as it takes someone to look at their phone.
     #
     # The stamp carries the write time as well as the length. The length alone would
     # miss a transcript replaced by another of exactly the same size, which is
     # unlikely rather than impossible, and the pair costs the same single stat call.
-    $stamp = ''
+    $length = [long]-1
+    $ticks = [long]0
     try {
         $info = [IO.FileInfo]::new($TranscriptPath)
-        if ($info.Exists) { $stamp = "$($info.Length):$($info.LastWriteTimeUtc.Ticks)" }
+        if ($info.Exists) { $length = $info.Length; $ticks = $info.LastWriteTimeUtc.Ticks }
     }
     catch { }
+    if ($length -lt 0) { return $empty }
 
-    if ($stamp) {
-        $hit = $script:CopilotAskUserStateCache[$TranscriptPath]
-        if ($null -ne $hit -and [string]$hit.Stamp -eq $stamp) {
-            # A copy, never the stored object: handing the same instance to every
-            # caller would let one of them edit what the next one reads.
-            return $hit.Result.PSObject.Copy()
+    $scan = $script:CopilotAskUserStateCache[$TranscriptPath]
+    if ($null -ne $scan -and $scan.Length -eq $length -and $scan.Ticks -eq $ticks) {
+        # A copy, never the stored object: handing the same instance to every caller
+        # would let one of them edit what the next one reads.
+        return $scan.Result.PSObject.Copy()
+    }
+    # Only growth continues a scan. A transcript that shrank, or changed without
+    # growing, has been replaced, and what was read of the old one says nothing about
+    # the new one. A longer replacement is caught by its first bytes, below.
+    if ($null -ne $scan -and $length -le $scan.Length) { $scan = $null }
+    if ($null -eq $scan) {
+        # The daemon outlives every session it watches, so this would otherwise grow
+        # an entry per transcript forever. Emptying it costs one full read per session
+        # still being watched, which is rare enough not to matter.
+        if ($script:CopilotAskUserStateCache.Count -ge 64) { $script:CopilotAskUserStateCache.Clear() }
+        $scan = New-CopilotAskUserScan
+        if ($From -gt 0 -and $From -lt $length) { $scan.Through = $From }
+    }
+
+    $hinted = [long]$scan.Through -gt 0 -and [long]$scan.Length -lt 0
+    if (-not (Update-CopilotAskUserScan -Path $TranscriptPath -Scan $scan -Through $length)) {
+        # Unreadable is not "no question". Nothing is remembered, so the next pass
+        # reads again from where the last good read got to.
+        $script:CopilotAskUserStateCache.Remove($TranscriptPath)
+        return $empty
+    }
+    if ($hinted -and [string]::IsNullOrWhiteSpace([string]$scan.StartId)) {
+        $scan = New-CopilotAskUserScan
+        if (-not (Update-CopilotAskUserScan -Path $TranscriptPath -Scan $scan -Through $length)) {
+            $script:CopilotAskUserStateCache.Remove($TranscriptPath)
+            return $empty
         }
     }
 
-    # Records what was read, so the next pass over an unchanged transcript is a stat
-    # call. Used for every outcome, including "no question here" - that answer costs
-    # the same full parse to reach as any other.
-    $remember = {
-        param($Answer)
-        if ($stamp) {
-            # The daemon outlives every session it watches, so this would otherwise
-            # grow an entry per transcript forever. Emptying it costs one parse per
-            # session still being watched, which is rare enough not to matter.
-            if ($script:CopilotAskUserStateCache.Count -ge 64) { $script:CopilotAskUserStateCache.Clear() }
-            $script:CopilotAskUserStateCache[$TranscriptPath] = @{ Stamp = $stamp; Result = $Answer.PSObject.Copy() }
-        }
-        $Answer
+    $result = $empty.PSObject.Copy()
+    if (-not [string]::IsNullOrWhiteSpace([string]$scan.StartId)) {
+        $result.Started = $true
+        $result.ToolCallId = [string]$scan.StartId
+        $result.StartedAt = $scan.StartAt
+        $result.Pending = -not $scan.Ended
+        $result.ResultContent = [string]$scan.Content
+        $result.ScanFrom = [long]$scan.StartFrom
     }
+    $scan.Length = $length
+    $scan.Ticks = $ticks
+    $scan.Result = $result
+    $script:CopilotAskUserStateCache[$TranscriptPath] = $scan
+    $result.PSObject.Copy()
+}
 
-    $lines = @(Get-CopilotTranscriptTailLines -Path $TranscriptPath)
-    if ($lines.Count -eq 0) { return $result }
+function New-CopilotAskUserScan {
+    <# Where a transcript's question scan starts: nothing read, nothing asked. #>
+    @{ Length = [long]-1; Ticks = [long]0; Through = [long]0; Head = $null; StartId = ''; StartAt = $null; StartFrom = [long]0; Ended = $false; Content = ''; Result = $null }
+}
 
-    # Walk forward, tracking the latest ask_user start and the set of completed ids.
-    $latestStartId = ''
-    $latestStartAt = $null
-    $completed = @{}
-    $results = @{}
-    foreach ($line in $lines) {
-        if ($line -notmatch '"type":"tool\.execution_(start|complete)"') { continue }
-        try {
-            $o = $line | ConvertFrom-Json
+function Update-CopilotAskUserScan {
+    <#
+        Reads a transcript from where its question scan got to up to Through, and
+        folds every ask_user start, its completion, and anything that ends it into the
+        scan. Returns $false when the file could not be read; the scan is then left
+        where it was, so nothing is skipped by a failed read.
+
+        Only complete lines are taken, so a record still being written is read whole
+        next time instead of being parsed in half and lost.
+    #>
+    param(
+        [Parameter(Mandatory)][string]$Path,
+        [Parameter(Mandatory)][hashtable]$Scan,
+        [Parameter(Mandatory)][long]$Through
+    )
+
+    $stream = $null
+    try {
+        # Shared read/write: the CLI holds the transcript open while it writes.
+        $stream = [IO.File]::Open($Path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::ReadWrite)
+
+        # The first bytes stand for the file. A transcript replaced by a longer one
+        # passes the growth test above, but it starts with a different session.start.
+        $headLength = [int][Math]::Min([long]256, $Through)
+        $head = [byte[]]::new($headLength)
+        $got = 0
+        while ($got -lt $headLength) {
+            $count = $stream.Read($head, $got, $headLength - $got)
+            if ($count -eq 0) { break }
+            $got += $count
         }
-        catch { continue }
-
-        if ($o.type -eq 'tool.execution_start' -and [string]$o.data.toolName -eq 'ask_user') {
-            $latestStartId = [string]$o.data.toolCallId
-            $latestStartAt = $o.timestamp
+        if ($got -lt $headLength) { [Array]::Resize([ref]$head, $got) }
+        $reset = {
+            $fresh = New-CopilotAskUserScan
+            foreach ($key in @($fresh.Keys)) { $Scan[$key] = $fresh[$key] }
         }
-        elseif ($o.type -eq 'tool.execution_complete') {
-            $cid = [string]$o.data.toolCallId
-            if (-not [string]::IsNullOrWhiteSpace($cid)) {
-                $completed[$cid] = $true
+        # Compared over the bytes both reads have, since a transcript first seen with
+        # fewer than 256 bytes in it has a shorter head on record.
+        if ($null -ne $Scan.Head) {
+            $known = [byte[]]$Scan.Head
+            for ($i = 0; $i -lt [Math]::Min($known.Length, $head.Length); $i++) {
+                if ($known[$i] -ne $head[$i]) { & $reset; break }
+            }
+        }
+        $limit = [Math]::Min($Through, $stream.Length)
+        if ($limit -lt [long]$Scan.Through) { & $reset }
+        if ($null -eq $Scan.Head -or ([byte[]]$Scan.Head).Length -lt $head.Length) { $Scan.Head = $head }
+
+        $visit = {
+            param([string]$Line, [long]$At)
+            if ($Line -notmatch '"type":"([^"]+)"') { return }
+            $type = $Matches[1]
+            if ($type -eq 'tool.execution_start') {
+                # Most starts are other tools; the name is in the line before any parse.
+                if (-not $Line.Contains('"ask_user"')) { return }
+                try { $record = $Line | ConvertFrom-Json } catch { return }
+                if ((Get-DecisionEventField -Data (Get-DecisionEventData -Record $record) -Name 'toolName') -ne 'ask_user') { return }
+                $Scan.StartId = Get-DecisionEventField -Data (Get-DecisionEventData -Record $record) -Name 'toolCallId'
+                $Scan.StartAt = if ($record.PSObject.Properties['timestamp']) { $record.timestamp } else { $null }
+                $Scan.StartFrom = $At
+                $Scan.Ended = $false
+                $Scan.Content = ''
+                return
+            }
+            $id = [string]$Scan.StartId
+            if ([string]::IsNullOrWhiteSpace($id)) { return }
+            if ($type -eq 'tool.execution_complete') {
+                # By identity: this question's own id, quoted, before the parse - a
+                # session writes thousands of other completions, many of them large.
+                if (-not $Line.Contains("`"$id`"")) { return }
+                try { $record = $Line | ConvertFrom-Json } catch { return }
+                if ((Get-DecisionEventField -Data (Get-DecisionEventData -Record $record) -Name 'toolCallId') -cne $id) { return }
+                $Scan.Ended = $true
                 # Keep the answer the CLI actually recorded, so an injected form can be
                 # checked against it. An arrow-key selection that lands one option
                 # short is otherwise indistinguishable from a correct one, and answers
@@ -3671,28 +3836,52 @@ function Get-CopilotAskUserState {
                 # A tool call that FAILED carries `error` instead of `result`. Reaching
                 # straight through `.result.content` makes StrictMode throw, and that
                 # terminating error kills the daemon's entire reconcile loop - so one
-                # unrelated failed tool anywhere in the transcript tail leaves every
-                # armed card unanswerable.
-                $content = ''
-                $data = $o.data
-                if ($null -ne $data -and $data.PSObject.Properties.Name -contains 'result') {
-                    $res = $data.result
-                    if ($null -ne $res -and $res.PSObject.Properties.Name -contains 'content') {
-                        $content = [string]$res.content
-                    }
-                }
-                $results[$cid] = $content
+                # unrelated failed tool anywhere in the transcript leaves every armed
+                # card unanswerable.
+                $data = Get-DecisionEventData -Record $record
+                $result = if ($null -ne $data -and $data.PSObject.Properties['result']) { $data.result } else { $null }
+                $Scan.Content = Get-DecisionEventField -Data $result -Name 'content'
+                return
             }
+            if ($Scan.Ended -or ($type -ne 'abort' -and $type -ne 'session.shutdown')) { return }
+            # A subagent's abort ends the subagent, not the question the session asked.
+            try { $record = $Line | ConvertFrom-Json } catch { return }
+            if ((Get-DecisionEventField -Data $record -Name 'type') -cne $type -or $record.PSObject.Properties['agentId']) { return }
+            $Scan.Ended = $true
         }
+        $Scan.Through = Invoke-BridgeTranscriptLineWalk -Stream $stream -From ([long]$Scan.Through) -Limit $limit `
+            -OnLine $visit -Types $script:CopilotAskUserTypes
+        return $true
     }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked'] -or $_.Exception.Data['BridgeTestNetworkBlocked']) { throw }
+        return $false
+    }
+    finally {
+        if ($null -ne $stream) { $stream.Dispose() }
+    }
+}
 
-    if ([string]::IsNullOrWhiteSpace($latestStartId)) { return (& $remember $result) }
-    $result.Started = $true
-    $result.ToolCallId = $latestStartId
-    $result.StartedAt = $latestStartAt
-    $result.Pending = -not $completed.ContainsKey($latestStartId)
-    if ($results.ContainsKey($latestStartId)) { $result.ResultContent = [string]$results[$latestStartId] }
-    & $remember $result
+function Get-DecisionEventData {
+    <# A transcript event's data object, or $null when it has none. #>
+    param([AllowNull()]$Record)
+
+    if ($null -eq $Record -or $Record -isnot [System.Management.Automation.PSCustomObject]) { return $null }
+    if (-not $Record.PSObject.Properties['data']) { return $null }
+    $Record.data
+}
+
+function Get-DecisionEventField {
+    <#
+        A field of a transcript event's data, or '' when there is no such field. Read
+        this way because the daemon runs under StrictMode, where a missing property
+        throws - and the shape of a tool's result is the tool's business.
+    #>
+    param([AllowNull()]$Data, [Parameter(Mandatory)][string]$Name)
+
+    if ($null -eq $Data -or $Data -isnot [System.Management.Automation.PSCustomObject]) { return '' }
+    if (-not $Data.PSObject.Properties[$Name]) { return '' }
+    [string]$Data.$Name
 }
 
 function Test-CopilotAnswerMatchesSelections {
@@ -4119,28 +4308,10 @@ function Measure-BridgeTranscriptLine {
             return $result
         }
 
-        $cursor = [long]$From
-        $chunk = [Math]::Max(65536, $ChunkBytes)
-        while ($cursor -lt $limit) {
-            $snapshot = [Math]::Min($limit, $cursor + [long]$chunk)
-            $append = Read-BridgeTranscriptStream -Stream $stream -Offset $cursor `
-                -SnapshotLength $snapshot -MaxTailBytes $chunk
-            foreach ($line in @($append.Lines)) {
-                if (& $Match $line) { $result.Count++ }
-            }
-            if ([long]$append.Offset -gt $cursor) {
-                $cursor = [long]$append.Offset
-                continue
-            }
-            # No line boundary in the whole window. One record is longer than the
-            # chunk - a tool result that returned a file, say - so the window has to
-            # grow to hold it rather than the walk stalling on it. Doubling is bounded
-            # by the range itself: once the window reaches the remaining bytes the
-            # next pass either finds the newline or there genuinely is not one yet.
-            if ($snapshot -ge $limit) { break }
-            $chunk = $chunk * 2
+        $result.Through = Invoke-BridgeTranscriptLineWalk -Stream $stream -From $From -Limit $limit -ChunkBytes $ChunkBytes -OnLine {
+            param($Line)
+            if (& $Match $Line) { $result.Count++ }
         }
-        $result.Through = $cursor
         $result.Known = $true
     }
     catch {
@@ -4156,17 +4327,78 @@ function Measure-BridgeTranscriptLine {
     $result
 }
 
+function Invoke-BridgeTranscriptLineWalk {
+    <#
+        Hands every complete line in [From, Limit) of a caller-owned transcript stream
+        to OnLine, in order, with the byte offset it starts at, and returns the end of the last complete line - where a
+        later walk resumes, so a record still being written is read whole next time
+        rather than parsed in half and lost.
+
+        A window at a time, so a 268 MB transcript or a multi-megabyte burst is never
+        one buffer: memory is the chunk, or the longest single record when that is
+        longer.
+    #>
+    param(
+        [Parameter(Mandatory)][IO.Stream]$Stream,
+        [Parameter(Mandatory)][long]$From,
+        [Parameter(Mandatory)][long]$Limit,
+        [Parameter(Mandatory)][scriptblock]$OnLine,
+        [int]$ChunkBytes = 4194304,
+        # Only records of these types are decoded and handed over (Read-BridgeTranscriptStream).
+        [AllowNull()][string[]]$Types = $null
+    )
+
+    $cursor = [long]$From
+    $base = [Math]::Max(65536, $ChunkBytes)
+    $chunk = $base
+    while ($cursor -lt $Limit) {
+        $snapshot = [Math]::Min($Limit, $cursor + [long]$chunk)
+        $append = Read-BridgeTranscriptStream -Stream $Stream -Offset $cursor `
+            -SnapshotLength $snapshot -MaxTailBytes $chunk -Types $Types
+        $lines = @($append.Lines)
+        $starts = @($append.Starts)
+        for ($i = 0; $i -lt $lines.Count; $i++) { & $OnLine $lines[$i] $starts[$i] }
+        if ([long]$append.Offset -gt $cursor) {
+            $cursor = [long]$append.Offset
+            $chunk = $base
+            continue
+        }
+        # No line boundary in the whole window. One record is longer than the chunk -
+        # a tool result that returned a file, say - so the window has to grow to hold
+        # it rather than the walk stalling on it. Doubling is bounded by the range
+        # itself: once the window reaches the remaining bytes the next pass either
+        # finds the newline or there genuinely is not one yet.
+        if ($snapshot -ge $Limit) { break }
+        $chunk = $chunk * 2
+    }
+    $cursor
+}
+
 function Read-BridgeTranscriptStream {
     <#
         Frames a bounded append from a caller-owned stream. SnapshotLength is captured
         from that opened handle before the wrapper applies its own shrink policy;
         neither a growing file nor positive short reads extend that byte budget.
+
+        From is where the lines handed back begin. When more than MaxTailBytes was
+        appended it is past Offset, and [Offset, From) is what the cap skipped - which
+        a caller that must not lose anything in it reads with
+        Invoke-BridgeTranscriptLineWalk (#259).
+
+        Types, when given, hands back only the lines that hold a record of one of those
+        types - `"type":"<type>"` anywhere in them, so a superset that does not depend
+        on the order Copilot writes its fields in. It exists for scans of a whole
+        transcript, which is mostly assistant messages, hook records and usage records
+        nobody here reads, and the lines a caller wants are found by .NET rather than
+        by a PowerShell loop over every line. The cursor and From are byte-exact
+        either way.
     #>
     param(
         [Parameter(Mandatory)][AllowNull()][IO.Stream]$Stream,
         [Parameter(Mandatory)][long]$Offset,
         [Parameter(Mandatory)][long]$SnapshotLength,
-        [Parameter(Mandatory)][int]$MaxTailBytes
+        [Parameter(Mandatory)][int]$MaxTailBytes,
+        [AllowNull()][string[]]$Types = $null
     )
 
     if ($null -eq $Stream) { throw [ArgumentNullException]::new('Stream') }
@@ -4177,7 +4409,8 @@ function Read-BridgeTranscriptStream {
     if ($SnapshotLength -lt $Offset) { throw [ArgumentOutOfRangeException]::new('SnapshotLength') }
     if ($MaxTailBytes -le 0) { throw [ArgumentOutOfRangeException]::new('MaxTailBytes') }
 
-    $result = [pscustomobject]@{ Lines = @(); Offset = $Offset }
+    # Starts holds where each of Lines begins, in bytes.
+    $result = [pscustomobject]@{ Lines = @(); Starts = @(); Offset = $Offset; From = $Offset }
     if ($Offset -eq $SnapshotLength) { return $result }
 
     $start = [Math]::Max($Offset, $SnapshotLength - [long]$MaxTailBytes)
@@ -4200,22 +4433,60 @@ function Read-BridgeTranscriptStream {
         $read += $count
     }
 
-    $lines = [Collections.Generic.List[string]]::new()
+    if ($null -ne $Types) {
+        $begin = 0
+        if (-not $aligned) {
+            $begin = [Array]::IndexOf($buffer, [byte]10, 0, $read) + 1
+            if ($begin -le 0) { return $result }
+        }
+        $end = if ($read -gt 0) { [Array]::LastIndexOf($buffer, [byte]10, $read - 1) } else { -1 }
+        if ($end -lt 0) { return $result }
+        $result.Offset = $start + [long]$end + 1
+        $result.From = $start + [long]$begin
+        if ($end -lt $begin) { return $result }
+        # Latin-1 maps each byte to one character, so an index into this text is a byte
+        # offset into the buffer, and an ASCII needle matches exactly the bytes it
+        # would in UTF-8. Only the wanted lines are then decoded properly.
+        $text = [Text.Encoding]::Latin1.GetString($buffer, $begin, $end + 1 - $begin)
+        $wanted = [Collections.Generic.SortedSet[int]]::new()
+        foreach ($type in $Types) {
+            $needle = "`"type`":`"$type`""
+            $at = $text.IndexOf($needle, [StringComparison]::Ordinal)
+            while ($at -ge 0) {
+                [void]$wanted.Add($text.LastIndexOf([char]10, $at) + 1)
+                $at = $text.IndexOf($needle, $text.IndexOf([char]10, $at) + 1, [StringComparison]::Ordinal)
+            }
+        }
+        $result.Lines = @(foreach ($at in $wanted) {
+            [Text.Encoding]::UTF8.GetString($buffer, $begin + $at, $text.IndexOf([char]10, $at) - $at)
+        })
+        $result.Starts = @(foreach ($at in $wanted) { $start + [long]$begin + $at })
+        return $result
+    }
     $lineStart = 0
-    while ($lineStart -lt $read) {
+    $first = [long]-1
+    $starts = [Collections.Generic.List[long]]::new()
+    # Emitted rather than added to a list. PowerShell hands every string passed to a
+    # .NET method to the antimalware scan interface first, and on Windows that scan
+    # costs about 50 ns a character: List.Add was most of the 25 seconds the first
+    # read of a 268 MB transcript took, scanning every byte of it once more.
+    $lines = @(while ($lineStart -lt $read) {
         $lineEnd = [Array]::IndexOf($buffer, [byte]10, $lineStart, $read - $lineStart)
         if ($lineEnd -lt 0) { break }
         if ($aligned) {
+            if ($first -lt 0) { $first = $start + [long]$lineStart }
+            $starts.Add($start + [long]$lineStart)
             # A split UTF-8 sequence becomes replacement text when decoded early.
             # Re-encoding that text corrupted the cursor for half-written answers.
-            $lines.Add([Text.Encoding]::UTF8.GetString($buffer, $lineStart, $lineEnd - $lineStart))
+            [Text.Encoding]::UTF8.GetString($buffer, $lineStart, $lineEnd - $lineStart)
         }
         else { $aligned = $true }
         $lineStart = $lineEnd + 1
         $result.Offset = $start + [long]$lineStart
-    }
-    # With no LF, even a skipped window start is not a committed record boundary.
-    $result.Lines = @($lines)
+    })    # With no LF, even a skipped window start is not a committed record boundary.
+    $result.Lines = $lines
+    $result.Starts = @($starts)
+    $result.From = if ($first -ge 0) { $first } else { [long]$result.Offset }
     $result
 }
 

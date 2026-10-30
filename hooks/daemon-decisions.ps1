@@ -1008,6 +1008,46 @@ function Get-DaemonAskUserState {
     & (Get-DaemonAgent -Kind (Get-DaemonEntryKind -Entry $Session)).AskUserState $Session $Marker
 }
 
+function Get-DaemonCopilotAskUserState {
+    <#
+        Whether a Copilot session's question is still waiting, read from where that
+        question started rather than from a fixed window.
+
+        The answer is paired with its question by tool call id however far back the
+        question was asked (Get-CopilotAskUserState), and only bytes written since the
+        last look are read. What a restart would lose is remembered beside the marker:
+        once the question is seen waiting, its id and the offset its start line begins
+        at are recorded for that decision (Set-CopilotDecisionAskHint) and handed back
+        as From, so a daemon that restarts mid-question reads on from the question
+        rather than through the whole session again (#259). Before that, the place the
+        hook marked when it armed the question serves.
+    #>
+    param([Parameter(Mandatory)]$Session, [AllowNull()]$Marker = $null)
+
+    $sessionId = if ($Session.PSObject.Properties['SessionId']) { [string]$Session.SessionId } else { '' }
+    $decisionId = if ($null -ne $Marker -and $Marker.PSObject.Properties['decisionId']) { [string]$Marker.decisionId } else { '' }
+    $hint = $null
+    if ($sessionId -and $decisionId) { $hint = Get-CopilotDecisionAskHint -SessionId $sessionId -DecisionId $decisionId }
+    $from = [long]0
+    if ($null -ne $hint) { $from = [long]$hint.From }
+    elseif ($null -ne $Marker -and $Marker.PSObject.Properties['askFrom']) {
+        try { $from = [long]$Marker.askFrom } catch { $from = 0 }
+    }
+    $state = Get-CopilotAskUserState -TranscriptPath ([string]$Session.Transcript) -From $from
+
+    if ($sessionId -and $decisionId -and $state.Started -and $state.Pending -and
+        ($null -eq $hint -or $hint.ToolCallId -cne [string]$state.ToolCallId)) {
+        try {
+            Set-CopilotDecisionAskHint -SessionId $sessionId -DecisionId $decisionId `
+                -ToolCallId ([string]$state.ToolCallId) -From ([long]$state.ScanFrom)
+        }
+        catch {
+            if (Test-DecisionMarkedGuardError -ErrorRecord $_) { throw }
+            # Only a shortcut for after a restart; the question is read either way.
+        }
+    }
+    $state
+}
 function Complete-DaemonClaudeAnswer {
     <#
         Makes sure an answer driven into a Claude question was submitted.

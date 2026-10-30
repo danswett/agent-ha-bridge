@@ -57,7 +57,7 @@ $script:DaemonAgents = [ordered]@{
         Activity = { param($Lines, $VerboseMode) Get-ActivityFromEvents -Lines $Lines -VerboseMode $VerboseMode }
         CountCompactions = { param($Path, $From, $Through) Measure-CopilotTranscriptCompaction -Path $Path -From $From -Through $Through }
         IsWorking = { param($SessionId, $Transcript, $Status) Test-CopilotSessionWorking -SessionId $SessionId }
-        AskUserState = { param($Session, $Marker) Get-CopilotAskUserState -TranscriptPath ([string]$Session.Transcript) }
+        AskUserState = { param($Session, $Marker) Get-DaemonCopilotAskUserState -Session $Session -Marker $Marker }
         AdapterInstalled = { Test-Path -LiteralPath (Join-Path (Get-BridgeInstallContext).CopilotHome 'hooks\decision-notifier.json') }
         # Copilot's hooks are written by the main installer, which also removes them
         # whenever Copilot is not among the configured clients - so it is run with

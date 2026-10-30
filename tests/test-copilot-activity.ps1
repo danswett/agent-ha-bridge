@@ -680,6 +680,51 @@ try {
         $script:StatusPublishes[-1].Status -eq 'idle'
     } "$($script:StatusPublishes[-1].Status)"
 
+    # A burst bigger than the tail window, with the command's end in the part the
+    # window skips. Large bursts are routine - a session with background agents wrote
+    # 7.1 MB in one - and a shell that ended inside one stayed listed until the session
+    # ended, with the card waiting on it (#259).
+    $previousCap = $script:DaemonConfig.MaxTailBytes
+    try {
+        $script:DaemonConfig.MaxTailBytes = 4096
+        StepShells -Lines @((New-ShellStarted 'burst259'), (New-BackgroundAgent 'toolu_burst'), '{"type":"assistant.turn_end"}')
+        Test-That 'a command and an agent are outstanding before the burst' {
+            @($shellEntry.BackgroundShells) -contains 'burst259' -and @($shellEntry.BackgroundAgents) -contains 'toolu_burst'
+        } "shells=$(@($shellEntry.BackgroundShells) -join ',') agents=$(@($shellEntry.BackgroundAgents) -join ',')"
+        StepShells -Lines @((New-ShellNotified 'burst259'), (New-AgentFinished 'toolu_burst'),
+            (New-Reply ('z' * 20000)), '{"type":"assistant.turn_end"}', (New-Reply ('z' * 20000)), (New-Reply 'and on'))
+        Test-That 'a command that ended in the part of a burst the window skipped is settled' {
+            @($shellEntry.BackgroundShells).Count -eq 0
+        } "outstanding=$(@($shellEntry.BackgroundShells) -join ',')"
+        Test-That 'and so is an agent' { @($shellEntry.BackgroundAgents).Count -eq 0 } "agents=$(@($shellEntry.BackgroundAgents) -join ',')"
+        Test-That 'and the session reads idle, from a turn end that was skipped too' {
+            $shellEntry.Status -eq 'idle'
+        } "$($shellEntry.Status)"
+        Test-That 'while the card still shows what was said last' { $script:Published['response'] -eq 'and on' } "$($script:Published['response'])"
+    }
+    finally { $script:DaemonConfig.MaxTailBytes = $previousCap }
+
+    # A message can carry a reply, a thought and a model, and the reader keeps each on
+    # its own - so the newest message alone is not enough to keep. A reply followed by
+    # a thought-only message, both in the skipped part, lost the reply.
+    $skipped = Join-Path ([IO.Path]::GetTempPath()) "copilot-skipped-$([guid]::NewGuid().ToString('N')).jsonl"
+    try {
+        [IO.File]::WriteAllText($skipped, ((@(
+            (New-ReplyFrom 'an older reply' 'model-a'), (New-ReplyFrom 'the reply that matters' 'model-b'),
+            (New-Thought 'then a thought'), '{"type":"tool.execution_start","data":{"toolName":"grep"}}'
+        ) -join "`n") + "`n"))
+        $stream = [IO.File]::OpenRead($skipped)
+        try { $landmarks = @(Get-CopilotTranscriptLandmarks -Stream $stream -From 0 -Through $stream.Length) }
+        finally { $stream.Dispose() }
+        $fromLandmarks = Get-ActivityFromEvents -Lines $landmarks -VerboseMode $false
+        Test-That 'a skipped reply followed by a skipped thought is still the reply shown' {
+            $fromLandmarks.Response -eq 'the reply that matters' -and $fromLandmarks.Reasoning -eq 'then a thought'
+        } "response=$($fromLandmarks.Response) reasoning=$($fromLandmarks.Reasoning)"
+        Test-That 'with the model it named' { $fromLandmarks.Model -eq 'model-b' } "$($fromLandmarks.Model)"
+        Test-That 'and only the newest of each is kept' { $landmarks.Count -eq 3 } "$($landmarks.Count) kept"
+    }
+    finally { Remove-Item -LiteralPath $skipped -Force -ErrorAction SilentlyContinue }
+
     StepShells -Lines @((New-ShellStarted 'rel137'), '{"type":"assistant.turn_end"}')
     Test-That 'and a restart finds it waiting, not idle' {
         (Get-DaemonStartupStatus -Session $shellSession -Entry $shellEntry) -eq 'shell'

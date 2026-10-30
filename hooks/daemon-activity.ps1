@@ -240,6 +240,136 @@ function Measure-CopilotTranscriptCompaction {
     }
 }
 
+function Get-CopilotTranscriptLandmarks {
+    <#
+        From a range of a Copilot transcript the tail reader skipped, the records whose
+        loss would leave the card wrong, in the order they were written.
+
+        The tail reader keeps a window rather than everything, so one burst cannot
+        stall the loop, and that is right for what the session is saying. It is wrong
+        for anything the card keeps a running account of. A background shell or agent
+        that ended in the skipped part stayed listed until the session ended, and the
+        card said it was waiting on work that had finished (#259) - and large bursts
+        are routine: a session with background agents wrote 7.1 MB in one on
+        2026-10-30.
+
+        So every byte of the range is read, a window at a time, and two kinds of record
+        are kept:
+
+          - every one that changes a running account: a subagent starting or ending,
+            a shell starting or settling, a CLI attaching. These are a few short lines
+            in megabytes of tool output.
+          - the newest of each thing that only says what the session is doing now - a
+            turn starting or ending, your message, a tool call, and for assistant
+            messages separately the newest reply, the newest thought and the newest
+            model named, since a message may carry any of them and the reader keeps
+            each on its own. Older ones would be overwritten anyway, and each kept
+            record's own place among the others is kept, so the reader below sees the
+            same final state it would have from the whole range.
+
+        Memory is the window and what is kept, never the range. A shell result long
+        enough to matter for that is cut down to its marker lines.
+    #>
+    param(
+        [Parameter(Mandatory)][IO.Stream]$Stream,
+        [Parameter(Mandatory)][long]$From,
+        [Parameter(Mandatory)][long]$Through
+    )
+
+    # Each kept record with how many "newest of" slots still point at it, so a record
+    # that is the newest reply and the newest thought at once is dropped only when it
+    # is neither. A running-account record is held for good. A linked list, so a
+    # record no slot holds any more is gone, not left behind as a tombstone: a burst
+    # of 100,000 messages holds the newest few, not 100,000 empty entries.
+    $kept = [Collections.Generic.LinkedList[object]]::new()
+    $newest = @{}
+    $keep = {
+        param([string]$Text, [string[]]$Slots)
+        $entry = [pscustomobject]@{ Line = $Text; Refs = 0 }
+        if (@($Slots).Count -eq 0) { $entry.Refs = 1 }
+        $node = $kept.AddLast($entry)
+        foreach ($slot in @($Slots)) {
+            if ($newest.ContainsKey($slot)) {
+                $previous = $newest[$slot]
+                $previous.Value.Refs--
+                if ($previous.Value.Refs -le 0) { $kept.Remove($previous) }
+            }
+            $newest[$slot] = $node
+            $entry.Refs++
+        }
+    }
+    $visit = {
+        param([string]$Line)
+        if ($Line -notmatch '"type":"([^"]+)"') { return }
+        $type = $Matches[1]
+        # A subagent's turn is not the session's, so the two are kept apart; the
+        # reader tells them apart properly (Test-BridgeSubagentEvent).
+        $who = if ($Line.Contains('"agentId"')) { 'agent' } else { 'session' }
+        switch ($type) {
+            { $_ -in @('subagent.started', 'subagent.completed', 'session.resume', 'session.start') } {
+                & $keep $Line @()
+                return
+            }
+            'system.notification' {
+                if ($Line.Contains('"shell_completed"')) { & $keep $Line @() }
+                return
+            }
+            'tool.execution_complete' {
+                # The same cheap test the activity reader makes before its parse.
+                if (-not $Line.Contains('shellId') -and -not $Line.Contains('command with id: ')) { return }
+                & $keep (Get-CopilotShellResultMarkers -Line $Line) @()
+                return
+            }
+            'assistant.message' {
+                try { $data = ($Line | ConvertFrom-Json).data } catch { return }
+                $slots = @(foreach ($field in @('content', 'reasoningText', 'model')) {
+                    if (-not [string]::IsNullOrWhiteSpace((Get-BridgeEventField -Data $data -Name $field))) { "$type|$field|$who" }
+                })
+                if ($slots.Count -gt 0) { & $keep $Line $slots }
+                return
+            }
+            { $_ -in @('assistant.turn_start', 'assistant.turn_end', 'user.message', 'tool.execution_start') } {
+                & $keep $Line @("$type|$who")
+                return
+            }
+        }
+    }
+    [void](Invoke-BridgeTranscriptLineWalk -Stream $Stream -From $From -Limit $Through -OnLine $visit -Types @(
+        'subagent.started', 'subagent.completed', 'session.resume', 'session.start', 'system.notification',
+        'tool.execution_complete', 'assistant.turn_start', 'assistant.turn_end', 'user.message',
+        'assistant.message', 'tool.execution_start'))
+    @($kept | ForEach-Object { $_.Line })
+}
+
+function Get-CopilotShellResultMarkers {
+    <#
+        A shell tool result small enough to keep. One under 64 KB is returned as it
+        is. A longer one - a command's whole output - is rewritten to carry only its
+        lines that start with '<', where every shell marker the activity reader looks
+        for sits, and a closing line that keeps the rewrite from ever reading as one
+        of the markers that must be the whole of a result.
+    #>
+    param([Parameter(Mandatory)][string]$Line)
+
+    if ($Line.Length -le 65536) { return $Line }
+    try {
+        $parsed = $Line | ConvertFrom-Json
+        $data = if ($parsed.PSObject.Properties['data']) { $parsed.data } else { $null }
+        $resultData = if ($null -ne $data -and $data.PSObject.Properties['result']) { $data.result } else { $null }
+        $content = Get-BridgeEventField -Data $resultData -Name 'content'
+        $markers = @($content -split "`n" | Where-Object { $_.StartsWith('<') })
+        $markers += '(output omitted by agent-ha-bridge)'
+        ConvertTo-Json -Compress -Depth 4 -InputObject @{
+            type = 'tool.execution_complete'
+            data = @{
+                toolCallId = Get-BridgeEventField -Data $data -Name 'toolCallId'
+                result = @{ content = ($markers -join "`n") }
+            }
+        }
+    }
+    catch { '{"type":"tool.execution_complete","data":{}}' }
+}
+
 function Read-TranscriptAppend {
     <#
         Returns transcript lines appended since $Offset, plus the new offset.
@@ -278,7 +408,14 @@ function Read-TranscriptAppend {
         # The shared framer withholds them using byte boundaries, not decoded lengths.
         $append = Read-BridgeTranscriptStream -Stream $stream -Offset $Offset `
             -SnapshotLength $length -MaxTailBytes $script:DaemonConfig.MaxTailBytes
-        $result.Lines = @($append.Lines | Where-Object { $_.Trim().StartsWith('{') })
+        $lines = @($append.Lines)
+        # More arrived than the window holds, and the framer skipped the start of it.
+        # What in there ended a shell or an agent, or said what the session was doing,
+        # is read back out of it rather than lost with it (#259).
+        if ([long]$append.From -gt $Offset) {
+            $lines = @(Get-CopilotTranscriptLandmarks -Stream $stream -From $Offset -Through ([long]$append.From)) + $lines
+        }
+        $result.Lines = @($lines | Where-Object { $_.Trim().StartsWith('{') })
         $result.Offset = $append.Offset
     }
     catch {

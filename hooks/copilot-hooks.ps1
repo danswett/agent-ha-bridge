@@ -141,9 +141,28 @@ function Invoke-CopilotAskUserHook {
     # card on completion. It also carries the combo mapping so a multi-field choice can
     # be reported field by field. Persist before even the reachability probe, so an
     # outage leaves the daemon a request to re-arm.
+    #
+    # Copilot writes the question's tool.execution_start just before it runs this
+    # hook, so the transcript's length now is a few bytes past it. The marker records
+    # a point safely before that, and the daemon looks for the question - and pairs
+    # its answer with it by id - from there rather than through the whole session: a
+    # question in a 268 MB transcript is then a read of a few megabytes, not all of
+    # it (#259). A stat, never a read, so the hook does not wait on it; and only a
+    # starting point, since the daemon reads from the beginning if no question is
+    # found after it.
+    $askFrom = [long]0
+    try {
+        $transcriptPath = [string](& $field $HookEvent 'transcriptPath')
+        if ([string]::IsNullOrWhiteSpace($transcriptPath)) {
+            $transcriptPath = Join-Path (Join-Path $script:DecisionBridgeConfig.SessionStateRoot $sessionId) 'events.jsonl'
+        }
+        $transcriptInfo = [IO.FileInfo]::new($transcriptPath)
+        if ($transcriptInfo.Exists) { $askFrom = [Math]::Max([long]0, $transcriptInfo.Length - $script:CopilotAskFromMargin) }
+    }
+    catch { $askFrom = 0 }
     Write-CopilotDecisionMarker -SessionId $sessionId -DecisionId $decisionId `
         -Question $question -Choices $choices -Combos $combos -Fields $fields `
-        -TerminalOnly:$terminalOnly -Mode $mode | Out-Null
+        -TerminalOnly:$terminalOnly -Mode $mode -AskFrom $askFrom | Out-Null
 
     # This hook runs before the native prompt appears; it must never wait on the
     # network. Enter-BridgeAdapterSession probes, sets the deadline and returns headers
