@@ -192,6 +192,8 @@ $script:DecisionBridgeConfig = @{
     ResponsePlaceholder = 'Select an answer...'
     CancelOption = 'Cancel request'
     LogFile = (Get-BridgeRuntimePath 'agent-decision-bridge.log')
+    # Past this the log is moved aside to .1 and started again (Write-DecisionBridgeLog).
+    LogMaxBytes = 10485760
     HttpRetryCount = 4
     HttpRetryInitialDelayMs = 400
     # How long the ask_user wait tolerates an unreachable Home Assistant before it
@@ -656,13 +658,33 @@ function Invoke-DecisionHttpRequest {
 }
 
 function Write-DecisionBridgeLog {
+    <#
+        Appends a line to the hooks' and launcher's log, keeping it bounded.
+
+        Once the log passes LogMaxBytes it becomes agent-decision-bridge.log.1, replacing
+        the previous one, and a new log starts - the way the native hook's log rolls.
+        Nothing bounded it before, and one repeated warning took it to 506 MB in a day
+        (#265). Every hook and the daemon write here, so two of them may both see it
+        over the limit; the second move simply fails, or rolls a file that has barely
+        started, and either way the line is still written.
+    #>
     param(
         [Parameter(Mandatory)]
         [string]$Message
     )
 
     $timestamp = [DateTimeOffset]::Now.ToString('o')
-    Add-Content -LiteralPath $script:DecisionBridgeConfig.LogFile -Value "$timestamp $Message"
+    $path = $script:DecisionBridgeConfig.LogFile
+    try {
+        $info = [IO.FileInfo]::new($path)
+        if ($info.Exists -and $info.Length -gt [long]$script:DecisionBridgeConfig.LogMaxBytes) {
+            [IO.File]::Move($path, "$path.1", $true)
+        }
+    }
+    catch {
+        if ($_.Exception.Data['BridgeTestWriteBlocked']) { throw }
+    }
+    Add-Content -LiteralPath $path -Value "$timestamp $Message"
 }
 
 function Split-CardText {
