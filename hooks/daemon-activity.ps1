@@ -278,23 +278,25 @@ function Get-CopilotTranscriptLandmarks {
 
     # Each kept record with how many "newest of" slots still point at it, so a record
     # that is the newest reply and the newest thought at once is dropped only when it
-    # is neither. A running-account record is held for good.
-    $kept = [Collections.Generic.List[object]]::new()
+    # is neither. A running-account record is held for good. A linked list, so a
+    # record no slot holds any more is gone, not left behind as a tombstone: a burst
+    # of 100,000 messages holds the newest few, not 100,000 empty entries.
+    $kept = [Collections.Generic.LinkedList[object]]::new()
     $newest = @{}
     $keep = {
         param([string]$Text, [string[]]$Slots)
         $entry = [pscustomobject]@{ Line = $Text; Refs = 0 }
         if (@($Slots).Count -eq 0) { $entry.Refs = 1 }
+        $node = $kept.AddLast($entry)
         foreach ($slot in @($Slots)) {
             if ($newest.ContainsKey($slot)) {
-                $previous = $kept[$newest[$slot]]
-                $previous.Refs--
-                if ($previous.Refs -le 0) { $previous.Line = $null }
+                $previous = $newest[$slot]
+                $previous.Value.Refs--
+                if ($previous.Value.Refs -le 0) { $kept.Remove($previous) }
             }
-            $newest[$slot] = $kept.Count
+            $newest[$slot] = $node
             $entry.Refs++
         }
-        $kept.Add($entry)
     }
     $visit = {
         param([string]$Line)
@@ -336,7 +338,7 @@ function Get-CopilotTranscriptLandmarks {
         'subagent.started', 'subagent.completed', 'session.resume', 'session.start', 'system.notification',
         'tool.execution_complete', 'assistant.turn_start', 'assistant.turn_end', 'user.message',
         'assistant.message', 'tool.execution_start'))
-    @($kept | Where-Object { $null -ne $_.Line } | ForEach-Object { $_.Line })
+    @($kept | ForEach-Object { $_.Line })
 }
 
 function Get-CopilotShellResultMarkers {
