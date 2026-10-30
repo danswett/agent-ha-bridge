@@ -1199,6 +1199,8 @@ function Start-BridgeDaemon {
 # functions without starting the daemon; the supervisor never sets it, so a real
 # launch is unaffected.
 if (-not $env:AGENT_BRIDGE_DAEMON_NORUN) {
+    # A daemon's warnings are logged, not written to the console it does not have.
+    $script:BridgeLaunchWarningsToLog = $true
     $mutex = [Threading.Mutex]::new($false, $script:DaemonConfig.MutexName)
     $owned = $false
     try {

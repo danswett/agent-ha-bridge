@@ -2180,6 +2180,8 @@ mid-write. Real arguments always win over recovered ones.
 Logs are under the recorded installation's `runtime` directory:
 `agent-decision-bridge.log` (hooks), `agent-bridge-daemon.log`,
 `agent-bridge-supervisor.log`, and, when enabled, `agent-bridge-devbox-keepawake.log`.
+`agent-decision-bridge.log` rolls over to `agent-decision-bridge.log.1` at 10 MB, and the daemon
+logs a repeated launch warning at most once an hour.
 Pre-metadata installs retain their legacy temporary paths. Hook config changes reach a running CLI only
 after `/restart`; the daemon is shared and picks up new sessions on its own reconcile.
 

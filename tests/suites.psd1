@@ -36,6 +36,7 @@
         'tests\test-install-http-guard.ps1'
         'tests\test-install-workspaces.ps1'
         'tests\test-launch-permissions.ps1'
+        'tests\test-launch-warnings.ps1'
         'tests\test-launchers.ps1'
         'tests\test-layout-migration.ps1'
         'tests\test-multi-machine.ps1'

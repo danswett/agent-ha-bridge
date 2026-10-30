@@ -23,16 +23,49 @@
     Nothing here needs Home Assistant, so it is straightforward to test offline.
 #>
 
+# Set by the daemon when it starts for real: its warnings go to the log, never to a
+# console (see Write-BridgeLaunchWarning).
+$script:BridgeLaunchWarningsToLog = $false
+# When each warning the daemon logged was last written, keyed by its text.
+$script:BridgeLaunchWarningLogged = @{}
+$script:BridgeLaunchWarningInterval = [TimeSpan]::FromHours(1)
+
 function Write-BridgeLaunchWarning {
+    <#
+        Says something went wrong without refusing anything. Warnings must not turn
+        safe cleanup failures into refused launches.
+
+        The daemon logs them instead of writing them to a console. It has no console
+        anyone reads, and after attaching to sessions' consoles to type into them its
+        own handle can be invalid, so every Write-Warning there threw first - "the
+        handle is invalid ... while getting the console mode" - and was logged with that
+        appended.
+
+        And it logs each one at most once an hour. The daemon asks the same questions
+        every pass, so a warning about something that stays wrong comes back every
+        pass: on 2026-10-30 one folder whose approval could not be worked out wrote the
+        same line about once a second, 20,031 lines in a row, and took the log to
+        506 MB with everything else in it buried (#265). The first line says
+        everything the thousandth does.
+    #>
     param([Parameter(Mandatory)][string]$Message)
 
+    if ($script:BridgeLaunchWarningsToLog) {
+        $now = [DateTimeOffset]::Now
+        $last = $script:BridgeLaunchWarningLogged[$Message]
+        if ($null -ne $last -and ($now - [DateTimeOffset]$last) -lt $script:BridgeLaunchWarningInterval) { return }
+        # Bounded: a warning naming a path can be as varied as the paths are.
+        if ($script:BridgeLaunchWarningLogged.Count -ge 256) { $script:BridgeLaunchWarningLogged.Clear() }
+        $script:BridgeLaunchWarningLogged[$Message] = $now
+        try { Write-DecisionBridgeLog -Message "launch warning: $Message" } catch { }
+        return
+    }
     try {
         Microsoft.PowerShell.Utility\Write-Warning $Message
     }
     catch {
-        # A long-running Windows daemon can survive with a poisoned console handle
-        # after console attach/detach work. Warnings must not turn safe cleanup
-        # failures into refused launches.
+        # A process can survive with a poisoned console handle after console
+        # attach/detach work, and a warning is not worth failing over.
         try { Write-DecisionBridgeLog -Message "launch warning: $Message (warning host failed: $($_.Exception.Message))" } catch { }
     }
 }
@@ -314,8 +347,24 @@ function Get-BridgeWorkspaceChoice {
     Get-BridgeWorkspaceChoices | Where-Object { $_.Label -eq $Label } | Select-Object -First 1
 }
 
+function Get-BridgeWorkspaceEntry {
+    <# One directory on a workspace path, as the file system reports it. #>
+    param([Parameter(Mandatory)][string]$Path)
+    [System.IO.DirectoryInfo]::new($Path)
+}
+
 function Resolve-BridgeWorkspaceDirectory {
-    <# GetFullPath alone does not resolve a junction or a symlink in an ancestor. #>
+    <#
+        GetFullPath alone does not resolve a junction or a symlink in an ancestor.
+
+        Only those are links. Plenty of ordinary folders are reparse points too:
+        OneDrive's Files On-Demand marks its whole tree, from the account folder down,
+        and deduplicated or other filter-driver folders carry tags of their own. They
+        have no target and are where they appear to be, so they are taken as they
+        are. Asking .NET to resolve one returns nothing, which used to read as a link
+        that could not be resolved - so every folder under OneDrive was refused, and
+        the daemon said so on every pass (#265).
+    #>
     param([Parameter(Mandatory)][string]$Path)
 
     if (-not [System.IO.Path]::IsPathFullyQualified($Path)) { throw 'A workspace directory must be absolute.' }
@@ -323,9 +372,10 @@ function Resolve-BridgeWorkspaceDirectory {
     $root = [System.IO.Path]::GetPathRoot($full)
     $resolved = $root
     foreach ($part in ($full.Substring($root.Length) -split '[\\/]' | Where-Object { $_ })) {
-        $entry = [System.IO.DirectoryInfo]::new((Join-Path $resolved $part))
+        $entry = Get-BridgeWorkspaceEntry -Path (Join-Path $resolved $part)
         if (-not $entry.Exists) { throw "Workspace directory is missing or unreadable: $Path" }
-        if ($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) {
+        # LinkTarget is set for a symbolic link or a junction and for nothing else.
+        if (($entry.Attributes -band [System.IO.FileAttributes]::ReparsePoint) -and $null -ne $entry.LinkTarget) {
             $entry = $entry.ResolveLinkTarget($true)
             if ($null -eq $entry -or -not $entry.Exists -or $entry -isnot [System.IO.DirectoryInfo]) {
                 throw "Workspace directory link could not be resolved: $Path"
