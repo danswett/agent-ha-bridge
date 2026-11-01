@@ -3170,6 +3170,7 @@ async function checkOtherRow() {
     }
     select() {}
     setSelectionRange() {}
+    focus(options) { this.focusedWith = options || {}; }
     // Tag names only, and never into another shadow root - as in a browser.
     querySelectorAll(tag) {
       const found = [];
@@ -3356,11 +3357,18 @@ async function checkOtherRow() {
     return true;
   };
   box.navigator = {};
+  // Focus as a browser reports it: the outermost shadow host, with the button that
+  // really has it several shadow roots further in.
+  box.document.activeElement = { shadowRoot: { activeElement: { shadowRoot: { activeElement: last } } } };
+  last.focusedWith = undefined;
   await last.click();
   check('without the Clipboard API the text is copied through a selected textarea',
     commands.length === 1 && commands[0].name === 'copy' && commands[0].text === COMMAND,
     JSON.stringify(commands.map((c) => ({ name: c.name, len: c.text && c.text.length }))));
   check('which is taken away again afterwards', box.document.body.childNodes.length === 0);
+  check('handing focus back to the Copy button, without scrolling the page to it',
+    !!last.focusedWith && last.focusedWith.preventScroll === true, JSON.stringify(last.focusedWith));
+  box.document.activeElement = undefined;
   check('and still says Copied', last.textContent === 'Copied', last.textContent);
 
   // A companion-app WebView can have the API and refuse it.

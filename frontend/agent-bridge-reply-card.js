@@ -1137,9 +1137,20 @@ function codeBlockText(pre) {
  * it even when it is there. A selected textarea and execCommand('copy') works in
  * both; it is deprecated, but nothing has replaced it for an insecure page.
  */
+// The element that really has focus. document.activeElement stops at the outermost
+// shadow host, and the Copy button sits several shadow roots below it.
+function deepActiveElement(doc) {
+  let el = doc.activeElement || null;
+  while (el && el.shadowRoot && el.shadowRoot.activeElement) { el = el.shadowRoot.activeElement; }
+  return el;
+}
+
 function copyWithTextarea(text) {
   const doc = typeof document !== 'undefined' ? document : null;
   if (!doc || !doc.body || typeof doc.execCommand !== 'function') { return false; }
+  // Selecting the textarea takes focus, and removing it leaves focus on the page, so
+  // a keyboard user who pressed Copy would lose their place in the card.
+  const focused = deepActiveElement(doc);
   const area = doc.createElement('textarea');
   area.value = text;
   // Read-only keeps a phone's keyboard down; 12pt stops iOS zooming in on focus.
@@ -1158,6 +1169,9 @@ function copyWithTextarea(text) {
     copied = false;
   } finally {
     doc.body.removeChild(area);
+    if (focused && focused !== doc.body && typeof focused.focus === 'function') {
+      try { focused.focus({ preventScroll: true }); } catch (err) { /* gone; nothing to return to */ }
+    }
   }
   return copied;
 }
