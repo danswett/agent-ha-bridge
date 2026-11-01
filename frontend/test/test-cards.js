@@ -3085,6 +3085,297 @@ async function checkOtherRow() {
     connection.subscriptions.length === 1, String(connection.subscriptions.length));
 
   console.log('');
+  console.log('--- a code block in a reply wraps, and copies whole ---');
+  /*
+   * A reply is often a command to paste elsewhere - a 1000-character
+   * `pwsh -EncodedCommand <base64>` - and on a phone it ran off the side of the card,
+   * where nobody could select all of it. Each block now carries a Copy button.
+   *
+   * The FakeElement DOM cannot show any of this, because the rules are about where
+   * things end up: ha-markdown renders later, inside a shadow root of its own, and
+   * replaces its tree when the content changes. So this section runs the real card
+   * against a small tree DOM with a stand-in ha-markdown that does those three things,
+   * and a MutationObserver that is actually told about mutations.
+   */
+  const { FakeClassList } = require('./card-harness');
+  const codeLoad = require('./card-harness').loadCards();
+  const box = codeLoad.sandbox;
+
+  const observers = [];
+  let observerCalls = 0;
+  const within = (root, node) => {
+    for (let n = node; n; n = n.parentNode) { if (n === root) { return true; } }
+    return false;
+  };
+  // Capped, so a card that reacts to its own buttons fails the checks below rather
+  // than spinning this process for ever.
+  const OBSERVER_CAP = 200;
+  const mutated = (node) => {
+    for (const { mo, root } of observers) {
+      if (!within(root, node) || mo.pending || observerCalls >= OBSERVER_CAP) { continue; }
+      mo.pending = true;
+      Promise.resolve().then(() => { mo.pending = false; observerCalls++; mo.cb([], mo); });
+    }
+  };
+  class TreeText {
+    constructor(text) { this.textContent = String(text); this.parentNode = null; }
+  }
+  class TreeEl {
+    constructor(tag) {
+      this.tagName = String(tag).toUpperCase();
+      this.childNodes = [];
+      this.parentNode = null;
+      this.classList = new FakeClassList();
+      this.attributes = {};
+      this.style = {};
+      this._listeners = {};
+    }
+    get firstChild() { return this.childNodes[0] || null; }
+    get firstElementChild() { return this.childNodes.find((n) => n instanceof TreeEl) || null; }
+    get textContent() { return this.childNodes.map((n) => n.textContent).join(''); }
+    set textContent(value) {
+      for (const n of this.childNodes) { n.parentNode = null; }
+      this.childNodes = String(value) === '' ? [] : [new TreeText(value)];
+      for (const n of this.childNodes) { n.parentNode = this; }
+      mutated(this);
+    }
+    set className(value) {
+      this.classList = new FakeClassList();
+      for (const c of String(value).split(/\s+/).filter(Boolean)) { this.classList.add(c); }
+    }
+    insertBefore(node, ref) {
+      if (node.parentNode) { node.parentNode.removeChild(node); }
+      const at = ref ? this.childNodes.indexOf(ref) : -1;
+      if (at < 0) { this.childNodes.push(node); } else { this.childNodes.splice(at, 0, node); }
+      node.parentNode = this;
+      mutated(this);
+      return node;
+    }
+    appendChild(node) { return this.insertBefore(node, null); }
+    append(...nodes) {
+      for (const n of nodes) { this.appendChild(typeof n === 'string' ? new TreeText(n) : n); }
+    }
+    removeChild(node) {
+      this.childNodes.splice(this.childNodes.indexOf(node), 1);
+      node.parentNode = null;
+      mutated(this);
+      return node;
+    }
+    setAttribute(name, value) { this.attributes[name] = String(value); }
+    getAttribute(name) { return name in this.attributes ? this.attributes[name] : null; }
+    addEventListener(type, fn) { (this._listeners[type] = this._listeners[type] || []).push(fn); }
+    async click() {
+      const event = { preventDefault() {}, stopPropagation() {} };
+      await Promise.all((this._listeners.click || []).map((fn) => fn(event)));
+    }
+    select() {}
+    setSelectionRange() {}
+    // Tag names only, and never into another shadow root - as in a browser.
+    querySelectorAll(tag) {
+      const found = [];
+      const walk = (el) => {
+        for (const n of el.childNodes) {
+          if (!(n instanceof TreeEl)) { continue; }
+          if (n.tagName === tag.toUpperCase()) { found.push(n); }
+          walk(n);
+        }
+      };
+      walk(this);
+      return found;
+    }
+  }
+  const all = (el, tag) => el.querySelectorAll(tag);
+
+  // What marked does with the two shapes that matter here: a fenced block is
+  // <pre><code>, ending in one newline, and backticks inside a line are <code> alone.
+  function renderMarkdownLike(into, text) {
+    text.split(/```[^\n]*\n([\s\S]*?)```/).forEach((part, i) => {
+      if (i % 2) {
+        const pre = new TreeEl('pre');
+        const code = new TreeEl('code');
+        code.appendChild(new TreeText(part.endsWith('\n') ? part : `${part}\n`));
+        pre.appendChild(code);
+        into.appendChild(pre);
+      } else if (part.trim()) {
+        const p = new TreeEl('p');
+        part.split(/`([^`]+)`/).forEach((bit, j) => {
+          if (j % 2) { const c = new TreeEl('code'); c.appendChild(new TreeText(bit)); p.appendChild(c); }
+          else { p.appendChild(new TreeText(bit)); }
+        });
+        into.appendChild(p);
+      }
+    });
+  }
+
+  // <ha-markdown> > #shadow-root > <ha-markdown-element> > the render, which arrives
+  // a turn later (marked runs in a worker) and replaces the whole tree when, and only
+  // when, the content is different - Lit's unsafeHTML leaves an unchanged one alone.
+  const markdowns = [];
+  function fakeHaMarkdown() {
+    const md = new TreeEl('ha-markdown');
+    md.shadowRoot = new TreeEl('#shadow-root');
+    const inner = new TreeEl('ha-markdown-element');
+    md.shadowRoot.appendChild(inner);
+    let content;
+    let drawn;
+    md.updateComplete = Promise.resolve(true);
+    Object.defineProperty(md, 'content', {
+      get() { return content; },
+      set(value) {
+        content = value;
+        md.updateComplete = new Promise((resolve) => setImmediate(() => {
+          if (drawn !== content) {
+            drawn = content;
+            for (const n of inner.childNodes.slice()) { inner.removeChild(n); }
+            renderMarkdownLike(inner, String(content));
+          }
+          resolve(true);
+        }));
+      },
+    });
+    markdowns.push(md);
+    return md;
+  }
+
+  box.customElements = { get: (name) => (name === 'ha-markdown' ? class {} : undefined),
+    define: () => {}, whenDefined: () => new Promise(() => {}) };
+  box.document.createElement = (tag) => (tag === 'ha-markdown' ? fakeHaMarkdown() : new TreeEl(tag));
+  box.document.body = new TreeEl('body');
+  box.MutationObserver = class {
+    constructor(cb) { this.cb = cb; this.pending = false; }
+    observe(root) { observers.push({ mo: this, root }); }
+  };
+  const settle = async () => { for (let i = 0; i < 5; i++) { await new Promise((r) => setImmediate(r)); } };
+
+  const COMMAND = `pwsh -NoProfile -EncodedCommand ${'SQBuAHYAbwBrAGUALQBXAGUAYgBSAGUAcQB1AGUAcwB0AA'.repeat(22)}`;
+  const codeCard = Object.create(codeLoad.AgentBridgeActivityCard.prototype);
+  codeCard._last = {};
+  codeCard._els = {};
+  for (const key of ['title', 'meta', 'question', 'q', 'response', 'reasoning', 'r', 'history', 'list',
+    'working', 'glyph', 'verb', 'elapsed']) {
+    codeCard._els[key] = new TreeEl('div');
+  }
+  codeCard._config = { name: 'copy', machine: 'DESK', status: S_STATUS, activity: S_ACTIVITY, decision: S_DECISION };
+  const showReply = async (response) => {
+    codeCard._hass = { states: {
+      [S_STATUS]: { state: 'idle', attributes: {} },
+      [S_ACTIVITY]: { state: '', attributes: { response } },
+      [S_DECISION]: { state: 'Idle', attributes: {} },
+    } };
+    codeCard._render();
+    await settle();
+  };
+
+  await showReply(`Run this on the server:\n\n\`\`\`pwsh\n${COMMAND}\n\`\`\`\n\nThen tell me what it says.`);
+  const md = codeCard._els.response.firstElementChild;
+  const shadow = md && md.shadowRoot;
+  const pres = shadow ? all(shadow, 'pre') : [];
+  const buttonsIn = (pre) => pre.childNodes.filter((n) => n instanceof TreeEl && n.tagName === 'BUTTON');
+  check('the reply is rendered by ha-markdown, into its own shadow root',
+    md && md.tagName === 'HA-MARKDOWN' && pres.length === 1, String(pres.length));
+  check('its fenced block gets exactly one button',
+    pres.length === 1 && buttonsIn(pres[0]).length === 1, pres.length ? String(buttonsIn(pres[0]).length) : 'no pre');
+  const copyButton = pres.length ? buttonsIn(pres[0])[0] : null;
+  check('which says Copy, and is named for a screen reader as copying code',
+    copyButton && copyButton.textContent === 'Copy' && copyButton.getAttribute('aria-label') === 'Copy code'
+    && copyButton.type === 'button');
+  check('and makes room for itself rather than sitting on the first line of code',
+    pres.length === 1 && pres[0].classList.contains('agent-bridge-copyable')
+    && /pre\.agent-bridge-copyable \{ padding-top: 48px; \}/.test(codeLoad.source)
+    && /min-height: 44px/.test(codeLoad.source));
+  const injected = shadow ? shadow.firstChild : null;
+  check('the wrapping rules go into ha-markdown\'s shadow root, which no card style reaches',
+    injected && injected.tagName === 'STYLE'
+    && /ha-markdown-element pre \{[^}]*white-space: pre-wrap;[^}]*overflow-wrap: anywhere;/.test(injected.textContent),
+    injected ? injected.textContent.slice(0, 160) : 'nothing injected');
+  check('and are put ahead of the render, where a re-render never clears them',
+    shadow && shadow.childNodes.indexOf(injected) === 0
+    && all(shadow, 'style').length === 1);
+
+  // The same content again, as the card does when ha-markdown is redefined: Lit leaves
+  // the tree alone, and the button already in it must not gain a twin.
+  const callsBefore = observerCalls;
+  codeCard._last = {};
+  codeCard._render();
+  await settle();
+  check('rendering the same reply again leaves it with one button, not two',
+    all(shadow, 'pre').length === 1 && buttonsIn(all(shadow, 'pre')[0]).length === 1);
+  check('and the same shadow root has still only one stylesheet',
+    all(shadow, 'style').length === 1);
+  const callsAfter = observerCalls;
+  await settle();
+  check('the button going in does not set off a loop of further changes',
+    observerCalls < OBSERVER_CAP && observerCalls === callsAfter && callsAfter - callsBefore <= 2,
+    `${callsBefore} -> ${callsAfter} -> ${observerCalls}`);
+
+  // New content: the tree is replaced wholesale, button and all.
+  await showReply(`Or this one:\n\n\`\`\`\n${COMMAND} -Verbose\n\`\`\``);
+  const fresh = all(shadow, 'pre');
+  check('a new reply\'s block gets its own button, exactly one',
+    fresh.length === 1 && buttonsIn(fresh[0]).length === 1 && codeBlockOf(fresh[0]).includes('-Verbose'),
+    String(fresh.length));
+  check('without a second ha-markdown or a second observer on it',
+    markdowns.length === 1 && observers.filter((o) => o.root === shadow).length === 1,
+    `${markdowns.length} / ${observers.filter((o) => o.root === shadow).length}`);
+  function codeBlockOf(pre) { return all(pre, 'code').map((c) => c.textContent).join(''); }
+
+  await showReply('Run `Get-Date` and then `whoami` to check.');
+  check('inline code gets no button',
+    all(shadow, 'pre').length === 0 && all(shadow, 'code').length === 2 && all(shadow, 'button').length === 0,
+    `${all(shadow, 'pre').length} pre / ${all(shadow, 'code').length} code / ${all(shadow, 'button').length} button`);
+
+  await showReply(`Two:\n\n\`\`\`\nfirst block\n\`\`\`\n\nand\n\n\`\`\`sh\n${COMMAND}\n\`\`\``);
+  const pair = all(shadow, 'pre');
+  check('each of several blocks gets a button of its own',
+    pair.length === 2 && pair.every((p) => buttonsIn(p).length === 1));
+
+  // Copying, through the Clipboard API where there is one.
+  let written = [];
+  box.navigator = { clipboard: { writeText: async (text) => { written.push(text); } } };
+  const timerMark = box.timers.length;
+  const last = buttonsIn(pair[1])[0];
+  await last.click();
+  check('Copy hands over the block\'s exact text - no button label, no closing newline',
+    written.length === 1 && written[0] === COMMAND, JSON.stringify(written.map((w) => w.slice(0, 40))));
+  check('and says Copied', last.textContent === 'Copied', last.textContent);
+  const feedback = box.timers.slice(timerMark).filter(Boolean);
+  check('for a moment and a half', feedback.length === 1 && feedback[0].ms === 1500,
+    feedback.map((t) => t.ms).join(','));
+  feedback.forEach((t) => t.fn());
+  check('after which it reads Copy again', last.textContent === 'Copy'
+    && last.getAttribute('aria-label') === 'Copy code', last.textContent);
+  written = [];
+  await buttonsIn(pair[0])[0].click();
+  check('and the other block copies its own text', written[0] === 'first block', JSON.stringify(written));
+
+  // Plain http on the LAN has no navigator.clipboard at all.
+  const commands = [];
+  box.document.execCommand = (name) => {
+    const area = box.document.body.childNodes.find((n) => n.tagName === 'TEXTAREA');
+    commands.push({ name, text: area ? area.value : undefined });
+    return true;
+  };
+  box.navigator = {};
+  await last.click();
+  check('without the Clipboard API the text is copied through a selected textarea',
+    commands.length === 1 && commands[0].name === 'copy' && commands[0].text === COMMAND,
+    JSON.stringify(commands.map((c) => ({ name: c.name, len: c.text && c.text.length }))));
+  check('which is taken away again afterwards', box.document.body.childNodes.length === 0);
+  check('and still says Copied', last.textContent === 'Copied', last.textContent);
+
+  // A companion-app WebView can have the API and refuse it.
+  box.navigator = { clipboard: { writeText: async () => { throw new Error('NotAllowedError'); } } };
+  await last.click();
+  check('a Clipboard API that refuses falls back to the textarea too',
+    commands.length === 2 && commands[1].text === COMMAND && last.textContent === 'Copied', last.textContent);
+
+  box.navigator = undefined;
+  box.document.execCommand = () => false;
+  await last.click();
+  check('and when nothing will copy, it says so rather than claiming it did',
+    last.textContent === 'Copy failed', last.textContent);
+
+  console.log('');
   if (failures) {
     console.log(`${failures} check(s) failed`);
     process.exit(1);
