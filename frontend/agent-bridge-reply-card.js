@@ -81,8 +81,12 @@
  * dashboard its lovelace_updated subscription - so a session that started while it
  * was away never appeared, and a hard reload was the only way to see it. The cards
  * now hold a subscription of their own; see CONFIG_WATCH.
+ *
+ * 1.42.0 wraps the code blocks in a reply and gives each a Copy button, so a long
+ * command can be read and copied whole on a phone; see codeBlockCss. The dashboard
+ * config is unchanged, so the generator needs no gate for it.
  */
-const CARD_VERSION = '1.41.0';
+const CARD_VERSION = '1.42.0';
 
 /*
  * How large a non-image attachment may be.
@@ -1067,6 +1071,189 @@ class AgentBridgeReplyCard extends HTMLElement {
 }
 
 /*
+ * Code blocks in a rendered reply: wrapped, and each with a Copy button.
+ *
+ * A reply is often a command to paste somewhere else - a 1000-character
+ * `pwsh -EncodedCommand <base64>`, say. Home Assistant draws a code block as one
+ * horizontally scrolling line, so on a phone it ran off the side of the card and
+ * selecting all of it by hand was close to impossible. Blocks now wrap, and carry a
+ * button that copies the block's own text, which wrapping does not touch.
+ *
+ * Neither can be done with the card's own styles or markup. ha-markdown renders into
+ * a shadow root of its own - `<ha-markdown>` > #shadow-root > `<ha-markdown-element>`
+ * > `<pre>` - so a rule in this card never reaches a `pre`, and the render happens
+ * later, off the main thread, so there is nothing to decorate when the content is
+ * set. A stylesheet goes into that shadow root, and the buttons are added whenever
+ * its tree changes.
+ */
+const CODE_COPY_FEEDBACK_MS = 1500;
+// The buttons this card made. Membership, not a class name, is what marks a block as
+// done: a class could just as well arrive in a reply's own HTML.
+const CODE_COPY_BUTTONS = new WeakSet();
+const CODE_COPY_WATCHED = new WeakSet();
+
+// Selectors carry one more type than ha-markdown's own (`pre`, `pre code`) so they
+// win whichever of the two sheets the browser happens to order last.
+function codeBlockCss(scope) {
+  return `
+    ${scope} pre {
+      position: relative;
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      word-break: normal;
+    }
+    ${scope} pre code { white-space: inherit; overflow-wrap: inherit; }
+    /* Room above the code for the button, so it never sits over the first line. */
+    ${scope} pre.agent-bridge-copyable { padding-top: 48px; }
+    ${scope} pre > button.agent-bridge-copy {
+      position: absolute; top: 2px; right: 2px;
+      min-width: 64px; min-height: 44px; padding: 0 12px; box-sizing: border-box;
+      font-family: var(--ha-font-family-body, var(--mdc-typography-font-family, sans-serif));
+      font-size: 0.85em; line-height: 1;
+      color: var(--primary-text-color);
+      background: var(--card-background-color, var(--primary-background-color));
+      border: 1px solid var(--divider-color, rgba(127, 127, 127, 0.4)); border-radius: 8px;
+      cursor: pointer; touch-action: manipulation;
+      user-select: none; -webkit-user-select: none;
+      white-space: nowrap;
+    }
+  `;
+}
+
+// The text of a block as written. Wrapping is only drawn, so it is not in here; the
+// button is skipped; and the one newline marked always ends a block with is dropped,
+// so pasting into a terminal does not run the command before it can be read.
+function codeBlockText(pre) {
+  let text = '';
+  for (const node of Array.from(pre.childNodes || [])) {
+    if (!CODE_COPY_BUTTONS.has(node)) { text += node.textContent; }
+  }
+  return text.replace(/\n$/, '');
+}
+
+/*
+ * The Clipboard API is missing altogether over plain http, which is how Home
+ * Assistant is often reached on the LAN, and the companion apps' WebViews can refuse
+ * it even when it is there. A selected textarea and execCommand('copy') works in
+ * both; it is deprecated, but nothing has replaced it for an insecure page.
+ */
+// The element that really has focus. document.activeElement stops at the outermost
+// shadow host, and the Copy button sits several shadow roots below it.
+function deepActiveElement(doc) {
+  let el = doc.activeElement || null;
+  while (el && el.shadowRoot && el.shadowRoot.activeElement) { el = el.shadowRoot.activeElement; }
+  return el;
+}
+
+function copyWithTextarea(text) {
+  const doc = typeof document !== 'undefined' ? document : null;
+  if (!doc || !doc.body || typeof doc.execCommand !== 'function') { return false; }
+  // Selecting the textarea takes focus, and removing it leaves focus on the page, so
+  // a keyboard user who pressed Copy would lose their place in the card.
+  const focused = deepActiveElement(doc);
+  const area = doc.createElement('textarea');
+  area.value = text;
+  // Read-only keeps a phone's keyboard down; 12pt stops iOS zooming in on focus.
+  area.setAttribute('readonly', '');
+  area.setAttribute('aria-hidden', 'true');
+  Object.assign(area.style, {
+    position: 'fixed', top: '0', left: '-9999px', opacity: '0', fontSize: '12pt',
+  });
+  doc.body.appendChild(area);
+  let copied = false;
+  try {
+    area.select();
+    if (typeof area.setSelectionRange === 'function') { area.setSelectionRange(0, text.length); }
+    copied = !!doc.execCommand('copy');
+  } catch (err) {
+    copied = false;
+  } finally {
+    doc.body.removeChild(area);
+    if (focused && focused !== doc.body && typeof focused.focus === 'function') {
+      try { focused.focus({ preventScroll: true }); } catch (err) { /* gone; nothing to return to */ }
+    }
+  }
+  return copied;
+}
+
+async function copyCodeText(text) {
+  const clipboard = typeof navigator !== 'undefined' && navigator ? navigator.clipboard : undefined;
+  if (clipboard && typeof clipboard.writeText === 'function') {
+    try {
+      await clipboard.writeText(text);
+      return true;
+    } catch (err) {
+      // Refused (a WebView, or a lapsed user gesture): the textarea may still work.
+    }
+  }
+  return copyWithTextarea(text);
+}
+
+function addCopyButton(pre) {
+  const button = document.createElement('button');
+  CODE_COPY_BUTTONS.add(button);
+  button.type = 'button';
+  button.className = 'agent-bridge-copy';
+  button.textContent = 'Copy';
+  button.setAttribute('aria-label', 'Copy code');
+  let reset = null;
+  const show = (label) => {
+    button.textContent = label;
+    button.setAttribute('aria-label', label === 'Copy' ? 'Copy code' : label);
+  };
+  button.addEventListener('click', async (event) => {
+    if (event && event.preventDefault) { event.preventDefault(); }
+    if (event && event.stopPropagation) { event.stopPropagation(); }
+    const copied = await copyCodeText(codeBlockText(pre));
+    show(copied ? 'Copied' : 'Copy failed');
+    if (reset) { clearTimeout(reset); }
+    reset = setTimeout(() => { reset = null; show('Copy'); }, CODE_COPY_FEEDBACK_MS);
+  });
+  pre.classList.add('agent-bridge-copyable');
+  pre.insertBefore(button, pre.firstChild);
+}
+
+// Idempotent, because it runs on every change to the tree - including the one its own
+// buttons make, which is what stops that from becoming a loop: the second pass finds
+// nothing left to do and changes nothing.
+function decorateCodeBlocks(root) {
+  if (!root || typeof root.querySelectorAll !== 'function') { return; }
+  for (const pre of Array.from(root.querySelectorAll('pre'))) {
+    const has = Array.from(pre.childNodes || []).some((node) => CODE_COPY_BUTTONS.has(node));
+    if (!has) { addCopyButton(pre); }
+  }
+}
+
+/*
+ * Called after every content change. The shadow root only exists once the element is
+ * connected, and the blocks only once marked has answered, so it tries now, again when
+ * ha-markdown says that render is complete, and from then on whenever the tree
+ * changes - which also covers re-renders this card did not ask for.
+ */
+function enhanceMarkdownCode(md) {
+  const attach = () => {
+    // A frontend old enough to render ha-markdown without a shadow root puts the
+    // blocks in the card's own tree, where its own stylesheet already reaches them.
+    const root = md.shadowRoot || md;
+    if (!CODE_COPY_WATCHED.has(root)) {
+      CODE_COPY_WATCHED.add(root);
+      if (md.shadowRoot) {
+        const style = document.createElement('style');
+        style.textContent = codeBlockCss('ha-markdown-element');
+        // First, ahead of Lit's own render marker, so a re-render never clears it.
+        root.insertBefore(style, root.firstChild);
+      }
+      if (typeof MutationObserver === 'function') {
+        new MutationObserver(() => decorateCodeBlocks(root)).observe(root, { childList: true, subtree: true });
+      }
+    }
+    decorateCodeBlocks(root);
+  };
+  attach();
+  Promise.resolve(md.updateComplete).then(attach, () => {});
+}
+
+/*
  * agent-bridge-activity-card
  *
  * The live header of a session card: status, the last response, and the reasoning
@@ -1143,6 +1330,7 @@ class AgentBridgeActivityCard extends HTMLElement {
       .working .glyph { display: inline-block; width: 1.1em; text-align: center; font-variant-emoji: text; }
       .working .elapsed { color: var(--secondary-text-color); }
       [hidden] { display: none !important; }
+      ${codeBlockCss('.md')}
     `;
 
     const card = document.createElement('ha-card');
@@ -1260,6 +1448,7 @@ class AgentBridgeActivityCard extends HTMLElement {
         container.appendChild(md);
       }
       md.content = text;
+      enhanceMarkdownCode(md);
     } else {
       container.classList.add('plain');
       container.textContent = text;
