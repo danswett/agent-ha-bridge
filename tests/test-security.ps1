@@ -42,13 +42,24 @@ $payloads = @(
     '{{ 1+1 }}',
     "{% for s in states %}{{ s }}{% endfor %}",
     '{# comment #}',
-    "{{ states('device_tracker.phone') }}"
+    "{{ states('device_tracker.phone') }}",
+    # A run of braces longer than the delimiter: each opening brace must be broken,
+    # or the one after a broken pair is still a live opener.
+    "{{{ states('device_tracker.phone') }}",
+    '{{{{ 1+1 }}',
+    '{{% if true %}x{% endif %}',
+    '{%% raw %}',
+    '{## comment #}'
 )
 foreach ($payload in $payloads) {
     $safe = Remove-CopilotTemplateMarkup -Text $payload
     Test-That "neutralised: $payload" {
         $safe -notmatch '\{\{' -and $safe -notmatch '\{%' -and $safe -notmatch '\{#'
     } $safe
+}
+Test-That 'neutralising only inserts zero-width spaces, so the text reads the same' {
+    $all = @($payloads | Where-Object { (Remove-CopilotTemplateMarkup -Text $_).Replace([string][char]0x200B, '') -ne $_ })
+    $all.Count -eq 0
 }
 Test-That 'ordinary text is untouched' {
     (Remove-CopilotTemplateMarkup -Text 'Fix the decision notifier') -eq 'Fix the decision notifier'
