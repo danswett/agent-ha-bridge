@@ -2546,6 +2546,38 @@ function Remove-CopilotTemplateMarkup {
     $Text -replace '\{(?=[{%#])', "{$([char]0x200B)"
 }
 
+function ConvertTo-BridgeInertNotifyData {
+    <#
+        A notify service call's data with every string in it made template-inert.
+
+        Home Assistant's notify services declare `title` and `message` as templates and
+        render them, so text sent through one is evaluated, not just shown. Session
+        names were neutralised, but the question an agent asks, its choices and a reply
+        preview went in as they were: an agent steered by what it read could put
+        "{{ states.person... }}" in a question and have the owner's own entity state
+        rendered onto the Lock Screen, or a nested loop that holds Home Assistant's
+        event loop. Every string is passed through, not only title and message,
+        because which keys a given notifier renders is the integration's choice; the
+        identifiers, tags and URLs the bridge sends never contain an opener, so they
+        are unchanged.
+    #>
+    param([AllowNull()]$Value)
+
+    if ($null -eq $Value) { return $null }
+    if ($Value -is [string]) { return (Remove-CopilotTemplateMarkup -Text $Value) }
+    if ($Value -is [System.Collections.IDictionary]) {
+        $copy = @{}
+        foreach ($key in @($Value.Keys)) { $copy[$key] = ConvertTo-BridgeInertNotifyData -Value $Value[$key] }
+        return $copy
+    }
+    if ($Value -is [System.Collections.IEnumerable]) {
+        # Comma-wrapped: an array returned bare is unrolled, and one with a single or no
+        # element would come back as a scalar or $null instead of a list.
+        return , @(foreach ($item in $Value) { ConvertTo-BridgeInertNotifyData -Value $item })
+    }
+    $Value
+}
+
 function Get-CopilotSessionDisplay {
     param(
         [Parameter(Mandatory)]
@@ -4677,7 +4709,7 @@ function Send-BridgeNotification {
         return
     }
 
-    $data = @{ title = $Title; message = $Message }
+    $data = ConvertTo-BridgeInertNotifyData -Value @{ title = $Title; message = $Message }
     if ($parts[0] -eq 'ticker') {
         $data['category'] = $script:DecisionBridgeConfig.TickerCategory
         $data['actions'] = 'none'
