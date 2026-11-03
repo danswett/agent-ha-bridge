@@ -85,6 +85,18 @@ $script:DaemonMachineName = 'TESTBOX'
 
 . (Join-Path $repository 'hooks\daemon-decision-notify.ps1')
 
+# The daemon loads decision-bridge-common.ps1 first; this suite stubs its service call
+# instead, so it takes only the two template helpers the notify path needs from it.
+$commonAst = [Management.Automation.Language.Parser]::ParseFile((Join-Path $repository 'hooks\decision-bridge-common.ps1'), [ref]$null, [ref]$null)
+foreach ($helper in 'Remove-CopilotTemplateMarkup', 'ConvertTo-BridgeInertNotifyData') {
+    $definition = $commonAst.Find({
+            param($node)
+            $node -is [Management.Automation.Language.FunctionDefinitionAst] -and $node.Name -ceq $helper
+        }, $true)
+    if ($null -eq $definition) { throw "decision-bridge-common.ps1 no longer defines $helper" }
+    . ([scriptblock]::Create($definition.Extent.Text))
+}
+
 $headers = @{ Authorization = '******' }
 $session = 'a92623ed40334467b5d0342e27557c09'
 
@@ -397,6 +409,31 @@ Test-That 'and is not sent again on every pass' {
     Sync-DaemonAnswerButtons -SessionId $session -Marker $m -State $state -Headers $headers
     Sync-DaemonAnswerButtons -SessionId $session -Marker $m -State $state -Headers $headers
     $script:Sent.Count -eq 1
+}
+
+Test-That 'a question, its choices and the session name reach the phone with no live template in them' {
+    # Home Assistant's notify services render title and message as templates. The
+    # question and choices are the agent's own words, so a steered agent could
+    # otherwise read the owner's entity state onto the Lock Screen.
+    Reset-TestWorld
+    $m = New-TestMarker -DecisionId 'd-tpl' -Question "Proceed? {{{ states('person.me') }}" `
+        -Choices @('{{ 1+1 }}', '{%% for x in range(9) %}y{% endfor %}')
+    $state = @{ $session = [pscustomobject]@{ Name = '{{{ now() }}'; Status = 'idle' } }
+    Sync-DaemonAnswerButtons -SessionId $session -Marker $m -State $state -Headers $headers
+    $data = $script:Sent[0].Data
+    $texts = @($data.title, $data.message) + @($data.data.actions | ForEach-Object { $_.title })
+    $script:Sent.Count -eq 1 -and @($texts | Where-Object { $_ -match '\{[{%#]' }).Count -eq 0 -and
+        $data.message.Replace([string][char]0x200B, '') -eq "Proceed? {{{ states('person.me') }}"
+}
+
+Test-That 'neutralising leaves the identity a tap echoes back untouched' {
+    Reset-TestWorld
+    $m = New-TestMarker -DecisionId 'd-id'
+    $state = @{ $session = [pscustomobject]@{ Name = 'bridge'; Status = 'idle' } }
+    Sync-DaemonAnswerButtons -SessionId $session -Marker $m -State $state -Headers $headers
+    $data = $script:Sent[0].Data.data
+    $data.action_data.decision -eq 'd-id' -and $data.action_data.session -eq $session -and
+        @($data.actions).Count -ge 2 -and $data.actions[0].action -like 'BRIDGE_*_0'
 }
 
 Test-That 'withdrawing the notification does not yet forget the question' {
