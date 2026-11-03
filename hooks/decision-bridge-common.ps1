@@ -2535,12 +2535,15 @@ function Remove-CopilotTemplateMarkup {
 
         The delimiters are broken with a zero-width space rather than stripped, so the
         text still reads correctly while being inert.
+
+        Every brace that opens a delimiter is broken, not every delimiter: replacing
+        '{{' matches without overlap, so '{{{' became '{', ZWS, '{{' and left a live
+        opener behind - found in agent-bridge's review of the same helper (#287).
     #>
     param([Parameter(Mandatory)][AllowEmptyString()][string]$Text)
 
     if ([string]::IsNullOrEmpty($Text)) { return $Text }
-    $zws = [char]0x200B
-    $Text -replace '\{\{', "{$zws{" -replace '\{%', "{$zws%" -replace '\{#', "{$zws#"
+    $Text -replace '\{(?=[{%#])', "{$([char]0x200B)"
 }
 
 function Get-CopilotSessionDisplay {
