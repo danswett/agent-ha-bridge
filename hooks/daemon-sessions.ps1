@@ -461,6 +461,7 @@ function Clear-CopilotMqttOrphans {
             continue
         }
         try {
+            if (Test-DaemonPeerSession -Node $node -Headers $Headers) { Reset-DaemonWithdrawalClaims -Nodes @{ $node = $true }; continue }
             if ($orphanStatus[$node] -eq 'ending') {
                 Publish-CopilotMqttMessage -Topic "$($script:CopilotMqttConfig.TopicRoot)/$node/status/state" -Payload 'ended' -Headers $Headers -Retain
             }
@@ -538,6 +539,7 @@ function Update-DaemonStaleSessions {
             $observation = Get-Variable -Name BridgeDashboardObservation -Scope Script -ErrorAction SilentlyContinue
             if (-not $observation -or -not $observation.Value -or -not $observation.Value.Verified -or
                 $observation.Value.ReferencedNodes -ccontains $node) { continue }
+            if (Test-DaemonPeerSession -Node $node -Headers $Headers) { Reset-DaemonWithdrawalClaims -Nodes @{ $node = $true }; continue }
             if ([string]$state.state -eq 'ending') {
                 Publish-CopilotMqttMessage -Topic "$($script:CopilotMqttConfig.TopicRoot)/$node/status/state" `
                     -Payload 'ended' -Headers $Headers -Retain

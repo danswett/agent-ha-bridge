@@ -773,8 +773,8 @@ Test-That 'startup does not prune a node still referenced by the verified dashbo
 $script:BridgeDashboardObservation.ReferencedNodes = @()
 Clear-CopilotMqttOrphans -Headers @{} -Live $sweepLive -Discovery (New-DaemonDiscoverySnapshot -Live $sweepLive -Complete)
 
-Test-That 'the orphan sweep refreshes an expired cache through the synthetic template' {
-    $script:SweepHttpRequests.Count -eq ($orphanReadStart + 1) -and
+Test-That 'the orphan sweep refreshes an expired cache and rechecks ownership through the synthetic template' {
+    $script:SweepHttpRequests.Count -eq ($orphanReadStart + 2) -and
         $script:SweepHttpRequests[-1].Method -ceq 'Post' -and
         $script:SweepHttpRequests[-1].Uri -ceq 'http://publication.invalid:8123/api/template'
 }
@@ -900,6 +900,7 @@ Test-That 'a known session awaiting a possible resume keeps its entities' { $pro
 
 $statusFixture = $script:SweepHttpStates[-1]
 $statusFixture.state = 'ended'
+$script:DaemonStatesCache = $script:SweepHttpStates
 $script:DaemonStaleSessions = @{}
 $script:SweepFailTopic = "copilot/cli/$staleNode/activity/state"
 Update-DaemonStaleSessions -Headers @{} -Discovery $snapshot -Now $start
@@ -995,6 +996,29 @@ foreach ($scanner in @('orphan', 'stale')) {
         & $scanRetirement
         Test-That "$scanner self=$selfClaim restart completes the interrupted withdrawal without retained ownership" {
             $script:Swept.Count -gt 0 -and -not (Get-DaemonWithdrawalQueue).ContainsKey($staleNode)
+        }
+    }
+}
+
+foreach ($scanner in @('orphan', 'stale')) {
+    foreach ($cachedStatus in @('ended', 'ending')) {
+        $inventory = @($sweepStates | Where-Object { $_.entity_id -ne "sensor.${staleNode}_status" })
+        $script:DaemonStatesCache = $inventory + @(
+            [pscustomobject]@{ entity_id = "sensor.${staleNode}_status"; state = $cachedStatus; attributes = [pscustomobject]@{ machine = $script:DaemonMachineName } }
+        )
+        $script:SweepHttpStates = $inventory + @(
+            [pscustomobject]@{ entity_id = "sensor.${staleNode}_status"; state = 'working'; attributes = [pscustomobject]@{ machine = 'PEERBOX' } }
+        )
+        $script:DaemonStatesCacheAt = [DateTimeOffset]::Now
+        $script:DaemonOrphanFirstSeen[$staleNode] = [DateTimeOffset]::Now.AddMinutes(-11)
+        $script:DaemonStaleSessions[$staleNode] = [pscustomobject]@{ Since = $start.AddMinutes(-11) }
+        $script:SweepWrites = @()
+        $readStart = $script:SweepHttpRequests.Count
+        if ($scanner -eq 'orphan') {
+            [void](Clear-CopilotMqttOrphans -Headers @{} -Live $snapshot.Live -Discovery $snapshot)
+        } else { Update-DaemonStaleSessions -Headers @{} -Discovery $snapshot -Now $start }
+        Test-That "$scanner cached $cachedStatus ownership cannot withdraw or publish over a fresh peer owner" {
+            $script:SweepHttpRequests.Count -gt $readStart -and $script:SweepWrites.Count -eq 0
         }
     }
 }
