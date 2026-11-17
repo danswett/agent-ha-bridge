@@ -967,30 +967,35 @@ foreach ($scanner in @('orphan', 'stale')) {
 $script:DaemonPendingRetire = @()
 
 foreach ($scanner in @('orphan', 'stale')) {
-    $script:DaemonPendingRetire = @($staleId)
-    $retirementSnapshot = New-DaemonDiscoverySnapshot -Live @{} -Complete
-    $script:SweepFailTopic = "copilot/cli/$staleNode/activity/state"
-    Complete-DaemonSessionRetirement -Gone @() -DashboardCurrent $true -Headers @{} -Discovery $retirementSnapshot
-    Test-That "$scanner real partial retirement retains both retry queues" {
-        $script:DaemonPendingRetire -contains $staleId -and (Get-DaemonWithdrawalQueue).ContainsKey($staleNode)
-    }
-    $script:SweepHttpStates = @($script:SweepHttpStates | Where-Object { $_.entity_id -ne "sensor.${staleNode}_status" })
-    $script:DaemonStatesCache = $script:SweepHttpStates
-    $script:DaemonStatesCacheAt = [DateTimeOffset]::Now
-    $script:SweepFailTopic = ''; $script:Swept = @()
-    $scanRetirement = {
-        if ($scanner -eq 'orphan') {
-            [void](Clear-CopilotMqttOrphans -Headers @{} -Live $retirementSnapshot.Live -Discovery $retirementSnapshot)
-        } else { Update-DaemonStaleSessions -Headers @{} -Discovery $retirementSnapshot -Now $start }
-    }
-    & $scanRetirement
-    Test-That "$scanner scan holds pending retirement without cancelling its durable retry" {
-        $script:Swept.Count -eq 0 -and (Get-DaemonWithdrawalQueue).ContainsKey($staleNode)
-    }
-    $script:DaemonPendingRetire = @(); $script:DaemonWithdrawalQueue = $null
-    & $scanRetirement
-    Test-That "$scanner restart completes the interrupted withdrawal without retained ownership" {
-        $script:Swept.Count -gt 0 -and -not (Get-DaemonWithdrawalQueue).ContainsKey($staleNode)
+    foreach ($selfClaim in @($false, $true)) {
+        $sweepStates[0].attributes.sessions = @()
+        if ($selfClaim) { $sweepStates[0].attributes.sessions = @([pscustomobject]@{ node = $staleNode }) }
+        $script:DaemonPendingRetire = @($staleId)
+        $retirementSnapshot = New-DaemonDiscoverySnapshot -Live @{} -Complete
+        $script:SweepFailTopic = "copilot/cli/$staleNode/activity/state"
+        Complete-DaemonSessionRetirement -Gone @() -DashboardCurrent $true -Headers @{} -Discovery $retirementSnapshot
+        Test-That "$scanner self=$selfClaim real partial retirement retains both retry queues" {
+            $script:DaemonPendingRetire -contains $staleId -and (Get-DaemonWithdrawalQueue).ContainsKey($staleNode)
+        }
+        $script:SweepHttpStates = @($script:SweepHttpStates | Where-Object { $_.entity_id -ne "sensor.${staleNode}_status" })
+        $script:SweepHttpStates += [pscustomobject]@{ entity_id = "sensor.${staleNode}_status"; state = 'unknown'; attributes = [pscustomobject]@{} }
+        $script:DaemonStatesCache = $script:SweepHttpStates
+        $script:DaemonStatesCacheAt = [DateTimeOffset]::Now
+        $script:SweepFailTopic = ''; $script:Swept = @()
+        $scanRetirement = {
+            if ($scanner -eq 'orphan') {
+                [void](Clear-CopilotMqttOrphans -Headers @{} -Live $retirementSnapshot.Live -Discovery $retirementSnapshot)
+            } else { Update-DaemonStaleSessions -Headers @{} -Discovery $retirementSnapshot -Now $start }
+        }
+        & $scanRetirement
+        Test-That "$scanner self=$selfClaim scan holds pending retirement without cancelling its durable retry" {
+            $script:Swept.Count -eq 0 -and (Get-DaemonWithdrawalQueue).ContainsKey($staleNode)
+        }
+        $script:DaemonPendingRetire = @(); $script:DaemonWithdrawalQueue = $null
+        & $scanRetirement
+        Test-That "$scanner self=$selfClaim restart completes the interrupted withdrawal without retained ownership" {
+            $script:Swept.Count -gt 0 -and -not (Get-DaemonWithdrawalQueue).ContainsKey($staleNode)
+        }
     }
 }
 

@@ -417,6 +417,18 @@ $script:DaemonMissingSessions[$missingId] = [DateTimeOffset]::Now.AddMinutes(-11
 Invoke-TestSessionSync -Headers $headers -State $state -Live @{ $script:Ids.s1 = (New-Session 's1') }
 Test-That 'a non-ended known session retires after ten minutes of process absence' { -not $state.ContainsKey($missingId) }
 
+$savedRecoveryStates = $script:DaemonHttpStates
+$peerNode = Get-CopilotMqttNodeId -SessionId $endingId
+$script:DaemonHttpStates += [pscustomobject]@{ entity_id = "sensor.${peerNode}_status"; state = 'working'; attributes = [pscustomobject]@{ machine = 'PEERBOX' } }
+$state[$endingId] = [pscustomobject]@{ Name = 'Claude: moved'; Machine = 'DESK'; Status = 'ending'; Kind = 'claude' }
+$script:StatusValues[$endingId] = 'working'; $script:Retired = @()
+Invoke-TestSessionSync -Headers $headers -State $state -Live @{ $script:Ids.s1 = (New-Session 's1') }
+Invoke-TestSessionSync -Headers $headers -State $state -Live @{ $script:Ids.s1 = (New-Session 's1') }
+Test-That 'recovery does not overwrite peer ownership or retire a moved session' {
+    $script:StatusValues[$endingId] -eq 'working' -and $script:Retired -notcontains $endingId
+}
+$script:DaemonHttpStates = $savedRecoveryStates
+
 $rebuilds = @($script:Log | Where-Object { $_ -like 'dashboard rebuilt*' }).Count
 Invoke-TestSessionSync -Headers $headers -State $state -Live @{ $script:Ids.s1 = (New-Session 's1') }
 Test-That 'an unchanged pass does not rebuild the dashboard' { @($script:Log | Where-Object { $_ -like 'dashboard rebuilt*' }).Count -eq $rebuilds }

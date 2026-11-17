@@ -331,6 +331,19 @@ function Set-DaemonWithdrawalQueued {
     }
 }
 
+function Test-DaemonPeerSession {
+    param([string]$Node, [hashtable]$Headers)
+    $states = Get-DaemonHomeAssistantStates -Headers $Headers -Fresh
+    $foreign = @($states | Where-Object {
+        [string]$_.entity_id -ceq "sensor.${Node}_status" -and $_.attributes -and
+        $_.attributes.PSObject.Properties['machine'] -and [string]$_.attributes.machine -and
+        [string]$_.attributes.machine -ine $script:DaemonMachineName
+    })
+    $peer = @(Get-BridgePeerMachine -States $states -ExcludeSelf | ForEach-Object { $_.Sessions } |
+        Where-Object { $_.node -ceq $Node })
+    [bool]($foreign.Count -or $peer.Count)
+}
+
 function Reset-DaemonWithdrawalClaims {
     param([hashtable]$Nodes)
     $queue = Get-DaemonWithdrawalQueue
@@ -399,6 +412,7 @@ function Clear-CopilotMqttOrphans {
     $peers = @(Get-BridgePeerMachine -States $states)
     foreach ($peer in $peers) {
         $liveNodes[(Get-CopilotMqttMachineNode -Slug $peer.Slug)] = $true
+        if ($peer.IsSelf) { continue }
         foreach ($remote in @($peer.Sessions)) {
             $node = [string]$remote.node
             if ($node) { $liveNodes[$node] = $true }
@@ -425,8 +439,9 @@ function Clear-CopilotMqttOrphans {
         if (-not $liveNodes.ContainsKey($node)) {
             if ([string]$state.entity_id -ceq "sensor.${node}_status") {
                 $orphanStatus[$node] = [string]$state.state
-                if ($state.attributes -and $state.attributes.PSObject.Properties['machine'] -and
-                    [string]$state.attributes.machine -ieq $script:DaemonMachineName) { $orphanNodes[$node] = $true }
+                $machine = if ($state.attributes -and $state.attributes.PSObject.Properties['machine']) { [string]$state.attributes.machine } else { '' }
+                if ($machine -ieq $script:DaemonMachineName -or
+                    (-not $machine -and $localNodes.ContainsKey($node))) { $orphanNodes[$node] = $true }
                 else { [void]$orphanNodes.Remove($node) }
             }
         }
@@ -491,6 +506,7 @@ function Update-DaemonStaleSessions {
     }
     $peers = @(Get-BridgePeerMachine -States $states)
     foreach ($peer in $peers) {
+        if ($peer.IsSelf) { continue }
         foreach ($session in @($peer.Sessions)) { if ($session.node) { $claimed[[string]$session.node] = $true } }
     }
     Reset-DaemonWithdrawalClaims -Nodes $claimed
@@ -509,9 +525,9 @@ function Update-DaemonStaleSessions {
         if ($null -eq $state -or [string]$state.entity_id -notmatch '^sensor\.(agent_bridge_[0-9a-z]{12,})_status$') { continue }
         $node = $Matches[1]
         if ($claimed.ContainsKey($node)) { continue }
-        if ($missingStatus -cnotcontains $node -and (-not $state.attributes -or
-            -not $state.attributes.PSObject.Properties['machine'] -or
-            [string]$state.attributes.machine -ine $script:DaemonMachineName)) { continue }
+        $machine = if ($state.attributes -and $state.attributes.PSObject.Properties['machine']) { [string]$state.attributes.machine } else { '' }
+        if (($machine -and $machine -ine $script:DaemonMachineName) -or
+            (-not $machine -and -not $queue.ContainsKey($node))) { continue }
         $seen[$node] = $true
         if (-not $script:DaemonStaleSessions.ContainsKey($node)) {
             $script:DaemonStaleSessions[$node] = [pscustomobject]@{ Since = $Now }
@@ -736,19 +752,26 @@ function Sync-DaemonSessions {
             if (-not $script:DaemonMissingSessions.ContainsKey($known)) { $script:DaemonMissingSessions[$known] = [DateTimeOffset]::Now }
             if (([DateTimeOffset]::Now - $script:DaemonMissingSessions[$known]).TotalMinutes -lt 10) { continue }
         }
-        if ($status -ne 'ended') {
-            try {
+        try {
+            $node = Get-CopilotMqttNodeId -SessionId $known
+            if (Test-DaemonPeerSession -Node $node -Headers $Headers) {
+                Reset-DaemonWithdrawalClaims -Nodes @{ $node = $true }
+                $State.Remove($known)
+                [void]$script:DaemonMissingSessions.Remove($known)
+                continue
+            }
+            if ($status -ne 'ended') {
                 Set-CopilotMqttStatus -SessionId $known -Status 'ended' -Headers $Headers -Attributes (
                     Add-DaemonTuningAttributes -Attributes @{
                         session = $ending.Name; machine = $ending.Machine
                         updated = [DateTimeOffset]::Now.ToString('o')
                     } -Tuning $ending) | Out-Null
             }
-            catch {
-                if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
-                Write-DaemonLog -Message "ending status recovery failed for $known : $($_.Exception.Message)"
-                continue
-            }
+        }
+        catch {
+            if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+            Write-DaemonLog -Message "ending status recovery failed for $known : $($_.Exception.Message)"
+            continue
         }
         [void]$script:DaemonMissingSessions.Remove($known)
         $goneSessions += $known
@@ -2268,15 +2291,7 @@ function Complete-DaemonSessionRetirement {
     foreach ($known in @($retirePlan.Retire)) {
         try {
             $node = Get-CopilotMqttNodeId -SessionId $known
-            $states = Get-DaemonHomeAssistantStates -Headers $Headers -Fresh
-            $foreign = @($states | Where-Object {
-                [string]$_.entity_id -ceq "sensor.${node}_status" -and $_.attributes -and
-                $_.attributes.PSObject.Properties['machine'] -and [string]$_.attributes.machine -and
-                [string]$_.attributes.machine -ine $script:DaemonMachineName
-            })
-            $peer = @(Get-BridgePeerMachine -States $states -ExcludeSelf | ForEach-Object { $_.Sessions } |
-                Where-Object { $_.node -ceq $node })
-            if ($foreign.Count -or $peer.Count) { Reset-DaemonWithdrawalClaims -Nodes @{ $node = $true }; continue }
+            if (Test-DaemonPeerSession -Node $node -Headers $Headers) { Reset-DaemonWithdrawalClaims -Nodes @{ $node = $true }; continue }
             Set-DaemonWithdrawalQueued -Node (Get-CopilotMqttNodeId -SessionId $known) -Queued $true
             Remove-CopilotMqttSession -SessionId $known -Headers $Headers
             # The session itself is going, so there can be no replacement question to
