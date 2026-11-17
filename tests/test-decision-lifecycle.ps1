@@ -416,6 +416,24 @@ try {
         $previousStateFile = $script:DaemonConfig.StateFile
         $script:DaemonConfig.StateFile = Join-Path $root 'stop-restoration.json'
         $script:DaemonStateLastWritten = $null
+        $script:RestoreInventory = @(
+            [pscustomobject]@{ entity_id = "sensor.agent_bridge_$(Get-BridgeMachineSlug)_sessions"
+                attributes = [pscustomobject]@{ machine = $script:DaemonMachineName; sessions = @() } }
+        )
+        $script:RestoreInventoryReads = 0
+        $script:RestoreUnexpectedReads = 0
+        function Invoke-RestMethod {
+            param($Method, $Uri, $Headers, $Body, $ContentType, $TimeoutSec)
+            if ($args.Count -eq 0 -and $Method -ceq 'Post' -and
+                $Uri -ceq 'http://127.0.0.1:1/api/template' -and $Headers -is [hashtable] -and
+                $ContentType -ceq 'application/json' -and $TimeoutSec -eq 15 -and $Body -is [string] -and
+                ($Body | ConvertFrom-Json).template -ceq $script:DaemonBridgeStatesTemplate) {
+                $script:RestoreInventoryReads++
+                return (ConvertTo-Json -InputObject $script:RestoreInventory -Depth 10 -Compress)
+            }
+            $script:RestoreUnexpectedReads++
+            throw "Unexpected restoration transport: $Method $Uri"
+        }
 
         function Publish-CopilotMqttMessage {
             param($Topic, $Payload, $Headers, [switch]$Retain)
@@ -573,6 +591,7 @@ try {
                 $fixture.State[$fixture.Id].Status = 'error'
                 $fixture.Live = @{}
                 Test-That "a retired $kind failed-stop session is still removed by the unchanged reconcile" {
+                    $script:DaemonMissingSessions[$fixture.Id] = [DateTimeOffset]::Now.AddMinutes(-11)
                     Invoke-RestorationRoundTrip -Fixture $fixture
                     -not $fixture.State.ContainsKey($fixture.Id)
                 }
@@ -714,9 +733,14 @@ try {
                 (Get-DaemonStartupStatus -Session $fixture.Session -Entry $fixture.State[$fixture.Id]) -ceq 'working'
             }
             $empty = @{ State = @{}; Live = @{} }
+            $script:RestoreInventory = @()
+            $script:DaemonStatesCacheAt = [DateTimeOffset]::MinValue
             Test-That 'startup with no saved or live sessions still restores nothing' {
                 Invoke-RestorationRoundTrip -Fixture $empty
                 $empty.State.Count -eq 0
+            }
+            Test-That 'restoration ownership reads use only the synthetic inventory transport' {
+                $script:RestoreInventoryReads -gt 0 -and $script:RestoreUnexpectedReads -eq 0
             }
         }
         finally { $script:DaemonConfig.StateFile = $previousStateFile }
