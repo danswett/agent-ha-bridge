@@ -917,6 +917,21 @@ Test-That 'an empty filtered response stays an empty array without a fallback re
     $emptyStates.Count -eq 0 -and $script:DaemonHttpRequests.Count -eq ($beforeEmptyRead + 1) -and
         $script:DaemonHttpRequests[-1].Method -eq 'Post'
 }
+foreach ($restoring in @('empty', 'partial')) {
+    if ($restoring -eq 'partial') {
+        $script:DaemonHttpStates = @(
+            [pscustomobject]@{ entity_id = 'sensor.agent_bridge_fixture_sessions'; attributes = [pscustomobject]@{ machine = 'FIXTURE' } }
+            [pscustomobject]@{ entity_id = 'sensor.agent_bridge_1111111100004000_status'; state = 'unknown'; attributes = [pscustomobject]@{} }
+        )
+    }
+    $script:DaemonStatesCache = $filteredStates; $script:DaemonStatesCacheAt = [DateTimeOffset]::Now
+    Test-That "fresh $restoring ownership defers retirement despite a complete cached inventory" {
+        $deferred = $false
+        try { [void](Test-DaemonPeerSession -Node 'agent_bridge_1111111100004000' -Headers $headers) }
+        catch { $deferred = $_.Exception.Message -eq 'Fresh session ownership inventory is incomplete' }
+        $deferred
+    }
+}
 $script:DaemonHttpStates = $savedHttpStates
 $script:DaemonHttpTemplateRefused = $true
 $beforeFallbackRead = $script:DaemonHttpRequests.Count

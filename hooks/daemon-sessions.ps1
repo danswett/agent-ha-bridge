@@ -334,12 +334,16 @@ function Set-DaemonWithdrawalQueued {
 function Test-DaemonPeerSession {
     param([string]$Node, [hashtable]$Headers)
     $states = Get-DaemonHomeAssistantStates -Headers $Headers -Fresh
+    $peers = @(Get-BridgePeerMachine -States $states)
+    if ($peers.Count -eq 0 -or @($peers | Where-Object { -not $_.SessionsKnown }).Count -gt 0) {
+        throw 'Fresh session ownership inventory is incomplete'
+    }
     $foreign = @($states | Where-Object {
         [string]$_.entity_id -ceq "sensor.${Node}_status" -and $_.attributes -and
         $_.attributes.PSObject.Properties['machine'] -and [string]$_.attributes.machine -and
         [string]$_.attributes.machine -ine $script:DaemonMachineName
     })
-    $peer = @(Get-BridgePeerMachine -States $states -ExcludeSelf | ForEach-Object { $_.Sessions } |
+    $peer = @($peers | Where-Object { -not $_.IsSelf } | ForEach-Object { $_.Sessions } |
         Where-Object { $_.node -ceq $Node })
     [bool]($foreign.Count -or $peer.Count)
 }
