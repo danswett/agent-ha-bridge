@@ -861,13 +861,15 @@ Update-DaemonStaleSessions -Headers @{} -Discovery $snapshot -Now $start
 Update-DaemonStaleSessions -Headers @{} -Discovery $snapshot -Now $start.AddMinutes(9)
 Test-That 'a missing local session is not pruned before ten minutes' { $script:Swept.Count -eq 0 }
 $script:BridgeDashboardObservation.ReferencedNodes = @($staleNode)
+$script:SweepWrites = @()
 Update-DaemonStaleSessions -Headers @{} -Discovery $snapshot -Now $start.AddMinutes(11)
 Test-That 'a verified dashboard still rendering a stale session prevents removal' { $script:Swept.Count -eq 0 }
+Test-That 'a referenced stale session does not publish ended' { $script:SweepWrites.Count -eq 0 }
+$script:BridgeDashboardObservation.ReferencedNodes = @()
+Update-DaemonStaleSessions -Headers @{} -Discovery $snapshot -Now $start.AddMinutes(11)
 Test-That 'a missing process resolves the stuck ending status to ended' {
     @($script:SweepWrites | Where-Object { $_.Topic -match "$staleNode/status/state$" -and $_.Payload -eq 'ended' -and $_.Retain }).Count -eq 1
 }
-$script:BridgeDashboardObservation.ReferencedNodes = @()
-Update-DaemonStaleSessions -Headers @{} -Discovery $snapshot -Now $start.AddMinutes(11)
 Test-That 'a stale local session is pruned after ten minutes when its card is gone' {
     @($script:Swept | Where-Object { $_ -match $staleNode }).Count -eq
         (@(Get-CopilotMqttSessionDiscoveryTopic -Node $staleNode).Count +
@@ -901,23 +903,59 @@ $statusFixture.state = 'ended'
 $script:DaemonStaleSessions = @{}
 $script:SweepFailTopic = "copilot/cli/$staleNode/activity/state"
 Update-DaemonStaleSessions -Headers @{} -Discovery $snapshot -Now $start
-$statusFixture.attributes = [pscustomobject]@{}
+$script:SweepHttpStates = @($script:SweepHttpStates | Where-Object { $_ -ne $statusFixture })
+$script:DaemonStatesCache = $script:SweepHttpStates
 $script:SweepFailTopic = ''
 $script:Swept = @()
-Update-DaemonStaleSessions -Headers @{} -Discovery $snapshot -KnownSessions $owned -Now $start.AddMinutes(1)
-Test-That 'a queued withdrawal does not continue while its session is known' { $script:Swept.Count -eq 0 }
 $script:DaemonWithdrawalQueue = $null
 Update-DaemonStaleSessions -Headers @{} -Discovery $snapshot -Now $start.AddMinutes(1)
-Test-That 'an interrupted withdrawal survives restart after its machine attribute disappears' {
+Test-That 'an interrupted withdrawal survives restart after its status sensor disappears' {
     @($script:Swept | Where-Object { $_ -match $staleNode }).Count -eq
         (@(Get-CopilotMqttSessionDiscoveryTopic -Node $staleNode).Count + @(Get-CopilotMqttSessionStateTopic -Node $staleNode).Count)
 }
+$script:SweepHttpStates += $statusFixture
+$script:DaemonStatesCache = $script:SweepHttpStates
 $statusFixture.attributes = [pscustomobject]@{ machine = $script:DaemonMachineName }
 $statusFixture.state = 'idle'; $script:DaemonStaleSessions = @{}; $script:Swept = @()
 Update-DaemonStaleSessions -Headers @{} -Discovery $snapshot -Now $start
 $statusFixture.state = 'ended'
 Update-DaemonStaleSessions -Headers @{} -Discovery $snapshot -Now $start.AddMinutes(1)
 Test-That 'a session ending during its grace is retired promptly' { $script:Swept.Count -gt 0 }
+
+foreach ($scanner in @('orphan', 'stale')) {
+    foreach ($claim in @('live', 'known', 'pending', 'peer', 'foreign', 'unknown')) {
+        Set-DaemonWithdrawalQueued -Node $staleNode -Queued $true
+        $script:DaemonOrphanFirstSeen[$staleNode] = [DateTimeOffset]::Now.AddMinutes(-11)
+        $script:DaemonStaleSessions[$staleNode] = [pscustomobject]@{ Since = $start.AddMinutes(-11) }
+        $statusFixture.state = 'idle'
+        $statusFixture.attributes = [pscustomobject]@{ machine = $(if ($claim -eq 'foreign') { 'PEERBOX' } else { $script:DaemonMachineName }) }
+        if ($claim -eq 'unknown') { $statusFixture.attributes = [pscustomobject]@{} }
+        $claimLive = if ($claim -eq 'live') { $running } else { $sweepLive }
+        $claimKnown = if ($claim -eq 'known') { $owned } else { @{} }
+        $script:DaemonPendingRetire = if ($claim -eq 'pending') { @($staleId) } else { @() }
+        $sweepStates[1].attributes.sessions = @()
+        if ($claim -eq 'peer') { $sweepStates[1].attributes.sessions = @([pscustomobject]@{ node = $staleNode }) }
+        $script:DaemonStatesCache = $script:SweepHttpStates
+        $script:DaemonStatesCacheAt = [DateTimeOffset]::Now
+        $script:Swept = @()
+        $claimSnapshot = New-DaemonDiscoverySnapshot -Live $claimLive -Complete
+        if ($scanner -eq 'orphan') {
+            [void](Clear-CopilotMqttOrphans -Headers @{} -Live $claimLive -KnownSessions $claimKnown -Discovery $claimSnapshot)
+        } else {
+            Update-DaemonStaleSessions -Headers @{} -Discovery $claimSnapshot -KnownSessions $claimKnown -Now $start
+        }
+        Test-That "$scanner queued $claim node is not withdrawn" { $script:Swept.Count -eq 0 }
+        $script:DaemonWithdrawalQueue = $null
+        if ($claim -notin @('foreign', 'unknown')) {
+            Test-That "$scanner $claim reappearance durably cancels withdrawal and resets grace" {
+                -not (Get-DaemonWithdrawalQueue).ContainsKey($staleNode) -and
+                -not $script:DaemonOrphanFirstSeen.ContainsKey($staleNode) -and -not $script:DaemonStaleSessions.ContainsKey($staleNode)
+            }
+        }
+        Set-DaemonWithdrawalQueued -Node $staleNode -Queued $false
+    }
+}
+$script:DaemonPendingRetire = @()
 
 # A machine whose name happens to look like a session node.
 $script:Swept = @()

@@ -331,6 +331,16 @@ function Set-DaemonWithdrawalQueued {
     }
 }
 
+function Reset-DaemonWithdrawalClaims {
+    param([hashtable]$Nodes)
+    $queue = Get-DaemonWithdrawalQueue
+    foreach ($node in $Nodes.Keys) {
+        if ($queue.ContainsKey($node)) { Set-DaemonWithdrawalQueued -Node $node -Queued $false }
+        [void]$script:DaemonOrphanFirstSeen.Remove($node)
+        [void]$script:DaemonStaleSessions.Remove($node)
+    }
+}
+
 function Clear-CopilotMqttOrphans {
     <#
         Removes published entities for sessions that are no longer live.
@@ -359,15 +369,16 @@ function Clear-CopilotMqttOrphans {
         [AllowNull()]$Discovery = $null
     )
 
+    $liveNodes = @{}
+    foreach ($sessionId in @($Live.Keys) + @($KnownSessions.Keys) + @($script:DaemonPendingRetire)) {
+        $liveNodes[(Get-CopilotMqttNodeId -SessionId $sessionId)] = $true
+    }
+    Reset-DaemonWithdrawalClaims -Nodes $liveNodes
     if (-not (Test-DaemonDiscoveryContext -Snapshot $Discovery) -or -not $Discovery.Complete -or
         -not [object]::ReferenceEquals($Live, $Discovery.Live)) {
         $script:DaemonOrphanFirstSeen.Clear()
         Write-DaemonLog -Message 'orphan sweep skipped: local session ownership observation is incomplete'
         return $false
-    }
-    $liveNodes = @{}
-    foreach ($sessionId in @($Live.Keys) + @($KnownSessions.Keys) + @($script:DaemonPendingRetire)) {
-        $liveNodes[(Get-CopilotMqttNodeId -SessionId $sessionId)] = $true
     }
 
     try {
@@ -383,18 +394,18 @@ function Clear-CopilotMqttOrphans {
     # Every machine, including this one, so a machine-level node is never mistaken for
     # a session and peers' sessions are left alone.
     $peers = @(Get-BridgePeerMachine -States $states)
-    if ($peers.Count -eq 0 -or @($peers | Where-Object { -not $_.SessionsKnown }).Count -gt 0) {
-        $script:DaemonOrphanFirstSeen.Clear()
-        Write-DaemonLog -Message 'orphan sweep skipped: machine session inventories are incomplete'
-        return $false
-    }
     foreach ($peer in $peers) {
         $liveNodes[(Get-CopilotMqttMachineNode -Slug $peer.Slug)] = $true
-        if ($peer.IsSelf) { continue }
         foreach ($remote in @($peer.Sessions)) {
             $node = [string]$remote.node
             if ($node) { $liveNodes[$node] = $true }
         }
+    }
+    Reset-DaemonWithdrawalClaims -Nodes $liveNodes
+    if ($peers.Count -eq 0 -or @($peers | Where-Object { -not $_.SessionsKnown }).Count -gt 0) {
+        $script:DaemonOrphanFirstSeen.Clear()
+        Write-DaemonLog -Message 'orphan sweep skipped: machine session inventories are incomplete'
+        return $false
     }
 
     $orphanNodes = @{}
@@ -412,6 +423,7 @@ function Clear-CopilotMqttOrphans {
                 $orphanStatus[$node] = [string]$state.state
                 if ($state.attributes -and $state.attributes.PSObject.Properties['machine'] -and
                     [string]$state.attributes.machine -ieq $script:DaemonMachineName) { $orphanNodes[$node] = $true }
+                else { [void]$orphanNodes.Remove($node) }
             }
         }
     }
@@ -456,6 +468,12 @@ function Update-DaemonStaleSessions {
         [DateTimeOffset]$Now = [DateTimeOffset]::Now
     )
 
+    $claimed = @{}
+    foreach ($id in @($KnownSessions.Keys) + @($script:DaemonPendingRetire)) { $claimed[(Get-CopilotMqttNodeId -SessionId $id)] = $true }
+    if (Test-DaemonDiscoveryContext -Snapshot $Discovery) {
+        foreach ($id in $Discovery.Live.Keys) { $claimed[(Get-CopilotMqttNodeId -SessionId $id)] = $true }
+    }
+    Reset-DaemonWithdrawalClaims -Nodes $claimed
     if (-not (Test-DaemonDiscoveryContext -Snapshot $Discovery) -or -not $Discovery.Complete) {
         $script:DaemonStaleSessions.Clear()
         return
@@ -468,27 +486,25 @@ function Update-DaemonStaleSessions {
         return
     }
     $peers = @(Get-BridgePeerMachine -States $states)
+    foreach ($peer in $peers) {
+        foreach ($session in @($peer.Sessions)) { if ($session.node) { $claimed[[string]$session.node] = $true } }
+    }
+    Reset-DaemonWithdrawalClaims -Nodes $claimed
     if ($peers.Count -eq 0 -or @($peers | Where-Object { -not $_.SessionsKnown }).Count -gt 0) {
         $script:DaemonStaleSessions.Clear()
         return
     }
-    $claimed = @{}
-    foreach ($id in @($Discovery.Live.Keys) + @($KnownSessions.Keys)) { $claimed[(Get-CopilotMqttNodeId -SessionId $id)] = $true }
-    foreach ($id in @($script:DaemonPendingRetire)) { $claimed[(Get-CopilotMqttNodeId -SessionId $id)] = $true }
-    foreach ($peer in $peers) {
-        if ($peer.IsSelf) { continue }
-        foreach ($session in @($peer.Sessions)) { if ($session.node) { $claimed[[string]$session.node] = $true } }
-    }
     $queue = Get-DaemonWithdrawalQueue
-    $states = @($states) + @($queue.Keys | Where-Object {
+    $missingStatus = @($queue.Keys | Where-Object {
         $node = $_; -not @($states | Where-Object { $_.entity_id -ceq "sensor.${node}_status" }).Count
-    } | ForEach-Object { [pscustomobject]@{ entity_id = "sensor.${_}_status"; state = 'ended'; attributes = $null } })
+    })
+    $states = @($states) + @($missingStatus | ForEach-Object { [pscustomobject]@{ entity_id = "sensor.${_}_status"; state = 'ended'; attributes = $null } })
     $seen = @{}
     foreach ($state in $states) {
         if ($null -eq $state -or [string]$state.entity_id -notmatch '^sensor\.(agent_bridge_[0-9a-z]{12,})_status$') { continue }
         $node = $Matches[1]
         if ($claimed.ContainsKey($node)) { continue }
-        if (-not $queue.ContainsKey($node) -and (-not $state.attributes -or
+        if ($missingStatus -cnotcontains $node -and (-not $state.attributes -or
             -not $state.attributes.PSObject.Properties['machine'] -or
             [string]$state.attributes.machine -ine $script:DaemonMachineName)) { continue }
         $seen[$node] = $true
@@ -498,13 +514,13 @@ function Update-DaemonStaleSessions {
         $stale = $script:DaemonStaleSessions[$node]
         if (-not $queue.ContainsKey($node) -and [string]$state.state -ne 'ended' -and ($Now - $stale.Since).TotalMinutes -lt 10) { continue }
         try {
+            $observation = Get-Variable -Name BridgeDashboardObservation -Scope Script -ErrorAction SilentlyContinue
+            if (-not $observation -or -not $observation.Value -or -not $observation.Value.Verified -or
+                $observation.Value.ReferencedNodes -ccontains $node) { continue }
             if ([string]$state.state -eq 'ending') {
                 Publish-CopilotMqttMessage -Topic "$($script:CopilotMqttConfig.TopicRoot)/$node/status/state" `
                     -Payload 'ended' -Headers $Headers -Retain
             }
-            $observation = Get-Variable -Name BridgeDashboardObservation -Scope Script -ErrorAction SilentlyContinue
-            if (-not $observation -or -not $observation.Value -or -not $observation.Value.Verified -or
-                $observation.Value.ReferencedNodes -ccontains $node) { continue }
             Set-DaemonWithdrawalQueued -Node $node -Queued $true
             Remove-CopilotMqttSessionTopics -Node $node -Headers $Headers
             Set-DaemonWithdrawalQueued -Node $node -Queued $false
@@ -1144,6 +1160,8 @@ function Add-DaemonTuningAttributes {
     $Attributes
 }
 
+$script:DaemonNameRetry = @{}
+
 function Update-DaemonKnownSession {
     <#
         One pass for a session already in state: re-resolves a stale name, then streams
@@ -1161,12 +1179,6 @@ function Update-DaemonKnownSession {
     $id = $session.SessionId
     $entryKind = Get-DaemonEntryKind -Entry $entry
     $agent = Get-DaemonAgent -Kind $entryKind
-    # An agent that streams its own card (Codex) does so here and in the fast lane.
-    if ($agent.KnownActivity) {
-        & $agent.KnownActivity $id $entry $session $Headers $VerboseOn
-        return
-    }
-
     # Re-resolve the name of an agent whose sessions can be renamed while they run.
     # Copilot's name is whatever its workspace file says, and that changes twice over
     # a session's life: the id fallback gives way to the first prompt once the file is
@@ -1184,29 +1196,44 @@ function Update-DaemonKnownSession {
         $refreshed = Get-BridgeSessionDisplay -SessionId $id -Kind $entryKind -WorkingDirectory $workingDirectory
         if ([string]$refreshed.Name -ne [string]$entry.Name) {
             $entry.Name = $refreshed.Name
-            try {
-                # Discarded like every other publish here: this runs on any rename, and
-                # what it emits would otherwise ride out through the reconcile. Through
-                # the helper, because the attributes are replaced wholesale and a
-                # Copilot session is renamed as soon as it has a first prompt - so a
-                # bare set here erased the settings line moments after it appeared.
-                Set-CopilotMqttStatus -SessionId $id -Status ([string]$entry.Status) -Headers $Headers -Attributes (
-                    Add-DaemonTuningAttributes -Attributes @{
-                        session = $entry.Name
-                        machine = $entry.Machine
-                        process_id = $session.ProcessId
-                        updated = [DateTimeOffset]::Now.ToString('o')
-                    } -Tuning $entry) | Out-Null
-                # The card reads the name above; this is what carries it to the names
-                # Home Assistant itself shows, which are built from the device's.
-                Update-CopilotMqttSessionName -SessionId $id -SessionName ([string]$entry.Name) `
-                    -Machine ([string]$entry.Machine) -Headers $Headers | Out-Null
+            if ($entryKind -ne 'codex') {
+                $entry | Add-Member -NotePropertyName PendingStatusName -NotePropertyValue ([string]$entry.Name) -Force
             }
-            catch { }
+            [void]$script:DaemonNameRetry.Remove($id)
             Write-DaemonLog -Message "renamed $($id.Substring(0,8)) to '$($entry.Name)'"
         }
     }
 
+    $pendingStatus = $entry.PSObject.Properties['PendingStatusName'] -and $entry.PendingStatusName -ceq [string]$entry.Name
+    $needsDiscovery = -not $entry.PSObject.Properties['DiscoveryName'] -or $entry.DiscoveryName -cne [string]$entry.Name
+    if (($pendingStatus -or $needsDiscovery) -and
+        (-not $script:DaemonNameRetry.ContainsKey($id) -or [DateTimeOffset]::Now -ge $script:DaemonNameRetry[$id])) {
+        try {
+            if ($pendingStatus) {
+                Set-CopilotMqttStatus -SessionId $id -Status ([string]$entry.Status) -Headers $Headers -Attributes (
+                    Add-DaemonTuningAttributes -Attributes @{
+                        session = $entry.Name; machine = $entry.Machine; process_id = $session.ProcessId
+                        updated = [DateTimeOffset]::Now.ToString('o')
+                    } -Tuning $entry) | Out-Null
+                $entry.PSObject.Properties.Remove('PendingStatusName')
+            }
+            if ($needsDiscovery) {
+                Update-CopilotMqttSessionName -SessionId $id -SessionName ([string]$entry.Name) `
+                    -Machine ([string]$entry.Machine) -Headers $Headers | Out-Null
+                $entry | Add-Member -NotePropertyName DiscoveryName -NotePropertyValue ([string]$entry.Name) -Force
+            }
+            [void]$script:DaemonNameRetry.Remove($id)
+        }
+        catch {
+            if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+            $script:DaemonNameRetry[$id] = [DateTimeOffset]::Now.AddSeconds(60)
+            Write-DaemonLog -Message "session name publication failed for $id : $($_.Exception.Message); retrying"
+        }
+    }
+    if ($agent.KnownActivity) {
+        & $agent.KnownActivity $id $entry $session $Headers $VerboseOn
+        return
+    }
     Update-DaemonSessionActivity -Id $id -Entry $entry -Session $session -Headers $Headers -VerboseOn $VerboseOn
 }
 

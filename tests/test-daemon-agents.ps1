@@ -144,10 +144,19 @@ Remove-Item -LiteralPath $registration, $transcript -Force
 Write-Host '--- the reconcile ---'
 $cxId = '11111111-0000-4000-8000-000000000001'
 $script:Named = $false
+$script:DiscoveryNames = @{}
 function Get-BridgeSessionDisplay { param($SessionId, $Kind, $WorkingDirectory) $script:Named = $true; [pscustomobject]@{ Name = 'x' } }
 function Set-CopilotMqttStatus { param($SessionId, $Status, $Headers, $Attributes) }
-$routed = Get-Routed { Update-DaemonKnownSession -Session ([pscustomobject]@{ SessionId = $cxId }) -Entry ([pscustomobject]@{ Kind = 'codex'; Name = 'Codex: x' }) -Headers @{} -VerboseOn $true }
+function Update-CopilotMqttSessionName {
+    param($SessionId, $SessionName, $Machine, $Headers)
+    $script:DiscoveryNames[$SessionId] = $SessionName
+}
+$codexEntry = [pscustomobject]@{ Kind = 'codex'; Name = 'Codex: x'; Machine = 'M' }
+$routed = Get-Routed { Update-DaemonKnownSession -Session ([pscustomobject]@{ SessionId = $cxId }) -Entry $codexEntry -Headers @{} -VerboseOn $true }
 Test-That 'a known Codex session streams its own card' { $routed -eq "codex-card:$cxId" }
+Test-That 'Codex discovery repair is exercised by the routing fixture' {
+    $codexEntry.DiscoveryName -eq $codexEntry.Name -and $script:DiscoveryNames[$cxId] -eq $codexEntry.Name
+}
 $script:Named = $false
 $null = Get-Routed { Update-DaemonKnownSession -Session ([pscustomobject]@{ SessionId = '22222222-0000-4000-8000-000000000002' }) -Entry ([pscustomobject]@{ Kind = 'copilot'; Name = 'old name'; Status = 'idle'; Machine = 'M' }) -Headers @{} -VerboseOn $true }
 Test-That 'a Copilot name without its prefix is re-resolved' { $script:Named }
