@@ -370,7 +370,7 @@ function Clear-CopilotMqttOrphans {
     )
 
     $liveNodes = @{}
-    foreach ($sessionId in @($Live.Keys) + @($KnownSessions.Keys) + @($script:DaemonPendingRetire)) {
+    foreach ($sessionId in @($Live.Keys) + @($KnownSessions.Keys)) {
         $liveNodes[(Get-CopilotMqttNodeId -SessionId $sessionId)] = $true
     }
     Reset-DaemonWithdrawalClaims -Nodes $liveNodes
@@ -402,6 +402,7 @@ function Clear-CopilotMqttOrphans {
         }
     }
     Reset-DaemonWithdrawalClaims -Nodes $liveNodes
+    foreach ($id in @($script:DaemonPendingRetire)) { $liveNodes[(Get-CopilotMqttNodeId -SessionId $id)] = $true }
     if ($peers.Count -eq 0 -or @($peers | Where-Object { -not $_.SessionsKnown }).Count -gt 0) {
         $script:DaemonOrphanFirstSeen.Clear()
         Write-DaemonLog -Message 'orphan sweep skipped: machine session inventories are incomplete'
@@ -469,7 +470,7 @@ function Update-DaemonStaleSessions {
     )
 
     $claimed = @{}
-    foreach ($id in @($KnownSessions.Keys) + @($script:DaemonPendingRetire)) { $claimed[(Get-CopilotMqttNodeId -SessionId $id)] = $true }
+    foreach ($id in $KnownSessions.Keys) { $claimed[(Get-CopilotMqttNodeId -SessionId $id)] = $true }
     if (Test-DaemonDiscoveryContext -Snapshot $Discovery) {
         foreach ($id in $Discovery.Live.Keys) { $claimed[(Get-CopilotMqttNodeId -SessionId $id)] = $true }
     }
@@ -490,6 +491,7 @@ function Update-DaemonStaleSessions {
         foreach ($session in @($peer.Sessions)) { if ($session.node) { $claimed[[string]$session.node] = $true } }
     }
     Reset-DaemonWithdrawalClaims -Nodes $claimed
+    foreach ($id in @($script:DaemonPendingRetire)) { $claimed[(Get-CopilotMqttNodeId -SessionId $id)] = $true }
     if ($peers.Count -eq 0 -or @($peers | Where-Object { -not $_.SessionsKnown }).Count -gt 0) {
         $script:DaemonStaleSessions.Clear()
         return

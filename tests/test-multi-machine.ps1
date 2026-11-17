@@ -946,7 +946,9 @@ foreach ($scanner in @('orphan', 'stale')) {
         }
         Test-That "$scanner queued $claim node is not withdrawn" { $script:Swept.Count -eq 0 }
         $script:DaemonWithdrawalQueue = $null
-        if ($claim -notin @('foreign', 'unknown')) {
+        if ($claim -eq 'pending') {
+            Test-That "$scanner pending retirement preserves its durable withdrawal" { (Get-DaemonWithdrawalQueue).ContainsKey($staleNode) }
+        } elseif ($claim -notin @('foreign', 'unknown')) {
             Test-That "$scanner $claim reappearance durably cancels withdrawal and resets grace" {
                 -not (Get-DaemonWithdrawalQueue).ContainsKey($staleNode) -and
                 -not $script:DaemonOrphanFirstSeen.ContainsKey($staleNode) -and -not $script:DaemonStaleSessions.ContainsKey($staleNode)
@@ -956,6 +958,34 @@ foreach ($scanner in @('orphan', 'stale')) {
     }
 }
 $script:DaemonPendingRetire = @()
+
+foreach ($scanner in @('orphan', 'stale')) {
+    $script:DaemonPendingRetire = @($staleId)
+    $retirementSnapshot = New-DaemonDiscoverySnapshot -Live @{} -Complete
+    $script:SweepFailTopic = "copilot/cli/$staleNode/activity/state"
+    Complete-DaemonSessionRetirement -Gone @() -DashboardCurrent $true -Headers @{} -Discovery $retirementSnapshot
+    Test-That "$scanner real partial retirement retains both retry queues" {
+        $script:DaemonPendingRetire -contains $staleId -and (Get-DaemonWithdrawalQueue).ContainsKey($staleNode)
+    }
+    $script:SweepHttpStates = @($script:SweepHttpStates | Where-Object { $_.entity_id -ne "sensor.${staleNode}_status" })
+    $script:DaemonStatesCache = $script:SweepHttpStates
+    $script:DaemonStatesCacheAt = [DateTimeOffset]::Now
+    $script:SweepFailTopic = ''; $script:Swept = @()
+    $scanRetirement = {
+        if ($scanner -eq 'orphan') {
+            [void](Clear-CopilotMqttOrphans -Headers @{} -Live $retirementSnapshot.Live -Discovery $retirementSnapshot)
+        } else { Update-DaemonStaleSessions -Headers @{} -Discovery $retirementSnapshot -Now $start }
+    }
+    & $scanRetirement
+    Test-That "$scanner scan holds pending retirement without cancelling its durable retry" {
+        $script:Swept.Count -eq 0 -and (Get-DaemonWithdrawalQueue).ContainsKey($staleNode)
+    }
+    $script:DaemonPendingRetire = @(); $script:DaemonWithdrawalQueue = $null
+    & $scanRetirement
+    Test-That "$scanner restart completes the interrupted withdrawal without retained ownership" {
+        $script:Swept.Count -gt 0 -and -not (Get-DaemonWithdrawalQueue).ContainsKey($staleNode)
+    }
+}
 
 # A machine whose name happens to look like a session node.
 $script:Swept = @()
