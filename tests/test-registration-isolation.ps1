@@ -864,7 +864,8 @@ try {
             [IO.File]::SetLastWriteTimeUtc($path, $stamp)
             $snapshot = Invoke-A14Reconcile
             Test-A14HeldOwner "$kind queued malformed" $snapshot
-            Test-A14 "$kind verified view omission cannot retire uncertain A" ($script:DaemonPendingRetire -contains $script:A14Ids.A)
+            Test-A14 "$kind a known owner cancels retirement despite verified view omission" (
+                $script:A14State.ContainsKey($script:A14Ids.A) -and $script:DaemonPendingRetire -notcontains $script:A14Ids.A)
             Write-A14Registration A; [IO.File]::SetLastWriteTimeUtc($path, $stamp)
             $snapshot = Invoke-A14Reconcile
             Test-A14 "$kind repair at the same stamp recovers and cancels stale retirement" (

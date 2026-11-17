@@ -339,6 +339,9 @@ function Reset-DaemonWithdrawalClaims {
         [void]$script:DaemonOrphanFirstSeen.Remove($node)
         [void]$script:DaemonStaleSessions.Remove($node)
     }
+    $script:DaemonPendingRetire = @($script:DaemonPendingRetire | Where-Object {
+        $_ -and -not $Nodes.ContainsKey((Get-CopilotMqttNodeId -SessionId $_))
+    })
 }
 
 function Clear-CopilotMqttOrphans {
@@ -2264,6 +2267,16 @@ function Complete-DaemonSessionRetirement {
     $script:DaemonPendingRetire = @($retirePlan.Queue)
     foreach ($known in @($retirePlan.Retire)) {
         try {
+            $node = Get-CopilotMqttNodeId -SessionId $known
+            $states = Get-DaemonHomeAssistantStates -Headers $Headers -Fresh
+            $foreign = @($states | Where-Object {
+                [string]$_.entity_id -ceq "sensor.${node}_status" -and $_.attributes -and
+                $_.attributes.PSObject.Properties['machine'] -and [string]$_.attributes.machine -and
+                [string]$_.attributes.machine -ine $script:DaemonMachineName
+            })
+            $peer = @(Get-BridgePeerMachine -States $states -ExcludeSelf | ForEach-Object { $_.Sessions } |
+                Where-Object { $_.node -ceq $node })
+            if ($foreign.Count -or $peer.Count) { Reset-DaemonWithdrawalClaims -Nodes @{ $node = $true }; continue }
             Set-DaemonWithdrawalQueued -Node (Get-CopilotMqttNodeId -SessionId $known) -Queued $true
             Remove-CopilotMqttSession -SessionId $known -Headers $Headers
             # The session itself is going, so there can be no replacement question to

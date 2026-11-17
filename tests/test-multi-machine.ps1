@@ -932,7 +932,7 @@ foreach ($scanner in @('orphan', 'stale')) {
         if ($claim -eq 'unknown') { $statusFixture.attributes = [pscustomobject]@{} }
         $claimLive = if ($claim -eq 'live') { $running } else { $sweepLive }
         $claimKnown = if ($claim -eq 'known') { $owned } else { @{} }
-        $script:DaemonPendingRetire = if ($claim -eq 'pending') { @($staleId) } else { @() }
+        $script:DaemonPendingRetire = @($staleId)
         $sweepStates[1].attributes.sessions = @()
         if ($claim -eq 'peer') { $sweepStates[1].attributes.sessions = @([pscustomobject]@{ node = $staleNode }) }
         $script:DaemonStatesCache = $script:SweepHttpStates
@@ -951,8 +951,15 @@ foreach ($scanner in @('orphan', 'stale')) {
         } elseif ($claim -notin @('foreign', 'unknown')) {
             Test-That "$scanner $claim reappearance durably cancels withdrawal and resets grace" {
                 -not (Get-DaemonWithdrawalQueue).ContainsKey($staleNode) -and
+                $script:DaemonPendingRetire -notcontains $staleId -and
                 -not $script:DaemonOrphanFirstSeen.ContainsKey($staleNode) -and -not $script:DaemonStaleSessions.ContainsKey($staleNode)
             }
+        }
+        if ($claim -in @('peer', 'foreign')) {
+            $script:SweepWrites = @()
+            Complete-DaemonSessionRetirement -Gone @($staleId) -DashboardCurrent $true -Headers @{} -Discovery $claimSnapshot
+            Complete-DaemonSessionRetirement -Gone @() -DashboardCurrent $true -Headers @{} -Discovery $claimSnapshot
+            Test-That "$scanner retirement rechecks peer ownership before publishing" { $script:SweepWrites.Count -eq 0 }
         }
         Set-DaemonWithdrawalQueued -Node $staleNode -Queued $false
     }
