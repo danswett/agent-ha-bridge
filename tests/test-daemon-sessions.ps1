@@ -296,6 +296,12 @@ $script:Log = @()
 $script:Published = @()
 $script:Retired = @()
 $script:FailPublish = @{}
+$script:FailRename = $false
+$script:FailStatusRename = $false
+$script:StatusAttempts = 0
+$script:RenameAttempts = 0
+$script:RenamedDiscovery = @{}
+$script:StatusValues = @{}
 function Write-DaemonLog { param([string]$Message) $script:Log += $Message }
 function Get-HomeAssistantState { param([string]$EntityId, [hashtable]$Headers) $null }
 function Publish-CopilotMqttSession { param($SessionId, $SessionName, $Machine, $Headers)
@@ -304,7 +310,16 @@ function Set-CopilotMqttEntityIds { param($SessionId) $true }
 function Clear-CopilotMqttDecisionFields { param($SessionId, $SessionName, $Machine, $Headers) }
 function Publish-CopilotMqttSubmitButton { param($SessionId, $SessionName, $Machine, $Headers) }
 # These emit something, as real calls can, to prove none of it leaks into what is returned.
-function Set-CopilotMqttStatus { param($SessionId, $Status, $Headers, $Attributes) $script:StatusAttributes[$SessionId] = $Attributes; 'status-response' }
+function Set-CopilotMqttStatus { param($SessionId, $Status, $Headers, $Attributes)
+    $script:StatusAttempts++
+    if ($script:FailStatusRename) { throw 'broker down' }
+    $script:StatusValues[$SessionId] = $Status; $script:StatusAttributes[$SessionId] = $Attributes; 'status-response'
+}
+function Update-CopilotMqttSessionName { param($SessionId, $SessionName, $Machine, $Headers)
+    $script:RenameAttempts++
+    if ($script:FailRename) { throw 'broker down' }
+    $script:RenamedDiscovery[$SessionId] = $SessionName
+}
 $script:StatusAttributes = @{}
 function Set-CopilotMqttActivity { param($SessionId, $Summary, $Detail, $Headers) }
 function Invoke-HomeAssistantService { param($Domain, $Service, $Headers, $Data) @('service', 'response') }
@@ -396,6 +411,50 @@ Test-That 'renaming it is picked up next pass, though the old name looked perfec
 Test-That 'the new name reaches its status attributes' { $script:StatusAttributes[$renamed].session -eq 'Copilot: agent-ha-bridge' }
 Test-That 'and its card header' { @($script:DashboardSessions | Where-Object { $_.Name -eq 'Copilot: agent-ha-bridge' }).Count -eq 1 }
 Test-That 'and the republish it triggers returns nothing to the reconcile' { $null -eq $renameLeak } ($renameLeak -join ',')
+
+$renameState[$renamed].PSObject.Properties.Remove('DiscoveryName')
+$script:RenamedDiscovery.Remove($renamed)
+$script:StatusValues[$renamed] = 'working'
+Invoke-TestSessionSync -Headers $headers -State $renameState -Live @{ $renamed = (New-CopilotSession 's4') }
+Test-That 'repairing adopted discovery does not overwrite live status' {
+    $script:RenamedDiscovery[$renamed] -eq 'Copilot: agent-ha-bridge' -and $script:StatusValues[$renamed] -eq 'working'
+}
+$script:FailRename = $true
+$script:DisplayNames[$renamed] = 'Copilot: after failure'
+Invoke-TestSessionSync -Headers $headers -State $renameState -Live @{ $renamed = (New-CopilotSession 's4') }
+$attempts = $script:RenameAttempts
+Invoke-TestSessionSync -Headers $headers -State $renameState -Live @{ $renamed = (New-CopilotSession 's4') }
+Test-That 'failed discovery publication is backed off rather than retried every pass' { $script:RenameAttempts -eq $attempts }
+$script:FailRename = $false
+if (Get-Variable -Name DaemonNameRetry -Scope Script -ErrorAction SilentlyContinue) { $script:DaemonNameRetry[$renamed] = [DateTimeOffset]::MinValue }
+Invoke-TestSessionSync -Headers $headers -State $renameState -Live @{ $renamed = (New-CopilotSession 's4') }
+Test-That 'discovery publication retries after the backoff' { $script:RenamedDiscovery[$renamed] -eq 'Copilot: after failure' }
+
+$script:FailStatusRename = $true
+$script:DisplayNames[$renamed] = 'Copilot: status retry'
+Invoke-TestSessionSync -Headers $headers -State $renameState -Live @{ $renamed = (New-CopilotSession 's4') }
+$statusAttempts = $script:StatusAttempts
+Invoke-TestSessionSync -Headers $headers -State $renameState -Live @{ $renamed = (New-CopilotSession 's4') }
+Test-That 'a failed actual-rename status update is backed off' { $script:StatusAttempts -eq $statusAttempts }
+$script:FailStatusRename = $false
+$script:DaemonNameRetry[$renamed] = [DateTimeOffset]::MinValue
+Invoke-TestSessionSync -Headers $headers -State $renameState -Live @{ $renamed = (New-CopilotSession 's4') }
+Test-That 'a failed actual-rename status update retries after backoff' {
+    $script:StatusAttributes[$renamed].session -eq 'Copilot: status retry' -and
+    $script:RenamedDiscovery[$renamed] -eq 'Copilot: status retry'
+}
+
+$codexAgent = Get-DaemonAgent -Kind 'codex'
+$oldKnownActivity = $codexAgent.KnownActivity
+$codexAgent.KnownActivity = { param($Id, $Entry, $Session, $Headers, $VerboseOn) }
+$codexEntry = [pscustomobject]@{ Name = 'Codex: existing'; Machine = 'DESK'; Status = 'idle'; Kind = 'codex' }
+$codexSession = [pscustomobject]@{ SessionId = $script:Ids.s5; ProcessId = 1; WorkingDirectory = 'C:\x' }
+$script:StatusValues[$script:Ids.s5] = 'working'
+Update-DaemonKnownSession -Session $codexSession -Entry $codexEntry -Headers $headers -VerboseOn $false
+Test-That 'Codex discovery repair leaves its hook-owned status intact' {
+    $script:StatusValues[$script:Ids.s5] -eq 'working' -and $script:RenamedDiscovery[$script:Ids.s5] -eq 'Codex: existing'
+}
+$codexAgent.KnownActivity = $oldKnownActivity
 
 # The other half of the same check: a session of any kind can be holding the Copilot
 # id fallback, from a build that published it before its own adapter had loaded.

@@ -987,6 +987,8 @@ function Add-DaemonTuningAttributes {
     $Attributes
 }
 
+$script:DaemonNameRetry = @{}
+
 function Update-DaemonKnownSession {
     <#
         One pass for a session already in state: re-resolves a stale name, then streams
@@ -1004,12 +1006,6 @@ function Update-DaemonKnownSession {
     $id = $session.SessionId
     $entryKind = Get-DaemonEntryKind -Entry $entry
     $agent = Get-DaemonAgent -Kind $entryKind
-    # An agent that streams its own card (Codex) does so here and in the fast lane.
-    if ($agent.KnownActivity) {
-        & $agent.KnownActivity $id $entry $session $Headers $VerboseOn
-        return
-    }
-
     # Re-resolve the name of an agent whose sessions can be renamed while they run.
     # Copilot's name is whatever its workspace file says, and that changes twice over
     # a session's life: the id fallback gives way to the first prompt once the file is
@@ -1027,29 +1023,44 @@ function Update-DaemonKnownSession {
         $refreshed = Get-BridgeSessionDisplay -SessionId $id -Kind $entryKind -WorkingDirectory $workingDirectory
         if ([string]$refreshed.Name -ne [string]$entry.Name) {
             $entry.Name = $refreshed.Name
-            try {
-                # Discarded like every other publish here: this runs on any rename, and
-                # what it emits would otherwise ride out through the reconcile. Through
-                # the helper, because the attributes are replaced wholesale and a
-                # Copilot session is renamed as soon as it has a first prompt - so a
-                # bare set here erased the settings line moments after it appeared.
-                Set-CopilotMqttStatus -SessionId $id -Status ([string]$entry.Status) -Headers $Headers -Attributes (
-                    Add-DaemonTuningAttributes -Attributes @{
-                        session = $entry.Name
-                        machine = $entry.Machine
-                        process_id = $session.ProcessId
-                        updated = [DateTimeOffset]::Now.ToString('o')
-                    } -Tuning $entry) | Out-Null
-                # The card reads the name above; this is what carries it to the names
-                # Home Assistant itself shows, which are built from the device's.
-                Update-CopilotMqttSessionName -SessionId $id -SessionName ([string]$entry.Name) `
-                    -Machine ([string]$entry.Machine) -Headers $Headers | Out-Null
+            if ($entryKind -ne 'codex') {
+                $entry | Add-Member -NotePropertyName PendingStatusName -NotePropertyValue ([string]$entry.Name) -Force
             }
-            catch { }
+            [void]$script:DaemonNameRetry.Remove($id)
             Write-DaemonLog -Message "renamed $($id.Substring(0,8)) to '$($entry.Name)'"
         }
     }
 
+    $pendingStatus = $entry.PSObject.Properties['PendingStatusName'] -and $entry.PendingStatusName -ceq [string]$entry.Name
+    $needsDiscovery = -not $entry.PSObject.Properties['DiscoveryName'] -or $entry.DiscoveryName -cne [string]$entry.Name
+    if (($pendingStatus -or $needsDiscovery) -and
+        (-not $script:DaemonNameRetry.ContainsKey($id) -or [DateTimeOffset]::Now -ge $script:DaemonNameRetry[$id])) {
+        try {
+            if ($pendingStatus) {
+                Set-CopilotMqttStatus -SessionId $id -Status ([string]$entry.Status) -Headers $Headers -Attributes (
+                    Add-DaemonTuningAttributes -Attributes @{
+                        session = $entry.Name; machine = $entry.Machine; process_id = $session.ProcessId
+                        updated = [DateTimeOffset]::Now.ToString('o')
+                    } -Tuning $entry) | Out-Null
+                $entry.PSObject.Properties.Remove('PendingStatusName')
+            }
+            if ($needsDiscovery) {
+                Update-CopilotMqttSessionName -SessionId $id -SessionName ([string]$entry.Name) `
+                    -Machine ([string]$entry.Machine) -Headers $Headers | Out-Null
+                $entry | Add-Member -NotePropertyName DiscoveryName -NotePropertyValue ([string]$entry.Name) -Force
+            }
+            [void]$script:DaemonNameRetry.Remove($id)
+        }
+        catch {
+            if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+            $script:DaemonNameRetry[$id] = [DateTimeOffset]::Now.AddSeconds(60)
+            Write-DaemonLog -Message "session name publication failed for $id : $($_.Exception.Message); retrying"
+        }
+    }
+    if ($agent.KnownActivity) {
+        & $agent.KnownActivity $id $entry $session $Headers $VerboseOn
+        return
+    }
     Update-DaemonSessionActivity -Id $id -Entry $entry -Session $session -Headers $Headers -VerboseOn $VerboseOn
 }
 
