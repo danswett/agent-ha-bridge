@@ -715,7 +715,7 @@ function Invoke-DaemonStartupSessionCleanup {
         [void](Invoke-DaemonLegacyCleanup -Headers $Headers -Live $Discovery.Live -State $State)
     }
     else {
-        if (-not (Clear-CopilotMqttOrphans -Headers $Headers -Live $Discovery.Live -Discovery $Discovery)) {
+        if (-not (Clear-CopilotMqttOrphans -Headers $Headers -Live $Discovery.Live -Discovery $Discovery -KnownSessions $State)) {
             $script:DaemonSessionCleanupPending[$Phase] = $true
             return $false
         }

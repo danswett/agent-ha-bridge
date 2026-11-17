@@ -732,8 +732,12 @@ function Invoke-RestMethod {
 }
 
 $script:Swept = @()
+$script:SweepFailTopic = ''
+$script:SweepWrites = @()
 function Publish-CopilotMqttMessage {
     param([string]$Topic, [AllowEmptyString()][string]$Payload, [hashtable]$Headers, [switch]$Retain)
+    if ($Topic -eq $script:SweepFailTopic) { throw 'synthetic broker failure' }
+    $script:SweepWrites += [pscustomobject]@{ Topic = $Topic; Payload = $Payload; Retain = [bool]$Retain }
     if ($Payload -eq '') { $script:Swept += $Topic }
 }
 function Write-DaemonLog { param([string]$Message) $script:SweepLog += $Message }
@@ -750,6 +754,7 @@ $sweepStates = @(
     [pscustomobject]@{ entity_id = 'select.agent_bridge_1111111111111111_decision'; state = 'Idle'; attributes = [pscustomobject]@{} }
     [pscustomobject]@{ entity_id = 'select.agent_bridge_2222222222222222_decision'; state = 'Idle'; attributes = [pscustomobject]@{} }
     [pscustomobject]@{ entity_id = 'select.agent_bridge_3333333333333333_decision'; state = 'Idle'; attributes = [pscustomobject]@{} }
+    [pscustomobject]@{ entity_id = 'sensor.agent_bridge_3333333333333333_status'; state = 'idle'; attributes = [pscustomobject]@{ machine = $script:DaemonMachineName } }
 )
 $script:DaemonStatesCache = $sweepStates
 $script:SweepHttpStates = $script:DaemonStatesCache
@@ -757,6 +762,15 @@ $script:DaemonStatesCacheAt = [DateTimeOffset]::MinValue
 $script:SweepLog = @()
 $orphanReadStart = $script:SweepHttpRequests.Count
 $sweepLive = @{ '11111111-1111-1111-1111-111111111111' = $true }
+$script:DaemonOrphanFirstSeen = @{}
+$script:BridgeDashboardObservation = [pscustomobject]@{ Verified = $true; ReferencedNodes = @() }
+$firstSweep = Clear-CopilotMqttOrphans -Headers @{} -Live $sweepLive -Discovery (New-DaemonDiscoverySnapshot -Live $sweepLive -Complete)
+Test-That 'startup does not prune an unclaimed session without the ten-minute grace' { -not $firstSweep -and $script:Swept.Count -eq 0 }
+$script:DaemonOrphanFirstSeen['agent_bridge_3333333333333333'] = [DateTimeOffset]::Now.AddMinutes(-11)
+$script:BridgeDashboardObservation.ReferencedNodes = @('agent_bridge_3333333333333333')
+$heldSweep = Clear-CopilotMqttOrphans -Headers @{} -Live $sweepLive -Discovery (New-DaemonDiscoverySnapshot -Live $sweepLive -Complete)
+Test-That 'startup does not prune a node still referenced by the verified dashboard' { -not $heldSweep -and $script:Swept.Count -eq 0 }
+$script:BridgeDashboardObservation.ReferencedNodes = @()
 Clear-CopilotMqttOrphans -Headers @{} -Live $sweepLive -Discovery (New-DaemonDiscoverySnapshot -Live $sweepLive -Complete)
 
 Test-That 'the orphan sweep refreshes an expired cache through the synthetic template' {
@@ -793,6 +807,117 @@ Test-That 'this machine own live session is left alone' {
 Test-That 'no machine-level sensor is mistaken for an orphaned session' {
     @($script:Swept | Where-Object { $_ -match 'peerbox|sessions/config' }).Count -eq 0
 }
+
+$script:DaemonStatesCache = @($sweepStates) + @(
+    [pscustomobject]@{ entity_id = 'sensor.agent_bridge_4444444444444444_status'; state = 'ended'; attributes = [pscustomobject]@{ machine = 'PEERBOX' } }
+    [pscustomobject]@{ entity_id = 'sensor.agent_bridge_5555555555555555_status'; state = 'ended'; attributes = [pscustomobject]@{} }
+)
+$script:DaemonOrphanFirstSeen['agent_bridge_4444444444444444'] = [DateTimeOffset]::Now.AddMinutes(-11)
+$script:DaemonOrphanFirstSeen['agent_bridge_5555555555555555'] = [DateTimeOffset]::Now.AddMinutes(-11)
+$script:Swept = @()
+[void](Clear-CopilotMqttOrphans -Headers @{} -Live $sweepLive -Discovery (New-DaemonDiscoverySnapshot -Live $sweepLive -Complete))
+Test-That 'a peer or unknown node is not swept without positive local ownership' { @($script:Swept | Where-Object { $_ -match '4444444444444444|5555555555555555' }).Count -eq 0 }
+$script:DaemonStatesCache = $sweepStates
+
+$script:Swept = @()
+$script:SweepFailTopic = (Get-CopilotMqttSessionStateTopic -Node 'agent_bridge_3333333333333333')[0]
+$script:DaemonOrphanFirstSeen['agent_bridge_3333333333333333'] = [DateTimeOffset]::Now.AddMinutes(-11)
+$failedSweep = Clear-CopilotMqttOrphans -Headers @{} -Live $sweepLive -Discovery (New-DaemonDiscoverySnapshot -Live $sweepLive -Complete)
+Test-That 'an orphan sweep reports failed topic withdrawal for retry' { -not $failedSweep }
+Test-That 'failed state withdrawal leaves discovery available for the next sweep' {
+    @($script:Swept | Where-Object { $_ -match 'agent_bridge_3333333333333333/.*/config$' }).Count -eq 0
+}
+$script:SweepFailTopic = ''
+$script:Swept = @()
+$retrySweep = Clear-CopilotMqttOrphans -Headers @{} -Live $sweepLive -Discovery (New-DaemonDiscoverySnapshot -Live $sweepLive -Complete)
+Test-That 'a later orphan sweep retries every retained topic after failure' {
+    $retrySweep -and @($script:Swept | Where-Object { $_ -match 'agent_bridge_3333333333333333' }).Count -eq
+        (@(Get-CopilotMqttSessionDiscoveryTopic -Node 'agent_bridge_3333333333333333').Count +
+         @(Get-CopilotMqttSessionStateTopic -Node 'agent_bridge_3333333333333333').Count)
+}
+
+$savedPeerAttributes = $sweepStates[1].attributes
+$sweepStates[1].attributes = [pscustomobject]@{ machine = 'PEERBOX'; machine_slug = 'peerbox' }
+$script:DaemonStatesCache = $sweepStates
+$script:Swept = @()
+$unknownPeerSweep = Clear-CopilotMqttOrphans -Headers @{} -Live $sweepLive -Discovery (New-DaemonDiscoverySnapshot -Live $sweepLive -Complete)
+Test-That 'an unreadable peer inventory holds the orphan sweep for retry' { -not $unknownPeerSweep -and $script:Swept.Count -eq 0 }
+$sweepStates[1].attributes = $savedPeerAttributes
+
+Write-Host '--- stale local sessions are reconciled during normal operation ---'
+$staleNode = 'agent_bridge_3333333333333333'
+$script:DaemonStaleSessions = @{}
+$script:Swept = @()
+$script:SweepHttpStates = @($sweepStates | Where-Object { $_.entity_id -ne "sensor.${staleNode}_status" }) + @(
+    [pscustomobject]@{ entity_id = "sensor.${staleNode}_status"; state = 'ending'
+        attributes = [pscustomobject]@{ machine = $script:DaemonMachineName } }
+)
+$script:DaemonStatesCache = $script:SweepHttpStates
+$script:DaemonStatesCacheAt = [DateTimeOffset]::Now
+$script:BridgeDashboardObservation = [pscustomobject]@{ Verified = $true; ReferencedNodes = @() }
+$start = [DateTimeOffset]::Parse('2026-01-01T00:00:00Z')
+$snapshot = New-DaemonDiscoverySnapshot -Live $sweepLive -Complete
+Update-DaemonStaleSessions -Headers @{} -Discovery $snapshot -Now $start
+Update-DaemonStaleSessions -Headers @{} -Discovery $snapshot -Now $start.AddMinutes(9)
+Test-That 'a missing local session is not pruned before ten minutes' { $script:Swept.Count -eq 0 }
+$script:BridgeDashboardObservation.ReferencedNodes = @($staleNode)
+Update-DaemonStaleSessions -Headers @{} -Discovery $snapshot -Now $start.AddMinutes(11)
+Test-That 'a verified dashboard still rendering a stale session prevents removal' { $script:Swept.Count -eq 0 }
+Test-That 'a missing process resolves the stuck ending status to ended' {
+    @($script:SweepWrites | Where-Object { $_.Topic -match "$staleNode/status/state$" -and $_.Payload -eq 'ended' -and $_.Retain }).Count -eq 1
+}
+$script:BridgeDashboardObservation.ReferencedNodes = @()
+Update-DaemonStaleSessions -Headers @{} -Discovery $snapshot -Now $start.AddMinutes(11)
+Test-That 'a stale local session is pruned after ten minutes when its card is gone' {
+    @($script:Swept | Where-Object { $_ -match $staleNode }).Count -eq
+        (@(Get-CopilotMqttSessionDiscoveryTopic -Node $staleNode).Count +
+         @(Get-CopilotMqttSessionStateTopic -Node $staleNode).Count)
+}
+$script:Swept = @()
+$script:DaemonStaleSessions = @{}
+$staleId = '33333333-3333-3333-3333-333333333333'
+$running = @{ $staleId = $true }
+Update-DaemonStaleSessions -Headers @{} -Discovery (New-DaemonDiscoverySnapshot -Live $running -Complete) -Now $start
+Update-DaemonStaleSessions -Headers @{} -Discovery (New-DaemonDiscoverySnapshot -Live $running -Complete) -Now $start.AddMinutes(11)
+Test-That 'a live local session is never a stale candidate' { $script:Swept.Count -eq 0 }
+Update-DaemonStaleSessions -Headers @{} -Discovery $snapshot -Now $start
+Update-DaemonStaleSessions -Headers @{} -Discovery (New-DaemonDiscoverySnapshot -Live @{}) -Now $start.AddMinutes(11)
+Update-DaemonStaleSessions -Headers @{} -Discovery $snapshot -Now $start.AddMinutes(12)
+Test-That 'incomplete discovery resets the absence interval instead of proving death' { $script:Swept.Count -eq 0 }
+
+$owned = @{ $staleId = [pscustomobject]@{ Status = 'idle' } }
+$script:DaemonStaleSessions = @{}
+$script:Swept = @()
+$protectedScan = $false
+try {
+    Update-DaemonStaleSessions -Headers @{} -Discovery $snapshot -KnownSessions $owned -Now $start
+    Update-DaemonStaleSessions -Headers @{} -Discovery $snapshot -KnownSessions $owned -Now $start.AddMinutes(11)
+    $protectedScan = $true
+} catch { }
+Test-That 'a known session awaiting a possible resume keeps its entities' { $protectedScan -and $script:Swept.Count -eq 0 }
+
+$statusFixture = $script:SweepHttpStates[-1]
+$statusFixture.state = 'ended'
+$script:DaemonStaleSessions = @{}
+$script:SweepFailTopic = "copilot/cli/$staleNode/activity/state"
+Update-DaemonStaleSessions -Headers @{} -Discovery $snapshot -Now $start
+$statusFixture.attributes = [pscustomobject]@{}
+$script:SweepFailTopic = ''
+$script:Swept = @()
+Update-DaemonStaleSessions -Headers @{} -Discovery $snapshot -KnownSessions $owned -Now $start.AddMinutes(1)
+Test-That 'a queued withdrawal does not continue while its session is known' { $script:Swept.Count -eq 0 }
+$script:DaemonWithdrawalQueue = $null
+Update-DaemonStaleSessions -Headers @{} -Discovery $snapshot -Now $start.AddMinutes(1)
+Test-That 'an interrupted withdrawal survives restart after its machine attribute disappears' {
+    @($script:Swept | Where-Object { $_ -match $staleNode }).Count -eq
+        (@(Get-CopilotMqttSessionDiscoveryTopic -Node $staleNode).Count + @(Get-CopilotMqttSessionStateTopic -Node $staleNode).Count)
+}
+$statusFixture.attributes = [pscustomobject]@{ machine = $script:DaemonMachineName }
+$statusFixture.state = 'idle'; $script:DaemonStaleSessions = @{}; $script:Swept = @()
+Update-DaemonStaleSessions -Headers @{} -Discovery $snapshot -Now $start
+$statusFixture.state = 'ended'
+Update-DaemonStaleSessions -Headers @{} -Discovery $snapshot -Now $start.AddMinutes(1)
+Test-That 'a session ending during its grace is retired promptly' { $script:Swept.Count -gt 0 }
 
 # A machine whose name happens to look like a session node.
 $script:Swept = @()

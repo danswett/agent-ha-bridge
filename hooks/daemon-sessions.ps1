@@ -300,6 +300,37 @@ function Restore-DaemonSessionEntities {
     $true
 }
 
+$script:DaemonOrphanFirstSeen = @{}
+$script:DaemonWithdrawalQueue = $null
+
+function Get-DaemonWithdrawalQueue {
+    if ($null -eq $script:DaemonWithdrawalQueue) {
+        $path = Get-BridgeRuntimePath 'agent-bridge-withdrawals.json'
+        $queue = if (Test-Path -LiteralPath $path) { Get-Content -LiteralPath $path -Raw | ConvertFrom-Json -AsHashtable } else { @{} }
+        if ($queue -isnot [System.Collections.IDictionary] -or @($queue.Keys | Where-Object { $_ -notmatch '^agent_bridge_[0-9a-z]{12,}$' }).Count) {
+            throw 'Invalid session withdrawal queue; refusing cleanup'
+        }
+        $script:DaemonWithdrawalQueue = $queue
+    }
+    return $script:DaemonWithdrawalQueue
+}
+
+function Set-DaemonWithdrawalQueued {
+    param([string]$Node, [bool]$Queued)
+    $queue = Get-DaemonWithdrawalQueue
+    $had = $queue.ContainsKey($Node)
+    if ($Queued) { $queue[$Node] = $true } else { [void]$queue.Remove($Node) }
+    $path = Get-BridgeRuntimePath 'agent-bridge-withdrawals.json'
+    try {
+        [IO.File]::WriteAllText("$path.tmp", ($queue | ConvertTo-Json -Compress))
+        [IO.File]::Move("$path.tmp", $path, $true)
+    }
+    catch {
+        if ($had) { $queue[$Node] = $true } else { [void]$queue.Remove($Node) }
+        throw
+    }
+}
+
 function Clear-CopilotMqttOrphans {
     <#
         Removes published entities for sessions that are no longer live.
@@ -307,8 +338,8 @@ function Clear-CopilotMqttOrphans {
         A daemon that is killed rather than shut down cleanly, or a session that exits
         while no daemon is running, leaves its retained MQTT discovery configs in the
         broker with nothing to retire them. On startup the daemon reconciles the full
-        published set against the live sessions and clears anything orphaned, so the
-        dashboard never accumulates dead sessions across daemon restarts.
+        published set against live sessions. Unclaimed nodes wait ten minutes unless
+        already ended, and all wait until the verified dashboard no longer shows them.
 
         Orphans are matched by node id: every published entity id is
         `<component>.agent_bridge_<node>_<object>`, and the live node ids are computed
@@ -320,21 +351,22 @@ function Clear-CopilotMqttOrphans {
         are therefore excluded, and when the peer list could not be read the sweep is
         skipped entirely rather than run on a partial picture - deleting a running
         machine's session entities is far worse than leaving a dead one a while longer,
-        and the sweep runs again on the next start.
+        and the pending sweep runs again on the next reconcile.
     #>
     param(
         [Parameter(Mandatory)][hashtable]$Headers,
-        [Parameter(Mandatory)][hashtable]$Live,
+        [Parameter(Mandatory)][hashtable]$Live, [hashtable]$KnownSessions = @{},
         [AllowNull()]$Discovery = $null
     )
 
     if (-not (Test-DaemonDiscoveryContext -Snapshot $Discovery) -or -not $Discovery.Complete -or
         -not [object]::ReferenceEquals($Live, $Discovery.Live)) {
+        $script:DaemonOrphanFirstSeen.Clear()
         Write-DaemonLog -Message 'orphan sweep skipped: local session ownership observation is incomplete'
         return $false
     }
     $liveNodes = @{}
-    foreach ($sessionId in $Live.Keys) {
+    foreach ($sessionId in @($Live.Keys) + @($KnownSessions.Keys) + @($script:DaemonPendingRetire)) {
         $liveNodes[(Get-CopilotMqttNodeId -SessionId $sessionId)] = $true
     }
 
@@ -343,6 +375,7 @@ function Clear-CopilotMqttOrphans {
     }
     catch {
         if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        $script:DaemonOrphanFirstSeen.Clear()
         Write-DaemonLog -Message "orphan sweep skipped: $($_.Exception.Message)"
         return $false
     }
@@ -350,8 +383,9 @@ function Clear-CopilotMqttOrphans {
     # Every machine, including this one, so a machine-level node is never mistaken for
     # a session and peers' sessions are left alone.
     $peers = @(Get-BridgePeerMachine -States $states)
-    if ($peers.Count -eq 0) {
-        Write-DaemonLog -Message 'orphan sweep skipped: no machine sensors visible yet'
+    if ($peers.Count -eq 0 -or @($peers | Where-Object { -not $_.SessionsKnown }).Count -gt 0) {
+        $script:DaemonOrphanFirstSeen.Clear()
+        Write-DaemonLog -Message 'orphan sweep skipped: machine session inventories are incomplete'
         return $false
     }
     foreach ($peer in $peers) {
@@ -364,31 +398,127 @@ function Clear-CopilotMqttOrphans {
     }
 
     $orphanNodes = @{}
+    $orphanStatus = @{}
+    $localNodes = Get-DaemonWithdrawalQueue
+    foreach ($node in @($localNodes.Keys)) { if (-not $liveNodes.ContainsKey($node)) { $orphanNodes[$node] = $true } }
     foreach ($state in @($states)) {
         if ($null -eq $state) { continue }
         if ([string]$state.entity_id -notmatch '^(?:select|sensor|text|button)\.(agent_bridge_[0-9a-z]{12,})_') {
             continue
         }
         $node = $Matches[1]
-        if (-not $liveNodes.ContainsKey($node)) { $orphanNodes[$node] = $true }
-    }
-
-    foreach ($node in $orphanNodes.Keys) {
-        foreach ($topic in @(
-            (Get-CopilotMqttSessionDiscoveryTopic -Node $node) +
-            (Get-CopilotMqttSessionStateTopic -Node $node)
-        )) {
-            try {
-                Publish-CopilotMqttMessage -Topic $topic -Payload '' -Headers $Headers -Retain
-            }
-            catch {
-                if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
-                # Best effort; a missed one is caught on the next startup sweep.
+        if (-not $liveNodes.ContainsKey($node)) {
+            if ([string]$state.entity_id -ceq "sensor.${node}_status") {
+                $orphanStatus[$node] = [string]$state.state
+                if ($state.attributes -and $state.attributes.PSObject.Properties['machine'] -and
+                    [string]$state.attributes.machine -ieq $script:DaemonMachineName) { $orphanNodes[$node] = $true }
             }
         }
-        Write-DaemonLog -Message "cleared orphaned entities for node $node"
     }
-    $true
+
+    foreach ($node in @($script:DaemonOrphanFirstSeen.Keys)) {
+        if (-not $orphanNodes.ContainsKey($node)) { [void]$script:DaemonOrphanFirstSeen.Remove($node) }
+    }
+    $success = $true
+    foreach ($node in $orphanNodes.Keys) {
+        if (-not $script:DaemonOrphanFirstSeen.ContainsKey($node)) { $script:DaemonOrphanFirstSeen[$node] = [DateTimeOffset]::Now }
+        $observation = Get-Variable -Name BridgeDashboardObservation -Scope Script -ErrorAction SilentlyContinue
+        if ((-not $localNodes.ContainsKey($node) -and $orphanStatus[$node] -ne 'ended' -and ([DateTimeOffset]::Now - $script:DaemonOrphanFirstSeen[$node]).TotalMinutes -lt 10) -or
+            -not $observation -or -not $observation.Value -or -not $observation.Value.Verified -or
+            $observation.Value.ReferencedNodes -ccontains $node) {
+            $success = $false
+            continue
+        }
+        try {
+            if ($orphanStatus[$node] -eq 'ending') {
+                Publish-CopilotMqttMessage -Topic "$($script:CopilotMqttConfig.TopicRoot)/$node/status/state" -Payload 'ended' -Headers $Headers -Retain
+            }
+            Set-DaemonWithdrawalQueued -Node $node -Queued $true
+            Remove-CopilotMqttSessionTopics -Node $node -Headers $Headers
+            Set-DaemonWithdrawalQueued -Node $node -Queued $false
+            [void]$script:DaemonOrphanFirstSeen.Remove($node)
+            Write-DaemonLog -Message "cleared orphaned entities for node $node"
+        }
+        catch {
+            if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+            $success = $false
+            Write-DaemonLog -Message "orphan cleanup failed for $node : $($_.Exception.Message); trying again"
+        }
+    }
+    $success
+}
+
+$script:DaemonStaleSessions = @{}
+
+function Update-DaemonStaleSessions {
+    param(
+        [Parameter(Mandatory)][hashtable]$Headers, [AllowNull()]$Discovery, [hashtable]$KnownSessions = @{},
+        [DateTimeOffset]$Now = [DateTimeOffset]::Now
+    )
+
+    if (-not (Test-DaemonDiscoveryContext -Snapshot $Discovery) -or -not $Discovery.Complete) {
+        $script:DaemonStaleSessions.Clear()
+        return
+    }
+    try { $states = Get-DaemonHomeAssistantStates -Headers $Headers }
+    catch {
+        if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+        $script:DaemonStaleSessions.Clear()
+        Write-DaemonLog -Message "stale session scan failed: $($_.Exception.Message)"
+        return
+    }
+    $peers = @(Get-BridgePeerMachine -States $states)
+    if ($peers.Count -eq 0 -or @($peers | Where-Object { -not $_.SessionsKnown }).Count -gt 0) {
+        $script:DaemonStaleSessions.Clear()
+        return
+    }
+    $claimed = @{}
+    foreach ($id in @($Discovery.Live.Keys) + @($KnownSessions.Keys)) { $claimed[(Get-CopilotMqttNodeId -SessionId $id)] = $true }
+    foreach ($id in @($script:DaemonPendingRetire)) { $claimed[(Get-CopilotMqttNodeId -SessionId $id)] = $true }
+    foreach ($peer in $peers) {
+        if ($peer.IsSelf) { continue }
+        foreach ($session in @($peer.Sessions)) { if ($session.node) { $claimed[[string]$session.node] = $true } }
+    }
+    $queue = Get-DaemonWithdrawalQueue
+    $states = @($states) + @($queue.Keys | Where-Object {
+        $node = $_; -not @($states | Where-Object { $_.entity_id -ceq "sensor.${node}_status" }).Count
+    } | ForEach-Object { [pscustomobject]@{ entity_id = "sensor.${_}_status"; state = 'ended'; attributes = $null } })
+    $seen = @{}
+    foreach ($state in $states) {
+        if ($null -eq $state -or [string]$state.entity_id -notmatch '^sensor\.(agent_bridge_[0-9a-z]{12,})_status$') { continue }
+        $node = $Matches[1]
+        if ($claimed.ContainsKey($node)) { continue }
+        if (-not $queue.ContainsKey($node) -and (-not $state.attributes -or
+            -not $state.attributes.PSObject.Properties['machine'] -or
+            [string]$state.attributes.machine -ine $script:DaemonMachineName)) { continue }
+        $seen[$node] = $true
+        if (-not $script:DaemonStaleSessions.ContainsKey($node)) {
+            $script:DaemonStaleSessions[$node] = [pscustomobject]@{ Since = $Now }
+        }
+        $stale = $script:DaemonStaleSessions[$node]
+        if (-not $queue.ContainsKey($node) -and [string]$state.state -ne 'ended' -and ($Now - $stale.Since).TotalMinutes -lt 10) { continue }
+        try {
+            if ([string]$state.state -eq 'ending') {
+                Publish-CopilotMqttMessage -Topic "$($script:CopilotMqttConfig.TopicRoot)/$node/status/state" `
+                    -Payload 'ended' -Headers $Headers -Retain
+            }
+            $observation = Get-Variable -Name BridgeDashboardObservation -Scope Script -ErrorAction SilentlyContinue
+            if (-not $observation -or -not $observation.Value -or -not $observation.Value.Verified -or
+                $observation.Value.ReferencedNodes -ccontains $node) { continue }
+            Set-DaemonWithdrawalQueued -Node $node -Queued $true
+            Remove-CopilotMqttSessionTopics -Node $node -Headers $Headers
+            Set-DaemonWithdrawalQueued -Node $node -Queued $false
+            [void]$script:DaemonStaleSessions.Remove($node)
+            Write-DaemonLog -Message "retired stale local session $node"
+        }
+        catch {
+            if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+            Write-DaemonLog -Message "stale session cleanup failed for $node : $($_.Exception.Message); trying again"
+        }
+    }
+    foreach ($node in @($script:DaemonStaleSessions.Keys)) {
+        if (-not $seen.ContainsKey($node)) { [void]$script:DaemonStaleSessions.Remove($node) }
+    }
 }
 
 $script:DaemonStaleHelperSeen = @{}
@@ -531,6 +661,8 @@ function Invoke-DaemonUnscopedEntityCleanup {
     $cleared
 }
 
+$script:DaemonMissingSessions = @{}
+
 function Sync-DaemonSessions {
     <#
         Brings the published Home Assistant entities in line with the live sessions,
@@ -565,15 +697,39 @@ function Sync-DaemonSessions {
     $script:DaemonDiscoverySnapshot = $Discovery
     $script:DaemonVerbose = $verbose
 
-    # Note sessions that have exited, and drop them from state now, but defer removing
+    # Note ended sessions and sessions absent for ten minutes, then drop them from state,
+    # but defer removing
     # their Home Assistant entities until after the dashboard has been rebuilt without
     # them (below). Removing the entities first leaves the still-present card pointing
     # at dead entities, which renders as "Entity not found" until the rebuild catches
     # up. Rebuilding first means the card is gone before the entities are.
     $goneSessions = @()
     foreach ($known in @($State.Keys)) {
-        if ($live.ContainsKey($known)) { continue }
-        if (-not (Test-DaemonRetirementObservation -Snapshot $Discovery -SessionId $known)) { continue }
+        if ($live.ContainsKey($known) -or -not (Test-DaemonRetirementObservation -Snapshot $Discovery -SessionId $known)) {
+            [void]$script:DaemonMissingSessions.Remove($known)
+            continue
+        }
+        $ending = $State[$known]
+        $status = if ($ending.PSObject.Properties['Status']) { [string]$ending.Status } else { '' }
+        if ($status -notin @('ending', 'ended')) {
+            if (-not $script:DaemonMissingSessions.ContainsKey($known)) { $script:DaemonMissingSessions[$known] = [DateTimeOffset]::Now }
+            if (([DateTimeOffset]::Now - $script:DaemonMissingSessions[$known]).TotalMinutes -lt 10) { continue }
+        }
+        if ($status -ne 'ended') {
+            try {
+                Set-CopilotMqttStatus -SessionId $known -Status 'ended' -Headers $Headers -Attributes (
+                    Add-DaemonTuningAttributes -Attributes @{
+                        session = $ending.Name; machine = $ending.Machine
+                        updated = [DateTimeOffset]::Now.ToString('o')
+                    } -Tuning $ending) | Out-Null
+            }
+            catch {
+                if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
+                Write-DaemonLog -Message "ending status recovery failed for $known : $($_.Exception.Message)"
+                continue
+            }
+        }
+        [void]$script:DaemonMissingSessions.Remove($known)
         $goneSessions += $known
         $State.Remove($known)
     }
@@ -657,6 +813,7 @@ function Sync-DaemonSessions {
     }
     $dashboardCurrent = Sync-DaemonDashboard -Descriptors $descriptors -Capabilities $capabilities -Headers $Headers -ObserveOnly:(-not $publish)
     Complete-DaemonSessionRetirement -Gone $goneSessions -DashboardCurrent $dashboardCurrent -Headers $Headers -Discovery $Discovery
+    Update-DaemonStaleSessions -Headers $Headers -Discovery $Discovery -KnownSessions $State
     Update-DaemonOwnerCatalogue -Snapshot $Discovery -State $State
 }
 
@@ -2078,15 +2235,18 @@ function Complete-DaemonSessionRetirement {
     $script:DaemonPendingRetire = @($retirePlan.Queue)
     foreach ($known in @($retirePlan.Retire)) {
         try {
+            Set-DaemonWithdrawalQueued -Node (Get-CopilotMqttNodeId -SessionId $known) -Queued $true
             Remove-CopilotMqttSession -SessionId $known -Headers $Headers
             # The session itself is going, so there can be no replacement question to
             # protect; everything it recorded goes with it.
             Remove-CopilotDecisionMarker -SessionId $known -AllBaselines
+            Set-DaemonWithdrawalQueued -Node (Get-CopilotMqttNodeId -SessionId $known) -Queued $false
             Write-DaemonLog -Message "retired session $($known.Substring(0, [Math]::Min(8, $known.Length)))"
         }
         catch {
             if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
             Write-DaemonLog -Message "retire failed for $known : $($_.Exception.Message)"
+            $script:DaemonPendingRetire = @($script:DaemonPendingRetire + @($known) | Select-Object -Unique)
         }
     }
 }

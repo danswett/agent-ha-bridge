@@ -34,7 +34,7 @@ $script:A14PsCalls = 0
 $script:A14Guard = $null
 $script:A14ActualWindows = $script:BridgeIsWindows
 $expectedGroups = 26
-$expectedChecks = 126
+$expectedChecks = 128
 $primaryFailure = $null
 
 function Test-A14 {
@@ -888,6 +888,9 @@ try {
             [void](Invoke-A14Reconcile)
             $script:A14State[$script:A14Ids.D] = [pscustomobject]@{ Name = "$kind`: D"; Machine = 'FIXTURE'; Kind = $kind; Status = 'idle'; Offset = 0L }
             Write-A14Registration D
+            [void](Invoke-A14Reconcile)
+            Test-A14 "$kind dead D remains during its grace" ($script:A14State.ContainsKey($script:A14Ids.D))
+            $script:DaemonMissingSessions[$script:A14Ids.D] = [DateTimeOffset]::Now.AddMinutes(-11)
             [void](Invoke-A14Reconcile)
             Test-A14 "$kind complete negative evidence queues only D" (-not $script:A14State.ContainsKey($script:A14Ids.D) -and $script:DaemonPendingRetire -contains $script:A14Ids.D)
             [void](Invoke-A14Reconcile)

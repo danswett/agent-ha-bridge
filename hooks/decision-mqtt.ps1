@@ -611,6 +611,19 @@ function Get-CopilotMqttSessionStateTopic {
     )
 }
 
+function Remove-CopilotMqttSessionTopics {
+    param([Parameter(Mandatory)][string]$Node, [Parameter(Mandatory)][hashtable]$Headers)
+
+    $discovery = @(Get-CopilotMqttSessionDiscoveryTopic -Node $Node)
+    $status = "$($script:CopilotMqttConfig.DiscoveryPrefix)/sensor/$Node/status/config"
+    foreach ($topic in @(
+        (Get-CopilotMqttSessionStateTopic -Node $Node) +
+        @($discovery | Where-Object { $_ -cne $status }) + @($status)
+    )) {
+        Publish-CopilotMqttMessage -Topic $topic -Payload '' -Headers $Headers -Retain
+    }
+}
+
 function Remove-CopilotMqttSession {
     <#
         Clears the retained discovery configs so Home Assistant drops the entities
@@ -629,13 +642,7 @@ function Remove-CopilotMqttSession {
 
     Publish-CopilotMqttMessage -Topic $topics.Availability -Payload 'offline' -Headers $Headers -Retain
 
-    foreach ($topic in (Get-CopilotMqttSessionDiscoveryTopic -Node $topics.Node)) {
-        Publish-CopilotMqttMessage -Topic $topic -Payload '' -Headers $Headers -Retain
-    }
-
-    foreach ($topic in (Get-CopilotMqttSessionStateTopic -Node $topics.Node)) {
-        Publish-CopilotMqttMessage -Topic $topic -Payload '' -Headers $Headers -Retain
-    }
+    Remove-CopilotMqttSessionTopics -Node $topics.Node -Headers $Headers
 }
 
 function Publish-CopilotMqttUpdate {
