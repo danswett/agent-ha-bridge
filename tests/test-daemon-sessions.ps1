@@ -296,6 +296,11 @@ $script:Log = @()
 $script:Published = @()
 $script:Retired = @()
 $script:FailPublish = @{}
+$script:FailRetire = $false
+$script:FailRename = $false
+$script:FailStatusRename = $false
+$script:RenamedDiscovery = @{}
+$script:StatusValues = @{}
 function Write-DaemonLog { param([string]$Message) $script:Log += $Message }
 function Get-HomeAssistantState { param([string]$EntityId, [hashtable]$Headers) $null }
 function Publish-CopilotMqttSession { param($SessionId, $SessionName, $Machine, $Headers)
@@ -304,7 +309,7 @@ function Set-CopilotMqttEntityIds { param($SessionId) $true }
 function Clear-CopilotMqttDecisionFields { param($SessionId, $SessionName, $Machine, $Headers) }
 function Publish-CopilotMqttSubmitButton { param($SessionId, $SessionName, $Machine, $Headers) }
 # These emit something, as real calls can, to prove none of it leaks into what is returned.
-function Set-CopilotMqttStatus { param($SessionId, $Status, $Headers, $Attributes) $script:StatusAttributes[$SessionId] = $Attributes; 'status-response' }
+function Set-CopilotMqttStatus { param($SessionId, $Status, $Headers, $Attributes) if ($script:FailStatusRename) { throw 'broker down' }; $script:StatusValues[$SessionId] = $Status; $script:StatusAttributes[$SessionId] = $Attributes; 'status-response' }
 $script:StatusAttributes = @{}
 function Set-CopilotMqttActivity { param($SessionId, $Summary, $Detail, $Headers) }
 function Invoke-HomeAssistantService { param($Domain, $Service, $Headers, $Data) @('service', 'response') }
@@ -317,7 +322,9 @@ function Get-BridgeServedReplyCardUrl { '' }
 function Set-CopilotMqttGlobalEntityId { $true }
 function Clear-DaemonLaunchNoteOnRegistration { param($Headers) $script:NoteCleared = ($script:NoteCleared + 1) }
 function Initialize-BridgeMachineSelector { param($Machines) '' }
-function Remove-CopilotMqttSession { param($SessionId, $Headers) $script:Retired += $SessionId }
+function Remove-CopilotMqttSession { param($SessionId, $Headers) if ($script:FailRetire) { throw 'broker down' }; $script:Retired += $SessionId }
+function Update-CopilotMqttSessionName { param($SessionId, $SessionName, $Machine, $Headers)
+    if ($script:FailRename) { throw 'broker down' }; $script:RenamedDiscovery[$SessionId] = $SessionName }
 function Remove-CopilotDecisionMarker { param($SessionId) }
 function Update-DaemonSessionActivity { param($Id, $Entry, $Session, $Headers, $VerboseOn) $script:Streamed += $Id }
 function Test-BridgeSessionWorking { param($SessionId, $Kind, $Transcript, $Status) $false }
@@ -369,12 +376,37 @@ Invoke-TestSessionSync -Headers $headers -State $state -Live @{ $script:Ids.s1 =
 Test-That 'a session whose publish fails is not adopted, so it is tried again' { -not $state.ContainsKey($script:Ids.s3) }
 Test-That 'known sessions stream their activity instead of being republished' { $script:Streamed -contains $script:Ids.s1 -and $script:Published.Count -eq 0 }
 
+$state[$script:Ids.s2].Status = 'ended'
 Invoke-TestSessionSync -Headers $headers -State $state -Live @{ $script:Ids.s1 = (New-Session 's1') }
 Test-That 'an ended session leaves state at once' { -not $state.ContainsKey($script:Ids.s2) }
 Test-That 'and its card leaves the dashboard' { @($script:DashboardSessions).Count -eq 1 }
 Test-That 'but its entities wait a pass, so the browser is not left pointing at nothing' { $script:Retired.Count -eq 0 }
 Invoke-TestSessionSync -Headers $headers -State $state -Live @{ $script:Ids.s1 = (New-Session 's1') }
 Test-That 'and are retired on the next' { ($script:Retired -join ',') -eq $script:Ids.s2 }
+
+$retryId = $script:Ids.s2
+$script:DaemonPendingRetire = @($retryId)
+$script:FailRetire = $true
+Invoke-TestSessionSync -Headers $headers -State $state -Live @{ $script:Ids.s1 = (New-Session 's1') }
+Test-That 'a failed removal stays queued for retry' { $script:DaemonPendingRetire -contains $retryId }
+$script:FailRetire = $false
+$script:Retired = @()
+Invoke-TestSessionSync -Headers $headers -State $state -Live @{ $script:Ids.s1 = (New-Session 's1') }
+Test-That 'a failed removal is retried once the broker returns' { $script:Retired -contains $retryId -and $script:DaemonPendingRetire -notcontains $retryId }
+
+$endingId = $script:Ids.s3
+$state[$endingId] = [pscustomobject]@{ Name = 'Claude: ending'; Machine = 'DESK'; Status = 'ending'; Kind = 'claude' }
+Invoke-TestSessionSync -Headers $headers -State $state -Live @{ $script:Ids.s1 = (New-Session 's1') }
+Test-That 'a missing ending session publishes ended before retirement' { $script:StatusValues[$endingId] -eq 'ended' }
+
+$missingId = $script:Ids.s5
+$state[$missingId] = [pscustomobject]@{ Name = 'Claude: missing'; Machine = 'DESK'; Status = 'idle'; Kind = 'claude' }
+$script:DaemonMissingSessions = @{}
+Invoke-TestSessionSync -Headers $headers -State $state -Live @{ $script:Ids.s1 = (New-Session 's1') }
+Test-That 'a non-ended known session remains while process absence is under ten minutes' { $state.ContainsKey($missingId) }
+$script:DaemonMissingSessions[$missingId] = [DateTimeOffset]::Now.AddMinutes(-11)
+Invoke-TestSessionSync -Headers $headers -State $state -Live @{ $script:Ids.s1 = (New-Session 's1') }
+Test-That 'a non-ended known session retires after ten minutes of process absence' { -not $state.ContainsKey($missingId) }
 
 $rebuilds = @($script:Log | Where-Object { $_ -like 'dashboard rebuilt*' }).Count
 Invoke-TestSessionSync -Headers $headers -State $state -Live @{ $script:Ids.s1 = (New-Session 's1') }
@@ -396,6 +428,39 @@ Test-That 'renaming it is picked up next pass, though the old name looked perfec
 Test-That 'the new name reaches its status attributes' { $script:StatusAttributes[$renamed].session -eq 'Copilot: agent-ha-bridge' }
 Test-That 'and its card header' { @($script:DashboardSessions | Where-Object { $_.Name -eq 'Copilot: agent-ha-bridge' }).Count -eq 1 }
 Test-That 'and the republish it triggers returns nothing to the reconcile' { $null -eq $renameLeak } ($renameLeak -join ',')
+
+$script:FailRename = $true
+$script:DisplayNames[$renamed] = 'Copilot: name after failure'
+Invoke-TestSessionSync -Headers $headers -State $renameState -Live @{ $renamed = (New-CopilotSession 's4') }
+$script:FailRename = $false
+Invoke-TestSessionSync -Headers $headers -State $renameState -Live @{ $renamed = (New-CopilotSession 's4') }
+Test-That 'a failed discovery rename is retried even when the session name no longer changes' {
+    $script:RenamedDiscovery[$renamed] -eq 'Copilot: name after failure'
+}
+
+$script:FailStatusRename = $true
+$script:DisplayNames[$renamed] = 'Copilot: status retry'
+Invoke-TestSessionSync -Headers $headers -State $renameState -Live @{ $renamed = (New-CopilotSession 's4') }
+$script:FailStatusRename = $false
+Invoke-TestSessionSync -Headers $headers -State $renameState -Live @{ $renamed = (New-CopilotSession 's4') }
+Test-That 'a failed status rename is retried along with discovery' { $script:StatusAttributes[$renamed].session -eq 'Copilot: status retry' }
+
+$script:RenamedDiscovery.Remove($renamed)
+$renameState[$renamed].PSObject.Properties.Remove('DiscoveryName')
+Invoke-TestSessionSync -Headers $headers -State $renameState -Live @{ $renamed = (New-CopilotSession 's4') }
+Test-That 'an adopted persisted session repairs an old discovery name without another rename' {
+    $script:RenamedDiscovery[$renamed] -eq 'Copilot: status retry'
+}
+
+$codexAgent = Get-DaemonAgent -Kind 'codex'
+$oldKnownActivity = $codexAgent.KnownActivity
+$codexAgent.KnownActivity = { param($Id, $Entry, $Session, $Headers, $VerboseOn) }
+$codexEntry = [pscustomobject]@{ Name = 'Codex: existing'; Machine = 'DESK'; Status = 'idle'; Kind = 'codex' }
+$codexSession = [pscustomobject]@{ SessionId = $script:Ids.s5; ProcessId = 1; WorkingDirectory = 'C:\x' }
+$script:StatusValues[$script:Ids.s5] = 'working'
+Update-DaemonKnownSession -Session $codexSession -Entry $codexEntry -Headers $headers -VerboseOn $false
+Test-That 'discovery name repair does not overwrite a hook-owned Codex status' { $script:StatusValues[$script:Ids.s5] -eq 'working' }
+$codexAgent.KnownActivity = $oldKnownActivity
 
 # The other half of the same check: a session of any kind can be holding the Copilot
 # id fallback, from a build that published it before its own adapter had loaded.

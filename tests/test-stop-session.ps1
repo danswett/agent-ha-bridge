@@ -1313,6 +1313,12 @@ $script:MqttMsgs = @()
 Remove-CopilotMqttSession -SessionId 'aaaaaaaa-1111-2222-3333-444444444444' -Headers $headers
 $cleared = ($script:MqttMsgs | Where-Object { $_.Topic -match "/button/$node/stop/config$" } | Select-Object -First 1)
 Test-That 'retiring a session clears the stop button too' { $null -ne $cleared -and $cleared.Payload -eq '' }
+Test-That 'retirement clears retained state before discovery and the status config last' {
+    $clears = @($script:MqttMsgs | Where-Object { $_.Payload -eq '' })
+    $stateTopics = @(Get-CopilotMqttSessionStateTopic -Node $node)
+    (($clears | Select-Object -First $stateTopics.Count).Topic -join '|') -eq ($stateTopics -join '|') -and
+        $clears[-1].Topic -match "/sensor/$node/status/config$"
+}
 
 Write-Host ''
 Write-Host '--- reporting what Send did must not empty the card ---'
