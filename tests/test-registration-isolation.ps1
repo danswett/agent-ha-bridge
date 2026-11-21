@@ -1129,6 +1129,7 @@ try {
             Test-A14 'a skipped orphan observation does not poison the pending-success state' (-not $attempted -and $script:DaemonSessionCleanupPending.ContainsKey('Orphans'))
         }
         finally { $script:A14States[$machineEntity] = $machine; $script:DaemonStatesCache = $null }
+        $script:DaemonOrphanSweepNextAttempt = [DateTimeOffset]::Now.AddSeconds(-1)
         [void](Invoke-A14Reconcile)
         Test-A14 'ordinary recovery resumes actual deferred startup work' ($script:DaemonSessionCleanupPending.Count -eq 0 -and [IO.File]::Exists($script:DaemonConfig.LegacyCleanupMarker))
     }

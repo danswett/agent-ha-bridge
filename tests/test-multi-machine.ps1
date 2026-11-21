@@ -827,6 +827,80 @@ Test-That 'an incomplete picture skips the sweep rather than guessing' {
     @($script:Swept).Count -eq 0 -and @($script:SweepLog | Where-Object { $_ -match 'skipped' }).Count -eq 1
 }
 
+Write-Host '--- the sweep waits for restored sensors, and a silent machine stops vouching ---'
+
+function New-SweepStates {
+    param([string]$PeerOnline = 'on', [switch]$NoSensors)
+    $states = @(
+        [pscustomobject]@{ entity_id = 'select.agent_bridge_1111111111111111_decision'; state = 'Idle'; attributes = [pscustomobject]@{} }
+        [pscustomobject]@{ entity_id = 'select.agent_bridge_2222222222222222_decision'; state = 'Idle'; attributes = [pscustomobject]@{} }
+        [pscustomobject]@{ entity_id = 'select.agent_bridge_3333333333333333_decision'; state = 'Idle'; attributes = [pscustomobject]@{} }
+    )
+    if ($NoSensors) { return $states }
+    $states + @(
+        [pscustomobject]@{ entity_id = "sensor.agent_bridge_${selfSlug}_sessions"; state = '1'
+            attributes = [pscustomobject]@{ machine = 'HERE'; sessions = @() } }
+        [pscustomobject]@{ entity_id = 'sensor.agent_bridge_peerbox_sessions'; state = '1'
+            attributes = [pscustomobject]@{ machine = 'PEERBOX'
+                sessions = @([pscustomobject]@{ node = 'agent_bridge_2222222222222222' }) } }
+        [pscustomobject]@{ entity_id = 'binary_sensor.agent_bridge_peerbox_online'; state = $PeerOnline; attributes = [pscustomobject]@{} }
+    )
+}
+function Invoke-SweepPass {
+    param([object[]]$States)
+    $script:DaemonStatesCache = $States
+    $script:SweepHttpStates = $States
+    $script:DaemonStatesCacheAt = [DateTimeOffset]::MinValue
+    $live = @{ '11111111-1111-1111-1111-111111111111' = $true }
+    Invoke-DaemonStartupSessionCleanup -Headers @{} -State @{} -Phase Orphans `
+        -Discovery (New-DaemonDiscoverySnapshot -Live $live -Complete)
+}
+function Test-SweptNode { param([string]$Node) @($script:Swept | Where-Object { $_ -match $Node }).Count -ge 1 }
+
+$script:Swept = @(); $script:SweepLog = @()
+$script:DaemonSessionCleanupPending = @{}
+$script:DaemonOrphanSweepNextAttempt = $null
+$script:DaemonOrphanSweepPeerSilentSince = @{}
+$script:DaemonOrphanSweepSkipLogged = @{}
+
+$first = Invoke-SweepPass -States (New-SweepStates -NoSensors)
+Test-That 'a first pass with no machine sensors skips, deletes nothing and stays pending' {
+    -not $first -and $script:DaemonSessionCleanupPending.ContainsKey('Orphans') -and @($script:Swept).Count -eq 0
+}
+$readsBefore = $script:SweepHttpRequests.Count
+$tooSoon = Invoke-SweepPass -States (New-SweepStates)
+Test-That 'a retry inside the cadence does not read Home Assistant or sweep' {
+    -not $tooSoon -and $script:SweepHttpRequests.Count -eq $readsBefore -and @($script:Swept).Count -eq 0
+}
+$script:DaemonOrphanSweepNextAttempt = [DateTimeOffset]::Now.AddSeconds(-1)
+$later = Invoke-SweepPass -States (New-SweepStates)
+Test-That 'the later pass sees the restored sensors, clears the stale node and drains pending' {
+    $later -and -not $script:DaemonSessionCleanupPending.ContainsKey('Orphans') -and (Test-SweptNode 'agent_bridge_3333333333333333')
+}
+Test-That 'the later pass keeps this machine and the fresh peer claimed nodes' {
+    -not (Test-SweptNode 'agent_bridge_1111111111111111') -and -not (Test-SweptNode 'agent_bridge_2222222222222222')
+}
+Test-That 'one skip line and one done line are logged' {
+    @($script:SweepLog | Where-Object { $_ -match 'still skipped' }).Count -eq 1 -and
+        @($script:SweepLog | Where-Object { $_ -match 'orphan sweep done: cleared 1' }).Count -eq 1
+}
+
+# A restored sensor whose host has not reported yet may be a live slow host.
+$script:Swept = @(); $script:DaemonSessionCleanupPending = @{}
+$script:DaemonOrphanSweepNextAttempt = $null
+$script:DaemonOrphanSweepPeerSilentSince = @{}
+$waited = Invoke-SweepPass -States (New-SweepStates -PeerOnline 'unavailable')
+Test-That 'a machine that has only just gone quiet still vouches and the sweep waits' {
+    -not $waited -and $script:DaemonSessionCleanupPending.ContainsKey('Orphans') -and @($script:Swept).Count -eq 0
+}
+$script:DaemonOrphanSweepNextAttempt = $null
+$script:DaemonOrphanSweepPeerSilentSince['peerbox'] = [DateTimeOffset]::Now.AddSeconds(-($script:OrphanSweepStalePeerSeconds + 5))
+$aged = Invoke-SweepPass -States (New-SweepStates -PeerOnline 'unavailable')
+Test-That 'a machine silent past the bound stops vouching, so its stale nodes are cleared' {
+    $aged -and (Test-SweptNode 'agent_bridge_2222222222222222') -and (Test-SweptNode 'agent_bridge_3333333333333333') -and
+        -not (Test-SweptNode 'agent_bridge_1111111111111111')
+}
+
 Write-Host '--- taking a machine that is never coming back off the dashboard ---'
 
 # A machine that was renamed, reimaged or thrown away never publishes under its old
