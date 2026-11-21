@@ -300,6 +300,27 @@ function Restore-DaemonSessionEntities {
     $true
 }
 
+# Retry cadence for a skipped sweep: each attempt is a full /api/states read, and HA
+# needs on the order of a minute to restore retained entities after a restart.
+$script:OrphanSweepRetrySeconds = 60
+# A machine that has not reported online for this long stops vouching for its sessions:
+# the online sensor expires at 180 s and beats every 60 s, so 300 s outlasts a merely slow peer.
+$script:OrphanSweepStalePeerSeconds = 300
+# One log line per skip reason per this long; the retry loop would otherwise repeat it.
+$script:OrphanSweepSkipLogSeconds = 600
+$script:DaemonOrphanSweepPeerSilentSince = @{}
+$script:DaemonOrphanSweepNextAttempt = $null
+$script:DaemonOrphanSweepSkipLogged = @{}
+
+function Write-OrphanSweepSkip {
+    param([Parameter(Mandatory)][string]$Reason)
+    $now = [DateTimeOffset]::Now
+    $last = $script:DaemonOrphanSweepSkipLogged[$Reason]
+    if ($null -ne $last -and ($now - $last).TotalSeconds -lt $script:OrphanSweepSkipLogSeconds) { return }
+    $script:DaemonOrphanSweepSkipLogged[$Reason] = $now
+    Write-DaemonLog -Message "orphan sweep still skipped: $Reason"
+}
+
 function Clear-CopilotMqttOrphans {
     <#
         Removes published entities for sessions that are no longer live.
@@ -330,7 +351,7 @@ function Clear-CopilotMqttOrphans {
 
     if (-not (Test-DaemonDiscoveryContext -Snapshot $Discovery) -or -not $Discovery.Complete -or
         -not [object]::ReferenceEquals($Live, $Discovery.Live)) {
-        Write-DaemonLog -Message 'orphan sweep skipped: local session ownership observation is incomplete'
+        Write-OrphanSweepSkip -Reason 'local session ownership observation is incomplete'
         return $false
     }
     $liveNodes = @{}
@@ -343,7 +364,7 @@ function Clear-CopilotMqttOrphans {
     }
     catch {
         if (Test-BridgeObservationGuardFailure -ErrorRecord $_) { throw }
-        Write-DaemonLog -Message "orphan sweep skipped: $($_.Exception.Message)"
+        Write-OrphanSweepSkip -Reason $_.Exception.Message
         return $false
     }
 
@@ -351,12 +372,45 @@ function Clear-CopilotMqttOrphans {
     # a session and peers' sessions are left alone.
     $peers = @(Get-BridgePeerMachine -States $states)
     if ($peers.Count -eq 0) {
-        Write-DaemonLog -Message 'orphan sweep skipped: no machine sensors visible yet'
+        Write-OrphanSweepSkip -Reason 'no machine sensors visible yet'
         return $false
     }
+
+    # A restored machine sensor keeps the sessions list its host last published, however
+    # long ago, so a list is only evidence while its host is demonstrably reporting. The
+    # online sensor is the one stamp that shows it: unretained, with an expiry, and
+    # only 'on' while beats arrive. A host that is not 'on' might be dead or might just
+    # not have beaten since HA restarted, so it keeps vouching until it has stayed
+    # silent for OrphanSweepStalePeerSeconds, and the sweep waits rather than finishing
+    # on a guess. A host with no online sensor at all (an older bridge) cannot be told
+    # apart from a live one, so it always vouches.
+    $now = [DateTimeOffset]::Now
+    $vouching = @{}
+    $waiting = [System.Collections.Generic.List[string]]::new()
+    foreach ($peer in $peers) {
+        if ($peer.IsSelf) { continue }
+        if ($peer.Online -or -not $peer.OnlineKnown) {
+            [void]$script:DaemonOrphanSweepPeerSilentSince.Remove($peer.Slug)
+            $vouching[$peer.Slug] = $true
+            continue
+        }
+        if (-not $script:DaemonOrphanSweepPeerSilentSince.ContainsKey($peer.Slug)) {
+            $script:DaemonOrphanSweepPeerSilentSince[$peer.Slug] = $now
+        }
+        $silent = ($now - $script:DaemonOrphanSweepPeerSilentSince[$peer.Slug]).TotalSeconds
+        if ($silent -lt $script:OrphanSweepStalePeerSeconds) {
+            $vouching[$peer.Slug] = $true
+            $waiting.Add($peer.Slug)
+        }
+    }
+    if ($waiting.Count -gt 0) {
+        Write-OrphanSweepSkip -Reason "waiting for $($waiting.Count) machine(s) that are not reporting yet to report or age out"
+        return $false
+    }
+
     foreach ($peer in $peers) {
         $liveNodes[(Get-CopilotMqttMachineNode -Slug $peer.Slug)] = $true
-        if ($peer.IsSelf) { continue }
+        if ($peer.IsSelf -or -not $vouching.ContainsKey($peer.Slug)) { continue }
         foreach ($remote in @($peer.Sessions)) {
             $node = [string]$remote.node
             if ($node) { $liveNodes[$node] = $true }
@@ -388,6 +442,7 @@ function Clear-CopilotMqttOrphans {
         }
         Write-DaemonLog -Message "cleared orphaned entities for node $node"
     }
+    Write-DaemonLog -Message "orphan sweep done: cleared $($orphanNodes.Count) orphaned node(s)"
     $true
 }
 

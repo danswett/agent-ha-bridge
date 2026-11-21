@@ -1678,6 +1678,7 @@ function Get-BridgePeerMachine {
             Capabilities = $capabilities
             Resumable = @($resumable)
             Online = [bool]$online[$slug]
+            OnlineKnown = $online.ContainsKey($slug)
             IsSelf = ($slug -eq $self)
             EntityId = $entityId
         })
