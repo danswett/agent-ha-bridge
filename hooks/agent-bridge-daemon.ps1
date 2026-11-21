@@ -715,10 +715,18 @@ function Invoke-DaemonStartupSessionCleanup {
         [void](Invoke-DaemonLegacyCleanup -Headers $Headers -Live $Discovery.Live -State $State)
     }
     else {
-        if (-not (Clear-CopilotMqttOrphans -Headers $Headers -Live $Discovery.Live -Discovery $Discovery)) {
-            $script:DaemonSessionCleanupPending[$Phase] = $true
+        # Reconcile calls this every pass while pending; a retry is a full state read,
+        # so it is paced rather than run every 15 s.
+        $now = [DateTimeOffset]::Now
+        if ($null -ne $script:DaemonOrphanSweepNextAttempt -and $now -lt $script:DaemonOrphanSweepNextAttempt) {
             return $false
         }
+        if (-not (Clear-CopilotMqttOrphans -Headers $Headers -Live $Discovery.Live -Discovery $Discovery)) {
+            $script:DaemonSessionCleanupPending[$Phase] = $true
+            $script:DaemonOrphanSweepNextAttempt = $now.AddSeconds($script:OrphanSweepRetrySeconds)
+            return $false
+        }
+        $script:DaemonOrphanSweepNextAttempt = $null
     }
     [void]$script:DaemonSessionCleanupPending.Remove($Phase)
     $true
