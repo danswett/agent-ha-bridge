@@ -69,6 +69,34 @@ Test-That 'a lone brace is left alone' {
 }
 Test-That 'empty input is safe' { (Remove-CopilotTemplateMarkup -Text '') -eq '' }
 
+Write-Host '--- notification text reaching a notify service ---'
+Test-That 'a notification title and message carry no live template, and read the same' {
+    # Notify services render title and message as templates, and a reply preview or
+    # a question is the agent's own words.
+    $saved = @{ NotifyEnabled = $script:DecisionBridgeConfig.NotifyEnabled; NotifyService = $script:DecisionBridgeConfig.NotifyService }
+    $script:NotifySent = $null
+    function Invoke-HomeAssistantService { param($Domain, $Service, $Headers, $Data) $script:NotifySent = $Data }
+    try {
+        $script:DecisionBridgeConfig.NotifyEnabled = $true
+        $script:DecisionBridgeConfig.NotifyService = 'notify.mobile_app_test'
+        Send-BridgeNotification -Title '{{{ now() }}' -Message "Done. {{{ states('person.me') }} {%% if 1 %}" -Headers @{}
+        $values = @($script:NotifySent.title, $script:NotifySent.message)
+        @($values | Where-Object { $_ -match '\{[{%#]' }).Count -eq 0 -and
+            $script:NotifySent.message.Replace([string][char]0x200B, '') -eq "Done. {{{ states('person.me') }} {%% if 1 %}"
+    }
+    finally {
+        Remove-Item Function:\Invoke-HomeAssistantService
+        $script:DecisionBridgeConfig.NotifyEnabled = $saved.NotifyEnabled
+        $script:DecisionBridgeConfig.NotifyService = $saved.NotifyService
+    }
+}
+Test-That 'making notify data inert keeps its shape: nested tables, one-item lists and numbers' {
+    $out = ConvertTo-BridgeInertNotifyData -Value @{ a = @('{{x}}'); b = @{ c = 7; d = '{%y%}' }; e = @(); f = $null }
+    $out.a -is [array] -and $out.a.Count -eq 1 -and $out.a[0] -notmatch '\{\{' -and
+        $out.b.c -eq 7 -and $out.b.d -notmatch '\{%' -and $out.e -is [array] -and $out.e.Count -eq 0 -and
+        $null -eq $out.f
+}
+
 Write-Host '--- session names reaching a card ---'
 Test-That 'a hostile Claude folder name is neutralised' {
     $display = Get-ClaudeSessionDisplay -SessionId 'abc' -WorkingDirectory "C:\repos\{{ states('sun.sun') }}"

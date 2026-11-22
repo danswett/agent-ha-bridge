@@ -422,6 +422,9 @@ function Send-BridgeAnswerButtonNotification {
     )
 
     $sent = 0
+    # The question, its choices and the session name all reach a notify service that
+    # renders templates (ConvertTo-BridgeInertNotifyData).
+    $Payload = ConvertTo-BridgeInertNotifyData -Value $Payload
     foreach ($service in @($Services)) {
         $name = [string]$service
         if ([string]::IsNullOrWhiteSpace($name)) { continue }
